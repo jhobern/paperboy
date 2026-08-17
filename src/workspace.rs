@@ -8,11 +8,43 @@
 //! collection — this module instead walks the real filesystem under a
 //! chosen root directory.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 /// Filesystem entries recurse at most this many levels deep below the
 /// workspace root, as a defensive guard against pathological symlink loops.
 const MAX_DEPTH: usize = 32;
+
+/// Bumped every time PaperBoy itself changes the shape of a workspace tree.
+///
+/// [`Collection::ws_rows`](crate::collection::Collection::ws_rows) reuses a
+/// scan for a short while rather than reading the disk on every frame, but
+/// PaperBoy's *own* edits have to show up at once — creating a file and then
+/// not finding it in the tree is a bug, not a stale cache. So the write helpers
+/// here announce themselves, and a cache taken at an older generation is
+/// discarded on the spot.
+///
+/// It is a plain counter rather than a set of invalidated paths because the
+/// question a cache asks is only ever "is what I have still the latest?", and
+/// because a missed bump is merely slow (the scan's own expiry catches it)
+/// rather than wrong.
+static TREE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current tree generation; store it beside a cached scan and re-read when
+/// it no longer matches.
+pub fn tree_generation() -> u64 {
+    TREE_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Announce that the workspace tree has changed, so any cached scan is dropped
+/// at the next redraw. Called by the write helpers below; call it directly
+/// after writing a workspace file by some other route.
+pub fn note_tree_changed() {
+    TREE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 /// One row of a flattened, depth-first workspace file tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,22 +58,28 @@ pub struct WsEntry {
     pub is_dir: bool,
 }
 
-/// The three kinds of file a workspace is made of, as something the user can
-/// ask for a *new* one of.
+/// The kinds of thing a workspace is made of, as something the user can ask for
+/// a *new* one of: the three file types, plus the folder they get organised
+/// into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NewItemKind {
     Collection,
     Report,
     Environment,
+    /// A subfolder. Unlike the file kinds it has no extension and no starter
+    /// content -- it exists purely to be dragged things into.
+    Folder,
 }
 
 impl NewItemKind {
-    /// The extension given to a name typed without one.
+    /// The extension given to a name typed without one. Empty for a folder,
+    /// which never gains one.
     pub fn extension(self) -> &'static str {
         match self {
             NewItemKind::Collection => "hurl",
             NewItemKind::Report => "trail",
             NewItemKind::Environment => "vars",
+            NewItemKind::Folder => "",
         }
     }
 
@@ -77,6 +115,9 @@ impl NewItemKind {
             // scratch report in a tab does rather than a bare comment.
             NewItemKind::Report => crate::report::Report::scratch(stem).text,
             NewItemKind::Environment => format!("# {stem}\n"),
+            // Unused: `create_item` makes a directory rather than writing a
+            // file for this kind.
+            NewItemKind::Folder => String::new(),
         }
     }
 }
@@ -105,7 +146,9 @@ pub fn create_item(
         return Err(NewItemError::EmptyName);
     }
     let mut rel = PathBuf::from(name);
-    if rel.extension().is_none() {
+    // A folder keeps exactly the name that was typed -- "v2" must not become
+    // "v2.hurl", and a dot in a folder name is the user's business.
+    if kind != NewItemKind::Folder && rel.extension().is_none() {
         rel.set_extension(kind.extension());
     }
     let lexically_safe = rel
@@ -126,12 +169,19 @@ pub fn create_item(
         std::fs::create_dir_all(parent)
             .map_err(|e| NewItemError::Io(format!("{}: {e}", parent.display())))?;
     }
+    if kind == NewItemKind::Folder {
+        std::fs::create_dir_all(&full)
+            .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+        note_tree_changed();
+        return Ok(full);
+    }
     let stem = full
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| name.to_string());
     std::fs::write(&full, kind.starter(&stem))
         .map_err(|e| NewItemError::Io(format!("{}: {e}", full.display())))?;
+    note_tree_changed();
     Ok(full)
 }
 
@@ -171,6 +221,7 @@ pub fn move_item(root: &Path, src: &Path, dest_dir: &Path) -> Result<PathBuf, Mo
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| MoveError::Io(format!("{}: {e}", dest_dir.display())))?;
     std::fs::rename(src, &dest).map_err(|e| MoveError::Io(format!("{}: {e}", dest.display())))?;
+    note_tree_changed();
     Ok(dest)
 }
 
@@ -296,13 +347,14 @@ fn scan_dir(dir: &Path, depth: usize, filter_hurl_json: bool, out: &mut Vec<WsEn
     files.sort();
 
     for d in dirs {
-        // Recurse first into a scratch buffer so we can decide whether this
-        // directory is worth showing at all before committing any rows.
         let mut sub = Vec::new();
         scan_dir(&d, depth + 1, filter_hurl_json, &mut sub);
-        if filter_hurl_json && sub.is_empty() {
-            continue;
-        }
+        // Folders are always listed, even when the filter leaves them with
+        // nothing inside. The filter chooses which *files* are worth looking at;
+        // folders are the structure those files are organised into, and hiding
+        // an empty one makes the tree impossible to organise *with* -- a folder
+        // created to tidy things into would vanish the moment it was made, and
+        // there would be nowhere to drop the first file.
         let display_name = d
             .file_name()
             .and_then(|n| n.to_str())
@@ -362,14 +414,57 @@ pub fn is_report_file(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("trail"))
 }
 
-/// Whether `path` is an environment file (`.vars`, case-insensitive). The
-/// Workspace tree uses this to tell an environment apart from a collection file
-/// (both are surfaced by [`is_matching_file`]), so selecting one opens it as a
-/// global environment rather than trying to parse it as a collection.
+/// Whether `path` is an environment file. A `.vars` file always is; a `.json`
+/// is one only if its contents are a Postman environment export, since Postman
+/// writes collections and environments to the same extension and only the
+/// content tells them apart. The Workspace tree uses this to tell an
+/// environment from a collection file (both are surfaced by
+/// [`is_matching_file`]), so selecting one opens it as a global environment
+/// rather than trying to parse it as a collection.
+///
+/// The `.json` answer is memoised: this is called for every row of every
+/// workspace redraw, and re-reading a folder of exports each frame would make
+/// scrolling the tree cost a full directory's worth of file reads. The cache
+/// key includes the file's length and modification time, so editing a file
+/// still re-classifies it.
 pub fn is_env_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("vars"))
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if ext.eq_ignore_ascii_case("vars") {
+        return true;
+    }
+    if !ext.eq_ignore_ascii_case("json") {
+        return false;
+    }
+    is_postman_env_json(path)
+}
+
+/// Cached "is this `.json` a Postman environment export?" keyed by path, with
+/// the file's `(len, modified)` stamp so an edited file isn't answered from a
+/// stale entry.
+type JsonEnvCache = HashMap<PathBuf, ((u64, Option<SystemTime>), bool)>;
+static JSON_ENV_CACHE: LazyLock<Mutex<JsonEnvCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn is_postman_env_json(path: &Path) -> bool {
+    let stamp = std::fs::metadata(path)
+        .map(|m| (m.len(), m.modified().ok()))
+        .unwrap_or((0, None));
+    // A poisoned cache mutex must not take the UI down over a memo: fall back
+    // to reading the file directly.
+    if let Ok(cache) = JSON_ENV_CACHE.lock()
+        && let Some((cached_stamp, answer)) = cache.get(path)
+        && *cached_stamp == stamp
+    {
+        return *answer;
+    }
+    let answer = std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|c| crate::postman::postman_env_values(&c).is_some());
+    if let Ok(mut cache) = JSON_ENV_CACHE.lock() {
+        cache.insert(path.to_path_buf(), (stamp, answer));
+    }
+    answer
 }
 
 /// Whether `path` is any file the Workspace tree surfaces — a collection
@@ -760,22 +855,74 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The filter hides *files*, never folders: an empty folder, or one holding
+    /// only files the filter rejects, is still somewhere the user can put a
+    /// collection, and a freshly created folder would otherwise disappear
+    /// before anything could be moved into it.
     #[test]
-    fn filter_on_hides_directories_whose_subtree_has_no_matching_files() {
+    fn filter_on_still_lists_folders_that_hold_nothing_it_matches() {
         let root = tmp_dir("hide_empty");
         fs::create_dir_all(root.join("irrelevant")).unwrap();
         fs::write(root.join("irrelevant/notes.txt"), "").unwrap();
+        fs::create_dir_all(root.join("brand_new")).unwrap();
         fs::create_dir_all(root.join("relevant")).unwrap();
         fs::write(root.join("relevant/req.hurl"), "").unwrap();
 
         let entries = scan_workspace(&root, true);
         let names: Vec<&str> = entries.iter().map(|e| e.display_name.as_str()).collect();
         assert!(
-            !names.contains(&"irrelevant"),
-            "a folder with no matching descendants is hidden when filtered"
+            names.contains(&"brand_new"),
+            "a folder just created to organise into is still shown when filtered"
+        );
+        assert!(
+            names.contains(&"irrelevant"),
+            "and so is one whose only contents the filter rejects"
+        );
+        assert!(
+            !names.contains(&"notes.txt"),
+            "the rejected file itself stays hidden -- the filter still applies to files"
         );
         assert!(names.contains(&"relevant"));
         assert!(names.contains(&"req.hurl"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A new folder is made as a directory, not as a file with a folder-ish
+    /// name: it must gain no extension and hold no starter content.
+    #[test]
+    fn creating_a_folder_makes_a_directory_and_never_appends_an_extension() {
+        let root = tmp_dir("new_folder");
+
+        let made = create_item(&root, &root, "v2 endpoints", NewItemKind::Folder)
+            .expect("a plain name inside the root is allowed");
+        assert!(made.is_dir(), "a folder was created, not a file");
+        assert_eq!(
+            made.file_name().unwrap(),
+            "v2 endpoints",
+            "the name is exactly what was typed -- no .hurl was appended"
+        );
+
+        // A name that already contains a dot keeps it: that is a folder name,
+        // not an extension to be reasoned about.
+        let dotted = create_item(&root, &root, "v1.2", NewItemKind::Folder).unwrap();
+        assert_eq!(dotted.file_name().unwrap(), "v1.2");
+
+        // And the containment checks still apply.
+        assert!(
+            matches!(
+                create_item(&root, &root, "../escape", NewItemKind::Folder),
+                Err(NewItemError::Escapes(_))
+            ),
+            "a folder cannot be created outside the workspace"
+        );
+        assert!(
+            matches!(
+                create_item(&root, &root, "v2 endpoints", NewItemKind::Folder),
+                Err(NewItemError::Exists(_))
+            ),
+            "and an existing folder is not silently reused"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

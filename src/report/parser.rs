@@ -8,14 +8,15 @@ use nom::{
     character::complete::{char, multispace0, multispace1, not_line_ending, satisfy},
     combinator::{eof, map, opt, peek, recognize, value, verify},
     multi::{many0, separated_list0, separated_list1},
-    sequence::{delimited, pair, preceded, separated_pair},
+    sequence::{delimited, pair, preceded, separated_pair, tuple},
 };
 
 use crate::report::flow::{
-    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ParallelSpec, Pattern, Producer,
-    ReportFlow, ReportStmt, ResponseFmt, RoleRef, WithItem,
+    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, ParamDecl,
+    ParamKind, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef,
+    ShowField, WithItem,
 };
-use crate::report::model::StatKind;
+use crate::report::model::{ColumnClauses, StatKind};
 
 /*
 GRAMMAR:
@@ -40,6 +41,7 @@ header-line  := '#' [ key ':' value ]                 # before the first stateme
 
 statement    := assign
               | list-decl
+              | param-decl                             # prelude only
               | request
               | report
               | for-each
@@ -48,6 +50,9 @@ statement    := assign
 
 assign       := IDENT '=' value                       # incl. PRELUDE_* settings
 list-decl    := 'LIST' IDENT '=' producer
+param-decl   := 'PARAM' [ param-kind ] IDENT [ '=' value ] [ 'LABEL' name ]
+param-kind   := 'TEXT' | 'NUMBER' | 'ENV' | 'FOLDER' | 'FILE'
+              | 'CHOICE' '(' [ name (',' name)* ] ')'
 
 request      := 'REQUEST' name
 report       := 'REPORT' report-target
@@ -61,7 +66,8 @@ show         := 'SHOW' '(' IDENT (',' IDENT)* ')'
 hide         := 'HIDE' '(' IDENT (',' IDENT)* ')'
 with-block   := 'WITH' with-item* 'END'
 with-item    := response-fmt | field-def
-field-def    := IDENT ':' hurl-query                   # full Hurl query + filters
+field-def    := name ':' hurl-query                    # full Hurl query + filters
+                                                       # quote a multi-word name
 
 for-each     := [ parallel ] 'FOR' pattern 'IN' producer statement* 'END'
 for-envs     := [ parallel ] 'FOR' IDENT 'IN' 'ENVS' env-clause statement* 'END'
@@ -117,7 +123,11 @@ fn perr(i: &str) -> nom::Err<nom::error::Error<&str>> {
 
 /// `[A-Za-z_][A-Za-z0-9_]*` — the identifier predicate, used for header keys,
 /// assignment targets and binders.
-fn is_ident(s: &str) -> bool {
+///
+/// Exposed to `edit` so an inline field that renames a loop variable can refuse
+/// a name the parser would then reject, rather than writing text that no longer
+/// round-trips through `parse_flow`.
+pub(crate) fn is_ident(s: &str) -> bool {
     let mut c = s.chars();
     matches!(c.next(), Some(x) if x.is_ascii_alphabetic() || x == '_')
         && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
@@ -203,8 +213,25 @@ where
 // Whitespace / comment trivia between statements
 // ---------------------------------------------------------------------------
 
-/// Skip any run of blank space, newlines and whole-line `#` comments — the gaps
-/// between statements (header comments are consumed separately).
+/// A whole-line `#` comment kept as a node, so that commenting a block out in
+/// the source doesn't destroy it the next time the editors re-serialize the
+/// flow. The text is stored exactly as written after the `#`.
+fn comment_node(i: &str) -> IResult<&str, FlowNode> {
+    map(preceded(char('#'), not_line_ending), |text: &str| {
+        FlowNode::Comment(text.to_string())
+    })(i)
+}
+
+/// A statement or a comment. Bodies parse with this rather than `node` so a
+/// comment keeps its position among the statements around it.
+fn node_or_comment(i: &str) -> IResult<&str, FlowNode> {
+    alt((comment_node, node))(i)
+}
+
+/// Skip any run of blank space, newlines and whole-line `#` comments. Only used
+/// where a comment has nowhere to live (by `opens_block`, which is a lookahead
+/// and keeps nothing); statement bodies use `multispace0` + `node_or_comment`,
+/// and `WITH` blocks `multispace0` + `with_item_or_comment`.
 fn trivia(i: &str) -> IResult<&str, ()> {
     value(
         (),
@@ -228,14 +255,17 @@ fn parse_headers(i: &str) -> IResult<&str, Header> {
 fn header_line(i: &str) -> IResult<&str, HeaderLine> {
     let (i, _) = multispace0(i)?;
     let (i, _) = char('#')(i)?;
-    let (i, raw) = not_line_ending(i)?;
-    let raw = raw.trim();
+    let (i, verbatim) = not_line_ending(i)?;
+    let raw = verbatim.trim();
     let line = match raw.split_once(':') {
         Some((k, v)) if is_ident(k.trim()) => HeaderLine::Directive {
             key: k.trim().to_string(),
             value: v.trim().to_string(),
         },
-        _ => HeaderLine::Comment(raw.to_string()),
+        // Kept exactly as typed, unlike a directive: a block commented out
+        // above the first statement lands here, and re-spacing it would
+        // quietly destroy its indentation.
+        _ => HeaderLine::Comment(verbatim.to_string()),
     };
     Ok((i, line))
 }
@@ -245,7 +275,7 @@ fn header_line(i: &str) -> IResult<&str, HeaderLine> {
 // ---------------------------------------------------------------------------
 
 fn node(i: &str) -> IResult<&str, FlowNode> {
-    alt((for_stmt, list_decl, request, report, assign))(i)
+    alt((for_stmt, list_decl, param_decl, request, report, assign))(i)
 }
 
 /// `IDENT = <rest of line>` — value is untokenized (may contain `=`, `&`, …).
@@ -264,6 +294,54 @@ fn list_decl(i: &str) -> IResult<&str, FlowNode> {
         preceded(kw("LIST"), separated_pair(ident, sym('='), producer)),
         |(name, producer)| FlowNode::ListDecl { name, producer },
     )(i)
+}
+
+/// `PARAM [<kind>] IDENT [ '=' value ] [ 'LABEL' text ]`.
+///
+/// The kind is optional (omitted = `TEXT`), which needs a lookahead to stay
+/// unambiguous: `PARAM TEXT = "x"` declares a parameter *named* `TEXT`, while
+/// `PARAM TEXT NAME = "x"` is a text parameter named `NAME`. So a leading kind
+/// word is only consumed when an identifier follows it — otherwise the word is
+/// the parameter's own name.
+fn param_decl(i: &str) -> IResult<&str, FlowNode> {
+    let (i, _) = kw("PARAM")(i)?;
+    // `peek(ident)` after the kind is what disambiguates: without a name
+    // following, the word we just read was the name itself.
+    let (i, kind) = opt(map(pair(param_kind, peek(ident)), |(k, _)| k))(i)?;
+    let kind = kind.unwrap_or_default();
+    let (i, name) = ident(i)?;
+    let (i, default) = opt(preceded(sym('='), str_or_word))(i)?;
+    let (i, label) = opt(preceded(kw("LABEL"), str_or_word))(i)?;
+    Ok((
+        i,
+        FlowNode::Param(ParamDecl {
+            kind,
+            name,
+            default,
+            label,
+        }),
+    ))
+}
+
+/// `TEXT | NUMBER | ENV | FOLDER | FILE | CHOICE(a, b, …)`.
+fn param_kind(i: &str) -> IResult<&str, ParamKind> {
+    alt((
+        map(
+            preceded(kw("CHOICE"), paren_list1(str_or_word)),
+            |options| ParamKind::Choice(options),
+        ),
+        // An empty option list is a grammatical `CHOICE` with nothing to
+        // choose from; accepting it here lets validation say so in words
+        // instead of the parser rejecting the whole line as unknown syntax.
+        map(preceded(kw("CHOICE"), pair(sym('('), sym(')'))), |_| {
+            ParamKind::Choice(Vec::new())
+        }),
+        value(ParamKind::Text, kw("TEXT")),
+        value(ParamKind::Number, kw("NUMBER")),
+        value(ParamKind::Env, kw("ENV")),
+        value(ParamKind::Folder, kw("FOLDER")),
+        value(ParamKind::File, kw("FILE")),
+    ))(i)
 }
 
 fn request(i: &str) -> IResult<&str, FlowNode> {
@@ -327,7 +405,7 @@ fn parallel_prefix(i: &str) -> IResult<&str, ParallelSpec> {
 
 /// The statements up to (and consuming) the matching `END`.
 fn block_body(i: &str) -> IResult<&str, Vec<FlowNode>> {
-    let (i, nodes) = many0(preceded(trivia, node))(i)?;
+    let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = preceded(trivia, kw("END"))(i)?;
     Ok((i, nodes))
 }
@@ -372,17 +450,20 @@ fn report_vars(i: &str) -> IResult<&str, ReportStmt> {
     map(paren_list1(ident), ReportStmt::Vars)(i)
 }
 
-/// `REPORT "<template>" AS <name> [STATISTICS(…)]`.
+/// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE[(…)]]`.
 fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
     let (i, template) = string_lit(i)?;
     let (i, name) = preceded(kw("AS"), str_or_word)(i)?;
-    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
+    let (i, clauses) = column_clauses(i)?;
     Ok((
         i,
         ReportStmt::Computed {
             template,
             name,
-            stats,
+            stats: clauses.stats,
+            image: clauses.image,
+            truth: clauses.truth,
+            detail: clauses.detail,
         },
     ))
 }
@@ -395,18 +476,141 @@ fn report_computed(i: &str) -> IResult<&str, ReportStmt> {
 fn report_single(i: &str) -> IResult<&str, ReportStmt> {
     let (i, var) = ident(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
-    let (i, stats) = map(opt(statistics_clause), Option::unwrap_or_default)(i)?;
+    let (
+        i,
+        ColumnClauses {
+            stats,
+            image,
+            truth,
+            detail,
+        },
+    ) = column_clauses(i)?;
     Ok((
         i,
-        match (alias, stats.is_empty()) {
-            (Some(name), _) => ReportStmt::VarAs { var, name, stats },
+        match (
+            alias,
+            stats.is_empty() && image.is_none() && truth.is_none() && !detail,
+        ) {
+            (Some(name), _) => ReportStmt::VarAs {
+                var,
+                name,
+                stats,
+                image,
+                truth,
+                detail,
+            },
+            // A bare `REPORT X` is a plain variable column, but one carrying a
+            // clause needs a named column to hang the clause on, so the
+            // variable name becomes the header.
             (None, false) => {
                 let name = var.clone();
-                ReportStmt::VarAs { var, name, stats }
+                ReportStmt::VarAs {
+                    var,
+                    name,
+                    stats,
+                    image,
+                    truth,
+                    detail,
+                }
             }
             (None, true) => ReportStmt::Vars(vec![var]),
         },
     ))
+}
+
+/// The optional trailing column clauses -- `STATISTICS(…)`, `IMAGE[(…)]` and
+/// `TRUTH "…"` -- in any order, since none is more natural than another.
+fn column_clauses(i: &str) -> IResult<&str, ColumnClauses> {
+    let mut out = ColumnClauses::default();
+    let mut rest = i;
+    loop {
+        if let Ok((r, s)) = statistics_clause(rest) {
+            out.stats = s;
+            rest = r;
+            continue;
+        }
+        if out.image.is_none()
+            && let Ok((r, im)) = image_clause(rest)
+        {
+            out.image = Some(im);
+            rest = r;
+            continue;
+        }
+        if out.truth.is_none()
+            && let Ok((r, t)) = truth_clause(rest)
+        {
+            out.truth = Some(t);
+            rest = r;
+            continue;
+        }
+        if !out.detail
+            && let Ok((r, _)) = detail_clause(rest)
+        {
+            out.detail = true;
+            rest = r;
+            continue;
+        }
+        return Ok((rest, out));
+    }
+}
+
+/// `DETAIL` -- the placement flag that moves a column out of the table and into
+/// its row's drill-down. A bare keyword: it says *where* the column goes, and
+/// there is only one other place for it to be.
+fn detail_clause(i: &str) -> IResult<&str, ()> {
+    let (i, _) = kw("DETAIL")(i)?;
+    Ok((i, ()))
+}
+
+/// `TRUTH "<template>"` -- the column's expected value, interpolated per row.
+/// The argument is a mandatory string literal (see
+/// [`crate::report::model::split_truth`] for why it may not be bare).
+fn truth_clause(i: &str) -> IResult<&str, String> {
+    preceded(kw("TRUTH"), string_lit)(i)
+}
+
+/// `IMAGE` / `IMAGE(HEIGHT n | WIDTH n | FIT, …)` -- the render hint that makes
+/// a column's value be drawn as a picture by writers that can show one.
+fn image_clause(i: &str) -> IResult<&str, ImageSpec> {
+    let (i, _) = kw("IMAGE")(i)?;
+    let (i, opts) = opt(paren_list1(image_opt))(i)?;
+    let mut spec = ImageSpec::default();
+    for opt in opts.into_iter().flatten() {
+        match opt {
+            ImageOpt::Height(n) => spec.height = Some(n),
+            ImageOpt::Width(n) => spec.width = Some(n),
+            ImageOpt::Fit => spec.fit = true,
+        }
+    }
+    Ok((i, spec))
+}
+
+#[derive(Clone, Copy)]
+enum ImageOpt {
+    Height(u32),
+    Width(u32),
+    Fit,
+}
+
+fn image_opt(i: &str) -> IResult<&str, ImageOpt> {
+    let px = preceded(multispace0, nom::character::complete::u32);
+    alt((
+        value(ImageOpt::Fit, kw("FIT")),
+        map(
+            preceded(kw("HEIGHT"), verify(px, |n: &u32| *n > 0)),
+            ImageOpt::Height,
+        ),
+        map(
+            preceded(
+                kw("WIDTH"),
+                verify(
+                    preceded(multispace0, nom::character::complete::u32),
+                    |n: &u32| *n > 0,
+                ),
+            ),
+            ImageOpt::Width,
+        ),
+    ))(i)
 }
 
 /// `STATISTICS(stat, …)` — the summary-statistics clause on a `REPORT … AS …`.
@@ -430,9 +634,24 @@ fn resp_fmt(i: &str) -> IResult<&str, ResponseFmt> {
     ))(i)
 }
 
-/// `SHOW(a, b, …)` — at least one field (empty is a parse error).
-fn show_clause(i: &str) -> IResult<&str, Vec<String>> {
-    preceded(kw("SHOW"), paren_list1(ident))(i)
+/// `SHOW(a, b STATISTICS(MEAN), …)` — at least one field (empty is a parse
+/// error). Each field may carry its own `STATISTICS(…)`, which summarises the
+/// column that field produces.
+fn show_clause(i: &str) -> IResult<&str, Vec<ShowField>> {
+    preceded(kw("SHOW"), paren_list1(show_field))(i)
+}
+
+/// One `SHOW(…)` field: a name and an optional `STATISTICS(…)` clause.
+fn show_field(i: &str) -> IResult<&str, ShowField> {
+    let (i, field) = ident(i)?;
+    let (i, stats) = opt(statistics_clause)(i)?;
+    Ok((
+        i,
+        ShowField {
+            field,
+            stats: stats.unwrap_or_default(),
+        },
+    ))
 }
 
 /// `HIDE(a, b, …)` — at least one field (empty is a parse error).
@@ -441,11 +660,29 @@ fn hide_clause(i: &str) -> IResult<&str, Vec<String>> {
 }
 
 /// `WITH <item>* END`.
+///
+/// Items are parsed with `multispace0` + [`with_item_or_comment`] rather than
+/// `trivia`, so a comment inside the block keeps its place among the fields
+/// instead of being skipped as whitespace — commenting a field out and then
+/// editing the request elsewhere must not delete the commented line.
 fn with_block(i: &str) -> IResult<&str, Vec<WithItem>> {
     let (i, _) = kw("WITH")(i)?;
-    let (i, items) = many0(preceded(trivia, with_item))(i)?;
-    let (i, _) = preceded(trivia, kw("END"))(i)?;
+    let (i, items) = many0(preceded(multispace0, with_item_or_comment))(i)?;
+    let (i, _) = preceded(multispace0, kw("END"))(i)?;
     Ok((i, items))
+}
+
+/// A `WITH` item or a whole-line comment between items. Comments are tried
+/// first: a `#` can't start any real item, and a field would otherwise swallow
+/// the line as a name.
+fn with_item_or_comment(i: &str) -> IResult<&str, WithItem> {
+    alt((with_comment, with_item))(i)
+}
+
+fn with_comment(i: &str) -> IResult<&str, WithItem> {
+    map(preceded(char('#'), not_line_ending), |text: &str| {
+        WithItem::Comment(text.to_string())
+    })(i)
 }
 
 fn with_item(i: &str) -> IResult<&str, WithItem> {
@@ -462,17 +699,19 @@ fn with_field_name(i: &str) -> IResult<&str, String> {
     alt((string_lit, ident))(i)
 }
 
-/// `name: <rest of line> [STATISTICS(…)]` — a full Hurl query (may contain `:`
-/// and quotes) or an intrinsic name, with an optional trailing statistics
-/// clause. `name` may be quoted to allow spaces.
+/// `name: <rest of line> [STATISTICS(…)] [IMAGE[(…)]]` — a full Hurl query (may
+/// contain `:` and quotes) or an intrinsic name, with optional trailing
+/// statistics and image clauses. `name` may be quoted to allow spaces.
 fn with_field(i: &str) -> IResult<&str, WithItem> {
     let (i, name) = with_field_name(i)?;
     let (i, _) = sym(':')(i)?;
     let (i, rest) = not_line_ending(i)?;
-    // Peel an optional trailing `STATISTICS(…)` off the query text (the same
-    // whole-word, outside-quotes rule the `columns:` directive uses), leaving
-    // the bare query.
-    let (query, stats) = crate::report::model::split_statistics(rest);
+    // Peel the optional trailing `STATISTICS(…)`/`IMAGE(…)` clauses off the
+    // query text (the same whole-word, outside-quotes rule the `columns:`
+    // directive uses), leaving the bare query. It has to be done textually
+    // here rather than with a combinator because the query itself runs to the
+    // end of the line and may contain almost anything.
+    let (query, clauses) = crate::report::model::split_column_clauses(rest);
     let query = query.trim();
     if query.is_empty() {
         return Err(perr(i));
@@ -482,7 +721,10 @@ fn with_field(i: &str) -> IResult<&str, WithItem> {
         WithItem::Field {
             name,
             query: query.to_string(),
-            stats,
+            stats: clauses.stats,
+            image: clauses.image,
+            truth: clauses.truth,
+            detail: clauses.detail,
         },
     ))
 }
@@ -589,17 +831,32 @@ fn folders_src(i: &str) -> IResult<&str, Producer> {
     map(
         preceded(
             kw("FOLDERS"),
-            pair(
+            tuple((
                 string_lit,
+                opt(preceded(kw("MATCH"), string_lit)),
                 opt(preceded(
                     kw("WITH"),
-                    separated_list1(sym(','), separated_pair(ident, sym('='), string_lit)),
+                    separated_list1(sym(','), role_binding),
                 )),
-            ),
+            )),
         ),
-        |(dir, roles)| Producer::Folders {
+        |(dir, glob, roles)| Producer::Folders {
             dir,
+            glob,
             roles: roles.unwrap_or_default(),
+        },
+    )(i)
+}
+
+/// One `role="glob"` binding, with an optional trailing `?` marking the role
+/// optional (it may match no file, binding empty, rather than failing the run).
+fn role_binding(i: &str) -> IResult<&str, RoleBinding> {
+    map(
+        pair(separated_pair(ident, sym('='), string_lit), opt(sym('?'))),
+        |((name, glob), mark)| RoleBinding {
+            name,
+            glob,
+            optional: mark.is_some(),
         },
     )(i)
 }
@@ -677,7 +934,7 @@ fn roles_clause(i: &str) -> IResult<&str, EnvClause> {
 /// live env name or a `FILE("…")` snapshot.  `SHOW` after `COMPARISON` is a
 /// hard parse error (returned as `nom::Err::Failure`) so it can't be silently
 /// swallowed by the surrounding `alt`.
-fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<String>)> {
+fn role(i: &str) -> IResult<&str, (bool, Vec<RoleRef>, Vec<ShowField>)> {
     let (i, is_baseline) = alt((value(true, kw("BASELINE")), value(false, kw("COMPARISON"))))(i)?;
     let (i, refs) = paren_list1(role_ref)(i)?;
     // SHOW(…) is only legal on a BASELINE role.  If we see SHOW after a
@@ -719,7 +976,7 @@ fn file_ref(i: &str) -> IResult<&str, String> {
 
 fn report_flow(i: &str) -> IResult<&str, ReportFlow> {
     let (i, header) = parse_headers(i)?;
-    let (i, nodes) = many0(preceded(trivia, node))(i)?;
+    let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = trivia(i)?;
     Ok((i, ReportFlow { header, nodes }))
 }
@@ -807,6 +1064,121 @@ fn with_block_head(i: &str) -> IResult<&str, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug that motivated `FlowNode::Comment`: a block commented out in the
+    /// body used to vanish, because `trivia` threw comments away and the
+    /// editors re-serialize the flow after every edit.
+    #[test]
+    fn a_commented_out_block_survives_a_round_trip() {
+        let src =
+            "# collection: c\n\nREQUEST b\n# FOR X IN FILES \"*.txt\"\n#     REQUEST a\n# END\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src, "round-trips byte for byte");
+    }
+
+    /// Whatever follows the `#` is kept verbatim — a comment is not re-spaced,
+    /// so indentation inside a commented-out block is preserved.
+    #[test]
+    fn comment_text_is_kept_exactly_as_written() {
+        let src = "# collection: c\n\nREQUEST b\n#no space\n#      wide   gap\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src);
+    }
+
+    /// A comment sits where it was written, not hoisted to the top or sunk to
+    /// the bottom of its block.
+    #[test]
+    fn a_comment_keeps_its_position_in_the_body() {
+        let flow =
+            parse_flow("# collection: c\n\nREQUEST a\n# between\nREQUEST b\n").expect("parses");
+        let kinds: Vec<_> = flow
+            .nodes
+            .iter()
+            .map(|n| matches!(n, FlowNode::Comment(_)))
+            .collect();
+        assert_eq!(kinds, vec![false, true, false]);
+    }
+
+    /// Comments above the first statement belong to the *header* — that is what
+    /// makes `# collection:` a directive, and it holds even across a blank line
+    /// so a directive written below one isn't silently demoted to a comment.
+    #[test]
+    fn leading_comments_still_belong_to_the_header() {
+        let flow = parse_flow("# collection: c\n# a note\nREQUEST b\n").expect("parses");
+        assert!(
+            !flow.nodes.iter().any(|n| matches!(n, FlowNode::Comment(_))),
+            "the note stayed in the header"
+        );
+    }
+
+    /// …and header comments are kept verbatim too, so a block commented out up
+    /// there survives with its indentation, it just sits with the directives.
+    #[test]
+    fn a_header_comment_keeps_its_spacing() {
+        let flow = parse_flow("# collection: c\n#     indented note\nREQUEST b\n").expect("parses");
+        assert!(
+            flow.to_text().contains("#     indented note"),
+            "{:?}",
+            flow.to_text()
+        );
+    }
+    /// The same gap, one level down: a `WITH` block is the one place a comment
+    /// still had nowhere to live, so commenting a column out and then touching
+    /// the request from an editor deleted the line. The `#` is re-indented to
+    /// the block's own depth on the way out — the *text* after it is verbatim.
+    #[test]
+    fn a_commented_out_with_field_survives_a_round_trip() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    Score: jsonpath \"$.score\"\n",
+            "    #    Frame: jsonpath \"$.frame\" IMAGE(HEIGHT 110)\n",
+            "    Verdict: jsonpath \"$.verdict\"\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src, "round-trips byte for byte");
+    }
+
+    /// A comment keeps its place among the fields rather than being hoisted or
+    /// sunk, which is the whole point: `# Frame:` above `Verdict:` means the
+    /// column that *was* there, not a note about the block.
+    #[test]
+    fn a_with_comment_keeps_its_position_among_the_fields() {
+        let flow = parse_flow(concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    a: HttpStatus\n",
+            "#    b: Time\n",
+            "    c: Response\n",
+            "END\n",
+        ))
+        .expect("parses");
+        let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = flow.nodes.first() else {
+            panic!("expected a report request, got {:?}", flow.nodes);
+        };
+        let kinds: Vec<_> = with
+            .iter()
+            .map(|w| matches!(w, WithItem::Comment(_)))
+            .collect();
+        assert_eq!(kinds, vec![false, true, false]);
+    }
+
+    /// A comment on the last line of the block still belongs to it, rather than
+    /// being swallowed by whatever skips whitespace before `END`.
+    #[test]
+    fn a_with_comment_just_above_end_is_kept() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    a: HttpStatus\n",
+            "    #    b: Time\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.to_text(), src);
+    }
+
     use crate::report::flow::{
         Binder, Element, EnvClause, FlowNode, ParallelSpec, Producer, ReportStmt, RoleRef, WithItem,
     };
@@ -896,6 +1268,98 @@ mod tests {
     }
 
     #[test]
+    fn a_parameter_declares_a_type_a_default_and_a_prompt() {
+        let flow = assert_round_trips(
+            "PARAM CHOICE(\"v4.2\", \"v4.3\") VERSION = \"v4.3\" LABEL \"API version\"\nREPORT REQUEST r\n",
+        );
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(
+                    p.kind,
+                    ParamKind::Choice(vec!["v4.2".into(), "v4.3".into()])
+                );
+                assert_eq!(p.name, "VERSION");
+                assert_eq!(p.default.as_deref(), Some("v4.3"));
+                assert_eq!(p.label.as_deref(), Some("API version"));
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_part_of_a_parameter_but_its_name_is_optional() {
+        let flow = parse_flow("PARAM TICKETS\nREPORT REQUEST r\n").unwrap();
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                // No type written means free text, and no default means the
+                // parameter is required rather than empty-by-default.
+                assert_eq!(p.kind, ParamKind::Text);
+                assert_eq!(p.name, "TICKETS");
+                assert_eq!(p.default, None);
+                assert_eq!(p.label, None);
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+        // The canonical form spells the type out, so nobody has to know which
+        // one they got by saying nothing.
+        assert!(flow.to_text().starts_with("PARAM TEXT TICKETS\n"));
+    }
+
+    /// The type is optional, so a parameter *named* after a type keyword has to
+    /// resolve the other way — the word is only a type when a name follows it.
+    #[test]
+    fn a_parameter_named_after_a_type_is_still_its_own_name() {
+        let flow = parse_flow("PARAM ENV = \"staging\"\n").unwrap();
+        match &flow.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(p.name, "ENV");
+                assert_eq!(p.kind, ParamKind::Text);
+                assert_eq!(p.default.as_deref(), Some("staging"));
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+        let typed = parse_flow("PARAM ENV TARGET = \"staging\"\n").unwrap();
+        match &typed.nodes[0] {
+            FlowNode::Param(p) => {
+                assert_eq!(p.name, "TARGET");
+                assert_eq!(p.kind, ParamKind::Env);
+            }
+            other => panic!("expected Param, got {other:?}"),
+        }
+    }
+
+    /// Most parameters will never carry a `LABEL`, and the people who only run
+    /// reports shouldn't be shouted at in identifiers.
+    #[test]
+    fn a_parameter_without_a_label_still_has_a_readable_prompt() {
+        let cases = [
+            ("PARAM TICKET_REF", "Ticket ref"),
+            ("PARAM TEXT api_version", "Api version"),
+            ("PARAM FOLDER IMAGES", "Images"),
+            // Already mixed-case: deliberate, so left exactly as written.
+            ("PARAM TEXT imageWidth", "imageWidth"),
+            ("PARAM TEXT iOS_build", "iOS build"),
+        ];
+        for (src, want) in cases {
+            let flow = parse_flow(&format!("{src}\n")).unwrap();
+            assert_eq!(flow.params()[0].prompt(), want, "for {src}");
+        }
+        // A written LABEL always wins.
+        let flow = parse_flow("PARAM TICKET_REF LABEL \"Ticket\"\n").unwrap();
+        assert_eq!(flow.params()[0].prompt(), "Ticket");
+    }
+
+    #[test]
+    fn the_declared_parameters_are_readable_without_running_anything() {
+        let flow = parse_flow(
+            "# collection: c\nPARAM ENV TARGET = \"staging\"\nPARAM FOLDER IMAGES = \"./t\"\nREPORT REQUEST r\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = flow.params().iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["TARGET", "IMAGES"]);
+    }
+
+    #[test]
     fn multiline_list_literal_is_joined() {
         let flow = parse_flow(
             "LIST DOCS = [\n  (\"a\", \"b\"),\n  (\"c\", \"d\")\n]\nFOR (X, Y) IN DOCS\n  REQUEST r\nEND\n",
@@ -932,6 +1396,27 @@ mod tests {
             "LIST PAIRS = ZIP(FILES \"fronts\" MATCH \"*.jpg\", FILES \"backs\")\nFOR (F, B) IN PAIRS\n    REQUEST r\nEND\n",
         );
         assert_round_trips("FOR ROW IN TUPLES FROM \"m.csv\"\n    REQUEST r\nEND\n");
+    }
+
+    #[test]
+    fn folders_match_glob_and_optional_roles_round_trip() {
+        let flow = assert_round_trips(
+            "FOR CASE IN FOLDERS \"cases\" MATCH \"**/case_*\" WITH front=\"*_front.*\", back=\"*_back.*\"?\n    REQUEST r\nEND\n",
+        );
+        if let FlowNode::ForEach { producer, .. } = &flow.nodes[0] {
+            match producer {
+                Producer::Folders { glob, roles, .. } => {
+                    assert_eq!(glob.as_deref(), Some("**/case_*"));
+                    assert!(!roles[0].optional);
+                    assert!(roles[1].optional, "trailing ? marks the role optional");
+                }
+                other => panic!("expected FOLDERS, got {other:?}"),
+            }
+        } else {
+            panic!("expected ForEach");
+        }
+        // MATCH without roles, and roles without MATCH, are both still valid.
+        assert_round_trips("FOR D IN FOLDERS \"cases\" MATCH \"**\"\n    REQUEST r\nEND\n");
     }
 
     #[test]
@@ -1026,7 +1511,9 @@ mod tests {
         match &flow.nodes[0] {
             FlowNode::Report(ReportStmt::Request { with, .. }) => {
                 match &with[0] {
-                    WithItem::Field { name, query, stats } => {
+                    WithItem::Field {
+                        name, query, stats, ..
+                    } => {
                         assert_eq!(name, "Response Time");
                         assert_eq!(query, "Time");
                         assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
@@ -1360,6 +1847,27 @@ mod tests {
         } else {
             panic!("expected ForEnvs roles with SHOW");
         }
+        // A SHOW field may carry its own STATISTICS(…), which is how a column
+        // gets a summary without restating every other column in `# columns:`.
+        assert_round_trips(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time STATISTICS(MEAN, MEDIAN)), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        );
+        let f = parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time STATISTICS(MEAN)), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
+        )
+        .unwrap();
+        let FlowNode::ForEnvs {
+            clause: EnvClause::Roles { baseline_show, .. },
+            ..
+        } = &f.nodes[0]
+        else {
+            panic!("expected ForEnvs roles with SHOW");
+        };
+        assert_eq!(baseline_show[0].field, "Time");
+        assert_eq!(baseline_show[0].stats, vec![StatKind::Mean]);
+        // The same clause works on a REPORT statement's own SHOW.
+        assert_round_trips("REPORT REQUEST r SHOW(status, Time STATISTICS(MEAN))\n");
+
         // Multiple SHOW fields also round-trip.
         assert_round_trips(
             "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time, HttpStatus), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
@@ -1388,7 +1896,9 @@ mod tests {
             "REPORT Time AS \"Response time\" STATISTICS(MEAN, MEDIAN)\nREPORT Overall AS Verdict STATISTICS(DISTRIBUTION)\n",
         );
         match &flow.nodes[0] {
-            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
+            FlowNode::Report(ReportStmt::VarAs {
+                var, name, stats, ..
+            }) => {
                 assert_eq!(var, "Time");
                 assert_eq!(name, "Response time");
                 assert_eq!(stats, &vec![StatKind::Mean, StatKind::Median]);
@@ -1401,6 +1911,241 @@ mod tests {
             Some(&vec![StatKind::Mean, StatKind::Median])
         );
         assert_eq!(cs.get("Verdict"), Some(&vec![StatKind::Distribution]));
+    }
+
+    #[test]
+    fn report_image_clause_parses_and_round_trips() {
+        use crate::report::flow::ImageSpec;
+        // Bare `IMAGE`, each sizing option, and `FIT` all survive a parse →
+        // serialize round-trip, and are collected by column header.
+        let flow = assert_round_trips(
+            "REPORT Frame AS Face IMAGE
+REPORT Doc AS Page IMAGE(HEIGHT 110)
+REPORT Sig AS Mark IMAGE(WIDTH 200, HEIGHT 100)
+REPORT Thumb AS Small IMAGE(FIT)
+",
+        );
+        let ci = flow.column_images();
+        assert_eq!(ci.get("Face"), Some(&ImageSpec::default()));
+        assert_eq!(
+            ci.get("Page"),
+            Some(&ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            ci.get("Mark"),
+            Some(&ImageSpec {
+                width: Some(200),
+                height: Some(100),
+                fit: false
+            })
+        );
+        assert_eq!(
+            ci.get("Small"),
+            Some(&ImageSpec {
+                fit: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn report_image_and_statistics_parse_in_either_order() {
+        use crate::report::flow::ImageSpec;
+        use crate::report::model::StatKind;
+        // Neither clause is more natural than the other, so both orders parse;
+        // serialization normalises to STATISTICS-then-IMAGE.
+        for src in [
+            "REPORT Frame AS Face STATISTICS(COUNT) IMAGE(HEIGHT 60)
+",
+            "REPORT Frame AS Face IMAGE(HEIGHT 60) STATISTICS(COUNT)
+",
+        ] {
+            let flow = parse_flow(src).expect("parse");
+            assert_eq!(
+                flow.column_stats().get("Face"),
+                Some(&vec![StatKind::Count]),
+                "{src}"
+            );
+            assert_eq!(
+                flow.column_images().get("Face"),
+                Some(&ImageSpec {
+                    height: Some(60),
+                    ..Default::default()
+                }),
+                "{src}"
+            );
+            assert_eq!(
+                flow.to_text(),
+                "REPORT Frame AS Face STATISTICS(COUNT) IMAGE(HEIGHT 60)\n",
+                "both orders serialize the same way"
+            );
+        }
+    }
+
+    #[test]
+    fn with_field_image_clause_parses_and_round_trips() {
+        use crate::report::flow::ImageSpec;
+        // The clause is available on a `WITH` field too, where the value is a
+        // Hurl query rather than a variable.
+        let flow = assert_round_trips(
+            "REPORT REQUEST face WITH\n    Frame: jsonpath \"$.frame_url\" IMAGE(HEIGHT 110)\n    Status: HttpStatus\nEND\n",
+        );
+        assert_eq!(
+            flow.column_images().get("face.Frame"),
+            Some(&ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn image_rejects_a_zero_or_missing_size() {
+        // A zero-pixel picture is never what was meant, and an option list that
+        // parses nothing should fail loudly rather than silently yielding a
+        // bare IMAGE.
+        for src in [
+            "REPORT Frame AS Face IMAGE(HEIGHT 0)\n",
+            "REPORT Frame AS Face IMAGE(HEIGHT)\n",
+            "REPORT Frame AS Face IMAGE(TALL 10)\n",
+        ] {
+            assert!(parse_flow(src).is_err(), "{src} should not parse");
+        }
+    }
+
+    /// A `TRUTH` clause is data, not an assertion, so it has to survive a
+    /// round-trip through the editors untouched and reach `column_truths`.
+    #[test]
+    fn truth_clause_parses_and_round_trips_on_every_column_form() {
+        for (src, key) in [
+            (
+                "REPORT Verdict AS Result TRUTH \"{{ expected }}\"\n",
+                "Result",
+            ),
+            (
+                "REPORT \"{{ a }}/{{ b }}\" AS Ratio TRUTH \"1/2\"\n",
+                "Ratio",
+            ),
+            (
+                "REPORT REQUEST face WITH\n    Verdict: jsonpath \"$.verdict\" TRUTH \"{{ expected }}\"\nEND\n",
+                "face.Verdict",
+            ),
+        ] {
+            let flow = assert_round_trips(src);
+            assert!(
+                flow.column_truths().contains_key(key),
+                "{src} should record a truth for {key}"
+            );
+        }
+    }
+
+    /// `DETAIL` is placement, not content, so like `TRUTH` it has to survive a
+    /// round-trip untouched and reach `column_details` from every column form.
+    #[test]
+    fn detail_flag_parses_and_round_trips_on_every_column_form() {
+        for (src, key) in [
+            ("REPORT Raw AS Payload DETAIL\n", "Payload"),
+            ("REPORT \"{{ a }}/{{ b }}\" AS Ratio DETAIL\n", "Ratio"),
+            (
+                "REPORT REQUEST face WITH\n    Body: jsonpath \"$.body\" DETAIL\nEND\n",
+                "face.Body",
+            ),
+        ] {
+            let flow = assert_round_trips(src);
+            assert!(
+                flow.column_details().contains(key),
+                "{src} should mark {key} as a detail column"
+            );
+        }
+    }
+
+    /// `DETAIL` serializes last, so it must still parse when written before the
+    /// other clauses, and a column source ending in the word must be left alone.
+    #[test]
+    fn detail_parses_in_any_order_and_only_as_a_trailing_keyword() {
+        let flow = parse_flow("REPORT V AS Verdict DETAIL TRUTH \"{{ e }}\"\n").expect("parse");
+        assert!(flow.column_details().contains("Verdict"));
+        assert_eq!(
+            flow.to_text(),
+            "REPORT V AS Verdict TRUTH \"{{ e }}\" DETAIL\n",
+            "every order serializes the same way"
+        );
+
+        let flow = parse_flow("REPORT \"level of DETAIL\" AS Note\n").expect("parse");
+        assert!(
+            flow.column_details().is_empty(),
+            "the word inside the quoted template is just text"
+        );
+    }
+
+    /// The three trailing clauses are independent, so any order has to parse;
+    /// serialization then normalises them to one order.
+    #[test]
+    fn truth_parses_in_any_clause_order_and_normalises() {
+        for src in [
+            "REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) TRUTH \"{{ e }}\"\n",
+            "REPORT V AS Verdict TRUTH \"{{ e }}\" IMAGE(HEIGHT 60) STATISTICS(COUNT)\n",
+            "REPORT V AS Verdict IMAGE(HEIGHT 60) TRUTH \"{{ e }}\" STATISTICS(COUNT)\n",
+        ] {
+            let flow = parse_flow(src).expect("parse");
+            assert_eq!(
+                flow.column_truths().get("Verdict").map(String::as_str),
+                Some("{{ e }}"),
+                "{src}"
+            );
+            assert_eq!(
+                flow.to_text(),
+                "REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) TRUTH \"{{ e }}\"\n",
+                "every order serializes the same way"
+            );
+        }
+    }
+
+    /// The template is arbitrary text, so words that happen to be clause
+    /// keywords inside it must stay part of the value, and an escaped quote
+    /// must not end it early.
+    #[test]
+    fn truth_template_may_contain_clause_keywords_and_escaped_quotes() {
+        let flow = parse_flow("REPORT V AS Verdict TRUTH \"IMAGE STATISTICS\"\n").expect("parse");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("IMAGE STATISTICS"),
+            "keywords inside the quotes are just text"
+        );
+        assert!(
+            flow.column_images().is_empty(),
+            "no IMAGE clause was written"
+        );
+
+        let flow =
+            assert_round_trips("REPORT V AS Verdict TRUTH \"say \\\"hi\\\"\" STATISTICS(COUNT)\n");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("say \"hi\""),
+            "an escaped quote is part of the template"
+        );
+        assert_eq!(
+            flow.column_stats().get("Verdict"),
+            Some(&vec![StatKind::Count]),
+            "the clause after it is still found"
+        );
+    }
+
+    /// `TRUTH` needs a quoted argument; without one it is ordinary text, so the
+    /// user sees what they typed rather than losing it to a silent no-op.
+    #[test]
+    fn truth_without_a_quoted_argument_is_not_a_clause() {
+        let flow = parse_flow("REPORT V AS Verdict TRUTH pass\n");
+        assert!(
+            flow.is_err() || flow.unwrap().column_truths().is_empty(),
+            "an unquoted TRUTH never becomes a clause"
+        );
+        // A column whose name merely starts with the word is untouched.
+        let flow = parse_flow("REPORT V AS Truthy\n").expect("parse");
+        assert!(flow.column_truths().is_empty());
     }
 
     #[test]

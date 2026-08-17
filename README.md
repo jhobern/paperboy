@@ -229,10 +229,13 @@ What changes is how you interact with it:
 - **Selection, scrolling and the clipboard** use the platform's native
   handling; **collection tabs switch by clicking**; folders collapse/expand by
   clicking their header.
-- **The File menu is grouped by verb** (New / Open / Save / Import-Export)
-  rather than one flat list. There is no separate "Import Postman": **Open ▸
-  Collection** takes a Hurl `.hurl` file or a Postman `.json` export and works
-  out which it is. Every file dialog reopens in the folder you last used it in.
+- **The File menu is grouped by verb** (New / Import / Open / Save) rather than
+  one flat list. **File ▸ Import from Postman** has the two routes across:
+  *From an exported file (.json)…*, which needs nothing but the file and works
+  out by itself whether it holds a collection or an environment, and *From my
+  Postman account…*, which connects with an API key and brings whole workspaces
+  over. (**Open ▸ Collection** takes a Postman export too — it is the same
+  load.) Every file dialog reopens in the folder you last used it in.
 - **Workspaces can be grown from inside the app.** The workspace panel's **New**
   menu adds a collection, report or environment at the top of the tree, and
   right-clicking any row offers the same three inside *that* folder. Files (and
@@ -345,14 +348,11 @@ picked still highlighted.
 
 Notes on saving:
 
-- **Save** (Collection / Environment) writes back to the file the tab
-  was originally loaded from. If there are no new or modified entries, saving
-  is a no-op and no confirmation is shown (there's nothing to warn about).
-  If there *are* unsaved changes, you'll get a confirmation naming how many
-  new/modified requests (for a collection) or variables (for an environment)
-  will be written — the two counts are tracked and reported independently, so
-  saving a collection only ever mentions collection changes, and saving an
-  environment only ever mentions environment changes.
+- **Save** (Collection / Environment / Report) writes back to the file the tab
+  was originally loaded from, straight away and without a confirmation:
+  overwriting that file with your changes is exactly what Save means. Something
+  that has never been saved has no file to write back to, so Save becomes
+  Save As.
 - **Save As…** always prompts for a filename. If the chosen path already
   exists you'll be asked to confirm the overwrite (Yes/No) before anything is
   written.
@@ -597,6 +597,92 @@ up-to-date list. Highlights:
 | `F2`, `Ctrl+Enter` | Save the open editor / wizard |
 | `Esc` | Cancel |
 | `q`, `Ctrl+C` | Quit |
+
+## Importing a Postman workspace
+
+Bring a whole Postman workspace across at once, rather than exporting each
+collection by hand.
+
+If all you have is a file you already exported from Postman, none of this is
+needed: **File ▸ Import from Postman ▸ From an exported file (.json)…** opens it
+straight away — collection or environment, whichever it turns out to be — with
+no API key and no account.
+
+**In the app**, it's **File ▸ Import ▸ Postman account…** in the terminal UI and
+**File ▸ Import from Postman ▸ From my Postman account…** in the GUI — or, if
+you are already thinking in workspaces, **File ▸ Load ▸ Workspace ▸ From a
+Postman account…** (**Open ▸ Workspace ▸ …** in the GUI). Give it your API key and
+it lists the workspaces the key can see; pick one, choose what to bring across
+and where to put it, and the imported folder opens as a workspace.
+
+Because Postman rate-limits its API, the wizard shows you what it found and
+roughly how long the download will take *before* downloading anything, so
+backing out costs nothing. While it runs it shows a remaining time worked out
+from the rate it is actually achieving, and says so explicitly when it is
+pausing to stay inside the limit.
+
+If you already know the workspace, paste its id — or its address in Postman —
+into the optional field on the first step and the wizard skips the listing
+entirely.
+
+**From the command line**, the same import runs headlessly:
+
+```sh
+export POSTMAN_API_KEY='PMAK-…'
+
+# List the workspaces the key can see
+paperboy --postman-import
+
+# Download one into a folder you can open as a workspace
+paperboy --postman-import --postman-workspace 12ece9e1-… -o ~/API
+```
+
+The workspace may be given as its id or as its address in Postman, so the
+browser address bar can be pasted straight in. The result is a folder of
+`Collections/` and `Environments/` — open it with **Open ▸ Workspace**.
+
+- `--postman-key` supplies the key instead of `$POSTMAN_API_KEY`. It accepts the
+  same `{{ … }}` provider references as a `.vars` file, so the key needn't
+  appear in your shell history:
+  `--postman-key '{{ op://Private/Postman/credential }}'`. The key is never
+  written to disk, and is stripped from any error message.
+- `--postman-what collections|environments|all` limits what is downloaded.
+- `--postman-format hurl` converts on the way in: collections become `.hurl`
+  files and environments become `.vars` files, so the result owes nothing to
+  Postman. See **Converting to Hurl** below. The default, `postman`, keeps
+  Postman's own JSON byte for byte — PaperBoy opens that directly too.
+- `--overwrite` replaces an existing destination; without it, a destination that
+  exists and isn't empty is refused.
+- `--postman-base-url` points at a different tenant (EU Enterprise accounts use
+  `https://api.eu.postman.com`).
+
+A Postman API key carries its owner's own access — it can't be scoped — so a
+workspace missing from the list is one your Postman account isn't a member of.
+
+Postman rate-limits its API, so an import is paced deliberately and tells you
+up front roughly how long it will take; a large workspace takes a minute or two.
+
+### Converting to Hurl
+
+`--postman-format hurl` writes Hurl rather than Postman JSON. What comes across:
+
+- Requests, folders (as `Folder/Name` titles), headers, query parameters,
+  raw bodies and form/multipart fields.
+- **Auth, including inheritance.** Postman applies a collection's or folder's
+  auth to every request that doesn't set its own, and `noauth` on a request
+  opts back out; all three levels are resolved, so a collection that
+  authenticates once at the top doesn't import as an unauthenticated one.
+  `basic`, `bearer` and `apikey` (header or query) are mapped.
+- **Collection variables**, which have nowhere to live in a `.hurl` file, become
+  `<name> (collection variables).vars` alongside the environments — select it
+  like any other environment and `{{base}}` resolves.
+- `pm.<store>.set("NAME", body.a.b)` calls in a test script, as `[Captures]`.
+
+Hurl doesn't cover everything Postman does, so anything dropped — a
+pre-request script, an OAuth 2 block, a GraphQL body — is listed by request in
+`CONVERSION-NOTES.md` at the root of the imported folder. No notes file means
+nothing was lost. A collection this build can't read is written out as its
+original JSON instead, so converting can never cost you data.
 
 ## Headless CLI mode
 

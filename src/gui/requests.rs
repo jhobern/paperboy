@@ -142,7 +142,7 @@ fn render_node(
         let row = ui
             .push_id(("req_row", i), |ui| {
                 ui.horizontal(|ui| {
-                    super::widgets::method_badge(ui, &entry.method);
+                    super::widgets::method_badge(ui, theme, &entry.method);
                     let text = if is_sel {
                         RichText::new(&label).strong().color(theme.text)
                     } else {
@@ -224,6 +224,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.gui_delete,
         s.gui_edited_request,
     );
+    let (lbl_import, lbl_import_file, lbl_import_account, tip_import_file, tip_import_account) = (
+        s.gui_import_postman_button,
+        s.gui_menu_import_file,
+        s.gui_menu_import_account,
+        s.help_menu_import_file,
+        s.help_menu_import_account,
+    );
 
     // Header: collection name (truncates) + Run All / Add (always visible).
     let name = app.session.collections[ci].name.clone();
@@ -267,6 +274,29 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             if entries.is_empty() {
                 ui.add_space(8.0);
                 ui.colored_label(theme.dim, lbl_no_requests);
+                // The other way a first collection arrives. Someone coming from
+                // Postman meets this panel before they meet the File menu, and
+                // an empty list is exactly the moment "where are my requests?"
+                // is being asked.
+                ui.add_space(6.0);
+                ui.menu_button(lbl_import, |ui| {
+                    if ui
+                        .button(lbl_import_file)
+                        .on_hover_text(tip_import_file)
+                        .clicked()
+                    {
+                        super::menu::open_via_picker(app, super::app::OpenKind::PostmanExport);
+                        ui.close();
+                    }
+                    if ui
+                        .button(lbl_import_account)
+                        .on_hover_text(tip_import_account)
+                        .clicked()
+                    {
+                        app.postman.open();
+                        ui.close();
+                    }
+                });
                 return;
             }
             let tree = build_tree(entries);
@@ -345,11 +375,23 @@ enum WsAction {
         path: PathBuf,
         reveal: bool,
     },
+    /// Make a workspace environment file the active one, loading it first if it
+    /// isn't open yet — the whole point being to activate it without having to
+    /// open it and then find it again in the Environments panel.
+    ActivateEnv(PathBuf),
     /// Add a new collection/report/environment to the workspace, inside `dir`.
     NewItem {
         dir: PathBuf,
         kind: crate::workspace::NewItemKind,
     },
+    /// Discard a request's in-memory edits, restoring it from the collection's
+    /// on-disk file. Only offered for the loaded file's edited requests.
+    RevertRequest {
+        collection: PathBuf,
+        idx: usize,
+    },
+    /// Discard every in-memory edit to a workspace collection file.
+    RevertFile(PathBuf),
     /// Move a file or folder into another folder of the same workspace.
     MoveItem {
         src: PathBuf,
@@ -461,15 +503,20 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         )
     };
 
-    let (lbl_new, tip_new, lbl_in_folder, lbl_in_root) = {
+    let (lbl_new, tip_new, lbl_in_folder, lbl_in_root, lbl_set_active_env) = {
         let s = &app.strings;
         (
             s.gui_ws_new,
             s.gui_ws_new_tooltip,
             s.gui_ws_new_in_folder,
             s.gui_ws_new_in_root,
+            s.gui_ws_set_active_env,
         )
     };
+    let (lbl_revert_req, lbl_revert_file) = (
+        app.strings.gui_ws_revert_request,
+        app.strings.gui_ws_revert_file,
+    );
     let s_new = new_item_labels(&app.strings);
 
     let name = app.session.collections[ci].name.clone();
@@ -608,29 +655,51 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 open: *open,
                             });
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        // A file with edits only in memory can be put back to
+                        // what is on disk; a clean one has nothing to offer, so
+                        // the entry isn't shown at all rather than shown greyed.
+                        let edited_file = app.session.collections[ci].workspace_file_edited(path);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                if !edited_file {
+                                    return None;
+                                }
+                                let hit = ui.button(lbl_revert_file).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::RevertFile(path.clone()))
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
                     WsRow::Request {
                         collection,
                         idx,
                         name,
+                        method,
                         depth,
                         loaded,
                     } => {
                         let is_sel = *loaded
                             && loaded_path.as_deref() == Some(collection.as_path())
                             && *idx == selected_entry;
-                        // Method badge + run marker only for the loaded file's
-                        // rows (other collections are listed by name only).
-                        let (method, marker) = if *loaded {
+                        // The method is known for every listed request — which row
+                        // is the POST is the question the badge answers, and a
+                        // reader shouldn't have to open a file to ask it. The
+                        // run marker really is loaded-only: nothing else has
+                        // been run this session.
+                        let marker = if *loaded {
                             app.session.collections[ci]
                                 .entries
                                 .get(*idx)
-                                .map(|e| (Some(e.method.clone()), run_marker(e.last_run)))
-                                .unwrap_or((None, ("", true)))
+                                .map(|e| run_marker(e.last_run))
+                                .unwrap_or(("", true))
                         } else {
-                            (None, ("", true))
+                            ("", true)
                         };
                         // Unlike the method badge and the run marker, the edit
                         // pencil is shown for every collection's rows, not just
@@ -639,16 +708,16 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         // see (and save).
                         let edited =
                             app.session.collections[ci].workspace_request_edited(collection, *idx);
-                        // A stable per-request id namespace: the badge and
-                        // run marker only appear for the loaded collection, so
-                        // without it every row's ids shift the moment the tab
-                        // changes which file it holds (see `render_node`).
+                        // A stable per-request id namespace: the run marker
+                        // only appears for the loaded collection, so without it
+                        // every row's ids shift the moment the tab changes which
+                        // file it holds (see `render_node`).
                         let resp = ui
                             .push_id(("ws_req", collection, idx), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.add_space(*depth as f32 * WS_INDENT);
-                                    if let Some(m) = &method {
-                                        super::widgets::method_badge(ui, m);
+                                    if !method.is_empty() {
+                                        super::widgets::method_badge(ui, &theme, method);
                                     }
                                     let text = if is_sel {
                                         RichText::new(name).strong().color(theme.text)
@@ -697,12 +766,35 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 loaded: *loaded,
                             });
                         }
-                        ws_row_menu(
+                        // Only the loaded file's requests can be reverted one
+                        // at a time: another file's edits are parked as a whole,
+                        // with no on-disk entry to put back in place of a single
+                        // one of them (its file row reverts the lot). An *added*
+                        // request has no saved version either, so `modified` is
+                        // the test, not the pencil.
+                        let revertable = *loaded
+                            && loaded_path.as_deref() == Some(collection.as_path())
+                            && app.session.collections[ci]
+                                .entries
+                                .get(*idx)
+                                .is_some_and(|e| e.modified);
+                        ws_row_menu_with(
                             &resp,
                             sibling_dir(collection),
                             lbl_in_folder,
                             s_new,
                             &mut actions,
+                            |ui| {
+                                if !revertable {
+                                    return None;
+                                }
+                                let hit = ui.button(lbl_revert_req).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::RevertRequest {
+                                    collection: collection.clone(),
+                                    idx: *idx,
+                                })
+                            },
                         );
                     }
                     WsRow::Report { path, name, depth } => {
@@ -733,7 +825,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 reveal: resp.double_clicked(),
                             });
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let hit = ui.button(lbl_set_active_env).clicked();
+                                ui.separator();
+                                hit.then(|| WsAction::ActivateEnv(path.clone()))
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
                 }
@@ -753,14 +856,18 @@ fn sibling_dir(path: &std::path::Path) -> PathBuf {
     path.parent().unwrap_or(path).to_path_buf()
 }
 
-/// The three `New …` entries, shared by the header menu and every right-click
-/// menu so they can't drift apart. Returns the kind chosen, if any.
+/// The `New …` entries, shared by the header menu and every right-click menu so
+/// they can't drift apart. Returns the kind chosen, if any.
+///
+/// The folder entry sits below a separator: the other three make a file to work
+/// in, while a folder makes somewhere to put those files, which is a different
+/// enough intent to be worth the line.
 fn new_item_menu(
     ui: &mut egui::Ui,
-    labels: (&'static str, &'static str, &'static str),
+    labels: NewItemLabels,
 ) -> Option<crate::workspace::NewItemKind> {
     use crate::workspace::NewItemKind;
-    let (collection, report, env) = labels;
+    let (collection, report, env, folder) = labels;
     for (label, kind) in [
         (collection, NewItemKind::Collection),
         (report, NewItemKind::Report),
@@ -770,16 +877,24 @@ fn new_item_menu(
             return Some(kind);
         }
     }
+    ui.separator();
+    if ui.button(folder).clicked() {
+        return Some(NewItemKind::Folder);
+    }
     None
 }
 
+/// The `New …` menu labels: collection, report, environment, folder.
+type NewItemLabels = (&'static str, &'static str, &'static str, &'static str);
+
 /// The `New …` labels, pulled out of `Strings` once so the menu can be built
 /// while the tree is borrowed.
-fn new_item_labels(s: &crate::i18n::Strings) -> (&'static str, &'static str, &'static str) {
+fn new_item_labels(s: &crate::i18n::Strings) -> NewItemLabels {
     (
         s.gui_ws_new_collection,
         s.gui_ws_new_report,
         s.gui_ws_new_environment,
+        s.gui_ws_new_folder,
     )
 }
 
@@ -797,19 +912,68 @@ fn new_workspace_item(
     dir: &std::path::Path,
     kind: crate::workspace::NewItemKind,
 ) {
-    use crate::workspace::{NewItemError, NewItemKind};
+    use crate::workspace::NewItemKind;
 
-    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+    // Nothing to create into, so not even worth opening a dialog.
+    if app.session.collections[ci].workspace_root.is_none() {
         return;
-    };
+    }
+    // A folder is asked for by name rather than through the platform's save
+    // dialog, which is built around naming a *file* and would append an
+    // extension the folder must not have.
+    if kind == crate::workspace::NewItemKind::Folder {
+        app.dialog = Some(super::app::Dialog::Prompt {
+            kind: super::app::PromptKind::NewWorkspaceFolder {
+                ci,
+                dir: dir.to_path_buf(),
+            },
+            text: String::new(),
+        });
+        return;
+    }
     let s = &app.strings;
     let (title, default) = match kind {
         NewItemKind::Collection => (s.gui_ws_new_collection_title, "collection.hurl"),
         NewItemKind::Report => (s.gui_ws_new_report_title, "report.trail"),
         NewItemKind::Environment => (s.gui_ws_new_environment_title, "environment.vars"),
+        // Diverted to the name prompt above.
+        NewItemKind::Folder => return,
     };
     let ext = kind.extension();
-    let Some(chosen) = super::filepick::save_file(title, Some(dir), default, &[(ext, &[ext])])
+    app.request_pick(
+        super::filepick::PickKind::Save {
+            default_name: default.to_string(),
+            filters: super::filepick::owned_filters(&[(ext, &[ext])]),
+        },
+        title,
+        Some(dir),
+        super::menu::PickAction::NewWorkspaceItem { ci, kind },
+    );
+}
+
+/// Create the workspace item the save dialog named, frames later (see
+/// [`super::filepick`] for why the naming and the creating are separate).
+///
+/// The workspace root is re-read here rather than captured with the request:
+/// the collection could have been closed or repointed while the dialog was up,
+/// and creating a file under a root that is no longer open would be worse than
+/// doing nothing.
+pub(super) fn apply_new_workspace_item(
+    app: &mut GuiApp,
+    ci: usize,
+    kind: crate::workspace::NewItemKind,
+    picked: Option<std::path::PathBuf>,
+) {
+    use crate::workspace::{NewItemError, NewItemKind};
+
+    let Some(chosen) = picked else {
+        return; // cancelled
+    };
+    let Some(root) = app
+        .session
+        .collections
+        .get(ci)
+        .and_then(|c| c.workspace_root.clone())
     else {
         return;
     };
@@ -843,6 +1007,7 @@ fn new_workspace_item(
                     // A just-created environment is empty and worth showing.
                     reveal: true,
                 },
+                NewItemKind::Folder => return,
             };
             // The status is set first because opening may replace it with
             // something more specific, which is the more useful message.
@@ -851,6 +1016,47 @@ fn new_workspace_item(
             if app.session.status.is_none() {
                 app.session.status = created;
             }
+        }
+        Err(NewItemError::EmptyName) => {}
+        Err(NewItemError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+        }
+        Err(NewItemError::Exists(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemExists(what));
+        }
+        Err(NewItemError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+        }
+    }
+}
+
+/// Create a subfolder in a Workspace tab, from the name typed into the prompt.
+///
+/// Folders are what makes a workspace navigable once it holds more than a
+/// handful of files, and until now the tree could only ever show the folders
+/// that already existed on disk. The name goes through the same
+/// [`crate::workspace::create_item`] containment checks as a new file, so a
+/// name with `..` or an absolute path in it is refused rather than quietly
+/// creating a folder outside the workspace.
+pub(super) fn new_workspace_folder(app: &mut GuiApp, ci: usize, dir: &std::path::Path, name: &str) {
+    use crate::workspace::{NewItemError, NewItemKind};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    match crate::workspace::create_item(&root, dir, name, NewItemKind::Folder) {
+        Ok(path) => {
+            // Reveal *and* expand it. A new folder is empty, so without being
+            // opened it is an unremarkable closed row, and the next thing the
+            // user wants is to drag something into it.
+            reveal_in_tree(app, ci, &path, &root);
+            app.session.collections[ci]
+                .workspace_expanded
+                .insert(path.clone());
+            app.session.status = Some(crate::i18n::Status::WsItemCreated(
+                crate::workspace::display_name(&root, &path),
+            ));
+            app.session.save();
         }
         Err(NewItemError::EmptyName) => {}
         Err(NewItemError::Escapes(what)) => {
@@ -1013,10 +1219,30 @@ fn ws_row_menu(
     resp: &egui::Response,
     dir: PathBuf,
     header: &'static str,
-    labels: (&'static str, &'static str, &'static str),
+    labels: NewItemLabels,
     actions: &mut Vec<WsAction>,
 ) {
+    ws_row_menu_with(resp, dir, header, labels, actions, |_| None);
+}
+
+/// [`ws_row_menu`] plus row-specific entries above the shared "New …" ones.
+///
+/// A row can only carry one context menu, so anything extra has to be built
+/// into the same closure rather than attached separately.
+fn ws_row_menu_with(
+    resp: &egui::Response,
+    dir: PathBuf,
+    header: &'static str,
+    labels: NewItemLabels,
+    actions: &mut Vec<WsAction>,
+    extra: impl FnOnce(&mut egui::Ui) -> Option<WsAction>,
+) {
     resp.context_menu(|ui| {
+        let mut extra = Some(extra);
+        if let Some(action) = extra.take().and_then(|f| f(ui)) {
+            actions.push(action);
+            ui.close();
+        }
         ui.label(header);
         ui.separator();
         if let Some(kind) = new_item_menu(ui, labels) {
@@ -1041,14 +1267,49 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             collection: path, ..
         }
         | WsAction::OpenReport(path)
-        | WsAction::OpenEnv { path, .. } => {
+        | WsAction::OpenEnv { path, .. }
+        | WsAction::ActivateEnv(path) => {
             app.session.collections[ci].workspace_selected = Some(path.clone());
         }
         // Opening or closing a folder isn't "working on" anything; a new or
         // moved file records itself once it is actually there.
-        WsAction::ToggleFolder(_) | WsAction::NewItem { .. } | WsAction::MoveItem { .. } => {}
+        // A revert isn't "working on" the file either — it undoes work — and
+        // the dialog it raises names its own target.
+        WsAction::ToggleFolder(_)
+        | WsAction::NewItem { .. }
+        | WsAction::MoveItem { .. }
+        | WsAction::RevertRequest { .. }
+        | WsAction::RevertFile(_) => {}
     }
     match action {
+        WsAction::RevertRequest { collection, idx } => {
+            let name = app.session.collections[ci]
+                .entries
+                .get(idx)
+                .map(|e| {
+                    let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                    if leaf.is_empty() { e.url.clone() } else { leaf }
+                })
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::RevertToSaved {
+                ci,
+                path: collection,
+                entry: Some(idx),
+                name,
+            });
+        }
+        WsAction::RevertFile(path) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::RevertToSaved {
+                ci,
+                path,
+                entry: None,
+                name,
+            });
+        }
         WsAction::ToggleFolder(p) => {
             let col = &mut app.session.collections[ci];
             if col.workspace_expanded.contains(&p) {
@@ -1068,7 +1329,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             } else {
                 app.session.load_workspace_file(ci, path);
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.focus = super::Focus::List;
             app.session.save();
         }
@@ -1091,7 +1352,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 col.sync_folder_to_selected();
                 col.invalidate_request_json();
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.focus = super::Focus::List;
             app.session.save();
         }
@@ -1108,7 +1369,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 let n = app.session.collections[ci].entries.len();
                 app.session.collections[ci].selected_entry = idx.min(n.saturating_sub(1));
             }
-            app.report_editor = None;
+            app.close_report_editor();
             app.session.save();
             app.run_active();
         }
@@ -1129,15 +1390,71 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             if reveal {
                 app.reveal_env = id;
             }
-            app.report_editor = None;
+            app.close_report_editor();
+            app.session.save();
+        }
+        // Activating a file that isn't open yet has to open it first. An
+        // already-open one is reused rather than loaded again, so activating
+        // twice can't leave two copies of the same file in the panel — and
+        // `set_active_env` is a toggle, so re-activating the active one turns
+        // substitution off, exactly as the Environments panel's button does.
+        WsAction::ActivateEnv(path) => {
+            let existing = app
+                .session
+                .global_envs
+                .iter()
+                .find(|e| e.path.as_deref() == Some(path.as_path()))
+                .map(|e| e.id);
+            let id = match existing {
+                Some(id) => Some(id),
+                None => app.session.open_workspace_environment(&path),
+            };
+            if id.is_some() {
+                // `set_active_env` is a toggle, so an already-active
+                // environment would be *deactivated* by it — not what "Set as
+                // active" asks for.
+                if app.session.active_env_id != id {
+                    app.session.set_active_env(id);
+                }
+                app.reveal_env = id;
+            }
             app.session.save();
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Right-clicking a workspace environment file offers making it the active
+    /// environment. The menu itself is egui-driven, so what's checked here is
+    /// the action it raises: loading the file if needed and activating it,
+    /// without the toggle behaviour that would *deactivate* an already-active
+    /// one.
+    #[test]
+    fn activating_a_workspace_environment_from_the_tree_loads_it_and_makes_it_active() {
+        let dir = ws_tmp("activate");
+        let env = dir.join("api/v1/dev.vars");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        apply_ws_action(&mut app, ci, WsAction::ActivateEnv(env.clone()));
+
+        assert_eq!(app.session.global_envs.len(), 1, "the file was loaded");
+        let id = app.session.global_envs[0].id;
+        assert_eq!(app.session.active_env_id, Some(id));
+        assert_eq!(app.reveal_env, Some(id), "and it is shown in the panel");
+
+        // Again: neither a second copy nor a deactivation.
+        apply_ws_action(&mut app, ci, WsAction::ActivateEnv(env));
+        assert_eq!(app.session.global_envs.len(), 1);
+        assert_eq!(app.session.active_env_id, Some(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Collect the text of every id-clash complaint egui painted this frame.
     ///
@@ -1177,7 +1494,7 @@ mod tests {
         // every row's width, and layout is exactly what decides whether two
         // widgets end up sharing an id at different rects.
         let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
         ctx.set_fonts(fonts);
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
@@ -1214,7 +1531,7 @@ mod tests {
     /// `state.json`. Set once and never unset: every test in this binary is
     /// better off writing to a scratch dir, and the environment is process-wide,
     /// so flipping it back mid-run would race the other test threads.
-    fn redirect_saved_state() {
+    pub(crate) fn redirect_saved_state() {
         static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         ONCE.get_or_init(|| {
             let dir =

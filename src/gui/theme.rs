@@ -121,17 +121,26 @@ impl GuiTheme {
         // style in place (we force our own colours, so dark/light are identical).
         ctx.all_styles_mut(|style| {
             style.visuals = visuals.clone();
-            style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 4.0);
+            // Deliberately tighter than egui's defaults. Generous padding makes
+            // controls read as large friendly buttons; a tool that professionals
+            // look at all day wants a denser grid, and the extra rows it buys
+            // are worth more than the air. Kept in one place so the whole app
+            // moves together rather than drifting control by control.
+            style.spacing.item_spacing = egui::vec2(5.0, 5.0);
+            style.spacing.button_padding = egui::vec2(7.0, 3.0);
         });
     }
 }
 
 /// The badge colour for an HTTP method, from the shared `hurl::method_rgb`
 /// table (so GET/POST/… colours match the terminal UI exactly).
-pub fn method_color(method: &str) -> Color32 {
+///
+/// A method the table has no colour for (a custom verb) falls back to the
+/// caller's `fallback` rather than a fixed grey, so every colour the GUI paints
+/// still comes from the active theme.
+pub fn method_color(method: &str, fallback: Color32) -> Color32 {
     match crate::hurl::method_rgb(method) {
         Some((r, g, b)) => Color32::from_rgb(r, g, b),
-        None => Color32::GRAY,
+        None => fallback,
     }
 }

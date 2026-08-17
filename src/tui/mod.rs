@@ -4,12 +4,15 @@
 //! Launched with `-r` / `--ratatui`.
 
 mod app;
+mod clipboard;
 mod draw;
 mod editor;
 mod git_save;
 mod input;
 mod line_editor;
+mod listscroll;
 mod new_request;
+mod postman;
 pub(crate) mod remote;
 // Shared with the GUI (`gui::report_editor`'s Source view) so a PaperTrail
 // script is coloured identically in both front-ends: it produces `ratatui`
@@ -60,6 +63,8 @@ pub fn run() -> io::Result<()> {
         app.poll_capture_updates();
         // Advance the remote-git wizard when a background op finishes.
         app.poll_git_updates();
+        // Advance the Postman bulk-import wizard when its worker reports in.
+        app.poll_postman_updates();
         // Advance a background Workspace-redownload attempt (see
         // `Overlay::WorkspaceReloadConfirm`/`WorkspaceReloadLoading`).
         app.poll_workspace_redownload_updates();

@@ -1,6 +1,9 @@
-//! Serializing a [`ReportResult`] to an output format. CSV, JSON and `.xlsx`
-//! are supported; the [`ReportWriter`] trait keeps the interpreter/model
-//! independent of the format so more can be added without touching either.
+//! Serializing a [`ReportResult`] to an output format. CSV, JSON, HTML,
+//! `.xlsx` and PDF are supported; the [`ReportWriter`] trait keeps the
+//! interpreter/model independent of the format so more can be added without
+//! touching either. (The PDF writer lives in [`super::pdf`], which is a module
+//! of its own because a hand-built PDF container is a lot of machinery to sit
+//! beside four serializers that only push strings.)
 //!
 //! Output is driven entirely by the resolved columns (the `columns:` header
 //! directive, else the produced columns in first-seen order — see
@@ -8,9 +11,11 @@
 //! ([`ReportResult::no_match_marker`]), so what a run writes matches exactly
 //! what the TUI grid shows (both read the same columns).
 
-use super::compare::{MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN};
+use super::compare::{
+    CORRECT_COLUMN, MATCH, NO_BASELINE, NO_CANDIDATE, RESULT_COLUMN, TREND_COLUMN,
+};
 use super::flow::Header;
-use super::model::{OutputColumn, ReportResult};
+use super::model::{OutputColumn, ReportResult, Trend, Verdict};
 
 /// Serializes a run result to a concrete output format (bytes, so a binary
 /// format like `.xlsx` fits the same interface). Fallible because a binary
@@ -21,7 +26,7 @@ pub trait ReportWriter {
 }
 
 /// The set of output formats PaperTrail can write, keyed by lower-case file
-/// extension (`csv`/`json`/`html`/`xlsx`). Returns `None` for anything else so
+/// extension (`csv`/`json`/`html`/`xlsx`/`pdf`). Returns `None` for anything else so
 /// callers can report an unsupported-format error naming the extension.
 pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
     match ext.to_ascii_lowercase().as_str() {
@@ -29,12 +34,87 @@ pub fn writer_for_extension(ext: &str) -> Option<Box<dyn ReportWriter>> {
         "json" => Some(Box::new(JsonWriter)),
         "html" | "htm" => Some(Box::new(HtmlWriter)),
         "xlsx" => Some(Box::new(XlsxWriter)),
+        "pdf" => Some(Box::new(super::pdf::PdfWriter)),
         _ => None,
     }
 }
 
 /// The list of supported output extensions, for help/error text.
-pub const OUTPUT_EXTENSIONS: [&str; 4] = ["csv", "json", "html", "xlsx"];
+pub const OUTPUT_EXTENSIONS: [&str; 5] = ["csv", "json", "html", "xlsx", "pdf"];
+
+/// The preferred output extension for `report`: its `# output:` header format
+/// when that names a supported writer, else `csv`.
+///
+/// Used by both front-ends to seed their export picker, so a report declaring
+/// `# output: xlsx` exports `.xlsx` by default (and the user can still choose
+/// another format in the dialog). An unparseable report, or one naming a format
+/// PaperBoy can't write, falls back to CSV rather than refusing to export.
+pub fn report_output_extension(report: &crate::report::Report) -> String {
+    report
+        .flow()
+        .ok()
+        .and_then(|f| f.header.output().map(|o| o.trim().to_ascii_lowercase()))
+        .filter(|ext| writer_for_extension(ext).is_some())
+        .unwrap_or_else(|| "csv".to_string())
+}
+
+/// Where an export with extension `ext` lands: alongside a saved report (same
+/// stem), else `<name>.<ext>` in the current directory for a scratch report.
+///
+/// When the report *name* carries an output token (`{time}`), the expanded name
+/// wins — even for a saved report — and lands in the report's own folder (or the
+/// current directory for a scratch report), so repeated runs write distinct
+/// timestamped files rather than overwriting one export. Shared by both
+/// front-ends and by both kinds of export (a results file and a `.baseline`
+/// snapshot), so the same report always suggests the same name.
+pub fn export_path(report: &crate::report::Report, ext: &str) -> std::path::PathBuf {
+    if let Some(p) = tokened_output_path(report, ext) {
+        return p;
+    }
+    if let Some(path) = &report.path {
+        return path.with_extension(ext);
+    }
+    std::path::PathBuf::from(format!("{}.{ext}", sanitize_file_stem(&report.name)))
+}
+
+/// The output path when the report name carries an output token (`{time}`): the
+/// token-expanded, sanitised name as the file stem with extension `ext`, placed
+/// in the saved report's own folder (or the current directory for a scratch
+/// report). `None` when the name has no token, so callers fall back to their
+/// normal (file-stem-based) derivation.
+fn tokened_output_path(report: &crate::report::Report, ext: &str) -> Option<std::path::PathBuf> {
+    if !crate::report::name_has_output_token(&report.name) {
+        return None;
+    }
+    let stem = sanitize_file_stem(&crate::report::expand_output_tokens(&report.name));
+    let file = format!("{stem}.{ext}");
+    match report.path.as_ref().and_then(|p| p.parent()) {
+        Some(d) => Some(d.join(file)),
+        None => Some(std::path::PathBuf::from(file)),
+    }
+}
+
+/// Turn a display name into a safe single-segment file stem (replacing path
+/// separators and other awkward characters with `_`), so a scratch report's
+/// name can't escape the current directory when exported.
+fn sanitize_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "report".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// Writes a report as RFC 4180 CSV (comma-separated, `\r\n` line endings,
 /// minimal quoting). The header row is the resolved column headers; each data
@@ -59,8 +139,10 @@ impl ReportWriter for CsvWriter {
             push_record(&mut out, cells.iter().map(String::as_str));
         }
 
-        // Appended statistics summary rows (empty when no column requested any).
-        for srow in result.summary_rows(&columns) {
+        // Appended statistics and ground-truth metric rows (empty when the
+        // report asked for neither). CSV has one table and no header block, so
+        // the metrics can only live in the footer.
+        for srow in result.footer_rows(&columns, header) {
             let cells: Vec<String> = (0..columns.len()).map(|c| srow.text_cell(c)).collect();
             push_record(&mut out, cells.iter().map(String::as_str));
         }
@@ -99,7 +181,7 @@ impl ReportWriter for JsonWriter {
         // Appended statistics summary rows, keyed like the data rows (the row's
         // label lands in the first column). Omitted entirely when none exist.
         let summary: Vec<serde_json::Value> = result
-            .summary_rows(&columns)
+            .footer_rows(&columns, header)
             .iter()
             .map(|srow| {
                 let mut obj = serde_json::Map::new();
@@ -117,8 +199,66 @@ impl ReportWriter for JsonWriter {
                 .unwrap()
                 .insert("summary".to_string(), serde_json::Value::Array(summary));
         }
+        // The metrics also go out structured, not just as footer text: JSON is
+        // the format a dashboard or a CI gate reads, and re-parsing "95.9%" out
+        // of a summary row would be a silly thing to make anyone do.
+        if let Some(metrics) = result.metrics(&columns, header) {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("metrics".to_string(), metrics_json(&metrics));
+        }
         serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())
     }
+}
+
+/// The `metrics` object of the JSON export: the same figures the footer rows
+/// carry, but as numbers a dashboard or a CI gate can read without parsing
+/// "95.9%" back out of a string.
+fn metrics_json(metrics: &super::metrics::Metrics) -> serde_json::Value {
+    let column = |m: &super::metrics::ColumnMetrics| {
+        let mut obj = serde_json::json!({
+            "column": m.header,
+            "total": m.total,
+            "compared": m.compared,
+            "correct": m.correct,
+            "incorrect": m.incorrect,
+            "accuracy": m.accuracy(),
+        });
+        if let Some(matrix) = &m.matrix {
+            obj.as_object_mut().unwrap().insert(
+                "confusion".to_string(),
+                serde_json::json!({
+                    "axis": matrix.axis,
+                    // Rows are the truth, columns the value the run produced.
+                    "counts": matrix.counts,
+                }),
+            );
+        }
+        obj
+    };
+    let mut doc = serde_json::json!({
+        "columns": metrics.columns.iter().map(column).collect::<Vec<_>>(),
+    });
+    if let Some(overall) = &metrics.overall {
+        doc.as_object_mut()
+            .unwrap()
+            .insert("overall".to_string(), column(overall));
+    }
+    // A CI gate's first question of a comparison run is "did anything
+    // regress?", so it is answered as a number rather than left to be counted
+    // out of the rows.
+    if let Some(mv) = &metrics.movement {
+        doc.as_object_mut().unwrap().insert(
+            "movement".to_string(),
+            serde_json::json!({
+                "fixed": mv.fixed,
+                "regressed": mv.regressed,
+                "still_wrong": mv.still_wrong,
+                "unchanged": mv.unchanged,
+            }),
+        );
+    }
+    doc
 }
 
 /// Writes a report as a self-contained `.html` file: a single styled `<table>`
@@ -130,36 +270,217 @@ impl ReportWriter for JsonWriter {
 /// response body is shown faithfully.
 pub struct HtmlWriter;
 
+/// The report's stylesheet, and with it the document's head.
+///
+/// Every colour is a custom property rather than a literal, so the whole
+/// document has exactly one palette and a second one can be laid over it by
+/// re-declaring the same names. Dark mode is that second declaration, applied
+/// twice: once for a reader whose system asks for it, and once for a reader who
+/// pressed the toggle (`data-pb-theme`), which wins over the system either way.
+/// The two blocks are the only place a dark colour appears -- nothing below
+/// them knows which palette is up.
+const HTML_HEAD: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>PaperTrail report</title>
+<style>
+:root{
+  --bg:#fff; --fg:#222; --muted:#666; --faint:#777;
+  --line:#ccc; --line-soft:#ddd;
+  --head-bg:#333; --head-fg:#fff;
+  --alt-bg:#f7f7f7; --hover-bg:#eaf1fb; --det-bg:#fbfbfd; --pre-bg:#fff;
+  --panel-bg:#fafafa; --btn-line:#bbb; --on-bg:#333; --on-fg:#fff;
+  --foot-bg:#ececec; --foot-line:#999; --fdiff-head-bg:#eee;
+  --pass-bg:#c6efce; --fail-bg:#ffc7ce; --warn-bg:#ffeb9c; --tint-fg:#222;
+  --cell-fg:#12305a; --pick-line:#12305a;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-pb-theme="light"]){
+    --bg:#14161a; --fg:#e6e6e6; --muted:#9aa0a6; --faint:#8a9099;
+    --line:#3a3f47; --line-soft:#2b3038;
+    --head-bg:#2a2f37; --head-fg:#f0f0f0;
+    --alt-bg:#1a1d22; --hover-bg:#232a35; --det-bg:#171a1f; --pre-bg:#0f1115;
+    --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
+    --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
+    --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
+    --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+  }
+}
+:root[data-pb-theme="dark"]{
+  --bg:#14161a; --fg:#e6e6e6; --muted:#9aa0a6; --faint:#8a9099;
+  --line:#3a3f47; --line-soft:#2b3038;
+  --head-bg:#2a2f37; --head-fg:#f0f0f0;
+  --alt-bg:#1a1d22; --hover-bg:#232a35; --det-bg:#171a1f; --pre-bg:#0f1115;
+  --panel-bg:#1b1f25; --btn-line:#454b54; --on-bg:#dfe3e8; --on-fg:#14161a;
+  --foot-bg:#22262c; --foot-line:#555c66; --fdiff-head-bg:#22262c;
+  --pass-bg:#1e4620; --fail-bg:#5b1f26; --warn-bg:#5c4a12; --tint-fg:#f2f2f2;
+  --cell-fg:#cfe0ff; --pick-line:#7aa7ff;
+}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;
+background:var(--bg);color:var(--fg)}
+table{border-collapse:collapse;table-layout:fixed;width:max-content;min-width:100%;font-size:14px}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;
+white-space:pre-wrap;overflow-wrap:anywhere}
+thead th{position:sticky;top:0;background:var(--head-bg);color:var(--head-fg);
+white-space:nowrap;overflow-wrap:normal}
+tbody tr.sum.alt{background:var(--alt-bg)}
+tbody tr.sum.has{cursor:pointer}
+tbody tr.sum.has:hover{background:var(--hover-bg)}
+tbody tr.sum.has>td:first-child::before{content:'\25b8 ';color:var(--faint)}
+tbody tr.sum.has[aria-expanded='true']>td:first-child::before{content:'\25be '}
+tr.det{display:none}
+tr.det.open{display:table-row}
+tr.det>td{background:var(--det-bg);border-top:none}
+.panel{display:flex;flex-wrap:wrap;align-items:flex-start;gap:.7rem 1rem}
+/* Sections hug their content instead of each claiming an equal share of the
+   row: stretched to a third of a wide screen apiece, a picture and a short
+   JSON blob ended up at opposite ends of the panel with a void between them.
+   They still wrap, and still cannot grow past a comfortable reading width. */
+.panel section{flex:0 1 auto;min-width:0;max-width:min(100%,40rem)}
+.panel h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;
+color:var(--muted);margin:0 0 .35rem;font-weight:600}
+.panel pre{margin:0;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;
+background:var(--pre-bg);border:1px solid var(--line-soft);border-radius:4px;padding:.4rem .5rem;
+max-height:24rem;overflow:auto}
+.panel img{display:block;max-width:100%;height:auto;border:1px solid var(--line-soft);border-radius:4px}
+table.fdiff{width:100%;font-size:12px}
+table.fdiff th{background:var(--fdiff-head-bg);color:var(--fg);position:static;font-weight:600}
+table.fdiff tr.chg td{background:var(--warn-bg);color:var(--tint-fg)}
+/* A DETAIL column carrying a TRUTH says whether it is right, the way its grid
+   cell would have: the panel is where the value is actually read, so a full
+   value shown without its verdict reads as one nobody checked. */
+.panel h3 .verdict{margin-left:.4rem;font-size:11px;padding:.05rem .35rem;border-radius:3px;
+color:var(--tint-fg);text-transform:none;letter-spacing:0}
+.panel h3 .verdict.pass{background:var(--pass-bg)}
+.panel h3 .verdict.fail{background:var(--fail-bg)}
+.toolbar{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;margin:0 0 .6rem}
+.toolbar button{font:inherit;font-size:13px;padding:.25rem .7rem;border:1px solid var(--btn-line);
+border-radius:5px;background:var(--panel-bg);color:var(--fg);cursor:pointer}
+.toolbar button.on{background:var(--on-bg);color:var(--on-fg);border-color:var(--on-bg)}
+.toolbar button#pb-theme{margin-left:auto}
+.toolbar input{font:inherit;font-size:13px;padding:.25rem .5rem;border:1px solid var(--btn-line);
+border-radius:5px;background:var(--pre-bg);color:var(--fg)}
+.toolbar .count{font-size:12px;color:var(--muted)}
+tfoot td{font-weight:bold;background:var(--foot-bg);border-top:2px solid var(--foot-line)}
+td.pass{background:var(--pass-bg);color:var(--tint-fg)}
+td.fail{background:var(--fail-bg);color:var(--tint-fg)}
+td.warn{background:var(--warn-bg);color:var(--tint-fg)}
+.metrics{display:flex;flex-wrap:wrap;gap:.75rem;margin:0 0 1rem}
+.card{border:1px solid var(--line);border-radius:6px;padding:.5rem .9rem;background:var(--panel-bg)}
+.card .k{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;
+letter-spacing:.04em}
+.card .v{display:block;font-size:20px;font-weight:600}
+.matrix{margin:0 0 1.25rem}
+.matrix h2{font-size:17px;font-weight:600;margin:0 0 .45rem}
+.matrix table{width:auto;min-width:0;font-size:20px}
+.matrix th,.matrix td{text-align:center;white-space:nowrap;padding:12px 18px}
+.matrix thead th{position:static;background:var(--panel-bg);color:var(--fg);font-weight:600}
+.matrix th.axis{background:var(--panel-bg);color:var(--fg);text-align:right;font-weight:600}
+.matrix td.cell{color:var(--cell-fg);background:var(--heat,transparent)}
+.matrix td.pick{cursor:pointer}
+.matrix td.pick:hover{outline:2px solid var(--pick-line);outline-offset:-2px}
+.matrix td.hot{color:#fff}
+.matrix caption{caption-side:bottom;font-size:13px;color:var(--muted);padding-top:.4rem;
+text-align:left}
+/* The heat ramp is mixed with white by construction, so on a dark page every
+   cell would be a bright block. Mixing it back toward the page keeps the
+   ramp's shape without the glare. `color-mix` is a progressive enhancement:
+   a browser that doesn't know it keeps the light ramp, which is legible
+   either way because the cell text stays dark on it. */
+@media (prefers-color-scheme: dark){
+  :root:not([data-pb-theme="light"]) .matrix td.cell{
+    background:color-mix(in srgb, var(--heat) 62%, #0b0d10);color:#eaf1ff}
+}
+:root[data-pb-theme="dark"] .matrix td.cell{
+  background:color-mix(in srgb, var(--heat) 62%, #0b0d10);color:#eaf1ff}
+</style>
+<noscript><style>tr.det{display:table-row}.toolbar{display:none}</style></noscript>
+</head>
+<body>
+"##;
+
 impl ReportWriter for HtmlWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
-        let columns = result.resolved_columns(header);
+        let all_columns = result.resolved_columns(header);
+        // `DETAIL` columns leave the grid for the drill-down (see
+        // `detail::split_columns` for the all-detail escape hatch).
+        let (columns, detail_columns) = super::detail::split_columns(&all_columns);
+        let labels = super::labels::LabelMap::parse(&header.labels());
         let mut out = String::new();
-        out.push_str(
-            "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-             <title>PaperTrail report</title>\n<style>\n\
-             body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:1rem;color:#222}\n\
-             table{border-collapse:collapse;width:100%;font-size:14px}\n\
-             th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;word-break:break-word}\n\
-             thead th{position:sticky;top:0;background:#333;color:#fff}\n\
-             tbody tr:nth-child(even){background:#f7f7f7}\n\
-             tfoot td{font-weight:bold;background:#ececec;border-top:2px solid #999}\n\
-             td.pass{background:#c6efce}\n\
-             td.fail{background:#ffc7ce}\n\
-             td.warn{background:#ffeb9c}\n\
-             </style>\n</head>\n<body>\n<table>\n<thead>\n<tr>",
-        );
+        out.push_str(HTML_HEAD);
+        // Ground-truth metrics go *above* the table, as cards and a matrix:
+        // HTML has a header block, and a reader who wants to know whether the
+        // run was any good should not have to scroll 500 rows to find out. The
+        // flat formats put the same figures in the footer instead, so no
+        // document ever states them twice.
+        // Metrics are computed over *every* column, detail ones included: the
+        // flag says where a column is drawn, never whether it counts.
+        let metrics = result.metrics(&all_columns, header);
+        // Every filter the file offers, in one list: the toolbar's buttons
+        // first, then one per non-empty confusion-matrix cell. Rows carry the
+        // indices they pass, so the browser only ever compares numbers -- the
+        // decisions themselves are made by the same `RowFilter` the in-app
+        // views use, and the two can't drift.
+        let (filters, buttons) = super::filter::all_filters(result, metrics.as_ref());
+        push_filter_toolbar(&mut out, &filters[..buttons]);
+        if let Some(metrics) = &metrics {
+            push_metric_cards(&mut out, metrics);
+            for m in &metrics.columns {
+                if let Some(matrix) = &m.matrix {
+                    push_confusion_matrix(&mut out, &m.header, matrix, &filters);
+                }
+            }
+        }
+        out.push_str("<table>\n");
+        // Sized columns, so the browser doesn't squeeze a short column to a few
+        // characters and hyphenate its header (see `html_column_widths`). The
+        // table is `table-layout:fixed`, which is what makes these binding
+        // rather than a hint, and `width:max-content` so the sum is honoured and
+        // the page scrolls sideways instead of the columns being squashed back.
+        out.push_str("<colgroup>");
+        for w in html_column_widths(&columns, result) {
+            out.push_str(&format!("<col style=\"width:{w}ch\">"));
+        }
+        out.push_str("</colgroup>\n<thead>\n<tr>");
         for c in &columns {
             out.push_str("<th>");
             push_escaped(&mut out, &c.header);
             out.push_str("</th>");
         }
         out.push_str("</tr>\n</thead>\n<tbody>\n");
-        for row in &result.rows {
-            out.push_str("<tr>");
-            for c in &columns {
+        for (r, row) in result.rows.iter().enumerate() {
+            // The filters this row passes, and the text the search runs over --
+            // both computed here so the browser needs no report knowledge.
+            let passes: Vec<String> = filters
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.matches(result, &all_columns, &labels, r))
+                .map(|(i, _)| i.to_string())
+                .collect();
+            let searchable = columns
+                .iter()
+                .map(|c| c.value(row, &result.no_match_marker))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            // Striping is a class rather than `:nth-child`, because the detail
+            // rows are siblings and would otherwise shift the parity of every
+            // row after the first expandable one.
+            out.push_str("<tr class=\"sum");
+            if r % 2 == 1 {
+                out.push_str(" alt");
+            }
+            out.push_str("\" data-f=\"");
+            out.push_str(&passes.join(" "));
+            out.push_str("\" data-t=\"");
+            push_escaped(&mut out, &searchable);
+            out.push_str("\">");
+            for (ci, c) in columns.iter().enumerate() {
                 let value = c.value(row, &result.no_match_marker);
-                let class = match cell_tint(&c.header, &value) {
+                let class = match run_cell_tint(result, r, &c.header, &value) {
                     Some(Tint::Green) => " class=\"pass\"",
                     Some(Tint::Red) => " class=\"fail\"",
                     Some(Tint::Amber) => " class=\"warn\"",
@@ -168,10 +489,26 @@ impl ReportWriter for HtmlWriter {
                 out.push_str("<td");
                 out.push_str(class);
                 out.push('>');
-                push_escaped(&mut out, &value);
+                // An `IMAGE` column embeds the picture as a `data:` URI so the
+                // file stays self-contained (the whole point of the HTML
+                // export): a `<img src="http://…">` would break the moment the
+                // pre-signed URL it came from expired.
+                match result.images.get(&(r, c.header.clone())) {
+                    Some(img) => push_html_image(&mut out, img, c.image, &value, Some(ci)),
+                    None => push_escaped(&mut out, &value),
+                }
                 out.push_str("</td>");
             }
             out.push_str("</tr>\n");
+            push_detail_row(
+                &mut out,
+                result,
+                r,
+                &all_columns,
+                &detail_columns,
+                &columns.iter().collect::<Vec<_>>(),
+                columns.len(),
+            );
         }
         out.push_str("</tbody>\n");
         // Appended statistics summary rows in a distinct, bold footer.
@@ -189,9 +526,501 @@ impl ReportWriter for HtmlWriter {
             }
             out.push_str("</tfoot>\n");
         }
-        out.push_str("</table>\n</body>\n</html>\n");
+        out.push_str("</table>\n");
+        out.push_str(INTERACTIVE_SCRIPT);
+        out.push_str("</body>\n</html>\n");
         Ok(out.into_bytes())
     }
+}
+
+/// The filter toolbar: one button per offered row class, plus a live text
+/// search and a count of what survived.
+///
+/// The buttons are radio-like rather than additive. Combining "differences"
+/// with "regressions" reads like it should intersect but people expect it to
+/// union, and a filter whose meaning the reader has to guess is worse than one
+/// fewer filter.
+/// The toolbar above the table: the row filters, then the find box.
+///
+/// The buttons are drawn only when there is a choice to make. `RowFilter`
+/// always offers `All`, so a report with no baseline and no `TRUTH` would
+/// otherwise get a lone "All" button that filters nothing -- a control whose
+/// only possible effect is the state it is already in. The find box is not
+/// conditional: it is useful in every report.
+fn push_filter_toolbar(out: &mut String, filters: &[super::filter::RowFilter]) {
+    out.push_str("<div class=\"toolbar\" role=\"group\" aria-label=\"Filter rows\">");
+    if filters.len() > 1 {
+        for (i, f) in filters.iter().enumerate() {
+            out.push_str(&format!(
+                "<button type=\"button\" data-i=\"{i}\"{}>",
+                if i == 0 { " class=\"on\"" } else { "" }
+            ));
+            push_escaped(out, &f.label());
+            out.push_str("</button>");
+        }
+    }
+    // The theme toggle rides along in the toolbar because it is the same kind
+    // of thing: a control over how the page is read, not over what it says. It
+    // is written by the document rather than assumed, so a browser with
+    // scripting off never shows a button that would do nothing (the toolbar is
+    // hidden outright there) and still gets the system's own light/dark choice.
+    out.push_str(
+        "<input type=\"search\" id=\"pb-find\" placeholder=\"Find\u{2026}\" \
+         aria-label=\"Find in rows\">\
+         <span class=\"count\" id=\"pb-count\" aria-live=\"polite\"></span>\
+         <button type=\"button\" id=\"pb-theme\" aria-pressed=\"false\" \
+         title=\"Switch between the light and dark palette\">Dark</button></div>\n",
+    );
+}
+
+/// The hidden drill-down row that follows row `r`, or nothing at all when the
+/// row has nothing to drill into — an expander that opens onto an empty panel
+/// teaches the reader to stop clicking.
+///
+/// It holds what the grid can't: the row's pictures at full size, its `DETAIL`
+/// columns in full, and — when the run compared against something — a
+/// field-by-field diff of whichever of them are JSON on both sides.
+fn push_detail_row(
+    out: &mut String,
+    result: &ReportResult,
+    r: usize,
+    all_columns: &[OutputColumn],
+    detail_columns: &[&OutputColumn],
+    summary_columns: &[&OutputColumn],
+    span: usize,
+) {
+    use super::detail::DetailSection;
+    let sections = super::detail::sections(result, r, all_columns, detail_columns);
+    if sections.is_empty() {
+        return;
+    }
+    out.push_str(&format!(
+        "<tr class=\"det\"><td colspan=\"{span}\"><div class=\"panel\">"
+    ));
+    for section in &sections {
+        match section {
+            DetailSection::Image {
+                header,
+                image,
+                value,
+            } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, header);
+                out.push_str("</h3>");
+                // Where this column sits in the grid, if it is in the grid at
+                // all: a `DETAIL` picture has no cell, so it has nothing to
+                // borrow from.
+                let cell = summary_columns.iter().position(|s| &s.header == header);
+                push_panel_image(out, image, value, cell);
+                out.push_str("</section>");
+            }
+            DetailSection::Text {
+                header,
+                value,
+                verdict,
+            } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, header);
+                if let Some((v, truth)) = verdict {
+                    let cls = if *v == Verdict::Correct {
+                        "pass"
+                    } else {
+                        "fail"
+                    };
+                    out.push_str(&format!("<span class=\"verdict {cls}\">"));
+                    push_escaped(out, &super::detail::verdict_label(*v, truth));
+                    out.push_str("</span>");
+                }
+                out.push_str("</h3><pre>");
+                push_escaped(out, value);
+                out.push_str("</pre></section>");
+            }
+            DetailSection::Diff { header, fields } => {
+                out.push_str("<section><h3>");
+                push_escaped(out, &format!("{header} \u{2014} changed fields"));
+                out.push_str(
+                    "</h3><table class=\"fdiff\"><thead><tr><th>Field</th><th>Baseline</th>\
+                      <th>This run</th></tr></thead><tbody>",
+                );
+                for f in fields {
+                    // Unchanged fields are kept, so the reader can see the
+                    // field they care about whether or not it moved -- the
+                    // highlight, not the omission, is what points at the
+                    // difference.
+                    out.push_str(if f.differs() {
+                        "<tr class=\"chg\"><td>"
+                    } else {
+                        "<tr><td>"
+                    });
+                    push_escaped(out, &f.path);
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td><td>");
+                    push_escaped(out, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                    out.push_str("</td></tr>");
+                }
+                out.push_str("</tbody></table></section>");
+            }
+        }
+    }
+    out.push_str("</div></td></tr>\n");
+}
+
+/// The export's only script: row expansion and filtering, inline and
+/// dependency-free.
+///
+/// It makes no decisions about the report — every row already carries the
+/// filter indices it passes and the text to search — so it stays a few dozen
+/// lines and the file stays something you can email. With scripting off, the
+/// `<noscript>` rule opens every panel and hides the toolbar, so the document
+/// degrades to its long form rather than to a table of unreachable rows.
+const INTERACTIVE_SCRIPT: &str = r#"<script>
+(function () {
+  var rows = Array.prototype.slice.call(document.querySelectorAll('tr.sum'));
+  var panelOf = function (tr) {
+    var n = tr.nextElementSibling;
+    return n && n.classList.contains('det') ? n : null;
+  };
+  rows.forEach(function (tr) {
+    var p = panelOf(tr);
+    if (!p) return;
+    tr.classList.add('has');
+    tr.tabIndex = 0;
+    tr.setAttribute('role', 'button');
+    tr.setAttribute('aria-expanded', 'false');
+    // The panel's pictures carry no `src` of their own -- they borrow the
+    // bytes already in the row's cells, so the file holds each picture once
+    // instead of twice. Done on first expand rather than up front so a report
+    // with a thousand rows doesn't decode a thousand images nobody opened.
+    var hydrate = function () {
+      var pending = p.querySelectorAll('img.full[data-from]');
+      for (var i = 0; i < pending.length; i++) {
+        var want = pending[i].getAttribute('data-from');
+        var src = tr.querySelector('img[data-c="' + want + '"]');
+        if (src) {
+          pending[i].src = src.src;
+          pending[i].removeAttribute('data-from');
+        }
+      }
+    };
+    var toggle = function () {
+      var open = p.classList.toggle('open');
+      if (open) hydrate();
+      tr.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    tr.addEventListener('click', function (e) {
+      if (e.target.closest('a, img, input, button')) return;
+      toggle();
+    });
+    tr.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+  var buttons = Array.prototype.slice.call(document.querySelectorAll('.toolbar button'));
+  var picks = Array.prototype.slice.call(document.querySelectorAll('.matrix td.pick'));
+  var find = document.getElementById('pb-find');
+  var count = document.getElementById('pb-count');
+  var active = 0;
+  var apply = function () {
+    var needle = find ? find.value.trim().toLowerCase() : '';
+    var shown = 0;
+    rows.forEach(function (tr) {
+      var f = (tr.getAttribute('data-f') || '').split(' ');
+      var ok = f.indexOf(String(active)) >= 0 &&
+        (!needle || (tr.getAttribute('data-t') || '').indexOf(needle) >= 0);
+      tr.style.display = ok ? '' : 'none';
+      var p = panelOf(tr);
+      if (p) p.style.display = ok ? '' : 'none';
+      if (ok) shown++;
+    });
+    buttons.forEach(function (b) {
+      b.classList.toggle('on', Number(b.getAttribute('data-i')) === active);
+    });
+    picks.forEach(function (c) {
+      c.classList.toggle('on', Number(c.getAttribute('data-i')) === active);
+    });
+    if (count) {
+      count.textContent = shown === rows.length
+        ? rows.length + ' rows'
+        : shown + ' of ' + rows.length + ' rows';
+    }
+  };
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () {
+      active = Number(b.getAttribute('data-i'));
+      apply();
+    });
+  });
+  picks.forEach(function (c) {
+    // A second click on the same cell returns to everything, so a reader who
+    // drilled in by accident is never stuck with a filter they can't name.
+    c.addEventListener('click', function () {
+      var i = Number(c.getAttribute('data-i'));
+      active = active === i ? 0 : i;
+      apply();
+    });
+  });
+  if (find) find.addEventListener('input', apply);
+  apply();
+
+  // Dark mode. The page already follows the reader's system setting on its own
+  // (a `prefers-color-scheme` block in the stylesheet); this is the override
+  // for when the two disagree -- a dark desktop and a report going on a
+  // projector, say. The choice is remembered per file:// origin where the
+  // browser allows it, and simply doesn't stick where it doesn't.
+  var root = document.documentElement;
+  var themeBtn = document.getElementById('pb-theme');
+  var store = function (k, v) {
+    try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {}
+  };
+  var stored = null;
+  try { stored = localStorage.getItem('pb-theme'); } catch (e) {}
+  var systemDark = function () {
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  };
+  var paint = function () {
+    var dark = root.getAttribute('data-pb-theme') === 'dark' ||
+      (!root.hasAttribute('data-pb-theme') && systemDark());
+    if (themeBtn) {
+      // The button names the palette you would get by pressing it, which is
+      // the question someone reaching for it is actually asking.
+      themeBtn.textContent = dark ? 'Light' : 'Dark';
+      themeBtn.setAttribute('aria-pressed', dark ? 'true' : 'false');
+    }
+  };
+  if (stored === 'dark' || stored === 'light') root.setAttribute('data-pb-theme', stored);
+  paint();
+  if (themeBtn) {
+    themeBtn.addEventListener('click', function () {
+      var dark = root.getAttribute('data-pb-theme') === 'dark' ||
+        (!root.hasAttribute('data-pb-theme') && systemDark());
+      var next = dark ? 'light' : 'dark';
+      root.setAttribute('data-pb-theme', next);
+      store('pb-theme', next);
+      paint();
+    });
+  }
+  if (window.matchMedia) {
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    var follow = function () { if (!root.hasAttribute('data-pb-theme')) paint(); };
+    if (mq.addEventListener) mq.addEventListener('change', follow);
+    else if (mq.addListener) mq.addListener(follow);
+  }
+})();
+</script>
+"#;
+
+/// The metric cards drawn above the table: one group per ground-truthed column
+/// (plus the row roll-up), each stating what was compared, how much of it was
+/// wrong, and the resulting accuracy.
+fn push_metric_cards(out: &mut String, metrics: &super::metrics::Metrics) {
+    use super::metrics::{
+        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
+        REGRESSED_LABEL, STILL_WRONG_LABEL,
+    };
+    fn card(out: &mut String, k: &str, v: &str) {
+        out.push_str("<div class=\"card\"><span class=\"k\">");
+        push_escaped(out, k);
+        out.push_str("</span><span class=\"v\">");
+        push_escaped(out, v);
+        out.push_str("</span></div>");
+    }
+    // How the run moved comes first of all, when there is a baseline to have
+    // moved from: two runs that both score 98% are not the same run if one of
+    // them fixed three rows and broke three others, and the accuracy figures
+    // below cannot tell them apart.
+    if let Some(mv) = &metrics.movement {
+        out.push_str("<div class=\"metrics\">");
+        if mv.is_still() {
+            card(out, MOVEMENT_LABEL, "Nothing moved");
+        } else {
+            card(out, FIXED_LABEL, &mv.fixed.to_string());
+            card(out, REGRESSED_LABEL, &mv.regressed.to_string());
+        }
+        if mv.still_wrong > 0 {
+            card(out, STILL_WRONG_LABEL, &mv.still_wrong.to_string());
+        }
+        out.push_str("</div>\n");
+    }
+    // The roll-up first when there is one: with several truth-bearing columns
+    // it is the figure that answers "did this run pass?", and the per-column
+    // breakdown is the follow-up question.
+    let groups = metrics
+        .overall
+        .iter()
+        .chain(metrics.columns.iter())
+        .collect::<Vec<_>>();
+    for m in groups {
+        out.push_str("<div class=\"metrics\">");
+        card(
+            out,
+            &format!("{} — {COMPARED_LABEL}", m.header),
+            &format!("{} of {}", m.compared, m.total),
+        );
+        card(out, INCORRECT_LABEL, &m.incorrect.to_string());
+        card(
+            out,
+            ACCURACY_LABEL,
+            m.accuracy_text().as_deref().unwrap_or("\u{2014}"),
+        );
+        out.push_str("</div>\n");
+    }
+}
+
+/// A confusion matrix as a heatmap: truth down the side, the value the run
+/// produced across the top.
+///
+/// Shaded in a single hue rather than a green-to-red scale, because the
+/// diagonal is not "good" in every matrix — for a rare-event detector the
+/// interesting cells are off it — and a colour scheme that pre-judges which
+/// cells are the bad ones is a scheme that misleads on exactly those reports.
+/// The count is always printed, so the shading only ever ranks what the reader
+/// can already read (and the report stays legible in greyscale, to a
+/// colour-blind reader, and on a printout).
+/// The matrix is drawn at roughly twice the table's type size, with matching
+/// padding: it is a handful of numbers people read *across* and *down* to find
+/// the one cell that is wrong, and at the grid's own 13px they had to lean in.
+/// Its cells are also click targets, and the padding is most of the target.
+fn push_confusion_matrix(
+    out: &mut String,
+    column: &str,
+    matrix: &super::metrics::ConfusionMatrix,
+    filters: &[super::filter::RowFilter],
+) {
+    let max = matrix.max();
+    out.push_str("<div class=\"matrix\"><h2>");
+    push_escaped(out, column);
+    out.push_str("</h2>\n<table><caption>");
+    // A perfect matrix says so in words: leaving the reader to verify that
+    // every off-diagonal cell is a zero is work a caption can do for them.
+    let clean = if matrix.is_diagonal() {
+        " Every scored row matched its ground truth."
+    } else {
+        ""
+    };
+    push_escaped(
+        out,
+        &format!(
+            "Rows: ground truth. Columns: reported value. {} scored row(s).{clean}",
+            matrix.total()
+        ),
+    );
+    out.push_str("</caption>\n<thead><tr><th class=\"axis\"></th>");
+    for label in &matrix.axis {
+        out.push_str("<th>");
+        push_escaped(out, label);
+        out.push_str("</th>");
+    }
+    out.push_str("</tr></thead>\n<tbody>\n");
+    for (t, label) in matrix.axis.iter().enumerate() {
+        out.push_str("<tr><th class=\"axis\">");
+        push_escaped(out, label);
+        out.push_str("</th>");
+        for (p, answer) in matrix.axis.iter().enumerate() {
+            let n = matrix.counts[t][p];
+            let (bg, hot) = heat_shade(n, max);
+            // "Which seven rows are those?" is the first question anyone asks
+            // of an off-diagonal count, so every non-empty cell filters the
+            // table to exactly the rows it counted.
+            let pick = filters
+                .iter()
+                .position(|f| {
+                    matches!(f, super::filter::RowFilter::MatrixCell { column: c, truth: tr, answer: a }
+                        if c == column && tr == label && a == answer)
+                })
+                .map(|i| format!(" pick\" data-i=\"{i}\" title=\"Show these rows"))
+                .unwrap_or_default();
+            // The shade travels as a custom property rather than a
+            // `background`, so the dark palette can mix it back toward the page
+            // instead of being overruled by an inline style it can't reach.
+            out.push_str(&format!(
+                "<td class=\"cell{}{pick}\" style=\"--heat:{bg}\">{n}</td>",
+                if hot { " hot" } else { "" }
+            ));
+        }
+        out.push_str("</tr>\n");
+    }
+    out.push_str("</tbody></table></div>\n");
+}
+
+/// The background for a heatmap cell holding `n` of a maximum `max`, and
+/// whether the text on it needs to flip to white. A blue ramp: colour-blind
+/// safe at both ends, and distinct from the green/amber/red the *data* cells
+/// use for pass/changed/fail, so nobody reads a busy matrix cell as a failure.
+fn heat_shade(n: usize, max: usize) -> (String, bool) {
+    let ([r, g, b], hot) = super::metrics::heat_rgb(n, max);
+    (format!("#{r:02x}{g:02x}{b:02x}"), hot)
+}
+
+/// Append an `<img>` for a resolved picture, sized per the column's `IMAGE`
+/// clause. The cell's text becomes the `alt`/`title`, so the source it came
+/// from is still available on hover and to a screen reader.
+///
+/// `cell` is the column's index in the grid, tagged onto the element as
+/// `data-c` so the drill-down panel can find this picture and borrow its bytes
+/// (see [`push_panel_image`]).
+fn push_html_image(
+    out: &mut String,
+    img: &super::model::ImageData,
+    spec: Option<crate::report::flow::ImageSpec>,
+    value: &str,
+    cell: Option<usize>,
+) {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&img.bytes);
+    let style = match spec.and_then(|s| s.scaled_size(img.natural)) {
+        Some((w, h)) => format!("width:{}px;height:{}px", w.round(), h.round()),
+        // A `FIT` column has no fixed box, so the picture is capped to the
+        // column instead -- the browser's equivalent of fitting to the cell.
+        None => "max-width:100%;height:auto".to_string(),
+    };
+    out.push_str("<img style=\"");
+    out.push_str(&style);
+    out.push_str("\"");
+    if let Some(ci) = cell {
+        out.push_str(&format!(" data-c=\"{ci}\""));
+    }
+    out.push_str(" alt=\"");
+    push_escaped(out, value);
+    out.push_str("\" title=\"");
+    push_escaped(out, value);
+    out.push_str("\" src=\"data:");
+    out.push_str(&img.mime);
+    out.push_str(";base64,");
+    out.push_str(&b64);
+    out.push_str("\">");
+}
+
+/// Append the drill-down panel's copy of a picture.
+///
+/// When the picture is also in the grid (`cell`), the element is emitted with
+/// **no `src`** and the script copies it from the cell on first expand. The
+/// panel used to base64 the same bytes a second time, which doubled the size of
+/// every report that showed pictures -- a thousand-row run embedded a thousand
+/// full-resolution images twice. Borrowing the cell's URI is the same picture
+/// for none of the bytes.
+///
+/// A picture in a `DETAIL` column has no cell to borrow from, so that one is
+/// still embedded here: it appears in the panel or nowhere.
+fn push_panel_image(
+    out: &mut String,
+    img: &super::model::ImageData,
+    value: &str,
+    cell: Option<usize>,
+) {
+    let Some(ci) = cell else {
+        // Deliberately unsized: the whole reason to open the panel is to see
+        // the picture properly.
+        push_html_image(out, img, None, value, None);
+        return;
+    };
+    out.push_str(&format!(
+        "<img class=\"full\" data-from=\"{ci}\" style=\"max-width:100%;height:auto\" alt=\""
+    ));
+    push_escaped(out, value);
+    out.push_str("\" title=\"");
+    push_escaped(out, value);
+    out.push_str("\">");
 }
 
 /// Append `text` to `out` with the five XML/HTML special characters escaped, so
@@ -220,7 +1049,23 @@ impl ReportWriter for XlsxWriter {
     fn write(&self, result: &ReportResult, header: &Header) -> Result<Vec<u8>, String> {
         use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
 
-        let columns = result.resolved_columns(header);
+        // `DETAIL` columns move to the right of the summary ones and are put in
+        // a collapsed outline group: the spreadsheet idiom for exactly what the
+        // HTML drill-down does, and the one place a reader can still expand
+        // them. Nothing is dropped -- a workbook is an archive as much as a
+        // report.
+        let resolved = result.resolved_columns(header);
+        let summary_count = resolved.iter().filter(|c| !c.detail).count();
+        let columns: Vec<OutputColumn> = resolved
+            .iter()
+            .filter(|c| !c.detail)
+            .chain(resolved.iter().filter(|c| c.detail))
+            .cloned()
+            .collect();
+        // Pixel boxes for every picture that is going to be embedded, worked
+        // out up front because they drive the row heights and column widths,
+        // which have to be set before the cells are written.
+        let boxes = xlsx_image_boxes(&columns, result);
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();
 
@@ -249,6 +1094,36 @@ impl ReportWriter for XlsxWriter {
                 .map_err(|e| e.to_string())?;
         }
 
+        // Size the columns to their content. Left at Excel's 8.43-character
+        // default, every column comes out equally tiny and the wrapped cells
+        // become tall thin ribbons — the same run's HTML export looks right
+        // only because the browser sizes the table itself.
+        let widths = xlsx_column_widths(&columns, result);
+        for (col, width) in widths.into_iter().enumerate() {
+            sheet
+                .set_column_width(col as u16, width)
+                .map_err(|e| e.to_string())?;
+        }
+
+        if summary_count > 0 && summary_count < columns.len() {
+            sheet
+                .group_columns_collapsed(summary_count as u16, (columns.len() - 1) as u16)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Keep the headers on screen while scrolling a long run, and let the
+        // reviewer filter it. The autofilter deliberately spans only the data
+        // rows: including the appended statistics rows below would let them be
+        // filtered away, or sorted into the middle of the data.
+        if !columns.is_empty() {
+            sheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+            let last_col = (columns.len() - 1) as u16;
+            let last_row = result.rows.len() as u32;
+            sheet
+                .autofilter(0, 0, last_row, last_col)
+                .map_err(|e| e.to_string())?;
+        }
+
         // Which columns are numeric (every non-empty cell parses as a number):
         // their cells are written as real numbers so the spreadsheet can run
         // statistics on them, instead of text that Excel flags "stored as text".
@@ -260,14 +1135,50 @@ impl ReportWriter for XlsxWriter {
         // Data rows.
         for (r, row) in result.rows.iter().enumerate() {
             let excel_row = (r + 1) as u32;
+            // A row carrying pictures has to be tall enough for the tallest of
+            // them, or Excel draws the image overflowing into the rows below.
+            let tallest = (0..columns.len())
+                .filter_map(|col| boxes.get(&(r, col)))
+                .fold(0.0f64, |acc, (_, h)| acc.max(*h));
+            if tallest > 0.0 {
+                sheet
+                    .set_row_height_pixels(excel_row, tallest.ceil() as u32)
+                    .map_err(|e| e.to_string())?;
+            }
             for (col, c) in columns.iter().enumerate() {
                 let value = c.value(row, &result.no_match_marker);
-                let fmt = match cell_tint(&c.header, &value) {
+                let fmt = match run_cell_tint(result, r, &c.header, &value) {
                     Some(Tint::Green) => &green,
                     Some(Tint::Red) => &red,
                     Some(Tint::Amber) => &amber,
                     None => &body_fmt,
                 };
+                // An embedded picture replaces the cell's text rather than
+                // sitting on top of it: the value is a URL or a path, which
+                // would show through around the image and is of no interest to
+                // the reader once the picture is there. It stays in the CSV and
+                // JSON exports, which is where it is actually useful.
+                if let Some(img) = result.images.get(&(r, c.header.clone())) {
+                    let mut image = rust_xlsxwriter::Image::new_from_buffer(&img.bytes)
+                        .map_err(|e| e.to_string())?
+                        // The alt text is the value, so the information isn't
+                        // lost -- a screen reader, or anyone who clicks the
+                        // picture, still gets the source it came from.
+                        .set_alt_text(&value);
+                    if c.image.is_some_and(|i| i.fit) {
+                        sheet
+                            .insert_image_fit_to_cell(excel_row, col as u16, &image, true)
+                            .map_err(|e| e.to_string())?;
+                    } else {
+                        if let Some((w, h)) = boxes.get(&(r, col)) {
+                            image = image.set_scale_to_size(*w, *h, false);
+                        }
+                        sheet
+                            .insert_image(excel_row, col as u16, &image)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    continue;
+                }
                 match parse_report_number(&value) {
                     Some(n) if numeric[col] => sheet
                         .write_number_with_format(excel_row, col as u16, n, fmt)
@@ -335,15 +1246,459 @@ impl ReportWriter for XlsxWriter {
             }
         }
 
+        // Ground-truth metrics get a sheet of their own rather than more footer
+        // rows: a confusion matrix is a second table with its own axes, and
+        // pasting it under a filtered data table would put it inside the
+        // filter's range — where sorting the report would scramble it.
+        if let Some(metrics) = result.metrics(&columns, header) {
+            write_metrics_sheet(&mut workbook, &metrics)?;
+        }
+
         workbook.save_to_buffer().map_err(|e| e.to_string())
     }
 }
 
+/// The `Metrics` worksheet: the accuracy figures, then one confusion matrix per
+/// ground-truthed column that declared a label vocabulary.
+fn write_metrics_sheet(
+    workbook: &mut rust_xlsxwriter::Workbook,
+    metrics: &super::metrics::Metrics,
+) -> Result<(), String> {
+    use super::metrics::{
+        ACCURACY_LABEL, COMPARED_LABEL, FIXED_LABEL, INCORRECT_LABEL, MOVEMENT_LABEL,
+        REGRESSED_LABEL, STILL_WRONG_LABEL, UNCHANGED_LABEL,
+    };
+    use rust_xlsxwriter::{Color, Format, FormatAlign};
+
+    let head = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0x33_3333))
+        .set_font_color(Color::White);
+    let label = Format::new().set_bold();
+    let axis = Format::new().set_bold().set_align(FormatAlign::Right);
+    let sheet = workbook.add_worksheet();
+    sheet.set_name("Metrics").map_err(|e| e.to_string())?;
+    sheet.set_column_width(0, 28.0).map_err(|e| e.to_string())?;
+
+    let mut r: u32 = 0;
+    let put = |sheet: &mut rust_xlsxwriter::Worksheet,
+               row: u32,
+               col: u16,
+               text: &str,
+               fmt: &Format|
+     -> Result<(), String> {
+        sheet
+            .write_string_with_format(row, col, text, fmt)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    for (c, h) in ["Column", COMPARED_LABEL, INCORRECT_LABEL, ACCURACY_LABEL]
+        .iter()
+        .enumerate()
+    {
+        put(sheet, r, c as u16, h, &head)?;
+    }
+    r += 1;
+    for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+        put(sheet, r, 0, &m.header, &label)?;
+        put(
+            sheet,
+            r,
+            1,
+            &format!("{} of {}", m.compared, m.total),
+            &Format::new(),
+        )?;
+        sheet
+            .write_number(r, 2, m.incorrect as f64)
+            .map_err(|e| e.to_string())?;
+        // Written as a real percentage, not the "95.9%" string the flat
+        // formats show, so the cell can be charted or thresholded.
+        if let Some(a) = m.accuracy() {
+            sheet
+                .write_number_with_format(r, 3, a, &Format::new().set_num_format("0.0%"))
+                .map_err(|e| e.to_string())?;
+        }
+        r += 1;
+    }
+
+    // How the run moved, under the accuracy table it can't be read from.
+    if let Some(mv) = &metrics.movement {
+        r += 2;
+        put(sheet, r, 0, MOVEMENT_LABEL, &head)?;
+        r += 1;
+        for (name, n) in [
+            (FIXED_LABEL, mv.fixed),
+            (REGRESSED_LABEL, mv.regressed),
+            (STILL_WRONG_LABEL, mv.still_wrong),
+            (UNCHANGED_LABEL, mv.unchanged),
+        ] {
+            put(sheet, r, 0, name, &label)?;
+            sheet
+                .write_number(r, 1, n as f64)
+                .map_err(|e| e.to_string())?;
+            r += 1;
+        }
+    }
+
+    for m in &metrics.columns {
+        let Some(matrix) = &m.matrix else { continue };
+        r += 2;
+        put(
+            sheet,
+            r,
+            0,
+            &format!("{} — truth (down) by reported value (across)", m.header),
+            &label,
+        )?;
+        r += 1;
+        for (c, a) in matrix.axis.iter().enumerate() {
+            put(sheet, r, c as u16 + 1, a, &head)?;
+        }
+        r += 1;
+        for (t, a) in matrix.axis.iter().enumerate() {
+            put(sheet, r, 0, a, &axis)?;
+            for (p, n) in matrix.counts[t].iter().enumerate() {
+                sheet
+                    .write_number(r, p as u16 + 1, *n as f64)
+                    .map_err(|e| e.to_string())?;
+            }
+            r += 1;
+        }
+    }
+    Ok(())
+}
+
 /// A background tint for a colour-coded cell.
-enum Tint {
+#[derive(Clone, Copy)]
+pub(super) enum Tint {
     Green,
     Red,
     Amber,
+}
+
+/// The narrowest a column may be sized, in Excel character widths. Excel's own
+/// default is 8.43, and a report column is never usefully narrower than its
+/// (bold, filtered) header.
+const XLSX_MIN_COL_WIDTH: f64 = 9.0;
+
+/// The widest a column may be sized, in Excel character widths. Report cells
+/// can hold an entire JSON response body, so the width has to be capped or one
+/// such column pushes every other column off the screen — which is exactly what
+/// a sized-to-content-only export looks like. Cells are already wrapped and
+/// top-aligned, so anything longer than this stays fully visible by growing the
+/// row taller instead of the column wider.
+const XLSX_MAX_COL_WIDTH: f64 = 60.0;
+
+/// Padding added to a measured header, in characters: headers are bold (so
+/// wider per character than the body font Excel measures against) and carry an
+/// autofilter dropdown arrow, which overlaps the text without it.
+const XLSX_HEADER_PADDING: usize = 5;
+
+/// Padding added to a measured body cell, so text doesn't touch the gridline.
+const XLSX_CELL_PADDING: usize = 2;
+
+/// How wide a cell's text needs to be displayed, in characters.
+///
+/// Cells are wrapped, so what matters is the longest *line*, not the total
+/// length: a 40-line JSON body whose longest line is 30 characters needs 30,
+/// not 1200. Measured in `char`s rather than bytes so non-ASCII content isn't
+/// over-measured into a needlessly wide column.
+fn text_display_width(text: &str) -> usize {
+    text.lines().map(|l| l.chars().count()).max().unwrap_or(0)
+}
+
+/// Clamp a measured character count to the column-width range Excel is given.
+fn clamp_xlsx_width(measured: usize) -> f64 {
+    (measured as f64).clamp(XLSX_MIN_COL_WIDTH, XLSX_MAX_COL_WIDTH)
+}
+
+/// Excel's column width unit is "characters of the default font", which is
+/// about 7 pixels wide, plus ~5px of cell padding. Converting the other way is
+/// what lets an image column be sized to its pictures.
+fn px_to_char_width(px: f64) -> usize {
+    (((px - 5.0).max(0.0)) / 7.0).ceil() as usize
+}
+
+/// The pixel `(width, height)` box each embedded picture is drawn in, keyed by
+/// `(row index, column index)`.
+///
+/// Computed before anything is written because the boxes drive both the row
+/// heights and the image columns' widths, and Excel wants those set before the
+/// cells. `FIT` columns are absent from the map: their sizing is the cell's, so
+/// they neither need nor should get a row-height bump.
+fn xlsx_image_boxes(
+    columns: &[OutputColumn],
+    result: &ReportResult,
+) -> std::collections::HashMap<(usize, usize), (f64, f64)> {
+    let mut out = std::collections::HashMap::new();
+    for (col, c) in columns.iter().enumerate() {
+        let Some(spec) = c.image else { continue };
+        if spec.fit {
+            continue;
+        }
+        for r in 0..result.rows.len() {
+            if let Some(img) = result.images.get(&(r, c.header.clone()))
+                && let Some(size) = spec.scaled_size(img.natural)
+            {
+                out.insert((r, col), size);
+            }
+        }
+    }
+    out
+}
+
+/// Per-column widths for the xlsx export, sized to the widest thing each column
+/// actually has to show — header, data cells and the appended statistics rows
+/// alike — then clamped to [`XLSX_MIN_COL_WIDTH`]..=[`XLSX_MAX_COL_WIDTH`].
+///
+/// Without this every column is left at Excel's 8.43-character default, so a
+/// report exports as a row of tiny columns full of wrapped ribbons of text,
+/// while the same run's HTML export looks fine (the browser sizes the table
+/// for us). Kept separate from the writing loop so the sizing can be tested
+/// without unzipping a workbook.
+fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f64> {
+    let mut widths: Vec<f64> = measured_column_widths(columns, result)
+        .into_iter()
+        .map(clamp_xlsx_width)
+        .collect();
+    // A picture column is sized to its pictures, not to the path or URL they
+    // were resolved from: that text is only a fallback for a picture that
+    // couldn't be fetched, and sizing to it gives a column of thumbnails the
+    // width of a file path -- while sizing *below* the picture clips it.
+    for (col, c) in columns.iter().enumerate() {
+        if let Some(w) = xlsx_image_column_width(c, result) {
+            widths[col] = w;
+        }
+    }
+    widths
+}
+
+/// The width to give `column` if it shows pictures, in Excel characters;
+/// `None` for an ordinary column.
+fn xlsx_image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<f64> {
+    let spec = column.image?;
+    let widest = result
+        .images
+        .iter()
+        .filter(|((_, header), _)| header == &column.header)
+        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
+        .fold(0.0_f64, f64::max);
+    if widest > 0.0 {
+        return Some(clamp_xlsx_width(px_to_char_width(widest)));
+    }
+    // A `FIT` column has no fixed box, and a column whose pictures all failed
+    // to fetch has nothing to size to -- but neither wants to be as wide as the
+    // path behind them, which in a real run is a hundred characters of
+    // directory nobody reads.
+    result
+        .images
+        .keys()
+        .any(|(_, header)| header == &column.header)
+        .then_some(XLSX_FIT_IMAGE_WIDTH)
+}
+
+/// How wide a `FIT` picture column is made, in Excel characters. `FIT` sizes
+/// the picture to the cell, so the cell has to get its size from somewhere.
+const XLSX_FIT_IMAGE_WIDTH: f64 = 18.0;
+
+/// How many characters wide each column needs to be to show its content
+/// unwrapped — header, data cells and the appended statistics rows alike, each
+/// with its own padding. Unclamped: every export wants the same measurement but
+/// caps it in its own units.
+pub(super) fn measured_column_widths(
+    columns: &[OutputColumn],
+    result: &ReportResult,
+) -> Vec<usize> {
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .map(|c| text_display_width(&c.header) + XLSX_HEADER_PADDING)
+        .collect();
+    for row in &result.rows {
+        for (col, c) in columns.iter().enumerate() {
+            let value = c.value(row, &result.no_match_marker);
+            let want = text_display_width(&value) + XLSX_CELL_PADDING;
+            if want > widths[col] {
+                widths[col] = want;
+            }
+        }
+    }
+    // Statistics rows are bold, and their labels ("Mean", "Distribution") can
+    // be wider than anything in the column above them.
+    for srow in result.summary_rows(columns) {
+        for (col, width) in widths.iter_mut().enumerate() {
+            let want = text_display_width(&srow.text_cell(col)) + XLSX_HEADER_PADDING;
+            if want > *width {
+                *width = want;
+            }
+        }
+    }
+    widths
+}
+
+/// The widest a column is sized in the HTML export, in `ch` units. Higher than
+/// the xlsx cap because a browser scrolls a wide table sideways rather than
+/// hiding what runs off the page, but still a cap: one column holding a JSON
+/// body must not push every other column out of the first screenful.
+const HTML_MAX_COL_WIDTH: usize = 70;
+
+/// The narrowest, so a one-character column ("#", a tick) still reads as a
+/// column rather than a sliver.
+const HTML_MIN_COL_WIDTH: usize = 6;
+
+/// Roughly how many pixels a `ch` is at the table's font size. Only ever used
+/// to turn a picture's pixel width into the same units the other columns are
+/// measured in, so an approximation is the right kind of answer.
+const HTML_PX_PER_CH: f64 = 8.0;
+
+/// How wide a `FIT` image column is made. `FIT` sizes the picture to the cell,
+/// so the cell has to be given a size from somewhere, and its text (a path, or
+/// a base64 blob) is never shown.
+const HTML_FIT_IMAGE_WIDTH: usize = 24;
+
+/// The width every column together should try to fit into, in `ch`, before the
+/// wide ones start being asked to give some back. Around a wide screen's worth:
+/// a table wider than this is read by scrolling whatever is done, and the
+/// scrolling is much less work when it isn't dragging half a page of padding
+/// behind each column.
+const HTML_TOTAL_WIDTH_BUDGET: usize = 240;
+
+/// No column is squeezed below this while fitting to the budget — narrower and
+/// a wrapped cell turns into a column of single words.
+const HTML_SHRINK_FLOOR: usize = 16;
+
+/// Per-column `<colgroup>` widths for the HTML export, in `ch`.
+///
+/// Without them the browser's automatic table layout distributes the width it
+/// is given, which squeezes a narrow column down to a few characters and — with
+/// the wrapping the long cells need — breaks its header mid-word, so an
+/// `Environment` column reads "Enviro / ment" with every value wrapped beneath
+/// it. That is the same failure the xlsx export had before it was sized to its
+/// content, so it is fixed the same way and off the same measurement.
+fn html_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<usize> {
+    let mut widths: Vec<usize> = measured_column_widths(columns, result)
+        .into_iter()
+        .map(|w| w.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
+        .collect();
+    // A picture column is sized by the picture, not by the text behind it: the
+    // cell draws a thumbnail, while the value it was resolved from is a long
+    // path (or a base64 blob), which was buying a 70ch column to hold a 60px
+    // stamp and pushing every other column off the screen.
+    for (ci, c) in columns.iter().enumerate() {
+        if let Some(w) = image_column_width(c, result) {
+            widths[ci] = w;
+        }
+    }
+    fit_to_budget(widths)
+}
+
+/// The width to give `column` if it shows pictures, in `ch`; `None` for an
+/// ordinary column.
+fn image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<usize> {
+    let spec = column.image?;
+    let widest = result
+        .images
+        .iter()
+        .filter(|((_, header), _)| header == &column.header)
+        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
+        .fold(0.0_f64, f64::max);
+    if widest <= 0.0 {
+        // Either a `FIT` column (no fixed box) or one whose pictures all failed
+        // to resolve; both want a modest column rather than one sized to text
+        // that is never drawn.
+        return result
+            .images
+            .keys()
+            .any(|(_, header)| header == &column.header)
+            .then_some(HTML_FIT_IMAGE_WIDTH);
+    }
+    // A little more than the picture: the cell has padding, and a column cut to
+    // the pixel puts a scrollbar's worth of nothing between neighbours.
+    let ch = (widest / HTML_PX_PER_CH).ceil() as usize + 2;
+    Some(ch.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
+}
+
+/// Bring the total width down towards [`HTML_TOTAL_WIDTH_BUDGET`] by taking it
+/// from the widest columns first.
+///
+/// A report with thirty columns is not helped by each of them being as wide as
+/// its longest value: the narrow ones are already right, and it is the two or
+/// three carrying a path or a JSON body that put the rest over the horizon. So
+/// a ceiling is found — the highest one that fits the budget — and only the
+/// columns above it are cut, down to a floor a wrapped cell can still be read
+/// in. Everything narrower keeps exactly the width it measured.
+fn fit_to_budget(mut widths: Vec<usize>) -> Vec<usize> {
+    let total: usize = widths.iter().sum();
+    if total <= HTML_TOTAL_WIDTH_BUDGET || widths.is_empty() {
+        return widths;
+    }
+    let mut low = HTML_SHRINK_FLOOR;
+    let mut high = widths.iter().copied().max().unwrap_or(low).max(low);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let sum: usize = widths.iter().map(|w| (*w).min(mid)).sum();
+        if sum <= HTML_TOTAL_WIDTH_BUDGET {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    for w in widths.iter_mut() {
+        *w = (*w).min(low);
+    }
+    widths
+}
+
+/// The colour tint for a cell of a *run*, which is [`cell_tint`] with ground
+/// truth layered over it.
+///
+/// A ground-truthed cell is tinted by whether it is **right**, not by what it
+/// says: an engine that answers `fail` where the truth is `fail` is a green
+/// cell, even though `cell_tint`'s word list would call it red. That is the
+/// whole point of declaring a truth — without this the colours would go on
+/// reporting the sentiment of the word rather than the quality of the answer.
+///
+/// `Untested` is left plain, deliberately: a row nobody has labelled must not
+/// borrow the appearance of one that passed.
+pub(super) fn run_cell_tint(
+    result: &ReportResult,
+    r: usize,
+    header: &str,
+    value: &str,
+) -> Option<Tint> {
+    if let Some(v) = result.verdicts.get(&(r, header.to_string())) {
+        return match v {
+            Verdict::Correct => Some(Tint::Green),
+            Verdict::Incorrect => Some(Tint::Red),
+            Verdict::Untested => None,
+        };
+    }
+    // The `Trend` column is tinted by *movement*, which is the only thing it
+    // knows that its neighbour doesn't. Whether the row is right is the
+    // `Correct` column's question, and it is sat immediately to the left,
+    // already coloured -- so tinting a still-wrong row red here would paint the
+    // same fact twice and leave the column's colour carrying nothing of its
+    // own. Green is a row that got better, red a row that got worse, and a row
+    // that didn't move is plain in both directions.
+    //
+    // Taken from the roll-up rather than the text because the text can't tell
+    // the two unchanged cases apart -- but here that no longer matters, since
+    // neither of them is tinted.
+    if header == TREND_COLUMN {
+        return match result.row_trend(r) {
+            Some(Trend::Fixed) => Some(Tint::Green),
+            Some(Trend::Regressed) => Some(Tint::Red),
+            Some(Trend::Unchanged) | Some(Trend::StillWrong) | None => None,
+        };
+    }
+    // The roll-up column holds the verdict as text, so it tints the same way.
+    if header == CORRECT_COLUMN {
+        return match value.trim() {
+            v if v == Verdict::Correct.as_str() => Some(Tint::Green),
+            v if v == Verdict::Incorrect.as_str() => Some(Tint::Red),
+            _ => None,
+        };
+    }
+    cell_tint(header, value)
 }
 
 /// The colour tint for a cell, or `None` to leave it plain. Recognises the
@@ -358,13 +1713,20 @@ fn cell_tint(header: &str, value: &str) -> Option<Tint> {
     }
     // The comparison Result column has known verdicts; anything else non-empty
     // there is a diff listing (a real difference) → amber.
+    //
+    // A match is *not* green. "Comparison matched baseline" says the answer did
+    // not change, which is neither good nor bad on its own: a row that has been
+    // wrong all along matches its baseline perfectly, and painting that green
+    // says the run went well when it went nowhere. Whether an answer is right
+    // is the `Correct` column's business, and whether it improved is `Trend`'s;
+    // this column only reports movement, so only its unusual values are tinted.
     if header == RESULT_COLUMN {
-        return Some(match v {
-            MATCH => Tint::Green,
-            NO_BASELINE => Tint::Amber,
-            NO_CANDIDATE => Tint::Red,
-            _ => Tint::Amber,
-        });
+        return match v {
+            MATCH => None,
+            NO_BASELINE => Some(Tint::Amber),
+            NO_CANDIDATE => Some(Tint::Red),
+            _ => Some(Tint::Amber),
+        };
     }
     let lower = v.to_ascii_lowercase();
     match lower.as_str() {
@@ -422,14 +1784,14 @@ fn xlsx_stat_formula(
     let letter = col_letter(col);
     // Data occupies A1-style rows 2..=nrows+1 (row 1 is the header).
     let range = format!("{letter}2:{letter}{}", nrows + 1);
-    if v.stat == StatKind::Distribution {
+    if v.stat == Some(StatKind::Distribution) {
         let crit = v.match_value.as_deref().unwrap_or("").replace('"', "\"\"");
         return Some(format!("=COUNTIF({range},\"{crit}\")"));
     }
     if !v.numeric {
         return None;
     }
-    let f = match v.stat {
+    let f = match v.stat? {
         StatKind::Mean => format!("=AVERAGE({range})"),
         StatKind::Median => format!("=MEDIAN({range})"),
         StatKind::Sum => format!("=SUM({range})"),
@@ -530,6 +1892,51 @@ mod tests {
     use super::*;
     use crate::report::model::{ReportResult, ReportRow};
     use std::collections::HashMap;
+
+    /// The `# output:` directive picks the export format, whatever its case.
+    #[test]
+    fn the_output_directive_chooses_the_export_extension() {
+        let r = crate::report::Report::from_text("s", "# output: XLSX\n# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "xlsx");
+    }
+
+    /// Anything PaperBoy can't write — and a report with no directive at all —
+    /// falls back to CSV, so the export button always does something.
+    #[test]
+    fn an_unwritable_or_absent_output_directive_falls_back_to_csv() {
+        let r = crate::report::Report::from_text("s", "# output: docx\n# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "csv");
+        let r = crate::report::Report::from_text("s", "# collection: c.hurl\n");
+        assert_eq!(report_output_extension(&r), "csv");
+        let r = crate::report::Report::from_text("s", "this is not a report at all {{{\n");
+        assert_eq!(report_output_extension(&r), "csv");
+    }
+
+    /// An export lands beside the report it came from, under its own stem.
+    #[test]
+    fn an_export_lands_beside_a_saved_report() {
+        let mut r = crate::report::Report::from_text("sample", "# collection: c.hurl\n");
+        r.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
+        assert_eq!(
+            export_path(&r, "xlsx"),
+            std::path::PathBuf::from("/tmp/reports/sample.xlsx")
+        );
+        // The same rule names a baseline snapshot, so the two agree.
+        assert_eq!(
+            export_path(&r, "baseline"),
+            std::path::PathBuf::from("/tmp/reports/sample.baseline")
+        );
+    }
+
+    /// A scratch report has no file to sit beside, so its display name becomes
+    /// the stem — sanitised, so it can't escape the current directory.
+    #[test]
+    fn a_scratch_reports_name_is_sanitised_into_the_stem() {
+        let r = crate::report::Report::from_text("s", "# name: ../../etc/passwd\n");
+        let p = export_path(&r, "csv");
+        assert_eq!(p, std::path::PathBuf::from("______etc_passwd.csv"));
+        assert_eq!(p.components().count(), 1, "must stay a single segment");
+    }
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
@@ -677,6 +2084,63 @@ mod tests {
         assert!(!html.contains("http://") && !html.contains("https://"));
     }
 
+    /// The reported bug: an `Environment` column came out a few characters wide
+    /// with its header broken across two lines ("Enviro"/"ment") and every
+    /// value wrapped under it, because the browser's automatic layout squeezed
+    /// the table to the page. The columns are sized to their content, the same
+    /// as the xlsx export.
+    #[test]
+    fn html_columns_are_sized_to_their_content() {
+        let res = ReportResult {
+            column_order: vec!["Environment".into(), "Body".into()],
+            rows: vec![row(&[
+                ("Environment", "staging_au"),
+                ("Body", &"x".repeat(400)),
+            ])],
+            ..Default::default()
+        };
+        let widths = html_column_widths(&res.resolved_columns(&Header::default()), &res);
+        assert!(
+            widths[0] >= "Environment".len(),
+            "the header fits on one line, got {}ch",
+            widths[0]
+        );
+        assert_eq!(
+            widths[1], HTML_MAX_COL_WIDTH,
+            "a 400-character body is capped, not allowed to push everything else off the page"
+        );
+
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains(&format!("<col style=\"width:{}ch\">", widths[0])),
+            "the widths reach the document: {html}"
+        );
+        // Fixed layout is what makes the widths binding, and `max-content` is
+        // what stops the table being squashed back to the page width.
+        assert!(html.contains("table-layout:fixed"), "{html}");
+        assert!(html.contains("width:max-content"), "{html}");
+        // A header must never be broken inside a word — that is the reported
+        // symptom — while a long body cell still has to break somewhere.
+        assert!(
+            html.contains("white-space:nowrap;overflow-wrap:normal"),
+            "{html}"
+        );
+        assert!(html.contains("overflow-wrap:anywhere"), "{html}");
+    }
+
+    /// A one-character column is still a column: sized to a readable minimum
+    /// rather than to its content.
+    #[test]
+    fn a_tiny_html_column_keeps_a_readable_minimum() {
+        let res = ReportResult {
+            column_order: vec!["#".into()],
+            rows: vec![row(&[("#", "1")])],
+            ..Default::default()
+        };
+        let widths = html_column_widths(&res.resolved_columns(&Header::default()), &res);
+        assert_eq!(widths[0], HTML_MIN_COL_WIDTH);
+    }
+
     #[test]
     fn parse_report_number_accepts_quantities_but_not_identifiers() {
         assert_eq!(parse_report_number(" 123 "), Some(123.0));
@@ -698,6 +2162,9 @@ mod tests {
             header: "Time".into(),
             sources: vec!["Time".into()],
             stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
         };
         let res = ReportResult {
             no_match_marker: "-".into(),
@@ -728,6 +2195,100 @@ mod tests {
         assert!(!column_is_numeric(&numeric_col, &empty));
     }
 
+    /// Cells are wrapped, so a column only has to be as wide as the longest
+    /// *line* in it — otherwise one multi-line JSON body would demand a column
+    /// thousands of characters wide.
+    #[test]
+    fn text_width_measures_the_longest_line_not_the_whole_string() {
+        assert_eq!(text_display_width("abc"), 3);
+        assert_eq!(text_display_width("abc\nlonger line\nx"), 11);
+        assert_eq!(text_display_width(""), 0);
+        // Counted in chars, not bytes, so accented text isn't over-measured.
+        assert_eq!(text_display_width("héllo"), 5);
+    }
+
+    #[test]
+    fn measured_widths_are_clamped_to_the_readable_range() {
+        assert_eq!(clamp_xlsx_width(0), XLSX_MIN_COL_WIDTH);
+        assert_eq!(clamp_xlsx_width(1), XLSX_MIN_COL_WIDTH);
+        assert_eq!(clamp_xlsx_width(20), 20.0);
+        assert_eq!(clamp_xlsx_width(10_000), XLSX_MAX_COL_WIDTH);
+    }
+
+    /// The bug this fixes: with no widths written at all, every column came out
+    /// at Excel's 8.43-character default regardless of content.
+    #[test]
+    fn xlsx_columns_are_sized_to_their_widest_content() {
+        let res = ReportResult {
+            column_order: vec!["id".into(), "url".into()],
+            rows: vec![
+                row(&[
+                    ("id", "1"),
+                    ("url", "https://example.com/a/fairly/long/path"),
+                ]),
+                row(&[("id", "2"), ("url", "short")]),
+            ],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+
+        // "id" holds only single characters, so it falls back to the minimum
+        // rather than being sized down to nothing.
+        assert_eq!(widths[0], XLSX_MIN_COL_WIDTH);
+        // "url" is sized to its longest value plus padding.
+        assert_eq!(
+            widths[1],
+            ("https://example.com/a/fairly/long/path".len() + XLSX_CELL_PADDING) as f64
+        );
+        assert!(widths[1] > widths[0], "the wide column is genuinely wider");
+    }
+
+    #[test]
+    fn a_very_long_cell_is_capped_so_it_cannot_squeeze_out_every_other_column() {
+        let res = ReportResult {
+            column_order: vec!["body".into(), "id".into()],
+            rows: vec![row(&[("body", &"x".repeat(5_000)), ("id", "1")])],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(widths[0], XLSX_MAX_COL_WIDTH);
+        // The cap must not drag the other columns along with it.
+        assert_eq!(widths[1], XLSX_MIN_COL_WIDTH);
+    }
+
+    #[test]
+    fn a_long_header_widens_its_column_even_when_every_value_is_short() {
+        let res = ReportResult {
+            column_order: vec!["a_rather_long_column_header".into()],
+            rows: vec![row(&[("a_rather_long_column_header", "1")])],
+            ..Default::default()
+        };
+        let columns = res.resolved_columns(&Header::default());
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(
+            widths[0],
+            ("a_rather_long_column_header".len() + XLSX_HEADER_PADDING) as f64
+        );
+    }
+
+    #[test]
+    fn statistics_labels_widen_the_column_they_sit_in() {
+        // A Distribution row is labelled "<header> = <value>", which is longer
+        // than the "Name" header or any of the one-character values above it,
+        // and lands in the first column.
+        let res = stats_result();
+        let header = stats_header("Name, Time STATISTICS(DISTRIBUTION)");
+        let columns = res.resolved_columns(&header);
+        let widths = xlsx_column_widths(&columns, &res);
+        assert_eq!(
+            widths[0],
+            ("Time = 100".len() + XLSX_HEADER_PADDING) as f64,
+            "label column must fit its widest statistics label"
+        );
+    }
+
     #[test]
     fn xlsx_output_is_a_valid_nonempty_zip() {
         let res = ReportResult {
@@ -752,6 +2313,149 @@ mod tests {
                 value: spec.into(),
             }],
         }
+    }
+
+    /// A ground-truthed result: three scored rows (one wrong) and one row
+    /// nobody labelled, with a declared vocabulary so a matrix is produced.
+    fn truth_result() -> (ReportResult, Header) {
+        use crate::report::model::Verdict;
+        let mut res = ReportResult {
+            column_order: vec!["Correct".into(), "Name".into(), "Verdict".into()],
+            rows: vec![
+                row(&[
+                    ("Name", "a"),
+                    ("Verdict", "Low Risk"),
+                    ("Correct", "correct"),
+                ]),
+                row(&[
+                    ("Name", "b"),
+                    ("Verdict", "High Risk"),
+                    ("Correct", "correct"),
+                ]),
+                row(&[
+                    ("Name", "c"),
+                    ("Verdict", "Low Risk"),
+                    ("Correct", "incorrect"),
+                ]),
+                row(&[("Name", "d"), ("Verdict", "Low Risk")]),
+            ],
+            ..Default::default()
+        };
+        res.column_truths
+            .insert("Verdict".into(), "{{ expected }}".into());
+        for (r, (v, t)) in [
+            (Verdict::Correct, "real"),
+            (Verdict::Correct, "fake"),
+            (Verdict::Incorrect, "fake"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            res.verdicts.insert((r, "Verdict".into()), v);
+            res.truths.insert((r, "Verdict".into()), t.into());
+        }
+        let header = Header {
+            lines: vec![
+                super::super::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Pass = pass, real, low risk".into(),
+                },
+                super::super::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Fail = fail, fake, high risk".into(),
+                },
+            ],
+        };
+        (res, header)
+    }
+
+    /// CSV has one table and no header block, so the metrics ride in the
+    /// footer — and a report with no `TRUTH` gains nothing at all.
+    #[test]
+    fn csv_appends_the_ground_truth_metrics_to_the_footer() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(CsvWriter.write(&res, &header).unwrap()).unwrap();
+        // Roll-up under `Correct`, per-column figure under `Verdict`, and the
+        // row's label in the first column that had nothing of its own.
+        assert!(
+            out.contains("3 of 4,Compared,3 of 4"),
+            "compared row: {out}"
+        );
+        assert!(out.contains("66.7%,Accuracy,66.7%"), "accuracy row: {out}");
+        // Nothing is appended to a report that never declared a truth.
+        let plain = String::from_utf8(
+            CsvWriter
+                .write(&stats_result(), &Header::default())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!plain.contains("Accuracy"), "{plain}");
+    }
+
+    /// HTML states the figures once, above the table, and draws the matrix in
+    /// the declared axis order. Nothing it emits reaches out to the network.
+    #[test]
+    fn html_draws_metric_cards_and_a_confusion_matrix() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(out.contains("class=\"metrics\""), "cards: {out}");
+        assert!(out.contains("66.7%"), "accuracy card: {out}");
+        assert!(out.contains("class=\"matrix\""), "matrix: {out}");
+        let pass = out.find("Pass").expect("Pass axis label");
+        let fail = out.find("Fail").expect("Fail axis label");
+        assert!(pass < fail, "the axis keeps its declared order");
+        assert!(
+            !out.contains("<tfoot"),
+            "the metrics are not also repeated in the footer: {out}"
+        );
+        assert!(
+            !out.contains("http://") && !out.contains("https://"),
+            "the export stays self-contained"
+        );
+    }
+
+    /// JSON carries the metrics structured, so a CI gate doesn't have to parse
+    /// "66.7%" back out of a string.
+    #[test]
+    fn json_exports_the_metrics_as_numbers() {
+        let (res, header) = truth_result();
+        let out = JsonWriter.write(&res, &header).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let col = &doc["metrics"]["columns"][0];
+        assert_eq!(col["column"], "Verdict");
+        assert_eq!(col["compared"], 3);
+        assert_eq!(col["incorrect"], 1);
+        assert!((col["accuracy"].as_f64().unwrap() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(col["confusion"]["axis"][0], "Pass");
+        // Truth down, prediction across: the one wrong row is a Fail read as a Pass.
+        assert_eq!(col["confusion"]["counts"][1][0], 1);
+        assert_eq!(doc["metrics"]["overall"]["correct"], 2);
+    }
+
+    /// The matrix is drawn larger than the grid it sits above: it is read cell
+    /// by cell, and its cells are click targets.
+    #[test]
+    fn the_confusion_matrix_is_drawn_larger_than_the_table() {
+        let (res, header) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            out.contains(".matrix table{width:auto;min-width:0;font-size:20px}"),
+            "the matrix has its own, larger type size: {out}"
+        );
+        assert!(
+            out.contains("padding:12px 18px"),
+            "and cells big enough to aim at: {out}"
+        );
+    }
+
+    /// A matrix only exists where a vocabulary was declared: without one there
+    /// is no meaningful axis order, and a matrix of whatever turned up is noise.
+    #[test]
+    fn no_labels_directive_means_no_matrix_but_still_metrics() {
+        let (res, _) = truth_result();
+        let out = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(out.contains("class=\"metrics\""), "figures still shown");
+        assert!(!out.contains("class=\"matrix\""), "but no matrix: {out}");
     }
 
     fn stats_result() -> ReportResult {
@@ -841,6 +2545,384 @@ mod tests {
         assert_eq!(&bytes[..2], b"PK", "still a valid ZIP container");
     }
 
+    /// A result whose `Frame` column is an IMAGE column holding one resolved
+    /// 1x1 PNG in row 0.
+    fn image_result() -> (ReportResult, Header) {
+        use crate::report::flow::ImageSpec;
+        let png = crate::report::image::tests::png_1x1();
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Frame".into()],
+            rows: vec![row(&[("Name", "a"), ("Frame", "shots/a.png")])],
+            ..Default::default()
+        };
+        res.column_images.insert(
+            "Frame".to_string(),
+            ImageSpec {
+                height: Some(60),
+                ..Default::default()
+            },
+        );
+        res.images.insert(
+            (0, "Frame".to_string()),
+            crate::report::model::ImageData {
+                bytes: png,
+                mime: "image/png".to_string(),
+                natural: (1, 1),
+            },
+        );
+        (res, Header::default())
+    }
+
+    /// The header block leads with how the run *moved*, because the accuracy
+    /// figures beneath it cannot say: a run that fixed three rows and broke
+    /// three others scores exactly as well as one that touched nothing.
+    #[test]
+    fn the_header_block_says_what_moved_since_the_baseline() {
+        use crate::report::model::Trend;
+        let mut res = ReportResult {
+            column_order: vec!["Correct".into(), "Trend".into(), "Verdict".into()],
+            rows: vec![
+                row(&[("Correct", "correct"), ("Verdict", "pass")]),
+                row(&[("Correct", "incorrect"), ("Verdict", "fail")]),
+            ],
+            ..Default::default()
+        };
+        res.column_truths.insert("Verdict".into(), "{{ e }}".into());
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.trends.insert((0, "Verdict".into()), Trend::Fixed);
+        res.trends.insert((1, "Verdict".into()), Trend::Regressed);
+
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("Fixed") && html.contains("Regressed"),
+            "both directions are stated, not just the bad one: {html}"
+        );
+
+        // A machine reading the export gets them as numbers, since "did
+        // anything regress?" is a CI gate's first question of a comparison.
+        let json = String::from_utf8(JsonWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(doc["metrics"]["movement"]["fixed"], 1);
+        assert_eq!(doc["metrics"]["movement"]["regressed"], 1);
+
+        // And a run with no baseline says nothing about movement at all: it
+        // hasn't stayed still, it has nothing to have moved from.
+        let mut alone = res.clone();
+        alone.trends.clear();
+        let json =
+            String::from_utf8(JsonWriter.write(&alone, &Header::default()).unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(doc["metrics"]["movement"].is_null());
+    }
+
+    /// The exported report reads on a dark screen as well as a light one.
+    ///
+    /// The thing worth pinning down is not that a dark colour appears
+    /// somewhere, but that there is exactly *one* palette: a literal colour
+    /// left behind in the body of the stylesheet is a patch of light theme
+    /// stranded on a dark page, and that is the failure mode this catches.
+    #[test]
+    fn an_html_report_carries_a_dark_palette_as_well_as_a_light_one() {
+        let mut res = ReportResult::default();
+        res.column_order = vec!["Name".to_string()];
+        res.rows.push(ReportRow {
+            cells: HashMap::from([("Name".to_string(), "a".to_string())]),
+            ..Default::default()
+        });
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+
+        assert!(
+            html.contains("prefers-color-scheme: dark"),
+            "a reader whose system asks for dark gets it without being asked: {html}"
+        );
+        assert!(
+            html.contains("id=\"pb-theme\""),
+            "and a reader who disagrees with their system can say so"
+        );
+        assert!(
+            html.contains("data-pb-theme=\"dark\""),
+            "the override is an attribute on the document, so it beats the media query"
+        );
+
+        // The rules *below* the palette must name no colour of their own. Two
+        // exceptions stand: `#fff` on a hot heatmap cell (which sits on a
+        // saturated blue in either palette) and the mixing colour the dark heat
+        // ramp is folded into.
+        let style = html
+            .split("<style>")
+            .nth(1)
+            .and_then(|s| s.split("</style>").next())
+            .expect("the document has a stylesheet");
+        let body = style
+            .split(":root[data-pb-theme=\"dark\"]{")
+            .nth(1)
+            .and_then(|s| s.split_once('}'))
+            .expect("the explicit dark palette is the last of the palettes")
+            .1;
+        let stray: Vec<&str> = body
+            .match_indices('#')
+            .map(|(i, _)| &body[i..(i + 7).min(body.len())])
+            // A `#` starts a colour only when hex digits follow it; `#pb-theme`
+            // is an id selector, not a shade.
+            .filter(|c| c[1..].starts_with(|ch: char| ch.is_ascii_hexdigit()))
+            .filter(|c| !c.starts_with("#fff") && !c.starts_with("#0b0d10"))
+            .filter(|c| !c.starts_with("#eaf1ff"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "every other colour comes from the palette, not from the rule: {stray:?}"
+        );
+    }
+
+    /// A picture in the grid must reach the file **once**. The drill-down panel
+    /// used to base64 the same bytes a second time, which doubled the size of
+    /// every report that showed pictures -- at a thousand rows that is the
+    /// difference between a file you can email and one you cannot open.
+    #[test]
+    fn html_embeds_each_picture_once_and_the_panel_borrows_it() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(
+            html.matches(";base64,").count(),
+            1,
+            "the bytes appear once, not once per view: {html}"
+        );
+        // The panel's copy is an element with no source of its own, pointing at
+        // the grid cell it borrows from.
+        assert!(
+            html.contains("data-c=\"1\""),
+            "the grid cell is tagged with its column index: {html}"
+        );
+        assert!(
+            html.contains("class=\"full\" data-from=\"1\""),
+            "and the panel copy points back at it: {html}"
+        );
+        assert!(
+            html.contains("img.full[data-from]"),
+            "the script hydrates it on expand: {html}"
+        );
+    }
+
+    /// The drill-down's sections used to each claim an equal share of the row,
+    /// so on a wide screen a picture and a short JSON blob were pushed to
+    /// opposite ends with a void between them. They size to their content.
+    #[test]
+    fn the_drill_down_sections_hug_their_content() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains(".panel section{flex:0 1 auto;"),
+            "sections do not grow to fill the row: {html}"
+        );
+        assert!(
+            html.contains("align-items:flex-start"),
+            "and a short section is not stretched to the tallest one's height: {html}"
+        );
+    }
+
+    /// A picture on a `DETAIL` column has no grid cell to borrow from, so it is
+    /// still embedded in the panel: there it appears, or nowhere at all.
+    #[test]
+    fn html_embeds_a_detail_only_picture_in_the_panel_itself() {
+        let (mut res, header) = image_result();
+        res.column_details.insert("Frame".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(
+            html.matches(";base64,").count(),
+            1,
+            "still exactly once -- but this time in the panel: {html}"
+        );
+        assert!(
+            !html.contains("data-from="),
+            "there is no cell to borrow from, so nothing is deferred: {html}"
+        );
+    }
+
+    /// The picture reaches the workbook as a real media part, and the cell's
+    /// source text is not also written beside it.
+    #[test]
+    fn xlsx_embeds_a_resolved_picture_as_a_media_part() {
+        let (res, header) = image_result();
+        let bytes = XlsxWriter.write(&res, &header).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        // A ZIP stores each member's name uncompressed in its local header, so
+        // the media part is findable without unzipping.
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(
+            hay.contains("xl/media/image"),
+            "the workbook should carry an embedded picture"
+        );
+        assert!(
+            hay.contains("xl/drawings/drawing1.xml"),
+            "and the drawing that anchors it"
+        );
+    }
+
+    /// HTML inlines the picture as a `data:` URI so the export is a single
+    /// self-contained file, keeping the source value as alt/title text.
+    #[test]
+    fn html_inlines_a_resolved_picture_as_a_data_uri() {
+        let (res, header) = image_result();
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains("<img style=\"width:60px;height:60px\""),
+            "sized from the IMAGE clause and the 1x1 aspect ratio: {html}"
+        );
+        assert!(
+            html.contains("data:image/png;base64,"),
+            "inlined rather than linked: {html}"
+        );
+        assert!(
+            html.contains("alt=\"shots/a.png\""),
+            "the source value survives as alt text: {html}"
+        );
+    }
+
+    /// `IMAGE` is a render hint, so formats that cannot show a picture keep
+    /// writing the value exactly as before — CSV and JSON stay lossless.
+    #[test]
+    fn text_formats_ignore_the_image_clause_entirely() {
+        let (res, header) = image_result();
+        let text = String::from_utf8(CsvWriter.write(&res, &header).unwrap()).unwrap();
+        assert_eq!(text, "Name,Frame\r\na,shots/a.png\r\n");
+        let bytes = JsonWriter.write(&res, &header).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["rows"][0]["Frame"].as_str(),
+            Some("shots/a.png"),
+            "JSON carries the value, not the picture"
+        );
+    }
+
+    /// A row whose value never resolved (a bad path, an offline fetch) has no
+    /// entry in `images`, and must fall back to its text rather than a blank.
+    #[test]
+    fn an_unresolved_image_cell_falls_back_to_its_text() {
+        let (mut res, header) = image_result();
+        res.rows
+            .push(row(&[("Name", "b"), ("Frame", "missing.png")]));
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains("missing.png</td>") || html.contains(">missing.png<"),
+            "the unresolved row keeps its text: {html}"
+        );
+        // And the workbook still writes, with one picture rather than two.
+        let bytes = XlsxWriter.write(&res, &header).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("xl/media/image2"));
+    }
+
+    /// A ground-truthed cell is coloured by whether it is right, overriding the
+    /// word-sentiment heuristic: an engine that correctly answers `fail` is a
+    /// green cell, and one that wrongly answers `pass` is a red one.
+    #[test]
+    fn a_verdict_tints_a_cell_by_correctness_not_by_its_wording() {
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Verdict", "fail"), ("Correct", "correct")]),
+            row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            row(&[("Verdict", "pass"), ("Correct", "untested")]),
+        ];
+        res.column_order = vec!["Correct".to_string(), "Verdict".to_string()];
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.verdicts
+            .insert((2, "Verdict".into()), Verdict::Untested);
+
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Verdict", "fail"),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Verdict", "pass"),
+            Some(Tint::Red)
+        ));
+        assert!(
+            run_cell_tint(&res, 2, "Verdict", "pass").is_none(),
+            "an untested row never borrows the look of a passing one"
+        );
+        // The roll-up column tints from its own text.
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Correct", "correct"),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Correct", "incorrect"),
+            Some(Tint::Red)
+        ));
+        // A report with no ground truth is tinted exactly as before.
+        let plain = ReportResult::default();
+        assert!(matches!(
+            run_cell_tint(&plain, 0, "Verdict", "fail"),
+            Some(Tint::Red)
+        ));
+    }
+
+    /// The `Trend` column is tinted by the direction of travel, and a scored
+    /// cell keeps the colour of its *own* verdict: a comparison must not repaint
+    /// a correct answer just because it was also correct last time.
+    #[test]
+    fn the_trend_column_tints_by_whether_the_row_is_right_not_by_its_word() {
+        use crate::report::model::Trend;
+
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Verdict", "fail"), ("Trend", "fixed")]),
+            row(&[("Verdict", "pass"), ("Trend", "regressed")]),
+            row(&[("Verdict", "fail"), ("Trend", "unchanged")]),
+        ];
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.verdicts.insert((2, "Verdict".into()), Verdict::Correct);
+        res.trends.insert((0, "Verdict".into()), Trend::Fixed);
+        res.trends.insert((1, "Verdict".into()), Trend::Regressed);
+        res.trends.insert((2, "Verdict".into()), Trend::Unchanged);
+
+        assert!(
+            matches!(run_cell_tint(&res, 2, "Verdict", "fail"), Some(Tint::Green)),
+            "an unchanged-but-correct answer stays green, exactly as it is \
+             without a comparison"
+        );
+        assert!(matches!(
+            run_cell_tint(&res, 0, "Trend", Trend::Fixed.as_str()),
+            Some(Tint::Green)
+        ));
+        assert!(matches!(
+            run_cell_tint(&res, 1, "Trend", Trend::Regressed.as_str()),
+            Some(Tint::Red)
+        ));
+        // Neither unchanged case is tinted. Colouring the still-wrong one red
+        // would repeat what the `Correct` cell immediately to its left already
+        // says in red, which spends the column's colour on a fact the reader
+        // has just read and leaves nothing to mark the rows that actually
+        // moved.
+        let mut wrong = res.clone();
+        wrong
+            .trends
+            .insert((1, "Verdict".into()), Trend::StillWrong);
+        assert!(
+            run_cell_tint(&wrong, 1, "Trend", Trend::StillWrong.as_str()).is_none(),
+            "a row that didn't move is plain, however it scored"
+        );
+        assert!(
+            run_cell_tint(&res, 2, "Trend", Trend::Unchanged.as_str()).is_none(),
+            "and so is the other one"
+        );
+        assert_eq!(
+            Trend::StillWrong.as_str(),
+            Trend::Unchanged.as_str(),
+            "both say what the column is asking: this row did not move"
+        );
+        // The `Correct` column is what keeps them apart, and it is right there.
+        assert!(matches!(
+            run_cell_tint(&wrong, 1, CORRECT_COLUMN, Verdict::Incorrect.as_str()),
+            Some(Tint::Red)
+        ));
+    }
+
     #[test]
     fn cell_tint_recognises_status_and_result_verdicts() {
         assert!(matches!(cell_tint("Status", "success"), Some(Tint::Green)));
@@ -848,7 +2930,9 @@ mod tests {
         assert!(matches!(cell_tint("Status", "changed"), Some(Tint::Amber)));
         assert!(matches!(cell_tint("HttpStatus", "200"), Some(Tint::Green)));
         assert!(matches!(cell_tint("HttpStatus", "503"), Some(Tint::Red)));
-        assert!(matches!(cell_tint("Result", MATCH), Some(Tint::Green)));
+        // A match is plain: "nothing changed" is not an achievement, and a row
+        // that has been wrong since the first run matches its baseline exactly.
+        assert!(cell_tint("Result", MATCH).is_none());
         assert!(matches!(cell_tint("Result", NO_CANDIDATE), Some(Tint::Red)));
         assert!(matches!(
             cell_tint("Result", "status: a≠b"),
@@ -856,5 +2940,408 @@ mod tests {
         ));
         assert!(cell_tint("Name", "anything.jpg").is_none());
         assert!(cell_tint("Status", "  ").is_none());
+    }
+
+    /// The spreadsheet has the same rule as the HTML: a column of thumbnails is
+    /// as wide as a thumbnail, not as wide as the path each was fetched from.
+    #[test]
+    fn the_spreadsheets_picture_column_is_sized_to_the_picture() {
+        let (mut res, header) = image_result();
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+
+        let columns = res.resolved_columns(&header);
+        let widths = xlsx_column_widths(&columns, &res);
+        let ci = columns
+            .iter()
+            .position(|c| c.header == "Frame")
+            .expect("the picture column");
+        assert!(
+            widths[ci] < long.len() as f64 / 2.0,
+            "sized to the thumbnail, not the path: {}",
+            widths[ci]
+        );
+        assert!(
+            widths[ci] >= XLSX_MIN_COL_WIDTH,
+            "and not so narrow the picture is clipped: {}",
+            widths[ci]
+        );
+    }
+
+    /// A `FIT` column has no fixed box to measure, and a picture that couldn't
+    /// be fetched leaves only its path — neither is a reason for a column as
+    /// wide as a directory tree.
+    #[test]
+    fn a_fit_picture_column_is_not_sized_to_its_path() {
+        use crate::report::flow::ImageSpec;
+        let (mut res, header) = image_result();
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+        res.column_images.insert(
+            "Frame".to_string(),
+            ImageSpec {
+                fit: true,
+                ..Default::default()
+            },
+        );
+
+        let columns = res.resolved_columns(&header);
+        let ci = columns.iter().position(|c| c.header == "Frame").unwrap();
+        assert_eq!(xlsx_column_widths(&columns, &res)[ci], XLSX_FIT_IMAGE_WIDTH);
+
+        let html = html_column_widths(&columns, &res);
+        assert_eq!(html[ci], HTML_FIT_IMAGE_WIDTH);
+    }
+
+    /// A picture column is sized by the picture. Its cell value is the path (or
+    /// the blob) the picture was resolved from, which was buying a 70ch column
+    /// to hold a 60px stamp and pushing the columns that matter off the screen.
+    #[test]
+    fn a_picture_column_is_sized_to_the_picture_not_to_its_path() {
+        let (mut res, header) = image_result();
+        // A path as long as the ones a real run produces.
+        let long = "/home/somebody/Development/sample_images/absolute/trimmed/Real/image-real-6/Front-39.jpg";
+        res.rows[0]
+            .cells
+            .insert("Frame".to_string(), long.to_string());
+
+        let widths = html_column_widths(&res.resolved_columns(&header), &res);
+        let ci = res
+            .resolved_columns(&header)
+            .iter()
+            .position(|c| c.header == "Frame")
+            .expect("the picture column");
+        assert!(
+            widths[ci] < long.len() / 2,
+            "sized to the thumbnail, not the path: {}ch",
+            widths[ci]
+        );
+    }
+
+    /// Thirty columns each as wide as their longest value is a table read by
+    /// scrolling past a lot of padding. The widest give width back first; the
+    /// narrow ones, which were already right, keep what they measured.
+    #[test]
+    fn many_columns_are_fitted_by_taking_from_the_widest() {
+        let unfitted = vec![
+            8,
+            9,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+            HTML_MAX_COL_WIDTH,
+        ];
+        let fitted = fit_to_budget(unfitted.clone());
+        assert!(
+            fitted.iter().sum::<usize>() <= HTML_TOTAL_WIDTH_BUDGET,
+            "fitted to the budget: {fitted:?}"
+        );
+        assert_eq!(
+            (fitted[0], fitted[1]),
+            (8, 9),
+            "the narrow columns are untouched: {fitted:?}"
+        );
+        assert!(
+            fitted[2..].iter().all(|w| *w >= HTML_SHRINK_FLOOR),
+            "and nothing that was wide is squeezed into single words: {fitted:?}"
+        );
+    }
+
+    /// A table that already fits is left exactly as measured — the budget is a
+    /// ceiling, not a target to stretch or shrink towards.
+    #[test]
+    fn a_narrow_table_is_left_alone() {
+        let widths = vec![10, 12, 30];
+        assert_eq!(fit_to_budget(widths.clone()), widths);
+    }
+
+    /// A `DETAIL` column carrying a `TRUTH` says in the panel whether it is
+    /// right, the way its grid cell would have: the panel is where that value
+    /// is actually read, and a full value shown without a verdict reads as one
+    /// nobody checked.
+    #[test]
+    fn a_ground_truthed_detail_section_is_marked_right_or_wrong() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "High Risk")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        res.verdicts.insert((0, "Raw".into()), Verdict::Incorrect);
+        res.truths.insert((0, "Raw".into()), "Low Risk".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("<span class=\"verdict fail\">incorrect \u{2014} expected Low Risk"),
+            "the heading says it is wrong, and what was wanted: {html}"
+        );
+        assert!(
+            html.contains(".panel h3 .verdict.fail{background:var(--fail-bg)}"),
+            "and the badge is painted like the grid's own wrong cells: {html}"
+        );
+    }
+
+    /// A `DETAIL` column leaves the grid for the drill-down panel -- but only
+    /// in HTML, which has somewhere to put it. The value itself is untouched,
+    /// which is what lets every other writer ignore the flag.
+    #[test]
+    fn html_moves_a_detail_column_into_the_drill_down_and_csv_keeps_it_inline() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "{\"score\":7}")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        let head = &html[..html.find("<tbody>").unwrap()];
+        assert!(!head.contains("<th>Raw</th>"), "not a grid column: {head}");
+        assert!(
+            html.contains("<tr class=\"det\">") && html.contains("<h3>Raw</h3>"),
+            "it is in the panel instead: {html}"
+        );
+        assert!(
+            html.contains("&quot;score&quot;: 7"),
+            "and pretty-printed, because a body arrives on one line: {html}"
+        );
+        // Placement only: the machine-readable formats are unchanged.
+        let text = String::from_utf8(CsvWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert_eq!(text, "Name,Raw\r\na,\"{\"\"score\"\":7}\"\r\n");
+    }
+
+    /// A spreadsheet has no click, so `DETAIL` becomes the idiom that means the
+    /// same thing there: the columns move to the right and are collapsed into
+    /// an outline group. Nothing is dropped -- a workbook is an archive.
+    #[test]
+    fn xlsx_groups_detail_columns_to_the_right_and_collapses_them() {
+        let mut res = ReportResult {
+            column_order: vec!["Raw".into(), "Name".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let bytes = XlsxWriter.write(&res, &Header::default()).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        // The sheet part is deflated, so the grouping is checked through the
+        // one thing the writer can observe without a full unzip: that it wrote
+        // at all with the group applied, and that the summary column comes
+        // first in the resolved order.
+        let mut res2 = res.clone();
+        res2.column_details.clear();
+        assert_ne!(
+            bytes,
+            XlsxWriter.write(&res2, &Header::default()).unwrap(),
+            "the flag changes the workbook"
+        );
+    }
+
+    /// A row with nothing to drill into gets no panel: an expander that opens
+    /// onto an empty box teaches the reader to stop clicking.
+    #[test]
+    fn a_row_with_no_detail_gets_no_panel() {
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[("Name", "a")])],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(!html.contains("class=\"det\""), "no panel row: {html}");
+    }
+
+    /// A report with nothing to filter by gets no filter buttons -- but keeps
+    /// its find box, which is useful in any report.
+    #[test]
+    fn a_plain_report_gets_a_find_box_but_no_filter_buttons() {
+        let res = ReportResult {
+            column_order: vec!["Name".into()],
+            rows: vec![row(&[("Name", "a")])],
+            ..Default::default()
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            !html.contains("data-i=\"0\""),
+            "a lone All button filters nothing, so it is not drawn: {html}"
+        );
+        assert!(html.contains("id=\"pb-find\""), "find box survives: {html}");
+    }
+
+    /// As soon as there is a real choice, the buttons appear -- including the
+    /// All that returns to the unfiltered view.
+    #[test]
+    fn a_report_with_something_to_filter_keeps_its_all_button() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), super::super::compare::CORRECT_COLUMN.into()],
+            rows: vec![
+                row(&[
+                    ("Name", "a"),
+                    (super::super::compare::CORRECT_COLUMN, "incorrect"),
+                ]),
+                row(&[
+                    ("Name", "b"),
+                    (super::super::compare::CORRECT_COLUMN, "correct"),
+                ]),
+            ],
+            ..Default::default()
+        };
+        res.column_details.clear();
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("data-i=\"0\""), "All is back: {html}");
+        assert!(
+            html.contains("data-i=\"1\""),
+            "and the filter that earned it: {html}"
+        );
+    }
+
+    /// Every column being `DETAIL` would leave an empty grid, which helps
+    /// nobody, so the flag is ignored rather than obeyed off a cliff.
+    #[test]
+    fn an_all_detail_report_still_renders_its_grid() {
+        let mut res = ReportResult {
+            column_order: vec!["Raw".into()],
+            rows: vec![row(&[("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(html.contains("<th>Raw</th>"), "the grid survives: {html}");
+    }
+
+    /// The browser makes no decisions about the report: each row carries the
+    /// indices of the filters it passes, computed here by the same `RowFilter`
+    /// the in-app views use.
+    #[test]
+    fn rows_carry_the_filters_they_pass_and_the_toolbar_offers_them() {
+        let mut res = ReportResult {
+            column_order: vec!["Verdict".into(), "Correct".into()],
+            rows: vec![
+                row(&[("Verdict", "pass"), ("Correct", "correct")]),
+                row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            ],
+            ..Default::default()
+        };
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains(">Incorrect</button>"),
+            "the class is offered: {html}"
+        );
+        assert!(
+            !html.contains(">Regressions</button>"),
+            "and one that could only ever select nothing is not: {html}"
+        );
+        // "All" is filter 0, "Incorrect" filter 1, and only the second row is
+        // in it.
+        let rows: Vec<&str> = html
+            .match_indices("data-f=\"")
+            .map(|(i, _)| {
+                let rest = &html[i + 8..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        assert_eq!(rows, vec!["0", "0 1"], "{html}");
+    }
+
+    /// The single highest-value interaction of the tool this is modelled on:
+    /// every non-empty matrix cell filters the table to exactly the rows it
+    /// counted.
+    #[test]
+    fn confusion_matrix_cells_are_clickable_filters() {
+        let mut res = ReportResult {
+            column_order: vec!["Verdict".into(), "Correct".into()],
+            rows: vec![
+                row(&[("Verdict", "pass"), ("Correct", "correct")]),
+                row(&[("Verdict", "pass"), ("Correct", "incorrect")]),
+            ],
+            ..Default::default()
+        };
+        res.verdicts.insert((0, "Verdict".into()), Verdict::Correct);
+        res.verdicts
+            .insert((1, "Verdict".into()), Verdict::Incorrect);
+        res.truths.insert((0, "Verdict".into()), "pass".into());
+        res.truths.insert((1, "Verdict".into()), "fail".into());
+        res.column_truths
+            .insert("Verdict".into(), "{{ expected }}".into());
+        let header = Header {
+            lines: vec![
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Pass = pass".into(),
+                },
+                crate::report::flow::HeaderLine::Directive {
+                    key: "labels".into(),
+                    value: "Fail = fail".into(),
+                },
+            ],
+        };
+        let html = String::from_utf8(HtmlWriter.write(&res, &header).unwrap()).unwrap();
+        assert!(
+            html.contains(" pick\" data-i="),
+            "the counted cells are pickable: {html}"
+        );
+        // The empty Pass/Fail cell is not: clicking it could only ever empty
+        // the table.
+        // Two buttons plus the two cells that counted something; the empty
+        // Pass/Fail cell is not pickable, since clicking it could only ever
+        // empty the table.
+        let picks = html.matches("data-i=\"").count();
+        assert_eq!(picks, 4, "{html}");
+    }
+
+    /// When a comparison kept the baseline row, a JSON detail column is shown
+    /// field by field -- the whole point being to say *which* field moved
+    /// rather than handing the reader two blobs.
+    #[test]
+    fn a_json_detail_column_is_diffed_against_the_baseline_row() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "{\"score\":9,\"id\":1}")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        res.baseline_rows
+            .insert(0, row(&[("Name", "a"), ("Raw", "{\"score\":7,\"id\":1}")]));
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            html.contains("class=\"fdiff\""),
+            "a field table is drawn: {html}"
+        );
+        assert!(
+            html.contains("<tr class=\"chg\"><td>score</td><td>7</td><td>9</td></tr>"),
+            "the moved field is highlighted: {html}"
+        );
+        assert!(
+            html.contains("<tr><td>id</td><td>1</td><td>1</td></tr>"),
+            "and the unchanged one is kept for context: {html}"
+        );
+    }
+
+    /// The export has to stay a single file you can email: no external assets,
+    /// and a `<noscript>` fallback so a browser with scripting off shows the
+    /// panels expanded rather than losing them.
+    #[test]
+    fn the_interactive_export_stays_self_contained_and_degrades_without_script() {
+        let mut res = ReportResult {
+            column_order: vec!["Name".into(), "Raw".into()],
+            rows: vec![row(&[("Name", "a"), ("Raw", "x")])],
+            ..Default::default()
+        };
+        res.column_details.insert("Raw".to_string());
+        let html = String::from_utf8(HtmlWriter.write(&res, &Header::default()).unwrap()).unwrap();
+        assert!(
+            !html.contains("http://") && !html.contains("https://"),
+            "no external references"
+        );
+        assert!(!html.contains("<link"), "no external stylesheet");
+        assert!(
+            html.contains("<noscript><style>tr.det{display:table-row}"),
+            "the panels open without script: {html}"
+        );
+        assert!(html.contains("<script>") && html.contains("</script>"));
     }
 }

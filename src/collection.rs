@@ -3,9 +3,11 @@
 //! request model, parser, serializer and `[Captures]`/`[Asserts]` evaluation
 //! live in the [`crate::hurl`] module.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::git_remote::GitOrigin;
 use crate::hurl::{HurlEntry, collection_to_hurl};
@@ -15,6 +17,23 @@ use crate::tree::{self, Row};
 /// its folder-encoded title (e.g. `Auth/Login` → `Login`, since the `Auth`
 /// folder is already its own tree row), falling back to the URL when the
 /// request is untitled.
+/// The cached headline of one request in a collection that isn't loaded: what
+/// it is called and what it does. The method is cached with the name because a
+/// list of bare names makes the reader open a file to find out which row is the
+/// POST — the one thing the badge exists to save them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsTitle {
+    pub name: String,
+    pub method: String,
+}
+
+fn ws_request_title(entry: &HurlEntry) -> WsTitle {
+    WsTitle {
+        name: ws_request_label(entry),
+        method: entry.method.clone(),
+    }
+}
+
 fn ws_request_label(entry: &HurlEntry) -> String {
     let leaf = crate::tree::entry_path(&entry.title)
         .pop()
@@ -30,12 +49,12 @@ fn ws_request_label(entry: &HurlEntry) -> String {
 /// a not-currently-loaded collection's requests in the workspace tree. Returns
 /// an empty vec when the file can't be read or parsed — the collection then
 /// simply shows no requests until it is opened.
-fn read_collection_labels(path: &Path) -> Vec<String> {
+fn read_collection_labels(path: &Path) -> Vec<WsTitle> {
     std::fs::read_to_string(path)
         .map(|content| {
             crate::postman::parse_collection(&content)
                 .iter()
-                .map(ws_request_label)
+                .map(ws_request_title)
                 .collect()
         })
         .unwrap_or_default()
@@ -89,12 +108,15 @@ pub enum WsRow {
     /// `idx` the request's position within it. When `loaded` is true the file
     /// is the tab's currently-loaded collection, so `idx` indexes `entries` and
     /// the row renders in full detail; when false the row is drawn from the
-    /// cached `name` only (see `workspace_titles`) and selecting it previews the
-    /// name — opening it (Enter/Right) loads that collection first.
+    /// cached name and method (see `workspace_titles`) and selecting it previews
+    /// the name — opening it (Enter/Right) loads that collection first.
     Request {
         collection: PathBuf,
         idx: usize,
         name: String,
+        /// The request's HTTP method, known for every listed request whether or
+        /// not its file is the loaded one.
+        method: String,
         depth: usize,
         loaded: bool,
     },
@@ -116,6 +138,34 @@ impl WsRow {
             WsRow::Request { collection, .. } => collection,
         }
     }
+}
+
+/// How long a workspace tree scan is reused before the disk is read again.
+///
+/// The scan is a recursive `read_dir` of the whole workspace, and the graphical
+/// front-end asks for the tree once per frame — so at 60fps this was real
+/// filesystem I/O sixty times a second, growing with the size of the tree, just
+/// to redraw a list that hadn't changed.
+///
+/// The window is deliberately short and deliberately *time*-based rather than
+/// invalidated by the app's own file operations. A tree can change from outside
+/// PaperBoy (another editor, a `git pull`, a test run dropping result files),
+/// so a cache keyed only on things PaperBoy knows it did would go stale in
+/// exactly the cases the tree matters most. A third of a second is below the
+/// threshold at which a file list reads as "live", and it still collapses
+/// ~95% of the scans.
+const WS_SCAN_TTL: Duration = Duration::from_millis(300);
+
+/// The last workspace tree read off disk, and what it was read for.
+#[derive(Clone)]
+struct WsScan {
+    root: PathBuf,
+    filter_hurl_json: bool,
+    taken_at: Instant,
+    /// [`crate::workspace::tree_generation`] when this was taken, so PaperBoy's
+    /// own file operations don't have to wait out [`WS_SCAN_TTL`].
+    generation: u64,
+    entries: Vec<crate::workspace::WsEntry>,
 }
 
 /// A loaded Hurl collection (one .hurl file).
@@ -193,7 +243,7 @@ pub struct Collection {
     /// between sessions), the app can offer to redownload the exact same
     /// commit rather than losing track of the workspace entirely — see
     /// `PersistedTab::into_collection`'s `PendingWorkspaceReload`.
-    pub workspace_git_origin: Option<crate::tui::remote::WorkspaceGitOrigin>,
+    pub workspace_git_origin: Option<crate::remote_flow::WorkspaceGitOrigin>,
     /// For a Workspace tab, the set of *expanded* node paths (absolute) in the
     /// file-tree — both folders (whose child entries are shown) and collection
     /// files (whose inline request names are shown). A node is visible when all
@@ -222,7 +272,12 @@ pub struct Collection {
     /// away from a loaded file (from its live entries) and when restoring an
     /// expanded collection from disk (see [`Self::rebuild_expanded_titles`]).
     /// Derived state — not persisted.
-    pub workspace_titles: HashMap<PathBuf, Vec<String>>,
+    pub workspace_titles: HashMap<PathBuf, Vec<WsTitle>>,
+    /// The most recent workspace tree read off disk, reused for [`WS_SCAN_TTL`]
+    /// so redrawing the tree isn't a recursive `read_dir` every frame. Purely
+    /// derived state: dropping it only costs one extra scan, which is why it is
+    /// neither persisted nor part of any equality check.
+    workspace_scan: RefCell<Option<WsScan>>,
     /// Unsaved edits belonging to workspace collection files that are **not**
     /// the currently-loaded one.
     ///
@@ -245,6 +300,20 @@ static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
 /// A process-unique id for a new collection.
 pub fn next_collection_id() -> u64 {
     NEXT_COLLECTION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Write collection text to `path`, creating the folder it lives in if that has
+/// gone missing since the file was opened. The error carries the path, because
+/// a bulk save spans several files and "permission denied" on its own would not
+/// say which one refused.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn write_hurl(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 impl Collection {
@@ -271,6 +340,7 @@ impl Collection {
             workspace_expanded: HashSet::new(),
             workspace_selected: None,
             workspace_titles: HashMap::new(),
+            workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
         };
         c.sync_folder_to_selected();
@@ -322,11 +392,34 @@ impl Collection {
     /// collection file opens it (with inline requests beneath); selecting a
     /// report embeds it in the right pane.  Empty for a non-Workspace tab.
     pub fn ws_rows(&self) -> Vec<WsRow> {
+        self.ws_rows_at(Instant::now())
+    }
+
+    /// [`Self::ws_rows`] as of a given moment, so the scan cache's expiry can be
+    /// tested without sleeping.
+    pub(crate) fn ws_rows_at(&self, now: Instant) -> Vec<WsRow> {
+        self.ws_rows_as_of(now, crate::workspace::tree_generation())
+    }
+
+    /// [`Self::ws_rows`] as of a given moment *and* a given tree generation.
+    ///
+    /// The generation is a parameter rather than read from the global counter
+    /// so a test of the time-based expiry can't be perturbed by another test
+    /// running in parallel that happens to create a workspace file.
+    pub(crate) fn ws_rows_as_of(&self, now: Instant, generation: u64) -> Vec<WsRow> {
         let Some(root) = &self.workspace_root else {
             return Vec::new();
         };
 
-        let full_tree = crate::workspace::scan_workspace(root, self.workspace_filter_hurl_json);
+        self.refresh_scan(root, now, generation);
+        // Held across the whole loop so the tree is walked in place rather than
+        // cloned out of the cache every frame — the point of the cache is to
+        // stop doing work per frame, not to trade I/O for an allocation.
+        let scan = self.workspace_scan.borrow();
+        let full_tree = scan
+            .as_ref()
+            .map(|s| s.entries.as_slice())
+            .unwrap_or_default();
         let mut out = Vec::new();
 
         // `ancestor_at[d]` holds the absolute path of the most-recently-visited
@@ -360,8 +453,8 @@ impl Collection {
                 if visible {
                     let expanded = self.workspace_expanded.contains(&entry.path);
                     out.push(WsRow::Folder {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                         expanded,
                     });
@@ -369,27 +462,26 @@ impl Collection {
             } else if visible {
                 if crate::workspace::is_report_file(&entry.path) {
                     out.push(WsRow::Report {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                     });
                 } else if crate::workspace::is_env_file(&entry.path) {
                     out.push(WsRow::Environment {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                     });
                 } else {
                     let expanded = self.workspace_expanded.contains(&entry.path);
-                    let path = entry.path.clone();
                     out.push(WsRow::Collection {
-                        path: entry.path,
-                        name: entry.display_name,
+                        path: entry.path.clone(),
+                        name: entry.display_name.clone(),
                         depth: d,
                         open: expanded,
                     });
                     if expanded {
-                        out.extend(self.request_rows_for(&path, d + 1));
+                        out.extend(self.request_rows_for(&entry.path, d + 1));
                     }
                 }
             }
@@ -397,10 +489,73 @@ impl Collection {
         out
     }
 
+    /// Read the workspace tree off disk if what's cached is missing, stale, or
+    /// was taken for a different root or filter.
+    ///
+    /// The *visibility* half of [`Self::ws_rows_at`] (the expand/collapse
+    /// filter) is deliberately left out of the cache: expanding a folder must
+    /// feel instant, and re-filtering an already-scanned tree costs nothing.
+    fn refresh_scan(&self, root: &Path, now: Instant, generation: u64) {
+        let mut slot = self.workspace_scan.borrow_mut();
+        let usable = slot.as_ref().is_some_and(|s| {
+            s.root == root
+                && s.filter_hurl_json == self.workspace_filter_hurl_json
+                && s.generation == generation
+                && now.saturating_duration_since(s.taken_at) < WS_SCAN_TTL
+        });
+        if usable {
+            return;
+        }
+        *slot = Some(WsScan {
+            root: root.to_path_buf(),
+            filter_hurl_json: self.workspace_filter_hurl_json,
+            taken_at: now,
+            generation,
+            entries: crate::workspace::scan_workspace(root, self.workspace_filter_hurl_json),
+        });
+    }
+
+    /// Every `.vars` (or env-shaped `.json`) file in this tab's workspace, for
+    /// the Environments panel to list alongside the loaded environments.
+    ///
+    /// Served out of the same cached tree walk [`Self::ws_rows`] uses rather
+    /// than scanning the disk itself: both front-ends' environment panels ask
+    /// for this list several times per frame — once for the rows, once for the
+    /// unfiltered rows behind the "no matches" message, once for the empty
+    /// state — and each of those used to be a full recursive `read_dir` of the
+    /// workspace. The cached scan holds every non-hidden file whichever way the
+    /// tab's display filter is set (the filter only ever *narrows* to the
+    /// workspace's own file types, and `.vars` is one of them), so it can
+    /// answer this without a second walk.
+    ///
+    /// Empty for a tab that isn't a workspace.
+    pub fn workspace_env_files(&self) -> Vec<PathBuf> {
+        self.workspace_env_files_as_of(Instant::now(), crate::workspace::tree_generation())
+    }
+
+    /// [`Self::workspace_env_files`] as of a given moment and tree generation,
+    /// so the cache can be tested without racing its expiry.
+    pub(crate) fn workspace_env_files_as_of(&self, now: Instant, generation: u64) -> Vec<PathBuf> {
+        let Some(root) = self.workspace_root.clone() else {
+            return Vec::new();
+        };
+        self.refresh_scan(&root, now, generation);
+        let scan = self.workspace_scan.borrow();
+        scan.as_ref()
+            .map(|s| {
+                s.entries
+                    .iter()
+                    .filter(|e| !e.is_dir && crate::workspace::is_env_file(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The request rows shown under an expanded collection at `path`, indented
     /// to `depth`. For the currently-loaded file the rows come straight from
     /// `entries` (full detail, `loaded: true`); for any other expanded
-    /// collection they come from the cached names in `workspace_titles`
+    /// collection they come from the cached titles in `workspace_titles`
     /// (`loaded: false`), so several collections' requests can be listed at once
     /// without re-parsing every file each frame. A collection with no cached
     /// names yet contributes no rows.
@@ -413,6 +568,7 @@ impl Collection {
                     collection: path.to_path_buf(),
                     idx,
                     name: ws_request_label(e),
+                    method: e.method.clone(),
                     depth,
                     loaded: true,
                 })
@@ -420,14 +576,15 @@ impl Collection {
         } else {
             self.workspace_titles
                 .get(path)
-                .map(|names| {
-                    names
+                .map(|titles| {
+                    titles
                         .iter()
                         .enumerate()
-                        .map(|(idx, name)| WsRow::Request {
+                        .map(|(idx, t)| WsRow::Request {
                             collection: path.to_path_buf(),
                             idx,
-                            name: name.clone(),
+                            name: t.name.clone(),
+                            method: t.method.clone(),
                             depth,
                             loaded: false,
                         })
@@ -443,8 +600,8 @@ impl Collection {
     /// expanded keeps listing its requests from the cache.
     pub fn snapshot_loaded_titles(&mut self) {
         if let Some(path) = self.path.clone() {
-            let names = self.entries.iter().map(ws_request_label).collect();
-            self.workspace_titles.insert(path, names);
+            let titles = self.entries.iter().map(ws_request_title).collect();
+            self.workspace_titles.insert(path, titles);
         }
     }
 
@@ -496,16 +653,6 @@ impl Collection {
         self.entries.iter().any(|e| e.user_added || e.modified)
     }
 
-    /// `true` when this tab is holding *any* request edit that exists only in
-    /// memory — the loaded file's, or a Workspace file's parked while the user
-    /// looks at another one. This is the question to ask before doing something
-    /// that discards them (closing the tab, quitting); [`Self::has_unsaved_edits`]
-    /// alone would miss a Workspace tab's parked files.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    pub fn has_any_unsaved_edits(&self) -> bool {
-        self.has_unsaved_edits() || !self.workspace_pending.is_empty()
-    }
-
     /// How many requests in this tab are added-but-unsaved or edited, counting
     /// a Workspace tab's parked files as well as the one it is showing.
     pub fn unsaved_edit_count(&self) -> usize {
@@ -528,6 +675,28 @@ impl Collection {
             })
             .sum();
         loaded + parked
+    }
+
+    /// How many of this tab's request edits would be gone for good after a
+    /// quit — the question to ask before warning about closing the app, as
+    /// opposed to [`Self::unsaved_edit_count`], which answers what closing
+    /// *this tab* would throw away.
+    ///
+    /// The two differ because quitting is not the same as discarding. A plain
+    /// tab's entries are written to the session state verbatim, edit markers
+    /// included, so its edits are still there — still flagged, still unsaved —
+    /// next time the app starts; warning about those taught the user to dismiss
+    /// a dialog that was never true. A Workspace tab is the exception: it is
+    /// bound to a live folder rather than to a snapshot, so its entries are
+    /// deliberately not persisted and its selected file is re-read from disk on
+    /// restore, which does drop anything edited but not saved.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn edits_lost_on_exit(&self) -> usize {
+        if self.workspace_root.is_some() {
+            self.unsaved_edit_count()
+        } else {
+            0
+        }
     }
 
     /// `true` when the workspace collection file at `path` has unsaved edits —
@@ -562,6 +731,55 @@ impl Collection {
         entries.get(idx).is_some_and(|e| e.user_added || e.modified)
     }
 
+    /// Discard request `ei`'s in-memory edits by reloading that single entry,
+    /// from the same position, out of this collection's on-disk file (#19).
+    ///
+    /// Returns the reverted request's HTTP method on success, or `None` when
+    /// there's nothing to revert to — the collection has no file (scratch), the
+    /// file can't be read/parsed, or it holds no entry at that position (e.g. a
+    /// never-saved request). The other entries and their edits are untouched.
+    pub fn revert_request(&mut self, ei: usize) -> Option<String> {
+        let path = self.path.clone()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut disk = crate::postman::parse_collection(&content);
+        if ei >= disk.len() || ei >= self.entries.len() {
+            return None;
+        }
+        let entry = disk.swap_remove(ei);
+        let method = entry.method.clone();
+        self.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        Some(method)
+    }
+
+    /// Throw away every in-memory edit to the workspace collection file at
+    /// `path`, so the tab shows exactly what is on disk again.
+    ///
+    /// Works whether or not `path` is the file this tab currently has loaded:
+    /// an edited file switched away from lives on in `workspace_pending`, and
+    /// its requests are what the tree lists for it, so both places have to be
+    /// dropped or the edits would come back the moment it was reopened. Errors
+    /// if the file can't be re-read, and changes nothing in that case.
+    pub fn revert_workspace_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let entries = crate::postman::parse_collection(&std::fs::read_to_string(path)?);
+        self.workspace_pending.remove(path);
+        if self.path.as_deref() == Some(path) {
+            let sel = self.selected_entry;
+            self.entries = entries;
+            self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
+            self.invalidate_request_json();
+            self.sync_folder_to_selected();
+        } else {
+            // Not loaded: the tree lists it from the title cache, which was
+            // snapshotted off the edited entries. Re-snapshot from disk so the
+            // row names match the file again.
+            let titles = entries.iter().map(ws_request_title).collect();
+            self.workspace_titles.insert(path.to_path_buf(), titles);
+        }
+        Ok(())
+    }
+
     /// Clear this collection's "new"/"edited" request markers, and drop any
     /// parked edits for its file — called whenever its `.hurl` is written to
     /// disk (local Save or git push) so every save path agrees on what "saved"
@@ -576,9 +794,52 @@ impl Collection {
         }
     }
 
+    /// Write every edited file this Workspace tab is holding back to disk — the
+    /// one it is showing as well as the ones parked in `workspace_pending` —
+    /// and clear the edit markers. Returns how many files were written, or the
+    /// first path that could not be, so the caller can say which one failed.
+    ///
+    /// This is what "Save all changes" on the quit dialog needs, and it is
+    /// deliberately the same set of files that [`Self::edits_lost_on_exit`]
+    /// counts: an ordinary tab is left alone because its edits are persisted to
+    /// the session state rather than lost, so silently writing them out to a
+    /// file on the way out of the app would be doing something the user never
+    /// asked for. A Workspace tab's edits, by contrast, have a file they came
+    /// from and are otherwise dropped on exit.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn save_workspace_edits(&mut self) -> Result<usize, String> {
+        if self.workspace_root.is_none() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        // The loaded file first: saving it also drops its parked copy, so the
+        // parked pass below can't then write a stale snapshot back over it.
+        if self.has_unsaved_edits()
+            && let Some(path) = self.path.clone()
+        {
+            write_hurl(&path, &self.to_hurl())?;
+            written += 1;
+        }
+        let parked: Vec<(PathBuf, Vec<HurlEntry>)> = self
+            .workspace_pending
+            .iter()
+            .filter(|(path, _)| self.path.as_deref() != Some(path.as_path()))
+            .map(|(p, e)| (p.clone(), e.clone()))
+            .collect();
+        for (path, entries) in parked {
+            if !entries.iter().any(|e| e.user_added || e.modified) {
+                continue;
+            }
+            write_hurl(&path, &collection_to_hurl(&entries))?;
+            written += 1;
+        }
+        self.workspace_pending.clear();
+        self.mark_saved();
+        Ok(written)
+    }
+
     /// Re-read the request names of every expanded collection file that isn't
-    /// the currently-loaded one, populating `workspace_titles` from disk. Used
-    /// after restoring persisted state, where collections expanded last session
+    /// the currently-loaded one, populating `workspace_titles` from disk. Used    /// after restoring persisted state, where collections expanded last session
     /// must list their requests without having been opened yet this session.
     pub fn rebuild_expanded_titles(&mut self) {
         let loaded = self.path.clone();
@@ -591,8 +852,8 @@ impl Collection {
             {
                 continue;
             }
-            let names = read_collection_labels(&p);
-            self.workspace_titles.insert(p, names);
+            let titles = read_collection_labels(&p);
+            self.workspace_titles.insert(p, titles);
         }
     }
 
@@ -653,7 +914,25 @@ impl Collection {
     /// changed programmatically (as opposed to normal Up/Down/Enter list
     /// navigation, which keeps the two in sync itself) — e.g. after adding,
     /// deleting, or renaming a request, or restoring persisted state.
+    /// A Workspace tab's `list_cursor` indexes the file tree
+    /// ([`Self::ws_rows`]), not the request list, so the row it wants is the
+    /// one [`Self::sync_ws_cursor`] computes. Writing a request-list index
+    /// into it here would point at an unrelated file (usually the top of the
+    /// tree), which is what saving an edited request used to do: commit the
+    /// wizard, and the selection left the request and jumped to the first row
+    /// of the workspace.
     pub fn sync_folder_to_selected(&mut self) {
+        if self.is_workspace() {
+            let idx = self
+                .selected_entry
+                .min(self.entries.len().saturating_sub(1));
+            self.selected_entry = idx;
+            if !self.entries.is_empty() {
+                self.folder = tree::folder_of(&self.entries, idx);
+            }
+            self.sync_ws_cursor();
+            return;
+        }
         if self.entries.is_empty() {
             self.folder = Vec::new();
             self.list_cursor = 0;
@@ -664,5 +943,299 @@ impl Collection {
         self.folder = tree::folder_of(&self.entries, idx);
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
+    }
+}
+
+#[cfg(test)]
+mod ws_scan_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_ws_scan_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn workspace_at(root: &Path) -> Collection {
+        let mut c = Collection::new("ws".into(), Vec::new());
+        c.workspace_root = Some(root.to_path_buf());
+        c
+    }
+
+    fn names(rows: &[WsRow]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                WsRow::Folder { name, .. }
+                | WsRow::Report { name, .. }
+                | WsRow::Environment { name, .. }
+                | WsRow::Collection { name, .. } => name.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// The graphical front-end asks for the tree once per frame. Reading it off
+    /// disk that often is real I/O on every mouse move, so a scan is reused for
+    /// [`WS_SCAN_TTL`] — and then genuinely re-read, because a workspace can
+    /// change from outside PaperBoy.
+    #[test]
+    fn the_workspace_tree_is_read_off_disk_at_most_once_per_ttl() {
+        let root = tmp_root("ttl");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        let c = workspace_at(&root);
+
+        // The generation is held fixed: this test is about the *time* window,
+        // and PaperBoy is not the one making the change.
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["a.hurl"]);
+
+        // A file appears behind PaperBoy's back. Within the window the tree is
+        // the one already in hand — that is the whole point of the cache.
+        fs::write(root.join("b.hurl"), "").unwrap();
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0 + WS_SCAN_TTL / 2, 7)),
+            vec!["a.hurl"],
+            "still serving the cached scan"
+        );
+
+        // Once the window passes, the disk is read again and the new file shows
+        // up without anyone having told PaperBoy about it.
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0 + WS_SCAN_TTL + Duration::from_millis(1), 7)),
+            vec!["a.hurl", "b.hurl"],
+            "the tree catches up with the filesystem"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The environments panel's file list comes out of the same cached scan the
+    /// tree does, so drawing the panel doesn't walk the workspace again —
+    /// several times per frame, as it used to.
+    #[test]
+    fn the_environment_file_list_is_served_from_the_tree_scan() {
+        let root = tmp_root("envscan");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        fs::write(root.join("dev.vars"), "K=1").unwrap();
+        let c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(
+            c.workspace_env_files_as_of(t0, 7),
+            vec![root.join("dev.vars")],
+            "the workspace's environment files, and only those"
+        );
+
+        // Written behind PaperBoy's back and *not* seen, which is the proof:
+        // a fresh scan would have found it, so this answer came from the cache
+        // the tree filled in above.
+        fs::write(root.join("prod.vars"), "K=2").unwrap();
+        assert_eq!(
+            c.workspace_env_files_as_of(t0 + WS_SCAN_TTL / 2, 7),
+            vec![root.join("dev.vars")],
+            "no second walk of the disk"
+        );
+        // And it does catch up once the window passes, like the tree does.
+        assert_eq!(
+            c.workspace_env_files_as_of(t0 + WS_SCAN_TTL + Duration::from_millis(1), 7),
+            vec![root.join("dev.vars"), root.join("prod.vars")]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tab that isn't a workspace has no files to offer — and must not scan
+    /// anything looking for them.
+    #[test]
+    fn a_non_workspace_tab_lists_no_environment_files() {
+        let c = Collection::new("scratch".into(), Vec::new());
+        assert!(c.workspace_env_files().is_empty());
+    }
+
+    /// The panel lists a workspace's environments whether or not the tab's
+    /// display filter is narrowing the *tree* to collections — the filter
+    /// chooses what the tree shows, not what environments exist.
+    #[test]
+    fn the_display_filter_does_not_hide_environment_files() {
+        let root = tmp_root("envfilter");
+        fs::write(root.join("dev.vars"), "K=1").unwrap();
+        let mut c = workspace_at(&root);
+        c.workspace_filter_hurl_json = true;
+        assert_eq!(c.workspace_env_files(), vec![root.join("dev.vars")]);
+        c.workspace_filter_hurl_json = false;
+        assert_eq!(c.workspace_env_files(), vec![root.join("dev.vars")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cache must not answer a question it wasn't asked: changing the
+    /// filter (or the root) has to re-read, however fresh the last scan is.
+    #[test]
+    fn changing_the_filter_or_the_root_bypasses_a_fresh_scan() {
+        let root = tmp_root("keys");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        fs::write(root.join("notes.txt"), "").unwrap();
+        let mut c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["a.hurl"], "filtered");
+
+        c.workspace_filter_hurl_json = false;
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["a.hurl", "notes.txt"],
+            "showing everything, at the very same instant"
+        );
+
+        let other = tmp_root("keys_other");
+        fs::write(other.join("z.hurl"), "").unwrap();
+        c.workspace_root = Some(other.clone());
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["z.hurl"],
+            "a different root is a different tree"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    /// PaperBoy's own edits must not have to wait out the window: creating a
+    /// file and then not finding it in the tree is a bug, not a stale cache.
+    #[test]
+    fn the_app_s_own_file_operations_show_up_at_once() {
+        let root = tmp_root("generation");
+        fs::write(root.join("a.hurl"), "").unwrap();
+        let c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_at(t0)), vec!["a.hurl"]);
+
+        crate::workspace::create_item(&root, &root, "b", crate::workspace::NewItemKind::Collection)
+            .expect("created");
+        assert_eq!(
+            names(&c.ws_rows_at(t0)),
+            vec!["a.hurl", "b.hurl"],
+            "at the very same instant, well inside the scan window"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Expanding a folder is a *view* change, not a filesystem one, so it must
+    /// take effect on the very next frame rather than waiting out the TTL.
+    #[test]
+    fn expanding_a_folder_shows_its_contents_immediately() {
+        let root = tmp_root("expand");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/inner.hurl"), "").unwrap();
+        let mut c = workspace_at(&root);
+
+        let t0 = Instant::now();
+        assert_eq!(names(&c.ws_rows_as_of(t0, 7)), vec!["sub"], "collapsed");
+
+        c.workspace_expanded.insert(root.join("sub"));
+        assert_eq!(
+            names(&c.ws_rows_as_of(t0, 7)),
+            vec!["sub", "inner.hurl"],
+            "no wait for the scan window: the filter isn't cached"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_revert_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A file edited and then switched away from keeps its edits in
+    /// `workspace_pending`, and the tree lists its requests from the title
+    /// cache snapshotted off those same edited entries. Reverting it has to
+    /// clear both, or reopening the file would bring the edits back and the
+    /// tree would go on showing the edited names in the meantime.
+    #[test]
+    fn reverting_a_file_that_isnt_loaded_drops_its_parked_edits() {
+        let root = tmp_root("parked");
+        let a = root.join("a.hurl");
+        let b = root.join("b.hurl");
+        fs::write(&a, "GET https://example.com/a\n").unwrap();
+        fs::write(&b, "GET https://example.com/b\n").unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+
+        col.load_workspace_file(a.clone()).unwrap();
+        col.entries[0].url = "https://edited.example".into();
+        col.entries[0].modified = true;
+        // Switching away parks the edits and caches the edited row names.
+        col.load_workspace_file(b.clone()).unwrap();
+        assert!(col.workspace_file_edited(&a), "the edits are parked");
+
+        col.revert_workspace_file(&a).unwrap();
+
+        assert!(!col.workspace_file_edited(&a), "and now they are gone");
+        col.load_workspace_file(a.clone()).unwrap();
+        assert_eq!(
+            col.entries[0].url, "https://example.com/a",
+            "reopening the file shows what is on disk, not the discarded edit"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Reverting the loaded file leaves the tab showing it — same file, same
+    /// request selected — with the edits gone.
+    #[test]
+    fn reverting_the_loaded_file_restores_it_in_place() {
+        let root = tmp_root("loaded");
+        let a = root.join("a.hurl");
+        fs::write(
+            &a,
+            "GET https://example.com/a\nGET https://example.com/a2\n",
+        )
+        .unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+        col.load_workspace_file(a.clone()).unwrap();
+        col.selected_entry = 1;
+        col.entries[1].url = "https://edited.example".into();
+        col.entries[1].modified = true;
+
+        col.revert_workspace_file(&a).unwrap();
+
+        assert_eq!(col.path.as_deref(), Some(a.as_path()));
+        assert_eq!(col.selected_entry, 1, "the selection stays where it was");
+        assert_eq!(col.entries[1].url, "https://example.com/a2");
+        assert!(!col.has_unsaved_edits());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A file that has vanished can't be reverted to — and the attempt must
+    /// leave the in-memory edits alone rather than half-clearing them.
+    #[test]
+    fn reverting_an_unreadable_file_changes_nothing() {
+        let root = tmp_root("missing");
+        let a = root.join("a.hurl");
+        fs::write(&a, "GET https://example.com/a\n").unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+        col.load_workspace_file(a.clone()).unwrap();
+        col.entries[0].url = "https://edited.example".into();
+        col.entries[0].modified = true;
+        fs::remove_file(&a).unwrap();
+
+        assert!(col.revert_workspace_file(&a).is_err());
+        assert_eq!(col.entries[0].url, "https://edited.example");
+        assert!(col.has_unsaved_edits());
+        let _ = fs::remove_dir_all(&root);
     }
 }

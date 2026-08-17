@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -9,27 +9,35 @@ use ratatui_explorer::FileExplorer;
 
 use crate::collection::Collection;
 use crate::environment::{
-    EnvUpdate, EnvVar, Environment, PendingSecret, looks_like_env, parse_vars_pending,
-    spawn_resolution,
+    EnvVar, Environment, PendingSecret, looks_like_env, parse_vars_pending, spawn_resolution,
 };
 use crate::git_remote::{self, GitOrigin, RefKind};
-use crate::http::ApiResponse;
 use crate::hurl::{FormFieldKind, HurlEntry, RunStatus};
-use crate::i18n::{Language, Status, Strings};
-use crate::request::{self, AppVars, CaptureUpdate, build_request_json};
+use crate::i18n::{Status, Strings};
+use crate::request::{self, build_request_json};
 
 use super::editor::*;
 use super::git_save::*;
+use super::listscroll::ListScroll;
 use super::new_request::*;
+use super::postman::*;
 use super::remote::*;
+use crate::postman_flow::{PostmanEvent, Step};
+use crate::postman_import::{ImportFormat, ImportSummary};
+use crate::remote_flow::{FlowEvent, RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::save_flow::{SaveFlow, SaveSource, SaveTargetKind};
 use tui_panel_select::MultiSelectPanel;
 use tui_panel_select::wrapcache::TextPos;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum FileAction {
     SaveRequest,
     LoadRequest,
     OpenCollection,
+    /// A `.json` file exported from Postman, opened without the user having to
+    /// say first whether it holds a collection or an environment — the file
+    /// itself says which, and Postman gives both the same extension.
+    ImportPostmanFile,
     SaveCollection,
     LoadEnv,
     SaveEnv,
@@ -49,6 +57,12 @@ pub(crate) enum FileAction {
     /// permanently (see [`TuiApp::pending_workspace_save`]) — confirms on
     /// `Space` exactly like `OpenWorkspace`, then a name prompt follows.
     SaveWorkspaceChooseFolder,
+    /// Picking the PARENT FOLDER the Postman import will create its workspace
+    /// folder inside, with the folder's own name typed into the browser's
+    /// inline name editor — the same shape as `SaveWorkspaceChooseFolder`. The
+    /// wizard is parked in [`TuiApp::parked_postman`] meanwhile, since the
+    /// browser needs the overlay slot.
+    PostmanDestChooseFolder,
     /// Picking the DESTINATION FOLDER for a workspace file or folder being
     /// moved (see [`TuiApp::pending_workspace_move`]) — confirms on `Space`
     /// like the other folder pickers, since there is no name to type. The
@@ -99,6 +113,24 @@ pub(crate) enum FileAction {
     /// [`TuiApp::pending_node_folder`] (`FileAction` stays `Copy`, so the node
     /// path can't live in the variant).
     PickReportNodeFolder,
+    /// Picking the FOLDER for a report's `# root:` header directive from the
+    /// node editor's settings section. Confirms on `Space` (the current
+    /// directory) like the other folder pickers; the target report and
+    /// directive are parked in [`TuiApp::pending_header_path`].
+    PickReportHeaderFolder,
+    /// Picking the FILE for a report's `# baseline:` header directive from the
+    /// node editor's settings section — a plain file pick (Enter on the file),
+    /// parked the same way as `PickReportHeaderFolder`.
+    PickReportHeaderFile,
+    /// Picking the FOLDER for a `PARAM … FOLDER` in a report's run settings.
+    /// Confirms on `Space` (the current directory) like the other folder
+    /// pickers; the target report and parameter are parked in
+    /// [`TuiApp::pending_param_path`].
+    PickReportParamFolder,
+    /// Picking the FILE for a `PARAM … FILE` in a report's run settings — a
+    /// plain file pick (Enter on the file), parked the same way as
+    /// `PickReportParamFolder`.
+    PickReportParamFile,
 }
 
 impl FileAction {
@@ -116,6 +148,7 @@ impl FileAction {
                 | FileAction::SaveReportBaselineChooseFolder
                 | FileAction::SaveReportChooseFolder
                 | FileAction::NewReportChooseFolder
+                | FileAction::PostmanDestChooseFolder
         )
     }
 }
@@ -163,6 +196,29 @@ pub(crate) enum PromptKind {
     ReportNodeLine {
         report_id: u64,
         path: Vec<usize>,
+    },
+    /// Typing the value of one report-header directive in the node editor's
+    /// settings section — `columns:`, a path, or any directive being edited as
+    /// raw text with `e`. Committing writes `# <key>: <text>` (an empty commit
+    /// removes the directive, matching Delete on the row). Addressed by
+    /// `report_id` rather than tab index so a tab reorder can't misroute it,
+    /// exactly like [`PromptKind::ReportNodeLine`].
+    /// Typing the value of one report `PARAM` in the run settings view.
+    /// Committing sets it for the next run only — the source is untouched,
+    /// because a parameter's value belongs to the run, not to the report.
+    /// Addressed by `report_id` for the same reason as the two above.
+    ReportParamValue {
+        report_id: u64,
+        name: String,
+    },
+    ReportHeaderValue {
+        report_id: u64,
+        key: &'static str,
+        /// Which occurrence of `key` is being edited — see
+        /// [`crate::tui::report_nodes::SettingRow::occurrence`]. `collection:`
+        /// repeats, so this is what keeps a helper row from overwriting the
+        /// primary collection.
+        occurrence: usize,
     },
 }
 
@@ -373,10 +429,35 @@ impl WorkspacePickerState {
     }
 }
 
+/// Take the overlay out of the app, but **only** when it is the one asked for.
+///
+/// The obvious spelling of this is a `let ... else` over `self.overlay.take()`,
+/// and it is wrong in a way that is easy to miss and severe when it happens:
+/// `take()` is evaluated before the pattern is matched, so an overlay that
+/// *doesn't* match has already been removed by the time the arm gives up, and
+/// is dropped. Anything polled on every pass of the event loop then quietly
+/// closes whatever the user just opened — which is exactly how the File and
+/// Settings menus, and the quit confirmation, once became unreachable.
+///
+/// Here the closure is handed the overlay and must give it back (as `Err`) if
+/// it isn't interested, so declining to match cannot lose it.
+///
+/// Prefer the [`take_overlay!`] macro, which writes the give-it-back arm.
+macro_rules! take_overlay {
+    ($app:expr, $pat:pat => $out:expr) => {
+        $app.take_overlay_matching(|overlay| match overlay {
+            $pat => Ok($out),
+            other => Err(other),
+        })
+    };
+}
+pub(crate) use take_overlay;
+
 pub(crate) enum Overlay {
-    /// Top-level File menu: just "(L)oad" / "(S)ave", each opening its own
-    /// grouped submenu (see `FileLoadMenu`/`FileSaveMenu`) — replaces the old
-    /// flat 12-item list that had grown hard to scan.
+    /// Top-level File menu: "(L)oad" / "(S)ave" / "(I)mport", each opening its
+    /// own grouped submenu (see `FileLoadMenu` / `FileSaveMenu` /
+    /// `FileImportMenu`) — replaces the old flat 12-item list that had grown
+    /// hard to scan.
     FileMenu(usize),
     /// The "Load" submenu of the File menu: just the *kinds* (Request /
     /// Collection / Environment / Workspace). Picking a kind that can come
@@ -384,6 +465,9 @@ pub(crate) enum Overlay {
     /// git; Request (local-only) goes straight to its path prompt. Esc/q
     /// returns to `FileMenu(0)`.
     FileLoadMenu(usize),
+    /// The "Import" submenu of the File menu: an exported Postman file, or a
+    /// Postman account to connect to. Esc/q returns to `FileMenu(2)`.
+    FileImportMenu(usize),
     /// The "Save" submenu of the File menu: just the *kinds* (Request /
     /// Collection / Environment / Workspace / Response). Picking a kind with
     /// more than one destination opens `FileSaveDest`; Request/Response go
@@ -443,6 +527,10 @@ pub(crate) enum Overlay {
     NewRequest(Box<NewReq>),
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
+    /// The "import a whole Postman workspace" wizard (File ▸ Load ▸ Workspace ▸
+    /// From Postman…). Its state machine is shared with the GUI — see
+    /// [`crate::postman_flow`].
+    PostmanImport(Box<PostmanWizard>),
     GitSave(Box<GitSaveWizard>),
     /// Dry-run preview for a report tab: the projected row count, a sample of
     /// Drill-down popup for a results grid cell: shows the selected cell's full
@@ -474,6 +562,14 @@ pub(crate) enum Overlay {
     /// collection. Opened with `a` (add) or `Enter`/`e` (edit a request node) in
     /// the node view. See [`crate::tui::report_nodes::NodeMenu`].
     ReportNodeMenu(Box<crate::tui::report_nodes::NodeMenu>),
+    /// The node editor's **settings** menu ([`Overlay::ReportSettingMenu`]): a
+    /// one-step list that either adds a report-header directive (`a` on the
+    /// settings section) or picks the value of one that has a closed set of
+    /// answers — the output format, or one of the loaded environments. The
+    /// directives whose values are open-ended use a text prompt instead, and
+    /// `collection:` reuses the existing bind picker.
+    /// See [`crate::tui::report_nodes::SettingMenu`].
+    ReportSettingMenu(Box<crate::tui::report_nodes::SettingMenu>),
     /// The structured node editor's reported-request detail form
     /// ([`Overlay::ReportNodeRequest`]): configures a `REPORT REQUEST` node's
     /// response format, `AS` alias and `SHOW(…)` field checklist. Opened with
@@ -596,13 +692,13 @@ pub(crate) enum Overlay {
 }
 
 /// Which action a confirmation popup is guarding.
-#[derive(Clone, Copy, PartialEq)]
+/// Not `Copy`: [`Self::RevertWorkspaceFile`] names a file, and a path can't be
+/// squeezed into an index the way the other variants' targets can (a workspace
+/// tree row is a file, not a slot in a list).
+#[derive(Clone, PartialEq)]
 pub(crate) enum ConfirmAction {
     Exit,
     Clear,
-    /// Save a collection / environment to its ORIGINAL file (clears the "new"
-    /// and "modified" markers). Only raised when there are unsaved changes.
-    Save(FileAction),
     /// "Save As" to a path that already exists — confirm the overwrite. The
     /// target path is held in [`TuiApp::pending_save_path`].
     Overwrite(FileAction),
@@ -618,6 +714,11 @@ pub(crate) enum ConfirmAction {
     /// values. Holds the env id. Raised by `Ctrl+R` in the entries popup only
     /// when the env has unsaved changes.
     RevertEnv(u64),
+    /// Discard every in-memory edit to a workspace collection file, restoring
+    /// it from disk. Holds `(tab index, file path)`. Raised by a right-click on
+    /// an edited file row in the workspace tree (and by the GUI's context
+    /// menu), only when that file actually has unsaved edits.
+    RevertWorkspaceFile(usize, std::path::PathBuf),
     /// Rerun the active report when its current on-screen results haven't been
     /// exported (CSV/JSON/HTML/XLSX or a `.baseline` snapshot) since the run
     /// that produced them — confirming discards the unsaved results. Acts on the
@@ -689,6 +790,10 @@ pub(crate) enum MouseHitTarget {
     RunRequest,
     ReportResultsCell,
     ReportNodeRow(usize),
+    /// A row of the node editor's report-settings section, above the outline.
+    ReportSettingRow(usize),
+    /// A row of the run settings view — one declared `PARAM`.
+    ReportParamRow(usize),
     OverlayRow(usize),
     ConfirmChoice(usize),
     HelpTab(usize),
@@ -724,7 +829,9 @@ impl MouseHitTarget {
             MouseHitTarget::ReportResultsCell => Some(MouseScrollTarget::ReportPane(
                 crate::tui::reports::ReportPane::Results,
             )),
-            MouseHitTarget::ReportNodeRow(_) => Some(MouseScrollTarget::ReportPane(
+            MouseHitTarget::ReportNodeRow(_)
+            | MouseHitTarget::ReportSettingRow(_)
+            | MouseHitTarget::ReportParamRow(_) => Some(MouseScrollTarget::ReportPane(
                 crate::tui::reports::ReportPane::Source,
             )),
             MouseHitTarget::OverlayRow(_) | MouseHitTarget::ConfirmChoice(_) => {
@@ -776,9 +883,23 @@ pub(crate) struct MouseHit {
 /// concatenates them in reading order (see
 /// `input::concatenated_selection_text`, which iterates the two panels in
 /// this order directly).
-/// The 2 top-level File menu items: "(L)oad" and "(S)ave".
-pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
-    [s.file_menu_item_load, s.file_menu_item_save]
+/// The 3 top-level File menu items: "(L)oad", "(S)ave" and "(I)mport".
+///
+/// Import is here rather than buried under Load ▸ Workspace ▸ From Postman
+/// because it is what someone arriving from Postman comes looking for, and
+/// they will not find it by first deciding that what they want is a workspace.
+pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 3] {
+    [
+        s.file_menu_item_load,
+        s.file_menu_item_save,
+        s.file_menu_item_import,
+    ]
+}
+
+/// The "Import" submenu: the two ways a Postman user's work can arrive, named
+/// after what *they* have — a file they exported, or an account to connect to.
+pub(crate) fn file_import_items(s: &Strings) -> [&'static str; 2] {
+    [s.file_import_item_file, s.file_import_item_account]
 }
 
 /// The kinds of thing the File menu can load or save. Chosen in the first
@@ -856,9 +977,18 @@ pub(crate) fn file_load_items(s: &Strings) -> [&'static str; 5] {
     ]
 }
 
-/// The two "Load" source choices: a local file or a git remote.
-pub(crate) fn file_load_source_items(s: &Strings) -> [&'static str; 2] {
-    [s.file_source_local, s.file_source_git]
+/// The "Load" source choices for `kind`: a local file or a git remote, plus —
+/// for a Workspace — bulk import from Postman, which produces a whole folder
+/// of collections and environments and so has nowhere else to belong.
+pub(crate) fn file_load_source_items(kind: FileKind, s: &Strings) -> Vec<&'static str> {
+    match kind {
+        FileKind::Workspace => vec![
+            s.file_source_local,
+            s.file_source_git,
+            s.file_source_postman,
+        ],
+        _ => vec![s.file_source_local, s.file_source_git],
+    }
 }
 
 /// The "Save" destination choices for `kind`. Collections can be saved to
@@ -946,10 +1076,6 @@ pub(crate) enum ClosedTab {
 }
 
 pub struct TuiApp {
-    pub(crate) language: Language,
-    pub(crate) vars: AppVars,
-    pub(crate) collections: Vec<Collection>,
-    pub(crate) active_tab: usize,
     /// Report tabs (PaperTrail `.trail` documents). *Standalone* reports show in
     /// the same tab bar after the collection tabs — the unified tab index
     /// (`active_tab`) counts collections first, then the standalone reports (see
@@ -960,17 +1086,6 @@ pub struct TuiApp {
     /// `active_tab` is that collection index. See [`Self::active_is_report`] and
     /// [`Self::embedded_report_index`].
     pub(crate) reports: Vec<crate::tui::reports::ReportTab>,
-    pub(crate) response: Arc<Mutex<ApiResponse>>,
-
-    /// The global list of Environments, shared across all collections (see
-    /// the "Global Environments" panel, `Pane::GlobalEnv`). Individual
-    /// collections may `linked_env_id` one of these; at most one may be
-    /// `active_env_id` at a time.
-    pub(crate) global_envs: Vec<Environment>,
-    /// The currently-activated Global Environment, if any — its vars are
-    /// used for substitution in any collection (subject to being overridden
-    /// by that collection's own `linked_env_id`, if set, on name collision).
-    pub(crate) active_env_id: Option<u64>,
     /// Undo stack for deleted Global Environments: each entry is the list index
     /// the environment was removed from plus the environment itself, so `u`
     /// (in the Global Environments panel) can reopen the most recent one. The
@@ -978,12 +1093,21 @@ pub struct TuiApp {
     pub(crate) deleted_envs: Vec<(usize, Environment)>,
 
     pub(crate) focus: Pane,
-    /// Selected row in the Global Environments list (panel showing env
-    /// NAMES only — see `Pane::GlobalEnv`). Renamed from the old `env_idx`,
-    /// which used to index the selected *variable* row inside the old
-    /// inline Environment panel; that per-variable selection now lives in
-    /// `Overlay::EnvPopup`'s own `EnvPopupState::idx`.
+    /// Selected row in the Global Environments list — an index into
+    /// [`Self::env_rows`], *not* into `global_envs`: the panel also lists the
+    /// open Workspace's environment files, including ones not loaded yet, and
+    /// the filter can hide any of them. Use [`Self::selected_env_row`] to get
+    /// at what it points to.
     pub(crate) global_env_idx: usize,
+    /// Type-to-filter query for the Global Environments panel (`/` starts it).
+    /// A case-insensitive substring of the environment name; empty means no
+    /// filtering. Runtime-only — a filter is a way of finding something now,
+    /// not a setting, so it isn't persisted across restarts.
+    pub(crate) env_query: String,
+    /// True while `/` filter entry is capturing keys for the Global
+    /// Environments panel, so letters type into the query instead of firing the
+    /// panel's single-key actions (`a`, `x`, `u`, …).
+    pub(crate) env_filter_typing: bool,
     /// Max scroll offset for the Response body (wrapped content rows −
     /// viewport height); cached each frame by `draw_response` from
     /// `resp_panel.clamp_scroll(..)` so a scrollbar drag between frames (and
@@ -1056,6 +1180,13 @@ pub struct TuiApp {
     /// adjusting that panel's scroll even if the cursor briefly leaves the
     /// scrollbar's one-column-wide hit area. Cleared on `Up`.
     pub(crate) scrollbar_drag: Option<Pane>,
+    /// Whether the pointer has actually moved since the left button went down
+    /// over a text panel. `begin` on a panel always leaves a degenerate
+    /// one-character region behind, so "is anything selected?" cannot tell a
+    /// deliberate drag from a plain click — and a plain click must not copy
+    /// (it is how a panel is focused). Set by the `Drag` handlers, cleared on
+    /// `Down`, read on `Up`. Runtime-only.
+    pub(crate) mouse_drag_moved: bool,
     /// Screen text areas for the report view's three panels (Source,
     /// Validation, Results), recorded during draw for mouse hit-testing
     /// (selection begin/drag + scrollbar click/drag), analogous to
@@ -1081,13 +1212,22 @@ pub struct TuiApp {
     /// recorded during draw so the scroll can be clamped to stop at the name's
     /// end (no scrolling past into blank space).
     pub(crate) list_scroll_w: std::cell::Cell<u16>,
+    /// The request/workspace tree's vertical scroll offset, carried between
+    /// frames and tagged with the tab it belongs to (another tab's scroll
+    /// position means nothing in this one). See [`ListScroll`] for why a list
+    /// that forgets where it was scrolled to follows the cursor instead of
+    /// letting the cursor move through it.
+    pub(crate) list_scroll: ListScroll,
+    /// Scroll position of the Global Environments panel.
+    pub(crate) env_list_scroll: ListScroll,
+    /// Scroll position of the variables list inside the environment popup,
+    /// tagged with the environment on show so opening a different one starts
+    /// at the top.
+    pub(crate) env_var_scroll: ListScroll,
+    /// Scroll position of the workspace file picker, tagged with the folder it
+    /// is listing.
+    pub(crate) ws_picker_scroll: ListScroll,
     pub(crate) global_env_scroll_w: std::cell::Cell<u16>,
-    pub(crate) response_pct: u16,
-    /// Width (columns) of the left column (Requests/Environment panels),
-    /// user-adjustable with `<`/`>` and persisted across restarts.
-    pub(crate) list_width: u16,
-
-    pub(crate) status: Option<Status>,
     pub(crate) overlay: Option<Overlay>,
     /// Vertical scroll offset (rows) into the currently-open Help popup's
     /// body — reset to 0 whenever Help is (re)opened or its tab is
@@ -1103,15 +1243,6 @@ pub struct TuiApp {
     pub(crate) help_query: String,
     pub(crate) quit: bool,
 
-    /// Receivers for in-flight background secret resolution (one per env load).
-    pub(crate) pending_env: Vec<Receiver<EnvUpdate>>,
-
-    /// Receivers for in-flight response captures (one per run of a capturing entry).
-    pub(crate) pending_captures: Vec<Receiver<CaptureUpdate>>,
-
-    /// Receivers for in-flight "Run All" (Alt+F5) passes over a whole collection.
-    pub(crate) pending_batch_runs: Vec<Receiver<request::BatchRunUpdate>>,
-
     /// Receivers for in-flight background report runs (one per running report),
     /// each tagged with its report id, drained by
     /// [`Self::poll_report_run_updates`]. A report runs on its own thread so the
@@ -1124,14 +1255,6 @@ pub struct TuiApp {
     /// discarded. Presence of a key also gates a second run of the same report.
     pub(crate) running_reports:
         std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
-
-    /// Folder the file browser last selected a file from; it reopens here.
-    pub(crate) last_browse_dir: Option<PathBuf>,
-
-    /// Folder the last *environment* file was loaded from; the environment
-    /// picker reopens here (falling back to `last_browse_dir`), so it isn't
-    /// dragged around by loads of unrelated file types.
-    pub(crate) last_env_dir: Option<PathBuf>,
 
     /// One-shot start folder for the *new-report* folder browser
     /// ([`FileAction::NewReportChooseFolder`]): the highlighted workspace folder
@@ -1152,43 +1275,6 @@ pub struct TuiApp {
     /// exactly where you started. Descending into any *other* folder (a genuine
     /// new navigation) clears it. Only meaningful while a browser overlay is up.
     pub(crate) browser_forward_path: Option<PathBuf>,
-
-    /// Settings (persisted): confirm before quitting / closing all collections.
-    pub(crate) confirm_on_exit: bool,
-    pub(crate) confirm_on_clear: bool,
-    /// Preferences (persisted): confirm before deleting a Global Environment
-    /// (`x` in the Global Environments panel). On by default; turn it off to
-    /// always delete immediately (the deletion stays undoable with `u`).
-    pub(crate) confirm_on_delete_env: bool,
-    /// Preferences (persisted): when set, a "Save / Discard / Cancel" prompt
-    /// for unsaved in-memory edits (switching collections in a Workspace, or
-    /// pushing one to git) is skipped and the "Save" action taken
-    /// automatically. Off by default, so the prompt is shown.
-    pub(crate) always_save_when_prompted: bool,
-    /// Preferences (persisted): which of JSON / Hurl text the Main (Request)
-    /// panel shows by default, for every request. Changed from the
-    /// Preferences submenu (Settings → Preferences → Default Request View).
-    pub(crate) default_request_view: request::RequestView,
-    /// Preferences (persisted): run "Run All" (Alt+F5) in batch mode — the
-    /// whole collection in one Hurl execution, so Hurl's cookie jar and
-    /// `[Captures]` chain across every request. Off by default, so Run All
-    /// streams results as they finish (matching the CLI default), at the cost
-    /// of not carrying automatic cookies between requests.
-    pub(crate) run_all_batch_mode: bool,
-
-    /// User-created themes (persisted). Shown in the Theme editor alongside the
-    /// built-in presets; deletable (unlike presets) with `Ctrl+D`.
-    pub(crate) custom_themes: Vec<crate::tui::theme::ThemeSpec>,
-    /// The explicitly-chosen theme name, or `None` to follow the language's
-    /// preset. Set the moment the user picks any theme in the Theme editor;
-    /// while `None`, changing language also changes the effective theme.
-    pub(crate) active_theme: Option<String>,
-
-    /// The GUI's window/panel geometry, carried through untouched. The terminal
-    /// UI has no use for pixel sizes, but it shares one `state.json` with the
-    /// graphical front-end, so dropping the field here would silently reset the
-    /// GUI's layout every time the terminal UI saved.
-    pub(crate) gui_layout: crate::persistence::GuiLayout,
 
     /// `true` when the terminal supports the keyboard-enhancement protocol, so
     /// Ctrl+Enter is reported distinctly from a plain Enter. Advanced shortcuts
@@ -1216,11 +1302,6 @@ pub struct TuiApp {
     /// state.
     pub(crate) pending_workspace_transfer: Option<PendingTransfer>,
 
-    /// Git URLs the user has loaded a collection/environment from, most recent
-    /// first. Offered as a pickable list in the "Load from Git" wizard and
-    /// persisted across restarts.
-    pub(crate) recent_git_urls: Vec<String>,
-
     /// Stack of recently closed tabs (with the index they were closed from),
     /// most-recently-closed last, so Ctrl+Shift+T can reopen them in order.
     /// Holds both collection and report tabs (see [`ClosedTab`]) so undo order
@@ -1233,11 +1314,26 @@ pub struct TuiApp {
     /// Restored (with the picked path applied, on success) once the browser
     /// closes. Runtime-only (not persisted).
     pub(crate) parked_wizard: Option<Box<NewReq>>,
+    /// The Postman import wizard, parked while its destination folder is picked
+    /// in the browser. Restored on both confirm and cancel, so browsing never
+    /// costs the key and options already typed.
+    pub(crate) parked_postman: Option<Box<PostmanWizard>>,
+    /// Where the destination picker should open, set just before it is.
+    pub(crate) postman_dest_seed_dir: Option<std::path::PathBuf>,
     /// The target `FOR … IN FILES/FOLDERS` node whose source folder is being
     /// chosen while a [`FileAction::PickReportNodeFolder`] browser is open:
     /// `(report id, node path)`. The chosen directory is written into that
     /// loop's producer `dir` on `Space`. Runtime-only (not persisted).
     pub(crate) pending_node_folder: Option<(u64, Vec<usize>)>,
+    /// The report id and header-directive key a `root:` / `baseline:` file
+    /// browser is picking for, parked while the browser owns the overlay slot
+    /// (`FileAction` is `Copy`, so the key can't live in the variant — the same
+    /// reason [`TuiApp::pending_node_folder`] exists).
+    pub(crate) pending_header_path: Option<(u64, &'static str)>,
+    /// The report and parameter a `PickReportParam*` browser is picking for,
+    /// parked here because `FileAction` has no room for a name. Cleared when
+    /// the pick is committed or abandoned.
+    pub(crate) pending_param_path: Option<(u64, String)>,
     /// The inline filename editor shown at the bottom of a "save to folder"
     /// browser (the two `*ChooseFolder` [`FileAction`]s): the file name for a
     /// collection, or the workspace's own subfolder name. Seeded with a
@@ -1259,6 +1355,13 @@ pub struct TuiApp {
     /// of the extension filter. Backspace trims it, Esc clears it (then cancels
     /// on a second press), and it resets whenever the browser opens. Runtime-only.
     pub(crate) browser_query: String,
+    /// The `label  ·  keys` line drawn along the bottom border of the file
+    /// browser. Built once in `open_browser` (where the action's label and hint
+    /// are chosen) and baked into the explorer's own theme — kept here as well
+    /// so the "no matches" placeholder, which replaces the explorer widget
+    /// entirely when a filter empties the list, can draw the same frame instead
+    /// of a bare box that loses the keys just when they're most needed.
+    pub(crate) browser_hint_line: String,
     /// Which pane focus returns to when the New/Edit Request wizard closes
     /// (whether saved or cancelled). Opening the wizard temporarily moves
     /// focus onto the Main panel so the request preview shows behind it, but
@@ -1271,14 +1374,6 @@ pub struct TuiApp {
     /// then add" on an [`Overlay::EnvCollision`] popup. Added to
     /// `global_envs` once the rename prompt is committed.
     pub(crate) pending_collision_env: Option<(Environment, Vec<PendingSecret>)>,
-    /// Workspace tabs restored with a vanished `workspace_root` that were
-    /// originally downloaded from git (see
-    /// `persistence::PersistedTab::into_collection`'s `PendingWorkspaceReload`),
-    /// queued up so each is offered a redownload one at a time via
-    /// [`Overlay::WorkspaceReloadConfirm`] rather than all popping up at once.
-    /// `usize` is the tab's index in `collections`.
-    pub(crate) pending_workspace_reloads:
-        std::collections::VecDeque<(usize, crate::persistence::PendingWorkspaceReload)>,
     /// A background redownload attempt in flight (see
     /// [`Overlay::WorkspaceReloadLoading`]): the tab index it's for, the
     /// previously-selected file's path relative to the old root (to
@@ -1302,22 +1397,48 @@ pub struct TuiApp {
     pub(crate) mouse_hits: RefCell<Vec<MouseHit>>,
     pub(crate) mouse_top_layer: Cell<MouseLayer>,
     pub(crate) mouse_hit_valid: Cell<bool>,
+
+    /// The front-end-agnostic application state: collections, environments,
+    /// themes, preferences and the persisted settings both front-ends share.
+    /// `TuiApp` derefs to it, so `self.collections` still reaches the one copy
+    /// that gets written to `state.json` — the terminal UI keeps only *view*
+    /// state (cursors, scroll offsets, overlays, focus, wrap caches) of its own.
+    pub(crate) session: crate::session::Session,
+}
+
+/// `TuiApp` owns the shared [`Session`] and reaches straight through it, so
+/// every existing `self.collections` / `self.status` / `self.list_width` call
+/// site keeps working while there is only one copy of that state in the process
+/// — and therefore only one writer of `state.json`.
+///
+/// A `Deref` rather than a wall of accessors because the alternative is ~2,200
+/// mechanical rewrites for no behavioural gain. The cost is that a method
+/// borrowing a session field and a view field at once now borrows all of
+/// `self`; where that bites, the fix is to name `self.session.<field>` and
+/// `self.<view field>` explicitly, which the borrow checker treats as disjoint.
+impl std::ops::Deref for TuiApp {
+    type Target = crate::session::Session;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for TuiApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
 }
 
 impl Default for TuiApp {
     fn default() -> Self {
         Self {
-            language: Language::default(),
-            vars: AppVars::default(),
-            collections: vec![Collection::new("Request".to_string(), Vec::new())],
-            active_tab: 0,
             reports: Vec::new(),
-            response: Arc::new(Mutex::new(ApiResponse::default())),
-            global_envs: Vec::new(),
-            active_env_id: None,
             deleted_envs: Vec::new(),
             focus: Pane::List,
             global_env_idx: 0,
+            env_query: String::new(),
+            env_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
             list_hscroll: 0,
@@ -1333,53 +1454,44 @@ impl Default for TuiApp {
             main_scrollbar_area: Rect::default(),
             resp_scrollbar_area: Rect::default(),
             scrollbar_drag: None,
+            mouse_drag_moved: false,
             report_pane_areas: [Rect::default(); 3],
             report_pane_bars: [Rect::default(); 3],
             report_scrollbar_drag: None,
             prompt_editor_area: Rect::default(),
             list_scroll_w: std::cell::Cell::new(0),
+            list_scroll: ListScroll::default(),
+            env_list_scroll: ListScroll::default(),
+            env_var_scroll: ListScroll::default(),
+            ws_picker_scroll: ListScroll::default(),
             global_env_scroll_w: std::cell::Cell::new(0),
-            response_pct: 42,
-            list_width: 38,
-            status: None,
             overlay: None,
             help_scroll: 0,
             help_query: String::new(),
             quit: false,
-            pending_env: Vec::new(),
-            pending_captures: Vec::new(),
-            pending_batch_runs: Vec::new(),
             pending_report_runs: Vec::new(),
             running_reports: std::collections::HashMap::new(),
-            last_browse_dir: None,
-            last_env_dir: None,
             new_report_seed_dir: None,
             browser_origin_dir: None,
             browser_forward_path: None,
-            confirm_on_exit: true,
-            confirm_on_clear: true,
-            confirm_on_delete_env: true,
-            always_save_when_prompted: false,
-            default_request_view: request::RequestView::default(),
-            run_all_batch_mode: false,
-            custom_themes: Vec::new(),
-            active_theme: None,
-            gui_layout: crate::persistence::GuiLayout::default(),
             enhanced_keys: false,
             pending_save_path: None,
             pending_workspace_request: None,
             pending_workspace_transfer: None,
-            recent_git_urls: Vec::new(),
             closed_tabs: Vec::new(),
             parked_wizard: None,
+            parked_postman: None,
+            postman_dest_seed_dir: None,
             pending_node_folder: None,
+            pending_header_path: None,
+            pending_param_path: None,
             browser_name: Editor::new("", false),
             browser_name_focused: false,
             browser_filter_on: true,
             browser_query: String::new(),
+            browser_hint_line: String::new(),
             wizard_return_focus: Pane::List,
             pending_collision_env: None,
-            pending_workspace_reloads: std::collections::VecDeque::new(),
             workspace_redownload_rx: None,
             pending_workspace_save: None,
             pending_workspace_move: None,
@@ -1387,11 +1499,30 @@ impl Default for TuiApp {
             mouse_hits: RefCell::new(Vec::new()),
             mouse_top_layer: Cell::new(MouseLayer::Base),
             mouse_hit_valid: Cell::new(false),
+            session: crate::session::Session::default(),
         }
     }
 }
 
 impl TuiApp {
+    /// The safe half of [`take_overlay!`]: hand the open overlay to `f`, which
+    /// either extracts what it wants from it or gives it back untouched.
+    ///
+    /// Returning the overlay in the `Err` case is what makes this safe — a
+    /// caller that isn't interested cannot accidentally drop what was open.
+    pub(crate) fn take_overlay_matching<T>(
+        &mut self,
+        f: impl FnOnce(Overlay) -> Result<T, Overlay>,
+    ) -> Option<T> {
+        match f(self.overlay.take()?) {
+            Ok(taken) => Some(taken),
+            Err(put_back) => {
+                self.overlay = Some(put_back);
+                None
+            }
+        }
+    }
+
     pub(crate) fn begin_mouse_frame(&self) {
         self.mouse_hits.borrow_mut().clear();
         self.mouse_top_layer.set(MouseLayer::Base);
@@ -1578,17 +1709,18 @@ impl TuiApp {
     /// Drain background secret-resolution results and apply them to the
     /// matching Global Environment, rebuilding affected request previews.
     pub(crate) fn poll_env_updates(&mut self) {
-        request::drain_env_updates(
-            &mut self.pending_env,
-            &mut self.global_envs,
-            &mut self.collections,
-        );
+        // Named through `session` because three simultaneous `&mut` borrows of
+        // distinct fields are only disjoint when the compiler can see the
+        // fields; going through `DerefMut` would borrow all of `self` thrice.
+        let s = &mut self.session;
+        request::drain_env_updates(&mut s.pending_env, &mut s.global_envs, &mut s.collections);
     }
 
     /// Drain completed response captures into their collections so subsequent
     /// requests can substitute the captured values.
     pub(crate) fn poll_capture_updates(&mut self) {
-        request::drain_capture_updates(&mut self.pending_captures, &mut self.collections);
+        let s = &mut self.session;
+        request::drain_capture_updates(&mut s.pending_captures, &mut s.collections);
     }
 
     /// Drain completed "Run All" passes: merge captured values into the
@@ -1889,6 +2021,23 @@ impl TuiApp {
             PromptKind::ReportNodeLine { report_id, path } => {
                 self.commit_report_node_line(report_id, &path, text)
             }
+            PromptKind::ReportParamValue { report_id, name } => {
+                self.set_report_param(report_id, &name, text);
+            }
+            PromptKind::ReportHeaderValue {
+                report_id,
+                key,
+                occurrence,
+            } => {
+                if let Some(idx) = self.report_index_by_id(report_id) {
+                    // An empty commit means "remove it", the same as Delete on
+                    // the row — otherwise clearing the field would write back
+                    // the `?` placeholder and look like nothing happened.
+                    let text = text.trim().to_string();
+                    let value = (!text.is_empty()).then_some(text);
+                    self.apply_report_setting(idx, key, occurrence, value.as_deref());
+                }
+            }
         }
     }
 
@@ -1942,13 +2091,16 @@ impl TuiApp {
     /// user has edited. Such edits are kept only in memory — writing them to
     /// the plaintext state file would leak the secret — so they are lost when
     /// the app closes.
-    /// How many requests across every tab have edits that only exist in memory.
-    /// Drives the exit warning: unlike a `.hurl` file the user explicitly saved,
-    /// these have nowhere to survive a quit.
+    /// How many requests across every tab would lose their edits to a quit.
+    /// Drives the exit warning.
+    ///
+    /// Only Workspace tabs count: every other tab's entries are written to the
+    /// session state as they stand, so its edits are waiting — still marked as
+    /// edited — at the next start (see `Collection::edits_lost_on_exit`).
     pub(crate) fn unsaved_request_edits(&self) -> usize {
         self.collections
             .iter()
-            .map(|c| c.unsaved_edit_count())
+            .map(|c| c.edits_lost_on_exit())
             .sum()
     }
 
@@ -1987,19 +2139,7 @@ impl TuiApp {
     /// file can't be read/parsed, or it holds no entry at that position (e.g. a
     /// never-saved request). The other entries and their edits are untouched.
     pub(crate) fn revert_request_to_saved(&mut self, ci: usize, ei: usize) -> Option<String> {
-        let path = self.collections.get(ci)?.path.clone()?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let mut disk = crate::postman::parse_collection(&content);
-        if ei >= disk.len() {
-            return None;
-        }
-        let entry = disk.swap_remove(ei);
-        let method = entry.method.clone();
-        let col = self.collections.get_mut(ci)?;
-        col.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
-        col.invalidate_request_json();
-        col.sync_folder_to_selected();
-        Some(method)
+        self.collections.get_mut(ci)?.revert_request(ei)
     }
 
     /// Discard a Global Environment's unsaved edits, restoring the last-saved
@@ -2072,6 +2212,23 @@ impl TuiApp {
                     let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
+                Err(e) => self.status = Some(Status::Error(e.to_string())),
+            },
+            // Sorted by what the export holds rather than by what the user
+            // said it was: knowing whether a `.json` is a collection or an
+            // environment is precisely the knowledge they arrived without.
+            FileAction::ImportPostmanFile => match std::fs::read_to_string(path) {
+                Ok(content) => match crate::postman::export_kind(&content) {
+                    Some(crate::postman::ExportKind::Collection) => {
+                        let name = collection_name_from_path(path, "collection");
+                        self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    }
+                    Some(crate::postman::ExportKind::Environment) => {
+                        let name = env_name_from_path(path, "environment");
+                        self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    }
+                    None => self.status = Some(Status::NotCollection),
+                },
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
             },
             FileAction::SaveCollection => {
@@ -2179,6 +2336,10 @@ impl TuiApp {
             // folder as the move destination (handled in `input.rs`), so no
             // path ever arrives here.
             FileAction::MoveWorkspaceItemChooseFolder => {}
+            // Folder-only like the pickers above: the Postman destination is
+            // confirmed with `Space`, or with `Enter` on the inline folder-name
+            // field, both of which route through `finish_postman_dest`.
+            FileAction::PostmanDestChooseFolder => {}
             FileAction::OpenWorkspace => {}
             // Same as `OpenWorkspace` above: the destination folder is
             // confirmed with `Space`, handled directly in `input.rs` via
@@ -2229,6 +2390,15 @@ impl TuiApp {
             // confirmed with `Space` in `input.rs`
             // (`commit_report_node_folder`), so a file-Enter never reaches here.
             FileAction::PickReportNodeFolder => {}
+            // Like the loop's source folder: `root:` is confirmed with `Space`
+            // in `input.rs`, so a file-Enter never reaches here.
+            FileAction::PickReportHeaderFolder => {}
+            // `baseline:` is a *file* pick, so Enter on the file does land here.
+            FileAction::PickReportHeaderFile => self.commit_report_header_path(path),
+            // Same split as the header pickers: the folder is confirmed with
+            // `Space` in `input.rs`, only the file lands here.
+            FileAction::PickReportParamFolder => {}
+            FileAction::PickReportParamFile => self.commit_report_param_path(path),
         }
     }
 
@@ -2894,6 +3064,9 @@ impl TuiApp {
                 self.load_workspace_file(ci, path.clone());
             }
             NewItemKind::Environment => {}
+            // Nothing to open: a new folder is somewhere to put files, and the
+            // tree already lists it (revealed above).
+            NewItemKind::Folder => {}
         }
         self.save_state();
         self.status = Some(Status::WsItemCreated(crate::workspace::display_name(
@@ -3171,6 +3344,81 @@ impl TuiApp {
         Some(id)
     }
 
+    /// The Environments panel's rows: the open Workspace's environment files
+    /// (loaded or not) followed by every other loaded environment, narrowed by
+    /// the `/` filter query. See [`crate::env_panel`].
+    ///
+    /// Recomputed on demand rather than cached, exactly as the Workspace tree's
+    /// [`crate::collection::Collection::ws_rows`] is — the folder scan is the
+    /// same one, and a cache would have to be invalidated on every file
+    /// created, moved or deleted from anywhere in the app.
+    pub(crate) fn env_rows(&self) -> Vec<crate::env_panel::EnvRow> {
+        let files = self.workspace_env_files();
+        crate::env_panel::rows(
+            &self.global_envs,
+            &files,
+            &self.env_query,
+            self.effective_env_source(),
+        )
+    }
+
+    pub(crate) fn workspace_env_files(&self) -> Vec<std::path::PathBuf> {
+        self.collections
+            .get(self.active_tab)
+            .map(|c| c.workspace_env_files())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn has_workspace_env_source(&self) -> bool {
+        self.collections
+            .get(self.active_tab)
+            .and_then(|c| c.workspace_root.as_deref())
+            .is_some()
+    }
+
+    pub(crate) fn effective_env_source(&self) -> crate::env_panel::EnvSource {
+        if self.has_workspace_env_source() {
+            self.env_source
+        } else {
+            // With no Workspace tab open, two of the three source modes would
+            // be guaranteed-empty. Treat the hidden control as "Both" so a
+            // persisted Workspace-only choice does not make globals vanish.
+            crate::env_panel::EnvSource::Both
+        }
+    }
+
+    /// The Environments panel row the selection is on, if any.
+    pub(crate) fn selected_env_row(&self) -> Option<crate::env_panel::EnvRow> {
+        let rows = self.env_rows();
+        rows.get(self.global_env_idx.min(rows.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    /// The loaded environment the panel selection points at. `None` when the
+    /// selected row is a workspace file that hasn't been opened yet (there is
+    /// no environment to act on until it is).
+    pub(crate) fn selected_env_id(&self) -> Option<u64> {
+        self.selected_env_row().and_then(|r| r.env_id())
+    }
+
+    /// The index into `global_envs` of the panel's selected environment, for
+    /// the operations that still address environments positionally (delete and
+    /// its undo stack, activate).
+    pub(crate) fn selected_env_index(&self) -> Option<usize> {
+        let id = self.selected_env_id()?;
+        self.global_envs.iter().position(|e| e.id == id)
+    }
+
+    /// Move the Environments panel selection onto whichever row holds `id`, so
+    /// an environment that was just loaded, renamed or restored stays under the
+    /// cursor even though the row order is the panel's, not `global_envs`'.
+    pub(crate) fn select_env_row_by_id(&mut self, id: u64) {
+        if let Some(i) = self.env_rows().iter().position(|r| r.env_id() == Some(id)) {
+            self.global_env_idx = i;
+            self.global_env_hscroll = 0;
+        }
+    }
+
     /// The Global Environment id that "Save Environment" / secret-reload
     /// actions currently target: the selected row in the Global Environments
     /// list, or (if open) the environment shown in the entries popup.
@@ -3178,7 +3426,7 @@ impl TuiApp {
         if let Some(Overlay::EnvPopup(p)) = &self.overlay {
             return Some(p.env_id);
         }
-        self.global_envs.get(self.global_env_idx).map(|e| e.id)
+        self.selected_env_id()
     }
 
     /// The rows to show in the File → Save submenu, filtered to what actually
@@ -3310,9 +3558,11 @@ impl TuiApp {
             }
         }
         self.deleted_envs.push((idx, removed));
+        // The selection indexes panel rows, and deleting an environment
+        // removes one — clamp so it can't be left past the end.
         self.global_env_idx = self
             .global_env_idx
-            .min(self.global_envs.len().saturating_sub(1));
+            .min(self.env_rows().len().saturating_sub(1));
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
@@ -3330,8 +3580,11 @@ impl TuiApp {
         };
         let idx = idx.min(self.global_envs.len());
         let name = env.name.clone();
+        let id = env.id;
         self.global_envs.insert(idx, env);
-        self.global_env_idx = idx;
+        // Follow the environment to whichever panel row it landed on: the
+        // panel's order isn't `global_envs`' once a workspace is open.
+        self.select_env_row_by_id(id);
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
@@ -3457,6 +3710,270 @@ impl TuiApp {
                 });
             }
         }
+    }
+
+    /// Open the "import a whole Postman workspace" wizard.
+    pub(crate) fn open_postman_wizard(&mut self) {
+        let recent = self.session.recent_key_refs.clone();
+        self.overlay = Some(Overlay::PostmanImport(Box::new(PostmanWizard::new(recent))));
+    }
+
+    /// Handle a key while the Postman import wizard is open.
+    ///
+    /// Everything that decides what happens next lives in
+    /// [`crate::postman_flow`]; this maps keys onto it and drives the editors.
+    pub(crate) fn on_key_postman(&mut self, mut w: Box<PostmanWizard>, key: KeyEvent) {
+        let s = Strings::for_language(&self.language);
+        let import_base = self
+            .picker_dir(crate::session::PickerKind::Import)
+            .map(std::path::Path::to_owned);
+        w.remember_step();
+        match w.stage() {
+            PostmanStage::Connect => match key.code {
+                // While the recent-keys dropdown has focus, Esc backs out of it
+                // rather than leaving the wizard's connect step.
+                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
+                KeyCode::Esc => return,
+                // On the key field, Down opens (or moves down in) the list of
+                // references this key has been read from before, instead of
+                // jumping to the workspace field.
+                KeyCode::Down if w.field == 1 && !w.recent_entries().is_empty() => {
+                    let last = w.recent_entries().len() - 1;
+                    w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
+                }
+                KeyCode::Up if w.recent_sel.is_some() => {
+                    let i = w.recent_sel.unwrap();
+                    w.recent_sel = if i == 0 { None } else { Some(i - 1) };
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS;
+                    w.recent_sel = None;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    w.field = (w.field + POSTMAN_CONNECT_FIELDS - 1) % POSTMAN_CONNECT_FIELDS;
+                    w.recent_sel = None;
+                }
+                // The key-source row is a choice, so Left/Right change it —
+                // the same gesture that changes the import format two steps
+                // later. On a text field they stay the editor's own.
+                KeyCode::Left if w.field == 0 => {
+                    w.key_source = w.key_source.cycled(false);
+                    // The remembered entries belong to a source; the old
+                    // selection would index into a different list.
+                    w.recent_sel = None;
+                }
+                KeyCode::Right if w.field == 0 => {
+                    w.key_source = w.key_source.cycled(true);
+                    w.recent_sel = None;
+                }
+                KeyCode::Enter => {
+                    // Picking a remembered reference fills the field and
+                    // connects, rather than making the user press Enter twice.
+                    if let Some(entry) = w
+                        .recent_sel
+                        .and_then(|i| w.recent_entries().get(i).cloned())
+                    {
+                        w.key = Editor::new(&entry, false);
+                    }
+                    w.recent_sel = None;
+                    w.sync_fields();
+                    w.flow.submit_connect(&s);
+                    // A typed workspace id skips the listing and lands straight
+                    // on the options, which want a suggested destination.
+                    if matches!(w.flow.step(), Step::Options) {
+                        w.suggest_dest(import_base.as_deref());
+                    }
+                }
+                // The source row is a choice, not an editor: there is nothing
+                // for a keystroke to type into.
+                _ if w.field > 0 => {
+                    // Typing anything else closes the dropdown and edits the
+                    // field normally.
+                    w.recent_sel = None;
+                    let ed = match w.field {
+                        1 => &mut w.key,
+                        2 => &mut w.workspace_ref,
+                        _ => &mut w.base_url,
+                    };
+                    apply_edit_key(ed, key);
+                }
+                _ => {}
+            },
+            // Esc during a background call cancels the whole wizard: there is
+            // nothing partial to keep, and the worker cleans up after itself.
+            PostmanStage::Loading => {
+                if key.code == KeyCode::Esc {
+                    w.flow.cancel();
+                    return;
+                }
+            }
+            PostmanStage::PickWorkspace => {
+                let n = w.flow.visible_workspaces().len();
+                match key.code {
+                    KeyCode::Esc => {
+                        w.flow.back_to_connect();
+                    }
+                    KeyCode::Up => w.flow.selected = w.flow.selected.saturating_sub(1),
+                    KeyCode::Down if w.flow.selected + 1 < n => w.flow.selected += 1,
+                    KeyCode::Enter => {
+                        if w.flow.submit_workspace() {
+                            w.suggest_dest(import_base.as_deref());
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        w.flow.filter.pop();
+                        w.flow.selected = 0;
+                    }
+                    KeyCode::Char(c) => {
+                        w.flow.filter.push(c);
+                        w.flow.selected = 0;
+                    }
+                    _ => {}
+                }
+            }
+            PostmanStage::Options => {
+                let on_dest = w.option_row == 0;
+                match key.code {
+                    KeyCode::Esc => {
+                        // Back to wherever the workspace came from: the list if
+                        // there is one, otherwise the key prompt.
+                        if w.flow.workspaces().is_empty() {
+                            w.flow.back_to_connect();
+                        } else {
+                            w.flow.to_pick_workspace();
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        w.option_row = (w.option_row + 1) % OPTION_ROWS;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        w.option_row = (w.option_row + OPTION_ROWS - 1) % OPTION_ROWS;
+                    }
+                    // Space toggles the row under the cursor, but only where a
+                    // row *is* a toggle — on the path field it must still type.
+                    KeyCode::Char(' ') if !on_dest => toggle_option_row(&mut w),
+                    // Left/Right change the value on the row, as they do
+                    // everywhere else in the app that offers a choice between
+                    // two settings — the format row in particular reads as a
+                    // pair of options laid out side by side, so pointing at
+                    // one of them has to select it.
+                    KeyCode::Left | KeyCode::Right if !on_dest => toggle_option_row(&mut w),
+                    KeyCode::Enter => {
+                        if w.option_row == OPTION_ROWS - 1 {
+                            w.sync_fields();
+                            w.flow.submit_options(&s);
+                        } else if !on_dest {
+                            toggle_option_row(&mut w);
+                        } else {
+                            // The destination is chosen in the file browser,
+                            // like every other "save into a folder" in the app;
+                            // typing a path by hand is not offered here because
+                            // it was the one place that asked the user to know
+                            // a path before seeing one.
+                            self.open_postman_dest_browser(w);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PostmanStage::Confirm => match key.code {
+                KeyCode::Esc => {
+                    w.flow.cancel();
+                    return;
+                }
+                KeyCode::Enter => {
+                    w.flow.confirm();
+                }
+                _ => {}
+            },
+            PostmanStage::Downloading => {
+                if key.code == KeyCode::Esc {
+                    w.flow.cancel();
+                    return;
+                }
+            }
+            // The folder was already opened as a workspace by
+            // `apply_postman_event`; this screen is just the receipt.
+            PostmanStage::Done => return,
+            PostmanStage::Error => {
+                let back = w.before_error.clone();
+                w.flow.clear_error(back);
+            }
+        }
+        self.overlay = Some(Overlay::PostmanImport(w));
+    }
+
+    /// Park the wizard and open the file browser on its destination folder.
+    /// The browser needs the overlay slot, so the wizard is stashed in
+    /// `parked_postman` and restored by `finish_postman_dest` (or by the
+    /// picker's Esc path) with everything else it holds intact.
+    fn open_postman_dest_browser(&mut self, w: Box<PostmanWizard>) {
+        self.postman_dest_seed_dir = w.dest_parent();
+        self.parked_postman = Some(w);
+        self.open_browser(FileAction::PostmanDestChooseFolder);
+    }
+
+    /// Take the folder chosen in the browser as the import destination and put
+    /// the wizard back on screen.
+    pub(crate) fn finish_postman_dest(&mut self, dir: std::path::PathBuf, name: String) {
+        let Some(mut w) = self.parked_postman.take() else {
+            return;
+        };
+        self.remember_picker_dir(crate::session::PickerKind::Import, &dir);
+        self.save_state();
+        // The browser refuses to commit a blank name, so this always names a
+        // subfolder of the chosen parent — the import creates it, exactly as
+        // the workspace save does.
+        w.set_dest(dir.join(name.trim()));
+        self.overlay = Some(Overlay::PostmanImport(w));
+    }
+
+    /// Poll the Postman wizard's worker (called each frame).
+    pub(crate) fn poll_postman_updates(&mut self) {
+        let Some(mut w) = take_overlay!(self, Overlay::PostmanImport(w) => w) else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        // Tracked every tick, not just on a keypress: a download runs with
+        // nobody touching the keyboard, so a failure during it used to be
+        // blamed on the *confirmation* — the last screen a key was pressed on —
+        // and dismissing it offered "start the import" again, straight back
+        // into the same wall. The step being interrupted is the one on screen.
+        w.remember_step();
+        let event = w.flow.poll(&s);
+        // Once the key has actually worked, keep the reference: finding the
+        // 1Password item path is the tedious half of setting an import up.
+        let learned = w
+            .flow
+            .key_to_remember()
+            .map(str::to_string)
+            .is_some_and(|key| self.session.remember_key_ref(&key));
+        if learned {
+            self.save_state();
+        }
+        let mut w = w;
+        if let Some(PostmanEvent::Imported(summary)) = &event {
+            // The receipt outlives the worker, so it keeps its own copy.
+            w.done = Some((**summary).clone());
+        }
+        self.overlay = Some(Overlay::PostmanImport(w));
+        if let Some(PostmanEvent::Imported(summary)) = event {
+            self.apply_postman_event(*summary);
+        }
+    }
+
+    /// A finished import: open the folder it produced as a Workspace, exactly
+    /// as if the user had browsed to it — the point of the whole feature.
+    pub(crate) fn apply_postman_event(&mut self, summary: ImportSummary) {
+        // Only one status line fits, so the more actionable of the two wins:
+        // missing data beats a note about data that was deliberately dropped.
+        if !summary.failures.is_empty() {
+            self.status = Some(Status::PostmanSkipped(summary.failures.len()));
+        } else if summary.converted_with_notes {
+            self.status = Some(Status::PostmanNotes);
+        }
+        self.confirm_workspace_root(summary.dest);
     }
 
     pub(crate) fn open_remote_wizard(&mut self, kind: RemoteKind) {
@@ -3593,73 +4110,60 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Close the wizard, cleaning up any temp repo it created.
-    pub(crate) fn close_remote(&mut self, w: Box<RemoteWizard>) {
-        if let Some(repo) = &w.repo {
-            git_remote::cleanup(repo);
-        }
+    /// Close the wizard. Any temp repo it fetched is owned by the flow, which
+    /// cleans it up as it is dropped.
+    pub(crate) fn close_remote(&mut self, _w: Box<RemoteWizard>) {
         self.overlay = None;
     }
 
     /// Handle a key while the remote-git wizard is open.
     pub(crate) fn on_key_remote(&mut self, mut w: Box<RemoteWizard>, key: KeyEvent) {
-        match &mut w.stage {
-            RemoteStage::Connect { field, recent_sel } => match key.code {
+        match w.stage() {
+            RemoteStage::Connect => match key.code {
                 // While the recent-URLs dropdown has focus, Esc backs out of it
                 // rather than closing the whole wizard.
-                KeyCode::Esc if recent_sel.is_some() => *recent_sel = None,
+                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
                 KeyCode::Esc => return self.close_remote(w),
                 KeyCode::Tab | KeyCode::BackTab => {
-                    *field = 1 - *field;
-                    *recent_sel = None;
+                    w.field = 1 - w.field;
+                    w.recent_sel = None;
                 }
                 // On the URL field, Down opens (or moves down in) the recent-URLs
                 // dropdown instead of jumping to the token field.
-                KeyCode::Down if *field == 0 && !w.recent.is_empty() => {
-                    *recent_sel = Some(recent_sel.map_or(0, |i| (i + 1).min(w.recent.len() - 1)));
+                KeyCode::Down if w.field == 0 && !w.recent.is_empty() => {
+                    let last = w.recent.len() - 1;
+                    w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
                 }
-                KeyCode::Up if recent_sel.is_some() => {
-                    let i = recent_sel.unwrap();
-                    *recent_sel = if i == 0 { None } else { Some(i - 1) };
+                KeyCode::Up if w.recent_sel.is_some() => {
+                    let i = w.recent_sel.unwrap();
+                    w.recent_sel = if i == 0 { None } else { Some(i - 1) };
                 }
                 KeyCode::Up | KeyCode::Down => {
-                    *field = 1 - *field;
-                    *recent_sel = None;
-                }
-                KeyCode::Enter if recent_sel.is_some() => {
-                    // Pick the highlighted recent URL and connect immediately,
-                    // rather than just populating the field (which would force
-                    // the user to press Enter a second time).
-                    if let Some(url) = recent_sel.and_then(|i| w.recent.get(i)).cloned() {
-                        w.url = Editor::new(&url, false);
-                    }
-                    *recent_sel = None;
-                    if w.url.text().trim().is_empty() {
-                        let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_url_required.to_string());
-                    } else {
-                        w.rx = Some(spawn_git_refs(w.url.text(), w.token_opt()));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::Refs,
-                        };
-                    }
+                    w.field = 1 - w.field;
+                    w.recent_sel = None;
                 }
                 KeyCode::Enter => {
-                    if w.url.text().trim().is_empty() {
+                    // Picking a recent URL connects immediately, rather than
+                    // just populating the field (which would force the user to
+                    // press Enter a second time).
+                    if let Some(url) = w.recent_sel.and_then(|i| w.recent.get(i)).cloned() {
+                        w.url = Editor::new(&url, false);
+                    }
+                    w.recent_sel = None;
+                    w.sync_fields();
+                    if w.flow.url.trim().is_empty() {
                         let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_url_required.to_string());
+                        w.flow.fail(s.git_url_required.to_string());
                     } else {
-                        w.rx = Some(spawn_git_refs(w.url.text(), w.token_opt()));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::Refs,
-                        };
+                        w.reset_list();
+                        w.flow.connect();
                     }
                 }
                 _ => {
                     // Typing anything else closes the dropdown and edits the
                     // field normally.
-                    *recent_sel = None;
-                    let ed = if *field == 0 {
+                    w.recent_sel = None;
+                    let ed = if w.field == 0 {
                         &mut w.url
                     } else {
                         &mut w.token
@@ -3667,181 +4171,123 @@ impl TuiApp {
                     apply_edit_key(ed, key);
                 }
             },
-            RemoteStage::Loading { .. } => {
+            RemoteStage::Loading => {
                 if key.code == KeyCode::Esc {
                     return self.close_remote(w);
                 }
             }
-            RemoteStage::PickRef { refs, filter, sel } => {
-                let vis = filter_indices(refs.iter().map(|r| r.label.as_str()), filter);
+            RemoteStage::PickRef => {
+                let s = Strings::for_language(&self.language);
+                let choices = w.flow.ref_choices(&s);
+                let vis = filter_indices(choices.iter().map(|r| r.label.as_str()), &w.filter);
                 match key.code {
                     KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
+                    KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                    KeyCode::Down if w.sel + 1 < vis.len() => w.sel += 1,
                     KeyCode::Enter => {
-                        if let Some(&ri) = vis.get(*sel) {
-                            let choice = refs[ri].clone();
-                            w.chosen_ref = Some(choice.clone());
-                            w.rx =
-                                Some(spawn_git_files(w.url.text(), w.token_opt(), choice.gitref));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::Files,
-                            };
+                        if let Some(&ri) = vis.get(w.sel) {
+                            let choice = choices[ri].clone();
+                            w.reset_list();
+                            w.flow.choose_ref(choice);
                         }
                     }
                     KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
+                        w.filter.pop();
+                        w.sel = 0;
                     }
                     KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
+                        w.filter.push(c);
+                        w.sel = 0;
                     }
                     _ => {}
                 }
             }
-            RemoteStage::PickFile { files, filter, sel } => {
-                let vis = filter_indices(files.iter().map(|s| s.as_str()), filter);
+            RemoteStage::PickFile => {
+                let files = w.flow.pickable_files();
+                let vis = filter_indices(files.iter().map(|s| s.as_str()), &w.filter);
                 match key.code {
                     KeyCode::Esc => return self.close_remote(w),
-                    KeyCode::Up => *sel = sel.saturating_sub(1),
-                    KeyCode::Down if *sel + 1 < vis.len() => *sel += 1,
+                    KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                    KeyCode::Down if w.sel + 1 < vis.len() => w.sel += 1,
                     KeyCode::Enter => {
-                        if let (Some(&fi), Some(repo)) = (vis.get(*sel), w.repo.clone()) {
+                        if let Some(&fi) = vis.get(w.sel) {
                             let path = files[fi].clone();
-                            w.selected_path = Some(path.clone());
-                            w.rx = Some(spawn_git_checkout(repo, path));
-                            w.stage = RemoteStage::Loading {
-                                phase: LoadPhase::File,
-                            };
+                            w.reset_list();
+                            w.flow.choose_file(path);
                         }
                     }
                     KeyCode::Backspace => {
-                        filter.pop();
-                        *sel = 0;
+                        w.filter.pop();
+                        w.sel = 0;
                     }
                     KeyCode::Char(c) => {
-                        filter.push(c);
-                        *sel = 0;
+                        w.filter.push(c);
+                        w.sel = 0;
                     }
                     _ => {}
                 }
             }
-            RemoteStage::PickWorkspaceFilter { sel } => match key.code {
+            RemoteStage::PickWorkspaceFilter => match key.code {
                 KeyCode::Esc => return self.close_remote(w),
-                KeyCode::Up => *sel = sel.saturating_sub(1),
-                KeyCode::Down => *sel = (*sel + 1).min(WorkspaceGitFilter::ALL.len() - 1),
+                KeyCode::Up => w.sel = w.sel.saturating_sub(1),
+                KeyCode::Down => w.sel = (w.sel + 1).min(WorkspaceGitFilter::ALL.len() - 1),
                 KeyCode::Enter => {
-                    let choice = WorkspaceGitFilter::ALL[*sel];
-                    w.chosen_workspace_filter = Some(choice);
-                    let matched: Vec<String> = w
-                        .files
-                        .iter()
-                        .filter(|p| choice.matches(p))
-                        .cloned()
-                        .collect();
-                    if matched.is_empty() {
+                    let choice = WorkspaceGitFilter::ALL[w.sel];
+                    if !w.flow.all_files().iter().any(|p| choice.matches(p)) {
                         let s = Strings::for_language(&self.language);
-                        w.stage = RemoteStage::Error(s.git_workspace_no_matches.to_string());
-                    } else if let Some(repo) = w.repo.clone() {
-                        w.rx = Some(spawn_git_checkout_workspace(repo, matched));
-                        w.stage = RemoteStage::Loading {
-                            phase: LoadPhase::WorkspaceFiles,
-                        };
+                        w.flow.fail(s.git_workspace_no_matches.to_string());
+                    } else {
+                        w.flow.choose_workspace_filter(choice);
                     }
                 }
                 _ => {}
             },
-            RemoteStage::Error(_) => return self.close_remote(w),
+            // Any key dismisses the error, which returns to the step it came
+            // from rather than throwing away everything fetched so far.
+            RemoteStage::Error => {
+                w.flow.clear_error();
+                w.reset_list();
+            }
         }
         self.overlay = Some(Overlay::RemoteGit(w));
     }
 
     /// Poll the wizard's in-flight git operation (called each frame).
     pub(crate) fn poll_git_updates(&mut self) {
-        if !matches!(self.overlay, Some(Overlay::RemoteGit(_))) {
-            return;
-        }
-        let Some(Overlay::RemoteGit(mut w)) = self.overlay.take() else {
+        let Some(mut w) = take_overlay!(self, Overlay::RemoteGit(w) => w) else {
             return;
         };
-        let Some(rx) = w.rx.as_ref() else {
-            self.overlay = Some(Overlay::RemoteGit(w));
-            return;
-        };
-        match rx.try_recv() {
-            Ok(msg) => {
-                w.rx = None;
-                let keep_open = self.apply_git_msg(&mut w, msg);
+        match w.flow.poll() {
+            Some(event) => {
+                let keep_open = self.apply_flow_event(&w, event);
                 if keep_open {
                     self.overlay = Some(Overlay::RemoteGit(w));
-                } else if let Some(repo) = &w.repo {
-                    git_remote::cleanup(repo);
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => self.overlay = Some(Overlay::RemoteGit(w)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                w.rx = None;
-                self.overlay = Some(Overlay::RemoteGit(w));
-            }
+            None => self.overlay = Some(Overlay::RemoteGit(w)),
         }
     }
 
-    /// Apply a completed git message to the wizard. Returns whether the wizard
-    /// should stay open (false = a file was loaded, close it).
-    pub(crate) fn apply_git_msg(&mut self, w: &mut RemoteWizard, msg: GitMsg) -> bool {
-        match msg {
-            GitMsg::Refs(Ok(refs)) => {
-                let s = Strings::for_language(&self.language);
-                w.stage = RemoteStage::PickRef {
-                    refs: build_ref_choices(&refs, &s),
-                    filter: String::new(),
-                    sel: 0,
-                };
-                true
-            }
-            GitMsg::Files(Ok((files, repo, sha))) => {
-                w.repo = Some(repo);
-                w.files = files.clone();
-                w.chosen_sha = Some(sha);
-                w.stage = if w.kind == RemoteKind::Workspace {
-                    RemoteStage::PickWorkspaceFilter { sel: 0 }
-                } else {
-                    // Only show files worth loading for this kind (a big repo
-                    // otherwise buries the one `.hurl`/`.vars` under noise).
-                    RemoteStage::PickFile {
-                        files: relevant_files(w.kind, &files),
-                        filter: String::new(),
-                        sel: 0,
-                    }
-                };
-                true
-            }
-            GitMsg::Workspace(Ok(repo)) => {
-                self.remember_git_url(&w.url.text());
-                let name = file_stem(&w.url.text(), "workspace");
-                let origin = self.build_workspace_git_origin(w);
-                // Ask the user whether to keep this download temporary (the
-                // old default behaviour) or save it to a permanent, chosen
-                // location right away — see `Overlay::WorkspaceStorageChoice`.
+    /// Act on a completed load. Returns whether the wizard should stay open
+    /// (false = something was loaded, so close it).
+    pub(crate) fn apply_flow_event(&mut self, w: &RemoteWizard, event: FlowEvent) -> bool {
+        match event {
+            FlowEvent::Workspace { root, name, origin } => {
+                self.remember_git_url(&w.flow.url);
+                // Ask the user whether to keep this download temporary (the old
+                // default behaviour) or save it to a permanent, chosen location
+                // right away — see `Overlay::WorkspaceStorageChoice`.
                 self.overlay = Some(Overlay::WorkspaceStorageChoice {
-                    repo: repo.clone(),
+                    repo: root,
                     name,
                     origin,
                     sel: 0,
                 });
-                // Ownership of the temp repo dir now belongs to the pending
-                // choice/tab — clear it here so `poll_git_updates`'s
-                // close-time cleanup (which deletes anything left in
-                // `w.repo`) doesn't remove the files we just downloaded.
-                w.repo = None;
                 false
             }
-            GitMsg::Content(Ok(text)) => {
-                let path = w.selected_path.clone().unwrap_or_default();
-                self.remember_git_url(&w.url.text());
-                let origin = self.build_git_origin(w);
-                match w.kind {
+            FlowEvent::Content { path, text, origin } => {
+                self.remember_git_url(&w.flow.url);
+                match w.kind() {
                     RemoteKind::Collection => {
                         let name = collection_name_from_path(&path, "remote");
                         if self.load_collection_text(name, &text, None) {
@@ -3865,55 +4311,12 @@ impl TuiApp {
                         self.open_loaded_report(report);
                         false
                     }
-                    // A Workspace load never reaches `PickFile`/`Content` —
-                    // it takes the `PickWorkspaceFilter` -> `GitMsg::Workspace`
-                    // path instead (see above). Unreachable in practice.
+                    // A Workspace load never produces `Content` — it takes the
+                    // filter/download path instead. Unreachable in practice.
                     RemoteKind::Workspace => false,
                 }
             }
-            GitMsg::Refs(Err(e))
-            | GitMsg::Files(Err(e))
-            | GitMsg::Content(Err(e))
-            | GitMsg::Workspace(Err(e)) => {
-                w.stage = RemoteStage::Error(e);
-                true
-            }
         }
-    }
-
-    /// Build the [`GitOrigin`] for the file the wizard just checked out, from
-    /// the ref chosen in `PickRef` and the path chosen in `PickFile`. `None` if
-    /// either piece of information is missing (shouldn't happen in practice —
-    /// both are set before a checkout is ever spawned).
-    fn build_git_origin(&self, w: &RemoteWizard) -> Option<GitOrigin> {
-        let choice = w.chosen_ref.as_ref()?;
-        let path = w.selected_path.clone()?;
-        let (ref_kind, ref_name) = git_remote::parse_ref_kind(&choice.gitref);
-        Some(GitOrigin {
-            repo_url: w.url.text(),
-            path,
-            ref_kind,
-            ref_name,
-        })
-    }
-
-    /// Build the [`WorkspaceGitOrigin`] for a Workspace whose files just
-    /// finished downloading, from the ref chosen in `PickRef`, the commit
-    /// sha resolved in `GitMsg::Files`, and the filter chosen in
-    /// `PickWorkspaceFilter`. `None` if any piece is missing (shouldn't
-    /// happen in practice — all three are set before the checkout is spawned).
-    fn build_workspace_git_origin(&self, w: &RemoteWizard) -> Option<WorkspaceGitOrigin> {
-        let choice = w.chosen_ref.as_ref()?;
-        let commit_sha = w.chosen_sha.clone()?;
-        let filter = w.chosen_workspace_filter?;
-        let (ref_kind, ref_name) = git_remote::parse_ref_kind(&choice.gitref);
-        Some(WorkspaceGitOrigin {
-            repo_url: w.url.text(),
-            commit_sha,
-            ref_kind,
-            ref_name,
-            filter,
-        })
     }
 
     /// Close the "save to git" wizard. Unlike the load wizard there is no
@@ -3925,35 +4328,24 @@ impl TuiApp {
     }
 
     /// Handle a key while the "save to git" wizard is open.
+    ///
+    /// Every decision about what a keystroke *means* for the save itself lives
+    /// in [`crate::save_flow`]; this maps keys onto it and manages the editors.
     pub(crate) fn on_key_git_save(&mut self, mut w: Box<GitSaveWizard>, key: KeyEvent) {
-        match &mut w.stage {
-            GitSaveStage::Connect { field } => match key.code {
+        let s = Strings::for_language(&self.language);
+        match w.stage() {
+            GitSaveStage::Connect => match key.code {
                 KeyCode::Esc => return self.close_git_save(),
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    *field = 1 - *field
+                    w.field = 1 - w.field;
                 }
                 KeyCode::Enter => {
-                    if w.url.text().trim().is_empty() {
-                        let s = Strings::for_language(&self.language);
-                        w.stage = GitSaveStage::Error(s.git_url_required.to_string());
-                    } else if matches!(w.source, GitSaveSource::Workspace { .. }) {
-                        // A Workspace push has no per-file path to choose (the
-                        // whole tree is committed as-is), so skip ChoosePaths
-                        // and go straight to picking the branch/tag, spawning
-                        // the refs fetch as ChoosePaths would have.
-                        let url = w.url.text();
-                        let token = w.token_opt();
-                        w.rx = Some(spawn_git_save_refs(url, token));
-                        w.stage = GitSaveStage::ChooseTarget {
-                            sel: None,
-                            refs: None,
-                        };
-                    } else {
-                        w.stage = GitSaveStage::ChoosePaths { field: 0 };
-                    }
+                    w.sync();
+                    w.flow.submit_connect(&s);
+                    w.field = 0;
                 }
                 _ => {
-                    let ed = if *field == 0 {
+                    let ed = if w.field == 0 {
                         &mut w.url
                     } else {
                         &mut w.token
@@ -3961,20 +4353,21 @@ impl TuiApp {
                     apply_edit_key(ed, key);
                 }
             },
-            GitSaveStage::ChoosePaths { field } => {
-                let has_env = w.has_env;
-                let include_env = w.include_env;
+            GitSaveStage::ChoosePaths => {
+                // Only the fields actually on screen take focus: the checkbox
+                // and the env path are absent without an environment, and the
+                // env path is hidden while the checkbox is unticked.
                 let mut visible = vec![0u8];
-                if has_env {
+                if w.has_env() {
                     visible.push(1);
-                    if include_env {
+                    if w.flow.include_env {
                         visible.push(2);
                     }
                 }
                 match key.code {
                     KeyCode::Esc => return self.close_git_save(),
                     KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                        let idx = visible.iter().position(|f| f == field).unwrap_or(0);
+                        let idx = visible.iter().position(|f| *f == w.field).unwrap_or(0);
                         let back = matches!(key.code, KeyCode::BackTab | KeyCode::Up);
                         let n = visible.len();
                         let next = if back {
@@ -3982,25 +4375,19 @@ impl TuiApp {
                         } else {
                             (idx + 1) % n
                         };
-                        *field = visible[next];
+                        w.field = visible[next];
                     }
-                    KeyCode::Char(' ') if *field == 1 => w.include_env = !w.include_env,
+                    KeyCode::Char(' ') if w.field == 1 => {
+                        w.flow.include_env = !w.flow.include_env;
+                    }
                     KeyCode::Enter => {
-                        let paths_ok = !w.collection_path.text().trim().is_empty()
-                            && (!w.include_env || !w.env_path.text().trim().is_empty());
-                        if paths_ok {
-                            let url = w.url.text();
-                            let token = w.token_opt();
-                            w.rx = Some(spawn_git_save_refs(url, token));
-                            w.stage = GitSaveStage::ChooseTarget {
-                                sel: None,
-                                refs: None,
-                            };
+                        w.sync();
+                        if w.flow.submit_paths(&s) {
+                            w.sel = None;
                         }
                     }
                     _ => {
-                        let f = *field;
-                        let ed = match f {
+                        let ed = match w.field {
                             2 => Some(&mut w.env_path),
                             1 => None, // the checkbox has no text to type into
                             _ => Some(&mut w.collection_path),
@@ -4011,73 +4398,59 @@ impl TuiApp {
                     }
                 }
             }
-            GitSaveStage::ChooseTarget { sel, refs } => {
-                let branches = refs
-                    .as_ref()
-                    .map(|r| r.branches.clone())
-                    .unwrap_or_default();
+            GitSaveStage::ChooseTarget => {
+                let branches = w.flow.refs().branches.clone();
                 match key.code {
-                    KeyCode::Esc if sel.is_some() => *sel = None,
+                    KeyCode::Esc if w.sel.is_some() => w.sel = None,
                     KeyCode::Esc => return self.close_git_save(),
                     KeyCode::Tab | KeyCode::BackTab => {
-                        w.target_kind = if w.target_kind == GitSaveTarget::Branch {
-                            GitSaveTarget::Tag
+                        w.flow.target_kind = if w.flow.target_kind == SaveTargetKind::Branch {
+                            SaveTargetKind::Tag
                         } else {
-                            GitSaveTarget::Branch
+                            SaveTargetKind::Branch
                         };
                     }
-                    KeyCode::Down if sel.is_none() => {
+                    KeyCode::Down if w.sel.is_none() => {
                         if !branches.is_empty() {
-                            *sel = Some(0);
+                            w.sel = Some(0);
                         }
                     }
                     KeyCode::Down => {
-                        if let Some(i) = *sel {
-                            *sel = Some((i + 1).min(branches.len().saturating_sub(1)));
+                        if let Some(i) = w.sel {
+                            w.sel = Some((i + 1).min(branches.len().saturating_sub(1)));
                         }
                     }
                     KeyCode::Up => {
-                        if let Some(i) = *sel {
-                            *sel = if i == 0 { None } else { Some(i - 1) };
+                        if let Some(i) = w.sel {
+                            w.sel = if i == 0 { None } else { Some(i - 1) };
                         }
                     }
-                    KeyCode::Enter if sel.is_some() => {
-                        if let Some(name) = sel.and_then(|i| branches.get(i)) {
+                    KeyCode::Enter if w.sel.is_some() => {
+                        if let Some(name) = w.sel.and_then(|i| branches.get(i)) {
                             w.target_name = Editor::new(name, false);
-                            w.target_kind = GitSaveTarget::Branch;
+                            w.flow.target_kind = SaveTargetKind::Branch;
                         }
-                        *sel = None;
+                        w.sel = None;
                     }
                     KeyCode::Enter => {
-                        let name = w.target_name.text().trim().to_string();
-                        if !name.is_empty() {
-                            let is_existing_branch = w.target_kind == GitSaveTarget::Branch
-                                && branches.iter().any(|b| b == &name);
-                            w.target_intent = if is_existing_branch {
-                                TargetIntent::ExistingBranch
-                            } else {
-                                TargetIntent::NewRef
-                            };
-                            if w.commit_msg.text().trim().is_empty() {
-                                let ci = w.ci;
-                                let default_msg =
-                                    format!("Update {} via PaperBoy", self.collections[ci].name);
-                                w.commit_msg = Editor::new(&default_msg, false);
-                            }
-                            w.stage = GitSaveStage::CommitMessage;
+                        w.sync();
+                        if w.flow.submit_target() {
+                            // The flow may have restored a cleared commit
+                            // message; show what it will actually push.
+                            w.commit_msg = Editor::new(&w.flow.message, false);
                         }
                     }
-                    KeyCode::Backspace if sel.is_none() => {
+                    KeyCode::Backspace if w.sel.is_none() => {
                         w.target_name.backspace();
                     }
-                    KeyCode::Char(c) if sel.is_none() => {
+                    KeyCode::Char(c) if w.sel.is_none() => {
                         w.target_name.insert(c);
                     }
                     _ => {
                         // Typing anything while the dropdown is open closes it
                         // and edits the field normally (matches the load
                         // wizard's recent-URL dropdown behaviour).
-                        *sel = None;
+                        w.sel = None;
                         apply_edit_key(&mut w.target_name, key);
                     }
                 }
@@ -4085,69 +4458,9 @@ impl TuiApp {
             GitSaveStage::CommitMessage => match key.code {
                 KeyCode::Esc => return self.close_git_save(),
                 KeyCode::Enter => {
-                    if !w.commit_msg.text().trim().is_empty() {
-                        let ci = w.ci;
-                        let files = match &w.source {
-                            GitSaveSource::Workspace { root, .. } => {
-                                match crate::workspace::collect_files_for_commit(root) {
-                                    Ok(files) if !files.is_empty() => files,
-                                    Ok(_) => {
-                                        let s = Strings::for_language(&self.language);
-                                        w.stage = GitSaveStage::Error(
-                                            s.git_save_workspace_empty.to_string(),
-                                        );
-                                        self.overlay = Some(Overlay::GitSave(w));
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        w.stage = GitSaveStage::Error(e.to_string());
-                                        self.overlay = Some(Overlay::GitSave(w));
-                                        return;
-                                    }
-                                }
-                            }
-                            GitSaveSource::Collection => {
-                                // Refuse to push a file PaperBoy couldn't read
-                                // back (see `SaveCollection`): an empty-path
-                                // file field breaks reparsing.
-                                if let Some((req, field)) =
-                                    self.collections[ci].first_empty_file_field()
-                                {
-                                    let s = Strings::for_language(&self.language);
-                                    w.stage = GitSaveStage::Error(
-                                        Status::SaveUnreadableEmptyFile { req, field }.text(&s),
-                                    );
-                                    self.overlay = Some(Overlay::GitSave(w));
-                                    return;
-                                }
-                                let col = &self.collections[ci];
-                                let mut files = vec![(w.collection_path.text(), col.to_hurl())];
-                                if w.include_env
-                                    && let Some(env) = w.env.as_ref()
-                                {
-                                    files.push((w.env_path.text(), env.to_vars_text()));
-                                }
-                                files
-                            }
-                            GitSaveSource::Report { report_idx } => {
-                                // Push the report's source text as-is to the
-                                // chosen path (no accompanying env file).
-                                let text = self.reports[*report_idx].report.text.clone();
-                                vec![(w.collection_path.text(), text)]
-                            }
-                        };
-                        w.rx = Some(spawn_git_save_push(
-                            w.url.text(),
-                            w.token_opt(),
-                            w.origin_gitref.clone(),
-                            w.target_kind,
-                            w.target_name.text(),
-                            w.target_intent,
-                            files,
-                            w.commit_msg.text(),
-                        ));
-                        w.stage = GitSaveStage::Pushing;
-                    }
+                    w.sync();
+                    let payload = self.git_save_payload(&w, &s);
+                    w.flow.submit_message(payload);
                 }
                 _ => apply_edit_key(&mut w.commit_msg, key),
             },
@@ -4156,150 +4469,115 @@ impl TuiApp {
                     return self.close_git_save();
                 }
             }
-            GitSaveStage::Done | GitSaveStage::Error(_) => return self.close_git_save(),
+            GitSaveStage::Done | GitSaveStage::Error => return self.close_git_save(),
         }
         self.overlay = Some(Overlay::GitSave(w));
+    }
+
+    /// Assemble the files this save will commit, reading whatever the wizard is
+    /// pointed at out of the app's own tabs. The assembly rules themselves
+    /// (including the refusals) belong to [`crate::save_flow`].
+    fn git_save_payload(
+        &self,
+        w: &GitSaveWizard,
+        s: &Strings,
+    ) -> Result<Vec<crate::save_flow::SaveFile>, String> {
+        match &w.flow.source {
+            SaveSource::Workspace { root, .. } => SaveFlow::workspace_payload(root, s),
+            SaveSource::Collection { ci } => {
+                let col = self
+                    .collections
+                    .get(*ci)
+                    .ok_or_else(|| s.git_save_source_gone.to_string())?;
+                w.flow.collection_payload(col, w.env.as_ref(), s)
+            }
+            SaveSource::Report { report_idx } => {
+                let rt = self
+                    .reports
+                    .get(*report_idx)
+                    .ok_or_else(|| s.git_save_source_gone.to_string())?;
+                Ok(w.flow.report_payload(&rt.report))
+            }
+        }
     }
 
     /// Poll the "save to git" wizard's in-flight background op (called each
     /// frame).
     pub(crate) fn poll_git_save_updates(&mut self) {
-        if !matches!(self.overlay, Some(Overlay::GitSave(_))) {
-            return;
-        }
-        let Some(Overlay::GitSave(mut w)) = self.overlay.take() else {
+        let Some(mut w) = take_overlay!(self, Overlay::GitSave(w) => w) else {
             return;
         };
-        let Some(rx) = w.rx.as_ref() else {
-            self.overlay = Some(Overlay::GitSave(w));
-            return;
-        };
-        match rx.try_recv() {
-            Ok(msg) => {
-                w.rx = None;
-                let keep_open = self.apply_git_save_msg(&mut w, msg);
-                self.overlay = if keep_open {
-                    Some(Overlay::GitSave(w))
-                } else {
-                    None
-                };
-            }
-            Err(mpsc::TryRecvError::Empty) => self.overlay = Some(Overlay::GitSave(w)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                w.rx = None;
-                self.overlay = Some(Overlay::GitSave(w));
-            }
+        let s = Strings::for_language(&self.language);
+        if let Some(crate::save_flow::SaveEvent::Pushed { commit_sha }) = w.flow.poll(&s) {
+            self.finish_git_save(&w, &commit_sha);
         }
+        self.overlay = Some(Overlay::GitSave(w));
     }
 
-    /// Apply a completed "save to git" message. Returns whether the wizard
-    /// should stay open (both a completed push and a failure stay open, to
-    /// show a result/error until the user dismisses it).
-    pub(crate) fn apply_git_save_msg(&mut self, w: &mut GitSaveWizard, msg: GitSaveMsg) -> bool {
-        match msg {
-            GitSaveMsg::Refs(Ok(refs)) => {
-                if let GitSaveStage::ChooseTarget { refs: r, .. } = &mut w.stage {
-                    *r = Some(refs);
-                }
-                true
-            }
-            GitSaveMsg::Refs(Err(e)) => {
-                w.stage = GitSaveStage::Error(e);
-                true
-            }
-            GitSaveMsg::Pushed(Ok(new_sha)) => {
-                self.finish_git_save(w, &new_sha);
-                w.stage = GitSaveStage::Done;
-                true
-            }
-            GitSaveMsg::Pushed(Err(err)) => {
-                let s = Strings::for_language(&self.language);
-                w.stage = GitSaveStage::Error(match err {
-                    GitSaveError::TagExists => s.git_tag_exists.to_string(),
-                    GitSaveError::RefExistsRace => s.git_ref_exists_race.to_string(),
-                    GitSaveError::Other(e) => e,
-                });
-                true
-            }
-        }
-    }
-
-    /// After a successful push: clear the "new"/"modified" markers (same as
-    /// a local Save) and, for a **branch** target only, remember it as the
-    /// collection's (and, if included, the environment's) new git origin. A
-    /// tag-target save clears the markers too but leaves the remembered
-    /// branch origin untouched, per spec.
+    /// After a successful push: clear the "new"/"modified" markers, exactly as
+    /// a local save does, and — for a **branch** target only — remember where
+    /// the item now lives. A tag save clears the markers too but leaves the
+    /// remembered branch origin alone: a tag is a snapshot, so later edits must
+    /// keep following the branch rather than a frozen point on it.
     fn finish_git_save(&mut self, w: &GitSaveWizard, new_sha: &str) {
-        let ci = w.ci;
-        if let GitSaveSource::Report { report_idx } = &w.source {
-            // A report push has no per-request markers; just clear the dirty
-            // flag and, for a branch target, repin the report's git origin to
-            // the path/branch just pushed (a tag save leaves it untouched,
-            // mirroring the collection flow).
-            let idx = *report_idx;
-            if let Some(rt) = self.reports.get_mut(idx) {
-                rt.report.dirty = false;
-                if w.target_kind == GitSaveTarget::Branch {
-                    rt.report.git_origin = Some(GitOrigin {
-                        repo_url: w.url.text(),
-                        path: w.collection_path.text(),
+        let repin = w.flow.target_kind.repins_origin();
+        match &w.flow.source {
+            SaveSource::Report { report_idx } => {
+                // A report has no per-request markers; just clear its dirty
+                // flag and repin it like a collection.
+                if let Some(rt) = self.reports.get_mut(*report_idx) {
+                    rt.report.dirty = false;
+                    if repin {
+                        rt.report.git_origin = Some(w.flow.pushed_origin());
+                    }
+                }
+            }
+            SaveSource::Workspace { ci, filter, .. } => {
+                // A workspace push commits the on-disk tree, not the in-memory
+                // collection, so there are no per-request markers to clear.
+                // Repin to the exact commit just pushed, so a later redownload
+                // fetches this state rather than whatever the branch points at
+                // by then.
+                if repin && let Some(col) = self.collections.get_mut(*ci) {
+                    col.workspace_git_origin = Some(WorkspaceGitOrigin {
+                        repo_url: w.flow.url.trim().to_string(),
+                        commit_sha: new_sha.to_string(),
                         ref_kind: RefKind::Branch,
-                        ref_name: w.target_name.text(),
+                        ref_name: w.flow.target_name.trim().to_string(),
+                        filter: *filter,
                     });
                 }
             }
-            self.remember_git_url(&w.url.text());
-            self.save_state();
-            self.status = Some(Status::GitSaved);
-            return;
-        }
-        if let GitSaveSource::Workspace { filter, .. } = &w.source {
-            // A Workspace push commits the on-disk tree, not the in-memory
-            // collection, so there are no per-request "modified" markers to
-            // clear. For a branch target, repin the remembered origin to the
-            // exact commit just pushed so a later redownload fetches it (and
-            // follows the same branch); a tag target leaves the origin
-            // untouched, mirroring the collection flow.
-            if w.target_kind == GitSaveTarget::Branch {
-                self.collections[ci].workspace_git_origin = Some(WorkspaceGitOrigin {
-                    repo_url: w.url.text(),
-                    commit_sha: new_sha.to_string(),
-                    ref_kind: RefKind::Branch,
-                    ref_name: w.target_name.text(),
-                    filter: *filter,
-                });
-            }
-            self.remember_git_url(&w.url.text());
-            self.save_state();
-            self.status = Some(Status::GitSaved);
-            return;
-        }
-        self.mark_collection_saved(ci);
-        if w.include_env
-            && let Some(env_id) = w.env.as_ref().map(|e| e.id)
-        {
-            self.mark_env_saved(env_id);
-        }
-        if w.target_kind == GitSaveTarget::Branch {
-            self.collections[ci].git_origin = Some(GitOrigin {
-                repo_url: w.url.text(),
-                path: w.collection_path.text(),
-                ref_kind: RefKind::Branch,
-                ref_name: w.target_name.text(),
-            });
-            if w.include_env
-                && let Some(env_id) = w.env.as_ref().map(|e| e.id)
-                && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
-            {
-                env.git_origin = Some(GitOrigin {
-                    repo_url: w.url.text(),
-                    path: w.env_path.text(),
-                    ref_kind: RefKind::Branch,
-                    ref_name: w.target_name.text(),
-                });
+            SaveSource::Collection { ci } => {
+                let ci = *ci;
+                self.mark_collection_saved(ci);
+                let env_id = w
+                    .flow
+                    .include_env
+                    .then(|| w.env.as_ref().map(|e| e.id))
+                    .flatten();
+                if let Some(env_id) = env_id {
+                    self.mark_env_saved(env_id);
+                }
+                if repin {
+                    let origin = w.flow.pushed_origin();
+                    if let Some(col) = self.collections.get_mut(ci) {
+                        col.git_origin = Some(origin.clone());
+                    }
+                    // The environment went up in the same commit, so it is
+                    // reachable at its own path on the same branch.
+                    if let Some(env_id) = env_id
+                        && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
+                    {
+                        env.git_origin = Some(GitOrigin {
+                            path: w.flow.env_path.trim().to_string(),
+                            ..origin
+                        });
+                    }
+                }
             }
         }
-        self.remember_git_url(&w.url.text());
+        self.remember_git_url(&w.flow.url);
         self.save_state();
         self.status = Some(Status::GitSaved);
     }
@@ -4445,5 +4723,22 @@ impl TuiApp {
             Pane::Main => self.main_panel.start_autoscroll(d),
             _ => self.resp_panel.start_autoscroll(d),
         }
+    }
+}
+
+/// Flip the toggle on the Options row under the cursor. Row 0 is the
+/// destination path, which is a text field rather than a toggle.
+fn toggle_option_row(w: &mut PostmanWizard) {
+    match w.option_row {
+        1 => w.flow.include_collections = !w.flow.include_collections,
+        2 => w.flow.include_environments = !w.flow.include_environments,
+        3 => {
+            w.flow.format = match w.flow.format {
+                ImportFormat::Raw => ImportFormat::Hurl,
+                ImportFormat::Hurl => ImportFormat::Raw,
+            }
+        }
+        4 => w.flow.overwrite = !w.flow.overwrite,
+        _ => {}
     }
 }

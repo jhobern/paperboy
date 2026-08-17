@@ -17,29 +17,34 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tui_panel_select::{MultiSelectPanel, WrapMode};
 
 use super::app::{
-    ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, TuiApp,
+    ConfirmAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, Pane, PromptKind, TuiApp,
 };
-use super::draw::panel;
+use super::draw::{centered_rect, panel};
 use super::editor::{
     Editor, apply_edit_key_full, render_editor_highlighted, word_left, word_right,
 };
 use super::new_request::draw_scrollbar;
+use super::report_nodes::{SettingMenu, SettingMenuStep};
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::flow::Header;
+use crate::report::indent::{
+    INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
+};
 use crate::report::model::{ReportResult, ReportRow, TARGET_COLUMN, parse_columns};
-use crate::report::parser::opens_block;
+use crate::report::params::ParamRow;
 use crate::report::run::{
     DryRunner, EntryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow, run_flow_raw,
 };
 use crate::report::validate::{Diagnostic, Severity};
-use crate::report::writer::{CsvWriter, writer_for_extension};
-use crate::report::{expand_output_tokens, name_has_output_token};
+use crate::report::writer::{
+    CsvWriter, export_path, report_output_extension, writer_for_extension,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +144,13 @@ pub(crate) struct ReportTab {
     pub(crate) report: Report,
     /// Validation diagnostics (errors + warnings) from the last revalidation.
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// The report's aliased helper collections, loaded at the last revalidation.
+    ///
+    /// Cached rather than loaded on demand because loading reads files from
+    /// disk, and the pickers, completion and known/unknown tinting that need it
+    /// all run while drawing. Refreshed by `revalidate_report`, which already
+    /// fires on every change that could affect it.
+    pub(crate) helpers: Vec<crate::report::run::HelperCollection>,
     /// Parser error message, if the source doesn't currently parse (shown in
     /// place of `diagnostics`, which can't be computed without a parse tree).
     pub(crate) parse_error: Option<String>,
@@ -174,12 +186,45 @@ pub(crate) struct ReportTab {
     /// flattened node rows; clamped on draw). Structural edits move it to track
     /// the affected node.
     pub(crate) node_selected: usize,
+    /// Where the node editor's cursor is when it sits in the **settings**
+    /// section above the flow rather than in the outline below it: `Some(i)`
+    /// selects the i-th settings row (the trailing "add setting" row included),
+    /// `None` means the cursor is on `node_selected` in the flow.
+    ///
+    /// Two indices rather than one combined one because everything structural —
+    /// insert positions, node paths, the undo snapshots — is expressed in flow
+    /// row numbers. Folding the settings in would have shifted every one of
+    /// them by a count that changes as settings are added and removed.
+    pub(crate) node_setting: Option<usize>,
     /// Undo stack for the structured node editor. Every structural node edit
     /// snapshots the pre-edit source text + node selection here (via
     /// [`ReportTab::set_text_undoable`]) so **Ctrl+Z** can restore the previous
     /// state exactly — the node editor's counterpart to the source editor's
     /// in-buffer undo. In-memory and per-tab (not persisted), like text undo.
     pub(crate) node_undo: Vec<NodeUndo>,
+    /// The values this report's `PARAM`s will be run with. Seeded when the run
+    /// settings first open — from what this report was last run with, falling
+    /// back to each declaration's own default — and thereafter whatever the
+    /// user has set. Keyed by the parameter's raw name, never its prompt.
+    pub(crate) param_values: crate::report::params::ParamValues,
+    /// Whether [`param_values`](Self::param_values) has been seeded yet. A
+    /// separate flag rather than "is it empty", because a report whose
+    /// parameters are all empty strings has been seeded just as much as one
+    /// with values, and re-seeding would undo the clearing.
+    pub(crate) params_seeded: bool,
+    /// Whether the run-settings overlay is up. A dialog rather than a view: the
+    /// questions are a step on the way to a run, and the report they are about
+    /// stays visible behind them.
+    pub(crate) params_open: bool,
+    /// The declarations these values were confirmed against, if they have been
+    /// (see [`TuiApp::report_params_answered`]).
+    pub(crate) params_answered: Option<String>,
+    /// The selected row in the run settings view.
+    pub(crate) param_selected: usize,
+    /// What the result (or preview) on screen was actually run with. Kept so
+    /// the summary line can say when the answers have moved on since — a table
+    /// described by values it wasn't produced with is worse than no summary.
+    pub(crate) result_params: Vec<(String, String)>,
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
@@ -195,6 +240,12 @@ pub(crate) struct ReportTab {
     /// warn before it discards results the user hasn't saved anywhere. A result
     /// that's only ever been viewed on screen counts as unexported.
     pub(crate) results_exported: bool,
+    /// The file the last successful export of this tab's result wrote, so
+    /// Ctrl+O can hand it to the desktop without asking where it went. Cleared
+    /// whenever a fresh run replaces the result, because the file on disk then
+    /// describes a run that is no longer on screen. Not persisted: it belongs
+    /// to a result that doesn't outlive the session either.
+    pub(crate) last_export: Option<std::path::PathBuf>,
     /// Live streaming state while a background run is in flight: which of the
     /// pre-built skeleton rows have been filled yet (so the grid greys the
     /// pending ones) and the path→row-index lookup that routes each streamed row
@@ -219,6 +270,20 @@ pub(crate) struct ReportTab {
     /// without touching the cursor) is *not* immediately yanked back to the
     /// highlighted cell. `None` forces a re-centre on the next draw.
     pub(crate) results_scrolled_to: Option<(usize, usize)>,
+    /// Which rows the results grid is showing. `f` cycles through the filters
+    /// the run actually offers ([`crate::report::filter::RowFilter::available`]),
+    /// the same set the GUI's filter bar and the interactive HTML export draw —
+    /// so "show me only the wrong rows" means the same rows everywhere. Reset
+    /// to `All` whenever a new run starts, because the rows it selected are
+    /// gone. Runtime-only.
+    pub(crate) results_filter: crate::report::filter::RowFilter,
+    /// Index of the leftmost grid column drawn in the results pane. A report
+    /// can easily have more columns than fit, and the grid clips rather than
+    /// wraps, so without this the columns past the right edge were simply
+    /// unreachable. Recomputed on draw to keep `cell_cursor`'s column fully
+    /// visible (the viewport follows the cursor, which Left/Right move), and
+    /// clamped to the current column count. Runtime-only.
+    pub(crate) results_col_offset: usize,
     /// When this report was opened from a Workspace tree, the workspace root it
     /// belongs to. This is a *link*, not UI state: the report is shown in the
     /// right pane of the Workspace collection tab rooted here, while that tab's
@@ -355,6 +420,7 @@ impl ReportTab {
         Self {
             report,
             diagnostics: Vec::new(),
+            helpers: Vec::new(),
             parse_error: None,
             parse_error_line: None,
             editor: None,
@@ -364,14 +430,24 @@ impl ReportTab {
             view: ReportView::Source,
             editor_view: ReportView::Source,
             node_selected: 0,
+            node_setting: None,
             node_undo: Vec::new(),
+            param_values: Default::default(),
+            result_params: Vec::new(),
+            params_seeded: false,
+            params_open: false,
+            params_answered: None,
+            param_selected: 0,
             result: None,
             dry_run: None,
             results_exported: false,
+            last_export: None,
             run_progress: None,
             results_panel,
             cell_cursor: None,
             results_scrolled_to: None,
+            results_filter: crate::report::filter::RowFilter::All,
+            results_col_offset: 0,
             workspace_root: None,
             embedded_active: true,
         }
@@ -401,6 +477,46 @@ impl ReportTab {
             self.node_undo.drain(0..overflow);
         }
         self.report.set_text(new_text);
+    }
+
+    /// The rows the results grid is showing, as indices into `result.rows`.
+    ///
+    /// Everything that addresses a row by position — the cell cursor, the
+    /// drill-down popup, the mouse hit-test — goes through this list, so a
+    /// filtered grid's "row 3" is the third row *on screen*.
+    ///
+    /// A streaming run is always shown whole, for the reason the GUI shows it
+    /// whole: [`crate::report::filter::visible_rows`] drops pending rows, so
+    /// filtering a live run would empty the very view being watched.
+    pub(crate) fn visible_result_rows(&self) -> Vec<usize> {
+        let Some(result) = &self.result else {
+            return Vec::new();
+        };
+        let n = result.rows.len();
+        if self.run_progress.is_some()
+            || self.results_filter == crate::report::filter::RowFilter::All
+        {
+            return (0..n).collect();
+        }
+        let header = self.report.flow().map(|f| f.header).unwrap_or_default();
+        let columns = result.resolved_columns(&header);
+        let labels = crate::report::labels::LabelMap::parse(&header.labels());
+        crate::report::filter::visible_rows(result, &columns, &labels, &self.results_filter, "")
+    }
+
+    /// The filters this run offers, in the order `f` cycles them.
+    ///
+    /// Only the button filters ([`crate::report::filter::RowFilter::available`]),
+    /// not the per-matrix-cell ones the GUI and the HTML export add: those are
+    /// reached by clicking the cell that counted them, and there is no matrix
+    /// to click in a terminal.
+    pub(crate) fn result_filters(&self) -> Vec<crate::report::filter::RowFilter> {
+        match &self.result {
+            Some(result) if self.run_progress.is_none() => {
+                crate::report::filter::RowFilter::available(result)
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -843,15 +959,20 @@ impl TuiApp {
     /// Recompute the diagnostics (and parse-error state) for report tab `idx`
     /// against the currently-loaded collections and environments.
     pub(crate) fn revalidate_report(&mut self, idx: usize) {
+        // Cheap and idempotent: the values a parameterised report will run with
+        // are filled in from what it was last run with the first time anything
+        // touches the tab, so the run settings show real answers rather than
+        // bare defaults however the tab was opened.
+        self.seed_report_params(idx);
         // Compute the parse-error / diagnostics up front so the immutable reads
         // of `self.collections` / `self.global_envs` don't overlap the mutable
         // borrow of `self.reports[idx]` that stores the result.
-        let (parse_error, parse_error_line, diagnostics) = {
+        let (parse_error, parse_error_line, diagnostics, helpers) = {
             let Some(rt) = self.reports.get(idx) else {
                 return;
             };
             match rt.report.flow() {
-                Err(e) => (Some(e.to_string()), Some(e.line), Vec::new()),
+                Err(e) => (Some(e.to_string()), Some(e.line), Vec::new(), Vec::new()),
                 Ok(flow) => {
                     // The full validation-context assembly (bound collection,
                     // request titles / [Reports] fields, env names + variable
@@ -865,7 +986,13 @@ impl TuiApp {
                         rt.report.path.as_deref(),
                         &crate::i18n::Strings::for_language(&self.language),
                     );
-                    (None, None, diags)
+                    let (helpers, _) = crate::report::context::load_helpers(
+                        &self.collections,
+                        &flow,
+                        rt.report.path.as_deref(),
+                        &crate::i18n::Strings::for_language(&self.language),
+                    );
+                    (None, None, diags, helpers)
                 }
             }
         };
@@ -873,6 +1000,7 @@ impl TuiApp {
             rt.parse_error = parse_error;
             rt.parse_error_line = parse_error_line;
             rt.diagnostics = diagnostics;
+            rt.helpers = helpers;
         }
     }
 
@@ -939,12 +1067,16 @@ impl TuiApp {
     /// see them for the differing pre-run checks.
     fn flow_result(&self, idx: usize, runner: &dyn EntryRunner) -> Result<ReportResult, String> {
         let inputs = self.build_report_run_inputs(idx)?;
+        let strings = Strings::for_language(&self.language);
         let ctx = RunContext {
             entries: &inputs.entries,
+            helpers: &inputs.helpers,
             base_vars: inputs.base_vars,
             named_envs: inputs.named_envs,
             root: inputs.root,
             runner,
+            strings: &strings,
+            params: inputs.params,
             sink: None,
         };
         Ok(run_flow(&inputs.flow, &ctx))
@@ -970,6 +1102,17 @@ impl TuiApp {
             &flow,
             rt.report.path.as_deref(),
         )
+        .map(|mut inputs| {
+            // The core has no language of its own; only the app knows which one
+            // the user picked, so the run's own errors are set to it here.
+            inputs.language = self.language.clone();
+            inputs.params = self
+                .report_param_rows(idx)
+                .into_iter()
+                .map(|r| (r.name, r.value))
+                .collect();
+            inputs
+        })
         .map_err(|e| match e {
             crate::report::context::RunInputError::Unbound => s.report_run_unbound.to_string(),
         })
@@ -982,6 +1125,15 @@ impl TuiApp {
     /// validation errors) reports why in the status bar and keeps the source
     /// view; the delivered result is folded in by [`Self::poll_report_run_updates`].
     pub(crate) fn run_active_report(&mut self) {
+        // A report that asks for values stops at the questions on the way to
+        // its run — before the discard guard below, because opening the
+        // questions discards nothing: the results stay exactly where they are
+        // until the *second* Run actually starts.
+        if self.report_run_needs_settings() {
+            self.open_report_run_settings();
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return;
+        }
         // Guard against a rerun silently discarding on-screen results the user
         // hasn't saved anywhere: ask first (#2). A run already in flight, or a
         // report with nothing worth keeping, skips straight through.
@@ -1002,6 +1154,23 @@ impl TuiApp {
         if let Some((report_id, inputs)) = self.prepare_report_run() {
             self.spawn_report_run(report_id, inputs, |file_root| LiveRunner { file_root });
         }
+    }
+
+    /// Whether Run on the active report should open its run settings instead of
+    /// starting: true when the report declares parameters and they aren't the
+    /// thing on screen. A run already in flight is exempt — that key is a
+    /// cancel ([`Self::prepare_report_run`]), and a cancel must never be read
+    /// as "show me the questions".
+    pub(crate) fn report_run_needs_settings(&self) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        !self
+            .running_reports
+            .contains_key(&self.reports[idx].report.id)
+            && !self.reports[idx].params_open
+            && !self.report_params_answered(idx)
+            && self.report_has_params(idx)
     }
 
     /// Whether pressing "run" on the active report would throw away results the
@@ -1065,6 +1234,36 @@ impl TuiApp {
             self.status = Some(Status::ReportRunBlocked(reason));
             return None;
         }
+        // A parameterised report is run with whatever the run settings hold —
+        // seeded here too, so `r` straight from the source view still runs with
+        // the declared defaults and what this report was last run with.
+        self.seed_report_params(idx);
+        // A report that asks for values stops at the run settings on the way to
+        // its run: Run opens them, Run again (from the settings) starts. The
+        // values decide what the run *means*, so they deserve a look before
+        // several minutes of requests go out under them — and this is also the
+        // only reliable way back to them once a run has filled the screen with
+        // results. A run already under way is unaffected: the cancel path above
+        // returns before this.
+        if self.report_run_needs_settings() {
+            self.reports[idx].params_open = true;
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return None;
+        }
+        if let Some(problem) = self
+            .report_param_rows(idx)
+            .into_iter()
+            .find_map(|r| r.problem.map(|p| format!("{}: {p}", r.prompt)))
+        {
+            // Refuse rather than run: a report that asks for something and is
+            // given nothing produces plausible-looking rows built around a hole.
+            self.status = Some(Status::ReportRunBlocked(problem));
+            self.seed_report_params(idx);
+            self.reports[idx].params_open = true;
+            return None;
+        }
+        self.remember_active_report_params(idx);
+        self.record_result_params(idx);
         match self.build_report_run_inputs(idx) {
             Ok(inputs) => Some((report_id, inputs)),
             Err(reason) => {
@@ -1072,6 +1271,37 @@ impl TuiApp {
                 None
             }
         }
+    }
+
+    /// Note what the run about to start is answering, so the summary line can
+    /// say later when the answers have moved on since the table was produced.
+    pub(crate) fn record_result_params(&mut self, idx: usize) {
+        let now: Vec<(String, String)> = self
+            .report_param_rows(idx)
+            .into_iter()
+            .map(|r| (r.name, r.value))
+            .collect();
+        if let Some(rt) = self.reports.get_mut(idx) {
+            rt.result_params = now;
+        }
+    }
+
+    /// Whether the answers have changed since the result on screen was made.
+    /// False with nothing to compare against: a report that has never been run
+    /// is not "changed".
+    pub(crate) fn report_params_changed_since_result(&self, idx: usize) -> bool {
+        let Some(rt) = self.reports.get(idx) else {
+            return false;
+        };
+        if rt.result_params.is_empty() || (rt.result.is_none() && rt.dry_run.is_none()) {
+            return false;
+        }
+        let now: Vec<(String, String)> = self
+            .report_param_rows(idx)
+            .into_iter()
+            .map(|r| (r.name, r.value))
+            .collect();
+        now != rt.result_params
     }
 
     /// Spawn the worker thread for a prepared run. The run streams back over a
@@ -1096,11 +1326,15 @@ impl TuiApp {
             let ReportRunInputs {
                 flow,
                 entries,
+                helpers,
                 base_vars,
                 named_envs,
                 root,
                 file_root,
+                language,
+                params,
             } = inputs;
+            let strings = crate::i18n::Strings::for_language(&language);
 
             // 1. Skeleton: expand the flow with no HTTP (a `DryRunner`) to get
             //    the full, canonical row set up front. The base layers are
@@ -1111,10 +1345,13 @@ impl TuiApp {
             let skeleton = {
                 let dry_ctx = RunContext {
                     entries: &entries,
+                    helpers: &helpers,
                     base_vars: base_vars.clone(),
                     named_envs: named_envs.clone(),
                     root: root.clone(),
                     runner: &DryRunner,
+                    strings: &strings,
+                    params: params.clone(),
                     sink: None,
                 };
                 run_flow_raw(&flow, &dry_ctx)
@@ -1158,10 +1395,13 @@ impl TuiApp {
             };
             let ctx = RunContext {
                 entries: &entries,
+                helpers: &helpers,
                 base_vars,
                 named_envs,
                 root,
                 runner: &runner,
+                strings: &strings,
+                params: params.clone(),
                 sink: Some(&sink),
             };
             let mut result = run_flow_raw(&flow, &ctx);
@@ -1248,12 +1488,18 @@ impl TuiApp {
                     .map(|(i, row)| (row.path.clone(), i))
                     .collect();
                 let rt = &mut self.reports[idx];
+                // Every slot is outstanding until its row streams in, so a live
+                // `STATISTICS(…)` measures what has actually run rather than the
+                // dry placeholders (`Time` 0, `status` 0) filling the rest.
+                let mut result = result;
+                result.pending = (0..n).collect();
                 rt.result = Some(result);
                 // A real run supersedes the projection it was previewing.
                 rt.dry_run = None;
                 // A fresh run's output starts life unexported, so a later rerun
                 // can warn before discarding it (#2).
                 rt.results_exported = false;
+                rt.last_export = None;
                 rt.run_progress = Some(RunProgress {
                     states: vec![RowState::Scheduled; n],
                     index,
@@ -1262,6 +1508,11 @@ impl TuiApp {
                 // A new run invalidates the cell cursor (column layout may
                 // change) — reset it so the cursor starts fresh on the new grid.
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 // Show the (greyed) grid straight away so the run's shape/size
                 // is visible before any request completes — unless the user is
                 // mid-edit, in which case just stage it (they can flip with Tab).
@@ -1308,6 +1559,7 @@ impl TuiApp {
                     && ri < result.rows.len()
                 {
                     result.rows[ri] = *row;
+                    result.pending.remove(&ri);
                     if prog.states[ri] != RowState::Finished {
                         prog.states[ri] = RowState::Finished;
                         prog.done += 1;
@@ -1349,9 +1601,15 @@ impl TuiApp {
                 // The finalized result supersedes the skeleton and is likewise
                 // unexported until the user saves it somewhere (#2).
                 rt.results_exported = false;
+                rt.last_export = None;
                 // The finalized grid may have different columns/rows than the
                 // streamed skeleton — reset cursor so it starts fresh.
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 if rt.editor.is_none() {
                     rt.view = ReportView::Results;
                     rt.results_panel.set_scroll(0);
@@ -1389,13 +1647,332 @@ impl TuiApp {
                 // A real run supersedes the projection it was previewing.
                 rt.dry_run = None;
                 rt.results_exported = false;
+                rt.last_export = None;
                 rt.cell_cursor = None;
+                rt.results_col_offset = 0;
+                // The rows a filter selected belong to the run that is being
+                // replaced, so the new grid starts unfiltered rather than
+                // opening on an empty table.
+                rt.results_filter = crate::report::filter::RowFilter::All;
                 rt.view = ReportView::Results;
                 rt.results_panel.set_scroll(0);
                 self.status = Some(Status::ReportRunDone { rows, errors });
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
         }
+    }
+
+    /// One row of the run settings view.
+    // Built fresh on every draw and key press from the flow + the tab's chosen
+    // values, so it can never drift from the source the way a cached copy of a
+    // declaration would.
+    pub(crate) fn report_param_rows(&self, idx: usize) -> Vec<ParamRow> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        let s = Strings::for_language(&self.language);
+        crate::report::params::rows(&flow.params(), &rt.param_values, &s)
+    }
+
+    /// Whether the active report declares any parameters — the question every
+    /// "should the run settings exist here?" decision asks.
+    pub(crate) fn report_has_params(&self, idx: usize) -> bool {
+        self.reports
+            .get(idx)
+            .and_then(|rt| rt.report.flow().ok())
+            .is_some_and(|f| !f.params().is_empty())
+    }
+
+    /// Open the run settings for the active report, seeding the values the
+    /// first time from what this report was last run with (and, failing that,
+    /// from each declaration's own default). Pressing the key again on the run
+    /// settings goes back to the report itself: a report that asks for values
+    /// *opens* on them, so its user never pressed anything to get here and
+    /// needs a way out that isn't "undo a step you didn't take" — the same
+    /// toggle `v` gives the results grid.
+    pub(crate) fn open_report_run_settings(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if self.reports[idx].params_open {
+            self.reports[idx].params_open = false;
+            return;
+        }
+        if !self.report_has_params(idx) {
+            self.status = Some(Status::ReportRunBlocked(
+                Strings::for_language(&self.language)
+                    .param_none_declared
+                    .to_string(),
+            ));
+            return;
+        }
+        self.seed_report_params(idx);
+        self.reports[idx].params_open = true;
+    }
+
+    /// Whether this report's questions have already been answered for the
+    /// values it currently asks for.
+    ///
+    /// Answered once per sitting, not once per run: the point of previewing a
+    /// report is to run the same thing afterwards, and being asked again in
+    /// between would make the preview worthless as a confirmation. The answer
+    /// is filed against a *signature* of the declarations, so changing what the
+    /// report asks — a new parameter, another choice — asks again, while
+    /// editing anything else doesn't.
+    pub(crate) fn report_params_answered(&self, idx: usize) -> bool {
+        self.reports[idx]
+            .params_answered
+            .as_ref()
+            .is_some_and(|sig| Some(sig) == self.report_param_signature(idx).as_ref())
+    }
+
+    /// What a report asks, as one string: every declaration's name, type and
+    /// default. Compared rather than inspected, so it only has to be stable.
+    /// `None` when the report doesn't currently parse — there is nothing to
+    /// compare, and re-asking on every keystroke of a half-typed edit would be
+    /// worse than trusting the last answer.
+    fn report_param_signature(&self, idx: usize) -> Option<String> {
+        let flow = self.reports[idx].report.flow().ok()?;
+        Some(
+            flow.params()
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{:?}:{}",
+                        p.name,
+                        p.kind,
+                        p.default.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Record that the questions have been answered as they currently stand,
+    /// and close them. Called by Run and Dry run from inside the overlay.
+    pub(crate) fn answer_report_params(&mut self, idx: usize) {
+        self.reports[idx].params_answered = self.report_param_signature(idx);
+        self.reports[idx].params_open = false;
+    }
+
+    /// The chosen values as coloured spans — for the binding panel, so what the
+    /// next run will use is on screen without opening anything — `REGION=au · TICKET=(not set)`.
+    /// A value with no answer is painted like something still to be
+    /// done rather than like the rest of the line, because a line where
+    /// everything is the same colour reads as a status message and this one is
+    /// a question.
+    pub(crate) fn report_param_spans<'a>(
+        &self,
+        idx: usize,
+        s: &'a Strings,
+        th: &Theme,
+    ) -> Vec<Span<'a>> {
+        let mut spans = Vec::new();
+        for (i, r) in self.report_param_rows(idx).iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(th.dim)));
+            }
+            spans.push(Span::styled(
+                format!("{}=", r.name),
+                Style::default().fg(th.dim),
+            ));
+            let (text, color) = if r.problem.is_some() {
+                (s.param_value_unset.to_string(), th.err)
+            } else if r.value.is_empty() {
+                (s.param_value_unset.to_string(), th.pending)
+            } else {
+                (r.value.clone(), th.text)
+            };
+            spans.push(Span::styled(text, Style::default().fg(color)));
+        }
+        spans
+    }
+
+    /// Fill in a report's parameter values from what it was last run with,
+    /// once. Anything the remembered set doesn't cover keeps the declared
+    /// default, so adding a parameter to a report someone has already run
+    /// doesn't leave it blank.
+    pub(crate) fn seed_report_params(&mut self, idx: usize) {
+        if self.reports.get(idx).is_none_or(|rt| rt.params_seeded) {
+            return;
+        }
+        let key = self.reports[idx].report.param_key();
+        let remembered = self.remembered_params(&key);
+        let declared: Vec<(String, Option<String>)> = self.reports[idx]
+            .report
+            .flow()
+            .map(|f| {
+                f.params()
+                    .into_iter()
+                    .map(|p| (p.name.clone(), p.default.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rt = &mut self.reports[idx];
+        for (name, default) in declared {
+            // Never over-write what is already there: seeding can happen after
+            // the user has already typed into the run settings (a report opened
+            // straight onto them), and their answer outranks both the
+            // remembered one and the declared default.
+            if rt.param_values.contains_key(&name) {
+                continue;
+            }
+            let value = remembered
+                .get(&name)
+                .cloned()
+                .or(default)
+                .unwrap_or_default();
+            rt.param_values.insert(name, value);
+        }
+        rt.params_seeded = true;
+    }
+
+    /// Move the run settings cursor, clamped to the rows that exist.
+    pub(crate) fn param_cursor_move(&mut self, delta: i32) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let last = self.report_param_rows(idx).len().saturating_sub(1);
+        let rt = &mut self.reports[idx];
+        let next = (rt.param_selected as i32 + delta).clamp(0, last as i32);
+        rt.param_selected = next as usize;
+    }
+
+    /// Enter on a run settings row: open whichever editor suits the parameter's
+    /// declared type — a list for the ones with a closed set of answers, the
+    /// file browser for the two that name paths, a text prompt for the rest.
+    /// The type is what makes a parameter worth declaring rather than
+    /// assigning, so this is where it earns its keep.
+    pub(crate) fn configure_selected_param(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let rows = self.report_param_rows(idx);
+        let sel = self.reports[idx].param_selected.min(rows.len());
+        let Some(row) = rows.get(sel) else { return };
+        let report_id = self.reports[idx].report.id;
+        match &row.kind {
+            crate::report::flow::ParamKind::Choice(options) if !options.is_empty() => {
+                let selected = options.iter().position(|o| *o == row.value).unwrap_or(0);
+                self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+                    step: SettingMenuStep::PickParam {
+                        name: row.name.clone(),
+                    },
+                    options: options.clone(),
+                    filter: String::new(),
+                    selected,
+                    report_id,
+                })));
+            }
+            crate::report::flow::ParamKind::Env => {
+                let options: Vec<String> =
+                    self.global_envs.iter().map(|e| e.name.clone()).collect();
+                if options.is_empty() {
+                    // Nothing is loaded to choose between. Typing a name by
+                    // hand still works, and is the right answer for an
+                    // environment that lives on another machine.
+                    self.status = Some(Status::ReportSettingNoChoices);
+                    self.open_param_text_prompt(report_id, row);
+                    return;
+                }
+                let selected = options.iter().position(|o| *o == row.value).unwrap_or(0);
+                self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+                    step: SettingMenuStep::PickParam {
+                        name: row.name.clone(),
+                    },
+                    options,
+                    filter: String::new(),
+                    selected,
+                    report_id,
+                })));
+            }
+            crate::report::flow::ParamKind::Folder | crate::report::flow::ParamKind::File => {
+                self.pending_param_path = Some((report_id, row.name.clone()));
+                // A parameter's paths almost always live beside the report.
+                if let Some(dir) = self.active_report_base_dir() {
+                    self.last_browse_dir = Some(dir);
+                }
+                self.open_browser(match row.kind {
+                    crate::report::flow::ParamKind::Folder => {
+                        super::app::FileAction::PickReportParamFolder
+                    }
+                    _ => super::app::FileAction::PickReportParamFile,
+                });
+            }
+            _ => self.open_param_text_prompt(report_id, row),
+        }
+    }
+
+    fn open_param_text_prompt(&mut self, report_id: u64, row: &ParamRow) {
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::ReportParamValue {
+                report_id,
+                name: row.name.clone(),
+            },
+            editor: Editor::new(&row.value, false),
+            title: row.prompt.clone(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Set one parameter's value for the next run, by report id so a tab
+    /// reorder while a prompt is open can't misroute it.
+    pub(crate) fn set_report_param(&mut self, report_id: u64, name: &str, value: String) {
+        if let Some(rt) = self.reports.iter_mut().find(|rt| rt.report.id == report_id) {
+            rt.param_values.insert(name.to_string(), value);
+        }
+    }
+
+    /// Remember what this report was just run with, so reopening it offers the
+    /// same answers rather than asking again from scratch.
+    fn remember_active_report_params(&mut self, idx: usize) {
+        let rows = self.report_param_rows(idx);
+        if rows.is_empty() {
+            return;
+        }
+        let key = self.reports[idx].report.param_key();
+        let values: crate::report::params::ParamValues =
+            rows.into_iter().map(|r| (r.name, r.value)).collect();
+        if self.session.remember_params(&key, &values) {
+            self.save_state();
+        }
+    }
+
+    /// Key handling while the run-settings overlay is up. Returns `true` when
+    /// it consumed the key; anything it doesn't take falls through to the
+    /// shared report shortcuts (so the tab keys and the menus still work).
+    fn on_key_report_run_settings(&mut self, key: KeyEvent, idx: usize) -> bool {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.param_cursor_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.param_cursor_move(1),
+            KeyCode::Home => self.param_cursor_move(i32::MIN),
+            KeyCode::End => self.param_cursor_move(i32::MAX),
+            KeyCode::Enter | KeyCode::Char(' ') => self.configure_selected_param(),
+            // The two exits that *do* something. Both count as an answer, so
+            // the next Run (or the run a preview talks you into) doesn't ask
+            // again — see `report_params_answered`.
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                self.answer_report_params(idx);
+                self.run_active_report();
+            }
+            KeyCode::Char('d') => {
+                self.answer_report_params(idx);
+                self.open_report_dry_run();
+            }
+            // Esc and `p` both put the questions away without answering them:
+            // `p` because it is what opened them, Esc because it is what a hand
+            // reaches for on a box in the middle of the screen.
+            KeyCode::Esc | KeyCode::Char('p') => self.reports[idx].params_open = false,
+            _ => return false,
+        }
+        true
     }
 
     /// Toggle the active report between its current *editor* view and the
@@ -1457,10 +2034,13 @@ impl TuiApp {
     /// saved report's stem (or its tab name) with a `.csv` extension.
     pub(crate) fn default_report_csv_filename(&self) -> String {
         match self.active_report_index() {
-            Some(idx) => csv_export_path(&self.reports[idx].report)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "report.csv".to_string()),
+            Some(idx) => export_path(
+                &self.reports[idx].report,
+                &report_output_extension(&self.reports[idx].report),
+            )
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "report.csv".to_string()),
             None => "report.csv".to_string(),
         }
     }
@@ -1511,6 +2091,7 @@ impl TuiApp {
                 // The result now lives on disk, so a rerun needn't warn about
                 // discarding it (#2).
                 self.reports[idx].results_exported = true;
+                self.reports[idx].last_export = Some(path.to_path_buf());
                 self.status = Some(Status::ReportExported(path.display().to_string()));
             }
             Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
@@ -1540,7 +2121,7 @@ impl TuiApp {
     /// the saved report's stem (or its tab name) with a `.baseline` extension.
     pub(crate) fn default_report_baseline_filename(&self) -> String {
         match self.active_report_index() {
-            Some(idx) => baseline_export_path(&self.reports[idx].report)
+            Some(idx) => export_path(&self.reports[idx].report, "baseline")
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "report.baseline".to_string()),
@@ -1574,6 +2155,32 @@ impl TuiApp {
         }
     }
 
+    /// Hand the active report's last exported file to the desktop's default
+    /// application (a browser for the interactive HTML, a spreadsheet for the
+    /// xlsx). Bound to Ctrl+O.
+    ///
+    /// Only ever opens a file *this* tab exported, and only while it still
+    /// describes the run on screen — a rerun clears it — because "open the
+    /// report" silently showing a previous run's numbers is worse than not
+    /// opening anything. Without one, says how to make one rather than
+    /// doing nothing.
+    pub(crate) fn open_exported_report(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let s = Strings::for_language(&self.language);
+        let Some(path) = self.reports[idx].last_export.clone() else {
+            self.status = Some(Status::ReportRunBlocked(
+                s.report_open_no_export.to_string(),
+            ));
+            return;
+        };
+        match crate::shared_utils::open_in_desktop(&path) {
+            Ok(()) => self.status = Some(Status::ReportOpened(path.display().to_string())),
+            Err(e) => self.status = Some(Status::Error(format!("{}: {e}", path.display()))),
+        }
+    }
+
     /// Dry-run the active report: expand its flow with a no-op runner (no HTTP)
     /// and show, in the results pane, the projected output grid (identical
     /// to what a real run would produce, but with all HTTP-response fields
@@ -1587,6 +2194,16 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
+        // A preview is only worth reading if it previews the run you mean, so
+        // it asks the same questions Run does — and the answer counts for both,
+        // so previewing and then running doesn't ask twice.
+        if self.report_run_needs_settings() {
+            self.open_report_run_settings();
+            self.status = Some(Status::ReportRunSettingsFirst);
+            return;
+        }
+        self.seed_report_params(idx);
+        self.record_result_params(idx);
         match self.dry_run_report_flow(idx) {
             Ok(result) => {
                 // The flow header is needed to resolve `# columns:` for the
@@ -1613,13 +2230,32 @@ impl TuiApp {
                 // occupy the same place and the same keys scroll both.
                 self.reports[idx].view = ReportView::Results;
                 self.reports[idx].results_panel.set_scroll(0);
+                self.reports[idx].results_col_offset = 0;
             }
             Err(reason) => self.status = Some(Status::ReportRunBlocked(reason)),
         }
     }
 
-    /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.
-    /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
+    /// Scroll the dry-run preview's grid sideways by `dc` columns, clamped so
+    /// the leftmost column never goes past the last one. The preview has no
+    /// cell cursor to follow, so this is the only thing that moves its
+    /// viewport.
+    fn preview_scroll_cols(&mut self, dc: i32) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        let Some(preview) = self.reports[idx].dry_run.as_ref() else {
+            return;
+        };
+        let ncols = preview.result.resolved_columns(&preview.header).len();
+        if ncols == 0 {
+            return;
+        }
+        let cur = self.reports[idx].results_col_offset as i32;
+        self.reports[idx].results_col_offset = (cur + dc).clamp(0, ncols as i32 - 1) as usize;
+    }
+
+    /// Move the cell cursor in the active report's Results grid by `(dr, dc)`.    /// Initialises the cursor at `(0, 0)` if it has no position yet. Clamps to
     /// the data-row/column count so it never points outside the grid.
     pub(crate) fn result_cursor_move(&mut self, dr: i32, dc: i32) {
         let Some(idx) = self.active_report_index() else {
@@ -1634,7 +2270,10 @@ impl TuiApp {
             .map(|f| f.header)
             .unwrap_or_default();
         let ncols = result.resolved_columns(&header).len();
-        let nrows = result.rows.len();
+        // Row positions are on-screen positions: with a filter up, the grid has
+        // fewer rows than the run does, and a cursor clamped to the run's count
+        // would walk off the bottom of what is drawn.
+        let nrows = self.reports[idx].visible_result_rows().len();
         if nrows == 0 || ncols == 0 {
             return;
         }
@@ -1642,6 +2281,38 @@ impl TuiApp {
         let new_row = (cur_row as i32 + dr).clamp(0, nrows as i32 - 1) as usize;
         let new_col = (cur_col as i32 + dc).clamp(0, ncols as i32 - 1) as usize;
         self.reports[idx].cell_cursor = Some((new_row, new_col));
+    }
+
+    /// Step the active report's results grid to the next filter it offers,
+    /// wrapping at the end.
+    ///
+    /// Inert unless a finished run is on screen with more than one filter to
+    /// choose between: a report with no comparison and no ground truth offers
+    /// only "All", and a key that silently does nothing is worse than one that
+    /// isn't bound.
+    pub(crate) fn cycle_report_row_filter(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        if self.reports[idx].view != ReportView::Results {
+            return;
+        }
+        let filters = self.reports[idx].result_filters();
+        if filters.len() < 2 {
+            return;
+        }
+        let at = filters
+            .iter()
+            .position(|f| *f == self.reports[idx].results_filter)
+            .unwrap_or(0);
+        let next = filters[(at + 1) % filters.len()].clone();
+        self.reports[idx].results_filter = next;
+        // Every row position on screen has just changed meaning, so the cursor
+        // and the scroll start again at the top rather than pointing at
+        // whichever row happens to have taken that slot.
+        self.reports[idx].cell_cursor = None;
+        self.reports[idx].results_scrolled_to = None;
+        self.reports[idx].results_panel.set_scroll(0);
     }
 
     /// Move the cell cursor by a whole page (Ctrl+Up / Ctrl+Down). The page
@@ -1661,11 +2332,7 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        if self.reports[idx]
-            .result
-            .as_ref()
-            .is_some_and(|r| !r.rows.is_empty())
-        {
+        if !self.reports[idx].visible_result_rows().is_empty() {
             let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
             self.reports[idx].cell_cursor = Some((0, col));
         }
@@ -1677,11 +2344,7 @@ impl TuiApp {
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        let nrows = self.reports[idx]
-            .result
-            .as_ref()
-            .map(|r| r.rows.len())
-            .unwrap_or(0);
+        let nrows = self.reports[idx].visible_result_rows().len();
         if nrows > 0 {
             let col = self.reports[idx].cell_cursor.map(|(_, c)| c).unwrap_or(0);
             self.reports[idx].cell_cursor = Some((nrows - 1, col));
@@ -1701,6 +2364,7 @@ impl TuiApp {
             self.result_cursor_move(0, 0); // lands at (0, 0)
             return;
         };
+        let visible = self.reports[idx].visible_result_rows();
         let Some(result) = &self.reports[idx].result else {
             return;
         };
@@ -1713,7 +2377,9 @@ impl TuiApp {
         let Some(col_def) = columns.get(col) else {
             return;
         };
-        let Some(data_row) = result.rows.get(row) else {
+        // `row` counts rows on screen; with a filter up that is not the run's
+        // own numbering, so it is mapped back before the row is read.
+        let Some(data_row) = visible.get(row).and_then(|&r| result.rows.get(r)) else {
             return;
         };
         let title = col_def.header.clone();
@@ -1784,7 +2450,7 @@ impl TuiApp {
             // `y` copies the panel selection to the clipboard, or — when
             // nothing is selected — the entire cell content.
             KeyCode::Char('y') => {
-                use tui_panel_select::clipboard::copy_to_clipboard;
+                use crate::tui::clipboard::copy_to_clipboard;
                 let text = panel
                     .selected_text(None)
                     .filter(|t| !t.is_empty())
@@ -1805,6 +2471,39 @@ impl TuiApp {
     /// come from the last run, so a report must have been run first; otherwise
     /// a hint is shown. A parse error (which can't normally coexist with a
     /// result) falls back to that hint too.
+    /// Re-indent the whole report source to its true block depth.
+    ///
+    /// Useful after a structural edit that changes nesting — wrapping an
+    /// existing block in a new outer loop leaves its whole body one level short,
+    /// and re-indenting it by hand in the source view is tedious.
+    ///
+    /// Only leading whitespace moves (see [`crate::report::indent::reformat`]),
+    /// so comments and blank lines survive; a script that doesn't parse is left
+    /// alone rather than guessed at.
+    pub(crate) fn reformat_active_report(&mut self) {
+        let Some(idx) = self.active_report_index() else {
+            return;
+        };
+        match crate::report::indent::reformat(&self.reports[idx].report.text) {
+            Ok(Some(text)) => {
+                self.reports[idx].set_text_undoable(text);
+                self.revalidate_report(idx);
+                self.save_state();
+                self.status = Some(Status::ReportReformatted);
+            }
+            Ok(None) => self.status = Some(Status::ReportAlreadyTidy),
+            Err(ReformatError::Unparseable(msg)) => {
+                self.status = Some(Status::ReportReformatFailed(msg));
+            }
+            Err(ReformatError::WouldChangeMeaning) => {
+                let s = Strings::for_language(&self.language);
+                self.status = Some(Status::ReportReformatFailed(
+                    s.report_reformat_unsafe.to_string(),
+                ));
+            }
+        }
+    }
+
     pub(crate) fn open_report_columns(&mut self) {
         let Some(idx) = self.active_report_index() else {
             return;
@@ -2110,8 +2809,37 @@ impl TuiApp {
         {
             return;
         }
+        // Same arrangement for the run settings: it owns the cursor keys and
+        // Enter, and lets everything else through.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].params_open
+            && self.on_key_report_run_settings(key, idx)
+        {
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // A dry-run preview has no cell cursor, but its grid clips just like
+        // the real one — so Left/Right scroll it sideways directly, keeping the
+        // preview's off-screen columns reachable.
+        if let Some(idx) = self.active_report_index()
+            && self.reports[idx].view == ReportView::Results
+            && self.reports[idx].dry_run.is_some()
+            && !ctrl
+            && !shift
+        {
+            match key.code {
+                KeyCode::Left => {
+                    self.preview_scroll_cols(-1);
+                    return;
+                }
+                KeyCode::Right => {
+                    self.preview_scroll_cols(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         // When the results grid is visible and has data, plain (unmodified)
         // arrow keys drive the cell cursor rather than cycling tabs or
         // scrolling the panel. Home/End also jump to the first/last data row.
@@ -2208,7 +2936,16 @@ impl TuiApp {
             KeyCode::Left | KeyCode::Right => {}
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
+            // `/` walks the results filters -- the key filters a list in k9s,
+            // lazygit and their neighbours, and nothing in the report view
+            // wanted it. The same filters the GUI's bar offers and the
+            // interactive HTML export writes buttons for, so "show me only the
+            // wrong rows" selects the same rows in all three.
+            KeyCode::Char('/') => self.cycle_report_row_filter(),
             // Global menus, unchanged from the collection view.
+            // Ctrl+O opens what Ctrl+S wrote, so an exported HTML report is one
+            // keystroke from the browser it was written for.
+            KeyCode::Char('o') if ctrl => self.open_exported_report(),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
             KeyCode::Char('s') if !ctrl => self.overlay = Some(Overlay::Options(0)),
             KeyCode::Char('?') | KeyCode::F(1) => {
@@ -2233,6 +2970,7 @@ impl TuiApp {
                     if self.reports[idx].dry_run.is_some() {
                         self.reports[idx].dry_run = None;
                         self.reports[idx].results_panel.set_scroll(0);
+                        self.reports[idx].results_col_offset = 0;
                     } else if self.reports[idx].view == ReportView::Nodes {
                         self.reports[idx].view = ReportView::Source;
                         self.reports[idx].editor_view = ReportView::Source;
@@ -2247,8 +2985,14 @@ impl TuiApp {
             KeyCode::Char('c') => self.open_report_columns(),
             // Bind: (re)point the report at one of the open collections.
             KeyCode::Char('b') => self.open_report_bind(),
+            // The run settings: the values this report's PARAMs will be run
+            // with. `p` because it's what the report asks the user for.
+            KeyCode::Char('p') => self.open_report_run_settings(),
             // Flip between the source and the last run's results grid.
             KeyCode::Char('v') => self.toggle_report_view(),
+            // Reformat: re-indent the source to its real block depth. Shift+F
+            // because a bare `f` already opens the File menu.
+            KeyCode::Char('F') => self.reformat_active_report(),
             // Tab moves focus. A standalone report has a single (full-screen)
             // body, so Tab is inert. An embedded report shares its tab with the
             // collection tree, so Tab rotates focus back to that tree (and on
@@ -2298,8 +3042,9 @@ impl TuiApp {
             let panel = match rt.view {
                 ReportView::Results => &mut rt.results_panel,
                 ReportView::Source => &mut rt.source_panel,
-                // The node outline scrolls to follow its selection cursor (moved
-                // by Up/Down in the node handler), not a free scroll offset.
+                // The node outline and the run settings both scroll to follow
+                // their selection cursor (moved by Up/Down in their own
+                // handlers), not a free scroll offset.
                 ReportView::Nodes => return,
             };
             let next = (panel.scroll() as i32).saturating_add(delta).max(0);
@@ -2419,10 +3164,7 @@ impl TuiApp {
                 KeyCode::Enter if !ctrl && !shift => {
                     let line = &editor.lines[editor.row];
                     if editor.col == line.chars().count() {
-                        let mut new_indent = leading_ws(line);
-                        if opens_block(line) {
-                            new_indent.push_str(INDENT_UNIT);
-                        }
+                        let new_indent = indent_for_new_line(line);
                         editor.checkpoint();
                         editor.newline();
                         editor.insert_str(&new_indent);
@@ -2456,7 +3198,7 @@ impl TuiApp {
         };
 
         if let Some(text) = copy {
-            tui_panel_select::clipboard::copy_to_clipboard(&text);
+            crate::tui::clipboard::copy_to_clipboard(&text);
             self.status = Some(crate::i18n::Status::Copied);
         }
         if let Some(text) = new_text {
@@ -2501,9 +3243,19 @@ impl TuiApp {
         }
         // Request names on a REQUEST / REPORT REQUEST line (bare or quoted).
         if let Some(partial) = request_name_partial(line) {
-            let ci = self.resolve_bound_collection(&rt.report)?;
-            let titles = self.collections[ci].entries.iter().map(|e| e.title.clone());
-            return complete_name(&partial, titles, false);
+            let entries = self
+                .resolve_bound_collection(&rt.report)
+                .map(|ci| self.collections[ci].entries.as_slice())
+                .unwrap_or(&[]);
+            // Qualified names, so a helper completes as `alias/request` — the
+            // only form that resolves. Matching stays a plain prefix match on
+            // that whole string: the alias has to be typed to reach a helper,
+            // which is deliberate, since the ghost can only ever *extend* what
+            // has been typed and could not insert an alias in front of it.
+            let names = crate::report::context::request_choices(entries, &rt.helpers)
+                .into_iter()
+                .map(|c| c.qualified);
+            return complete_name(&partial, names, false);
         }
         // Environment names on a FOR … ENVS clause (always quoted).
         if let Some(partial) = env_name_partial(line) {
@@ -2602,15 +3354,6 @@ enum NamePartial {
     Quoted { text: String, start: usize },
 }
 
-/// One level of source indentation (matches the flow serializer's four spaces).
-const INDENT_UNIT: &str = "    ";
-
-/// The leading whitespace of `line`, as an owned string (used to inherit the
-/// current line's indentation onto a freshly-inserted newline).
-fn leading_ws(line: &str) -> String {
-    line.chars().take_while(|c| c.is_whitespace()).collect()
-}
-
 /// Pretty-print `raw` when its whole trimmed text is a single valid JSON
 /// document, so a drilled-into cell holding a JSON body is shown indented (one
 /// field per line) instead of a dense single line. Content that isn't valid
@@ -2639,24 +3382,10 @@ fn reindent_end_line(ed: &mut Editor) {
     let Some(line) = ed.lines.get(row) else {
         return;
     };
-    if !line.trim().eq_ignore_ascii_case("END") {
+    if !is_end_line(line) {
         return;
     }
-    // Walk upward tracking opener/END balance to find the matching opener.
-    let mut depth = 0i32;
-    let mut target: Option<String> = None;
-    for prev in ed.lines[..row].iter().rev() {
-        if prev.trim().eq_ignore_ascii_case("END") {
-            depth += 1;
-        } else if opens_block(prev) {
-            if depth == 0 {
-                target = Some(leading_ws(prev));
-                break;
-            }
-            depth -= 1;
-        }
-    }
-    let Some(indent) = target else {
+    let Some(indent) = matching_opener_indent(&ed.lines[..row]) else {
         return;
     };
     let trimmed = ed.lines[row].trim_start().to_string();
@@ -2840,95 +3569,17 @@ fn relative_path(from_dir: &std::path::Path, to: &std::path::Path) -> Option<std
     }
 }
 
-/// Where an exported CSV lands: alongside a saved report (same stem, `.csv`
-/// extension), else `<name>.csv` in the current directory for a scratch report.
-/// When the report *name* carries an output token (`{time}`), the expanded name
-/// wins — even for a saved report — and lands in the report's own folder (or the
-/// current directory for a scratch report), so repeated runs write distinct
-/// timestamped files rather than overwriting one export.
-fn csv_export_path(report: &Report) -> std::path::PathBuf {
-    let ext = report_output_extension(report);
-    if let Some(p) = tokened_output_path(report, &ext) {
-        return p;
-    }
-    if let Some(path) = &report.path {
-        return path.with_extension(&ext);
-    }
-    let stem = sanitize_file_stem(&report.name);
-    std::path::PathBuf::from(format!("{stem}.{ext}"))
-}
-
-/// The preferred output extension for `report`: its `# output:` header format
-/// when that names a supported writer (csv/json/xlsx), else `csv`. Used to seed
-/// the export picker so a report declaring `# output: xlsx` exports `.xlsx` by
-/// default (the user can still type another extension).
-fn report_output_extension(report: &Report) -> String {
-    report
-        .flow()
-        .ok()
-        .and_then(|f| f.header.output().map(|o| o.trim().to_ascii_lowercase()))
-        .filter(|ext| writer_for_extension(ext).is_some())
-        .unwrap_or_else(|| "csv".to_string())
-}
-
-/// The default `.baseline` snapshot path for `report`: its own file with a
-/// `.baseline` extension, or a sanitised `<name>.baseline` for a scratch report
-/// with no file yet. Mirrors [`csv_export_path`] (including the `{time}` token).
-fn baseline_export_path(report: &Report) -> std::path::PathBuf {
-    if let Some(p) = tokened_output_path(report, "baseline") {
-        return p;
-    }
-    if let Some(path) = &report.path {
-        return path.with_extension("baseline");
-    }
-    let stem = sanitize_file_stem(&report.name);
-    std::path::PathBuf::from(format!("{stem}.baseline"))
-}
-
-/// The output path when the report name carries an output token (`{time}`): the
-/// token-expanded, sanitised name as the file stem with extension `ext`, placed
-/// in the saved report's own folder (or the current directory for a scratch
-/// report). `None` when the name has no token, so callers fall back to their
-/// normal (file-stem-based) derivation.
-fn tokened_output_path(report: &Report, ext: &str) -> Option<std::path::PathBuf> {
-    if !name_has_output_token(&report.name) {
-        return None;
-    }
-    let stem = sanitize_file_stem(&expand_output_tokens(&report.name));
-    let file = format!("{stem}.{ext}");
-    let dir = report.path.as_ref().and_then(|p| p.parent());
-    Some(match dir {
-        Some(d) => d.join(file),
-        None => std::path::PathBuf::from(file),
-    })
-}
-
-/// Turn a display name into a safe single-segment file stem (replacing path
-/// separators and other awkward characters with `_`), so a scratch report's
-/// name can't escape the current directory when exported.
-fn sanitize_file_stem(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "report".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 use crate::report::dry_run::DryRunReport;
 
 impl DryRunReport {
-    /// Render the preview body as themed lines for the overlay draw pass.
+    /// Render the preview body as themed lines for the results pane, split
+    /// into `(head, grid, tail)`.
+    ///
+    /// The split exists because the two parts want opposite treatment: the
+    /// prose is a paragraph and must wrap or a long producer error is silently
+    /// cut off, while the grid is a grid and must *clip* — wrapping it folds
+    /// every row over several lines and destroys the column alignment, which
+    /// is why the preview used to look nothing like the real results view.
     ///
     /// Layout:
     /// 1. Preview-notice label (marks this as a dry run, not a real result).
@@ -2938,41 +3589,55 @@ impl DryRunReport {
     /// 4. Variable-availability warnings (if any) — yellow `!` prefix.
     /// 5. Producer/expansion errors (if any) — red `•` prefix.
     /// 6. "No problems found." when both 4 and 5 are empty.
-    pub(crate) fn lines(&self, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
+    ///
+    /// `col_offset` scrolls the grid sideways, exactly as in the Results view.
+    pub(crate) fn line_sections(
+        &self,
+        s: &Strings,
+        th: &Theme,
+        col_offset: usize,
+    ) -> (Vec<Line<'static>>, Vec<Line<'static>>, Vec<Line<'static>>) {
+        let mut head: Vec<Line<'static>> = Vec::new();
 
         // Dry-run notice: distinguish the preview grid from a real-run result.
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             s.report_dry_run_preview_notice.to_string(),
             Style::default().fg(th.dim),
         )));
-        lines.push(Line::from(""));
+        head.push(Line::from(""));
 
         // Row count.
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             format!("{} {}", s.report_dry_run_rows, self.rows),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::from(""));
+        head.push(Line::from(""));
 
         // Output grid — identical path to the Results view.
+        let mut grid: Vec<Line<'static>> = Vec::new();
         if self.rows == 0 {
-            lines.push(Line::from(Span::styled(
+            head.push(Line::from(Span::styled(
                 s.report_dry_run_no_rows.to_string(),
                 Style::default().fg(th.dim),
             )));
         } else {
             // Pass `None` for states (no streaming progress in a dry run) so
             // the grid renders without status icons, exactly like a finished run.
-            lines.extend(report_grid_lines(
+            // A projection has nothing to filter by (no run, no verdicts), so
+            // every row of it is shown.
+            let visible: Vec<usize> = (0..self.result.rows.len()).collect();
+            grid.extend(report_grid_lines(
                 &self.result,
                 &self.header,
                 None,
                 th,
                 None,
+                col_offset,
+                &visible,
             ));
         }
 
+        let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(""));
 
         // Warnings and errors sections.
@@ -3014,7 +3679,7 @@ impl DryRunReport {
             }
         }
 
-        lines
+        (head, grid, lines)
     }
 }
 
@@ -3263,33 +3928,23 @@ pub(crate) fn draw_report_content(
     // when the user has flipped to it; otherwise the source + binding +
     // validation stack (binding and validation moved to the bottom for stable
     // layout when scrolling past different reports in a workspace).
+    let bind_h = binding_height(app, idx, area.width, s, th);
     if app.reports[idx].view == ReportView::Results {
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).split(area);
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(bind_h)]).split(area);
         draw_report_results(f, rows[0], app, idx, s, th);
         draw_report_binding(f, rows[1], app, idx, s, th);
         return;
     }
 
-    // Number of validation rows to reserve at the bottom. Grow with the number
-    // of problems so a long list is visible at once (mirrors the GUI's enlarged,
-    // drag-resizable validation panel), but always keep several rows of the
-    // source above — and the panel scrolls, so any overflow is still reachable.
-    let diag_count = {
-        let rt = &app.reports[idx];
-        if rt.parse_error.is_some() {
-            1
-        } else {
-            rt.diagnostics.len().max(1)
-        }
-    };
-    // Leave at least ~5 rows for the source plus the 4-row binding block; within
-    // that budget show up to 16 validation rows before falling back to scroll.
-    let diag_room = area.height.saturating_sub(4 + 5).max(4);
-    let diag_h = (diag_count as u16 + 2).min(diag_room).min(16);
+    // The validation panel is sized to the text it actually draws — wrapped, so
+    // a single long parse error gets the rows it needs — and capped so it can
+    // never take over the pane. It scrolls, so anything past the cap is still
+    // reachable.
+    let diag_h = validation_height(&app.reports[idx], s, th, area);
 
     let rows = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(4),
+        Constraint::Length(bind_h),
         Constraint::Length(diag_h),
     ])
     .split(area);
@@ -3301,6 +3956,109 @@ pub(crate) fn draw_report_content(
     }
     draw_report_binding(f, rows[1], app, idx, s, th);
     draw_report_validation(f, rows[2], app, idx, s, th);
+}
+
+/// Draw the run settings: one row per declared `PARAM` — what it asks for, the
+/// value this run will use, and what is wrong with it, if anything. The raw
+/// name and the declared type are shown dimmed beside the prompt: the prompt is
+/// what the row means, but the name is what `{{…}}` and `--param` say, so
+/// neither can be the only one on screen.
+pub(crate) fn draw_report_run_settings_overlay(
+    f: &mut Frame,
+    app: &mut TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
+    let rows = app.report_param_rows(idx);
+    if rows.is_empty() {
+        return;
+    }
+    // Sized to what it holds, within what the terminal has: the report stays
+    // visible around it, which is the point of asking here rather than in a
+    // view of its own.
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 100);
+    let box_h = (rows.len() as u16 + 2)
+        .min(f.area().height.saturating_sub(2))
+        .max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let title = format!("{} — {}", s.param_view_title, s.param_view_hint);
+    let block = panel(title, true, th);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    // Only the topmost layer's hits are tested, so raising the layer is what
+    // stops a click landing on the report behind acting through the box.
+    app.set_mouse_layer(MouseLayer::Overlay);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let sel = app.reports[idx]
+        .param_selected
+        .min(rows.len().saturating_sub(1));
+    app.reports[idx].param_selected = sel;
+
+    let prompt_w = rows
+        .iter()
+        .map(|r| r.prompt.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let selected = i == sel;
+            let mark = if selected { "> " } else { "  " };
+            let mut spans = vec![
+                Span::styled(mark, Style::default().fg(th.accent)),
+                Span::styled(
+                    format!("{:<prompt_w$}  ", row.prompt),
+                    if selected {
+                        Style::default().fg(th.text).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.text)
+                    },
+                ),
+            ];
+            if row.value.is_empty() {
+                spans.push(Span::styled(
+                    s.param_value_unset.to_string(),
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                spans.push(Span::styled(row.value.clone(), Style::default().fg(th.ok)));
+            }
+            spans.push(Span::styled(
+                format!("  {} {}", row.name, row.kind.keyword()),
+                Style::default().fg(th.dim),
+            ));
+            if let Some(problem) = &row.problem {
+                spans.push(Span::styled(
+                    format!("  {problem}"),
+                    Style::default().fg(th.err),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    // One cursor, one list: scroll just enough to keep the selected row on
+    // screen, the same way the node outline follows its own selection.
+    let h = inner.height as usize;
+    let first = sel.saturating_sub(h.saturating_sub(1));
+    let visible: Vec<Line> = lines.into_iter().skip(first).take(h).collect();
+    let shown = visible.len();
+    f.render_widget(Paragraph::new(visible), inner);
+    // One hit target per drawn row: a click selects it, a second click on the
+    // same row opens its editor — the same one-click/two-click gesture the node
+    // outline and the settings rows above it use.
+    for i in 0..shown {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+            MouseHitTarget::ReportParamRow(first + i),
+        );
+    }
 }
 
 /// row. Any run-level errors are surfaced in the panel title so a partly-failed
@@ -3319,16 +4077,20 @@ fn draw_report_results(
     // projection and the real thing are read in the same place. It renders as
     // plain lines (notice, row count, grid, problems), so there is no sticky
     // header and no cell cursor over it.
-    // The results panel clips, which is right for a grid but would silently cut
-    // off a long producer error or binding line — so the preview's lines are
-    // pre-wrapped to the pane width with an explicit `↵` marker, keeping them
-    // readable as single logical lines (as the popup did).
+    // The prose around the grid — a long producer error or binding line —
+    // would be silently cut off by the clipping panel, so it is pre-wrapped to
+    // the pane width with an explicit `↵` marker. The *grid* is deliberately
+    // left alone: wrapping it folds each row over several lines and destroys
+    // the column alignment, so it clips and scrolls sideways exactly as the
+    // real results grid does.
     let preview_lines = app.reports[idx].dry_run.as_ref().map(|preview| {
-        crate::tui::draw::wrap_lines_with_marker(
-            preview.lines(s, th),
-            area.width.saturating_sub(2),
-            th,
-        )
+        let col_offset = app.reports[idx].results_col_offset;
+        let (head, grid, tail) = preview.line_sections(s, th, col_offset);
+        let width = area.width.saturating_sub(2);
+        let mut lines = crate::tui::draw::wrap_lines_with_marker(head, width, th);
+        lines.extend(grid);
+        lines.extend(crate::tui::draw::wrap_lines_with_marker(tail, width, th));
+        lines
     });
     if let Some(lines) = preview_lines {
         let title = format!("{} — {}", s.report_dry_run_title, s.report_dry_run_hint);
@@ -3347,7 +4109,23 @@ fn draw_report_results(
         return;
     }
 
-    let (lines, title) = {
+    // Slide the grid sideways so the cursor's column is on screen. The grid
+    // clips rather than wraps, so without this the columns past the right edge
+    // are unreachable; recomputed every frame because it is cheap and, unlike
+    // the vertical scroll, nothing else moves it.
+    if let Some(result) = &app.reports[idx].result {
+        let rt = &app.reports[idx];
+        let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
+        let widths = result_column_widths(result, &header, &rt.visible_result_rows());
+        let show_icons = rt.run_progress.is_some();
+        let avail =
+            (area.width.saturating_sub(2) as usize).saturating_sub(if show_icons { 2 } else { 0 });
+        let cursor_col = rt.cell_cursor.map(|(_, c)| c).unwrap_or(0);
+        app.reports[idx].results_col_offset =
+            follow_col_offset(&widths, cursor_col, avail, rt.results_col_offset);
+    }
+
+    let (lines, head, title) = {
         let rt = &app.reports[idx];
         match &rt.result {
             None => (
@@ -3355,15 +4133,25 @@ fn draw_report_results(
                     s.report_results_empty.to_string(),
                     Style::default().fg(th.dim),
                 ))],
+                Vec::new(),
                 s.report_results_heading.to_string(),
             ),
             Some(result) => {
                 let header = rt.report.flow().map(|flow| flow.header).unwrap_or_default();
+                let visible = rt.visible_result_rows();
                 // While a run streams, each row carries a live `RowState`: the
                 // grid greys unfinished rows and shows a status icon per row so
                 // it doubles as a live progress indicator.
                 let states = rt.run_progress.as_ref().map(|p| p.states.as_slice());
-                let lines = report_grid_lines(result, &header, states, th, rt.cell_cursor);
+                let lines = report_grid_lines(
+                    result,
+                    &header,
+                    states,
+                    th,
+                    rt.cell_cursor,
+                    rt.results_col_offset,
+                    &visible,
+                );
                 let count = if result.errors.is_empty() {
                     format!("{}", result.rows.len())
                 } else {
@@ -3374,11 +4162,19 @@ fn draw_report_results(
                         s.report_status_errors
                     )
                 };
+                // The filter belongs in the panel's title, not in a line of
+                // its own inside the grid: it describes the pane rather than
+                // the run, and a row of prose between the summary and the
+                // table costs a row of the table on every screen.
+                let filter = filter_title(rt, result, visible.len(), s)
+                    .map(|f| format!(" — {f}"))
+                    .unwrap_or_default();
                 let title = format!(
-                    "{} ({}) — {}",
-                    s.report_results_heading, count, s.report_hint_results
+                    "{} ({}){} — {}",
+                    s.report_results_heading, count, filter, s.report_hint_results
                 );
-                (lines, title)
+                let head = results_head_lines(result, &header, s, th);
+                (lines, head, title)
             }
         }
     };
@@ -3387,7 +4183,20 @@ fn draw_report_results(
     // at the top of the pane and only the data rows below it scroll. This keeps
     // the column titles visible while scrolling a long report. `lines[0]` is the
     // header; `lines[1..]` are the data rows fed to the scrolling body panel.
+    // The metric/filter summary is pinned above the header for the same reason
+    // the header is pinned: it describes the rows being scrolled past, so it
+    // has to stay on screen while they move. It is dropped entirely when the
+    // pane is too short to show it *and* a few rows -- a summary that leaves no
+    // room for the table it summarises is worse than no summary.
+    let head: Vec<Line<'static>> = if inner_h >= head.len() + 3 {
+        head
+    } else {
+        Vec::new()
+    };
     let sticky = app.reports[idx].result.is_some() && lines.len() > 1 && inner_h >= 2;
+    // How many lines are pinned in total: the summary, plus the grid's header
+    // row when it is being pinned.
+    let pinned = head.len() + usize::from(sticky);
 
     // Auto-scroll the results panel to keep the cell cursor visible — but only
     // when the cursor *moved* since we last scrolled to it (i.e. keyboard
@@ -3402,8 +4211,8 @@ fn draw_report_results(
         if sticky {
             // With the sticky header the panel scroll is a DATA-ROW offset (0 ==
             // first data row shown just under the fixed header). Keep the cursor
-            // row inside the body window of `inner_h - 1` rows.
-            let body_h = inner_h.saturating_sub(1);
+            // row inside the body window left under everything pinned.
+            let body_h = inner_h.saturating_sub(pinned);
             if body_h > 0 {
                 if cursor_row < scroll {
                     app.reports[idx].results_panel.set_scroll(cursor_row as u16);
@@ -3436,23 +4245,30 @@ fn draw_report_results(
     let (inner, bar) = if sticky {
         let inner = block.inner(area);
         f.render_widget(block, area);
-        // Pin the header row at the top of the inner rect.
+        // Pin the summary lines and then the header row at the top of the inner
+        // rect.
+        let mut pinned_lines = head.clone();
+        pinned_lines.push(lines[0].clone());
         let header_area = Rect {
             x: inner.x,
             y: inner.y,
             width: inner.width,
-            height: 1,
+            height: pinned as u16,
         };
         f.render_widget(
-            Paragraph::new(lines[0].clone()).style(Style::default().fg(th.text)),
+            Paragraph::new(pinned_lines.clone()).style(Style::default().fg(th.text)),
             header_area,
         );
-        // Scroll only the data rows in the area below the pinned header.
+        // The pinned rows clip exactly like the scrolling ones below them, so
+        // they carry the same marker — a header row that stops mid-column
+        // otherwise reads as the last column there is.
+        mark_clipped_rows(f, header_area, &pinned_lines, 0, th);
+        // Scroll only the data rows in the area below everything pinned.
         let body_area = Rect {
             x: inner.x,
-            y: inner.y + 1,
+            y: inner.y + pinned as u16,
             width: inner.width,
-            height: inner.height - 1,
+            height: inner.height - pinned as u16,
         };
         let bar = render_panel_lines(
             f,
@@ -3488,6 +4304,172 @@ fn draw_report_results(
     app.push_mouse_hit(MouseLayer::Base, inner, MouseHitTarget::ReportResultsCell);
 }
 
+/// The lines pinned above the results grid: one metric line per ground-truthed
+/// column, then the filter line when the run offers a filter.
+///
+/// The GUI says these things in cards and a button bar; a terminal has a line
+/// each, but the figures and the filter set come from the same two shared
+/// modules ([`crate::report::metrics`], [`crate::report::filter`]) so the two
+/// front-ends and the HTML export cannot quote different accuracies or offer
+/// different filters.
+///
+/// Empty for a report with no ground truth and nothing to filter — which is
+/// most reports, and they must not pay a line for a summary of nothing.
+fn results_head_lines(
+    result: &ReportResult,
+    header: &crate::report::flow::Header,
+    s: &Strings,
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let columns = result.resolved_columns(header);
+    if let Some(metrics) = result.metrics(&columns, header) {
+        let label = Style::default().fg(th.dim);
+        let value = Style::default().fg(th.text).add_modifier(Modifier::BOLD);
+        // How the run moved comes first when there is a baseline to have moved
+        // from: the accuracy lines below cannot tell a run that fixed three
+        // rows and broke three others from one that touched nothing.
+        if let Some(mv) = &metrics.movement {
+            let mut spans = vec![Span::styled(
+                format!("{} ", s.report_metric_movement),
+                value,
+            )];
+            if mv.is_still() {
+                spans.push(Span::styled(
+                    s.report_metric_nothing_moved.to_string(),
+                    Style::default().fg(th.dim),
+                ));
+            } else {
+                spans.push(Span::styled(format!("{} ", s.report_metric_fixed), label));
+                spans.push(Span::styled(
+                    format!("{}  ", mv.fixed),
+                    Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", s.report_metric_regressed),
+                    label,
+                ));
+                spans.push(Span::styled(
+                    format!("{}  ", mv.regressed),
+                    // A regression is the one figure here anybody is scanning
+                    // for, so it is the one that stays plain when it is zero:
+                    // red on a `0` teaches the eye to ignore the colour.
+                    if mv.regressed > 0 {
+                        Style::default().fg(th.err).add_modifier(Modifier::BOLD)
+                    } else {
+                        value
+                    },
+                ));
+            }
+            if mv.still_wrong > 0 {
+                spans.push(Span::styled(
+                    format!("{} ", s.report_metric_still_wrong),
+                    label,
+                ));
+                spans.push(Span::styled(format!("{}", mv.still_wrong), value));
+            }
+            out.push(Line::from(spans));
+        }
+        // The roll-up first when there is one: it answers "did this run pass?",
+        // and the per-column breakdown is the follow-up question.
+        for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+            out.push(Line::from(vec![
+                Span::styled(format!("{} ", m.header), value),
+                Span::styled(format!("{} ", s.report_metric_compared), label),
+                Span::styled(format!("{}/{}  ", m.compared, m.total), value),
+                Span::styled(format!("{} ", s.report_metric_incorrect), label),
+                Span::styled(format!("{}  ", m.incorrect), value),
+                Span::styled(format!("{} ", s.report_metric_accuracy), label),
+                Span::styled(
+                    m.accuracy_text().unwrap_or_else(|| "\u{2014}".to_string()),
+                    // A run with nothing scored is neither good nor bad news,
+                    // so it stays plain rather than borrowing either colour.
+                    match m.accuracy() {
+                        Some(a) if a >= 1.0 => Style::default().fg(th.ok),
+                        Some(_) => Style::default().fg(th.pending),
+                        None => value,
+                    },
+                ),
+            ]));
+        }
+    }
+    out
+}
+
+/// How the results panel's title says which rows it is showing — `None` for a
+/// run that offers no filter worth naming (nothing to compare, nothing wrong),
+/// where a title saying "All rows" would be noise.
+///
+/// The row counts are always given, even under `All`: a grid showing a subset
+/// of its run must never be mistakable for the whole of it, and the only place
+/// left to say so is here.
+fn filter_title(
+    rt: &ReportTab,
+    result: &ReportResult,
+    visible: usize,
+    s: &Strings,
+) -> Option<String> {
+    if rt.result_filters().len() < 2 {
+        return None;
+    }
+    let rows = s
+        .report_rows_shown
+        .replace("{shown}", &visible.to_string())
+        .replace("{total}", &result.rows.len().to_string());
+    Some(
+        s.report_filter_title
+            .replace("{f}", &filter_label(s, &rt.results_filter))
+            .replace("{r}", &rows),
+    )
+}
+
+/// [`results_head_lines`] as plain strings — the summary the results view
+/// pins, without its styling. Test-only: it is what a test can assert on,
+/// since a `Line`'s spans carry the text in pieces.
+#[cfg(test)]
+pub(crate) fn results_head_text(rt: &ReportTab, s: &Strings) -> Vec<String> {
+    let Some(result) = &rt.result else {
+        return Vec::new();
+    };
+    let header = rt.report.flow().map(|f| f.header).unwrap_or_default();
+    let th = crate::tui::theme::theme(&crate::i18n::Language::English);
+    results_head_lines(result, &header, s, &th)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// [`filter_title`] for a tab, as the results panel's title bar would show it.
+/// Test-only: the title is assembled inside the draw pass, which a test can't
+/// call, but what it says about the filter is exactly what wants asserting.
+#[cfg(test)]
+pub(crate) fn results_title_filter(rt: &ReportTab, s: &Strings) -> Option<String> {
+    let result = rt.result.as_ref()?;
+    filter_title(rt, result, rt.visible_result_rows().len(), s)
+}
+
+/// A filter's name in the user's language.
+///
+/// [`crate::report::filter::RowFilter::label`] is deliberately English — it
+/// names buttons in an exported document read by whoever it is sent to — so the
+/// in-app views translate the fixed filters themselves, exactly as the GUI's
+/// filter bar does.
+fn filter_label(s: &Strings, f: &crate::report::filter::RowFilter) -> String {
+    use crate::report::filter::RowFilter;
+    match f {
+        RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Differ => s.report_filter_differences.to_string(),
+        RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
+        RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::MatrixCell { .. } => f.label(),
+    }
+}
+
 /// Build the grid's styled lines: a bold header row of the resolved column
 /// headers followed by one line per data row, each cell padded to its column's
 /// width (capped) so the columns line up under [`WrapMode::Clip`]. Newlines in
@@ -3498,13 +4480,17 @@ fn draw_report_results(
 /// indicator. When `None` (a completed or static result) no icon column is
 /// drawn and every row uses the normal text colour. `cursor` highlights the
 /// selected cell using the theme's selection colours so the active cell reads
-/// as distinct from its row's text style.
+/// as distinct from its row's text style. `col_offset` is the index of the
+/// leftmost column to draw, so columns that don't fit can be scrolled into
+/// view; the status-icon prefix stays pinned to the left edge regardless.
 fn report_grid_lines(
     result: &ReportResult,
     header: &crate::report::flow::Header,
     states: Option<&[RowState]>,
     th: &Theme,
-    cursor: Option<(usize, usize)>, // (data_row, col) 0-indexed
+    cursor: Option<(usize, usize)>, // (visible_row, col) 0-indexed
+    col_offset: usize,
+    visible: &[usize],
 ) -> Vec<Line<'static>> {
     let columns = result.resolved_columns(header);
     if columns.is_empty() {
@@ -3516,9 +4502,12 @@ fn report_grid_lines(
 
     // Materialise every cell so column widths can be measured once.
     let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
-    let body: Vec<Vec<String>> = result
-        .rows
+    // Only the rows the filter selected are materialised: the widths are
+    // measured off what is drawn, so a filtered grid is as narrow as the rows
+    // it is showing rather than carrying columns sized for hidden ones.
+    let body: Vec<Vec<String>> = visible
         .iter()
+        .filter_map(|&r| result.rows.get(r))
         .map(|row| {
             columns
                 .iter()
@@ -3552,10 +4541,15 @@ fn report_grid_lines(
         header_style,
         None,
         cursor_style,
+        col_offset,
     ));
     lines.push(Line::from(header_spans));
     for (i, row) in body.iter().enumerate() {
-        let state = states.and_then(|s| s.get(i)).copied();
+        // The status icons are per *result* row, so they are looked up by the
+        // original index rather than the on-screen one.
+        let state = states
+            .and_then(|s| visible.get(i).and_then(|&r| s.get(r)))
+            .copied();
         // A running row is highlighted in pending colour and bold so it stands out
         // from queued/finished rows; scheduled rows stay dim, finished stay normal.
         let text_style = match state {
@@ -3585,6 +4579,7 @@ fn report_grid_lines(
             text_style,
             cursor_col,
             cursor_style,
+            col_offset,
         ));
         lines.push(Line::from(spans));
     }
@@ -3606,6 +4601,7 @@ fn report_grid_lines(
             summary_style,
             None,
             cursor_style,
+            col_offset,
         ));
         lines.push(Line::from(spans));
     }
@@ -3660,19 +4656,21 @@ fn grid_column_widths(
         .collect()
 }
 
-/// Return the display column widths for `result`'s resolved grid — the same
+/// Return the display column widths for the `visible` rows of `result`'s
+/// resolved grid — the same
 /// widths [`report_grid_lines`] uses — so the mouse hit-test in
 /// [`crate::tui::input`] can map a click's x offset to a column index without
 /// duplicating the width computation.
 pub(crate) fn result_column_widths(
     result: &ReportResult,
     header: &crate::report::flow::Header,
+    visible: &[usize],
 ) -> Vec<usize> {
     let columns = result.resolved_columns(header);
     let headers: Vec<String> = columns.iter().map(|c| c.header.clone()).collect();
-    let body: Vec<Vec<String>> = result
-        .rows
+    let body: Vec<Vec<String>> = visible
         .iter()
+        .filter_map(|&r| result.rows.get(r))
         .map(|row| {
             columns
                 .iter()
@@ -3684,16 +4682,52 @@ pub(crate) fn result_column_widths(
     grid_column_widths(&headers, &body, &summary_body)
 }
 
-/// Map an x offset within a grid row to a column index. The grid layout has
-/// each column occupying `widths[i]` characters followed by a two-space gutter
-/// (before the next column); an optional 2-character status-icon prefix is
-/// present when `show_icons` is true. Clicks that fall in a gutter are
-/// assigned to the preceding column; clicks past the last column's end return
-/// the last column index.
-pub(crate) fn grid_col_at_x(widths: &[usize], x_off: usize, show_icons: bool) -> usize {
+/// The leftmost grid column to draw so that `cursor_col` is fully visible in
+/// `avail` display columns, given the current offset. Scrolls left whenever the
+/// cursor is left of the viewport and right by the fewest columns that bring
+/// the cursor's right edge back inside it — so a column wider than the whole
+/// pane still becomes the leftmost one rather than pinning the view.
+pub(crate) fn follow_col_offset(
+    widths: &[usize],
+    cursor_col: usize,
+    avail: usize,
+    current: usize,
+) -> usize {
     if widths.is_empty() {
         return 0;
     }
+    let last = widths.len() - 1;
+    let cursor_col = cursor_col.min(last);
+    // Never leave the cursor off the left edge.
+    let mut off = current.min(cursor_col);
+    // Width of columns `off..=cursor_col`, including the two-space gutters
+    // between them.
+    let span = |off: usize| -> usize {
+        widths[off..=cursor_col].iter().sum::<usize>() + 2 * (cursor_col - off)
+    };
+    while off < cursor_col && span(off) > avail {
+        off += 1;
+    }
+    off
+}
+
+/// Map an x offset within a grid row to a column index. The grid layout has/// each column occupying `widths[i]` characters followed by a two-space gutter
+/// (before the next column); an optional 2-character status-icon prefix is
+/// present when `show_icons` is true. Clicks that fall in a gutter are
+/// assigned to the preceding column; clicks past the last column's end return
+/// the last column index. `col_offset` is the leftmost drawn column, so the
+/// returned index is absolute even when the grid is scrolled sideways.
+pub(crate) fn grid_col_at_x(
+    widths: &[usize],
+    x_off: usize,
+    show_icons: bool,
+    col_offset: usize,
+) -> usize {
+    if widths.is_empty() {
+        return 0;
+    }
+    let col_offset = col_offset.min(widths.len() - 1);
+    let widths = &widths[col_offset..];
     // Strip the icon prefix so `x` is relative to the first column's start.
     let x = if show_icons {
         x_off.saturating_sub(2)
@@ -3707,28 +4741,31 @@ pub(crate) fn grid_col_at_x(widths: &[usize], x_off: usize, show_icons: bool) ->
         // except when we're on the last column (no gutter after it).
         let next_col_start = pos + w + 2;
         if ci + 1 == widths.len() || x < next_col_start {
-            return ci;
+            return col_offset + ci;
         }
         pos = next_col_start;
     }
-    widths.len() - 1
+    col_offset + widths.len() - 1
 }
 
 /// Produce the per-cell spans for one grid row. Each cell is padded (or
 /// truncated with `…`) to its column width; columns are joined with a two-space
 /// gutter. The column at `cursor_col` (if any) uses `cursor_style` instead of
 /// `base_style` so the selected cell is visually highlighted. Used for both the
-/// header row (always `cursor_col = None`) and each data row.
+/// header row (always `cursor_col = None`) and each data row. Columns before
+/// `col_offset` are skipped entirely, which is how the grid scrolls sideways;
+/// `cursor_col` is still an absolute column index.
 fn grid_row_cell_spans(
     fields: &[String],
     widths: &[usize],
     base_style: Style,
     cursor_col: Option<usize>,
     cursor_style: Style,
+    col_offset: usize,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
+    for (i, field) in fields.iter().enumerate().skip(col_offset) {
+        if i > col_offset {
             spans.push(Span::styled("  ".to_string(), base_style));
         }
         let w = widths[i];
@@ -3790,6 +4827,9 @@ fn render_panel_lines(
         Paragraph::new(visible).style(Style::default().fg(th.text)),
         area,
     );
+    if panel.wrap_mode() == WrapMode::Clip {
+        mark_clipped_rows(f, area, lines, panel.scroll(), th);
+    }
     let mut bar_area = Rect::default();
     if panel.max_scroll(area.height) > 0 {
         let total = panel.total_rows().min(u16::MAX as u32) as usize;
@@ -3817,6 +4857,52 @@ fn render_panel_lines(
 /// view's panels. Returns the inner text Rect and the scrollbar Rect (the
 /// latter `Rect::default()` when no scrollbar is needed) so the caller can
 /// record them for mouse hit-testing (text selection + scrollbar drag).
+/// The marker painted in the last column of a row whose content runs off the
+/// right edge of a clipping panel.
+///
+/// The report's Source view (and the results grid) clip rather than wrap, so a
+/// long line simply stopped at the panel edge with nothing to say it had been
+/// cut — the only way to find out was to enter edit mode and walk the cursor
+/// along it. The glyph is the ellipsis the wizard's clipped cells already use
+/// (see `editor::render_clipped_line`) rather than the `‹ ›` pair, which this
+/// codebase reserves for text you can actually scroll sideways; drawn dim like
+/// the soft-wrap marker so it never competes with the content.
+const CLIP_MARKER: char = '\u{2026}';
+
+/// Paint [`CLIP_MARKER`] on every visible row whose line is cut off by the
+/// panel's right edge.
+///
+/// Only meaningful for a clipping panel: a wrapping one has nothing off-screen
+/// to point at. Rows are 1:1 with logical lines under `WrapMode::Clip`, so the
+/// line behind visible row `n` is `lines[scroll + n]`.
+///
+/// A row is only marked when there is something other than blanks past the
+/// edge — the results grid pads its cells out to fixed column widths, and a
+/// row of trailing spaces is not something the reader is missing.
+fn mark_clipped_rows(f: &mut Frame, inner: Rect, lines: &[Line<'static>], scroll: u16, th: &Theme) {
+    let width = inner.width as usize;
+    if width == 0 {
+        return;
+    }
+    for row in 0..inner.height {
+        let Some(line) = lines.get(scroll as usize + row as usize) else {
+            break;
+        };
+        let mut chars = line.spans.iter().flat_map(|sp| sp.content.chars());
+        if chars.by_ref().take(width).count() < width {
+            continue;
+        }
+        if !chars.any(|c| c != ' ') {
+            continue;
+        }
+        let pos = ratatui::layout::Position::new(inner.x + inner.width - 1, inner.y + row);
+        if let Some(cell) = f.buffer_mut().cell_mut(pos) {
+            cell.set_char(CLIP_MARKER);
+            cell.set_style(Style::default().fg(th.dim));
+        }
+    }
+}
+
 fn draw_report_panel(
     f: &mut Frame,
     area: Rect,
@@ -3840,6 +4926,9 @@ fn draw_report_panel(
         Paragraph::new(visible).style(Style::default().fg(th.text)),
         inner,
     );
+    if panel.wrap_mode() == WrapMode::Clip {
+        mark_clipped_rows(f, inner, lines, panel.scroll(), th);
+    }
     let mut bar_area = Rect::default();
     if panel.max_scroll(inner.height) > 0 {
         let total = panel.total_rows().min(u16::MAX as u32) as usize;
@@ -3973,14 +5062,31 @@ pub(crate) fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
     }
 }
 
-fn draw_report_binding(
-    f: &mut Frame,
-    area: Rect,
-    app: &TuiApp,
-    idx: usize,
-    s: &Strings,
-    th: &Theme,
-) {
+/// The binding panel's height: its two standing lines plus, for a report that
+/// declares `PARAM`s, a third naming the values the next run will use.
+/// How tall the binding panel has to be to show everything it holds. Measured
+/// against the width it will actually get, because a long base directory wraps
+/// on a narrow terminal and a fixed height would silently clip whatever is
+/// last — which is how the run-settings line disappeared exactly when the
+/// window was too small to spare it.
+fn binding_height(app: &TuiApp, idx: usize, width: u16, s: &Strings, th: &Theme) -> u16 {
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let rows: usize = binding_lines(app, idx, s, th)
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|sp| sp.content.chars().count()).sum();
+            w.div_ceil(inner).max(1)
+        })
+        .sum();
+    // Capped so a pathological path can't take over the pane; the panel is the
+    // supporting cast, not the thing being read.
+    (rows as u16 + 2).clamp(4, 8)
+}
+
+/// The binding panel's contents: what the report is bound to, where its
+/// relative paths resolve, and (when it asks for any) the values the next run
+/// will use. Built apart from the drawing so the panel can be sized to them.
+fn binding_lines<'a>(app: &'a TuiApp, idx: usize, s: &'a Strings, th: &Theme) -> Vec<Line<'a>> {
     let rt = &app.reports[idx];
     let binding = match app.resolve_bound_collection(&rt.report) {
         Some(ci) => {
@@ -4047,7 +5153,48 @@ fn draw_report_binding(
             Style::default().fg(th.pending),
         ));
     }
-    let lines = vec![binding, Line::from(dir_spans)];
+    let mut lines = vec![binding, Line::from(dir_spans)];
+    // A report that asks questions says on screen what it was answered with,
+    // and how to change the answers — the questions are asked once per editing
+    // session, so without this the chosen values would be invisible after the
+    // box closes.
+    if app.report_has_params(idx) {
+        let mut spans = vec![
+            Span::styled(
+                format!("{}:", s.param_summary_prefix),
+                Style::default().fg(th.dim),
+            ),
+            Span::raw(" "),
+        ];
+        spans.extend(app.report_param_spans(idx, s, th));
+        // A table on screen that was produced with different answers is the one
+        // case where this line isn't describing what is being looked at.
+        if app.report_params_changed_since_result(idx) {
+            spans.push(Span::styled(
+                format!(" · {}", s.param_changed_since_run),
+                Style::default().fg(th.accent),
+            ));
+        }
+        spans.push(Span::styled("  ", Style::default().fg(th.dim)));
+        spans.push(Span::styled(
+            s.param_summary_hint,
+            Style::default().fg(th.accent),
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn draw_report_binding(
+    f: &mut Frame,
+    area: Rect,
+    app: &TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
+    let rt = &app.reports[idx];
+    let lines = binding_lines(app, idx, s, th);
     let title = if app.running_reports.contains_key(&rt.report.id) {
         format!(
             "{} — {}",
@@ -4080,18 +5227,25 @@ fn draw_report_source(
         s.report_hint_leave.to_string()
     } else {
         let mut hint = format!(
-            "{} · {} · {} · {} · {}",
+            "{} · {} · {} · {} · {} · {}",
             s.report_hint_edit,
             s.report_hint_run,
             s.report_hint_dry,
             s.report_hint_bind,
-            s.report_hint_nodes
+            s.report_hint_nodes,
+            s.report_hint_format
         );
         // Once a run has produced a grid, advertise `v` as the source↔output
         // swap (the discoverable replacement for the old Tab-into-results).
         if app.reports[idx].result.is_some() {
             hint.push_str(" · ");
             hint.push_str(s.report_hint_view);
+        }
+        // Only offered by a report that actually asks for something — the key
+        // does nothing on the rest, so advertising it everywhere would be noise.
+        if app.report_has_params(idx) {
+            hint.push_str(" · ");
+            hint.push_str(s.param_open_hint);
         }
         hint
     };
@@ -4176,6 +5330,73 @@ fn draw_report_source(
     );
 }
 
+/// The validation panel's content: the parse error if the source doesn't parse,
+/// else one line per diagnostic, else the "no problems" note.
+///
+/// Split out of the draw so [`draw_report_content`] can measure it — the panel
+/// soft-wraps, so how *tall* it needs to be is a question about the wrapped
+/// text, not about how many diagnostics there are.
+fn report_validation_lines(rt: &ReportTab, s: &Strings, th: &Theme) -> Vec<Line<'static>> {
+    if let Some(err) = &rt.parse_error {
+        return vec![Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(th.err),
+        ))];
+    }
+    if rt.diagnostics.is_empty() {
+        return vec![Line::from(Span::styled(
+            s.report_no_diagnostics,
+            Style::default().fg(th.ok),
+        ))];
+    }
+    rt.diagnostics
+        .iter()
+        .map(|d| {
+            let (icon, colour) = match d.severity {
+                Severity::Error => ("✗ ", th.err),
+                Severity::Warning => ("! ", th.pending),
+            };
+            Line::from(vec![
+                Span::styled(icon, Style::default().fg(colour)),
+                Span::styled(d.message.clone(), Style::default().fg(th.text)),
+            ])
+        })
+        .collect()
+}
+
+/// The most rows of validation text to show before the panel starts scrolling.
+///
+/// Small on purpose: the panel sits under the editor, so every row it takes is
+/// a row of the report you can no longer see. Five is enough to take in a
+/// handful of problems at a glance; past that the list is something you scroll
+/// through deliberately rather than something you want permanently covering the
+/// thing you're fixing.
+const VALIDATION_MAX_ROWS: u16 = 5;
+
+/// How tall the validation panel should be drawn, borders included.
+///
+/// Measured from the **wrapped** text rather than the number of diagnostics,
+/// which is what a parse error needs: there is only ever one of those, but it
+/// is a sentence long and used to be given a single row and then clipped —
+/// so the panel was stuck one row tall in exactly the state you most need to
+/// read it.
+fn validation_height(rt: &ReportTab, s: &Strings, th: &Theme, area: Rect) -> u16 {
+    let lines = report_validation_lines(rt, s, th);
+    // Same width the panel itself will wrap to (the block's borders take two).
+    let width = area.width.saturating_sub(2) as usize;
+    let rows = if width == 0 {
+        lines.len() as u16
+    } else {
+        let mut probe = MultiSelectPanel::new();
+        probe.set_styled_content(&lines, width);
+        probe.total_rows().min(u16::MAX as u32) as u16
+    };
+    // Always keep a workable editor above: the binding block is 4 rows and the
+    // editor wants at least 5, so the panel only grows into whatever is left.
+    let room = area.height.saturating_sub(4 + 5).max(3);
+    (rows + 2).min(room).min(VALIDATION_MAX_ROWS + 2).max(3)
+}
+
 fn draw_report_validation(
     f: &mut Frame,
     area: Rect,
@@ -4184,34 +5405,7 @@ fn draw_report_validation(
     s: &Strings,
     th: &Theme,
 ) {
-    let lines: Vec<Line<'static>> = {
-        let rt = &app.reports[idx];
-        if let Some(err) = &rt.parse_error {
-            vec![Line::from(Span::styled(
-                err.clone(),
-                Style::default().fg(th.err),
-            ))]
-        } else if rt.diagnostics.is_empty() {
-            vec![Line::from(Span::styled(
-                s.report_no_diagnostics,
-                Style::default().fg(th.ok),
-            ))]
-        } else {
-            rt.diagnostics
-                .iter()
-                .map(|d| {
-                    let (icon, colour) = match d.severity {
-                        Severity::Error => ("✗ ", th.err),
-                        Severity::Warning => ("! ", th.pending),
-                    };
-                    Line::from(vec![
-                        Span::styled(icon, Style::default().fg(colour)),
-                        Span::styled(d.message.clone(), Style::default().fg(th.text)),
-                    ])
-                })
-                .collect()
-        }
-    };
+    let lines = report_validation_lines(&app.reports[idx], s, th);
     let block = panel(s.report_validation_heading.to_string(), false, th);
     let (inner, bar) = draw_report_panel(
         f,
@@ -4227,6 +5421,11 @@ fn draw_report_validation(
         MouseLayer::Base,
         bar,
         MouseHitTarget::Scroll(MouseScrollTarget::ReportPane(ReportPane::Validation)),
+    );
+    app.push_mouse_hit(
+        MouseLayer::Base,
+        inner,
+        MouseHitTarget::FocusPane(Pane::Main),
     );
     app.push_mouse_hit(
         MouseLayer::Base,
@@ -4247,7 +5446,7 @@ mod export_path_tests {
         let mut report = Report::from_text("sample", "# name: run_{time}\n# collection: c.hurl\n");
         report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
 
-        let csv = csv_export_path(&report);
+        let csv = export_path(&report, &report_output_extension(&report));
         assert_eq!(csv.parent(), Some(std::path::Path::new("/tmp/reports")));
         let file = csv.file_name().unwrap().to_string_lossy().into_owned();
         assert!(file.starts_with("run_"), "expanded name used: {file}");
@@ -4264,7 +5463,7 @@ mod export_path_tests {
         let mut report = Report::from_text("sample", "# name: My Report\n# collection: c.hurl\n");
         report.path = Some(std::path::PathBuf::from("/tmp/reports/sample.trail"));
         assert_eq!(
-            csv_export_path(&report),
+            export_path(&report, &report_output_extension(&report)),
             std::path::PathBuf::from("/tmp/reports/sample.csv"),
             "unchanged behaviour when the name has no token"
         );

@@ -6,11 +6,12 @@
 //! "Automatic" are read-only. A live whole-app preview is driven by
 //! [`ThemeEditorState::draft`].
 
+use super::listscroll::ListScroll;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 
 use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp};
 use super::draw::{centered_rect, panel};
@@ -44,6 +45,9 @@ pub(crate) struct NewThemeState {
     /// Index into [`TuiApp::all_themes`] of the theme to copy colours from.
     pub(crate) base_idx: usize,
     pub(crate) focus: NewThemeFocus,
+    /// Where the base-theme list is scrolled to (a user with many custom
+    /// themes can overflow the popup's few rows).
+    pub(crate) base_scroll: ListScroll,
 }
 
 /// The R/G/B picker popup for editing a single theme colour. Wraps the
@@ -74,6 +78,9 @@ pub(crate) struct ThemeEditorState {
     /// back to the custom theme on each committed colour edit.
     pub(crate) draft: ThemeSpec,
     /// When `Some`, the "New theme" popup is open and takes all key input.
+    /// Where the theme list is scrolled to, carried between frames (see
+    /// [`ListScroll`]).
+    pub(crate) list_scroll: ListScroll,
     pub(crate) new_popup: Option<NewThemeState>,
     /// When `Some`, the colour picker popup is open and takes all key input.
     pub(crate) color_popup: Option<ColorPopup>,
@@ -88,6 +95,7 @@ impl ThemeEditorState {
             name_focused: false,
             name: Editor::blank(),
             draft: spec.clone(),
+            list_scroll: ListScroll::default(),
             new_popup: None,
             color_popup: None,
         };
@@ -266,9 +274,8 @@ fn draw_picker(f: &mut Frame, area: Rect, st: &ThemeEditorState, entries: &[Stri
         .block(panel("".to_string(), focused, th))
         .highlight_style(highlight)
         .highlight_symbol("› ");
-    let mut state = ListState::default();
-    state.select(Some(st.list_idx));
-    f.render_stateful_widget(list, area, &mut state);
+    st.list_scroll
+        .render(f, area, list, Some(st.list_idx), entries.len());
 }
 
 fn draw_fields(f: &mut Frame, area: Rect, st: &ThemeEditorState, s: &Strings, th: &Theme) {
@@ -400,9 +407,9 @@ fn draw_new_theme_popup(
             .add_modifier(Modifier::REVERSED)
     };
     let list = List::new(items).highlight_style(hl).highlight_symbol("› ");
-    let mut ls = ListState::default();
-    ls.select(Some(popup.base_idx));
-    f.render_stateful_widget(list, rows[2], &mut ls);
+    popup
+        .base_scroll
+        .render(f, rows[2], list, Some(popup.base_idx), base_names.len());
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -577,6 +584,7 @@ impl TuiApp {
             name: Editor::blank(),
             base_idx,
             focus: NewThemeFocus::Name,
+            base_scroll: ListScroll::default(),
         });
     }
 

@@ -111,9 +111,9 @@ pub fn panel_header(
 /// clips the content to the drag width but still places the neighbouring panel
 /// at the wider content edge — the "black strip" (see [`panel_header`]). We
 /// build the header by hand from a [`egui::collapsing_header::CollapsingState`]
-/// so the label can truncate, reusing egui's rotating-triangle icon and
-/// click-anywhere-to-toggle behaviour. Reused by the request tree, the
-/// environment list and (later) the workspace tree.
+/// so the label can truncate, with the same explicit Phosphor carets the
+/// workspace tree uses and click-anywhere-to-toggle behaviour. Reused by the
+/// request tree, the environment list and (later) the workspace tree.
 pub fn tree_header<R>(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
@@ -140,7 +140,10 @@ pub fn tree_header_marked<R>(
     highlight: Option<egui::Color32>,
     add_body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
-    let id = ui.make_persistent_id(id_salt);
+    // The caller supplies a namespaced, model-derived salt; do not mix in the
+    // current Ui id, because filtered trees can move the same model row between
+    // containers and should still keep its own expansion state.
+    let id = egui::Id::new(id_salt);
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
         ui.ctx(),
         id,
@@ -153,7 +156,7 @@ pub fn tree_header_marked<R>(
     if force_open && !state.is_open() {
         state.set_open(true);
     }
-    let openness = state.openness(ui.ctx());
+    let open = state.is_open();
 
     // The band has to be painted *under* the row's contents, so reserve a slot
     // in the paint order now and fill it once the row's rect is known.
@@ -164,10 +167,19 @@ pub fn tree_header_marked<R>(
             // Reserve the full row width so short names still toggle across the
             // whole row, then draw the triangle + a truncating label.
             ui.set_min_width(ui.available_width());
-            let icon_w = ui.spacing().icon_width;
-            let (_rect, icon_resp) =
-                ui.allocate_exact_size(egui::vec2(icon_w, icon_w), egui::Sense::hover());
-            egui::collapsing_header::paint_default_icon(ui, openness, &icon_resp);
+            let caret = if open {
+                super::icons::CARET_DOWN
+            } else {
+                super::icons::CARET_RIGHT
+            };
+            // egui's built-in painted triangle is a tiny vector shape, so the
+            // closed state could read as "no affordance" beside the Phosphor
+            // glyphs used by the workspace tree. Text carets keep both trees
+            // visually consistent and use the icon font PaperBoy installs.
+            ui.add_sized(
+                egui::vec2(ui.spacing().icon_width, ui.spacing().interact_size.y),
+                egui::Label::new(caret).selectable(false),
+            );
             ui.add(egui::Label::new(label).truncate().selectable(false));
         })
         .response
@@ -198,25 +210,33 @@ pub fn tree_header_marked<R>(
 }
 
 /// A coloured HTTP-method badge, matching the terminal UI's method colours.
-pub fn method_badge(ui: &mut egui::Ui, method: &str) {
-    let col = method_color(method);
+/// `theme` supplies the colour for any verb the shared table doesn't name.
+pub fn method_badge(ui: &mut egui::Ui, theme: &GuiTheme, method: &str) {
+    let col = method_color(method, theme.dim);
     ui.label(RichText::new(method).strong().monospace().color(col));
 }
 
 /// A method picker combo box. Returns true if the method changed.
 pub fn method_combo(
     ui: &mut egui::Ui,
+    theme: &GuiTheme,
     id: impl std::hash::Hash + std::fmt::Debug,
     method: &mut String,
 ) -> bool {
     let mut changed = false;
-    let col = method_color(method);
+    let col = method_color(method, theme.dim);
     egui::ComboBox::from_id_salt(id)
         .selected_text(RichText::new(method.clone()).strong().color(col))
         .width(96.0)
         .show_ui(ui, |ui| {
             for m in METHODS {
-                if selectable(ui, method == m, RichText::new(m).color(method_color(m))).clicked() {
+                if selectable(
+                    ui,
+                    method == m,
+                    RichText::new(m).color(method_color(m, theme.dim)),
+                )
+                .clicked()
+                {
                     *method = m.to_string();
                     changed = true;
                 }
@@ -229,6 +249,46 @@ pub fn method_combo(
 /// label for the column rather than as another editable row.
 fn column_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str) {
     ui.label(RichText::new(text).strong().color(theme.dim));
+}
+
+/// A column title that *allocates* `w`, exactly as the cell below it does.
+///
+/// A bare label only claims the width of its own text, so on an empty table the
+/// grid's columns shrank to fit the words "Header Value Description" and the
+/// titles bunched together — then sprang apart the moment a row was added and
+/// the real fields set the column widths. Sizing the titles from the same
+/// numbers as the fields keeps every label still.
+fn sized_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str, w: f32) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, h),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(w);
+            column_header(ui, theme, text);
+        },
+    );
+}
+
+/// The four column widths of a [`kv_editor`] row: tick, key, value, note.
+///
+/// The description used to be whatever the key and value left over — and they
+/// claimed 40% + 60% of the row between them, so it collapsed to a sliver you
+/// couldn't read a word in. All three text columns are now shares of the same
+/// free width, so a note has room without starving the key or the value.
+///
+/// Every width is returned (rather than letting the last column fill) because
+/// the header row has to allocate exactly what the rows below it do; see
+/// [`sized_header`].
+fn kv_widths(ui: &egui::Ui) -> (f32, f32, f32, f32) {
+    let check = ui.spacing().interact_size.y + 4.0;
+    // The tick, the remove ✕ and the three gaps between the four columns are
+    // fixed furniture; only what's left is shared out.
+    let fixed = check + ui.spacing().interact_size.y + 8.0 + 3.0 * 8.0;
+    let free = (ui.available_width() - fixed).max(240.0);
+    let key = free * 0.28;
+    let val = free * 0.38;
+    (check, key, val, free - key - val)
 }
 
 /// An editable table of [`KvRow`]s (headers, query params, cookies, options).
@@ -246,17 +306,12 @@ pub fn kv_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
-    // The description must be the grid's *last* column for egui to stretch it to
-    // the full available width — otherwise a trailing "remove" column would be
-    // the one that fills. So the remove ✕ is tucked into the description cell
-    // via a right-to-left layout: ✕ pins to the right edge and the description
-    // fills everything to its left.
-    //
-    // The key and value must grow too (fixed-width columns beside a filling one
-    // read as "tiny key, huge note"): after reserving the fixed controls
-    // (checkbox, ✕, column spacing) each takes a share of the free width.
-    let key_w = split_key_width(ui, 72.0);
-    let val_w = key_w * 1.5;
+    // The remove ✕ is tucked into the description cell via a right-to-left
+    // layout — ✕ pins to the right edge and the description fills everything to
+    // its left — rather than being a fifth column, so the note stays adjacent
+    // to the value it annotates.
+    let (check_w, key_w, val_w, desc_w) = kv_widths(ui);
+    let row_h = ui.spacing().interact_size.y;
     egui::Grid::new(id)
         .num_columns(4)
         .spacing([8.0, 4.0])
@@ -266,13 +321,19 @@ pub fn kv_editor(
             // Column titles, as in the terminal UI: without them a bare grid of
             // text boxes gives no clue that the tick is "send this row" rather
             // than "select".
-            column_header(ui, theme, "\u{2713}");
-            column_header(ui, theme, key_label);
-            column_header(ui, theme, val_label);
-            column_header(ui, theme, s.hdr_description);
+            sized_header(ui, theme, "\u{2713}", check_w);
+            sized_header(ui, theme, key_label, key_w);
+            sized_header(ui, theme, val_label, val_w);
+            sized_header(ui, theme, s.hdr_description, desc_w);
             ui.end_row();
             for i in 0..rows.len() {
-                if ui.checkbox(&mut rows[i].enabled, "").changed() {
+                if ui
+                    .add_sized(
+                        [check_w, row_h],
+                        egui::Checkbox::without_text(&mut rows[i].enabled),
+                    )
+                    .changed()
+                {
                     changed = true;
                 }
                 // A disabled row (checkbox unticked) isn't sent, so grey its
@@ -290,28 +351,33 @@ pub fn kv_editor(
                 if v.changed() {
                     changed = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                        .on_hover_text(s.gui_remove)
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                    // The description is a note for whoever reads the file
-                    // later, not part of the request, so it is always dim —
-                    // even on an enabled row it shouldn't compete with the
-                    // value beside it.
-                    let d = ui.add(
-                        egui::TextEdit::singleline(&mut rows[i].desc)
-                            .hint_text(s.gui_hint_description)
-                            .text_color(theme.dim)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if d.changed() {
-                        changed = true;
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(desc_w, row_h),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_width(desc_w);
+                        if ui
+                            .button(RichText::new(super::icons::CLOSE).color(theme.err))
+                            .on_hover_text(s.gui_remove)
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        // The description is a note for whoever reads the file
+                        // later, not part of the request, so it is always dim —
+                        // even on an enabled row it shouldn't compete with the
+                        // value beside it.
+                        let d = ui.add(
+                            egui::TextEdit::singleline(&mut rows[i].desc)
+                                .hint_text(s.gui_hint_description)
+                                .text_color(theme.dim)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if d.changed() {
+                            changed = true;
+                        }
+                    },
+                );
                 ui.end_row();
             }
         });
@@ -436,6 +502,123 @@ pub fn status_color(theme: &GuiTheme, status: u16) -> Color32 {
 mod tests {
     use super::*;
 
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0))
+    }
+
+    fn a_frame() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            ..Default::default()
+        }
+    }
+
+    fn click_at(input: &mut egui::RawInput, pos: egui::Pos2) {
+        input.events.push(egui::Event::PointerMoved(pos));
+        for pressed in [true, false] {
+            input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+
+    /// A dialog covers the app with a sheet that eats clicks: the menu bar and
+    /// the panels underneath must not act while a dialog is waiting for an
+    /// answer, or a second wizard ends up opened on top of the first. It is an
+    /// *input* sink only — the frame loop keeps running, so background work
+    /// (a git fetch, a report run) still finishes while the dialog is up.
+    #[test]
+    fn a_dialog_stops_clicks_reaching_the_app_behind_it() {
+        // The button sits in the far corner, well away from the centred dialog.
+        let button_pos = egui::pos2(20.0, 20.0);
+
+        let clicked_behind = |with_dialog: bool| {
+            let ctx = egui::Context::default();
+            let mut clicked = false;
+            // Two passes: egui needs the first to lay the widgets out before a
+            // click can land on them.
+            for pass in 0..2 {
+                let mut input = a_frame();
+                if pass == 1 {
+                    click_at(&mut input, button_pos);
+                }
+                let _ = ctx.run_ui(input, |ui| {
+                    if ui.button("behind").clicked() {
+                        clicked = true;
+                    }
+                    if with_dialog {
+                        let ctx = ui.ctx().clone();
+                        dialog(&ctx, "In the way", None, |ui| {
+                            ui.label("answer me");
+                        });
+                    }
+                });
+            }
+            clicked
+        };
+
+        assert!(
+            clicked_behind(false),
+            "the test's own button is clickable with no dialog up"
+        );
+        assert!(
+            !clicked_behind(true),
+            "the same click must not reach it through an open dialog"
+        );
+    }
+
+    /// The dialog opens centred but is not pinned there: one anchored to the
+    /// middle cannot be dragged off whatever the user opened it to look at.
+    #[test]
+    fn a_dialog_opens_centred_and_can_still_be_dragged_aside() {
+        let ctx = egui::Context::default();
+        let draw = |input: egui::RawInput| {
+            let _ = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                dialog(&ctx, "Draggable", None, |ui| {
+                    ui.label("body");
+                });
+            });
+            // egui derives a window's Area id from its title atoms.
+            egui::AreaState::load(&ctx, egui::Id::new(Some("Draggable")))
+                .expect("the dialog was drawn")
+                .rect()
+        };
+
+        draw(a_frame());
+        let centred = draw(a_frame());
+        assert!(
+            (centred.center().x - screen().center().x).abs() < 2.0
+                && (centred.center().y - screen().center().y).abs() < 2.0,
+            "it opens in the middle: {centred:?}"
+        );
+
+        // Drag the title bar to the left, as a user would.
+        let grab = egui::pos2(centred.center().x, centred.min.y + 6.0);
+        let mut press = a_frame();
+        press.events.push(egui::Event::PointerMoved(grab));
+        press.events.push(egui::Event::PointerButton {
+            pos: grab,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        draw(press);
+
+        let mut drag = a_frame();
+        drag.events
+            .push(egui::Event::PointerMoved(grab - egui::vec2(200.0, 0.0)));
+        let moved = draw(drag);
+
+        assert!(
+            moved.center().x < centred.center().x - 100.0,
+            "dragging the title bar moves it: {moved:?} vs {centred:?}"
+        );
+    }
+
     /// Paint one `tree_header_marked` row and return the fills of every solid
     /// rectangle it drew, so a test can tell a marked row from a plain one.
     fn header_fills(highlight: Option<egui::Color32>) -> Vec<egui::Color32> {
@@ -558,6 +741,77 @@ mod tests {
         (key_w, rendered)
     }
 
+    /// Render a `kv_editor` with `n` rows in a fixed-width window and report
+    /// the width the whole table claimed.
+    fn kv_table_width(n: usize) -> f32 {
+        let ctx = egui::Context::default();
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let mut rows: Vec<KvRow> = (0..n)
+            .map(|i| KvRow::new(&format!("Header-{i}"), "a value"))
+            .collect();
+        let mut w = 0.0;
+        // Grid column widths settle from the previous pass, so run a few.
+        for _ in 0..4 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(900.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let before = ui.min_rect().width();
+                    kv_editor(
+                        ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                    );
+                    w = ui.min_rect().width() - before;
+                },
+            );
+        }
+        w
+    }
+
+    /// The column titles used to be bare labels, so an empty table sized its
+    /// columns to the words "Header Value Description" and everything jumped
+    /// when the first row appeared. The table must claim the same width either
+    /// way.
+    #[test]
+    fn empty_and_filled_tables_lay_out_their_columns_identically() {
+        let empty = kv_table_width(0);
+        let filled = kv_table_width(2);
+        assert!(
+            (empty - filled).abs() < 1.0,
+            "empty table was {empty} wide, filled was {filled}"
+        );
+    }
+
+    /// The description column used to be whatever the key (40%) and value (60%)
+    /// left over — i.e. nothing. It must get a readable share of its own.
+    #[test]
+    fn the_description_column_gets_a_readable_share() {
+        let ctx = egui::Context::default();
+        let mut got = (0.0, 0.0, 0.0, 0.0);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| got = kv_widths(ui),
+        );
+        let (check, key, val, desc) = got;
+        assert!(desc > 150.0, "description was only {desc} wide");
+        assert!(key > 150.0 && val > key, "key {key}, value {val}");
+        // Nothing may overflow the row: the four columns plus the fixed
+        // furniture have to fit what the table was given.
+        let total = check + key + val + desc + 3.0 * 8.0 + 24.0;
+        assert!(total <= 900.0, "columns sum to {total}, wider than the row");
+    }
+
     #[test]
     fn key_field_renders_at_the_computed_split_width() {
         let (key_w, rendered) = measure_key(600.0);
@@ -615,4 +869,135 @@ mod tests {
             "asking to reveal it should open it with no click involved"
         );
     }
+}
+
+/// What a [`dialog`] frame produced, and whether the user asked to close it.
+///
+/// `inner` is `None` when egui declined to draw the window at all — which is
+/// not an answer, so callers keep the dialog armed rather than deciding for
+/// the user.
+pub(crate) struct DialogFrame<R> {
+    pub inner: Option<R>,
+    /// The user pressed Escape or clicked the window's ✕ this frame. Every
+    /// dialog treats this as its cancel, so there is always a way out that
+    /// doesn't involve finding the right button.
+    pub dismissed: bool,
+}
+
+impl<R> DialogFrame<R> {
+    /// The frame's answer, or `default` when egui drew nothing.
+    pub fn inner_or(self, default: R) -> R {
+        self.inner.unwrap_or(default)
+    }
+}
+
+/// The modal window shell shared by every GUI dialog.
+///
+/// Behaves the way a desktop dialog is expected to: it opens centred but can
+/// be dragged aside (an anchored dialog cannot be moved off whatever you
+/// opened it to look at), it carries the two ways out a windowed dialog has —
+/// a ✕ in the title bar and the Escape key, both reported as
+/// [`DialogFrame::dismissed`] so the caller can run its own Cancel — and it
+/// puts a dimmed, click-swallowing sheet over the app behind it.
+///
+/// That sheet blocks *input*, not the frame loop: the app keeps painting and
+/// keeps polling its background work, so a git fetch or a report run started
+/// before the dialog opened still finishes while it is up.
+pub(crate) fn dialog<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    dialog_with(ctx, title, min_width, None, true, add)
+}
+
+/// A [`dialog`] without the sheet behind it, for the one case where the dialog
+/// is *reporting* rather than *asking*: a long import that has everything it
+/// needs and now only has to be waited for. The rest of the app stays usable
+/// while it runs, because there is no question standing in the way of it.
+pub(crate) fn dialog_modeless<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    dialog_with(ctx, title, min_width, None, false, add)
+}
+
+/// A [`dialog`] the user can resize, for the ones whose body is a list: how
+/// much of a repo's files or a workspace's collections fits on screen is the
+/// user's call, not a number picked here.
+pub(crate) fn dialog_resizable<R>(
+    ctx: &egui::Context,
+    title: &str,
+    default_size: [f32; 2],
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    dialog_with(ctx, title, None, Some(default_size), true, add)
+}
+
+fn dialog_with<R>(
+    ctx: &egui::Context,
+    title: &str,
+    min_width: Option<f32>,
+    default_size: Option<[f32; 2]>,
+    modal: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> DialogFrame<R> {
+    if modal {
+        shade(ctx, title);
+    }
+    let mut open = true;
+    let mut window = egui::Window::new(title)
+        .collapsible(false)
+        .resizable(default_size.is_some())
+        // Centred on first sight, then wherever the user drags it.
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(ctx.input(|i| i.content_rect()).center())
+        // Above the sheet, which is itself above the panels.
+        .order(egui::Order::Foreground)
+        .open(&mut open);
+    if let Some(size) = default_size {
+        window = window.default_size(size);
+    }
+    let inner = window
+        .show(ctx, |ui| {
+            if let Some(w) = min_width {
+                ui.set_min_width(w);
+            }
+            add(ui)
+        })
+        .and_then(|r| r.inner);
+    // Escape is read from the raw input rather than consumed: a dialog is the
+    // top-most thing on screen, so nothing underneath it should be acting on
+    // the same press anyway.
+    // Escape closes the ones that are asking something. A modeless dialog is
+    // sitting beside work the user is still doing, and Escape there belongs to
+    // whatever they are actually typing into.
+    let esc = modal && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    DialogFrame {
+        inner,
+        dismissed: !open || esc,
+    }
+}
+
+/// The dimmed sheet between a dialog and the app: it darkens what is behind
+/// and swallows every click, drag and scroll aimed at it, so the menu bar and
+/// the panels cannot be driven while a dialog is waiting for an answer (which
+/// is how a second wizard used to end up opened on top of the first).
+///
+/// Deliberately *only* an input sink — nothing here stops the frame loop, so
+/// background work carries on and the app never looks hung.
+fn shade(ctx: &egui::Context, title: &str) {
+    let screen = ctx.input(|i| i.content_rect());
+    egui::Area::new(egui::Id::new(("paperboy-dialog-shade", title)))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.painter()
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
+            ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
+        });
 }

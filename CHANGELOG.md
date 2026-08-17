@@ -8,9 +8,1260 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.3.1] - 2026-08-06
+## [0.4.0] - unreleased
+
+### Fixed
+
+- **A finished Postman import says what it did.** The dialog used to simply
+  vanish on success: a tab quietly switched, the request panel still showed
+  whatever was open before, and nothing said what had landed or where. It now
+  ends on a receipt — the workspace's name, how many collections and
+  environments came with it, the folder they were saved to, anything that had
+  to be skipped, and the fact that the folder is now a tab with its collections
+  listed on the left. An import that finishes while it is running in the
+  background brings the receipt back on screen, because that is exactly the case
+  where nothing else would have told you.
+- **Every request in the workspace tree says what it does.** The `GET`/`POST`
+  badge used to appear only for the requests of the collection currently loaded;
+  every other expanded collection was a list of bare names, so finding the POST
+  meant opening files one at a time. The method is now cached alongside the name
+  and shown for every listed request, in both front-ends.
+- **A report's run settings are easier to find, and easier to trust.** The
+  values a report will run with used to be a dim, truncated label sitting beside
+  a separate *Run settings* button, and a line you can read but not act on reads
+  as a status message rather than a question. The summary is now the control
+  itself: click it (or press `p`, in both front-ends) to change the values.
+  Anything unanswered is painted in the colour the app uses for "not settled
+  yet" — or the error colour where it would actually stop the run — so an
+  unanswered report looks unanswered. Both front-ends now call the thing by the
+  same name, *Run settings*, and a table or preview left on screen after its
+  answers have changed says *changed since this run* rather than being described
+  by values it wasn't produced with. The terminal UI's binding panel is also
+  sized to what it holds, so a long base directory can no longer wrap and push
+  the run-settings line out of sight.
+- **Importing from Postman is where people look for it.** It used to be a leaf
+  three levels down — *Open ▸ Workspace ▸ From Postman…* — which asks a
+  newcomer to decide that what they want is a "workspace" before they can find
+  the word "import" at all. **Import from Postman** is now its own top-level
+  File entry in both front-ends, and it offers the two routes by what the user
+  actually has: *From an exported file (.json)…*, which needs no API key and
+  works out by itself whether the file holds a collection or an environment,
+  and *From my Postman account…*, which connects and brings whole workspaces
+  over. The old deep entry stays where it was, renamed *From a Postman
+  account…* so it can't be confused with the file route, and an empty request
+  list now offers the import directly — that is the screen where "where are my
+  requests?" is being asked.
+
+- **The Postman importer says what it wants of you.** The first thing the
+  importer asks is where your API key comes from, and it defaults to reading it
+  from 1Password rather than having you paste one — deliberately, because a
+  pasted key is a live credential while a reference is only its address. But it
+  never said so: the field showed `Private/Postman/credential`, which reads like
+  a value you should already have, and nothing mentioned that the key is fetched
+  fresh on every run, that nothing is stored, or that 1Password's `op` command
+  has to be installed. Each source now carries a line of plain English saying
+  exactly that, and the examples are written as shapes (`vault/item/field`) so
+  they cannot be mistaken for answers. The workspace field says "leave blank to
+  choose from a list" rather than "blank: choose from a list", and the Hurl
+  conversion note no longer names a file the user has not seen yet.
+
+- **The desktop dialogs all look like the same program.** A pass over every
+  window and dialog found four things drifting: the Postman and Git wizards
+  painted every field label in the accent blue while the rest of the app uses
+  dim grey and saves accent for status; the run-settings modal drew its own
+  title at body size, next to dialogs whose titles are a size larger; the
+  parameter cards annotated themselves at a size no other text in the app uses;
+  and the confirmation dialogs left their question uncoloured, so the sentence
+  the dialog exists to ask was fainter than the buttons under it. All four now
+  follow the same rules, the finished-import dialog leaves by *Close* rather
+  than *Cancel*, and a test paints every dialog and fails if any of them
+  reaches for a third text size.
+
+- **A Postman import no longer stops the desktop app.** Bulk imports are paced
+  around Postman's rate limit and can run for many minutes, and the dialog held
+  the whole app while they did — nothing to answer, and nothing else possible.
+  The download step now sits over a working app rather than in front of one,
+  and *Continue in the background* puts it away entirely: progress carries on
+  in the status bar, clicking there brings it back, and it reappears by itself
+  if the import fails or needs an answer. Opening the importer while one is
+  already running returns to that one instead of discarding its progress.
+
+- **A ground-truthed `DETAIL` column says whether it was right.** A column
+  carrying both `DETAIL` and `TRUTH` leaves the grid for the drill-down, and
+  with it went the green/red that said whether the answer was correct — so the
+  one place the full value is actually read was the one place that stayed
+  silent about it. The section heading now carries the verdict, and a wrong
+  answer says what was expected instead, in the desktop app and the interactive
+  HTML export alike. An unlabelled row still says nothing rather than borrowing
+  the appearance of one that passed.
+
+- **No workplace-specific names in the code.** Test fixtures, sample values and
+  the report editor's block-preview chips used real internal project and
+  environment names. They now use neutral ones (`api_staging`, `api_dev`,
+  `classify_result`, `samples/real`), so nothing about a particular API is
+  carried in the source.
+
+- **The run-settings summary is legible.** The line naming the values the next
+  run will use sat in the toolbar at the small text style — finer than the
+  report it describes, and it is meant to be read. It is set at body size now,
+  with the whole of it on hover when the toolbar has to truncate it.
+
+- **A picture's path in the drill-down is readable again.** The caption under a
+  full-size picture inherited the panel's justified column layout, which spread
+  its first line's letters across the full width (`/ h o m e / j o n a…`). It is
+  laid out plainly now.
+
+- **A Postman import no longer queues behind its own latency.** Items were
+  fetched strictly one at a time, so on a link with high round-trip times the
+  import crawled at one or two items a second even with hundreds of calls still
+  available in the account's allowance. Up to six fetches are now in flight at
+  once. The pacer is still the sole gatekeeper — it hands out slots without
+  holding its lock across the wait, so workers sleep in parallel rather than
+  queueing on each other — and results are put back into request order before
+  anything is written, so the names given to duplicate items don't change from
+  run to run.
+- **The test suite no longer invokes the real `op` or `aws` command.** Running
+  the tests could pop up a 1Password authorisation prompt: the asynchronous
+  secret resolution already swapped in a do-nothing resolver under test, but
+  the synchronous path used when parsing a `.vars` file or resolving a single
+  reference still shelled out for real. Both now go through the same
+  test-aware default.
+- **A slow Postman import now says what it is waiting for, and how much
+  allowance is left.** Listing a large workspace draws on Postman's strictest
+  rate limit, so the importer paces itself and backs off when told to — but
+  only the *download* screen ever drew that, leaving the listing step sitting
+  on "Checking what that workspace holds…" for minutes with nothing to
+  distinguish it from a hung app. The busy line now names the reason for the
+  wait and how long it has been waiting, and both front-ends show the account's
+  own figures, taken from the rate headers we were already reading and
+  discarding: calls left before the window resets, calls left this month, and
+  the spacing currently being kept between calls. The remaining-time figure is
+  also labelled as the estimate it is — it moves about as paced waits land
+  inside the average.
+
+- **The Postman wizard stops moving under the cursor.** Choosing where the API
+  key lives changes the label beside the key field ("API key" versus
+  "1Password item"), and both front-ends were sized to their contents: in the
+  terminal the value column jumped sideways, and in the GUI the whole dialog
+  grew and shrank. The label column and the dialog width are now reserved for
+  the widest source, so switching between them changes nothing but the label.
+
+- **A GUI dialog now behaves like a dialog.** They were anchored to the middle
+  of the window and fixed in size, so one could not be dragged aside to read
+  what it was covering, and the file/collection pickers inside the git and
+  Postman wizards were stuck at a few visible rows however large the window
+  was. Dialogs now open centred but can be moved, the two wizards can be
+  resized (with their lists growing to fill them), and the app behind is
+  covered by a dimmed sheet that blocks clicks and keyboard shortcuts — so a
+  second wizard can no longer be opened on top of the first, and Ctrl+S no
+  longer saves the tab hidden behind the dialog. The sheet blocks *input*
+  only: the app keeps painting and background work (a git fetch, a running
+  report) keeps finishing while a dialog is up.
+
+- **A workspace downloaded from git arrives with its environments and
+  reports.** The recommended file filter took `.hurl` and `.json` only, so a
+  repo holding requests, `.vars` environments and `.trail` reports downloaded
+  the requests and quietly dropped everything they needed to run — the only way
+  to get them was "All files", which also dragged down every unrelated binary in
+  the repo. The recommended filter is now "files PaperBoy can open" and covers
+  all four. Workspaces already pinned to the old filter keep working.
 
 ### Changed
+
+- **Running a report that asks for values now always stops at the questions
+  first.** Run opens the run settings; Run again — from the settings — starts
+  the run. The values decide what the run *means* and a run can take minutes,
+  so they are worth a glance on the way past; more practically, this is the way
+  back to them once results have filled the screen, which previously took
+  knowing that `p` existed. Opening the questions discards nothing, so the
+  unexported-results warning is held back until the run actually starts.
+
+- **Hints no longer explain the arrow keys.** Every list in the app said
+  "↑↓ move", which is the one thing nobody needs telling — it crowded out the
+  keys that *are* worth knowing in the same line. Arrows are still advertised
+  where they don't just move a cursor: `Shift+↑/↓` reorders, `←/→` picks or
+  steps into a folder, `↑/↓` changes an export format or a colour channel.
+
+- **`p` toggles a report's questions, and the hint says so.** A report that
+  asks for values opens on them, so the old "Esc back" pointed at a step its
+  user never took. `p` now closes the questions as readily as it opens them —
+  the way `v` toggles the results grid — and the hint reads "p show the
+  report". Esc still works, unadvertised.
+
+- **Long pick-lists in a report filter as you type.** The environment and
+  choice pickers used to treat any letter as "cancel", which made picking one
+  of a dozen loaded environments a scroll. Typing now narrows the list on a
+  case-insensitive substring, Backspace widens it again, and `j`/`k` no longer
+  move the cursor there — a letter is a letter.
+
+- **Clicking a report's results grid or its questions selects the report.**
+  Both moved their own cursor while keyboard focus stayed on the panel beside
+  them, so the next keypress went somewhere the user wasn't looking. Run
+  settings rows also answer the mouse now: one click selects, a second opens
+  the row's editor.
+
+- **Save no longer asks whether you meant it.** Saving a collection,
+  environment or report back to the file it came from used to raise a
+  confirmation counting the changes about to be written. Overwriting that file
+  with those changes is what Save *means*, so the dialog was asking the user to
+  confirm the thing they had just asked for — two keystrokes on the way to
+  every save. It now writes immediately. *Save As* still confirms before
+  overwriting a **different** file, which is a real surprise worth catching.
+
+### Added
+
+- **The GUI asks a report's questions on the way to a run.** A report that
+  declares `PARAM`s now stops at a run-settings dialog when Run (or Dry run)
+  is pressed: one tinted card per parameter in the Blocks editor's own idiom,
+  a drop-down for a closed set of answers or for an environment, a Browse
+  button beside a `FOLDER` or `FILE` path, and the raw name and type dimmed
+  alongside for anyone who goes on to read the source. Both Run and Dry run
+  are offered as exits whichever button opened it, and neither will start
+  while a required value is missing. The questions are asked once per editing
+  session — so a preview can be followed straight by the run it previewed —
+  and again only when the report changes what it declares. A `Run settings`
+  button and a summary of the chosen values (`REGION=au · TICKET=FR-12`) sit
+  in the toolbar, so what the next run will use is always on screen and one
+  click away. Answers are remembered per report between runs and survive a
+  trip to another tab, and a dry run previews with the same values the real
+  run would use. The form is built by the shared core, so the two front-ends
+  can't drift apart.
+
+- **The terminal UI asks the same questions the same way.** A report that
+  declares `PARAM`s no longer opens on a run-settings *view* it takes an Esc to
+  leave; the questions come up in a box over the report when Run (`r`) or Dry
+  run (`d`) is pressed, so what you're about to run stays on screen behind
+  them. `r` and `d` inside the box are both exits — either one counts as the
+  answer, so previewing and then running doesn't ask twice — and Esc puts the
+  box away without answering. Like the desktop app, the questions are asked
+  once per editing session and again only when the report changes what it
+  declares; `p` reopens them, and the binding panel names the values the next
+  run will use.
+
+- **A comparison can be pointed at its two stacks by parameter.** An `ENVS`
+  clause may name an environment (or a `FILE(…)` snapshot) through a parameter
+  — `BASELINE("{{BASELINE_ENV}}"), COMPARISON("{{COMPARE_ENV}}")` — so the
+  report that compares staging against dev this week compares another pair next
+  week without being edited or copied. Both halves of a comparison resolve the
+  same way, so the collapse still finds the rows the loop produced. Validation
+  judges such a name by what it means rather than by what it says: it must name
+  a declared `PARAM` (an `ENVS` clause is read before anything has run, so a
+  capture or an assignment would mean something different depending on where
+  the run had got to), and a default that currently names an unloaded
+  environment is a warning rather than the error a literal name gets.
+
+- **The terminal UI asks for the values a report declares.** A report with
+  `PARAM`s opens on a *Run settings* view (`p` from the source, Esc back)
+  listing one row per parameter: what it asks for in words, the value this run
+  will use, and its raw name and type dimmed beside it. Enter opens whichever
+  control the type deserves — a list of a `CHOICE`'s own choices or of the
+  loaded environments, the file browser for a `FILE`/`FOLDER` (stored relative
+  to the report, like `# root:`), a text field for the rest — and a value the
+  type wouldn't accept is refused there rather than at the run. Pressing `r`
+  with a required value still unanswered doesn't run: it says which one and
+  puts you back on the row. The answers are remembered per report (and survive
+  a restart), so a report someone runs every week opens on last week's answers
+  and is a glance and an `r`.
+
+- **Reports can ask for a value before they run.** A `PARAM` statement declares
+  a variable whose value is offered to the user rather than baked into the
+  file, so a report that differs from run to run only by its environment, its
+  input folder or an API version no longer has to be edited or copied to be
+  re-run:
+
+  ```
+  PARAM ENV    TARGET  = "staging_au"            LABEL "Environment"
+  PARAM CHOICE("v4.2", "v4.3") VERSION = "v4.3"  LABEL "API version"
+  PARAM FOLDER IMAGES  = "./tickets"
+  ```
+
+  A parameter is an assignment the user has a say in — `{{TARGET}}` reads it
+  like any other variable — with a type (`TEXT`, `NUMBER`, `ENV`, `FOLDER`,
+  `FILE` or `CHOICE(…)`) so each front-end can put the right control behind it,
+  and an optional `LABEL` to prompt with. Omitting the default makes the
+  parameter required. Parameters live in the prelude, so the whole set can be
+  read off a report without running it; validation says so when one is written
+  too late or hidden in a loop, when two share a name, or when a default
+  disagrees with its own type. Where no `LABEL` is written one is derived from
+  the name rather than shouting the identifier at whoever is running the
+  report — `TICKET_REF` asks for "Ticket ref" — and two parameters that end up
+  asking the same question are flagged. A run binds whichever values it was
+  given, falling back to the declared defaults, and holds them to the same
+  rules as the defaults — a choice off the list, a number that isn't one, or a
+  required parameter nobody supplied stops the run with a reason instead of
+  producing plausible-looking rows built from a URL with a hole in it. The run
+  settings that offer the values, and the `--param` flag that supplies them
+  headlessly, are next.
+
+- **The Postman importer remembers where your key lives.** A key read from
+  1Password, SSM or the environment is kept as a *reference* — the address, not
+  the credential — and offered back next time, the same way the git wizard
+  offers the repositories you have used: a dropdown under the key field in the
+  terminal (↓ to open), a Recent menu beside it in the GUI. The list is
+  filtered to the source you have chosen, so picking SSM doesn't offer
+  1Password paths, and only references that Postman actually accepted are
+  kept. A pasted key is never written to disk.
+
+- **The Postman importer offers 1Password first.** A pasted API key is a live
+  credential sitting in a text field, where a reference is only its address, so
+  the wizard now opens on 1Password and lists pasting last. Pasting is still
+  supported, and an existing key is still recognised for whatever source it
+  came from.
+
+- **The GUI File menu names what it opens before where it comes from.** It used
+  to lead with the source — "Open", "Open from Git", and a bare "From
+  Postman…" that never said what a Postman import produces. It now follows the
+  terminal's shape: **Open ▸ Workspace ▸ From Postman…**, with every source for
+  a thing listed together (a file, a folder, Git, Postman), and **Save As ▸
+  Collection ▸ To Git…** the same way round. Entries that cannot work — pushing
+  a workspace that never came from git, saving a report with none open — stay
+  visible but disabled rather than being hidden or silently failing.
+- **Reports load from Git in the GUI.** The terminal has always offered it; the
+  GUI's git wizard only knew about collections, environments and workspaces, so
+  a `.trail` living in a repo had to be cloned by hand first. Open ▸ Report ▸
+  From Git… now lists the repo's `.trail` files, opens the chosen one in the
+  report editor, and remembers where it came from so Save As ▸ Report ▸ To Git…
+  pushes straight back to it.
+
+- **The GUI's git wizard offers the repositories you have already used.** The
+  terminal has kept a list of recent remote URLs for a while and offers it under
+  the URL field; the GUI kept writing to the same list but never showed it, so a
+  git URL had to be typed out (or pasted from somewhere else) every time. Both
+  the load and the save wizard now show a **Recent** menu beside the URL field,
+  backed by that same shared list — a repo opened in one front-end is offered by
+  the other — and both URL and token fields carry their examples inside them.
+
+- **The GUI's Postman importer asks where the key lives, like the terminal
+  does.** The connect step wanted an API key and hinted, in prose, that a
+  provider reference could be typed instead — which only helps someone who
+  already knows the syntax. It now offers the source (pasted key, 1Password,
+  AWS SSM, environment variable) beside the field and writes the reference
+  itself, so a 1Password user types the item path their password manager shows
+  them. The remaining steps lost their stacked explanations: the fields carry
+  their examples inside them and the window title says what the dialog is, so
+  the options screen no longer repeats it back.
+
+- **Every GUI dialog can be left by Escape or by its corner.** The windows had
+  no ✕ and ignored Escape, so a dialog opened by accident could only be
+  answered — and the destructive confirmations re-arm themselves when they are
+  clicked away, so "wait for it to go" was not an option either. All of them
+  (rename, new name, theme editor, export results, revert to saved, the unsaved
+  quit/close warnings, the workspace reload offer, the Postman importer, the
+  git load wizard and the report node wizard) now carry a close button and
+  treat both it and Escape as their own Cancel, so dismissing does exactly what
+  the Cancel button did — an unanswered reload offer, for instance, is still
+  recorded on the tab and comes back next launch rather than being lost.
+
+- **The wizards say less and show more.** The Postman importer, the git load
+  wizard and the git save wizard were each a stack of fields with a sentence of
+  explanation underneath every one — a screen of prose to answer two questions.
+  They now follow the request editor's shape: a label column with the value
+  beside it, and the shortcut keys on the panel's bottom border rather than
+  taking a row of the body. What a field wants is shown as a dim example *in*
+  the field, where the answer is about to be typed ("https://github.com/owner/
+  repo", "Private/Postman/credential", "blank: choose from a list"), so the
+  explanation is read at the moment it is needed and costs nothing when it
+  isn't. The Postman connect step went from twelve rows to four and the git
+  ones from eight to two; the wording that survived is shorter throughout. If
+  it took a paragraph to say what a field was for, the field was not clear
+  enough.
+
+- **Reports export as PDF.** `# output: pdf`, or a `.pdf` filename in either
+  front-end's export dialog, writes a printable landscape A4 document: the
+  table sized to its content and fitted to the page, the column headers
+  repeated on every page, cells tinted exactly as the spreadsheet and the HTML
+  tint them, an `IMAGE` column's pictures embedded at the size the clause asked
+  for, and the statistics and ground-truth figures in the footer. `DETAIL`
+  columns are left out of the table — paper has no click, and a drill-down
+  column is usually a whole response body that would crush every other column
+  in a printed grid; the lossless exports still carry them. The file is
+  assembled by hand rather than through a PDF crate, so the format costs no new
+  dependency: text is wrapped here against Helvetica's real glyph widths, a
+  JPEG is embedded byte-for-byte as the DCT stream it already is, and anything
+  else reuses a PNG's own compressed pixel stream.
+
+- **The Postman importer takes a key reference, not just a key.** The wizard's
+  API key field now accepts the same `{{ … }}` provider references a `.vars`
+  file does — `{{ op://Private/Postman/credential }}`, `{{ ssm:/path }}`,
+  `{{ env:NAME }}` — resolved when you press Enter, so nobody has to fetch a
+  live credential out of 1Password and paste it into a form (the headless
+  `--postman-key` has accepted these all along; now the front-ends match). An
+  import lists, plans and downloads with a client apiece, so the resolved value
+  is held for the run rather than prompting three times, and — like every
+  resolved secret — it is never written to disk. A reference the provider won't
+  answer is reported as such instead of being sent as a key. The terminal
+  wizard no longer expects you to know that syntax: its first row is a **key
+  source** — Paste, 1Password, AWS SSM or an environment variable — and once
+  you have picked one you type only the part you can read off the provider (the
+  item path 1Password's own "Copy Secret Reference" gives you, the parameter
+  name, the variable name) and the wizard assembles the reference. Only a
+  pasted key is masked on screen; an item path is an address rather than a
+  credential, and hiding it would only stop you checking you typed it right. A
+  wizard reopened on an existing key shows it the way it was entered, and
+  someone who already knows the syntax can still type it in full — it is
+  recognised rather than wrapped a second time.
+
+- **A report says what moved, not just how it scored.** Two runs that both score
+  98% are not the same run if one of them fixed three rows and broke three
+  others, and the accuracy figures cannot tell them apart. The metrics header —
+  in the exported HTML, in the GUI and in the terminal — now leads with how the
+  run moved against its baseline: how many rows were **Fixed**, how many
+  **Regressed**, and how many are **Still wrong**, or a single "Nothing moved"
+  where every scored row landed where it did last time. The xlsx `Metrics` sheet
+  and the JSON export carry the same figures as numbers, so a CI gate can ask
+  "did anything regress?" without counting rows. A run with no baseline says
+  nothing about movement: it hasn't stayed still, it has nothing to have moved
+  from.
+
+- **The exported HTML report has a dark mode.** It was a white page whatever the
+  screen it was opened on, which is a bright thing to hand someone at the end of
+  a long day. It now follows the reader's own system setting, and carries a
+  **Dark**/**Light** toggle at the end of its toolbar for when the two disagree
+  — a dark desktop and a report going on a projector. The choice is remembered
+  between openings where the browser allows it. Every colour in the file now
+  comes from one palette declared in one place, including the confusion matrix's
+  heatmap, which is mixed back toward the page rather than glowing on it.
+
+- **Open an exported report where it belongs.** The interactive HTML export is
+  written to be read in a browser and the xlsx in a spreadsheet, but both
+  front-ends stopped at naming the file, leaving you to go and find it. After a
+  successful export the terminal UI opens it with **Ctrl+O** and the GUI grows
+  an **Open** button beside Export, each handing the file to the desktop's
+  default application. The offer only stands while the file still describes the
+  run on screen — a rerun withdraws it, because an "open" that shows the
+  previous run's numbers is worse than none.
+
+- **The terminal results view states the score and filters the rows.** It drew
+  the grid and nothing else, so a ground-truthed run had to be exported to find
+  out how it did, and there was no way to ask for just the rows that were wrong.
+  A summary is now pinned above the grid — compared, incorrect and accuracy per
+  scored column — and **`/`** cycles the same filters the GUI's bar and the
+  interactive HTML export offer (All, Differences, Incorrect, Regressions). The
+  results panel's own title says which filter is up and how many rows of how
+  many it leaves on screen, so the grid pays no rows for it. Both read from the shared
+  metrics and filter modules, so all three views quote the same accuracy and
+  hide the same rows. A report with no ground truth and nothing to filter is
+  drawn exactly as before.
+
+- **`TRUTH`, `DETAIL`, `STATISTICS` and `IMAGE` are syntax highlighted.** The
+  per-column clauses were the only part of PaperTrail the source view treated as
+  plain data, so `TRUTH "pass" DETAIL` read as a column name and a string. They
+  now take the same colour their editor chips carry, and their arguments
+  (`WIDTH`, `HEIGHT`, `FIT`, `MEAN`, `COUNT`, …) are accented — but only inside
+  their own parentheses, so a column honestly called `count` or `width` stays
+  plain text.
+
+- **The GUI results view has confusion matrices and per-row drill-down.** Each
+  ground-truthed column's matrix is drawn under the metric cards, shaded off the
+  same ramp the HTML export uses, and every non-empty count is a button that
+  selects the rows it counted. A row with pictures or `DETAIL` columns gets an
+  expander that opens a panel holding its pictures at full size, its detail
+  columns in full, and a field-by-field diff against the baseline where there is
+  one. `DETAIL` columns now leave the in-app grid for that panel, exactly as they
+  leave the exported table.
+
+- **The GUI results view has metric cards, row filters and a find box.** The
+  figures and filters that made the interactive HTML export worth exporting are
+  now drawn natively above the results grid, so a ground-truthed run can be
+  judged and picked through without exporting it first. The filters offered are
+  the ones the run has something to select (differences, incorrect rows,
+  regressions), the find box narrows whatever the filter chose, and the count
+  reports how many of the run's rows survive both. Both are computed from the
+  same `metrics`/`filter` core the HTML writer uses, so the two views can never
+  disagree. A run that is still streaming is shown unfiltered, since filtering
+  hides pending rows.
+
+- **`TRUTH`, `IMAGE` and `DETAIL` are editable in both structured editors.**
+  The three trailing clauses attach identically to a `WITH` field, a
+  `REPORT <var> AS` column and a computed column, so all three forms in the TUI
+  node editor and the GUI block editor now show one shared clause block instead
+  of carrying the clauses invisibly and writing them back untouched.
+
+  `IMAGE` is a toggle that reveals `FIT`, `HEIGHT` and `WIDTH` — most columns
+  are not pictures, and three permanently-visible size rows would bury the two
+  rows every column needs. `FIT` and a pixel size answer the same question, so
+  picking `FIT` clears the sizes rather than emitting a spec a writer would have
+  to arbitrate. A clause on its own is now enough to promote a bare
+  `REPORT <var>` to the named form, falling back to the variable's own name.
+
+- **Columns can be marked as supporting evidence with `DETAIL`.** A bare
+  `DETAIL` flag, alongside `STATISTICS(…)`, `IMAGE(…)` and `TRUTH "…"` on any
+  named column, says the column is worth keeping but not worth a slot in the
+  main grid:
+
+  ```
+  REPORT REQUEST classify AS c WITH
+      Verdict: jsonpath "$.decision" TRUTH "{{ expected }}"
+      Payload: jsonpath "$.raw" DETAIL
+  END
+  ```
+
+  It is *placement*, not content: a `DETAIL` column is still exported to CSV and
+  JSON, still compared, and still stored in a baseline snapshot. Writers that
+  have somewhere to put it use it; the rest ignore it.
+
+- **The HTML export is interactive.** Clicking a row (or pressing Enter/Space on
+  it) opens a drill-down panel holding the row's pictures at full size, its
+  `DETAIL` columns pretty-printed, and — when the run compared against a
+  baseline — a field-by-field diff of whichever of them are JSON on both sides,
+  with the fields that moved highlighted. Lists of `{key, value}` objects are
+  aligned by their `key` rather than by position, so a response whose checks
+  come back in a different order no longer reads as "everything changed".
+
+  Above the table there is a filter toolbar — **All**, **Differences**,
+  **Incorrect**, **Regressions**, each offered only when the report has rows in
+  that class — a live text search, and clickable confusion-matrix cells that
+  narrow the table to exactly the rows a cell counted.
+
+  The file is still a single self-contained document with no external references
+  of any kind, and with scripting disabled it renders every panel expanded
+  rather than losing them.
+
+- **xlsx groups `DETAIL` columns.** They move to the right of the summary
+  columns and are written as a collapsed outline group — the spreadsheet idiom
+  for the same idea as the HTML drill-down.
+
+- **PaperTrail reports can be scored against a ground truth (`TRUTH`).** A
+  column can name the answer it *should* have given, and the report says whether
+  it was right:
+
+  ```
+  # labels: Pass = pass, ok, low risk, real
+  # labels: Fail = fail, reject, high risk, fake
+
+  FOR ROW IN TUPLES FROM "labels.csv"
+      REPORT REQUEST classify AS c WITH
+          Verdict: jsonpath "$.decision" TRUTH "{{ expected }}"
+      END
+  END
+  ```
+
+  The clause goes wherever `STATISTICS(…)` and `IMAGE(…)` go — on a
+  `REPORT … AS …`, on a computed column or on a `WITH` field — and the three may
+  be written in any order. The template is interpolated **per row**, because the
+  label almost always arrives as a loop binding: a named field of a
+  `TUPLES FROM "labels.csv"` manifest, or the folder name a `FOLDERS` loop is
+  standing in. Nothing new has to be read from disk — the producers that already
+  bring in the files bring in their labels too.
+
+  The optional, repeatable `# labels:` setting declares the vocabulary once, so a
+  truth file that says `real` and an engine that answers `Low Risk` match without
+  a line of translation in the flow. Without it, values still compare as
+  themselves, ignoring case and surrounding space.
+
+  Each scored cell is tinted by whether it is **right** rather than by what it
+  says — an engine that correctly answers `fail` is a green cell — and a
+  reserved `Correct` column (`correct` / `incorrect` / `untested`) summarises
+  each row for CSV, which has no colour, and for sorting in a spreadsheet.
+
+  A ground truth is **data, not an assertion**: a mismatch never fails a run,
+  never sets an exit code and never emits a diagnostic — `[Asserts]` is where a
+  run says something went wrong. A row whose label is missing or blank reads
+  `untested` and is never scored as a pass, so the figures can't be inflated by
+  exactly the rows nobody has checked.
+
+  Both editors support it: a **Ground truth** row in the `WITH` field form, and
+  one settings row per declared label class with an "add label class" entry
+  beside "add helper collection".
+
+- **Ground-truth scores are summarised as accuracy and confusion matrices.** A
+  report scored with `TRUTH` now reports how well it did, not just cell by cell:
+  a per-column *compared / incorrect / accuracy* summary, plus a confusion
+  matrix whenever a `# labels:` setting declares the axis. The figures reach
+  every format from one shared model, so no two views can disagree: footer rows
+  in CSV and the live grids, a `metrics` object in JSON, metric cards and a
+  heat-mapped matrix in HTML, and a second *Metrics* worksheet in xlsx.
+
+  The denominator counts only rows that were actually compared, so adding
+  unchecked rows can't inflate an accuracy, and a report that scored nothing
+  says so rather than claiming 0%. Values the labels don't declare get their own
+  axis entry rather than being dropped, so the matrix always adds up to the
+  accuracy printed beside it.
+
+- **A comparison says which way each row moved (`Trend`).** This is the feature
+  the ground truth was for: *a change towards the truth is good, a change away
+  from it is bad.* A report that has both a `TRUTH` column and a comparison
+  (`BASELINE`/`COMPARISON` roles or a `# baseline:` snapshot) grows a reserved
+  `Trend` column reading `unchanged`, `fixed`, `regressed` or `still wrong`.
+
+  It is additive: the existing `Result` column still holds the structural diff,
+  so a row is routinely `Result: changed` *and* `Trend: fixed` — which is the
+  useful reading, not a contradiction. Two rows that changed identically as far
+  as `Result` is concerned are told apart by `Trend` alone. The row roll-up
+  favours the bad news (one regressed column makes the row a regression), and
+  `still wrong` is deliberately distinct from `regressed`: it is failing, but it
+  is not *new*.
+
+  Reports with no truth, or no comparison, are unchanged — no column appears.
+
+- **A `SHOW(…)` field can carry its own `STATISTICS(…)`.** Writing
+  `SHOW(Time STATISTICS(MEAN, MAX), Status)` attaches summary rows to a column
+  where it is named, on both `REPORT REQUEST … SHOW(…)` and
+  `BASELINE(…) SHOW(…)`. Previously the only way to add a statistic to a shown
+  column was the `# columns:` directive — which is an exhaustive whitelist, so
+  naming one column there hid every other one. Baseline statistics apply to
+  every `baseline.<alias>.<field>` column the comparison produces.
+
+- **The GUI's File menu opens and saves reports, and Ctrl+S saves.** *Open ▸
+  Report* loads a `.trail` file into the editor and lists it beside the session's
+  other reports (reopening the same file reuses its tab); *Save ▸ Report* writes
+  the source back out and adopts the path. **Ctrl+S** saves whatever is in
+  front of you — the open report, otherwise the active collection — writing
+  straight to its file when it has one, and only asking where when it doesn't.
+
+- **PaperTrail columns can hold pictures (`IMAGE`).** A column whose value is a
+  picture *source* — an image URL the response handed back, a path on disk, a
+  `data:` URI or a bare base64 blob — can be marked `IMAGE`, and every export
+  that can show a picture draws it instead of the text:
+
+  ```
+  REPORT REQUEST face AS f WITH
+      Frame: jsonpath "$.best_frame.url" IMAGE(HEIGHT 110)
+      Score: jsonpath "$.best_frame.score"
+  END
+  ```
+
+  The clause goes wherever `STATISTICS(…)` goes — on a `REPORT … AS …`, on a
+  computed column, on a `WITH` field, or inline in `# columns:` — and takes
+  `HEIGHT n`, `WIDTH n` (either alone scales proportionally, both together fix
+  the box) or `FIT` to size to the cell. With no options a picture is drawn
+  110 px high.
+
+  `IMAGE` is a **render hint, never a value**: the cell keeps its text. That is
+  what keeps the CSV and JSON exports byte-for-byte what they were, keeps
+  baseline snapshots textual, and lets a format that can't show pictures fall
+  back to the text with no rule of its own. The **xlsx** export embeds the
+  picture (widening the column and heightening the row to fit) and keeps the
+  source as its alt text; **HTML** inlines it as a `data:` URI so the export
+  stays a single self-contained file.
+
+  Where the picture comes from is worked out from the **value's shape**, so one
+  clause covers every case and a report never has to declare which kind it
+  meant. A value that can't be turned into a picture leaves the cell as text and
+  records a note — a broken thumbnail must never fail a report. `IMAGE` columns
+  are left out of baseline/`ENVS` comparison, because picture URLs are usually
+  signed and expiring and diffing them would flag every row while burying the
+  changes that matter. A **dry run** still resolves local paths and `data:`
+  URIs, but never fetches a URL: a run that reports "no requests sent" must not
+  quietly have made a hundred GETs.
+
+- **PaperTrail `FOLDERS` loops can now walk a nested tree.** `FOR CASE IN
+  FOLDERS "inputs" MATCH "**/case_*"` takes the same `MATCH` glob `FILES`
+  already took: it filters folder **names**, and recurses through the tree when
+  the glob contains `**` (a bare `MATCH "**"` filters nothing and simply visits
+  every folder at every depth). Previously `FOLDERS` could only see the
+  immediate children of one directory, so an input set laid out as
+  `<type>/<batch>/<case>/` — the shape most test corpora actually have — had to
+  be flattened by hand before a report could be run over it.
+
+  Because a recursive walk necessarily passes through container folders that
+  hold no case files, such a folder is now **skipped** rather than failing the
+  run: a recursive walk *searches* a tree for the folders that fit the shape.
+  A flat `FOLDERS "cases"` walk still *enumerates* a set you named, so there a
+  mis-shaped member remains a loud error, exactly as before.
+
+  In both editors the glob box that `FILES` loops offer is now offered for
+  `FOLDERS` loops too, so the way to narrow (or deepen) the walk is visible
+  rather than something you have to know to type.
+
+- **`FOLDERS … WITH` roles can be marked optional** with a trailing `?`:
+  `WITH front="*_front.*", back="*_back.*"?`. An optional role that matches no
+  file binds the empty string instead of failing the run, so a genuinely
+  optional input — a document with no back side, a case with no expected-result
+  file — no longer forces you to either split the corpus in two or drop the
+  role entirely. Matching *more* than one file stays an error whether or not
+  the role is optional: PaperTrail will not pick one of two candidates for you,
+  because the choice would silently depend on directory order.
+
+- **A report can pull requests from more than one collection.** `# collection:`
+  is now repeatable, and every collection after the first must be given a name:
+
+  ```
+  # collection: ./face.hurl
+  # collection: ./shared/auth.hurl AS auth
+
+  REQUEST auth/login
+  REPORT REQUEST verify AS v
+  ```
+
+  Requests in a helper are referred to as `alias/request` everywhere a request
+  name is accepted. The alias is **required** rather than optional so a bare
+  name always means the report's own collection: a name can never quietly
+  change which request it runs because a helper was added, and a helper's
+  request can never be reached by accident. For the same reason an alias that
+  collides with a top-level virtual folder is an error rather than a precedence
+  rule — PaperTrail does not pick between two readings of a name.
+
+  Both editors list the helpers in *Report Settings* (add, rename the alias,
+  re-point the file, remove — the primary collection stays put), and every
+  request picker, completion and validity tint offers and resolves the
+  qualified names. A helper that is already open as a tab is read from the tab,
+  so unsaved edits are seen; otherwise it is read from disk. A `git:` helper
+  must be opened first, since validating a report should not do network I/O.
+
+- **Reports can break a request's `Time` into its parts.** Three new per-request
+  intrinsics sit alongside `Time` and always sum to it: `TimeSetup` (DNS, TCP
+  connect and the TLS handshake), `TimeWait` (request sent → first response
+  byte, the closest thing to "what the server took") and `TimeDownload`
+  (receiving the body). They answer the question `Time` alone can't: when a wide
+  `PARALLEL(…)` run makes response times climb, was that the server, or was it
+  your own machine and uplink getting to it?
+
+  Unlike the other intrinsics these are emitted **only** when a `SHOW(…)` or
+  `columns:` clause names them, so no existing report gains columns; the request
+  form in the TUI and the GUI lists them un-ticked. Like `Time`, they are
+  excluded from a comparison run's compared fields, since they always differ.
+
+- **Reindent a PaperTrail script (`F` in the TUI, *Reindent* in the GUI).** Wrap
+  an existing block in a new outer loop and its whole body is suddenly one level
+  short; this puts every line back at its real block depth, four spaces a level.
+
+  **Only leading whitespace changes** — comments, blank lines and the spacing
+  inside a statement are preserved exactly, so it is safe to run over a file you
+  didn't write. (That rules out the obvious implementation of parsing to a flow
+  and re-serializing it: the AST has nowhere to keep a body comment, so a
+  round-trip through it deletes them.) The result is verified by re-parsing it
+  and comparing against the original, so reindenting can never change what a
+  report does; a script that doesn't parse is left alone rather than guessed at,
+  and it is a single undo step.
+
+- **`WITH` blocks open out in the TUI node editor.** A
+  `REPORT REQUEST … WITH … END` used to collapse to a single `… WITH …` row, so
+  its fields were invisible from the outline and there was no obvious way to add
+  one. Each field is now a row of its own, under the request and above the
+  block's `END`, with an `add a field…` row at the end: Enter edits a field,
+  Delete removes just that field, Shift+↑/↓ reorders the column within its
+  block, and `a` anywhere in the block adds another.
+
+- **Import a whole Postman workspace from inside PaperBoy.** Until now this
+  was CLI-only; both front-ends now have a wizard for it. Give it a Postman API
+  key, pick a workspace from the list it fetches, choose what to bring across
+  and where to put it, and the imported folder opens as a workspace. In the
+  terminal it's **File ▸ Load ▸ Workspace ▸ From Postman…**; in the GUI it's
+  **Open from Git ▸ From Postman…** (beside the other whole-folder sources).
+
+- **The wizard says what an import will cost before it spends anything.**
+  Postman rate-limits its API, so the confirmation step lists what was found,
+  explains that the download is paced deliberately, estimates how long it will
+  take, and warns when the import would eat an uncomfortable share of the
+  account's remaining monthly API budget. Nothing is downloaded until that
+  question is answered, so backing out there is free.
+
+- **A live estimate while it runs.** The progress view counts items, names the
+  one in flight, and shows a remaining time extrapolated from the rate actually
+  being achieved rather than the published one — a throttled account is exactly
+  when an estimate is worth having. When the importer is deliberately idle it
+  says so, rather than looking hung.
+
+- **A workspace id can be given up front to skip the list.** Paste an id or a
+  Postman workspace address into the optional field on the first step and the
+  wizard goes straight to the options — that listing call sits on Postman's
+  tightest rate-limit bucket, so it isn't made when the answer is already
+  known. The workspace's real name is picked up later and used for the folder.
+
+- The wizard offers the same **convert-to-Hurl** option as
+  `--postman-format hurl`, so an import can drop Postman's JSON entirely.
+
+- **A Postman import can now be converted to Hurl on the way in.** Pass
+  `--postman-format hurl` and collections arrive as `.hurl` files and
+  environments as `.vars` files, so the imported folder owes nothing to
+  Postman. The default is unchanged: Postman's own JSON, byte for byte.
+
+- **Anything the conversion can't carry across is written down.** Hurl has no
+  pre-request scripts and no OAuth 2, so a converted import leaves a
+  `CONVERSION-NOTES.md` listing, request by request, exactly what was dropped —
+  and no file at all when nothing was. A collection this build can't read is
+  kept as its original JSON rather than converted into an empty one, so
+  converting can never cost you data.
+
+- **Hovering a block in the visual report editor highlights it — and everything
+  that would move with it.** Pointing at a line lights that block, and pointing
+  at a `FOR` loop also lights its whole body and its `END`, so what a drag is
+  about to pick up is visible before the drag starts rather than only once the
+  block is in mid-air.
+
+- **`STATISTICS` can be dropped onto a `WITH` field.** A request's `WITH` fields
+  are the columns it actually produces, and the grammar has always allowed a
+  summary on one — but the block editor had nowhere to drop it, because a field
+  isn't a block. Each field row is now its own drop target, and the request line
+  above it explains why it refuses (it names no single column of its own).
+
+- **The desktop app can now save Workspaces and Reports to Git, not just
+  collections.** Saving to Git in the desktop app could only ever push a single
+  collection to a single branch. It now offers the same choices the terminal
+  app has always had: push a whole Workspace folder back to where it came from,
+  push an open Report, save the collection's environment alongside it in the
+  same commit, and tag a release instead of committing to a branch. The
+  Workspace and Report entries appear under *Save to Git* and are only
+  selectable when there is something for them to push.
+
+- **Download a whole Postman workspace from the command line.** Moving an
+  account into PaperBoy meant exporting each collection by hand, or writing a
+  script against the Postman API. `paperboy --postman-import` lists the
+  workspaces your API key can see, and
+  `paperboy --postman-import --postman-workspace <ID|URL> -o <FOLDER>`
+  downloads that workspace's collections and environments into a folder you can
+  open as a PaperBoy workspace. The workspace can be named by its id or by its
+  address in Postman, so the browser address bar can simply be pasted.
+
+  The key comes from `--postman-key` or `$POSTMAN_API_KEY`, and may be a
+  `{{ … }}` provider reference — `--postman-key '{{ op://Private/Postman/credential }}'`
+  works exactly as it would in a `.vars` file, so the key need not appear in
+  your shell history. It is never written to disk and is stripped from any error
+  message.
+
+  Postman rate-limits its API, and does so far more tightly for listing than for
+  fetching, so the import paces the two separately and adapts to the limits
+  reported in each response — a sixty-collection workspace takes about fifteen
+  seconds rather than the seventy a single uniform delay would cost. The run
+  says up front how many items it will fetch and roughly how long that will
+  take, and warns if it would consume most of what is left of your plan's
+  monthly API allowance.
+
+  A collection that has been deleted since the listing is reported and skipped
+  rather than ending the run; a rejected key or an exhausted monthly quota stops
+  it immediately, because neither improves by being retried. Everything is
+  written to a staging folder and moved into place in one step, so an
+  interrupted import never leaves a folder that looks like a workspace but is
+  missing half its collections, and an existing destination is left alone unless
+  `--overwrite` is given. `--postman-what` limits the import to just collections
+  or just environments.
+
+- **The Environments panel has a filter box, and shows the open workspace's
+  environments.** With an account's worth of environments loaded, finding the
+  one you want meant scrolling a list of hundreds. The panel now filters by
+  name — `/` in the terminal UI, a box above the list in the GUI — and, when a
+  Workspace tab is open, lists every environment file in that workspace
+  alongside the global ones, marked with a `⌂` (a folder icon in the GUI) so the
+  two can be told apart. Workspace files that haven't been opened yet are listed
+  too, dimmed, and open when you select them, so a folder of environments is
+  browsable without hunting through the tree for each one. In the terminal UI
+  `Esc` clears an applied filter, and Postman `.json` environments are now
+  recognised by the Workspace tree, so they appear as environments rather than
+  as collections.
+
+- **An environment file in a Workspace tree can be made the active environment
+  directly.** Previously it could only be opened, after which it still had to be
+  found again in the Environments panel and activated there. Right-clicking one
+  now offers "Set as active environment" in the GUI, and in the terminal UI both
+  `a` and a right-click on the row do the same — loading the file first if it
+  isn't open yet, reusing it if it is, and leaving the screen where it was.
+
+- **A `FOR` loop's variable, folder and file pattern are now edited on the chip
+  itself.** The loop head used to be one long label, which gave no hint that the
+  folder it reads from or the name it binds were things you could change — both
+  were only ever found by opening the wizard. `FOR` is now followed by a box for
+  the loop variable, the source keyword, a box and a picker button for the
+  folder (or file, for `TUPLES FROM`), and a `FILES` loop's `MATCH` pattern. The
+  picker starts in the folder the loop already names and writes what you choose
+  back relative to the report, so a report stays portable. Parts that no single
+  box could speak for — a destructuring pattern like `FOR (NAME, URL) IN …`, a
+  list literal, a `FOLDERS … WITH` role list — are still shown as text and still
+  edited through the wizard.
+
+- **Workspaces can be organised into folders from the app.** Right-clicking any
+  row in a Workspace tree (or the tree's own `New` menu) now offers "New
+  folder…" alongside the three file kinds, so a workspace can be tidied up
+  without leaving PaperBoy for a file manager. The new folder is revealed and
+  opened ready to have things dragged into it, and its name goes through the
+  same containment checks as a new file, so it can't be created outside the
+  workspace.
+
+- **"Save all changes" on the unsaved-changes warning.** Quitting with edits
+  that really would be lost now offers to write them out rather than only
+  offering to discard them. It saves exactly what the warning counts — every
+  edited file a Workspace tab is holding, including the ones it isn't currently
+  showing — and if a file can't be written the quit is called off and the file
+  that refused is named, so nothing is lost to a failed save.
+
+- **The Environments panel can be narrowed by source.** When a Workspace holds
+  hundreds of imported environments, hand-made global ones were buried in the
+  same list, and switching the name filter back and forth was a poor substitute
+  for saying which source you wanted. Both front-ends now offer a compact
+  Both/Global/Workspace source toggle that composes with the name filter and
+  remembers the choice across restarts.
+
+- **The GUI's top-level menus can be reached from the keyboard.** Pressing `Alt`
+  on its own arms the menu bar and underlines each menu's mnemonic letter, which
+  then opens that menu; `Alt`+letter as a single chord does the same thing in
+  one keystroke. `Esc`, a second `Alt`, or opening a menu puts the underlines
+  away again. The mnemonics are translated alongside the menu titles rather than
+  derived from them, so each language gets letters that suit its own words
+  (`F`/`V`/`S` in English, `F`/`A`/`P` in French, `F`/`V`/`I` in Danish).
+
+### Changed
+
+- **The test suite no longer opens a file chooser.** One GUI test exercises the
+  guard that stops a second Browse click opening a rival dialog — and it did so
+  by opening a real one, which put a native folder chooser in front of whatever
+  its author was doing and took the keyboard with it, with nobody in the test to
+  answer it. Under `cfg(test)` a picker (and a native error alert) now opens
+  nothing and resolves as a cancel, so the polling and unwind paths stay
+  covered without anything reaching the screen.
+
+- **The active environment is always on screen.** The Environments panel is a
+  scrolling list, and importing a Postman workspace can put a few hundred
+  entries in it — so the one carrying the checkmark was almost never visible,
+  and a filter could hide it outright, leaving no way to answer "what am I
+  about to run against?" without going to look for it. The panel now pins the
+  active environment on a line of its own above the list, in green with its
+  checkmark (and its git icon where it came from a remote); clicking that line
+  jumps to its row. With nothing active it says so, rather than disappearing
+  and shifting the list under the cursor. The GUI already carried this in its
+  status bar.
+
+- **A picture column in the HTML report is sized to the picture.** It was sized
+  to the text behind the picture — the path (or the base64 blob) the image was
+  resolved from — so a column drawing a 60-pixel thumbnail claimed seventy
+  characters of width and pushed the columns that carry the answers off the
+  screen. It is now measured from the thumbnail the `IMAGE` clause asks for.
+
+- **A wide report is fitted rather than left to sprawl.** Thirty columns each as
+  wide as their longest value make a table that is read by scrolling past a lot
+  of padding. The columns are now fitted to a budget by taking the width back
+  from the widest first, down to a floor a wrapped cell is still readable in;
+  every column that was already narrow keeps exactly the width it measured, and
+  a table that fits is left untouched.
+
+- **"Comparison matched baseline" is no longer green.** A match says the answer
+  did not change, which is neither good nor bad on its own — a row that has been
+  wrong since the first run matches its baseline perfectly, and tinting that
+  green reported a good run where nothing had happened. The `Result` column now
+  tints only its unusual values (no baseline, no candidate, a real difference).
+  Whether an answer is *right* is the `Correct` column's job, and whether it
+  *improved* is `Trend`'s.
+
+- **The HTML report's drill-down is no longer mostly gaps.** Each section in an
+  expanded row claimed an equal share of the row's width, so on a wide screen a
+  picture and a short JSON blob were shoved to opposite ends with a void
+  between them, and a short section was stretched to the height of the tallest.
+  Sections now size to their own content, sit next to each other, and wrap when
+  they run out of room — with a reading-width cap so one long block cannot take
+  the whole panel.
+
+- **An import lands next to the last one.** The Postman importer suggested a
+  folder inside the app's working directory — which, for anyone starting the
+  terminal UI from a project, meant downloaded workspaces landing inside that
+  repository. It now remembers the folder each import was written into and
+  suggests it for the next one (the GUI too, which was defaulting to the home
+  directory), so a shelf of downloaded workspaces stays a shelf. The choice is
+  kept with the rest of the session state, so it survives a restart.
+
+- **The confirmation screen asks for the key it wants.** "Enter import · Esc
+  cancel" sat in the dim footer style used for status text, so the last screen
+  before a long download read as though the download were already happening.
+  It now says **"Press Enter to start the download"** in the accent, in bold.
+
+- **Left and Right change an option in the Postman importer**, as they do on
+  every other two-way choice in the app — the format row draws Hurl and JSON
+  side by side, so an arrow pointed at one of them now picks it. The
+  destination row still takes arrows as cursor movement, since it is a path
+  being typed.
+
+- **A folder picker takes Space for "here, under this name".** Every
+  "save into a folder" picker — exporting a report, saving a collection or a
+  workspace, choosing where a Postman import lands — opens with the name already
+  worked out in its inline field, and then asked you to Tab into that field and
+  press Enter to accept it. **Space** now saves into the folder on screen under
+  the name already there, and **Enter on a file row** — which previously did
+  nothing at all, and so read as a stuck dialog — does the same. Enter on a
+  *folder* row still descends into it, and Tab is still there for renaming
+  first.
+
+- **The Postman importer's estimate counts a collection and an environment
+  separately.** It priced every fetch at the pacing interval alone, which is the
+  floor, not the cost: the round trip is what the time actually goes on, and a
+  collection — a whole document of requests, scripts and examples — takes far
+  longer to come back than an environment's short list of variables. A
+  23-collection, 500-environment workspace was quoted at "about 2 minutes" for a
+  download that ran for well over ten. The running ETA is now extrapolated per
+  kind too, so the minutes-remaining figure measured on the collections at the
+  front of the queue is no longer applied to the environments behind them.
+
+- **The Postman importer reads like the rest of the terminal UI.** Its connect
+  form spaced three fields out over sixteen rows with blank lines between them
+  and clipped the API-key hint mid-word at the panel edge ("it is never wri…").
+  The hints now wrap — in every language, however long the translation — each
+  field's own accented label is what starts its group, and the padding is gone.
+  The confirmation screen no longer borrows the git dialog's "Tab switch field ·
+  Enter connect" hint on a screen with no fields and nothing left to connect to;
+  it says Enter imports. The download screen gives its progress bar the width of
+  the terminal rather than a fixed 74 columns, and draws only the rows it has
+  something to put in, instead of reserving empty ones for an ETA that hasn't
+  been worked out yet.
+
+- **The `Trend` column is tinted by which way a row moved, and nothing else.**
+  It coloured a still-failing row red, which repeated in red exactly what the
+  `Correct` cell immediately to its left already said — spending the column's
+  colour on a fact the reader had just read, and leaving nothing to mark the
+  rows that actually moved. Green now means a row got better, red that it got
+  worse, and a row that didn't move is plain in both directions, right or
+  wrong.
+
+- **A still-failing row's `Trend` reads `unchanged`.** The column answers one
+  question — *did this row move?* — and for a row that was wrong before and is
+  wrong now the answer is no, so `still wrong` was answering a different
+  question in the column's own words. It now reads `unchanged` like the other
+  row that didn't move, with `Correct: incorrect` beside it saying which of the
+  two it is, and the cell still tinted red. Nothing else is lost: the tint and
+  the row filters read the scored cells rather than the column's text, so a
+  still-failing row is never confused with a passing one.
+
+- **The confusion matrix in an HTML export is drawn at readable size.** It was
+  set at the grid's own type size, so the handful of numbers a reader scans
+  across and down to find the one wrong cell were the smallest thing on the
+  page. The matrix now has roughly twice the type size and matching cell
+  padding — which is also most of the click target, since every cell filters the
+  table below it.
+
+- **The GUI asks for an export filename itself.** Exporting a report's results
+  used the desktop's own save dialog, whose format dropdown — tucked in the far
+  bottom corner — only *filtered* the listing: picking "Excel" left the name
+  ending `.csv`, and since PaperBoy chooses its writer by extension, the file
+  came out a CSV. Export now opens PaperBoy's own dialog, with the format
+  sitting next to the filename and changing it rewriting the extension, the way
+  the terminal UI has always worked. `Browse…` still opens the desktop picker
+  for anyone who wants to go looking for a folder.
+
+- **The row drill-down uses the width it has, opens on a click, and resizes.**
+  The in-app panel stacked its sections down the pane, so a full-height
+  photograph buried the response body a screen below it; it now lays them across
+  the pane in readable-width columns, the same layout the interactive HTML
+  export's flex row produces. Clicking anywhere in a row that has a drill-down
+  now opens it, rather than only the caret doing so — a row with nothing to
+  drill into keeps the cell inspector, which is otherwise the only way to read a
+  truncated value. The divider between the grid and the panel can be dragged,
+  and the height is saved with the rest of the GUI's geometry, so a reader who
+  wants a big picture pane keeps it between runs and between sessions.
+
+- **The report editor's header is one row, not three.** The title, the
+  Blocks/Source/Results toggle and (in the results view) a near-empty band
+  holding Baseline and Export were three stacked strips above a table. They are
+  now one line — what the document is, which way you are looking at it, what you
+  can do to it — which hands two rows of the window back to the rows being read.
+  The run's status moved up beside the Run button that started it.
+
+- **The results view's summary block can be resized.** The metric cards, the
+  filter bar and the confusion matrices took whatever height they wanted, so a
+  report with a matrix per ground-truthed column left almost nothing for the
+  rows the matrices are describing — and opening a drill-down under it left less
+  still. The block now scrolls within a height of its own, with a splitter under
+  it to set that height, saved with the rest of the GUI's geometry. A report
+  with no matrices still reserves no empty space.
+
+- **A drill-down picture's path is legible.** The caption under a full-size
+  photograph was set at the small text style, leaving the one line that says
+  *which* file of a thousand this row is as a fine grey thread. It is now body
+  size and wraps rather than being cut off.
+
+- **A confusion-matrix cell is clickable across the whole cell.** The click
+  sense sat on the digits rather than on the block of colour around them, so
+  selecting the rows a cell counted meant hitting a target the width of the
+  number — a "7" was a few pixels wide in the middle of something that looked
+  like a button. The whole cell now takes the click, and shows the pointing-hand
+  cursor to say so.
+
+- **The in-app confusion matrix is drawn large enough to read.** The counts and
+  their axis labels were set at the small text style, so the matrix — a thing
+  read by comparing one cell against another at a glance — came out as a grid of
+  little grey numbers. The cells are now uniformly wide, evenly padded and set
+  above body size, with the counts centred in their block of colour. The sizes
+  are derived from the app's body text height, so the matrix still follows the
+  text scale rather than being pinned to a fixed pixel size.
+
+- **A report embeds each picture once, downscaled.** `IMAGE(HEIGHT 110)` used
+  to be a sizing *hint* only: the full-resolution source file was embedded
+  regardless, and the interactive HTML export then embedded a second copy of the
+  same bytes for the drill-down panel. A thousand-row report over 2 MB
+  photographs produced a file measured in gigabytes to show pictures 110 pixels
+  tall.
+
+  Pictures are now re-encoded to at most 640 pixels on their longest edge when
+  resolved, which is sized for the drill-down view — the grid scales the same
+  copy down in CSS, and the HTML panel now borrows its picture from the row's
+  own cell instead of carrying a duplicate. A picture already within the cap,
+  or in a format this build has no encoder for, is still embedded exactly as it
+  was: unshrinkable must never mean unusable.
+
+- **A label class is edited as two fields in the GUI's report settings.**
+  `# labels:` used to be a single text box, so declaring a vocabulary meant
+  remembering both the `=` and the comma rules. The class is now split around
+  its `=` — the label on the left, the spellings that mean it on the right —
+  the same way a helper collection is split around its `AS`, with example hints
+  (`Low Risk` / `real, genuine, pass`) rather than descriptions.
+
+- **The GUI's "Report settings" title is a heading**, the same size every
+  wizard panel titles itself with, rather than small caption text.
+
+- **Summary statistics are behind a toggle in the TUI's `WITH` field editor.**
+  The six `STATISTICS(…)` choices used to be listed unconditionally, which made
+  the wizard mostly a wall of checkboxes for the common case of a plain column.
+  There is now a *Summary statistics* switch, and the choices only appear while
+  it is on. Turning it on seeds `COUNT` so the clause is never empty, and
+  turning it off clears the ticks — a hidden list can't leave a clause behind.
+
+- **A hovered tile in the GUI block editor recolours itself.** The hover
+  highlight used to be a band painted *behind* the row, which was easy to miss
+  on a densely packed row. The tiles that a drag would carry now deepen their
+  own fill and outline as well, so what is about to move is obvious before the
+  mouse button goes down. The tile keeps its own colour — only the intensity
+  changes — and the label is untouched.
+
+- **The GUI's *Report Settings* panel fills the pane and says what it is.** It
+  was laid out in a fixed-width box with a wide empty margin to its right, and
+  carried no heading to explain what the directives above the report were.
+
+- **The GUI's last hardcoded display strings now come from the translation
+  table**, so French and Danish get them too: the language names in Settings,
+  the Raw Request view's JSON / Hurl toggle, the URL, assertion and file-path
+  field hints, and the name a new report is created with.
+- **A custom HTTP verb's badge follows the theme.** Methods PaperBoy has no
+  colour for fell back to a fixed grey, which was the only colour in the GUI
+  that ignored the active theme; they now use the theme's dim colour.
+
+- **The Postman wizard's destination is now chosen in the file browser**, in
+  the terminal UI, instead of being typed as a path. It was the only place in
+  PaperBoy that asked you to know a folder path before you had seen one; it now
+  opens the same picker as every other "save into a folder", seeded at the
+  suggested destination and offering the folder name back for editing.
+  Cancelling the picker leaves the wizard exactly as it was. (The GUI already
+  used the native folder picker.)
+
+- The Postman import's state machine is now **shared between the terminal UI
+  and the GUI**, joining the git load and save flows. Every decision about what
+  an import does — validation, ordering, pacing, cancellation, what counts as a
+  failure — lives in one place, so the two front-ends cannot drift apart.
+
+- **The visual report editor's Send button is gone from the menu bar.** It ran
+  whatever request was selected in the active collection — the same thing the
+  Send button beside the URL does — but it was drawn on every screen, including
+  ones with no request in sight, so it could fire at something off-screen. The
+  keyboard shortcuts it advertised now appear on the real Send button.
+
+- **Key/value tables give their Description column room to be read.** The key
+  and value columns between them claimed the entire width, leaving the note a
+  sliver a word wouldn't fit in; all three now take a share. The column titles
+  also sit where the fields below them will be even when the table is empty, so
+  adding the first row no longer makes the headings jump apart.
+
+- **The workspace tree and the results grid are no longer rebuilt on every
+  frame.** Drawing the workspace list re-read the whole folder tree off disk —
+  a recursive directory scan sixty times a second, so simply moving the mouse
+  over a workspace was continuous filesystem I/O. Drawing a results grid
+  re-measured every cell in the table to size its columns, and computed the
+  `STATISTICS` summary rows once *per column* while doing it. Both now reuse
+  their last answer until something they depend on actually changes: about 8×
+  less work for the tree and 6× for the grid, and more on a large workspace or
+  a long report.
+
+  The tree is re-read whenever PaperBoy itself creates, moves or deletes a
+  file, and otherwise at most a few times a second, so a change made outside
+  PaperBoy (another editor, a `git pull`) still appears without a refresh.
+
+- **Syntax highlighting is no longer recomputed on every frame.** Both the
+  PaperTrail source editor and the request Code view re-ran their highlighter
+  over the entire buffer each frame — every keyword, `{{ VAR }}` and error line
+  re-classified sixty times a second for text that hadn't changed. Each now
+  keeps its last colouring and rebuilds only when something it depends on
+  moves: the text, the error line, the loaded environments, the request names,
+  the theme, the font size or the wrap width.
+
+  The Code view was additionally running a *second*, complete highlighting pass
+  purely to find out which kinds of substitution appeared in the buffer, so it
+  could label the legend beneath it — and threw the coloured result away. That
+  pass is now a plain scan that only answers that question.
+
+- **Every terminal-UI file picker can be filtered by typing.** Only the three
+  "open an existing collection / environment / report" pickers took a typed
+  filter; the folder pickers did not — including the one that chooses the
+  source folder for a `FOR … IN FILES/FOLDERS` loop, which is browsed against a
+  real corpus tree and is exactly where sifting a crowded directory matters. All
+  of them now narrow as you type, with the same `Filter:` strip showing what is
+  being matched.
+
+  Two keys keep their existing meaning: in a "save to folder" picker typing only
+  filters while the *list* has focus (Tab moves to the filename field, where the
+  same keys type a name), and in the three folder pickers `Space` still confirms
+  the current directory rather than entering a space.
+
+- **Both apps now run the same saving logic.** Loading from Git was unified in
+  the previous release; saving now follows, so a fix or an improvement to
+  saving reaches the terminal and the desktop at the same time instead of one
+  of them drifting behind.
+
+- **Both front-ends now drive one shared "load from a git remote" flow.** The
+  terminal UI and the GUI each had their own copy of the wizard, and the copies
+  had drifted. The steps, the background work and the recorded provenance now
+  live in one place, so a fix or an improvement to the flow reaches both.
+
+- **The report editor has been restyled to look like a working tool.** The
+  drag-and-drop view is the part of PaperBoy used by people who don't otherwise
+  write code, and several of them reported it looked childish enough that they
+  were reluctant to show it to colleagues. Nothing about how it works has
+  changed — no gesture, command or layout is different — but six things about
+  how it looks are:
+
+  - A block's category is now carried by a colour bar down its leading edge
+    rather than by the fill of the whole block. The hues are unchanged and just
+    as easy to tell apart, but a flow of ten blocks is no longer ten filled
+    panels of colour.
+  - Chip and block corners are much less rounded, and spacing and control
+    padding are tighter throughout the GUI, which fits more of a report on
+    screen.
+  - Chip labels are now set as two kinds of word: the editor's own keywords in
+    the interface font, and names you supplied in a monospace one, so
+    `BASELINE(staging)` no longer reads as a single phrase. Inline fields are
+    monospace for the same reason.
+  - Chip label contrast has been fixed. Category-coloured text on a tint of the
+    same colour fell as low as 2.3:1 in places, which is below the accessibility
+    floor for body text; every category on every built-in theme now passes WCAG
+    AA, and there is a test to keep it that way.
+  - Icons throughout the GUI are drawn in a lighter weight so they stop
+    competing with the labels beside them.
+  - The synthetic row at the top of a flow is drawn as a caption rather than in
+    a keyword's colour. It marks where the report starts and, unlike the `END`
+    that closes a loop, is not something that appears in the file — colouring it
+    like syntax implied there was a `BEGIN` keyword to write, and there isn't.
+
+- **PaperBoy now opens on a neutral dark theme.** The three language themes are
+  saturated flag colours with a bright yellow selection, which look striking and
+  read as unserious in an office. A new "Graphite" preset — a near-neutral grey
+  ground with a single restrained blue accent — is what a fresh install starts
+  on. The language themes remain, "Follow language" remains a choice you can
+  make, and an existing install keeps whatever theme it already had.
+
+- **The Workspace filter no longer hides folders.** With the filter on, a folder
+  containing nothing it matched was left out of the tree entirely, which made
+  the tree impossible to organise with: a folder created to tidy files into
+  disappeared the moment it was made, and there was nowhere to drop the first
+  one. The filter still applies to files, which is what it was for.
+
+- **A clause that qualifies another chip is now drawn as one pill with it.** In
+  the report editor's drag-and-drop view, `SHOW(…)` belongs to the `BASELINE`
+  before it, and `STATISTICS(…)` to the column before it, but the thin bracket
+  that said so was drawn beside the chips and read as decoration — it never made
+  clear which of the two owned the other. The pair now sits flush inside a single
+  outline with the meeting corners squared off, the way a segmented control does,
+  and hovering either half outlines both. Each chip keeps the colour its own kind
+  always has, so a `SHOW` still reads as a `SHOW`.
+
+- **The two front-ends now share one copy of the application state.** The
+  terminal UI kept its own duplicate of everything it had in common with the
+  graphical one — the open tabs, the global environments, the themes and every
+  persisted preference: 26 fields, plus a hand-written second copy of the code
+  that reads and writes `state.json`. The two could drift, and had: a default
+  changed in one place stayed unchanged in the other, and the terminal UI
+  carried a field of the GUI's window geometry that nothing there ever read,
+  purely so saving from the terminal didn't wipe it. `TuiApp` now owns a
+  `Session` and reads straight through it, so there is a single copy in the
+  process and a single writer of the state file. Nothing about either front-end
+  behaves differently, with one exception noted below.
+
+- **A Workspace whose folder has vanished now says so in the GUI too.** The
+  explanation ("the folder for this Workspace is gone") was written when the
+  terminal UI restored a session and was lost when the graphical one did, which
+  left an empty tab and no reason for it. Both front-ends now restore state
+  through the same code, so both report it.
 
 - **The GUI is now behind a `gui` Cargo feature, and is no longer built by
   default.** `cargo install paperboy` builds only the terminal UI and the
@@ -22,6 +1273,565 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   panel geometry, and `--gui` on a build without the feature prints the command
   to install one that has it rather than failing to parse the flag.
 
+### Added
+
+- **Revert a workspace file, or one request, from the tree.** Right-clicking a
+  row that carries the "edited" pencil offers to put it back the way it is on
+  disk: a request row reverts that request, a collection file row reverts every
+  edit in the file — including one edited and then switched away from, whose
+  changes were until now only reachable by reopening it. The GUI hangs this on
+  the row's context menu; a terminal has nowhere to put one, so the gesture
+  raises the same confirmation `Ctrl+R` does. A clean row offers nothing rather
+  than a greyed-out entry.
+
+### Fixed
+
+- **A report line that runs off the edge now says so.** The terminal UI's
+  report Source view clips long lines rather than wrapping them (they are code,
+  and wrapping would break the 1:1 relationship between a row on screen and a
+  line in the file), but it clipped them silently — the only way to discover
+  that something had been cut off was to enter edit mode and walk the cursor
+  along the line. A clipped row now ends in the same dim `…` the wizard's
+  truncated cells use. The results grid's rows, header included, are marked the
+  same way when columns run past the right edge; a row of trailing padding
+  doesn't count as something you're missing.
+
+- **Every other long list scrolled the way the workspace tree used to.** The
+  tree was fixed to let the cursor travel through the visible rows; the same
+  defect (a list rebuilt from scratch each frame, so it always scrolled the
+  minimum needed to reveal the selection and pinned it to the bottom edge) was
+  in nine more lists: the Global Environments panel, the environment popup's
+  variables, the workspace file picker, the git branch/tag and file pickers,
+  the Postman workspace picker, the theme list and the new-theme base list, and
+  the wizard's header-name and content-type dropdowns. All ten now share one
+  remembered scroll position, which also keeps their mouse hit-testing honest —
+  a click lands on the row it was drawn on rather than on where the old
+  formula assumed the list had scrolled to. Lists that can't overflow their
+  popup (a three-row dropdown, a menu sized to its own items) are unchanged.
+
+- **Three panels stopped redoing the same work on every frame.** The Global
+  Environments panel rescanned the whole workspace folder from disk several
+  times a frame; it now reads the workspace scan cache both front-ends already
+  share (and the terminal UI, which did the same, reads it too). The git load
+  wizard re-filtered and re-lowercased every path in the remote repository on
+  every frame of the file picker; the filtered list is now kept until the
+  filter, the selection or the file list itself changes — keyed on an explicit
+  generation counter rather than on anything derived from the list's contents,
+  because two different repositories can hold the same number of files. And the
+  report editor's Source view rebuilt its highlighter's set of known request
+  names — a formatted string per request, per helper — on every frame; it is
+  now rebuilt only when a name in it actually changes.
+
+- **The workspace tree scrolled with the cursor instead of the cursor moving
+  through the tree.** Walking up a long tree kept the selected row pinned to the
+  bottom edge of the panel while everything else slid past it. The list's scroll
+  position now persists between frames, so the cursor travels through the
+  visible rows and the tree only scrolls once the cursor reaches an edge — what
+  every other list does. Switching tabs still starts at the top: another tree's
+  scroll position means nothing in this one.
+
+- **Saving an edited request threw the workspace selection to the top.** The two
+  lists index differently — a Workspace tab's cursor walks the file tree, an
+  ordinary tab's walks the requests — and committing the request wizard wrote a
+  requests-list index into the workspace's cursor. The selection now stays on
+  the request that was just saved.
+
+- **A workspace report wouldn't run from the tree.** With a report showing in
+  the right pane, `r` and `d` did nothing unless focus had first been moved
+  into the report body — even though the tree's selection *was* that report.
+  Both keys now run and preview it from either pane. Only those two: every
+  other report key already means something to the tree, and a letter that
+  changes meaning with the right pane's contents is how a key map becomes
+  unlearnable.
+
+- **A spreadsheet's picture column was as wide as a file path.** A column of
+  thumbnails was sized to its pictures only when they had a fixed height and
+  had all been fetched; a `FIT` column, or one whose pictures failed to load,
+  fell back to the text underneath them — which in a real run is a hundred
+  characters of directory nobody reads, leaving the rest of the report pushed
+  off the screen. Such a column now gets a modest fixed width, the same rule
+  the HTML export follows.
+
+- **An import that stopped on a full folder offered to run again unchanged.**
+  Nobody presses a key while a download runs, so the failure was blamed on the
+  last screen that *had* seen one — the confirmation — and dismissing "already
+  exists and is not empty" put you back on "start the import", pointed at the
+  same occupied folder. A failure is now attributed to the screen actually on
+  display, so it returns to the options, with the destination still filled in,
+  ready to be pointed somewhere else or told to overwrite.
+
+- **A converted Postman collection could arrive unreadable, and say nothing.**
+  Two things Postman exports quite normally came out the other side as Hurl that
+  Hurl cannot parse: its **dynamic variables** (`{{$guid}}`, `{{$timestamp}}` —
+  a `$` is not a legal template name) and a **file part with no file chosen**
+  (`key: file,;`). Either one failed the *whole* file, so a collection of sixty
+  requests opened as none, with nothing on disk to suggest why — the same
+  workspace imported as raw JSON was fine. Dynamic variables are now renamed to
+  ordinary ones (`{{$guid}}` → `{{guid}}`, so the value has to be supplied, and
+  the conversion notes say so), a file part with no file is written switched off
+  so it can be filled in later, and — as a backstop for anything else — a
+  conversion whose output does not read back keeps the original JSON, which
+  always opens, and records the parse error against the collection's name.
+
+- **Dismissing a Postman import error goes back to what can be fixed.** A
+  rejected API key fails while the workspaces are being listed, so the step it
+  interrupted was "choose a workspace" — of a list that was never fetched.
+  Pressing Esc dropped the user on an empty picker with nothing to pick, no way
+  forward and no way back. It now returns to the key prompt, with the key still
+  in the field to correct; a failure with no workspace chosen goes back the same
+  way, and a failed download returns to the options it was started from rather
+  than a progress bar that cannot be resumed.
+
+- **A results row shows the pointing hand across its whole width.** The row was
+  clickable end to end but only looked it over the words in a cell, because the
+  cells take the hover from the row target wherever they overlap it. The cursor
+  now follows the row, not its text.
+
+- **An export offers the report's name from the folder the report works in.** A
+  saved report already exported beside itself; an unsaved one offered a bare
+  filename, which would have landed wherever PaperBoy was started from rather
+  than in the report's `# root:` directory the terminal UI's picker opens in.
+
+- **A whole results row opens its details, not just the words in it.** The click
+  target for expanding a row was the *text* of a cell, so the gaps between
+  columns, and the empty space in a short column, did nothing — a row of mostly
+  blank cells was nearly unclickable. The row itself is now the target; the
+  cells still win where they overlap, so each keeps its own hover text and its
+  value inspector.
+
+- **A `FOR` loop can be picked up and dragged.** The loop head's only drag
+  handle was the word `FOR` itself, making a loop the one block in the editor
+  you had to hit a three-letter target to move. Every fixed word on the head —
+  `FOR`, `IN FILES`/`IN FOLDERS`/`IN ENVS`, `MATCH` and the tail — is now a
+  handle, while the boxes between them are not, so a click meant for a field
+  still never starts a drag. Clicking a loop head also selects it (and
+  double-clicking opens its wizard), which it never did before.
+
+- **A column's clauses no longer look merged into the column.** `STATISTICS`,
+  `IMAGE`, `TRUTH` and `DETAIL` are drawn tethered to the column they belong to,
+  as one pill split into segments — but with nothing marking the splits, a
+  column carrying all four came out as a single long blob of text. Each segment
+  now has a visible seam down its leading edge, so the pill reads as the
+  segmented control it is meant to be.
+
+- **Hovering a chip highlights what a drag would actually pick up.** Resting the
+  pointer anywhere on a line lit the whole block, including when the pointer was
+  on a clause that a plain drag would pull out on its own — the highlight
+  promised to move the line and letting go would have detached one chip. A
+  detachable chip now outlines itself, and holding Ctrl (which is what turns the
+  same gesture into a whole-line drag) hands the highlight back to the block.
+
+- **A Workspace tab comes back to the report it was on.** A report opened from
+  a Workspace folder tree belongs to that tab, so it is closed when you leave —
+  but nothing reopened it when you came back, and the tab returned showing
+  whichever collection its tree had loaded last. Switching tabs now restores the
+  tab you arrive at from the same selection a restart restores from, so a report
+  you glance away from is still there when you look back.
+
+- **File > Save writes straight to the file, and Save As asks.** The File menu
+  offered only the asking kind, so saving a report you had just edited meant
+  walking through a file dialog to name the file it already had. There is now a
+  top-level **Save** (Ctrl+S) that writes whatever is in front of you — the open
+  report, otherwise the active collection — back where it came from, and a
+  **Save As…** submenu (Ctrl+Shift+S) holding the pickers that were there
+  before. Something that has never been saved still falls through to the picker,
+  since there is no file to write to. Ctrl+S and the menu entry now run the same
+  code, so they cannot disagree about what "save" means.
+
+- **The block editor draws a column's `IMAGE`, `TRUTH` and `DETAIL` clauses.**
+  Only `STATISTICS` was rendered, so a ground-truthed or picture-bearing column
+  looked identical to a plain one and the clauses could be edited but never
+  seen. Named columns now carry a chip per clause (detachable, like the
+  statistics chip), and a `WITH` field shows its clauses in its own row, where
+  its `STATISTICS(…)` already was.
+
+- **A plain HTML report no longer shows a lone "All" filter button.** The row
+  filters are offered only when a report actually has something to filter by (a
+  baseline to differ from, a ground truth to be wrong against, or a trend to
+  regress in); without one of those, "All" was a button whose only possible
+  effect was the state it was already in. The Find box and the row count are
+  unaffected — those are useful in every report.
+
+- **The Open and Save dialogs no longer freeze the window.** Every native file
+  picker was called straight from the frame loop and blocked it until the user
+  chose a file, so the window stopped repainting and the desktop offered to
+  force-quit the "not responding" application. It also stalled every other
+  per-frame poll — including the one that collects a finished report run, which
+  is why exporting results could report there was nothing to export.
+
+  Every dialog now runs on a worker thread and is collected when it answers:
+  File > Open and File > Save, the report editor's `root:` / `baseline:` /
+  `collection:` settings and its loop folder pickers, the `FILES`/`FOLDERS`
+  node wizard, Form and Multipart file values, the workspace's New Collection /
+  Report / Environment, the Postman import destination, and the git workspace
+  storage prompt.
+
+  Because the window now stays live while a chooser is open, pressing Browse a
+  second time no longer opens a rival dialog, and a path that arrives for a row
+  which has since been deleted (or a collection that has been closed) is
+  dropped rather than written somewhere it no longer belongs.
+
+- **Live summary statistics no longer count rows that haven't run yet.** The
+  results grid fills in a skeleton row per pending request, whose `Time` and
+  `Status` are numerically zero rather than empty — so a `STATISTICS(MEAN)` on
+  `Time` was dragged toward zero and only became correct once the last row
+  landed. Pending rows are now excluded from every summary figure, so a running
+  report's statistics describe the rows it has actually finished.
+
+- **Ctrl+Z in the GUI report source editor really undoes.** The edit appeared to
+  flash away and the cursor jumped, but the text came back: the editor ran its
+  own undo stack over the same buffer as egui's `TextEdit`, whose built-in
+  undoer (which can't be turned off) wrote its history back within the frame.
+  The source view now uses egui's undo alone; the editor's own stack still
+  serves the structural blocks view, where there is no `TextEdit` to argue with.
+
+- `FOR ROW IN TUPLES FROM "manifest.csv"` — the documented way to read a
+  manifest's columns by name — no longer reports a destructuring mismatch. It
+  put one error on the run for every row of the manifest, which was the loudest
+  possible complaint about the usage the cookbook recommends. A pattern that
+  really does destructure is still checked.
+
+- **A commented-out column inside a `WITH` block is no longer destroyed by the
+  editors.** Comments survived everywhere else in a report, but a `WITH` block
+  had nowhere in the syntax tree to keep one, so commenting a column out and
+  then touching that request from either editor silently deleted the line. A
+  commented `WITH` field is now kept verbatim, in place, and shown dimmed in the
+  outline so it can be found again to uncomment. It is not offered to the field
+  editor, since there is no field there to edit.
+
+- **A renamed timing column no longer makes every row of a comparison
+  differ.** Timing intrinsics were excluded from baseline and `ENVS`
+  comparisons by *column name*, so `"Response Time": Time STATISTICS(MEAN)` in
+  a `WITH` block produced a column whose name is not an intrinsic and was
+  compared — and an elapsed time never repeats, so every row read as changed
+  and buried the differences that mattered. Timing columns are now recorded by
+  **provenance** when the report runs: `Time`, `TimeSetup`, `TimeWait` and
+  `TimeDownload` are left out of the diff under any name. Non-timing intrinsics
+  are unaffected — a renamed `Status` still shows when it changes.
+
+- **The TUI `WITH` field wizard closes back to where it was opened from.**
+  Pressing Enter or Escape in the wizard reached from *+ add a field* in the
+  outline dropped you into the full request form, which then had to be closed
+  as well. It also left the cursor on the request line rather than the field
+  that had just been edited.
+
+- **HTML exports no longer squeeze their columns.** The table was laid out at
+  `width:100%`, so a browser narrowed every column to fit the page and then
+  broke text inside words — an `Environment` header came out as "Enviro" /
+  "ment" with every value under it wrapped. Columns are now sized to their
+  content the same way the xlsx export sizes them (clamped to a readable range,
+  so one enormous JSON body can't push everything else off the page), headers
+  are never broken mid-word, and a wide report scrolls sideways instead of
+  being crushed.
+
+- **Comments in a report body are no longer deleted.** A `#` line among the
+  statements was treated as whitespace and thrown away when the script was
+  parsed, so the moment you touched the report in either node editor — which
+  re-writes the script from the parsed flow after every edit — the comment was
+  gone. Commenting a block out to disable it therefore destroyed it, with no
+  way to get it back. Comments are now part of the flow, keep their place among
+  the statements, are shown as their own (dimmed) row in the outline so they can
+  be found and uncommented again, and round-trip byte for byte — including the
+  indentation inside a commented-out block. Comments *inside* a `WITH` block are
+  still dropped.
+
+- **The TUI's report node editor can now edit the report's settings.** The
+  outline gained a Settings section above the flow, listing every header
+  directive the language has — `collection`, `output`, `environment`, `root`,
+  `baseline` and `columns` — driven by the same four keys as the flow below it
+  (Enter configure, `e` edit as text, Delete clear, `a` add). Previously only
+  the collection could be bound from the outline and everything else meant
+  dropping back to the raw source. The directive table now lives in the shared
+  core rather than in the GUI, so the two editors can't drift apart again.
+
+- **The report Validation panel was stuck one row tall.** It was sized by
+  counting diagnostics, but a parse error is a single diagnostic a whole
+  sentence long — so in the one state where you most need to read the message it
+  got one row and clipped the rest. The panel is now sized to the text it
+  actually draws, wrapping included, and capped at five rows so it can't take
+  over the editor above it. Anything past the cap still scrolls.
+
+- **The `../` row ignored the file browser's filter.** Typing to narrow a picker
+  left the parent entry pinned to the top of the results — the one row that
+  never matched what you'd asked for. It is now filtered on the name it shows,
+  so `..` or `.` keeps it and anything else drops it. A query that matches
+  nothing at all draws a "No matching files" box that keeps the folder name and
+  the key hints, and Backspace, Esc and ← still get you out of it.
+
+- **Typing in a report block and pressing Run threw the typing away.** The
+  header's buttons acted before the blocks below them were redrawn, so an
+  inline field that had not yet been committed — it commits when it loses
+  focus, which is the very click that pressed the button — never got the
+  chance: Run ran the *previous* version of the report and the edit was lost
+  with it. Run, Dry run, Save and Close now act at the end of the frame that
+  pressed them, on what is actually on screen.
+- **Deleting or moving a block while typing in another one could rename the
+  wrong block.** The same collision inside the Blocks view: the field's commit
+  was applied *after* the structural edit, so it landed on whichever block had
+  shuffled into that position — renaming a block the user never touched, and
+  losing the edit they had actually made. Field commits are now applied first,
+  while the positions they were written against still hold, and the toolbar's
+  delete/move act on the block that was highlighted when the button was
+  pressed.
+- **Clicking the `SHOW(…)` on an ENVS comparison loop did nothing.** A report
+  request's `SHOW` opens the field checklist when clicked; the baseline's own
+  `SHOW` — whose checklist lives in the ENVS form — did not, leaving no way to
+  reach it by clicking the thing it belongs to.
+
+- **Saving a workspace or a report to Git said "Save collection to Git"**. The
+  dialog had one hardcoded title for all three save targets, so two of the
+  three announced themselves as something they weren't. Each target now titles
+  its own dialog.
+- **A dialog could crash the GUI instead of asking its question.** The shared
+  modal shell unwrapped egui's "did the window draw?" result twice; a frame in
+  which the window wasn't drawn panicked. An undrawn frame is now simply not an
+  answer — the dialog stays open and asks again.
+
+- **The hint under the Postman import options said "Enter connect"**, which was
+  true on none of the rows it appeared over — Enter actually chose a folder,
+  flipped a toggle, or started the import depending on where the cursor was.
+  The hint now describes the row the cursor is on.
+
+- **A file browser filter no longer makes the folder you open look empty.** The
+  typed filter stayed applied when you moved to another directory, so descending
+  into a folder you had just filtered *to* showed nothing but `../` — the query
+  that matched the folder's name rarely matches anything inside it. The filter
+  now belongs to the directory it was typed in and clears when you arrive
+  somewhere new.
+
+- **The `FOR … IN FILES` source-folder picker no longer says it is choosing a
+  Workspace.** It borrowed the Workspace picker's hint line wholesale, so it
+  offered "Space choose as Workspace" while actually setting a loop's source
+  folder.
+
+- **Stopping a report in the visual editor stops it now, not eventually.** Stop
+  raised the worker's cancel flag but kept hold of the run, so the button stayed
+  a Stop button — and the report stayed unrunnable — until the worker actually
+  wound down. Cancelling never aborts a request already in flight, and a
+  `PARALLEL` batch has a lot of them, so the wait could be a long one. The run
+  is now retired the moment you stop it and the next click starts a fresh one,
+  matching the terminal UI. Rows that had already come back are kept, so you can
+  still read, save or export a partial result.
+
+- **The report validation panel no longer flickers when the mouse moves.** Two
+  separate causes: the warnings were re-derived on every frame (a full
+  revalidation, dozens of times a second, even though nothing had changed), and
+  the per-request variable warnings were emitted straight out of a hash set, so
+  each rebuild shuffled them into a different order. Validation is now re-run
+  only when the report, the requests it uses or the loaded environments actually
+  change, and those warnings come out in alphabetical order.
+
+- **A running report is no longer cancelled by clicking a tab.** The report
+  editor is closed and rebuilt whenever you navigate — click a tab, open a
+  request, pick another file — and closing it dropped the run with it, which
+  cancelled the worker mid-flight and threw away every row it had already
+  collected. Runs now live alongside the editor rather than inside it: they keep
+  going while you are elsewhere, keep collecting rows, and are still there
+  (still streaming, if they haven't finished) when you come back. Two reports
+  can be in flight at once.
+
+- **`ENVS BASELINE(…) SHOW(Time)` now actually shows the baseline field.** The
+  clause is meant to put the baseline's value beside the candidate's as
+  `baseline.<request>.<field>`, but the copy could only see fields the rows
+  already carried — and an intrinsic like `Time` is suppressed on any request
+  that declares its own `[Reports]`/`WITH` fields. The result was that the
+  documented example produced no baseline column at all, in the results grid or
+  in any export. Naming an intrinsic in a baseline `SHOW(…)` now keeps it on the
+  rows, exactly as naming it in the request's own `SHOW(…)` does.
+
+- **The dry-run preview now shows its grid the way the results view does.**
+  The preview wrapped every line, so a wide grid folded over several lines and
+  lost its column alignment. Only the prose around the grid wraps now; the grid
+  clips, and `←`/`→` scroll it sideways.
+
+- **The report results grid now scrolls sideways.** A report with more columns
+  than fit on screen clipped the rest away with no way to reach them; the
+  arrow keys now carry the view along with the cell cursor, so walking right
+  brings the remaining columns into view (and walking back returns).
+
+- **Clicking the Request or Response panel in the terminal UI now selects it.**
+  Those two panels — and the report view's — were the only ones a click didn't
+  focus, so they could only be reached from the keyboard.
+
+- **A click no longer overwrites your clipboard.** Releasing the mouse used to
+  copy unconditionally, and with nothing selected that meant copying the whole
+  panel, so simply clicking on a response replaced whatever you had copied
+  earlier. Dragging out a selection still copies it on release, and `y` still
+  copies the whole focused panel when nothing is selected.
+
+- **Imported Postman requests now carry the auth they inherit.** A collection
+  or folder that sets its auth once at the top applies it to every request
+  underneath, which is how nearly every real collection is organised. PaperBoy
+  was only reading auth written on the request itself, so such a collection
+  imported as a set of unauthenticated requests. A request that opts out with
+  Postman's "No Auth" is respected too.
+
+- **API-key auth is now imported.** Previously only basic and bearer auth came
+  across; an API key sent as a header or a query parameter is now mapped as
+  well.
+
+- **Collection-level variables are no longer dropped on import.** A Postman
+  collection can define its own `{{base}}`-style defaults, without which its
+  URLs don't resolve. Converting to Hurl now writes them out as an environment
+  you can select.
+
+- **The GUI's report source editor now indents like the terminal one.** Pressing
+  Enter carried the caret back to column 0, so every line of a `FOR` or `WITH`
+  body had to be re-indented by hand. A new line now inherits the current line's
+  indentation and gains a level after a block opener, and a line that becomes
+  `END` snaps back to the indent of the block it closes. Splitting a line in the
+  middle is still a plain newline, and Shift+Enter remains an escape hatch. Both
+  front-ends now share one set of indentation rules.
+
+- **Tab in the GUI report source editor now indents four spaces.** It inserted a
+  literal tab character, which nothing else in PaperBoy writes — so a report
+  saved from the source view was indented inconsistently with the same report
+  serialised by the block editor. Shift+Tab and Backspace clear a level in the
+  same four-column steps the terminal editor uses. Tab does not leave the field
+  (press Escape for that).
+
+- **The GUI now exports report results in the format the report asks for.** Its
+  save dialog always defaulted to CSV, ignoring the `# output:` directive, so a
+  report declaring `# output: xlsx` had to have its extension retyped by hand
+  every time — while the terminal UI had offered the declared format as the
+  default all along. The dialog now leads with that format and suggests the same
+  filename the terminal UI does, `{time}` token included, with the other three
+  formats still one click away.
+
+- **The GUI can now save a run as a `.baseline` snapshot.** Only the terminal UI
+  could, so producing the file that `BASELINE(FILE(…))` and the `# baseline:`
+  directive read meant switching front-ends. A Baseline button now sits beside
+  Export in the results view, suggesting the same `<report>.baseline` name.
+
+- **A rejected file path no longer sends the desktop app back to the start.**
+  Entering a path that would write outside the repository now reports the
+  problem on the path step itself, so it can be corrected in place.
+
+- **The terminal app now refuses file paths that escape the repository.** This
+  check existed only in the desktop app; a path like `../elsewhere.hurl` is now
+  rejected in both.
+
+- **Saving to Git from the desktop app no longer fails on a collection that was
+  never loaded from Git.** It now starts from a suggested file name and the
+  repository's default branch, as the terminal app does.
+
+- **Exported spreadsheets no longer arrive as a row of tiny columns.** Every
+  column in an `.xlsx` export was left at the spreadsheet's default width
+  regardless of what it held, so a URL or a response body became a tall, narrow
+  ribbon of wrapped text while the same run's HTML export looked fine. Columns
+  are now sized to their widest content — header, cells and statistics rows
+  alike — with a floor so short columns stay readable and a ceiling so one very
+  long value can't push everything else off the screen. Anything past the
+  ceiling still wraps, as before, so nothing is hidden. The header row is also
+  frozen and given a filter, so a long run can be scrolled and sifted without
+  losing track of which column is which.
+
+- **A report that reuses a saved `.baseline` snapshot now warns before it
+  runs.** Referring to a snapshot file that isn't there — a renamed file, or a
+  typo — was the one baseline reference that got no advance check, so the
+  problem only appeared as an unmatched comparison once the whole run had
+  finished. The path is now checked alongside every other reference, once the
+  report has been saved somewhere for a relative path to resolve against.
+
+- **Copying no longer leaves a trail of unkillable processes behind.** Every
+  copy — from the Request, Response and Reports panels alike — stranded a
+  clipboard helper that was never cleaned up, so a long session accumulated
+  dozens of them in the system's process and application lists. They could not
+  be closed, because a process in that state can only be cleared by the program
+  that started it. PaperBoy now clears each helper as soon as it has done its
+  job.
+
+- **Copying no longer flashes an entry into the desktop's application bar.**
+  On GNOME and other desktops that lack the newer clipboard protocol, the
+  Wayland helper has to open a real window to take ownership of the clipboard,
+  which the desktop then shows as a running application for as long as the copy
+  survives. PaperBoy now prefers the X11 helper where one is reachable, which
+  needs no window at all and still reaches Wayland applications through the
+  usual clipboard bridge. Set `TUI_PANEL_SELECT_CLIPBOARD=wayland` to force the
+  previous behaviour on a desktop where the bridge is unavailable.
+
+- **Running the test suite no longer overwrites your clipboard.** Tests that
+  exercised a copy path wrote to the real desktop clipboard, discarding
+  whatever you had copied, and spawned a helper process for each one. Copies
+  are now disabled while the tests run.
+
+- **Menus in the terminal UI no longer close the instant they open.** The File
+  and Settings menus, and the quit confirmation, disappeared within a fraction
+  of a second of being opened, which left no way to reach any of them — or to
+  quit PaperBoy from its own interface. The wizard-polling that runs on every
+  pass of the event loop took the open overlay before checking whether the
+  overlay was the one it was interested in, and dropped whatever it found.
+
+- **The `FOR` loop's inline fields are no longer cramped or cryptic.** Three
+  small things made loops harder to use than they needed to be. The boxes were
+  fixed-width, so any real folder path or an alias longer than a word was
+  visibly cut off with nothing to indicate there was more; they now grow to fit
+  what's in them, up to a limit that keeps the rest of the statement on screen.
+  The full explanation of a field was being used as the placeholder *inside* it,
+  where it rendered as an unreadable stub — most notably the `MATCH` pattern,
+  which read "Only files ..." — so the boxes now show a short placeholder
+  (`*.json`, `folder`, `name`) and the explanation appears on hover, on both the
+  box and the `MATCH` keyword itself. That explanation has been rewritten to say
+  what the field *is* — a filename pattern, with examples — rather than
+  describing what it filters out. Finally, the folder picker beside the path was
+  drawn without a frame and read as a printed-on icon rather than a button;
+  it now has a proper button frame, a pointing-hand cursor and a tooltip saying
+  what it opens.
+
+- **Environment rows now keep the same expand/collapse shape before and after
+  opening.** Workspace environment files used to be plain dimmed load rows with
+  no disclosure triangle, then silently changed into collapsible rows after
+  being clicked. Every environment row now carries the same right/down caret
+  icons as the Workspace tree, and expanding an unopened workspace environment
+  loads the file and reveals its variables in one gesture.
+
+- **The Response pane's compact view no longer shortens object keys.** It
+  shortened every long quoted string, so a body with descriptive key names came
+  out as rows of `"auth...ifier": "aneh...rucg"` — unreadable, which is the
+  opposite of what an overview is for. Only values are compacted now; a key is
+  left whole however long it is, recognised by the `:` that follows it (with any
+  spacing between). Copying still yields the full, uncompacted text.
+
+- **Postman environments now load at all.** PaperBoy only ever read `.vars`
+  files, so a Postman environment export — a JSON document of `key`/`value`
+  entries — was rejected as "not an environment file", and the Load Environment
+  pickers hid `.json` outright so it couldn't even be selected. Postman
+  environments now import into the same model: enabled variables become
+  environment entries, and a value written as a provider reference
+  (`{{ op://… }}`, `{{ ssm:… }}`, `{{ env:… }}`) still resolves exactly as it
+  would in a `.vars` file. Variables Postman had disabled are skipped, since a
+  `.vars` environment has no "present but switched off" state. Both the bare
+  export and the `{"environment": …}` envelope an account backup writes are
+  accepted.
+
+- **Postman collections taken from an account backup now import.** Postman's
+  "Export all data" backup and its API wrap each collection in a
+  `{"collection": …}` envelope, where a single "Export collection" writes the
+  bare `{"info": …, "item": …}` document. PaperBoy only recognised the bare
+  shape, so every file in a backup's `Collections/` folder was not detected as
+  Postman at all, fell through to the Hurl parser and opened as "not a
+  collection". Both shapes are now unwrapped and imported.
+
+- **Chips no longer sit a pixel out of line with each other.** A chip built
+  around a dropdown — `REQUEST`, `BASELINE`, `COMPARISON` — was sized by egui to
+  the same formula as every other chip, so the two agreed at egui's default text
+  size and drifted a fraction of a pixel apart once the app scaled its text up,
+  leaving an uneven bottom edge. The dropdown's height is now derived from the
+  chip height rather than arriving at it independently.
+
+- **A tethered clause now really does sit flush against the chip it qualifies.**
+  The reduced spacing was applied while laying out the clause itself, but egui
+  fixes the gap between two widgets when the *first* of them is added, so it had
+  no effect and the pair was always drawn a full gap apart.
+
+- **Quitting no longer warns about edits that quitting would not lose.** The
+  warning counted every unsaved request edit, but an ordinary tab's requests are
+  written to the session state exactly as they are, edit markers included, so
+  those edits are still waiting — still flagged as unsaved — next time PaperBoy
+  starts. The dialog therefore reappeared on every quit, for the same requests,
+  no matter how many times it was dismissed. Only a Workspace tab genuinely
+  loses work on exit, because it is bound to a live folder and re-reads its
+  selected file from disk, so only its edits are counted now.
 
 ## [0.3.0] - 2026-08-06
 

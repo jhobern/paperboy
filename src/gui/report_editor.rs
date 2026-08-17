@@ -10,23 +10,27 @@
 
 use eframe::egui::{self, Color32, RichText};
 
-use crate::i18n::Status;
+use crate::i18n::{Status, Strings};
 use crate::report::Report;
 use crate::report::context;
 use crate::report::edit::{
-    self, CarriedMod, DetachWhich, InsertPos, Modifier, NodeKind, RowKind, attach_modifier,
-    attach_to_node, carry_modifier, detach_modifier, flatten, insert_node, insert_pos_after,
-    move_node, node_at, remove_node, replace_node, report_assignment, request_node,
-    set_request_name, transfer_modifier,
+    self, CarriedMod, DetachWhich, HEADER_PLACEHOLDER, HeaderKind, HeaderSpec, InsertPos, Modifier,
+    NodeKind, RowKind, attach_modifier, attach_to_node, carry_modifier, detach_modifier, flatten,
+    header_specs, insert_node, insert_pos_after, move_node, node_at, remove_node, replace_node,
+    report_assignment, request_node, set_request_name, transfer_modifier,
 };
+use crate::report::filter::RowFilter;
 use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
+use crate::report::indent::{
+    INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
+};
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
 use crate::tui::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
-use super::report_run::{self, RowState, RunHandle, RunProgress};
+use super::report_run::{self, ParkedRun, RowState, RunHandle, RunKey, RunProgress};
 use super::theme::GuiTheme;
 
 /// Which of the two editor views is shown.
@@ -61,6 +65,25 @@ pub struct ReportEditor {
     /// that line the way the terminal UI does.
     pub parse_error_line: Option<usize>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The report's aliased helper collections, loaded alongside `diagnostics`.
+    ///
+    /// Behind the same fingerprint gate, because loading them reads files from
+    /// disk and everything that needs them (the chip tints, the request combo,
+    /// the highlighter) runs while drawing — i.e. on every frame.
+    pub helpers: Vec<crate::report::run::HelperCollection>,
+    /// The [`context::diagnostics_fingerprint`] the current `diagnostics` were
+    /// computed from. Validation is re-run only when this changes, so it happens
+    /// on an edit rather than on every frame — see that function for why.
+    diag_key: Option<u64>,
+    /// The last highlighter context built for the Source view, with the
+    /// fingerprint of what it was built from.
+    ///
+    /// Same reasoning as `diag_key`, one step further in: the Source view asks
+    /// for this on every frame, and building it collects the bound collection's
+    /// (and every helper's) request names into a fresh `HashSet` of freshly
+    /// formatted qualified strings — a per-frame allocation per request, to
+    /// answer a question whose answer only changes when a request is renamed.
+    hl_cache: Option<(u64, std::rc::Rc<HlCtx>)>,
     /// The selected node's path (a sequence of indices into nested loop
     /// bodies). Empty = the synthetic `Begin` root.
     pub selection: Vec<usize>,
@@ -77,6 +100,36 @@ pub struct ReportEditor {
     pub run: Option<RunHandle>,
     /// Whether the current `result` has been exported since it was produced.
     pub results_exported: bool,
+    /// The file the last successful export wrote, so "Open" can hand it to the
+    /// desktop without asking where it went. Cleared when a fresh run replaces
+    /// the result, because the file then describes a run that is no longer on
+    /// screen.
+    pub last_export: Option<String>,
+    /// Which of the results view's row filters is selected, as an index into
+    /// [`crate::report::filter::RowFilter::available`] for the current result.
+    ///
+    /// Held as an index rather than the filter itself because the set of
+    /// filters worth offering is derived from the result: a stored `Regressed`
+    /// would have to be validated against every new result anyway, and an index
+    /// only has to be clamped. Reset with the result.
+    pub results_filter: usize,
+    /// The results view's find box: a case-insensitive substring the shown
+    /// columns are searched for, narrowing the rows the filter already chose.
+    pub results_find: String,
+    /// The row whose drill-down panel is open, if any.
+    ///
+    /// One at a time, unlike the HTML export's independently-expanding rows: a
+    /// panel holds full-size pictures and whole response bodies, and several
+    /// open at once in a fixed-height pane would leave the grid a sliver.
+    pub results_detail: Option<usize>,
+    /// Decoded textures for the pictures the drill-down has shown, keyed by row
+    /// and column.
+    ///
+    /// Uploading a picture to the GPU is not something to do sixty times a
+    /// second, so each one is decoded once and kept. Cleared with the result
+    /// that produced it — the keys are row indices, which mean nothing once the
+    /// rows change.
+    results_textures: std::collections::HashMap<(usize, String), egui::TextureHandle>,
     /// When `Some`, a node-configure wizard (request / envs / files) is open as
     /// a modal over the blocks view.
     pub wizard: Option<super::report_wizard::Wizard>,
@@ -85,6 +138,19 @@ pub struct ReportEditor {
     /// (the GUI's stand-in for a fixed panel), so a report with many validation
     /// errors can be given as much room as needed.
     pub diag_h: f32,
+    /// Height (px) the results view's summary block (metric cards, filter bar
+    /// and confusion matrices) is allowed before it starts scrolling within
+    /// itself. Adjustable by dragging the splitter under it: a matrix per
+    /// ground-truthed column can fill most of the pane, which leaves the grid
+    /// it is describing with nothing — but a reader comparing cells wants the
+    /// opposite, so the split is theirs to make.
+    pub summary_h: f32,
+    /// Height (px) reserved for the row drill-down panel under the results
+    /// grid, adjustable by dragging the splitter above it. A drill-down holds
+    /// full-size pictures and whole response bodies, so how much of the view it
+    /// should take is a matter of what the reader is doing — reading rows or
+    /// reading one row — rather than something the app can pick for them.
+    pub detail_h: f32,
     /// Width (px) of the palette column in the Blocks view. User-adjustable by
     /// dragging the divider between the palette and the block stack.
     pub palette_w: f32,
@@ -101,6 +167,67 @@ pub struct ReportEditor {
     /// exported as though it were them). Dismissing the preview brings them
     /// straight back.
     pub dry_run: Option<Box<crate::report::dry_run::DryRunReport>>,
+    /// The values chosen for this report's `PARAM`s, keyed by raw name. Owned
+    /// by the editor rather than the report: a value belongs to the run, not to
+    /// the file (which stays the same for everyone who opens it).
+    pub param_values: crate::report::params::ParamValues,
+    /// Whether [`ReportEditor::seed_params`] has run. The editor is built
+    /// without the session in hand, so the last-used values are filled in on
+    /// the first frame instead — once.
+    params_seeded: bool,
+    /// What the report's `PARAM` declarations looked like when the answers were
+    /// last confirmed. Editing a declaration re-asks the questions; editing
+    /// anything else does not.
+    params_sig: String,
+    /// Whether the questions have been answered for this editing session. Set
+    /// when the dialog is left by Run or Dry run, so a preview can be followed
+    /// straight by the real run without answering twice.
+    params_confirmed: bool,
+    /// The open run-settings dialog, and what pressing its primary button will
+    /// do. `None` when it isn't showing.
+    params_modal: Option<RunIntent>,
+    /// What the result on screen was actually run with, in the order the
+    /// report declares. Kept beside the result rather than in it, because the
+    /// question it answers — "what did *this* table come from?" — is only ever
+    /// asked while looking at the table, and because the answers can be
+    /// changed afterwards without rerunning.
+    result_params: Vec<(String, String)>,
+    /// A toolbar button pressed this frame, run *after* the body has been drawn
+    /// (see [`ToolbarAct`]).
+    pending_toolbar: Option<ToolbarAct>,
+}
+
+/// Which button the run-settings dialog was opened on the way to, and so which
+/// of its two exits is the primary one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RunIntent {
+    Run,
+    DryRun,
+    /// Opened deliberately from the toolbar rather than on the way anywhere.
+    /// Both exits are offered; neither is emphasised.
+    Review,
+}
+
+/// A toolbar button press, deferred to the end of the frame that pressed it.
+///
+/// The header strip is drawn before the view below it, and the inline chip
+/// fields in that view commit what has been typed into them when they lose
+/// focus — which is the same frame the button click takes focus away. Acting
+/// immediately therefore acted on the *pre-edit* report: Run ran the old flow
+/// (and switched to Results, so the field was never redrawn and the typing was
+/// simply dropped), and Save wrote the old text. Deferring to the end of the
+/// frame lets the field commit first, so a button always acts on what is on
+/// screen.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ToolbarAct {
+    Run,
+    DryRun,
+    /// Open the run-settings dialog without starting anything.
+    RunSettings,
+    Save,
+    Close,
+    /// Hand the named file (the last export) to the desktop's opener.
+    OpenExport(String),
 }
 
 /// One results cell opened in the inspector window: the column header (title)
@@ -133,6 +260,9 @@ impl ReportEditor {
             parse_error: None,
             parse_error_line: None,
             diagnostics: Vec::new(),
+            helpers: Vec::new(),
+            diag_key: None,
+            hl_cache: None,
             selection: Vec::new(),
             palette: None,
             undo: Vec::new(),
@@ -140,14 +270,68 @@ impl ReportEditor {
             progress: None,
             run: None,
             results_exported: false,
+            last_export: None,
+            results_filter: 0,
+            results_find: String::new(),
+            results_detail: None,
+            results_textures: std::collections::HashMap::new(),
             wizard: None,
             diag_h: 132.0,
+            summary_h: 240.0,
+            detail_h: 320.0,
             palette_w: 168.0,
             inspector: None,
             dry_run: None,
+            param_values: Default::default(),
+            result_params: Vec::new(),
+            params_seeded: false,
+            params_sig: String::new(),
+            params_confirmed: false,
+            params_modal: None,
+            pending_toolbar: None,
         };
         ed.reparse();
         ed
+    }
+
+    /// What this editor's run is filed under while the editor isn't on screen.
+    pub fn run_key(&self) -> RunKey {
+        RunKey::of(&self.report)
+    }
+
+    /// Lift the run out of the editor so it can outlive it.
+    ///
+    /// Called when the editor is closed or replaced. Everything about a *run*
+    /// moves out; everything about the *view* (selection, palette, undo) goes
+    /// with the editor, because it is rebuilt from the report text anyway.
+    pub fn park_run(&mut self) -> ParkedRun {
+        ParkedRun {
+            result: self.result.take(),
+            progress: self.progress.take(),
+            run: self.run.take(),
+            results_exported: self.results_exported,
+            last_export: self.last_export.clone(),
+            params: std::mem::take(&mut self.param_values),
+        }
+    }
+
+    /// Take back a run parked earlier, so reopening a report shows the rows it
+    /// collected while you were elsewhere — and keeps streaming if it is still
+    /// going.
+    pub fn adopt_run(&mut self, parked: ParkedRun) {
+        self.result = parked.result;
+        self.progress = parked.progress;
+        self.run = parked.run;
+        self.results_exported = parked.results_exported;
+        self.last_export = parked.last_export;
+        if !parked.params.is_empty() {
+            self.param_values = parked.params;
+            // Already answered: don't overwrite them from the remembered set.
+            self.params_seeded = true;
+        }
+        if self.result.is_some() {
+            self.view = EditorView::Results;
+        }
     }
 
     /// The report file path this editor is bound to, if any.
@@ -175,6 +359,45 @@ impl ReportEditor {
                 self.parse_error_line = Some(e.line);
             }
         }
+        // Answers are confirmed against the questions that were asked. Change
+        // what the report declares — a new parameter, a different set of
+        // choices — and the next run asks again; change anything else and it
+        // doesn't, so editing a report between runs isn't a interrogation.
+        // Only judged when the text parses: an edit caught mid-keystroke has
+        // no declarations to compare, and re-asking every time a report is
+        // momentarily unparseable would ask on nearly every keystroke.
+        let Some(sig) = self.param_signature() else {
+            return;
+        };
+        if sig != self.params_sig {
+            self.params_sig = sig;
+            self.params_confirmed = false;
+            // A parameter that has just appeared has no value yet.
+            self.params_seeded = false;
+        }
+    }
+
+    /// What this report asks, as one string: every declaration's name, type and
+    /// default. Compared rather than inspected, so it only has to be stable.
+    fn param_signature(&self) -> Option<String> {
+        let flow = self.flow.as_ref()?;
+        Some(
+            flow.params()
+                .iter()
+                .map(|p| {
+                    // The *whole* kind, not just its keyword: adding an option to a
+                    // CHOICE changes what is being asked as much as a new
+                    // parameter does.
+                    format!(
+                        "{}:{:?}:{}",
+                        p.name,
+                        p.kind,
+                        p.default.as_deref().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     /// Set the report text (marking it dirty) and re-parse.
@@ -197,6 +420,25 @@ impl ReportEditor {
         if new_text != self.report.text {
             self.undo.push(self.report.text.clone());
             self.set_text(new_text);
+        }
+    }
+
+    /// Re-indent the source to its true block depth, as one undo step.
+    ///
+    /// Deliberately *not* routed through [`Self::edit_flow`]: that re-serializes
+    /// the AST, which has nowhere to keep a body comment, so it would quietly
+    /// delete them. [`indent::reformat`] only moves leading whitespace.
+    /// `Ok(true)` when the text moved, `Ok(false)` when it was already tidy.
+    /// The caller turns the outcome into a status so the message can be
+    /// translated against the live language.
+    fn reformat(&mut self) -> Result<bool, ReformatError> {
+        match crate::report::indent::reformat(&self.report.text)? {
+            Some(text) => {
+                self.undo.push(self.report.text.clone());
+                self.set_text(text);
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -229,7 +471,7 @@ impl ReportEditor {
     }
 
     /// Whether a run is currently in flight.
-    fn is_running(&self) -> bool {
+    pub(super) fn is_running(&self) -> bool {
         self.run.as_ref().is_some_and(|h| !h.finished())
     }
 
@@ -244,12 +486,142 @@ impl ReportEditor {
                 .all(|d| d.severity != Severity::Error)
     }
 
+    /// Whether this report declares any `PARAM`s — the question every "should
+    /// the run settings be here?" decision asks.
+    pub fn has_params(&self) -> bool {
+        self.flow.as_ref().is_some_and(|f| !f.params().is_empty())
+    }
+
+    /// The run settings form: one row per declared parameter, built fresh from
+    /// the flow and the chosen values (never cached, so it can't drift from the
+    /// source) by the same shared builder the terminal UI uses.
+    pub fn param_rows(&self, s: &Strings) -> Vec<crate::report::params::ParamRow> {
+        let Some(flow) = self.flow.as_ref() else {
+            return Vec::new();
+        };
+        crate::report::params::rows(&flow.params(), &self.param_values, s)
+    }
+
+    /// Fill in the values this report was last run with, once. Anything the
+    /// remembered set doesn't cover keeps the declared default, so adding a
+    /// parameter to a report someone has already run doesn't leave it blank —
+    /// and nothing already chosen is overwritten, because the user's own answer
+    /// outranks both.
+    pub fn seed_params(&mut self, session: &crate::session::Session) {
+        if self.params_seeded {
+            return;
+        }
+        self.params_seeded = true;
+        let Some(flow) = self.flow.as_ref() else {
+            return;
+        };
+        let remembered = session.remembered_params(&self.report.param_key());
+        let declared: Vec<(String, Option<String>)> = flow
+            .params()
+            .into_iter()
+            .map(|p| (p.name.clone(), p.default.clone()))
+            .collect();
+        for (name, default) in declared {
+            if self.param_values.contains_key(&name) {
+                continue;
+            }
+            let value = remembered
+                .get(&name)
+                .cloned()
+                .or(default)
+                .unwrap_or_default();
+            self.param_values.insert(name, value);
+        }
+    }
+
+    /// Whether starting should stop at the questions first.
+    ///
+    /// Once per editing session, not once per run: the point of answering is to
+    /// be able to preview, look, and run the same thing — being asked again
+    /// between those two steps would make the preview meaningless as a
+    /// confirmation. [`Self::reparse`] re-arms this when a declaration changes.
+    fn run_needs_settings(&self) -> bool {
+        !self.is_running() && !self.params_confirmed && self.has_params()
+    }
+
+    /// Whether the answers now differ from the ones the result on screen was
+    /// produced with. False when there is nothing to compare against — a
+    /// report that has never been run is not "changed".
+    pub(super) fn params_changed_since_result(&self, s: &Strings) -> bool {
+        if self.result_params.is_empty() || (self.result.is_none() && self.dry_run.is_none()) {
+            return false;
+        }
+        let now: Vec<(String, String)> = self
+            .param_rows(s)
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        now != self.result_params
+    }
+
+    /// Open the run-settings dialog, seeded with what the last run used.
+    pub(super) fn open_param_modal(&mut self, app: &GuiApp, intent: RunIntent) {
+        self.seed_params(&app.session);
+        self.params_modal = Some(intent);
+    }
+
+    /// The chosen values in one line — `REGION=au · TICKET=FR-12` — for the
+    /// toolbar, so what the next run will use is on screen without opening
+    /// anything.
+    pub(super) fn param_summary(&self, s: &Strings) -> String {
+        self.param_rows(s)
+            .iter()
+            .map(|r| {
+                let v = if r.value.is_empty() {
+                    s.param_value_unset
+                } else {
+                    r.value.as_str()
+                };
+                format!("{}={}", r.name, v)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
     /// Start a background run of the current flow, switching to the Results view.
     /// A blocked run (unbound / no inputs) reports why in the status line.
     fn start_run(&mut self, app: &mut GuiApp) {
         let Some(flow) = self.flow.clone() else {
             return;
         };
+        // The questions first — see `run_needs_settings`. Asking discards
+        // nothing, so this happens before any result is cleared below.
+        if self.run_needs_settings() {
+            self.open_param_modal(app, RunIntent::Run);
+            return;
+        }
+        let rows = self.param_rows(&app.strings);
+        if let Some(problem) = rows
+            .iter()
+            .find_map(|r| r.problem.as_ref().map(|p| format!("{}: {p}", r.prompt)))
+        {
+            // Refuse rather than run: a report that asks for something and is
+            // given nothing produces plausible-looking rows built around a hole.
+            app.session.status = Some(Status::ReportRunBlocked(problem));
+            self.open_param_modal(app, RunIntent::Run);
+            return;
+        }
+        // Remember the answers for next time, keyed by the report (path → git
+        // origin → name) rather than by its process-unique id.
+        let chosen: crate::report::params::ParamValues = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        if app
+            .session
+            .remember_params(&self.report.param_key(), &chosen)
+        {
+            app.session.save();
+        }
+        self.result_params = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -257,10 +629,20 @@ impl ReportEditor {
             &flow,
             self.report.path.as_deref(),
         ) {
-            Ok(inputs) => {
+            Ok(mut inputs) => {
+                // Only the app knows the chosen language; the run's own errors
+                // are user-facing text like any other.
+                inputs.language = app.session.language.clone();
+                inputs.params = chosen;
                 self.result = None;
                 self.progress = None;
                 self.results_exported = false;
+                self.last_export = None;
+                // The old result's filters and panels described the old rows.
+                self.results_filter = 0;
+                self.results_find.clear();
+                self.results_detail = None;
+                self.results_textures.clear();
                 // A real run supersedes any preview of it.
                 self.dry_run = None;
                 self.view = EditorView::Results;
@@ -299,6 +681,24 @@ impl ReportEditor {
         let Some(flow) = self.flow.clone() else {
             return;
         };
+        // A preview is only worth looking at if it previews the run you mean,
+        // so the questions are asked here too -- once, shared with Run.
+        if self.run_needs_settings() {
+            self.open_param_modal(app, RunIntent::DryRun);
+            return;
+        }
+        // The preview answers the same questions the real run will, so it has
+        // to be given the same values -- a dry run against unset parameters
+        // would describe a flow nobody is going to run.
+        let rows = self.param_rows(&app.strings);
+        let chosen: crate::report::params::ParamValues = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        self.result_params = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -307,12 +707,16 @@ impl ReportEditor {
             self.report.path.as_deref(),
         ) {
             Ok(inputs) => {
+                let strings = Strings::for_language(&app.session.language);
                 let ctx = RunContext {
                     entries: &inputs.entries,
+                    helpers: &inputs.helpers,
                     base_vars: inputs.base_vars.clone(),
                     named_envs: inputs.named_envs.clone(),
                     root: inputs.root.clone(),
                     runner: &DryRunner,
+                    strings: &strings,
+                    params: chosen,
                     sink: None,
                 };
                 let result = run_flow_raw(&inputs.flow, &ctx);
@@ -341,10 +745,22 @@ impl ReportEditor {
     }
 
     /// Stop an in-flight run, retaining whatever partial grid has streamed in.
+    ///
+    /// The handle is retired *now* — cancelled and dropped, taking our end of
+    /// the channel with it — rather than left in place until the worker's `Done`
+    /// arrives. Cancelling only stops new requests being fired; an in-flight one
+    /// still has to finish, and a `PARALLEL` batch can take a while to wind
+    /// down, during which `is_running()` would keep reporting the run as live
+    /// and the Run button would stay a Stop button. Retiring immediately means
+    /// the very next click starts a fresh run. The detached worker keeps
+    /// draining in the background; its remaining messages land on a dropped
+    /// receiver and are ignored. Mirrors the TUI's `prepare_report_run`.
     fn stop_run(&mut self, app: &mut GuiApp) {
-        if let Some(h) = &self.run {
+        if let Some(h) = self.run.take() {
             h.cancel();
         }
+        // Clear streaming progress so no row is left rendering as "running".
+        // The partial grid in `self.result` is intentionally kept.
         self.progress = None;
         app.session.status = Some(Status::ReportRunStopped);
     }
@@ -450,6 +866,20 @@ struct Chip {
     /// reads as three peers in a row and the SHOW looks like it governs all of
     /// them.
     tethered: bool,
+    /// Whether this chip is drawn merged with its neighbour into one segmented
+    /// pill: the joined edge is squared off so the pair shares a single
+    /// outline. Derived from [`Chip::tethered`] by [`link_tethers`] rather than
+    /// set at construction, because it depends on the neighbours — and it is
+    /// cleared again wherever the pair is being pulled apart, so a chip is
+    /// never drawn joined to something that has left its slot.
+    join_prev: bool,
+    join_next: bool,
+    /// This chip's row is the one under the pointer, or travels with it. Drawn
+    /// in a stronger version of its own colour — see [`chip_colors`]. Set by
+    /// the row loop from *last* frame's hover group, because which rows light
+    /// up isn't known until every row has been measured (see
+    /// [`paint_hover_group`]).
+    hovered: bool,
 }
 
 impl Chip {
@@ -500,6 +930,39 @@ enum ChipEdit {
     Parallel {
         degree: Option<u32>,
     },
+    /// A `FOR` loop head, broken into the parts of it that are worth editing in
+    /// place: the loop variable, and — for the producers that draw from one
+    /// path — that path, with a picker beside it, plus a `FILES` loop's `MATCH`
+    /// glob.
+    ///
+    /// The point is legibility as much as convenience: a loop head rendered as
+    /// one long label gave no hint that the folder or the variable name were
+    /// things you could change, so both were only ever found through the
+    /// wizard. Boxes look editable.
+    Loop(LoopEdit),
+}
+
+/// The editable parts of a `FOR` loop head (see [`ChipEdit::Loop`]).
+#[derive(Clone)]
+struct LoopEdit {
+    /// The loop variable, when the pattern binds exactly one name. `None` for a
+    /// destructuring pattern (`FOR (A, B) IN …`) or a `_` discard, where one
+    /// box could not say which binder it meant — those keep to the wizard.
+    var: Option<String>,
+    /// The keyword between the variable and the source: `IN FILES`, `IN ENVS`,
+    /// `IN TUPLES FROM`, or plain `IN`.
+    keyword: String,
+    /// The single folder/file the loop draws from, and whether it is a file
+    /// (`TUPLES FROM`) rather than a folder, which decides which picker opens.
+    dir: Option<(String, bool)>,
+    /// A `FILES` loop's `MATCH` glob. `Some("")` when the loop is a `FILES` one
+    /// with no glob yet (so the box is offered); `None` when the producer has
+    /// no glob at all.
+    glob: Option<String>,
+    /// Whatever the producer is when it can't be broken up — a list literal, a
+    /// `ZIP`/`CONCAT`, or a named `LIST`. Shown as a plain label after the
+    /// keyword.
+    tail: String,
 }
 
 impl Chip {
@@ -522,6 +985,33 @@ impl Chip {
                     .unwrap_or_else(|| "PARALLEL".to_string()),
                 PARALLEL_FIELD_WIDTH,
             ),
+            ChipEdit::Loop(l) => {
+                let mut label = "FOR".to_string();
+                let mut extra = 0.0;
+                if let Some(v) = &l.var {
+                    label.push(' ');
+                    label.push_str(v);
+                    extra += LOOP_VAR_FIELD_WIDTH;
+                }
+                label.push(' ');
+                label.push_str(&l.keyword);
+                if let Some((dir, _)) = &l.dir {
+                    label.push(' ');
+                    label.push_str(dir);
+                    // The box and the picker button beside it.
+                    extra += LOOP_PATH_FIELD_WIDTH + PICKER_BUTTON_WIDTH;
+                }
+                if let Some(g) = &l.glob {
+                    label.push_str(" MATCH ");
+                    label.push_str(g);
+                    extra += LOOP_GLOB_FIELD_WIDTH;
+                }
+                if !l.tail.is_empty() {
+                    label.push(' ');
+                    label.push_str(&l.tail);
+                }
+                (label, extra)
+            }
         }
     }
 
@@ -534,6 +1024,9 @@ impl Chip {
             edit: ChipEdit::None,
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
     }
     fn modifier(text: String, color: Color32, which: DetachWhich) -> Chip {
@@ -545,6 +1038,9 @@ impl Chip {
             edit: ChipEdit::None,
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
     }
     /// The request base chip, whose name is picked from an inline dropdown.
@@ -559,6 +1055,9 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
     }
     /// A `BASELINE`/`COMPARISON` chip carrying a single-environment dropdown.
@@ -578,6 +1077,9 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
     }
     /// An `AS <alias>` chip whose alias is edited inline. `detach` is `Some(As)`
@@ -594,6 +1096,25 @@ impl Chip {
             },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
+        }
+    }
+    /// A `FOR` loop head whose variable, folder and glob are edited inline.
+    /// Still the row's base chip, so it stays the drag/select handle.
+    fn loop_head(edit: LoopEdit, color: Color32) -> Chip {
+        Chip {
+            text: String::new(),
+            color,
+            is_base: true,
+            detach: None,
+            edit: ChipEdit::Loop(edit),
+            help: "",
+            tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
     }
     /// A `PARALLEL` chip whose concurrency limit is edited inline.
@@ -606,7 +1127,153 @@ impl Chip {
             edit: ChipEdit::Parallel { degree },
             help: "",
             tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
         }
+    }
+}
+
+/// Break a `FOR` loop head into the parts the chip edits in place.
+///
+/// `envs` marks the `FOR … IN ENVS` form, whose source is a clause rendered as
+/// its own `BASELINE`/`COMPARISON` chips rather than a path, so it contributes
+/// only the variable and the keyword.
+fn loop_edit_parts(node: &FlowNode, envs: bool) -> LoopEdit {
+    use crate::report::flow::{Binder, Producer};
+
+    // Only a pattern binding exactly one name can be edited through one box.
+    let var = match node {
+        FlowNode::ForEnvs { var, .. } => Some(var.clone()),
+        FlowNode::ForEach { pattern, .. } => match (pattern.rest, pattern.binders.as_slice()) {
+            (false, [Binder::Named(n)]) => Some(n.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if envs {
+        // A `Roles` clause is drawn as its own BASELINE/COMPARISON chips beside
+        // this one, so the head carries nothing more. A `Plain` list of
+        // environment names has no chips of its own and would otherwise vanish,
+        // so it is shown as the tail.
+        let tail = match node {
+            FlowNode::ForEnvs {
+                clause: crate::report::flow::EnvClause::Plain(names),
+                ..
+            } => names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        return LoopEdit {
+            var,
+            keyword: "IN ENVS".to_string(),
+            dir: None,
+            glob: None,
+            tail,
+        };
+    }
+    let FlowNode::ForEach { producer, .. } = node else {
+        return LoopEdit {
+            var,
+            keyword: "IN".to_string(),
+            dir: None,
+            glob: None,
+            tail: String::new(),
+        };
+    };
+    match producer {
+        // `FILES` always offers the glob box, even when the loop has no MATCH
+        // yet: an empty box invites the glob, where nothing at all hides that
+        // the loop can be narrowed.
+        Producer::Files { dir, glob } => LoopEdit {
+            var,
+            keyword: "IN FILES".to_string(),
+            dir: Some((dir.clone(), false)),
+            glob: Some(glob.clone().unwrap_or_default()),
+            tail: String::new(),
+        },
+        // `FOLDERS` takes the same `MATCH` glob as `FILES` (matching the folder
+        // name, and recursing when it contains `**`), so it gets the same box.
+        // Its `WITH role="glob"` list is several named globs rather than one, so
+        // that part stays in the wizard and is shown as the tail.
+        Producer::Folders { dir, glob, roles } => LoopEdit {
+            var,
+            keyword: "IN FOLDERS".to_string(),
+            dir: Some((dir.clone(), false)),
+            glob: Some(glob.clone().unwrap_or_default()),
+            tail: if roles.is_empty() {
+                String::new()
+            } else {
+                let rs: Vec<String> = roles.iter().map(role_label).collect();
+                format!("WITH {}", rs.join(", "))
+            },
+        },
+        Producer::Tuples { path } => LoopEdit {
+            var,
+            keyword: "IN TUPLES FROM".to_string(),
+            // A file, so the picker opens a file dialog rather than a folder one.
+            dir: Some((path.clone(), true)),
+            glob: None,
+            tail: String::new(),
+        },
+        // No single path to point at: shown whole, as before.
+        other => LoopEdit {
+            var,
+            keyword: "IN".to_string(),
+            dir: None,
+            glob: None,
+            tail: producer_label(other),
+        },
+    }
+}
+
+/// A producer with no single path, rendered as the label the loop head used to
+/// carry. Mirrors `flow::producer_text`, which is private to the model.
+/// A single `WITH` role binding as it is written in the source, so the chip's
+/// tail reads back exactly what the file says — including the `?` that marks a
+/// role as optional.
+fn role_label(r: &crate::report::flow::RoleBinding) -> String {
+    let opt = if r.optional { "?" } else { "" };
+    format!("{}=\"{}\"{opt}", r.name, r.glob)
+}
+
+fn producer_label(p: &crate::report::flow::Producer) -> String {
+    use crate::report::flow::{Element, Producer};
+    fn element(e: &Element) -> String {
+        match e {
+            Element::Scalar(s) => format!("\"{s}\""),
+            Element::Tuple(parts) => {
+                let items: Vec<String> = parts.iter().map(|s| format!("\"{s}\"")).collect();
+                format!("({})", items.join(", "))
+            }
+        }
+    }
+    match p {
+        Producer::List(elems) => {
+            let items: Vec<String> = elems.iter().map(element).collect();
+            format!("[{}]", items.join(", "))
+        }
+        Producer::Zip(ps) => {
+            let items: Vec<String> = ps.iter().map(producer_label).collect();
+            format!("ZIP({})", items.join(", "))
+        }
+        Producer::Concat(ps) => {
+            let items: Vec<String> = ps.iter().map(producer_label).collect();
+            format!("CONCAT({})", items.join(", "))
+        }
+        Producer::Named(n) => n.clone(),
+        Producer::Files { dir, glob } => match glob {
+            Some(g) => format!("FILES \"{dir}\" MATCH \"{g}\""),
+            None => format!("FILES \"{dir}\""),
+        },
+        Producer::Folders { dir, glob, .. } => match glob {
+            Some(g) => format!("FOLDERS \"{dir}\" MATCH \"{g}\""),
+            None => format!("FOLDERS \"{dir}\""),
+        },
+        Producer::Tuples { path } => format!("TUPLES FROM \"{path}\""),
     }
 }
 
@@ -650,6 +1317,12 @@ fn build_node_chips(
     s: &crate::i18n::Strings,
 ) -> Vec<Chip> {
     match node {
+        // One chip holding the comment verbatim. It has no detachable parts —
+        // a comment is text, not a statement with clauses — but it is a block
+        // like any other, so it can be dragged, moved and deleted.
+        FlowNode::Comment(text) => {
+            vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
+        }
         FlowNode::Request { name } => {
             vec![Chip::request(name, req_col).with_help(s.chip_help_request)]
         }
@@ -682,7 +1355,7 @@ fn build_node_chips(
             if !show.is_empty() {
                 chips.push(
                     Chip::modifier(
-                        format!("SHOW({})", show.join(", ")),
+                        format!("SHOW({})", crate::report::flow::show_text(show)),
                         th.ok,
                         DetachWhich::Show,
                     )
@@ -732,7 +1405,12 @@ fn build_node_chips(
             ]
         }
         FlowNode::Report(ReportStmt::VarAs {
-            var, name, stats, ..
+            var,
+            name,
+            stats,
+            image,
+            truth,
+            detail,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -741,12 +1419,22 @@ fn build_node_chips(
                 Chip::alias(name, th.pending, Some(DetachWhich::As)).with_help(s.chip_help_alias),
             ];
             chips.extend(stats_chip(stats, th, s));
+            chips.extend(clause_chips(
+                image.as_ref(),
+                truth.as_deref(),
+                *detail,
+                th,
+                s,
+            ));
             chips
         }
         FlowNode::Report(ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
+            truth,
+            detail,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
@@ -757,7 +1445,20 @@ fn build_node_chips(
                 Chip::alias(name, th.pending, None).with_help(s.chip_help_alias_required),
             ];
             chips.extend(stats_chip(stats, th, s));
+            chips.extend(clause_chips(
+                image.as_ref(),
+                truth.as_deref(),
+                *detail,
+                th,
+                s,
+            ));
             chips
+        }
+        // One chip carrying the whole declaration. Editing it is the run
+        // settings panel's job, not the block editor's — what matters here is
+        // that a parameter is visible as the first thing the report does.
+        FlowNode::Param(_) => {
+            vec![Chip::base(node.label(), th.pending).with_help(s.chip_help_param)]
         }
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
             let (col, help) = if matches!(node, FlowNode::Assign { .. }) {
@@ -770,25 +1471,13 @@ fn build_node_chips(
         FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
             let mut chips = Vec::new();
             if let Some(spec) = parallel {
-                // The head label already embeds the PARALLEL prefix; strip it so
-                // it is not duplicated by the base chip below. PARALLEL uses the
-                // theme's *error* hue so it stands apart from the blue loop/set
-                // chips it sits beside (`PARALLEL(8) FOR …`).
+                // PARALLEL is its own chip, and uses the theme's *error* hue so
+                // it stands apart from the blue loop/set chips it sits beside
+                // (`PARALLEL(8) FOR …`). The loop head below is built from the
+                // node rather than from its label, so the prefix is never
+                // duplicated and there is nothing to strip back off.
                 chips.push(Chip::parallel(spec.degree, th.err).with_help(s.chip_help_parallel));
             }
-            let full = node.label();
-            let head = match parallel {
-                Some(spec) => {
-                    let prefix = match spec.degree {
-                        None => "PARALLEL".to_string(),
-                        Some(n) => format!("PARALLEL({n})"),
-                    };
-                    full.strip_prefix(&prefix)
-                        .map(|s| s.trim_start().to_string())
-                        .unwrap_or(full)
-                }
-                None => full,
-            };
             // For an ENVS comparison loop, split the BASELINE/COMPARISON clause
             // off the head into their own chips so a long compare line reads as
             // legible parts. They are edited through the ENVS wizard, so the
@@ -801,12 +1490,11 @@ fn build_node_chips(
                         comparisons,
                         baseline_show,
                     },
-                var,
                 ..
             } = node
             {
                 chips.push(
-                    Chip::base(format!("FOR {var} IN ENVS"), th.accent)
+                    Chip::loop_head(loop_edit_parts(node, true), th.accent)
                         .with_help(s.chip_help_for_envs),
                 );
                 // A single live-environment role becomes an inline dropdown; any
@@ -832,15 +1520,14 @@ fn build_node_chips(
                 }
                 // The SHOW belongs to the BASELINE, so it follows it directly —
                 // before the COMPARISON, mirroring the source order — and is
-                // *tethered* to it, which tucks it against the baseline chip and
-                // draws a bracket joining the two. It keeps SHOW's own colour
-                // rather than borrowing the baseline's: three identically
-                // coloured chips in a row read as three peers, and it should be
-                // the bracket, not the hue, that says which one it qualifies.
+                // *tethered* to it, which merges the two into one segmented pill
+                // (see `link_tethers`). It keeps SHOW's own colour: the pill
+                // already says which chip it qualifies, so the hue is free to go
+                // on saying what kind of clause it is.
                 if !baseline_show.is_empty() {
                     chips.push(
                         Chip::modifier(
-                            format!("SHOW({})", baseline_show.join(", ")),
+                            format!("SHOW({})", crate::report::flow::show_text(baseline_show)),
                             th.ok,
                             DetachWhich::BaselineShow,
                         )
@@ -867,12 +1554,13 @@ fn build_node_chips(
                     );
                 }
             } else {
-                let help = if matches!(node, FlowNode::ForEnvs { .. }) {
+                let envs = matches!(node, FlowNode::ForEnvs { .. });
+                let help = if envs {
                     s.chip_help_for_envs
                 } else {
                     s.chip_help_for
                 };
-                chips.push(Chip::base(head, th.accent).with_help(help));
+                chips.push(Chip::loop_head(loop_edit_parts(node, envs), th.accent).with_help(help));
             }
             chips
         }
@@ -882,7 +1570,7 @@ fn build_node_chips(
 /// The `STATISTICS(…)` chip for a named report column, or nothing when the
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
-/// whole.
+/// whole — so the two are drawn as one segmented pill (see [`link_tethers`]).
 fn stats_chip(
     stats: &[crate::report::model::StatKind],
     th: &GuiTheme,
@@ -905,6 +1593,51 @@ fn stats_chip(
         .with_help(s.chip_help_statistics)
         .tether(),
     )
+}
+
+/// The `IMAGE` / `TRUTH` / `DETAIL` chips for one column, in the order they are
+/// written. Tethered, like [`stats_chip`]: all four clauses belong to the
+/// column named immediately before them rather than to the statement, so they
+/// read as one segmented pill.
+///
+fn clause_chips(
+    image: Option<&crate::report::flow::ImageSpec>,
+    truth: Option<&str>,
+    detail: bool,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+) -> Vec<Chip> {
+    let mut out = Vec::new();
+    if image.is_some() {
+        out.push(
+            Chip::modifier(
+                crate::report::flow::image_text(image).trim().to_string(),
+                th.subst,
+                DetachWhich::Image,
+            )
+            .with_help(s.chip_help_image)
+            .tether(),
+        );
+    }
+    if truth.is_some() {
+        out.push(
+            Chip::modifier(
+                crate::report::flow::truth_text(truth).trim().to_string(),
+                th.subst,
+                DetachWhich::Truth,
+            )
+            .with_help(s.chip_help_truth)
+            .tether(),
+        );
+    }
+    if detail {
+        out.push(
+            Chip::modifier("DETAIL".to_string(), th.subst, DetachWhich::Detail)
+                .with_help(s.chip_help_detail)
+                .tether(),
+        );
+    }
+    out
 }
 
 /// Render a list of environment role refs for a BASELINE/COMPARISON chip: a
@@ -931,9 +1664,14 @@ enum Act {
         report: bool,
         name: String,
     },
-    MoveUp,
-    MoveDown,
-    Delete,
+    /// Move the block at `path` up (`up`) or down among its siblings. The path
+    /// is captured when the button is pressed rather than read back from the
+    /// selection later, because a value commit applied first re-selects the
+    /// field it wrote — the move has to act on what was highlighted on screen.
+    Move {
+        path: Vec<usize>,
+        up: bool,
+    },
     /// A palette block was dragged and dropped at `pos` (from the always-visible
     /// palette list). The node is built at drop time so request kinds pick up a
     /// default name from the bound collection.
@@ -992,6 +1730,26 @@ enum Act {
         path: Vec<usize>,
         text: String,
     },
+    /// One of the loop chip's inline boxes committed: the loop variable, the
+    /// folder/file it draws from, or a `FILES` loop's `MATCH` glob.
+    SetLoopVar {
+        path: Vec<usize>,
+        text: String,
+    },
+    SetLoopDir {
+        path: Vec<usize>,
+        text: String,
+    },
+    SetLoopGlob {
+        path: Vec<usize>,
+        text: String,
+    },
+    /// The folder/file picker beside a loop's path box. `file` picks a file
+    /// (`TUPLES FROM`) rather than a folder.
+    PickLoopDir {
+        path: Vec<usize>,
+        file: bool,
+    },
     /// The inline `PARALLEL` box committed a new max-concurrency for the loop at
     /// `path`; `None` clears it back to the prelude-driven default.
     SetParallelDegree {
@@ -1014,16 +1772,47 @@ enum Act {
         path: Vec<usize>,
         index: usize,
     },
+    /// Attach `STATISTICS(…)` to the `WITH` field at `index` of the report
+    /// request at `path` — the drop a `WITH` field row accepts. Its own action
+    /// rather than an [`Act::AttachMod`] because a field is addressed by
+    /// (path, index) and isn't a `FlowNode` a modifier can be attached to.
+    AttachWithStats {
+        path: Vec<usize>,
+        index: usize,
+    },
     /// A header-strip chip committed a `# key: value` directive; `None` removes
     /// the directive (see [`edit::set_header`]).
     SetHeader {
         key: &'static str,
+        /// Which occurrence of `key` to write. Always 0 except for
+        /// `collection:`, which repeats — occurrence 0 is the primary
+        /// collection, each one after it an aliased helper.
+        occurrence: usize,
         value: Option<String>,
     },
     /// Browse for the file a path-valued header directive should point at.
     PickHeaderFile {
         key: &'static str,
+        occurrence: usize,
     },
+}
+
+impl Act {
+    /// Whether this action only writes a value the user typed into an inline
+    /// field, leaving the shape of the flow alone. These are applied first (see
+    /// [`apply_block_actions`]) because their paths were resolved against the
+    /// tree as drawn.
+    fn is_value_commit(&self) -> bool {
+        matches!(
+            self,
+            Act::SetAlias { .. }
+                | Act::SetLoopVar { .. }
+                | Act::SetLoopDir { .. }
+                | Act::SetLoopGlob { .. }
+                | Act::SetParallelDegree { .. }
+                | Act::SetHeader { .. }
+        )
+    }
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -1033,6 +1822,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
     let th = app.theme;
     let mut close = false;
+    // Fill the form from what this report was last run with, once per editor.
+    ed.seed_params(&app.session);
+    // NB: `pending_toolbar` is *not* cleared here. It is always taken at the end
+    // of the frame that set it, so there is nothing stale to clear -- but a
+    // shortcut or menu entry outside the editor (Ctrl+S, File > Save > Report)
+    // sets it *before* this runs, and clearing would swallow that request.
 
     // Fold any streamed run updates into the grid, and keep repainting while a
     // run is live so the grid fills in real time.
@@ -1041,21 +1836,56 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.ctx().request_repaint();
     }
 
-    // Recompute diagnostics against the current collections/envs each frame
-    // (cheap; keeps the Run gate and panel live as the bound collection changes).
-    ed.diagnostics = match &ed.flow {
-        Some(flow) => context::report_diagnostics(
-            &app.session.collections,
-            &app.session.global_envs,
-            app.session.active_env_id,
-            flow,
-            ed.report.path.as_deref(),
-            &app.strings,
-        ),
-        None => Vec::new(),
-    };
+    // Revalidate against the current collections/envs, but only when one of the
+    // inputs has actually changed. Doing it per frame re-ran a deep-cloning walk
+    // dozens of times a second and — because parts of it are driven by hash-set
+    // iteration — reshuffled the panel each time, so the warnings visibly
+    // flickered whenever the mouse moved (see `diagnostics_fingerprint`).
+    match &ed.flow {
+        Some(flow) => {
+            let key = context::diagnostics_fingerprint(
+                &app.session.collections,
+                &app.session.global_envs,
+                app.session.active_env_id,
+                flow,
+                ed.report.path.as_deref(),
+                &app.strings,
+            );
+            if ed.diag_key != Some(key) {
+                ed.diagnostics = context::report_diagnostics(
+                    &app.session.collections,
+                    &app.session.global_envs,
+                    app.session.active_env_id,
+                    flow,
+                    ed.report.path.as_deref(),
+                    &app.strings,
+                );
+                let (helpers, _) = context::load_helpers(
+                    &app.session.collections,
+                    flow,
+                    ed.report.path.as_deref(),
+                    &app.strings,
+                );
+                ed.helpers = helpers;
+                ed.diag_key = Some(key);
+            }
+        }
+        None => {
+            ed.diagnostics.clear();
+            ed.helpers.clear();
+            ed.diag_key = None;
+        }
+    }
 
-    // ── Header: name, dirty marker, Run / Save / Close ─────────────────────
+    // ── Header: name, view toggle, and every action, all on one line ───────
+    //
+    // These were three stacked strips — title, view toggle, and (in the results
+    // view) a near-empty band holding Baseline/Export. Three lines of chrome
+    // over a table is three rows of that table not being read, and the report
+    // editor is a tool for reading tables. They fold together because they are
+    // all the same kind of thing: what this document is, which way you are
+    // looking at it, and what you can do to it.
+    let mut reindent = false;
     ui.horizontal(|ui| {
         let mut title = RichText::new(&ed.report.name).strong().color(th.text);
         if ed.report.dirty {
@@ -1064,20 +1894,57 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 .color(th.accent);
         }
         ui.label(title);
+        ui.separator();
+        for (view, label) in [
+            (EditorView::Blocks, app.strings.gui_report_view_blocks),
+            (EditorView::Source, app.strings.gui_report_view_source),
+            (EditorView::Results, app.strings.gui_report_view_results),
+        ] {
+            if super::widgets::selectable(ui, ed.view == view, RichText::new(label)).clicked() {
+                ed.view = view;
+            }
+        }
+        // Re-indent the source to its real block depth. Lives beside the view
+        // toggle rather than inside the source view because it is about the
+        // document, not about one way of looking at it.
+        ui.separator();
+        if ui
+            .button(app.strings.gui_report_reindent)
+            .on_hover_text(app.strings.gui_report_reindent_help)
+            .clicked()
+        {
+            reindent = true;
+        }
+        // The run's own status, which used to head the results view. It reads
+        // as well here, beside the Run button that started it.
+        if ed.is_running() {
+            ui.separator();
+            ui.colored_label(
+                th.pending,
+                format!(
+                    "{} {}",
+                    super::icons::RUNNING,
+                    app.strings.gui_report_running
+                ),
+            );
+        }
+        if let Some(prog) = &ed.progress {
+            ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button(format!("{} {}", super::icons::CLOSE, app.strings.gui_close))
                 .clicked()
             {
-                close = true;
+                ed.pending_toolbar = Some(ToolbarAct::Close);
             }
             let save = ui.add_enabled(
                 ed.report.dirty,
                 egui::Button::new(format!("{} {}", super::icons::SAVE, app.strings.gui_save)),
             );
             if save.clicked() {
-                save_report(&mut ed, app);
+                ed.pending_toolbar = Some(ToolbarAct::Save);
             }
             // Run toggles to Stop while a run is in flight.
             if ed.is_running() {
@@ -1101,7 +1968,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     )),
                 );
                 if run.clicked() {
-                    ed.start_run(app);
+                    ed.pending_toolbar = Some(ToolbarAct::Run);
                 }
                 // Dry run sits beside Run, disabled on the same terms: it
                 // expands the flow for real, so a flow with errors can't be
@@ -1117,49 +1984,108 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     )
                     .on_hover_text(app.strings.gui_report_dry_run_tooltip);
                 if dry.clicked() {
-                    ed.start_dry_run(app);
+                    ed.pending_toolbar = Some(ToolbarAct::DryRun);
+                }
+                // The answers themselves, and the way back to the questions —
+                // one thing, not two. They used to be a button beside a dim
+                // label, which split reading from acting: the part you could
+                // read looked like a status message, and the part you could
+                // click said "Run settings" without saying what the settings
+                // were. Now the line *is* the button.
+                if ed.has_params() {
+                    if param_chip(ui, &ed, app, &th).clicked() {
+                        ed.pending_toolbar = Some(ToolbarAct::RunSettings);
+                    }
+                }
+            }
+            // What you can do with a *result*, shown only where there is one to
+            // do it with. Left of the run controls, and separated from them:
+            // these act on the rows that came back, not on the report.
+            if ed.view == EditorView::Results && ed.dry_run.is_none() {
+                ui.separator();
+                let has_rows = ed.result.as_ref().is_some_and(|r| !r.rows.is_empty());
+                let export = ui.add_enabled(
+                    has_rows,
+                    egui::Button::new(format!(
+                        "{} {}",
+                        super::icons::EXPORT,
+                        app.strings.gui_report_export
+                    )),
+                );
+                if export.clicked() {
+                    open_export_dialog(app);
+                }
+                // Appears only once there is a file to open, and disappears
+                // again when a rerun makes that file describe a different run:
+                // an "Open" that shows yesterday's numbers is worse than no
+                // button at all.
+                if let Some(exported) = ed.last_export.clone() {
+                    let open = ui
+                        .add(egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::OPEN_EXTERNAL,
+                            app.strings.gui_report_open_export
+                        )))
+                        .on_hover_text(exported.clone());
+                    if open.clicked() {
+                        ed.pending_toolbar = Some(ToolbarAct::OpenExport(exported));
+                    }
+                }
+                // Saving the run as a snapshot is a different thing from
+                // exporting it for reading, so it gets its own button rather
+                // than hiding as a format in the export dialog: the file it
+                // writes is an input to a later run, not a report anyone opens.
+                let baseline = ui
+                    .add_enabled(
+                        has_rows,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::SAVE,
+                            app.strings.gui_report_save_baseline
+                        )),
+                    )
+                    .on_hover_text(app.strings.help_report_baseline)
+                    .on_disabled_hover_text(app.strings.report_baseline_no_result);
+                if baseline.clicked() {
+                    super::menu::save_via_picker(app, super::app::SaveKind::ReportBaseline);
                 }
             }
         });
     });
-
-    // View toggle (Blocks | Source | Results).
-    ui.horizontal(|ui| {
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Blocks,
-            RichText::new(app.strings.gui_report_view_blocks),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Blocks;
-        }
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Source,
-            RichText::new(app.strings.gui_report_view_source),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Source;
-        }
-        if super::widgets::selectable(
-            ui,
-            ed.view == EditorView::Results,
-            RichText::new(app.strings.gui_report_view_results),
-        )
-        .clicked()
-        {
-            ed.view = EditorView::Results;
-        }
-    });
     ui.separator();
+
+    if reindent {
+        app.session.status = Some(match ed.reformat() {
+            Ok(true) => Status::ReportReformatted,
+            Ok(false) => Status::ReportAlreadyTidy,
+            Err(ReformatError::Unparseable(msg)) => Status::ReportReformatFailed(msg),
+            Err(ReformatError::WouldChangeMeaning) => {
+                Status::ReportReformatFailed(app.strings.report_reformat_unsafe.to_string())
+            }
+        });
+    }
 
     match ed.view {
         EditorView::Source => source_view(&mut ed, app, ui),
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
         EditorView::Results => results_view(&mut ed, app, ui),
     }
+
+    // `p` opens the run settings, as it does in the terminal UI — but not while
+    // a text field has focus (it is a perfectly good letter) and not while the
+    // dialog it would open is already up.
+    let typing = ui.memory(|m| m.focused().is_some());
+    if !typing
+        && ed.has_params()
+        && ed.params_modal.is_none()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P))
+    {
+        ed.pending_toolbar = Some(ToolbarAct::RunSettings);
+    }
+
+    // The run settings dialog: the report's own questions, asked on the way to
+    // a run rather than occupying a view of their own.
+    show_param_modal(&mut ed, app, ui.ctx());
 
     // The node-configure wizard modal (opened by double-clicking a block on the
     // blocks view) floats above whichever view is showing.
@@ -1172,7 +2098,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let mut open = true;
         let esc = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
         let ins = ed.inspector.as_ref().unwrap();
-        egui::Window::new(RichText::new(&ins.title).strong().color(th.text))
+        // Titled like every other window in the app: a plain `RichText` here
+        // is body-sized, which left the one floating window with a title
+        // smaller than the dialogs beside it.
+        egui::Window::new(RichText::new(&ins.title).heading().color(th.text))
             .id(egui::Id::new("pt_cell_inspector"))
             .collapsible(false)
             .resizable(true)
@@ -1209,16 +2138,52 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
     }
 
-    // Global keys: Ctrl+Z undo (both views); Delete on the blocks view is
-    // handled inside `blocks_view` so it doesn't fire while typing.
-    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+    // Global keys: Ctrl+Z undoes the last *structural* edit; Delete on the
+    // blocks view is handled inside `blocks_view` so it doesn't fire while
+    // typing.
+    //
+    // The source view is deliberately excluded: egui's `TextEdit` has an undoer
+    // of its own that no one can turn off, so running this stack there meant
+    // both fired at once and the widget wrote its own history straight back
+    // over the editor's — the change appeared to vanish for a frame and then
+    // came back with the caret moved. Text editing is exactly what the widget's
+    // undoer is for (it undoes by typed word, not by whole snapshot), so in
+    // that view it is left to do the job alone.
+    if ed.view != EditorView::Source
+        && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z))
+    {
         ed.undo();
     }
 
-    if !close {
+    // The header's buttons act here, at the end of the frame that pressed them,
+    // so any inline field that committed on losing focus above has already been
+    // folded into the report (see [`ToolbarAct`]).
+    match ed.pending_toolbar.take() {
+        Some(ToolbarAct::Run) => ed.start_run(app),
+        Some(ToolbarAct::DryRun) => ed.start_dry_run(app),
+        Some(ToolbarAct::RunSettings) => ed.open_param_modal(app, RunIntent::Review),
+        Some(ToolbarAct::Save) => save_report(&mut ed, app),
+        Some(ToolbarAct::Close) => close = true,
+        Some(ToolbarAct::OpenExport(path)) => {
+            app.session.status = Some(match crate::shared_utils::open_in_desktop(&path) {
+                Ok(()) => Status::ReportOpened(path),
+                Err(e) => Status::Error(format!("{path}: {e}")),
+            });
+        }
+        None => {}
+    }
+
+    if close {
+        // The editor goes, the run stays: closing the view must not cancel a
+        // report mid-flight or discard the rows it has already collected.
+        let key = ed.run_key();
+        let parked = ed.park_run();
+        if parked.is_worth_keeping() {
+            app.report_runs.insert(key, parked);
+        }
+    } else {
         app.report_editor = Some(ed);
     }
-    // (A dropped `ed` cancels any in-flight run via `RunHandle`'s `Drop`.)
 }
 
 /// The dry-run preview's contents: a notice that nothing was sent, the
@@ -1286,7 +2251,18 @@ fn dry_run_body(
     }
     // `None` states: a dry run has no streaming progress, so the grid draws
     // without status icons, exactly like a finished run.
-    if let Some(ins) = results_grid(&th, ui, &preview.result, &columns, None) {
+    let (preview_grid_cols, preview_detail_cols) = crate::report::detail::split_columns(&columns);
+    let mut none = None;
+    if let Some(ins) = results_grid(
+        &th,
+        ui,
+        &preview.result,
+        &preview_grid_cols,
+        None,
+        None,
+        &preview_detail_cols,
+        &mut none,
+    ) {
         opened = Some(ins);
     }
     opened
@@ -1299,11 +2275,17 @@ fn dry_run_body(
 /// `ENVS` name reads green when it binds to something loaded and amber when it
 /// doesn't — so the Source view answers "is this report wired up?" at a glance,
 /// exactly as the terminal UI's does.
-fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
+fn highlight_ctx(ed: &mut ReportEditor, app: &GuiApp) -> std::rc::Rc<HlCtx> {
     let bound = ed.flow.as_ref().and_then(|flow| {
         context::resolve_bound_collection(&app.session.collections, flow, ed.report.path.as_deref())
     });
-    HlCtx {
+    let key = highlight_ctx_key(ed, app, bound);
+    if let Some((cached_key, ctx)) = &ed.hl_cache
+        && *cached_key == key
+    {
+        return ctx.clone();
+    }
+    let ctx = std::rc::Rc::new(HlCtx {
         error_line: ed.parse_error_line,
         collection_resolves: bound.is_some(),
         loaded_envs: app
@@ -1314,14 +2296,48 @@ fn highlight_ctx(ed: &ReportEditor, app: &GuiApp) -> HlCtx {
             .collect(),
         request_names: bound
             .map(|ci| {
-                app.session.collections[ci]
-                    .entries
-                    .iter()
-                    .map(|e| e.title.clone())
+                // Qualified, so a helper's request reads green in the Source
+                // view rather than misleadingly amber.
+                context::request_choices(&app.session.collections[ci].entries, &ed.helpers)
+                    .into_iter()
+                    .map(|c| c.qualified)
                     .collect()
             })
             .unwrap_or_default(),
+    });
+    ed.hl_cache = Some((key, ctx.clone()));
+    ctx
+}
+
+/// Everything [`highlight_ctx`] reads, in one number.
+///
+/// Names only, because names are all the context holds: which collection the
+/// report binds to, what its (and its helpers') requests are called, and what
+/// environments are loaded. Hashing those is a pass over a few kilobytes of
+/// title text; building the context is an allocation per request.
+///
+/// **Maintenance:** anything [`highlight_ctx`] starts reading has to be added
+/// here, or the colours will stop following it.
+fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp, bound: Option<usize>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ed.parse_error_line.hash(&mut h);
+    bound.hash(&mut h);
+    for e in &app.session.global_envs {
+        e.name.hash(&mut h);
     }
+    if let Some(ci) = bound {
+        for e in &app.session.collections[ci].entries {
+            e.title.hash(&mut h);
+        }
+    }
+    for helper in &ed.helpers {
+        helper.alias.hash(&mut h);
+        for e in &helper.entries {
+            e.title.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 /// Lay `text` out as a syntax-highlighted [`egui::text::LayoutJob`], reusing the
@@ -1377,7 +2393,673 @@ fn highlight_job(
     job
 }
 
+/// [`highlight_job`], reused between frames while nothing it depends on has
+/// changed.
+///
+/// `TextEdit` asks its layouter for a job on every frame, and building one
+/// re-tokenises the whole document — around 270µs for a 200-line report, on
+/// every frame, whether or not a key was pressed. Cloning a cached job costs a
+/// fraction of that, and handing it to `layout_job` as before leaves egui's own
+/// galley cache in charge of the actual text layout (which is what keeps this
+/// correct across a font or scale change).
+#[allow(clippy::too_many_arguments)]
+fn cached_highlight_job(
+    ui: &egui::Ui,
+    id: egui::Id,
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    th: &GuiTheme,
+    font: egui::FontId,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let key = highlight_key(text, ctx, spec, &font, wrap_width);
+    if let Some((cached_key, job)) = ui.data(|d| d.get_temp::<(u64, egui::text::LayoutJob)>(id))
+        && cached_key == key
+    {
+        return job;
+    }
+    let job = highlight_job(text, ctx, spec, th, font, wrap_width);
+    ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
+    job
+}
+
+/// Everything [`highlight_job`] reads, in one number.
+///
+/// **Maintenance:** anything the highlighter starts colouring by has to be
+/// added here, or the colours will stop following it.
+fn highlight_key(
+    text: &str,
+    ctx: &HlCtx,
+    spec: &crate::theme::ThemeSpec,
+    font: &egui::FontId,
+    wrap_width: f32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The document itself dominates, so it is hashed with the cheap mixer
+    // rather than a SipHash pass over every byte.
+    fnv1a(text.as_bytes(), FNV_OFFSET).hash(&mut h);
+    ctx.error_line.hash(&mut h);
+    ctx.collection_resolves.hash(&mut h);
+    // Both name sets are hash sets, so their iteration order is not stable:
+    // combine each name's hash with `^` so the key depends on the membership
+    // and not on the order it comes out in.
+    let mut names = 0u64;
+    for e in &ctx.loaded_envs {
+        names ^= fnv1a(e.as_bytes(), FNV_OFFSET);
+    }
+    for r in &ctx.request_names {
+        names ^= fnv1a(r.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    }
+    names.hash(&mut h);
+    spec.hash(&mut h);
+    font.size.to_bits().hash(&mut h);
+    wrap_width.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// The byte offset of char index `at` in `text` (clamped to the end).
+fn byte_at(text: &str, at: usize) -> usize {
+    text.char_indices()
+        .nth(at)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+/// The (row, column) — both counted in chars — of char index `at`.
+fn row_col_at(text: &str, at: usize) -> (usize, usize) {
+    let (mut row, mut col) = (0usize, 0usize);
+    for ch in text.chars().take(at) {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
+/// The char index at which `row` starts (clamped to the end of `text`).
+fn row_start(text: &str, row: usize) -> usize {
+    let mut idx = 0usize;
+    for (n, line) in text.split('\n').enumerate() {
+        if n == row {
+            return idx;
+        }
+        idx += line.chars().count() + 1; // + the newline itself
+    }
+    text.chars().count()
+}
+
+/// The text and new cursor position after Enter replaces the char range `sel`,
+/// with PaperTrail's auto-indent applied.
+///
+/// `egui`'s own Enter would insert a bare `\n`, dumping the caret in column 0
+/// of a nested block; this inherits the current line's indentation instead (and
+/// adds a level after a block opener), matching the terminal editor. Like that
+/// editor, a *mid-line* split stays a plain newline — the rule is for the
+/// ordinary "type to the end of the line, press Enter" flow, where anything else
+/// would be a surprise. What counts as "the end" is measured at `sel.end`, since
+/// that is where the caret lands once the selection is replaced, while the
+/// indent is taken from the line the selection *starts* on.
+fn newline_with_indent(text: &str, sel: std::ops::Range<usize>) -> (String, usize) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (row, _) = row_col_at(text, sel.start);
+    let (end_row, end_col) = row_col_at(text, sel.end);
+    let at_line_end = end_col == lines.get(end_row).map_or(0, |l| l.chars().count());
+    let indent = if at_line_end {
+        indent_for_new_line(lines.get(row).copied().unwrap_or(""))
+    } else {
+        String::new()
+    };
+    let (from, to) = (byte_at(text, sel.start), byte_at(text, sel.end));
+    let mut out = String::with_capacity(text.len() + 1 + indent.len());
+    out.push_str(&text[..from]);
+    out.push('\n');
+    out.push_str(&indent);
+    out.push_str(&text[to..]);
+    (out, sel.start + 1 + indent.chars().count())
+}
+
+/// The text and new cursor position after Tab indents one level over the char
+/// range `sel` (replacing any selection, as typing a character would).
+fn indent_at(text: &str, sel: std::ops::Range<usize>) -> (String, usize) {
+    let (from, to) = (byte_at(text, sel.start), byte_at(text, sel.end));
+    let mut out = String::with_capacity(text.len() + INDENT_UNIT.len());
+    out.push_str(&text[..from]);
+    out.push_str(INDENT_UNIT);
+    out.push_str(&text[to..]);
+    (out, sel.start + INDENT_UNIT.chars().count())
+}
+
+/// How many chars a de-indent at char index `at` should delete: back to the
+/// previous four-column stop within the run of spaces ending at the caret, so
+/// one press clears a whole level rather than a single space. `None` when the
+/// caret isn't preceded by a space, in which case the key means what it always
+/// did. Mirrors the terminal editor's Tab/Backspace rule.
+fn dedent_span(text: &str, at: usize) -> Option<usize> {
+    let (row, col) = row_col_at(text, at);
+    let chars: Vec<char> = text.split('\n').nth(row)?.chars().collect();
+    if col == 0 || chars.get(col - 1) != Some(&' ') {
+        return None;
+    }
+    let mut run_start = col;
+    while run_start > 0 && chars[run_start - 1] == ' ' {
+        run_start -= 1;
+    }
+    Some((col - run_start - 1) % INDENT_UNIT.len() + 1)
+}
+
+/// The text and new cursor position after deleting `n` chars before `at`.
+fn delete_before(text: &str, at: usize, n: usize) -> (String, usize) {
+    let start = at.saturating_sub(n);
+    let (from, to) = (byte_at(text, start), byte_at(text, at));
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..from]);
+    out.push_str(&text[to..]);
+    (out, start)
+}
+
+/// Handle the source editor's code-editing keys, which `egui`'s text area would
+/// otherwise take literally: Enter (auto-indent), Tab / Shift+Tab (indent by one
+/// four-space level rather than inserting a literal `\t`) and Backspace over
+/// indentation (clear a whole level). Returns the replacement text and caret
+/// position, or `None` to let the widget handle the key itself.
+///
+/// Tab stays in the field either way — `code_editor()` locks focus — so
+/// **Escape** is the way out of the editor (egui releases focus on it, and the
+/// focus filter deliberately lets it through).
+fn source_edit_key(
+    ui: &egui::Ui,
+    text: &str,
+    sel: std::ops::Range<usize>,
+) -> Option<(String, usize)> {
+    use egui::{Key, Modifiers};
+    if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+        return Some(newline_with_indent(text, sel));
+    }
+    if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+        return Some(indent_at(text, sel));
+    }
+    // Shift+Tab is always swallowed, even where there is no indentation to
+    // remove: with focus locked it can't mean "previous widget", and letting the
+    // widget see it would insert egui's own tab-flavoured indentation instead.
+    if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab)) {
+        return dedent_span(text, sel.start).map(|n| delete_before(text, sel.start, n));
+    }
+    // Backspace is only taken when it really is deleting indentation, so an
+    // ordinary character delete (and every selection-aware case) stays egui's.
+    if sel.is_empty()
+        && let Some(n) = dedent_span(text, sel.start)
+        && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace))
+    {
+        return Some(delete_before(text, sel.start, n));
+    }
+    None
+}
+
+/// If the line holding char index `at` now reads exactly `END`, snap it to its
+/// opener's indentation and return the corrected text with the cursor parked at
+/// the line end — so finishing a block dedents one level, as it does in the
+/// terminal editor. `None` when nothing needs changing (already aligned, not an
+/// `END`, or the nesting above is unbalanced, in which case guessing would be
+/// worse than leaving the typed text alone).
+fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (row, _) = row_col_at(text, at);
+    let line = *lines.get(row)?;
+    if !is_end_line(line) {
+        return None;
+    }
+    let indent = matching_opener_indent(&lines[..row])?;
+    let fixed = format!("{indent}{}", line.trim_start());
+    if fixed == line {
+        return None;
+    }
+    let start = row_start(text, row);
+    let cursor = start + fixed.chars().count();
+    let mut out: Vec<&str> = lines;
+    out[row] = &fixed;
+    Some((out.join("\n"), cursor))
+}
+
 /// The raw `.trail` source editor + validation panel.
+/// The run settings dialog: one card per declared `PARAM` — what it asks for,
+/// the value this run will use, and what is wrong with it, if anything.
+///
+/// A dialog rather than a view because it is a step on the way to a run, not a
+/// place to be: it is opened by Run (and by Dry run, which needs the same
+/// answers to preview the run you actually mean), and it leaves by starting
+/// one. Both exits are offered whichever button opened it, so changing your
+/// mind about previewing first doesn't mean answering twice.
+///
+/// Deliberately a *form*, not a script: most people who run a report never open
+/// it, so every parameter is a labelled field with the widget its declared type
+/// deserves (a drop-down for a closed set, a picker for a path). The raw name
+/// and type sit beside it dimmed — the form doubles as the reference for anyone
+/// who does go on to read the source. Drawn as tinted, rounded cards in the
+/// Blocks view's own idiom, in the `subst` hue every other `{{substitution}}`
+/// carries — which is exactly what a parameter is.
+/// The toolbar's run-settings chip: what the next run will use, as one
+/// clickable line.
+///
+/// Every part of it is readable *and* clickable, which is the whole point — the
+/// values used to be a dim label sitting beside a button, and a line you can
+/// read but not act on reads as a status message rather than a question. A
+/// value that has no answer is painted in the colour the app uses for "not
+/// settled yet" (or the error colour where it would actually stop the run), so
+/// an unanswered report looks unanswered instead of merely informative.
+fn param_chip(
+    ui: &mut egui::Ui,
+    ed: &ReportEditor,
+    app: &GuiApp,
+    th: &super::theme::GuiTheme,
+) -> egui::Response {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let s = &app.strings;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let fmt = |color: egui::Color32| TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    let mut job = LayoutJob::default();
+    // One row, however long the answers are: the toolbar is a row, not a
+    // paragraph, and the whole of it is on hover.
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job.wrap.max_width = (ui.available_width() - 24.0).max(120.0);
+    job.append(
+        &format!("{} {}: ", super::icons::ENV, s.gui_report_run_settings),
+        0.0,
+        fmt(th.text),
+    );
+    for (i, row) in ed.param_rows(s).iter().enumerate() {
+        if i > 0 {
+            job.append(" · ", 0.0, fmt(th.dim));
+        }
+        job.append(&format!("{}=", row.name), 0.0, fmt(th.dim));
+        let (text, color) = if row.problem.is_some() {
+            (s.param_value_unset, th.err)
+        } else if row.value.is_empty() {
+            (s.param_value_unset, th.pending)
+        } else {
+            (row.value.as_str(), th.text)
+        };
+        job.append(text, 0.0, fmt(color));
+    }
+    // A result on screen that was produced with different answers is the one
+    // case where the chip is not describing what the reader is looking at.
+    // Saying so here beats a strip above the table, which would cost a row of
+    // the table every run, changed or not.
+    let stale = ed.params_changed_since_result(s);
+    if stale {
+        job.append(
+            &format!(" · {}", s.param_changed_since_run),
+            0.0,
+            fmt(th.accent),
+        );
+    }
+    let mut hover = format!(
+        "{}\n{}",
+        ed.param_summary(s),
+        s.gui_report_run_settings_shortcut
+    );
+    if stale {
+        hover = format!(
+            "{}\n{}",
+            s.param_result_ran_with
+                .replace("{}", &summarize(&ed.result_params, s)),
+            hover
+        );
+    }
+    ui.add(egui::Button::new(job)).on_hover_text(hover)
+}
+
+/// `NAME=value · NAME=value`, with an empty value written as the same
+/// "(not set)" the form shows.
+fn summarize(values: &[(String, String)], s: &Strings) -> String {
+    values
+        .iter()
+        .map(|(name, value)| {
+            let shown = if value.is_empty() {
+                s.param_value_unset
+            } else {
+                value.as_str()
+            };
+            format!("{name}={shown}")
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+#[cfg(test)]
+pub(crate) fn arm_params_for_audit(ed: &mut ReportEditor) {
+    ed.params_modal = Some(RunIntent::Run);
+}
+
+fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
+    let Some(intent) = ed.params_modal else {
+        return;
+    };
+    let th = app.theme;
+    // A copy of its own, so the app is free to be borrowed mutably for the file
+    // picker at the end without the form's own words going out of scope.
+    let s = Strings::for_language(&app.session.language);
+    let rows = ed.param_rows(&s);
+    let envs: Vec<String> = app
+        .session
+        .global_envs
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    // Nothing may be started while a value would send the run at a hole.
+    let ready = rows.iter().all(|r| r.problem.is_none());
+
+    // What the frame decided, applied once the modal closure has let go of
+    // everything it borrowed.
+    let mut set: Option<(String, String)> = None;
+    let mut browse: Option<(String, bool)> = None;
+    let mut leave: Option<Option<RunIntent>> = None;
+
+    let modal = egui::Modal::new(egui::Id::new("pt_run_settings")).show(ctx, |ui| {
+        ui.set_min_width(FORM_MAX_WIDTH);
+        ui.set_max_width(FORM_MAX_WIDTH);
+        ui.horizontal(|ui| {
+            // Sized like the title bar of every framed dialog in the app: a
+            // modal draws its own title, and a body-sized one reads as a
+            // stray line rather than as the name of the window.
+            ui.heading(RichText::new(s.param_view_title).color(th.text));
+            // A modal has no title bar to hang a close button off, so it gets
+            // its own: every dialog in the app can be left by the corner as
+            // well as by Escape.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(RichText::new(super::icons::CLOSE).color(th.dim))
+                    .clicked()
+                {
+                    leave = Some(None);
+                }
+            });
+        });
+        ui.colored_label(th.dim, s.param_view_lead);
+        ui.add_space(8.0);
+
+        // Capped so a long form scrolls inside the dialog rather than growing
+        // it past the window it is centred in.
+        egui::ScrollArea::vertical()
+            .max_height(420.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for row in &rows {
+                    if let Some((name, edit)) = param_card(ui, &th, row, &envs, &s) {
+                        match edit {
+                            CardEdit::Set(v) => set = Some((name, v)),
+                            CardEdit::Browse(folder) => browse = Some((name, folder)),
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            // The button that was pressed to get here comes first, so the
+            // dialog reads as the middle of the gesture that opened it rather
+            // than as a fork in it.
+            let run = |ui: &mut egui::Ui, leave: &mut Option<Option<RunIntent>>| {
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(format!("{} {}", super::icons::PLAY, s.gui_report_run)),
+                    )
+                    .clicked()
+                {
+                    *leave = Some(Some(RunIntent::Run));
+                }
+            };
+            let dry = |ui: &mut egui::Ui, leave: &mut Option<Option<RunIntent>>| {
+                if ui
+                    .add_enabled(
+                        ready,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            super::icons::PREVIEW,
+                            s.gui_report_dry_run
+                        )),
+                    )
+                    .on_hover_text(s.gui_report_dry_run_tooltip)
+                    .clicked()
+                {
+                    *leave = Some(Some(RunIntent::DryRun));
+                }
+            };
+            if intent == RunIntent::DryRun {
+                dry(ui, &mut leave);
+                run(ui, &mut leave);
+            } else {
+                run(ui, &mut leave);
+                dry(ui, &mut leave);
+            }
+            if ui.button(s.gui_cancel).clicked() {
+                leave = Some(None);
+            }
+            // Not the per-card message repeated: beside the disabled buttons
+            // the useful thing to say is what to do about it.
+            if !ready {
+                ui.colored_label(th.err, s.param_blocked_hint);
+            }
+        });
+    });
+    if modal.should_close() {
+        leave = Some(None);
+    }
+
+    if let Some((name, value)) = set {
+        ed.param_values.insert(name, value);
+    }
+    if let Some((name, folder)) = browse {
+        let seed = ed
+            .report
+            .path
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf);
+        let kind = if folder {
+            super::filepick::PickKind::Folder
+        } else {
+            super::filepick::PickKind::File {
+                filters: super::filepick::owned_filters(&[("*", &["*"])]),
+            }
+        };
+        app.request_pick(
+            kind,
+            s.param_pick_path,
+            seed.as_deref(),
+            super::menu::PickAction::ReportParamPath { name },
+        );
+    }
+    if let Some(started) = leave {
+        ed.params_modal = None;
+        // Answered: Run and Dry run both act at once from here on, so a preview
+        // can be followed straight by the run it previewed. `reparse` re-arms
+        // this if the questions themselves change.
+        if let Some(intent) = started {
+            ed.params_confirmed = true;
+            match intent {
+                RunIntent::Run => ed.start_run(app),
+                RunIntent::DryRun => ed.start_dry_run(app),
+                RunIntent::Review => {}
+            }
+        }
+    }
+}
+
+/// How wide the run settings form is allowed to grow. Wide enough for a long
+/// path, narrow enough that a label and its field stay in one glance.
+const FORM_MAX_WIDTH: f32 = 620.0;
+/// How wide a parameter's field is. Fixed rather than fitted to the value so a
+/// column of fields lines up — a form of ragged boxes reads as an accident.
+const PARAM_FIELD_WIDTH: f32 = 320.0;
+
+/// What a [`param_card`] asked for this frame.
+enum CardEdit {
+    Set(String),
+    /// Browse for a path; `true` for a folder.
+    Browse(bool),
+}
+
+/// One parameter's card: its question, its field, and its identity.
+///
+/// Returns the parameter's name with whatever the user did to it, so the caller
+/// can apply it once the borrow of the rows is over.
+fn param_card(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    row: &crate::report::params::ParamRow,
+    envs: &[String],
+    s: &Strings,
+) -> Option<(String, CardEdit)> {
+    use crate::report::flow::ParamKind;
+
+    // The hue of a substitution, because that is what a parameter becomes.
+    // Deepened when something is wrong, so an unanswered card is findable in a
+    // column of them without reading a word.
+    let hue = if row.problem.is_some() {
+        th.err
+    } else {
+        th.subst
+    };
+    let mut edit = None;
+    egui::Frame::NONE
+        .fill(mix(th.panel, hue, 0.10))
+        .stroke(egui::Stroke::new(1.0, mix(th.panel, hue, 0.45)))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .corner_radius(BLOCK_RADIUS as u8)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            // The question, and — pushed to the far side — what the script
+            // calls it. Someone filling the form in reads the left; someone
+            // cross-referencing the source reads the right.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&row.prompt).strong().color(th.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.colored_label(th.dim, row.kind.keyword());
+                    ui.label(
+                        RichText::new(&row.name)
+                            .monospace()
+                            .color(mix(th.dim, th.subst, 0.5)),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+
+            let mut value = row.value.clone();
+            let name = row.name.clone();
+            ui.horizontal(|ui| {
+                match &row.kind {
+                    ParamKind::Choice(options) if !options.is_empty() => {
+                        if param_combo(ui, th, &name, &mut value, options) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                    // Nothing loaded to choose between: typing a name by hand
+                    // still works, and is the right answer for an environment
+                    // that lives on another machine.
+                    ParamKind::Env if !envs.is_empty() => {
+                        if param_combo(ui, th, &name, &mut value, envs) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                    ParamKind::Folder | ParamKind::File => {
+                        if param_field(ui, &mut value, s.param_value_unset) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                        if ui
+                            .button(format!("{} {}", super::icons::FOLDER, s.gui_browse))
+                            .on_hover_text(s.param_pick_path)
+                            .clicked()
+                        {
+                            edit = Some((
+                                name.clone(),
+                                CardEdit::Browse(matches!(row.kind, ParamKind::Folder)),
+                            ));
+                        }
+                    }
+                    _ => {
+                        if param_field(ui, &mut value, s.param_value_unset) {
+                            edit = Some((name.clone(), CardEdit::Set(value.clone())));
+                        }
+                    }
+                }
+            });
+
+            if let Some(problem) = &row.problem {
+                ui.add_space(4.0);
+                ui.colored_label(th.err, format!("{}  {}", super::icons::WARNING, problem));
+            }
+        });
+    edit
+}
+
+/// A parameter's text field: fixed width, monospace, and hinted with what the
+/// run would use if it were left alone.
+fn param_field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> bool {
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            // Monospace for the same reason an inline field in the Blocks view
+            // is: what goes in here is the user's own text, not the editor's
+            // vocabulary, and the two shouldn't look alike.
+            .font(egui::TextStyle::Monospace)
+            .desired_width(PARAM_FIELD_WIDTH),
+    )
+    .changed()
+}
+
+/// A parameter's drop-down: the closed set of answers its type allows, plus
+/// whatever it is currently set to if that isn't one of them (a value from a
+/// remembered run, or an environment that isn't loaded today — hiding it would
+/// silently change what the run does). Returns true when the pick changed.
+fn param_combo(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    name: &str,
+    value: &mut String,
+    options: &[String],
+) -> bool {
+    let mut changed = false;
+    let known = options.iter().any(|o| o == value);
+    let shown = if value.is_empty() {
+        RichText::new("—").color(th.dim)
+    } else {
+        RichText::new(value.clone()).color(if known { th.text } else { th.pending })
+    };
+    egui::ComboBox::from_id_salt(("pt_param", name))
+        .width(PARAM_FIELD_WIDTH)
+        .selected_text(shown)
+        .show_ui(ui, |ui| {
+            // An unrecognised current value is offered back to itself so
+            // opening the list can't quietly discard it.
+            if !known && !value.is_empty() {
+                let cur = value.clone();
+                let _ = ui.selectable_label(true, RichText::new(cur).color(th.pending));
+            }
+            for o in options {
+                if ui.selectable_label(o == value, o).clicked() {
+                    *value = o.clone();
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // Reserve room for the diagnostics panel at the bottom, then let the editor
     // fill the rest. Keeping the editor above avoids nesting egui panels inside
@@ -1385,30 +3067,93 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     let avail = ui.available_height();
     let diag_h = ed.diag_h.clamp(48.0, (avail - 100.0).max(48.0));
     let edit_h = (avail - diag_h - 8.0).max(80.0);
-    let hl = highlight_ctx(ed, app);
+    let hl_ctx = highlight_ctx(ed, app);
+    let hl = &*hl_ctx;
     let spec = app.session.active_theme_spec();
     let th = app.theme;
-    // The layout job is rebuilt on every keystroke, so egui's galley cache is
-    // what keeps this cheap: an unchanged job hashes to the same key and the
-    // laid-out text is reused.
+    // `TextEdit` asks for a job every frame; re-tokenising the whole document
+    // that often is the expensive part, so it is cached and egui's galley cache
+    // still handles the layout itself.
+    let job_id = egui::Id::new("report_source_highlight");
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let job = highlight_job(buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        let job = cached_highlight_job(ui, job_id, buf.as_str(), &hl, &spec, &th, font, wrap_width);
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .max_height(edit_h)
         .show(ui, |ui| {
+            let te_id = ui.id().with("trail_source");
             let mut text = ed.report.text.clone();
+            // The code-editing keys are intercepted *before* the widget sees
+            // them: egui would insert a bare newline or a literal tab, so the
+            // only way to indent PaperTrail's way is to consume the key and
+            // perform the edit (caret included) ourselves. Modified variants are
+            // left alone — Ctrl/Cmd+Enter runs the report, and Shift+Enter stays
+            // a plain-newline escape hatch.
+            // Only intercept when there is a live cursor to work from: with no
+            // stored state we have no idea where the newline goes, so the key
+            // is left for egui rather than consumed and dropped on the floor.
+            let cursor = ui
+                .memory(|m| m.has_focus(te_id))
+                .then(|| egui::TextEdit::load_state(ui.ctx(), te_id))
+                .flatten()
+                .and_then(|s| s.cursor.char_range())
+                .map(|r| {
+                    let r = r.as_sorted_char_range();
+                    r.start.0..r.end.0
+                });
+            let mut new_cursor: Option<usize> = None;
+            let mut edited = false;
+            if let Some(range) = cursor
+                && let Some((next, caret)) = source_edit_key(ui, &text, range)
+            {
+                text = next;
+                new_cursor = Some(caret);
+                edited = true;
+            }
             let resp = ui.add(
                 egui::TextEdit::multiline(&mut text)
+                    .id(te_id)
+                    // Also locks focus, so Tab stays in the field (Escape is the
+                    // way out) — we just intercept it above to indent in spaces
+                    // rather than the literal `\t` egui would insert.
                     .code_editor()
                     .desired_width(f32::INFINITY)
                     .desired_rows(20)
                     .layouter(&mut layouter),
             );
-            if resp.changed() {
+            // A line that has just become `END` dedents to its opener. Done
+            // after the widget so it also catches the `END` the user typed by
+            // hand, not just the one a newline left behind.
+            if (edited || resp.changed())
+                && let Some(state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+            {
+                let at = new_cursor.unwrap_or_else(|| {
+                    state
+                        .cursor
+                        .char_range()
+                        .map(|r| r.primary.index.0)
+                        .unwrap_or(0)
+                });
+                if let Some((next, caret)) = snap_end_line(&text, at) {
+                    text = next;
+                    new_cursor = Some(caret);
+                    edited = true;
+                }
+            }
+            if let Some(caret) = new_cursor
+                && let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), te_id)
+            {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text_selection::CCursorRange::one(
+                        egui::text::CCursor::new(egui::text::CharIndex(caret)),
+                    )));
+                egui::TextEdit::store_state(ui.ctx(), te_id, state);
+            }
+            if edited || resp.changed() {
                 // Snapshot for undo only when transitioning from a saved
                 // baseline, to avoid one entry per keystroke.
                 if ed.undo.last().map(String::as_str) != Some(ed.report.text.as_str()) {
@@ -1432,6 +3177,18 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         let mut keep = true;
         ui.horizontal(|ui| {
             ui.colored_label(th.pending, app.strings.report_dry_run_preview_notice);
+            // A preview is read as "this is what would happen", so the answers
+            // it assumed belong beside it rather than only in the toolbar.
+            if !ed.result_params.is_empty() {
+                ui.colored_label(
+                    th.dim,
+                    format!(
+                        "{} {}",
+                        app.strings.param_previewed_with,
+                        summarize(&ed.result_params, &app.strings)
+                    ),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button(format!(
@@ -1456,37 +3213,10 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         return;
     }
 
-    ui.horizontal(|ui| {
-        if ed.is_running() {
-            ui.colored_label(
-                th.pending,
-                format!(
-                    "{} {}",
-                    super::icons::RUNNING,
-                    app.strings.gui_report_running
-                ),
-            );
-        }
-        if let Some(prog) = &ed.progress {
-            ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let has_rows = ed.result.as_ref().is_some_and(|r| !r.rows.is_empty());
-            let export = ui.add_enabled(
-                has_rows,
-                egui::Button::new(format!(
-                    "{} {}",
-                    super::icons::EXPORT,
-                    app.strings.gui_report_export
-                )),
-            );
-            if export.clicked() {
-                open_export_dialog(app);
-            }
-        });
-    });
-    ui.separator();
-
+    // The run's status and its Baseline/Export buttons live in the editor's one
+    // header row (see `report_header`), not in a strip of their own: this view
+    // is a table, and every line spent above it is a row of that table not
+    // being read.
     let Some(result) = ed.result.as_ref() else {
         ui.add_space(8.0);
         ui.colored_label(th.dim, app.strings.gui_report_no_results);
@@ -1501,6 +3231,10 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         .map(|f| f.header.clone())
         .unwrap_or_default();
     let columns = result.resolved_columns(&header);
+    // `DETAIL` columns leave the grid for the drill-down, exactly as they do in
+    // the export -- a column that vanished from one and not the other would
+    // look like a bug in whichever you noticed second.
+    let (grid_columns, detail_columns) = crate::report::detail::split_columns(&columns);
     if columns.is_empty() {
         ui.add_space(8.0);
         ui.colored_label(th.dim, app.strings.gui_report_no_results);
@@ -1516,10 +3250,748 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     let states = ed.progress.as_ref().map(|p| p.states.as_slice());
-    ui.colored_label(th.dim, app.strings.gui_report_cell_hint);
+
+    // The metric cards and the filter bar, the two things the interactive HTML
+    // export offers that reading the grid alone doesn't. Both are skipped while
+    // a run is streaming: the figures would be computed over a half-filled
+    // table and would tick misleadingly as rows land, and `visible_rows` drops
+    // pending rows, so filtering a live run would empty the very view you are
+    // watching.
+    let live = states.is_some();
+    if let Some(visible) = visible_for_view(
+        result,
+        &columns,
+        &header,
+        live,
+        &mut ed.results_filter,
+        &ed.results_find,
+    ) {
+        let metrics = result.metrics(&columns, &header);
+        let (filters, buttons) = crate::report::filter::all_filters(result, metrics.as_ref());
+        // The summary block scrolls inside a height of its own rather than
+        // pushing the grid off the bottom. A report with a matrix per
+        // ground-truthed column can otherwise leave no room at all for the rows
+        // the matrices describe.
+        let summary_h = ed
+            .summary_h
+            .clamp(60.0, (ui.available_height() - 120.0).max(60.0));
+        let mut filter = ed.results_filter;
+        let mut find = std::mem::take(&mut ed.results_find);
+        egui::ScrollArea::vertical()
+            .id_salt("pb_report_summary")
+            .max_height(summary_h)
+            // Vertical auto-shrink is left on so a report with no matrices
+            // doesn't reserve a band of empty space above its grid.
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if let Some(metrics) = &metrics {
+                    metric_cards(&th, ui, app, metrics);
+                }
+                filter_bar(
+                    &th,
+                    ui,
+                    app,
+                    &filters[..buttons],
+                    &mut filter,
+                    &mut find,
+                    visible.len(),
+                    result.rows.len(),
+                );
+                // The matrices sit under the bar they drive: a cell is itself a
+                // filter, and picking one selects exactly the rows that cell
+                // counted.
+                if let Some(metrics) = &metrics {
+                    for m in &metrics.columns {
+                        if let Some(matrix) = &m.matrix {
+                            confusion_matrix(
+                                &th,
+                                ui,
+                                app,
+                                &m.header,
+                                matrix,
+                                &filters,
+                                &mut filter,
+                            );
+                        }
+                    }
+                }
+            });
+        ed.results_filter = filter;
+        ed.results_find = find;
+        summary_splitter(&mut ed.summary_h, ui);
+        ui.colored_label(
+            th.dim,
+            app.strings
+                .gui_report_cell_hint
+                .replace("{c}", super::icons::CARET_RIGHT),
+        );
+        ui.add_space(2.0);
+        // A row whose panel is open still has to be *reachable*, so the grid
+        // gives up the height the reader dragged the panel to (defaulting to
+        // something a picture fits in) rather than the panel appearing
+        // off-screen below it.
+        let avail = ui.available_height();
+        let grid_h = if ed.results_detail.is_some() {
+            let panel = ed.detail_h.clamp(80.0, (avail - 120.0).max(80.0));
+            (avail - panel - 10.0).max(80.0)
+        } else {
+            avail
+        };
+        let mut open_detail = ed.results_detail;
+        let mut inspector = None;
+        ui.allocate_ui(egui::vec2(ui.available_width(), grid_h), |ui| {
+            inspector = results_grid(
+                &th,
+                ui,
+                result,
+                &grid_columns,
+                states,
+                Some(&visible),
+                &detail_columns,
+                &mut open_detail,
+            );
+        });
+        if let Some(ins) = inspector {
+            ed.inspector = Some(ins);
+        }
+        // A filtered-away row must not keep its panel open: the panel is the
+        // row's, and the row is no longer on screen to close it.
+        if open_detail.is_some_and(|r| !visible.contains(&r)) {
+            open_detail = None;
+        }
+        ed.results_detail = open_detail;
+        if let Some(r) = ed.results_detail {
+            detail_splitter(&mut ed.detail_h, ui);
+            detail_panel(
+                &th,
+                ui,
+                app,
+                result,
+                r,
+                &columns,
+                &detail_columns,
+                &mut ed.results_textures,
+                &mut ed.results_detail,
+            );
+        }
+        return;
+    }
+    ui.colored_label(
+        th.dim,
+        app.strings
+            .gui_report_cell_hint
+            .replace("{c}", super::icons::CARET_RIGHT),
+    );
     ui.add_space(2.0);
-    if let Some(ins) = results_grid(&th, ui, result, &columns, states) {
+    let mut none = None;
+    if let Some(ins) = results_grid(
+        &th,
+        ui,
+        result,
+        &grid_columns,
+        states,
+        None,
+        &detail_columns,
+        &mut none,
+    ) {
         ed.inspector = Some(ins);
+    }
+}
+
+/// A thin draggable handle between the results grid and an open drill-down.
+/// Dragging it up or down grows or shrinks the panel (`ed.detail_h`), which is
+/// saved with the rest of the GUI's geometry so a reader who wants a big
+/// picture pane keeps it between runs and between sessions.
+///
+/// Deliberately a copy of [`diag_splitter`]'s look rather than a shared widget:
+/// the two hold different fields with different clamps, and the drawing is four
+/// lines. Keep them in step by eye.
+fn detail_splitter(height: &mut f32, ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    if resp.dragged() {
+        // Dragging *up* makes the panel taller, since the panel is below the
+        // handle — the same sense as the diagnostics splitter.
+        *height = (*height - resp.drag_delta().y).clamp(80.0, 2000.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let w = (rect.width() * 0.25).clamp(40.0, 160.0);
+    let x0 = rect.center().x - w / 2.0;
+    ui.painter()
+        .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
+/// A thin draggable handle under the results view's summary block. Dragging it
+/// down gives the metric cards, filter bar and matrices more room before they
+/// start scrolling; dragging it up gives the room back to the grid.
+///
+/// Same shape as [`detail_splitter`], opposite sense: the pane this one sizes
+/// is *above* the handle, so dragging down grows it.
+fn summary_splitter(height: &mut f32, ui: &mut egui::Ui) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    if resp.dragged() {
+        *height = (*height + resp.drag_delta().y).clamp(60.0, 2000.0);
+    }
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    let active = resp.hovered() || resp.dragged();
+    let visuals = ui.visuals();
+    let colour = if active {
+        visuals.widgets.active.fg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let w = (rect.width() * 0.25).clamp(40.0, 160.0);
+    let x0 = rect.center().x - w / 2.0;
+    ui.painter()
+        .hline(x0..=x0 + w, rect.center().y, egui::Stroke::new(2.0, colour));
+}
+
+/// How many side-by-side columns a drill-down's sections should be laid out in.
+///
+/// Mirrors the interactive HTML export's `flex: 1 1 22rem; min-width: min(100%,
+/// 22rem)`: sections sit beside each other while each still gets a readable
+/// width, and fall back to a single column when the pane is narrow. Never more
+/// columns than there are sections, so two sections never leave a third of the
+/// pane empty.
+fn detail_layout_columns(avail: f32, min_w: f32, sections: usize) -> usize {
+    if sections == 0 {
+        return 1;
+    }
+    let fits = (avail / min_w).floor().max(1.0) as usize;
+    fits.min(sections).max(1)
+}
+
+/// The width a drill-down section wants before it is willing to share a row,
+/// the pixel equivalent of the HTML export's `22rem`.
+const DETAIL_MIN_SECTION_W: f32 = 340.0;
+
+/// One row's drill-down: its pictures at full size, its `DETAIL` columns in
+/// full, and a field-by-field diff against the baseline where there is one.
+///
+/// What goes in it is decided by [`crate::report::detail::sections`], the same
+/// call the HTML export makes, so the two panels can never show different
+/// things about the same row.
+#[allow(clippy::too_many_arguments)]
+fn detail_panel(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    result: &ReportResult,
+    r: usize,
+    all_columns: &[crate::report::model::OutputColumn],
+    detail_columns: &[&crate::report::model::OutputColumn],
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+    open: &mut Option<usize>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(
+                app.strings
+                    .report_detail_title
+                    .replace("{n}", &(r + 1).to_string()),
+            )
+            .strong()
+            .color(th.accent),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(super::icons::CLOSE).frame(false))
+                .on_hover_text(app.strings.report_detail_close)
+                .clicked()
+            {
+                *open = None;
+            }
+        });
+    });
+    egui::ScrollArea::vertical()
+        .id_salt("pb_report_detail")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let sections = crate::report::detail::sections(result, r, all_columns, detail_columns);
+            // Laid out across the pane rather than down it, exactly as the
+            // interactive HTML export does: a picture beside its response body
+            // is how the row is actually read, and stacking them buried the
+            // JSON a screen below a full-height photograph.
+            let n =
+                detail_layout_columns(ui.available_width(), DETAIL_MIN_SECTION_W, sections.len());
+            ui.columns(n, |cols| {
+                for (i, section) in sections.into_iter().enumerate() {
+                    // Round-robin, which for the first row of sections is the
+                    // same order the HTML's `flex-wrap` produces.
+                    let ui = &mut cols[i % n];
+                    detail_section(th, ui, app, r, section, textures);
+                    ui.add_space(6.0);
+                }
+            });
+        });
+}
+
+/// Draw one section of a row's drill-down into whichever column it landed in.
+fn detail_section(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    r: usize,
+    section: crate::report::detail::DetailSection<'_>,
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+) {
+    use crate::report::detail::DetailSection;
+    match section {
+        DetailSection::Image {
+            header,
+            image,
+            value,
+        } => {
+            ui.label(RichText::new(header).strong().color(th.accent));
+            detail_image(ui, textures, r, header, image, &value, app);
+        }
+        DetailSection::Text {
+            header,
+            value,
+            verdict,
+        } => {
+            // A `DETAIL` column carrying a `TRUTH` says whether it is right,
+            // exactly as its grid cell would have. The panel is where the
+            // value is actually read, so a heading that stayed neutral over a
+            // wrong answer would read as one nobody checked.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(header).strong().color(th.accent));
+                if let Some((v, truth)) = &verdict {
+                    let col = if *v == crate::report::model::Verdict::Correct {
+                        th.ok
+                    } else {
+                        th.err
+                    };
+                    ui.label(
+                        RichText::new(crate::report::detail::verdict_label(*v, truth))
+                            .strong()
+                            .color(col),
+                    );
+                }
+            });
+            // Monospace and selectable: a detail column is usually a
+            // response body, which is read by picking bits out of it.
+            ui.add(
+                egui::TextEdit::multiline(&mut value.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        DetailSection::Diff { header, fields } => {
+            ui.label(
+                RichText::new(app.strings.report_detail_changed.replace("{c}", header))
+                    .strong()
+                    .color(th.accent),
+            );
+            egui::Grid::new(("pb_detail_diff", header))
+                .striped(true)
+                .num_columns(3)
+                .show(ui, |ui| {
+                    for f in &fields {
+                        // Unchanged fields are kept and the changed
+                        // ones highlighted, so the reader can find
+                        // the field they care about either way.
+                        let col = if f.differs() { th.err } else { th.dim };
+                        ui.colored_label(col, &f.path);
+                        ui.colored_label(col, f.baseline.as_deref().unwrap_or("\u{2014}"));
+                        ui.colored_label(col, f.candidate.as_deref().unwrap_or("\u{2014}"));
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+}
+
+/// Draw one of a row's pictures, decoding and uploading it on first sight.
+///
+/// The decode is cached because the panel is redrawn on every frame it is open,
+/// and a report picture is a photograph -- decoding one sixty times a second is
+/// not a thing to do by accident.
+fn detail_image(
+    ui: &mut egui::Ui,
+    textures: &mut std::collections::HashMap<(usize, String), egui::TextureHandle>,
+    r: usize,
+    header: &str,
+    image: &crate::report::model::ImageData,
+    value: &str,
+    app: &GuiApp,
+) {
+    let key = (r, header.to_string());
+    let tex = textures.entry(key).or_insert_with(|| {
+        let colour = ::image::load_from_memory(&image.bytes)
+            .map(|i| {
+                let rgba = i.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+            })
+            // A picture PaperBoy embedded but egui cannot decode is a 1x1
+            // placeholder rather than a panic: the rest of the panel is still
+            // worth reading, and the cell text below says where it came from.
+            .unwrap_or_else(|_| egui::ColorImage::new([1, 1], vec![egui::Color32::TRANSPARENT]));
+        ui.ctx().load_texture(
+            format!("pb_detail_{r}_{header}"),
+            colour,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    // Shown as large as the panel allows, up to the picture's own size: this is
+    // the view the grid thumbnail cannot give, so shrinking it further would
+    // defeat the point of opening the row.
+    let natural = egui::vec2(tex.size()[0] as f32, tex.size()[1] as f32);
+    let scale = (ui.available_width() / natural.x).min(1.0);
+    ui.add(egui::Image::new((tex.id(), natural * scale)))
+        .on_hover_text(value);
+    // The caption is the picture's path, and it is read -- it says which file
+    // of a thousand this row is. At the small text style it was a grey line too
+    // fine to make out under a full-size photograph, so it is set at body size
+    // and selectable, so a path can be picked up and pasted somewhere useful.
+    // Laid out explicitly left-to-right rather than in the caller's layout:
+    // the drill-down's columns are *justified*, and a justified wrapped label
+    // spreads its first line's glyphs across the full width — which turned the
+    // path into `/ h o m e / j o n a…`.
+    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+        ui.add(egui::Label::new(RichText::new(value).color(ui.visuals().weak_text_color())).wrap());
+    });
+    let _ = app;
+}
+
+/// The rows the results view should show, or `None` to show every row
+/// unfiltered.
+///
+/// `None` while a run is `live`, deliberately: `visible_rows` drops pending
+/// rows, so filtering a streaming run would empty the very view being watched,
+/// and the metric figures would be computed over a half-filled table and tick
+/// misleadingly as rows land.
+///
+/// `selected` is clamped rather than validated: the set of filters worth
+/// offering comes from the result, so a selection made against an earlier
+/// result can point past the end of the current one.
+fn visible_for_view(
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+    header: &crate::report::flow::Header,
+    live: bool,
+    selected: &mut usize,
+    find: &str,
+) -> Option<Vec<usize>> {
+    if live {
+        return None;
+    }
+    // The *full* list, matrix cells included: a matrix cell is picked by index
+    // exactly as a button is, so clamping against the buttons alone would throw
+    // away every selection made by clicking the matrix.
+    let (filters, _) =
+        crate::report::filter::all_filters(result, result.metrics(columns, header).as_ref());
+    *selected = (*selected).min(filters.len().saturating_sub(1));
+    let labels = crate::report::labels::LabelMap::parse(&header.labels());
+    Some(crate::report::filter::visible_rows(
+        result,
+        columns,
+        &labels,
+        filters.get(*selected).unwrap_or(&RowFilter::All),
+        find,
+    ))
+}
+
+/// The results view's metric cards: the same figures the interactive HTML
+/// export leads with, drawn natively so a ground-truthed run can be judged
+/// without exporting it first.
+///
+/// The *labels* are translated here even though the exported document's are
+/// not: this is application chrome, and the reason the export stays English is
+/// that a shared file has no reader whose language is known.
+fn metric_cards(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    metrics: &crate::report::metrics::Metrics,
+) {
+    let tinted = |ui: &mut egui::Ui, k: &str, v: &str, colour: egui::Color32| {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(k).size(11.0).color(th.dim));
+                    ui.label(RichText::new(v).strong().color(colour));
+                });
+            });
+    };
+    let card = |ui: &mut egui::Ui, k: &str, v: &str| tinted(ui, k, v, th.text);
+
+    // How the run moved comes first when there is a baseline to have moved
+    // from: the accuracy cards below cannot tell a run that fixed three rows
+    // and broke three others from one that touched nothing.
+    if let Some(mv) = &metrics.movement {
+        ui.horizontal_wrapped(|ui| {
+            if mv.is_still() {
+                card(
+                    ui,
+                    app.strings.report_metric_movement,
+                    app.strings.report_metric_nothing_moved,
+                );
+            } else {
+                tinted(
+                    ui,
+                    app.strings.report_metric_fixed,
+                    &mv.fixed.to_string(),
+                    th.ok,
+                );
+                // The regression count is the one figure here anybody is
+                // scanning for, so it is the one that stays plain at zero: red
+                // on a `0` teaches the eye to ignore the colour.
+                tinted(
+                    ui,
+                    app.strings.report_metric_regressed,
+                    &mv.regressed.to_string(),
+                    if mv.regressed > 0 { th.err } else { th.text },
+                );
+            }
+            if mv.still_wrong > 0 {
+                card(
+                    ui,
+                    app.strings.report_metric_still_wrong,
+                    &mv.still_wrong.to_string(),
+                );
+            }
+        });
+        ui.add_space(2.0);
+    }
+    // The roll-up first when there is one -- it answers "did this run pass?",
+    // and the per-column breakdown is the follow-up question.
+    for m in metrics.overall.iter().chain(metrics.columns.iter()) {
+        ui.horizontal_wrapped(|ui| {
+            card(
+                ui,
+                &format!("{} — {}", m.header, app.strings.report_metric_compared),
+                &format!("{} / {}", m.compared, m.total),
+            );
+            card(
+                ui,
+                app.strings.report_metric_incorrect,
+                &m.incorrect.to_string(),
+            );
+            card(
+                ui,
+                app.strings.report_metric_accuracy,
+                m.accuracy_text().as_deref().unwrap_or("\u{2014}"),
+            );
+        });
+        ui.add_space(2.0);
+    }
+}
+
+/// One column's confusion matrix as a heatmap: truth down the side, the value
+/// the run produced across the top.
+///
+/// Every non-empty cell is a button that selects the rows it counted — "which
+/// seven rows are those?" is the first question anyone asks of an off-diagonal
+/// count, and the alternative is reading the grid looking for them by hand.
+///
+/// The shading comes from [`crate::report::metrics::heat_rgb`], the same ramp
+/// the HTML export uses, so one matrix cannot come out looking like two.
+#[allow(clippy::too_many_arguments)]
+fn confusion_matrix(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    column: &str,
+    matrix: &crate::report::metrics::ConfusionMatrix,
+    filters: &[RowFilter],
+    selected: &mut usize,
+) {
+    let max = matrix.max();
+    // A matrix is read by comparing cells, which needs them big enough to scan
+    // at a glance: at body size the counts and their axis labels were a grid of
+    // small grey numbers. Sized off the body height so it still follows the
+    // app's text scale rather than being pinned to a pixel count.
+    let base = ui.text_style_height(&egui::TextStyle::Body);
+    let cell_font = base * 1.15;
+    let axis_font = base * 1.0;
+    // Every cell the same width, so a column of counts lines up and the block
+    // of colour reads as a heatmap rather than as ragged boxes.
+    let cell_w = (base * 3.2).max(
+        matrix
+            .axis
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1) as f32
+            * base
+            * 0.45,
+    );
+    egui::CollapsingHeader::new(RichText::new(column).strong().size(base * 1.1))
+        .id_salt(("pb_matrix", column))
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new(("pb_matrix_grid", column))
+                .spacing(egui::vec2(2.0, 2.0))
+                .show(ui, |ui| {
+                    ui.label("");
+                    for label in &matrix.axis {
+                        cell_slot(ui, cell_w, base, |ui| {
+                            ui.label(RichText::new(label).color(th.dim).size(axis_font));
+                        });
+                    }
+                    ui.end_row();
+                    for (t, truth) in matrix.axis.iter().enumerate() {
+                        ui.label(RichText::new(truth).color(th.dim).size(axis_font));
+                        for (p, answer) in matrix.axis.iter().enumerate() {
+                            let n = matrix.counts[t][p];
+                            let ([r, g, b], hot) =
+                                crate::report::metrics::heat_rgb(n, max);
+                            let fg = if hot {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::from_rgb(0x12, 0x30, 0x5a)
+                            };
+                            // An empty cell counted nothing, so there is
+                            // nothing for it to show -- it stays a plain
+                            // number rather than a button that selects no rows.
+                            let pick = (n > 0)
+                                .then(|| {
+                                    filters.iter().position(|f| {
+                                        matches!(
+                                            f,
+                                            RowFilter::MatrixCell { column: c, truth: tr, answer: a }
+                                            if c == column && tr == truth && a == answer
+                                        )
+                                    })
+                                })
+                                .flatten();
+                            let framed = egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(r, g, b))
+                                .inner_margin(egui::Margin::symmetric(6, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(cell_w);
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(n.to_string())
+                                                    .color(fg)
+                                                    .size(cell_font),
+                                            )
+                                            .selectable(false),
+                                        );
+                                    });
+                                });
+                            // The *cell* is the target, not the digits in it. A
+                            // sense on the label alone made the clickable area
+                            // the width of the number -- so a "7" was a few
+                            // pixels wide in the middle of a large block of
+                            // colour that looked like a button and wasn't.
+                            // Interacted after the frame is drawn, so it sits
+                            // over the whole painted cell; there is nothing
+                            // interactive inside for it to steal a click from.
+                            let cell = framed.response.rect;
+                            if let Some(i) = pick {
+                                let resp = ui.interact(
+                                    cell,
+                                    ui.id().with(("pb_matrix_cell", column, t, p)),
+                                    egui::Sense::click(),
+                                );
+                                if resp
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(app.strings.help_report_matrix_cell)
+                                    .clicked()
+                                {
+                                    *selected = i;
+                                }
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            let clean = if matrix.is_diagonal() {
+                app.strings.report_matrix_all_matched
+            } else {
+                ""
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} {clean}",
+                    app.strings
+                        .report_matrix_caption
+                        .replace("{n}", &matrix.total().to_string())
+                ))
+                .color(th.dim)
+                .size(axis_font * 0.95),
+            );
+        });
+    ui.add_space(2.0);
+}
+
+/// The row-filter buttons, the find box and the row count.
+///
+/// The buttons are drawn only when there is more than one -- `available` always
+/// offers `All`, and a lone `All` is a control whose only possible effect is the
+/// state it is already in (the HTML export hides it for the same reason). The
+/// find box and count are always drawn: those help in any report.
+#[allow(clippy::too_many_arguments)]
+fn filter_bar(
+    th: &GuiTheme,
+    ui: &mut egui::Ui,
+    app: &GuiApp,
+    filters: &[RowFilter],
+    selected: &mut usize,
+    find: &mut String,
+    shown: usize,
+    total: usize,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if filters.len() > 1 {
+            for (i, f) in filters.iter().enumerate() {
+                if ui
+                    .selectable_label(i == *selected, filter_label(&app.strings, f))
+                    .on_hover_text(app.strings.help_report_filter)
+                    .clicked()
+                {
+                    *selected = i;
+                }
+            }
+            ui.separator();
+        }
+        ui.add(
+            egui::TextEdit::singleline(find)
+                .desired_width(180.0)
+                .hint_text(app.strings.report_find_placeholder),
+        );
+        ui.colored_label(
+            th.dim,
+            app.strings
+                .report_rows_shown
+                .replace("{shown}", &shown.to_string())
+                .replace("{total}", &total.to_string()),
+        );
+    });
+    ui.add_space(2.0);
+}
+
+/// A filter's button text in the user's language.
+///
+/// [`RowFilter::label`] is deliberately English -- it names buttons in an
+/// exported document that is read by whoever it is sent to -- so the in-app bar
+/// translates the fixed filters here and falls back to that label for a matrix
+/// cell, whose text is the report's own data and so is not translatable.
+fn filter_label(s: &crate::i18n::Strings, f: &RowFilter) -> String {
+    match f {
+        RowFilter::All => s.report_filter_all.to_string(),
+        RowFilter::Differ => s.report_filter_differences.to_string(),
+        RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
+        RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::MatrixCell { .. } => f.label(),
     }
 }
 
@@ -1593,8 +4065,20 @@ fn results_grid(
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     states: Option<&[RowState]>,
+    visible: Option<&[usize]>,
+    detail_columns: &[&crate::report::model::OutputColumn],
+    open_detail: &mut Option<usize>,
 ) -> Option<CellInspector> {
     let show_icons = states.is_some();
+    // The expander column is offered only when *some* row has something to
+    // drill into: on a run with no pictures and no `DETAIL` columns it would be
+    // a column of blanks.
+    let expandable: std::collections::HashSet<usize> = (0..result.rows.len())
+        .filter(|&r| {
+            !crate::report::detail::sections(result, r, columns, detail_columns).is_empty()
+        })
+        .collect();
+    let show_expanders = !expandable.is_empty();
     let mut opened: Option<CellInspector> = None;
     let widths = fitted_column_widths(ui, result, columns, show_icons);
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
@@ -1606,7 +4090,11 @@ fn results_grid(
                 .striped(true)
                 .spacing(egui::vec2(SPACING_X, 3.0))
                 .show(ui, |ui| {
-                    // Header row.
+                    // Header row. The expander column comes first, where a
+                    // tree control's twisty lives.
+                    if show_expanders {
+                        ui.label(" ");
+                    }
                     if show_icons {
                         ui.label(" ");
                     }
@@ -1624,9 +4112,84 @@ fn results_grid(
                     }
                     ui.end_row();
 
-                    // Data rows.
-                    for (i, row) in result.rows.iter().enumerate() {
+                    // Data rows. `visible` is the filtered row order when the
+                    // view is filtering; the column widths are still measured
+                    // over *every* row, so narrowing the rows doesn't make the
+                    // table jump about as the reader types in the find box.
+                    let order: Vec<usize> = match visible {
+                        Some(v) => v.to_vec(),
+                        None => (0..result.rows.len()).collect(),
+                    };
+                    for i in order {
+                        let Some(row) = result.rows.get(i) else {
+                            continue;
+                        };
                         let state = states.and_then(|s| s.get(i)).copied();
+                        // A click anywhere on the row opens its drill-down --
+                        // including the gaps between columns, and the empty
+                        // space inside a column that its text doesn't fill. The
+                        // target is reserved *before* the cells so the cells,
+                        // added after, still win where they overlap it (egui
+                        // hit-tests in favour of the later widget), which keeps
+                        // each cell's own hover text and its inspector click.
+                        // Its size is known up front: the widths were measured
+                        // before the loop.
+                        let row_target = expandable.contains(&i).then(|| {
+                            let w: f32 = widths.iter().sum::<f32>()
+                                + SPACING_X * widths.len() as f32
+                                + if show_expanders { 24.0 } else { 0.0 }
+                                + if show_icons { 18.0 + SPACING_X } else { 0.0 };
+                            let rect =
+                                egui::Rect::from_min_size(ui.cursor().min, egui::vec2(w, row_h));
+                            let r = ui.interact(
+                                rect,
+                                ui.id().with(("pb_result_row", i)),
+                                egui::Sense::click(),
+                            );
+                            // The pointing hand has to cover the whole row, not
+                            // just the words in it. `hovered()` is no use here:
+                            // the cells are drawn after this target and take the
+                            // hover from it wherever they overlap -- over their
+                            // own text, which is exactly the part that most
+                            // looks clickable. `contains_pointer` doesn't care
+                            // who is on top, so the cursor stays a hand all the
+                            // way across.
+                            if r.contains_pointer() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            r
+                        });
+                        if show_expanders {
+                            let has = expandable.contains(&i);
+                            let open = *open_detail == Some(i);
+                            // A row with nothing to drill into gets a blank
+                            // rather than a caret that opens an empty panel.
+                            if has {
+                                let glyph = if open {
+                                    super::icons::CARET_DOWN
+                                } else {
+                                    super::icons::CARET_RIGHT
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(RichText::new(glyph).color(if open {
+                                            th.accent
+                                        } else {
+                                            th.dim
+                                        }))
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    // Clicking the open row's caret closes it,
+                                    // so the panel can be got rid of the same
+                                    // way it was opened.
+                                    *open_detail = (!open).then_some(i);
+                                }
+                            } else {
+                                ui.label(" ");
+                            }
+                        }
                         if show_icons {
                             let (glyph, colour) = match state {
                                 Some(RowState::Running) => (super::icons::RUNNING, th.pending),
@@ -1645,15 +4208,33 @@ fn results_grid(
                             let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
                             cell_slot(ui, w, row_h, |ui| {
                                 if let Some(ins) = result_cell(ui, text_col, &col.header, &full) {
-                                    opened = Some(ins);
+                                    // Clicking anywhere in a row that has a
+                                    // drill-down opens it: the panel is the
+                                    // fuller answer to "what is this row?" than
+                                    // one cell's text, and it is what the
+                                    // interactive HTML export does too. A row
+                                    // with nothing to drill into keeps the cell
+                                    // inspector, which is otherwise the only
+                                    // way to read a truncated value.
+                                    if expandable.contains(&i) {
+                                        *open_detail = Some(i);
+                                    } else {
+                                        opened = Some(ins);
+                                    }
                                 }
                             });
+                        }
+                        if row_target.is_some_and(|r| r.clicked()) {
+                            *open_detail = Some(i);
                         }
                         ui.end_row();
                     }
 
                     // STATISTICS summary rows (a footer, distinguished by italic accent).
                     for srow in result.summary_rows(columns) {
+                        if show_expanders {
+                            ui.label(" ");
+                        }
                         if show_icons {
                             ui.label(" ");
                         }
@@ -1688,36 +4269,108 @@ fn results_grid(
     opened
 }
 
-/// The gap left between a tethered chip and the chip it qualifies. Narrower
-/// than the normal inter-chip spacing, so the pair reads as one thing before
-/// the bracket is even noticed.
-const TETHER_GAP: f32 = 2.0;
-
-/// Draw the bracket joining a tethered chip to the chip it qualifies.
+/// The gap left between a tethered chip and the chip it qualifies: none, so the
+/// two sit flush and their touching borders form the divider of a single
+/// segmented pill (see [`link_tethers`]).
 ///
-/// A shallow staple above *and* below the pair: each starts over the anchor,
-/// steps out past the chips and runs along to the far edge of the hanger. The
-/// mirrored pair reads as a single bracket enclosing the two chips, which is
-/// much easier to spot in a long row than one lone line underneath. Drawn
-/// *outside* the chips rather than as a box around them so it can't be confused
-/// with the border that marks a request and its `WITH` fields as one droppable
-/// unit — this is an annotation, not a block boundary.
-fn paint_tether(painter: &egui::Painter, th: &GuiTheme, anchor: egui::Rect, hanger: egui::Rect) {
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.text, 0.55));
-    let drop = 3.0;
-    let left = anchor.center().x;
-    let right = hanger.right() - 2.0;
-    // `dir` is which way the staple steps away from the chips: +1 below, -1
-    // above. The union covers both chips even when they differ in height.
-    for (dir, edge) in [
-        (1.0, anchor.bottom().max(hanger.bottom()) + 2.0),
-        (-1.0, anchor.top().min(hanger.top()) - 2.0),
-    ] {
-        let near = edge - drop * dir;
-        painter.line_segment([egui::pos2(left, near), egui::pos2(left, edge)], stroke);
-        painter.line_segment([egui::pos2(left, edge), egui::pos2(right, edge)], stroke);
-        painter.line_segment([egui::pos2(right, edge), egui::pos2(right, near)], stroke);
+/// Applied while laying out the *anchor*, not the tethered chip. egui advances
+/// the cursor — spacing included — as each widget is allocated, so the gap
+/// between two chips is the one in effect when the **first** of them was added;
+/// narrowing it just before the second has no effect on the space already left
+/// behind it.
+const TETHER_GAP: f32 = 0.0;
+
+/// The corner radius of a chip.
+///
+/// Small on purpose. A large radius reads as a soft, toy-like pill; the shallow
+/// one here still says "this is a discrete object you can pick up" without the
+/// bubbliness. It is the single number most responsible for how playful or how
+/// businesslike the flow looks, so it is worth keeping deliberately low.
+const CHIP_RADIUS: u8 = 3;
+
+/// Fully rounded corners, for a chip that never joins a neighbour.
+const ROUND_CHIP: egui::CornerRadius = egui::CornerRadius::same(CHIP_RADIUS);
+
+/// The corner radii for a chip, squaring off whichever edge it shares with a
+/// tethered neighbour so the pair is drawn as one pill split into segments
+/// rather than as two separate chips that happen to be adjacent.
+fn chip_corners(chip: &Chip) -> egui::CornerRadius {
+    let joined = |yes: bool| if yes { 0 } else { CHIP_RADIUS };
+    egui::CornerRadius {
+        nw: joined(chip.join_prev),
+        sw: joined(chip.join_prev),
+        ne: joined(chip.join_next),
+        se: joined(chip.join_next),
     }
+}
+
+/// Work out how each tethered chip joins the chip it qualifies.
+///
+/// A tethered chip is drawn as the right-hand segment of a single pill: the
+/// pair sits flush, the anchor keeps its rounded left corners and squares off
+/// its right, and the hanger mirrors it, so one outline encloses both and their
+/// touching borders read as a divider. Segmented controls and breadcrumbs
+/// already teach that shape as "one control in two parts". The bracket this
+/// replaces was drawn *beside* the chips, and a thin line in a muted grey read
+/// as decoration — it never said which of the two owned the other.
+///
+/// Only the shape changes: each chip keeps the colour its own kind always has,
+/// so a `SHOW` is recognisable as a `SHOW` wherever it appears. Restating the
+/// ownership in the hue as well would trade that away for something the pill
+/// already says.
+fn link_tethers(chips: &mut [Chip]) {
+    for i in 1..chips.len() {
+        if !chips[i].tethered {
+            continue;
+        }
+        chips[i - 1].join_next = true;
+        chips[i].join_prev = true;
+    }
+}
+
+/// Undo the join between `chips[i - 1]` and `chips[i]`, restoring both the
+/// rounded corners and the normal inter-chip gap.
+///
+/// Used where the pair is about to stop being adjacent: either half is in hand,
+/// or a hovering clause is about to be dropped between them. Merging across
+/// that gap would say "these two are one thing" at exactly the moment the user
+/// is separating them, and would leave a squared-off edge facing an empty slot.
+fn split_tether(chips: &mut [Chip], i: usize) {
+    chips[i - 1].join_next = false;
+    chips[i].join_prev = false;
+    chips[i].tethered = false;
+}
+
+/// Highlight both halves of a tethered pair while the pointer is over either of
+/// them: a single outline around the two, which answers "what does this SHOW
+/// belong to?" the moment the user goes looking, without adding anything to the
+/// resting state of an already-busy line.
+fn paint_tether_hover(ui: &egui::Ui, th: &GuiTheme, anchor: egui::Rect, hanger: egui::Rect) {
+    let pair = anchor.union(hanger);
+    // Suppressed mid-drag: the pointer is then carrying something, and an
+    // outline under it reads as a drop target rather than as an explanation.
+    if ui.ctx().dragged_id().is_some() || !ui.rect_contains_pointer(pair) {
+        return;
+    }
+    // Also suppressed when the pointer is on a chip that a drag would lift on
+    // its own: that chip gets its own outline (see `record_chip_hover`), and
+    // two nested outlines around the same pointer say two different things
+    // about what letting go would do. Resting on the *anchor* still draws the
+    // pair, which is where "what does this belong to?" is actually asked.
+    if ui
+        .ctx()
+        .data(|d| d.get_temp::<Option<egui::Rect>>(chip_hover_id()))
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    ui.painter().rect_stroke(
+        pair.expand(2.0),
+        egui::CornerRadius::same(CHIP_RADIUS + 2),
+        egui::Stroke::new(1.0, mix(th.panel, th.text, 0.75)),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Horizontal spacing between the grid's columns.
@@ -1734,9 +4387,104 @@ fn fitted_column_widths(
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
     let icon_w = if show_icons { 18.0 + SPACING_X } else { 0.0 };
-    let natural = natural_column_widths(ui, result, columns);
+    let natural = cached_natural_widths(ui, result, columns);
     let avail = (ui.available_width() - icon_w).max(0.0);
+    // Fitting is pure arithmetic over the naturals, so it stays uncached and
+    // the grid still follows the window as it is dragged.
     fit_column_widths(&natural, avail, SPACING_X)
+}
+
+/// [`natural_column_widths`], reused between frames while nothing it depends on
+/// has changed.
+///
+/// Measuring is not cheap — a `String` per cell, a text layout per column, and
+/// a full pass over the summary rows — and the grid is redrawn on every frame,
+/// including the ones where all that happened was the mouse moving. The widths
+/// only depend on the values, the columns and the font, so they are kept in
+/// egui's own per-frame memory (rather than on `ReportEditor`) because the grid
+/// is drawn by free functions that are also called from the dry-run preview and
+/// from tests.
+fn cached_natural_widths(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> Vec<f32> {
+    let key = widths_fingerprint(ui, result, columns);
+    let id = egui::Id::new("report_grid_widths");
+    if let Some((cached_key, widths)) = ui.data(|d| d.get_temp::<(u64, Vec<f32>)>(id))
+        && cached_key == key
+    {
+        return widths;
+    }
+    let widths = natural_column_widths(ui, result, columns);
+    ui.data_mut(|d| d.insert_temp(id, (key, widths.clone())));
+    widths
+}
+
+/// FNV-1a's starting value.
+pub(super) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over `bytes`, continuing from `seed`.
+///
+/// Used instead of a `DefaultHasher` per cell in [`widths_fingerprint`]: the
+/// fingerprint runs over every cell of the table on every frame, and building a
+/// SipHash state for each of tens of thousands of cells costs more than hashing
+/// their bytes does. This is not a hash anyone attacks — it guards a cache of
+/// column widths — so the cheap mixing function is the right one.
+pub(super) fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+    let mut h = seed;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Everything [`natural_column_widths`] reads, in one number.
+///
+/// This hashes the cell *text* rather than something cheaper like the row
+/// count, because a streaming run replaces rows in place: the grid is built as
+/// a skeleton of empty rows and each one is overwritten as its result arrives,
+/// so a key that only counted rows would pin the columns at the width of an
+/// empty table for the whole run. Hashing the text is still far less work than
+/// laying it out — no allocation, one pass — which is what makes the cache
+/// worth having rather than a second copy of the same cost.
+///
+/// **Maintenance:** anything `natural_column_widths` starts reading has to be
+/// added here too, or the widths will stop following it.
+fn widths_fingerprint(
+    ui: &egui::Ui,
+    result: &ReportResult,
+    columns: &[crate::report::model::OutputColumn],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // The font decides how wide any of it renders.
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    font.size.to_bits().hash(&mut h);
+    format!("{:?}", font.family).hash(&mut h);
+    result.no_match_marker.hash(&mut h);
+    for col in columns {
+        col.header.hash(&mut h);
+        // A column's own definition decides what it pulls out of each row, and
+        // its statistics decide whether there are summary rows to measure.
+        format!("{:?}", col.stats).hash(&mut h);
+        format!("{:?}", col.sources).hash(&mut h);
+    }
+    result.rows.len().hash(&mut h);
+    for row in &result.rows {
+        // `cells` and `vars` are hash maps, so their iteration order changes
+        // from run to run. Combining each entry's hash with `^` makes the
+        // fingerprint depend on the contents and not on the order they come
+        // out in — the same trap that made the validation panel flicker.
+        let mut cells = 0u64;
+        for (k, v) in row.cells.iter().chain(&row.vars) {
+            cells ^= fnv1a(k.as_bytes(), fnv1a(v.as_bytes(), FNV_OFFSET));
+        }
+        cells.hash(&mut h);
+        row.target.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Lay a cell's content out in a slot exactly `w` wide.
@@ -1772,6 +4520,10 @@ fn natural_column_widths(
     columns: &[crate::report::model::OutputColumn],
 ) -> Vec<f32> {
     let font = egui::TextStyle::Body.resolve(ui.style());
+    // Computed once, not once per column: `summary_rows` walks every row of
+    // every column, so calling it inside the per-column loop below made finding
+    // the widths quadratic in the number of columns.
+    let summary = result.summary_rows(columns);
     // Leave room for the cell's own padding so text isn't flush against the
     // next column.
     let pad = 6.0;
@@ -1801,7 +4553,7 @@ fn natural_column_widths(
                     &col.value(row, &result.no_match_marker),
                 )));
             }
-            for srow in result.summary_rows(columns) {
+            for srow in &summary {
                 consider(truncate_cell(&flatten_cell(&srow.text_cell(c))));
             }
             measure(&col.header).max(measure(&longest))
@@ -1874,7 +4626,35 @@ fn truncate_cell(value: &str) -> String {
 /// defaulting to a `.csv` beside the report (or in the current dir for a scratch
 /// report).
 fn open_export_dialog(app: &mut GuiApp) {
-    super::menu::save_via_picker(app, super::app::SaveKind::ReportResults);
+    // Seeded with the name the report's own `# output:` directive asks for, so
+    // the common case is press-Export-and-done.
+    let path = app
+        .report_editor
+        .as_ref()
+        .map(|e| {
+            let p = crate::report::writer::export_path(
+                &e.report,
+                &crate::report::writer::report_output_extension(&e.report),
+            );
+            // A saved report exports beside itself, so `export_path` already
+            // gives an absolute name. A scratch report gives a bare filename,
+            // which would land wherever PaperBoy happens to have been started
+            // from -- anchor it to the report's own base directory, the folder
+            // the terminal UI's picker opens in.
+            if p.is_absolute() {
+                p
+            } else {
+                crate::report::context::report_base_dir(
+                    &e.flow.clone().unwrap_or_default(),
+                    e.report.path.as_deref(),
+                )
+                .0
+                .join(p)
+            }
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "results.csv".to_string());
+    app.dialog = Some(super::app::Dialog::ExportResults { path });
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.
@@ -1900,16 +4680,17 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         &flow,
         ed.report.path.as_deref(),
     );
-    let titles: Vec<String> = bound
-        .map(|ci| {
-            app.session.collections[ci]
-                .entries
-                .iter()
-                .map(|e| e.title.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    let resolves = |name: &str| titles.iter().any(|t| t == name);
+    let entries = bound
+        .map(|ci| app.session.collections[ci].entries.as_slice())
+        .unwrap_or(&[]);
+    let choices = context::request_choices(entries, &ed.helpers);
+    // Primary collection first (guaranteed by `request_choices`), so a newly
+    // dropped REQUEST block — which seeds itself from the first title — never
+    // defaults to a helper.
+    let titles: Vec<String> = choices.iter().map(|c| c.qualified.clone()).collect();
+    let helpers = ed.helpers.clone();
+    let resolves =
+        move |name: &str| crate::report::run::resolve_qualified(entries, &helpers, name).is_some();
     let rows = flatten(&flow, &resolves);
 
     let mut acts: Vec<Act> = Vec::new();
@@ -1940,7 +4721,10 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             .on_hover_text(app.strings.gui_report_move_up)
             .clicked()
         {
-            acts.push(Act::MoveUp);
+            acts.push(Act::Move {
+                path: ed.selection.clone(),
+                up: true,
+            });
         }
         if ui
             .add_enabled(
@@ -1950,7 +4734,10 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             .on_hover_text(app.strings.gui_report_move_down)
             .clicked()
         {
-            acts.push(Act::MoveDown);
+            acts.push(Act::Move {
+                path: ed.selection.clone(),
+                up: false,
+            });
         }
         if ui
             .add_enabled(
@@ -1963,7 +4750,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             )
             .clicked()
         {
-            acts.push(Act::Delete);
+            acts.push(Act::DeletePath(ed.selection.clone()));
         }
     });
     ui.separator();
@@ -2024,15 +4811,22 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                         header_strip(ed, app, ui, &mut acts);
                         ui.add_space(4.0);
                         let mut lift = DragLift::default();
+                        let mut hovers: Vec<RowHover> = Vec::new();
                         for (i, row) in rows.iter().enumerate() {
                             let selected = row.path == ed.selection
                                 && (row.kind != RowKind::LoopEnd || ed.selection.is_empty());
                             let drop_pos = insert_pos_after(&rows, i);
-                            block_row(
+                            if let Some(h) = block_row(
                                 ed, app, ui, row, i, selected, &drop_pos, &titles, &mut lift,
                                 &mut acts,
-                            );
+                            ) {
+                                hovers.push(h);
+                            }
                         }
+                        // Now that every row has been measured, light the block
+                        // under the pointer and everything a drag would take
+                        // with it (see `paint_hover_group`).
+                        paint_hover_group(ui, &th, &hovers);
                         // A report with no steps is where every new report
                         // starts, and an empty gap between BEGIN and END says
                         // nothing about what to do next — the palette's own
@@ -2068,7 +4862,7 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     // Delete key removes the selection (but not while a text field has focus).
     let typing = ui.memory(|m| m.focused().is_some());
     if !typing && !ed.selection.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-        acts.push(Act::Delete);
+        acts.push(Act::DeletePath(ed.selection.clone()));
     }
 
     // The delete drop target lives here — a distinct full-width bar that only
@@ -2166,7 +4960,7 @@ fn trash_bar(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         .fill(mix(th.panel, th.err, 0.14))
         .stroke(egui::Stroke::new(1.0, mix(th.panel, th.err, 0.5)))
         .inner_margin(egui::Margin::symmetric(8, 8))
-        .corner_radius(6);
+        .corner_radius(BLOCK_RADIUS as u8);
     let resp = frame
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2206,14 +5000,14 @@ fn trash_bar(app: &GuiApp, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
 }
 
 /// One rounded, category-tinted palette chip.
+///
+/// Drawn through [`chip_shell`] rather than its own frame so a palette entry and
+/// the chip it drops into the flow are the same object visually — same rule,
+/// same tint, same corners. They differ only in that the palette chip is inert.
 fn palette_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, base: Color32) {
-    let frame = egui::Frame::NONE
-        .fill(mix(th.panel, base, 0.22))
-        .stroke(egui::Stroke::new(1.0, mix(th.panel, base, 0.5)))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .corner_radius(6);
-    frame.show(ui, |ui| {
-        ui.add(egui::Label::new(RichText::new(text).color(base)).selectable(false));
+    let tint = chip_tint(th, base);
+    chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).color(tint.text)).selectable(false));
     });
 }
 
@@ -2261,11 +5055,31 @@ fn release_payload<T: std::any::Any + Send + Sync>(
     resp.dnd_release_payload::<T>()
 }
 
-/// Widths of the inline editors embedded in a chip. Shared by the real chip and
-/// by the same-sized placeholder a pending drop draws (see [`Chip::ghost_shape`])
-/// so the two can't drift apart.
+/// Minimum widths of the inline editors embedded in a chip. Each field grows
+/// past this to fit what is actually in it (see [`fitted_field_width`]) and
+/// stops at [`FIELD_MAX_WIDTH`]; these are the resting sizes an empty box takes,
+/// and what the same-sized placeholder a pending drop draws uses (see
+/// [`Chip::ghost_shape`]) so the two can't drift apart.
 const ALIAS_FIELD_WIDTH: f32 = 96.0;
 const PARALLEL_FIELD_WIDTH: f32 = 44.0;
+/// A loop variable is an identifier, and short ones are the convention.
+const LOOP_VAR_FIELD_WIDTH: f32 = 72.0;
+/// A folder path is the longest thing on a loop head, and the one most worth
+/// being able to read without scrolling the row.
+const LOOP_PATH_FIELD_WIDTH: f32 = 150.0;
+const LOOP_GLOB_FIELD_WIDTH: f32 = 84.0;
+/// How wide any inline field is allowed to grow to fit its contents.
+///
+/// A deep folder path would otherwise push a loop head past the width of the
+/// pane and put the rest of the statement out of sight. Past this the box
+/// scrolls internally, which is the old behaviour — but now only for the
+/// genuinely long values rather than for almost all of them.
+const FIELD_MAX_WIDTH: f32 = 320.0;
+/// The folder/file picker button beside a loop's path box.
+///
+/// Wider than the glyph needs because the button now carries a frame: it looked
+/// like decoration when drawn flat, and users didn't discover it was a button.
+const PICKER_BUTTON_WIDTH: f32 = 28.0;
 /// A combo chip's dropdown grows to fit its text, which the ghost already spells
 /// out; this is just the arrow and its padding.
 const COMBO_CHIP_WIDTH: f32 = 24.0;
@@ -2304,6 +5118,37 @@ fn dragged_chip(ctx: &egui::Context) -> Option<(Vec<usize>, DetachWhich)> {
 /// therefore lifts only itself; a loop lifts its whole body in one piece.
 fn row_is_lifted(dragged: &[usize], row_path: &[usize]) -> bool {
     row_path.starts_with(dragged)
+}
+
+/// How strongly a row is highlighted while the pointer rests on a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HoverTier {
+    /// The hovered block itself. A `FOR` loop is *two* rows at this tier — its
+    /// header and its `END` — because those are the two halves of one block, and
+    /// lighting only the half under the pointer made a loop look like it ended
+    /// somewhere it doesn't.
+    Block,
+    /// A row that isn't the block but travels with it: the body of a hovered
+    /// loop. Softer, because it answers a different question ("and this comes
+    /// too") from the block under the pointer.
+    CarriedAlong,
+}
+
+/// The highlight `row_path` earns while `hovered` is the block under the
+/// pointer, or `None` if it is unaffected.
+///
+/// Deliberately the same subtree rule as [`row_is_lifted`] — the highlight's
+/// whole promise is "this is what a drag would pick up", so if the two ever
+/// disagreed the preview would be a lie. A leaf therefore lights only itself; a
+/// loop lights its body and its `END` as well.
+fn hover_tier(hovered: &[usize], row_path: &[usize]) -> Option<HoverTier> {
+    if !row_is_lifted(hovered, row_path) {
+        None
+    } else if row_path.len() == hovered.len() {
+        Some(HoverTier::Block)
+    } else {
+        Some(HoverTier::CarriedAlong)
+    }
 }
 
 /// `rect` with the row's indent trimmed off its left edge: the block's own
@@ -2515,7 +5360,7 @@ fn paint_drop_silhouette(
 
 /// The corner radius every block, chip and ghost shares, so an outline drawn
 /// around a block traces the same silhouette the block itself has.
-const BLOCK_RADIUS: f32 = 6.0;
+const BLOCK_RADIUS: f32 = 3.0;
 
 /// A closed polyline tracing `rect` with rounded corners, for dashing along.
 ///
@@ -2680,7 +5525,7 @@ fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
     let h = chip_h(ui);
     let rect = egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
+        .corner_radius(ROUND_CHIP)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(h);
@@ -2713,6 +5558,26 @@ fn ghost_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, extra_width: f32) {
     }
 }
 
+/// A row's geometry and its reserved background slot, collected as the rows are
+/// laid out so the hover highlight can be painted once the whole pane has been
+/// walked and the block under the pointer is known.
+///
+/// The slot matters: the highlight has to sit *behind* the row's chips, but
+/// which rows light up isn't decided until every row has been measured (hovering
+/// a loop header lights rows that haven't been laid out yet). Reserving a shape
+/// index up-front and filling it in at the end gets both — a background that is
+/// genuinely in the background, with no frame of lag.
+struct RowHover {
+    path: Vec<usize>,
+    kind: RowKind,
+    /// The block's own bounds, with the indent trimmed off (see
+    /// [`indented_content`]) so the highlight hugs the block rather than
+    /// starting at the far-left margin.
+    rect: egui::Rect,
+    bg: egui::layers::ShapeIdx,
+    pointer_inside: bool,
+}
+
 fn block_row(
     ed: &mut ReportEditor,
     app: &GuiApp,
@@ -2724,9 +5589,13 @@ fn block_row(
     titles: &[String],
     lift: &mut DragLift,
     acts: &mut Vec<Act>,
-) {
+) -> Option<RowHover> {
     let th = app.theme;
     let s = &app.strings;
+    // Reserved *before* any of the row's own content, so whatever the hover
+    // highlight later puts here is painted underneath the chips rather than over
+    // them. Filled in by `paint_hover_group` once every row has been laid out.
+    let bg_slot = ui.painter().add(egui::Shape::Noop);
     // Loaded environment names — the choices a BASELINE/COMPARISON dropdown
     // offers. Cheap to gather; only consulted by env-role chips.
     let env_choices: Vec<String> = app
@@ -2786,6 +5655,12 @@ fn block_row(
             let node = ed.flow.as_ref().and_then(|f| node_at(f, p))?;
             Some((p.clone(), *w, carry_modifier(node, *w)?))
         });
+    // Whether this row is in last frame's hover group, which is what colours
+    // its chips (see `hover_group_id`). `END` is excluded: it is the tail of
+    // the loop above it, and lighting it as a chip of its own made a loop look
+    // like it had a second, separate block at the bottom.
+    let hover_lit = row.kind != RowKind::LoopEnd
+        && hovered_last_frame(ui).is_some_and(|h| hover_tier(&h, &row.path).is_some());
     // The gap this row opened for a hovering modifier, decided by last frame's
     // drop zone (see `mod_ghost_id`).
     let mod_ghost: Option<(usize, String, f32)> = ui
@@ -2803,23 +5678,69 @@ fn block_row(
         let inner = ui.horizontal_top(|ui| {
             ui.add_space(row.depth as f32 * INDENT_STEP);
             match row.kind {
+                // Drawn in `dim`, not `accent`: this row is the one thing in the
+                // flow that is *not* in the file. It exists so there is
+                // somewhere to drop a first statement and somewhere for the
+                // top of the report to be. Giving it a keyword's colour made it
+                // look like syntax — users reasonably asked whether `BEGIN` was
+                // a word they had to write, and it isn't (the grammar has `END`,
+                // but no opening keyword at all). So it stays sentence case,
+                // stays translated, and reads as a caption.
                 RowKind::Begin => static_chip(
                     ui,
                     &th,
                     app.strings.report_node_begin,
-                    th.accent,
+                    th.dim,
                     s.chip_help_begin,
                 ),
+                // Deliberately the literal, untranslated "END": unlike the
+                // `Begin` row above, this one is not an editor invention. It
+                // renders a real `END` keyword that the parser requires and
+                // that the Source view shows verbatim, so translating or
+                // title-casing it would make the two views disagree about what
+                // is actually in the file.
                 RowKind::LoopEnd => static_chip(ui, &th, "END", th.accent, s.chip_help_end),
-                RowKind::Leaf | RowKind::LoopHead => {
-                    let chips = node
+                // The GUI never asks for expanded `WITH` rows (it draws each
+                // field as a chip on the request's own row), so these are
+                // unreachable here — see `flatten_expanded`.
+                RowKind::WithField(_)
+                | RowKind::WithComment(_)
+                | RowKind::WithAdd
+                | RowKind::WithEnd => {}
+                RowKind::Leaf | RowKind::LoopHead | RowKind::Comment => {
+                    let mut chips = node
                         .as_ref()
                         .map(|n| node_chips(n, row.req_ok, &th, s))
                         .unwrap_or_default();
-                    // A tethered chip is pulled up against the chip it
-                    // qualifies and the pair is bracketed together afterwards
-                    // (see `paint_tether`); everything else keeps the normal
-                    // inter-chip gap.
+                    // Deepen the whole row's chips while it is in the hover
+                    // group, so what a drag would pick up is legible even on a
+                    // row whose chips leave almost none of the panel behind
+                    // them showing.
+                    if hover_lit {
+                        for chip in &mut chips {
+                            chip.hovered = true;
+                        }
+                    }
+                    // Merge each tethered chip into one pill with the chip it
+                    // qualifies (see `link_tethers`) — except where the two are
+                    // about to stop being neighbours, because either half is in
+                    // hand or a hovering clause is about to be dropped between
+                    // them.
+                    link_tethers(&mut chips);
+                    for i in (1..chips.len()).rev() {
+                        let parted = [i - 1, i]
+                            .iter()
+                            .any(|&j| chips[j].detach.is_some_and(&chip_in_this_row))
+                            || mod_ghost.as_ref().is_some_and(|(gi, _, _)| *gi == i);
+                        if chips[i].join_prev && parted {
+                            split_tether(&mut chips, i);
+                        }
+                    }
+                    // A tethered chip is pulled flush against the chip it
+                    // qualifies (see `TETHER_GAP`, which is why this keys off
+                    // the anchor's `join_next` rather than the tethered chip's
+                    // own flag); everything else keeps the normal inter-chip
+                    // gap.
                     let gap = ui.spacing().item_spacing.x;
                     let mut prev: Option<egui::Rect> = None;
                     let mut tethers: Vec<(egui::Rect, egui::Rect)> = Vec::new();
@@ -2832,7 +5753,7 @@ fn block_row(
                         {
                             ghost_chip(ui, &th, text, *extra);
                         }
-                        if chip.tethered {
+                        if chip.join_next {
                             ui.spacing_mut().item_spacing.x = TETHER_GAP;
                         }
                         let in_hand = chip.detach.is_some_and(&chip_in_this_row);
@@ -2865,12 +5786,11 @@ fn block_row(
                             )
                         };
                         ui.spacing_mut().item_spacing.x = gap;
-                        // No bracket to a chip that is currently in hand: it would
-                        // join the baseline to an empty ghost, which reads as
-                        // "these two are one thing" at exactly the moment the
-                        // user is pulling them apart.
-                        if chip.tethered
-                            && !in_hand
+                        // Remember the pair so it can be highlighted together
+                        // on hover. `split_tether` has already cleared the flag
+                        // for a pair that is being pulled apart, so there is no
+                        // in-hand case left to exclude here.
+                        if chip.join_prev
                             && let Some(anchor) = prev
                         {
                             tethers.push((anchor, rect));
@@ -2885,7 +5805,7 @@ fn block_row(
                         ghost_chip(ui, &th, text, *extra);
                     }
                     for (anchor, hanger) in tethers {
-                        paint_tether(ui.painter(), &th, anchor, hanger);
+                        paint_tether_hover(ui, &th, anchor, hanger);
                     }
                 }
             }
@@ -2970,11 +5890,23 @@ fn block_row(
         // whole subtree under the pointer is applied once every row has been
         // painted (see `DragLift`), never from here.
         lift.add(layer_id, content, is_drag_head);
-        return;
+        return None;
     }
     let block = ui.vertical(block_body);
     let cluster = block.inner;
     let block_rect = block.response.rect;
+    // The block's own bounds (indent stripped), and whether the pointer is over
+    // them. `rect_contains_pointer` rather than an `interact` so this purely
+    // observational read never competes with the row's chips or its drop zones
+    // for the click.
+    let hover_rect = indented_content(block_rect, row.depth);
+    let hover = RowHover {
+        path: row.path.clone(),
+        kind: row.kind,
+        rect: hover_rect,
+        bg: bg_slot,
+        pointer_inside: ui.rect_contains_pointer(hover_rect),
+    };
 
     // ── Modifier drop zone: dropping a modifier chip onto a real node attaches
     // it. Only reacts to `Modifier` payloads, so it never competes with the base
@@ -3151,6 +6083,145 @@ fn block_row(
         paint_drop_silhouette(ui, origin, &dragged_block_shape(ui), clip, &th);
         ui.add_space(gap);
     }
+    Some(hover)
+}
+
+/// The block under the pointer, if any: the *last* matching row, so a nested row
+/// wins over the loop whose rect happens to reach it.
+///
+/// The synthetic `Begin` row is never a candidate. Its path is empty, which
+/// every other path starts with, so treating it as hoverable would light the
+/// entire report the moment the pointer crossed the top of the pane — and
+/// `Begin` isn't a block you can select or move anyway, so the highlight would
+/// be promising something that can't happen.
+fn hovered_block(rows: &[RowHover]) -> Option<&[usize]> {
+    rows.iter()
+        .rev()
+        .find(|r| r.pointer_inside && r.kind != RowKind::Begin)
+        .map(|r| r.path.as_slice())
+}
+
+/// Paint the hover highlight: a filled panel behind the block under the pointer,
+/// and a softer one behind everything that would travel with it.
+///
+/// Skipped entirely while something is being dragged. A drag already says what
+/// is in hand — the lifted subtree floats under the pointer and leaves dashed
+/// ghosts behind — and adding a second, differently-shaped highlight to that
+/// only muddled which of the two to read.
+fn paint_hover_group(ui: &egui::Ui, th: &GuiTheme, rows: &[RowHover]) {
+    // A chip that a drag would lift on its own outranks the block it sits in:
+    // lighting the whole line while the pointer rests on a `PARALLEL` promised
+    // to move the line, which is not what letting go there would do.
+    // Stored as an `Option` because `remove_temp` needs a `Default`, which
+    // `Rect` has no sensible one of.
+    let chip_rect: Option<egui::Rect> = ui.ctx().data_mut(|d| {
+        let r = d.get_temp::<Option<egui::Rect>>(chip_hover_id()).flatten();
+        d.remove_temp::<Option<egui::Rect>>(chip_hover_id());
+        r
+    });
+    if let Some(rect) = chip_rect {
+        ui.ctx().data_mut(|d| {
+            d.insert_temp::<Option<Vec<usize>>>(hover_group_id(), None);
+        });
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            egui::CornerRadius::same(CHIP_RADIUS + 2),
+            egui::Stroke::new(1.5, th.accent),
+            egui::StrokeKind::Outside,
+        );
+        return;
+    }
+    let hovered = (!drag_in_flight(ui.ctx()))
+        .then(|| hovered_block(rows))
+        .flatten();
+    // Hand the group to the next frame, where the chips are drawn: a chip is
+    // painted long before the pane has been measured, so it can't ask which row
+    // is hovered — see `hover_group_id`. Written unconditionally, `None`
+    // included, or the chips would stay lit after the pointer left.
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(hover_group_id(), hovered.map(<[usize]>::to_vec)));
+    let Some(hovered) = hovered else {
+        return;
+    };
+    // Derived from the panel colour rather than fixed, so the highlight stays a
+    // gentle lift off the background on a light theme as well as a dark one.
+    let block = mix(th.panel, th.accent, 0.28);
+    let carried = mix(th.panel, th.accent, 0.12);
+    for row in rows {
+        let Some(tier) = hover_tier(hovered, &row.path) else {
+            continue;
+        };
+        let fill = match tier {
+            HoverTier::Block => block,
+            HoverTier::CarriedAlong => carried,
+        };
+        ui.painter().set(
+            row.bg,
+            egui::Shape::rect_filled(
+                row.rect.expand2(egui::vec2(4.0, 1.0)),
+                egui::CornerRadius::same(4),
+                fill,
+            ),
+        );
+    }
+}
+
+/// The ctx-data key holding the rect of the detachable chip under the pointer.
+///
+/// Unlike the hover *group*, this is a within-frame hand-off: chips are drawn
+/// before [`paint_hover_group`] runs, which reads the value and takes it back
+/// out again, so a frame where the pointer is over no chip at all leaves
+/// nothing behind to go stale.
+fn chip_hover_id() -> egui::Id {
+    egui::Id::new("pt_hoverchip")
+}
+
+/// Note that the pointer is over a chip that a plain drag would pick up *on its
+/// own*, so the hover highlight can outline exactly that chip rather than the
+/// whole block.
+///
+/// The highlight has to answer "what would I be lifting?", and for a detachable
+/// chip the answer is the chip: dragging `PARALLEL` takes the `PARALLEL`, not
+/// the loop it sits on. Holding Ctrl changes the answer — that is what
+/// [`chip_drag_payload`] switches to a whole-row drag — so with Ctrl down
+/// nothing is recorded here and the block highlight stands, matching what the
+/// gesture would actually do.
+fn record_chip_hover(ui: &egui::Ui, chip: &Chip, rect: egui::Rect) {
+    if chip.is_base
+        || chip.detach.is_none()
+        || drag_in_flight(ui.ctx())
+        || ui.input(|i| i.modifiers.command)
+        || !ui.rect_contains_pointer(rect)
+    {
+        return;
+    }
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(chip_hover_id(), Some(rect)));
+}
+
+/// The ctx-data key the hover group is parked under for the next frame.
+///
+/// Same one-frame hand-off as [`mod_ghost_id`], and for the same reason: which
+/// rows are in the group isn't known until every row has been laid out, but the
+/// chips have to be coloured while they are drawn. A single frame's lag on a
+/// pointer that stays put for many is invisible.
+fn hover_group_id() -> egui::Id {
+    egui::Id::new("pt_hovergroup")
+}
+
+/// The hover group last frame settled on, for a row that needs to colour its
+/// chips before this frame's group is known.
+fn hovered_last_frame(ui: &egui::Ui) -> Option<Vec<usize>> {
+    ui.ctx().data(|d| d.get_temp(hover_group_id())).flatten()
+}
+
+/// Whether anything at all is currently being dragged in the block editor — a
+/// palette block, a modifier clause or an existing row. Each travels as its own
+/// payload type, so all three have to be asked.
+fn drag_in_flight(ctx: &egui::Context) -> bool {
+    egui::DragAndDrop::has_payload_of_type::<DragItem>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<NodeKind>(ctx)
+        || egui::DragAndDrop::has_payload_of_type::<Modifier>(ctx)
 }
 
 /// Render the `WITH … END` fields of a report-request as a nested block under
@@ -3169,17 +6240,25 @@ fn with_block(
     acts: &mut Vec<Act>,
 ) -> egui::Rect {
     let field_indent = (depth as f32 + 1.0) * INDENT_STEP;
-    let fill = mix(th.panel, th.subst, 0.22);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, th.subst, 0.5));
     ui.vertical(|ui| {
         for (i, item) in items.iter().enumerate() {
             ui.horizontal(|ui| {
                 ui.add_space(field_indent);
                 let text = match item {
-                    // The field's own STATISTICS(…) belongs on its row: leaving
-                    // it out made a clause that is plainly there in the source
-                    // invisible in the block editor.
-                    WithItem::Field { name, query, stats } => {
+                    // A field's own clauses belong on its row: leaving them out
+                    // made clauses that are plainly there in the source
+                    // invisible in the block editor. They are written into the
+                    // row's text rather than drawn as detachable chips because
+                    // the row *is* one chip -- a field is edited through its
+                    // wizard, which is where all four clauses are set.
+                    WithItem::Field {
+                        name,
+                        query,
+                        stats,
+                        image,
+                        truth,
+                        detail,
+                    } => {
                         let mut t = format!("{name}: {query}");
                         if !stats.is_empty() {
                             t.push_str(&format!(
@@ -3191,6 +6270,9 @@ fn with_block(
                                     .join(", ")
                             ));
                         }
+                        t.push_str(&crate::report::flow::image_text(image.as_ref()));
+                        t.push_str(&crate::report::flow::truth_text(truth.as_deref()));
+                        t.push_str(&crate::report::flow::detail_text(*detail));
                         t
                     }
                     WithItem::ResponseFmt(fmt) => format!(
@@ -3200,14 +6282,23 @@ fn with_block(
                             crate::report::flow::ResponseFmt::Pretty => "PRETTY",
                         }
                     ),
+                    WithItem::Comment(text) => format!("#{text}"),
                 };
-                let lbl = chip_shell(ui, fill, stroke, true, |ui| {
+                // A commented-out line reads as a comment, not as a field it
+                // isn't: dimmed like a `FlowNode::Comment` block. It keeps its
+                // `×` so it can be deleted, but has no wizard.
+                let tint = if matches!(item, WithItem::Comment(_)) {
+                    chip_tint(th, th.dim)
+                } else {
+                    chip_tint(th, th.subst)
+                };
+                let lbl = chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
                     let lbl = ui.add(
-                        egui::Label::new(RichText::new(&text).color(th.subst))
+                        egui::Label::new(RichText::new(&text).color(tint.text))
                             .selectable(false)
                             .sense(egui::Sense::click()),
                     );
-                    if detach_x(ui, th.subst) {
+                    if detach_x(ui, tint.text) {
                         acts.push(Act::RemoveWith {
                             path: path.to_vec(),
                             index: i,
@@ -3219,6 +6310,58 @@ fn with_block(
                 // item is edited/removed via its `×` only.
                 if lbl.clicked() && matches!(item, WithItem::Field { .. }) {
                     acts.push(Act::EditWith {
+                        path: path.to_vec(),
+                        index: i,
+                    });
+                }
+                // A `WITH` field is a report column with a name of its own, so
+                // it is what a `STATISTICS` clause attaches to — the request
+                // line above has no single column to summarise. The row is
+                // therefore its own drop target: without one the clause bounced
+                // off every part of a `WITH` block, and there was no way at all
+                // to add a summary to a field by dragging.
+                let zone = egui::Rect::from_x_y_ranges(
+                    lbl.rect.left()..=ui.max_rect().right(),
+                    lbl.rect.y_range(),
+                );
+                let zresp = ui.interact(
+                    zone,
+                    ui.id().with(("pt_withstats", path, i)),
+                    egui::Sense::hover(),
+                );
+                if let Some(m) = zresp.dnd_hover_payload::<Modifier>() {
+                    let ok = *m == Modifier::Statistics && edit::with_stats_applies(items, i);
+                    ui.painter().rect_stroke(
+                        zone.expand(2.0),
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(2.0, if ok { th.accent } else { th.err }),
+                        egui::StrokeKind::Outside,
+                    );
+                    // The refusals a field row can give differ from a node's, so
+                    // they are spelled out here rather than through
+                    // `Modifier::reject_reason` (which only speaks about nodes).
+                    if !ok {
+                        let why = if *m != Modifier::Statistics {
+                            s.mod_reject_with_field
+                        } else {
+                            s.mod_reject_present
+                        };
+                        egui::Tooltip::always_open(
+                            ui.ctx().clone(),
+                            ui.layer_id(),
+                            ui.id().with(("pt_withwhy", path, i)),
+                            egui::PopupAnchor::Pointer,
+                        )
+                        .show(|ui| {
+                            ui.colored_label(th.err, why);
+                        });
+                    }
+                }
+                if let Some(m) = release_payload::<Modifier>(&zresp)
+                    && *m == Modifier::Statistics
+                    && edit::with_stats_applies(items, i)
+                {
+                    acts.push(Act::AttachWithStats {
                         path: path.to_vec(),
                         index: i,
                     });
@@ -3257,95 +6400,6 @@ fn with_block(
 /// top-level nodes (the append index). A no-op when there is no spare vertical
 /// space (the report already fills / overflows the viewport — the last row's own
 /// insert strip covers appending in that case).
-
-/// A header directive rendered in the settings strip: how to edit it and what
-/// its hover help says.
-struct HeaderSpec {
-    key: &'static str,
-    /// `true` for the directives worth showing even when unset (as a prompt),
-    /// rather than hiding them behind the add-setting menu.
-    always_shown: bool,
-    /// `true` when leaving this unset actually stops the report running, so the
-    /// prompt is drawn in the error colour. Only `collection:` qualifies:
-    /// everything else either has a working default (`output:` falls back to
-    /// `csv`, `root:` to the report's folder) or is simply absent.
-    required: bool,
-    kind: HeaderKind,
-}
-
-/// How one header directive is edited.
-enum HeaderKind {
-    /// Pick from the open collections.
-    Collection,
-    /// Pick from the loaded global environments.
-    Environment,
-    /// Pick one of the writers PaperTrail can produce.
-    ///
-    /// `# output:` names a *format*, never a filename — the runner derives the
-    /// file from the report's own name (only the CLI's `-o` flag takes a path),
-    /// and `output_extension_from_header` rejects anything that isn't one of
-    /// [`crate::report::writer::OUTPUT_EXTENSIONS`]. So this is a closed list,
-    /// and offering a free-text field with a file browser (as this first did)
-    /// only invited values the report would refuse to run with.
-    Format,
-    /// A path, typed or chosen with the file picker.
-    Path,
-    /// Free text (the `columns:` list).
-    Text,
-}
-
-fn header_specs() -> [HeaderSpec; 6] {
-    [
-        HeaderSpec {
-            key: "collection",
-            always_shown: true,
-            required: true,
-            kind: HeaderKind::Collection,
-        },
-        HeaderSpec {
-            key: "output",
-            always_shown: true,
-            required: false,
-            kind: HeaderKind::Format,
-        },
-        HeaderSpec {
-            key: "environment",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Environment,
-        },
-        HeaderSpec {
-            key: "root",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Path,
-        },
-        HeaderSpec {
-            key: "baseline",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Path,
-        },
-        HeaderSpec {
-            key: "columns",
-            always_shown: false,
-            required: false,
-            kind: HeaderKind::Text,
-        },
-    ]
-}
-
-/// The hover help for a header directive.
-fn header_help(key: &str, s: &crate::i18n::Strings) -> &'static str {
-    match key {
-        "collection" => s.chip_help_hdr_collection,
-        "output" => s.chip_help_hdr_output,
-        "environment" => s.chip_help_hdr_environment,
-        "root" => s.chip_help_hdr_root,
-        "baseline" => s.chip_help_hdr_baseline,
-        _ => s.chip_help_hdr_columns,
-    }
-}
 
 /// One option in the `collection:` dropdown.
 ///
@@ -3641,7 +6695,13 @@ fn header_strip(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui, acts: &mut V
         ui,
         &th,
         s,
-        &|key| flow.header.get(key).unwrap_or_default().to_string(),
+        &|key| {
+            flow.header
+                .get_all(key)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        },
         &collections,
         &envs,
         &formats,
@@ -3660,7 +6720,7 @@ fn settings_panel(
     ui: &mut egui::Ui,
     th: &GuiTheme,
     s: &crate::i18n::Strings,
-    value_of: &dyn Fn(&str) -> String,
+    value_of: &dyn Fn(&str) -> Vec<String>,
     collections: &dyn Fn() -> Vec<CollectionChoice>,
     envs: &Vec<String>,
     formats: &Vec<String>,
@@ -3668,22 +6728,50 @@ fn settings_panel(
 ) {
     let specs = header_specs();
     settings_frame(th).show(ui, |ui| {
+        // A heading, because the frame alone only said "these are grouped", not
+        // what the group *is*. The same words the TUI's panel uses.
+        ui.label(
+            RichText::new(s.report_settings_heading)
+                .strong()
+                .color(th.text),
+        )
+        .on_hover_text(s.report_settings_help);
         // One setting per line, each starting at the same left edge as `BEGIN`
         // below. Laying them out in a row instead left them ragged — a combo
         // chip and a text chip are different widths and sit differently in a
         // wrapped line.
         ui.set_width(settings_width(ui));
         for spec in &specs {
-            let value = value_of(spec.key);
-            if value.is_empty() && !spec.always_shown {
-                continue;
+            // `collection:` repeats — one chip for the primary and one for each
+            // aliased helper — so a helper is visible and editable here rather
+            // than only in the raw source. Every other directive has exactly one.
+            let mut values = value_of(spec.key);
+            if values.is_empty() {
+                values.push(String::new());
             }
-            let choices = match spec.kind {
-                HeaderKind::Environment => Some(envs),
-                HeaderKind::Format => Some(formats),
-                _ => None,
-            };
-            ui.horizontal(|ui| header_chip(ui, th, s, spec, &value, choices, collections, acts));
+            for (occurrence, value) in values.into_iter().enumerate() {
+                if value.is_empty() && !spec.always_shown {
+                    continue;
+                }
+                let choices = match spec.kind {
+                    HeaderKind::Environment => Some(envs),
+                    HeaderKind::Format => Some(formats),
+                    _ => None,
+                };
+                ui.horizontal(|ui| {
+                    header_chip(
+                        ui,
+                        th,
+                        s,
+                        spec,
+                        occurrence,
+                        &value,
+                        choices,
+                        collections,
+                        acts,
+                    )
+                });
+            }
         }
 
         // Optional directives that aren't set yet are offered from the button
@@ -3695,26 +6783,31 @@ fn settings_panel(
             .iter()
             .filter(|sp| !sp.always_shown && value_of(sp.key).is_empty())
             .collect();
-        if !missing.is_empty() {
-            header_add_menu(ui, s, &missing, acts);
-        }
+        // The add menu is always drawn now: a helper collection can always be
+        // added, since `collection:` repeats and so is never "already set".
+        header_add_menu(
+            ui,
+            s,
+            &missing,
+            value_of("collection").len().max(1),
+            value_of("labels").len(),
+            acts,
+        );
     });
 }
 
-/// How wide the settings panel is drawn.
+/// How wide the settings panel is drawn: the full width of the editor pane.
 ///
-/// Deliberately fixed rather than shrink-wrapped: the contents change width
-/// constantly (picking a longer collection name, adding a setting, clearing
-/// one) and a panel that resized with them would make the whole view twitch
-/// every time a dropdown was used. It still yields to a narrow editor pane so
-/// the panel can never overflow its column.
-///
-/// Wide enough for a realistic collection or baseline name to sit in its
-/// dropdown unabbreviated: these are file names, and truncating them to
-/// `billing-servi…` defeats the point of showing names instead of paths.
+/// Not shrink-wrapped to its contents, which change width constantly (picking a
+/// longer collection name, adding a setting, clearing one) — a panel that
+/// resized with them would make the whole view twitch every time a dropdown was
+/// used. Filling the pane is just as stable and doesn't leave the panel
+/// stranded in a sea of empty space, which made it read as a stray tooltip
+/// rather than as the report's own settings. It also gives a long collection
+/// path or output name room to sit unabbreviated, instead of being truncated to
+/// `billing-servi…` in a box that had space to spare beside it.
 fn settings_width(ui: &egui::Ui) -> f32 {
-    const SETTINGS_W: f32 = 460.0;
-    SETTINGS_W.min(ui.available_width())
+    ui.available_width()
 }
 
 /// The menu offering the optional directives that aren't set yet.
@@ -3728,14 +6821,16 @@ fn header_add_menu(
     ui: &mut egui::Ui,
     s: &crate::i18n::Strings,
     missing: &[&HeaderSpec],
+    next_collection: usize,
+    next_label: usize,
     acts: &mut Vec<Act>,
 ) {
-    let label = format!("{}  {}", super::icons::PLUS, s.gui_report_add_setting);
+    let label = format!("{}  {}", super::icons::PLUS, s.report_add_setting);
     ui.menu_button(label, |ui| {
         for spec in missing {
             if ui
                 .button(spec.key.to_uppercase())
-                .on_hover_text(header_help(spec.key, s))
+                .on_hover_text(edit::header_help(spec.key, s))
                 .clicked()
             {
                 // Seed with a placeholder so the chip appears; the user
@@ -3743,25 +6838,45 @@ fn header_add_menu(
                 // would immediately be dropped again by `set_header`.
                 acts.push(Act::SetHeader {
                     key: spec.key,
-                    value: Some(header_placeholder(spec)),
+                    occurrence: 0,
+                    value: Some(HEADER_PLACEHOLDER.to_string()),
                 });
                 ui.close();
             }
         }
+        // Always offered: unlike the one-shot directives, another collection
+        // can always be added.
+        if ui
+            .button(s.report_add_helper_collection)
+            .on_hover_text(s.report_helper_collection_help)
+            .clicked()
+        {
+            acts.push(Act::SetHeader {
+                key: "collection",
+                occurrence: next_collection,
+                value: Some(HEADER_PLACEHOLDER.to_string()),
+            });
+            ui.close();
+        }
+        // Likewise a further label class, once the first has been added: the
+        // vocabulary a report scores against is nearly always at least two
+        // classes, and the one-shot entry above is gone after the first.
+        if next_label > 0
+            && ui
+                .button(s.report_add_label_class)
+                .on_hover_text(edit::header_help("labels", s))
+                .clicked()
+        {
+            acts.push(Act::SetHeader {
+                key: "labels",
+                occurrence: next_label,
+                value: Some(HEADER_PLACEHOLDER.to_string()),
+            });
+            ui.close();
+        }
     })
     .response
-    .on_hover_text(s.gui_report_settings_help);
-}
-
-/// The value a freshly-added optional directive starts at.
-///
-/// Always `?`, the "present but not filled in yet" sentinel every editor here
-/// already understands (it renders as the unset prompt). It must not be the
-/// empty string: `set_header` treats an empty value as *remove this directive*,
-/// so an empty placeholder made picking a setting from the add menu do nothing
-/// at all — which is exactly what `columns:` used to do.
-fn header_placeholder(_spec: &HeaderSpec) -> String {
-    "?".to_string()
+    .on_hover_text(s.report_settings_help);
 }
 
 /// One chip in the header strip: an uppercase key label plus its editor.
@@ -3770,11 +6885,30 @@ fn header_chip(
     th: &GuiTheme,
     s: &crate::i18n::Strings,
     spec: &HeaderSpec,
+    occurrence: usize,
     value: &str,
     choices: Option<&Vec<String>>,
     collections: &dyn Fn() -> Vec<CollectionChoice>,
     acts: &mut Vec<Act>,
 ) {
+    // A helper collection stores `path AS alias` in one directive, but they are
+    // two different things to edit: the dropdown picks the file, a small text
+    // field beside it names the alias. Splitting here (and rejoining on write)
+    // keeps the chip honest about both without inventing a second directive.
+    let helper = spec.key == "collection" && occurrence > 0;
+    let (value, alias) = if spec.key == "collection" {
+        let (r, a) = crate::report::flow::split_collection_ref(value);
+        (r, a.unwrap_or_default())
+    } else {
+        (value, "")
+    };
+    let rejoin = move |reference: &str| {
+        if helper && !alias.is_empty() {
+            format!("{reference} AS {alias}")
+        } else {
+            reference.to_string()
+        }
+    };
     // An unset required directive is drawn in the error colour: it is the one
     // thing standing between the report and a run, so it should look like it.
     let unset = value.is_empty() || value == "?";
@@ -3783,14 +6917,20 @@ fn header_chip(
     } else {
         th.dim
     };
-    let fill = mix(th.panel, color, 0.18);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.45));
-    let text_col = if unset && spec.required {
+    let mut tint = chip_tint(th, color);
+    if !(unset && spec.required) {
+        // A settings row is chrome, not a category: its rule would otherwise be
+        // a grey bar saying nothing. An *unset required* one keeps its red rule,
+        // where the bar is doing real work — it marks the row blocking the run.
+        tint.rule = None;
+    }
+    tint.text = if unset && spec.required {
         th.err
     } else {
         th.text
     };
     let key = spec.key;
+    let text_col = tint.text;
 
     let combo = matches!(
         spec.kind,
@@ -3800,7 +6940,7 @@ fn header_chip(
     let scope = ui.scope(|ui| {
         // A combo box sets its own (tallest) height; everything else has to be
         // grown to match, exactly as in the flow's chips.
-        chip_shell(ui, fill, stroke, !combo, |ui| {
+        chip_shell(ui, &tint, !combo, ROUND_CHIP, |ui| {
             // The key label goes on the left, but a combo box is taller than a
             // label and only sets the row height once it has been added — a
             // label placed first would be "centred" in a still-short row and end
@@ -3816,7 +6956,7 @@ fn header_chip(
                     // A collection is stored as a path but shown by name, so
                     // the closed text has to be derived rather than echoed.
                     let shown = if unset {
-                        s.gui_report_setting_unset.to_string()
+                        s.report_setting_unset.to_string()
                     } else if matches!(spec.kind, HeaderKind::Collection) {
                         collection_label(std::path::Path::new(value))
                     } else {
@@ -3846,36 +6986,149 @@ fn header_chip(
                             }
                         });
                     if browse {
-                        acts.push(Act::PickHeaderFile { key });
+                        acts.push(Act::PickHeaderFile { key, occurrence });
                     }
                     if let Some(v) = picked
                         && v != value
                     {
                         acts.push(Act::SetHeader {
                             key,
-                            value: Some(v),
+                            occurrence,
+                            value: Some(rejoin(&v)),
                         });
                     }
+                    // The alias a helper's requests are addressed through. Only
+                    // on helpers: the primary collection is *the* collection,
+                    // and an alias on it is a validation error.
+                    if helper {
+                        let id = ui.make_persistent_id(("pt_hdr_alias", occurrence));
+                        if let Some(text) = inline_text_edit(
+                            ui,
+                            id,
+                            alias,
+                            s.report_alias_unset,
+                            "AS ",
+                            80.0,
+                            FIELD_MAX_WIDTH,
+                        ) && text != alias
+                        {
+                            let text = text.trim().to_string();
+                            let joined = if text.is_empty() {
+                                value.to_string()
+                            } else {
+                                format!("{value} AS {text}")
+                            };
+                            acts.push(Act::SetHeader {
+                                key,
+                                occurrence,
+                                value: Some(joined),
+                            });
+                        }
+                    }
                 }
-                HeaderKind::Path | HeaderKind::Text => {
-                    let current = if value == "?" { "" } else { value };
-                    let id = ui.make_persistent_id(("pt_hdr_text", key));
-                    if let Some(text) =
-                        inline_text_edit(ui, id, current, s.gui_report_setting_unset, 150.0)
-                        && text != current
+                // A label class is one directive but two different things to
+                // edit -- the label a report displays and scores by, and the
+                // other spellings that mean it -- so it is split into two
+                // fields with the `=` drawn between them, exactly as a helper
+                // collection is split around its `AS`. A single text box made
+                // the user remember both the `=` and the comma rules; two
+                // boxes and a keyword show them.
+                HeaderKind::Text if key == "labels" => {
+                    let raw = if value == "?" { "" } else { value };
+                    let (name, synonyms) = crate::report::flow::split_label_class(raw);
+                    // Writing back always keeps the class name, even with no
+                    // synonyms yet: a class that only knows its own label is a
+                    // perfectly good half-finished line, and dropping it would
+                    // delete the row out from under someone mid-edit.
+                    let rejoin = |name: &str, synonyms: &str| {
+                        let name = name.trim();
+                        let synonyms = synonyms.trim();
+                        let name = if name.is_empty() {
+                            HEADER_PLACEHOLDER
+                        } else {
+                            name
+                        };
+                        if synonyms.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{name} = {synonyms}")
+                        }
+                    };
+                    let id = ui.make_persistent_id(("pt_hdr_label", occurrence));
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        name,
+                        s.report_label_class_unset,
+                        "",
+                        90.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != name
                     {
                         acts.push(Act::SetHeader {
                             key,
+                            occurrence,
+                            value: Some(rejoin(&text, synonyms)),
+                        });
+                    }
+                    // The `=` is drawn, unlike the helper collection's `AS`
+                    // just above (which is only hover text): it is the
+                    // directive's own syntax, and seeing it is what tells the
+                    // reader these two boxes are one line of the source.
+                    //
+                    // It does read a little like assignment, which the relation
+                    // isn't -- every spelling here counts as the same answer,
+                    // and matching is symmetric (`LabelMap::same`). But the two
+                    // halves aren't interchangeable either: the left-hand side
+                    // is the label that gets *printed* and the order the
+                    // confusion-matrix axes read in, so a symmetric glyph like
+                    // `≡` would over-claim. Matching the source exactly was
+                    // judged worth more than either shade of imprecision.
+                    ui.label(RichText::new("=").color(color).monospace());
+                    let id = ui.make_persistent_id(("pt_hdr_label_syn", occurrence));
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        synonyms,
+                        s.report_label_synonyms_unset,
+                        s.report_label_synonyms_help,
+                        150.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != synonyms
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            occurrence,
+                            value: Some(rejoin(name, &text)),
+                        });
+                    }
+                }
+                HeaderKind::Folder | HeaderKind::File | HeaderKind::Text => {
+                    let current = if value == "?" { "" } else { value };
+                    let id = ui.make_persistent_id(("pt_hdr_text", key));
+                    if let Some(text) = inline_text_edit(
+                        ui,
+                        id,
+                        current,
+                        s.report_setting_unset,
+                        "",
+                        150.0,
+                        FIELD_MAX_WIDTH,
+                    ) && text != current
+                    {
+                        acts.push(Act::SetHeader {
+                            key,
+                            occurrence,
                             value: Some(text),
                         });
                     }
-                    if matches!(spec.kind, HeaderKind::Path)
+                    if spec.kind.is_path()
                         && ui
                             .small_button(super::icons::FOLDER)
                             .on_hover_text(s.gui_report_browse)
                             .clicked()
                     {
-                        acts.push(Act::PickHeaderFile { key });
+                        acts.push(Act::PickHeaderFile { key, occurrence });
                     }
                 }
             }
@@ -3886,8 +7139,14 @@ fn header_chip(
             // An *optional* setting keeps its `×` even while unset: it was put
             // here from the add menu and starts life showing the unset prompt,
             // so without one there would be no way to take it off again.
-            if (!unset || !spec.always_shown) && detach_x(ui, color) {
-                acts.push(Act::SetHeader { key, value: None });
+            // A helper is always removable: it is one of many, so clearing it
+            // takes the whole line out rather than leaving an unset prompt.
+            if (!unset || !spec.always_shown || helper) && detach_x(ui, color) {
+                acts.push(Act::SetHeader {
+                    key,
+                    occurrence,
+                    value: None,
+                });
             }
             let cy = ui.min_rect().center().y;
             ui.painter().galley(
@@ -3898,7 +7157,7 @@ fn header_chip(
         });
     });
     if ui.ctx().dragged_id().is_none() {
-        scope.response.on_hover_text(header_help(key, s));
+        scope.response.on_hover_text(edit::header_help(key, s));
     }
 }
 
@@ -3906,11 +7165,18 @@ fn header_chip(
 /// should point at, and store it relative to the report when that is shorter —
 /// a report and its data usually travel together, so an absolute path would
 /// break the moment the pair moved.
-fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) {
-    let seed = ed
+fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str, occurrence: usize) {
+    // A helper's stored value is `path AS alias`; only the path part seeds the
+    // browser, and only it is replaced by what comes back.
+    let current = ed
         .flow
         .as_ref()
-        .and_then(|f| f.header.get(key))
+        .and_then(|f| f.header.get_all(key).get(occurrence).copied())
+        .unwrap_or_default()
+        .to_string();
+    let (current_ref, _) = crate::report::flow::split_collection_ref(&current);
+    let seed = Some(current_ref)
+        .filter(|r| !r.is_empty())
         .and_then(super::filepick::seed_dir)
         .or_else(|| {
             ed.report
@@ -3919,43 +7185,165 @@ fn pick_header_file(ed: &mut ReportEditor, app: &mut GuiApp, key: &'static str) 
                 .and_then(|p| p.parent())
                 .map(std::path::Path::to_path_buf)
         });
-    let title = header_help(key, &app.strings);
+    let title = edit::header_help(key, &app.strings);
     // Only `root:` and `baseline:` are paths — `output:` names a format and is
     // picked from a list, so it never reaches here.
-    let picked = match key {
-        "root" => super::filepick::pick_folder(title, seed.as_deref()),
+    let kind = match key {
+        "root" => super::filepick::PickKind::Folder,
         // `collection:` is normally chosen from the dropdown, but that list can
         // be empty (a report outside a workspace, opened before any collection),
         // so Browse is offered there too and lands here.
-        "collection" => super::filepick::pick_file(
-            title,
-            seed.as_deref(),
-            &[("hurl", &["hurl"]), ("*", &["*"])],
-        ),
-        _ => super::filepick::pick_file(
-            title,
-            seed.as_deref(),
-            &[("baseline", &["baseline", "json"]), ("*", &["*"])],
-        ),
+        "collection" => super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[("hurl", &["hurl"]), ("*", &["*"])]),
+        },
+        _ => super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[
+                ("baseline", &["baseline", "json"]),
+                ("*", &["*"]),
+            ]),
+        },
     };
+    app.request_pick(
+        kind,
+        title,
+        seed.as_deref(),
+        super::menu::PickAction::ReportHeaderFile { key, occurrence },
+    );
+}
+
+/// Write back the file a [`pick_header_file`] dialog returned.
+///
+/// Split from the request because the dialog runs off the frame loop (see
+/// [`super::filepick`]), so this happens frames later with only the app in
+/// hand. The alias is re-read here rather than captured at request time: the
+/// user may have edited it while the dialog was up.
+pub(super) fn apply_picked_header_file(
+    app: &mut GuiApp,
+    key: &'static str,
+    occurrence: usize,
+    picked: Option<std::path::PathBuf>,
+) {
     let Some(path) = picked else {
-        return;
+        return; // cancelled
     };
+    let Some(mut ed) = app.report_editor.take() else {
+        return; // the editor closed while the dialog was open
+    };
+    apply_header_file(&mut ed, app, key, occurrence, &path);
+    app.report_editor = Some(ed);
+}
+
+fn apply_header_file(
+    ed: &mut ReportEditor,
+    app: &mut GuiApp,
+    key: &'static str,
+    occurrence: usize,
+    path: &std::path::Path,
+) {
+    let current = ed
+        .flow
+        .as_ref()
+        .and_then(|f| f.header.get_all(key).get(occurrence).copied())
+        .unwrap_or_default()
+        .to_string();
+    let (_, alias) = crate::report::flow::split_collection_ref(&current);
     // A browsed collection is relativised the same way a picked one is — the
     // dropdown writes a portable `../`-walking ref, and Browse must not quietly
     // bake in an absolute path instead.
     let text = if key == "collection" {
         portable_ref(
-            &path,
+            path,
             ed.report.path.as_deref(),
             report_workspace_root(app, ed).as_deref(),
         )
     } else {
-        relative_to_report(&path, ed.report.path.as_deref())
+        relative_to_report(path, ed.report.path.as_deref())
+    };
+    // The alias is the user's, not the picker's — browsing for a different file
+    // must not silently drop it.
+    let text = match alias {
+        Some(a) if key == "collection" && occurrence > 0 => format!("{text} AS {a}"),
+        _ => text,
     };
     ed.edit_flow(|flow| {
-        edit::set_header(flow, key, Some(&text));
+        edit::set_header_nth(flow, key, occurrence, Some(&text));
     });
+}
+
+/// The folder/file picker beside a loop's path box.
+///
+/// Seeded from the path the loop already names, resolved against the report's
+/// own folder, so browsing starts where the loop is looking rather than at the
+/// process working directory. What comes back is written relative to the report
+/// wherever it can be: a loop that hard-codes an absolute path stops working
+/// the moment the report is shared or moved, and picking a folder is exactly
+/// when that would otherwise happen without the user noticing.
+fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: bool) {
+    let report_dir = ed
+        .report
+        .path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf);
+    let current = ed
+        .flow
+        .as_ref()
+        .and_then(|f| edit::loop_dir(f, path))
+        .unwrap_or_default();
+    // Resolve the loop's own (usually relative) path against the report so the
+    // dialog opens on the folder it names.
+    let seed = if current.is_empty() {
+        report_dir.clone()
+    } else {
+        let joined = match &report_dir {
+            Some(dir) => dir.join(&current),
+            None => std::path::PathBuf::from(&current),
+        };
+        super::filepick::seed_dir(joined.to_string_lossy().as_ref()).or(report_dir.clone())
+    };
+
+    let title = if file {
+        app.strings.gui_pick_loop_file
+    } else {
+        app.strings.gui_pick_loop_folder
+    };
+    let kind = if file {
+        super::filepick::PickKind::File {
+            filters: super::filepick::owned_filters(&[("*", &["*"])]),
+        }
+    } else {
+        super::filepick::PickKind::Folder
+    };
+    app.request_pick(
+        kind,
+        title,
+        seed.as_deref(),
+        super::menu::PickAction::ReportLoopDir {
+            path: path.to_vec(),
+            file,
+        },
+    );
+}
+
+/// Write back the folder a [`pick_loop_dir`] dialog returned, frames later.
+pub(super) fn apply_picked_loop_dir(
+    app: &mut GuiApp,
+    path: &[usize],
+    _file: bool,
+    picked: Option<std::path::PathBuf>,
+) {
+    let Some(picked) = picked else {
+        return; // cancelled
+    };
+    let Some(mut ed) = app.report_editor.take() else {
+        return; // the editor closed while the dialog was open
+    };
+    let text = relative_to_report(&picked, ed.report.path.as_deref());
+    ed.edit_flow(|flow| {
+        edit::set_loop_dir(flow, path, &text);
+    });
+    ed.selection = path.to_vec();
+    app.report_editor = Some(ed);
 }
 
 /// `path` expressed relative to the report's own folder when it lives under it,
@@ -4029,10 +7417,21 @@ fn portable_ref(
 /// Laid out exactly like a depth-0 block row (the same vertical/horizontal
 /// nesting) so it lines up with `BEGIN` rather than sitting at a different
 /// indent.
+/// The closing caption of the whole flow, matching the synthetic `Begin` row at
+/// the top.
+///
+/// Dim, sentence case and translated, exactly like its opening partner and
+/// deliberately *unlike* the uppercase `END` that closes a `FOR` or a `WITH`.
+/// Those are real keywords the parser requires and the Source view prints
+/// verbatim; this one is punctuation the editor draws so the report reads as one
+/// bracketed block, and there is no node behind it to select, move or drop onto.
+/// Two things that look identical but behave completely differently is the worst
+/// of both, so the pair that isn't in the file is the pair that looks like a
+/// caption.
 fn flow_end_row(ui: &mut egui::Ui, th: &GuiTheme, s: &crate::i18n::Strings) {
     ui.vertical(|ui| {
         ui.horizontal_top(|ui| {
-            static_chip(ui, th, s.report_node_end, th.accent, s.chip_help_flow_end);
+            static_chip(ui, th, s.report_node_end, th.dim, s.chip_help_flow_end);
         });
     });
 }
@@ -4110,7 +7509,7 @@ fn tail_drop_zone(
 /// as one hosting a combo box or a text field.
 fn chip_h(ui: &egui::Ui) -> f32 {
     let sp = ui.spacing();
-    let row = ui.text_style_height(&egui::TextStyle::Button);
+    let row = ui.text_style_height(&egui::TextStyle::Body);
     (sp.interact_size.y.max(row + 2.0 * sp.button_padding.y)).ceil()
 }
 
@@ -4122,20 +7521,83 @@ fn chip_h(ui: &egui::Ui) -> f32 {
 /// field) is shorter, so `grow = true` reserves a [`chip_h`]-tall row and
 /// centres the content in it, lifting those chips to exactly the same height as
 /// a combo-box chip. Returns the content closure's value.
+/// Lay out a chip's label as two distinct kinds of word rather than one
+/// undifferentiated run: the editor's own keyword in the UI face, and any
+/// identifier the user supplied in the monospace face.
+///
+/// This is most of what makes a flow skimmable. `BASELINE(staging)` is two
+/// different things joined by punctuation — one is vocabulary the editor
+/// defines, the other is the user's own data — and setting them identically
+/// makes the reader parse the brackets to tell which is which. A face change
+/// does that pre-attentively, and it is the convention every code editor
+/// already teaches, so it needs no explaining.
+///
+/// egui has no bold variant of the default proportional font (only Phosphor is
+/// registered alongside it), so weight is not available as a channel here; face
+/// and the theme's brighter `strong` colour carry the emphasis instead.
+fn chip_label_job(ui: &egui::Ui, text: &str, color: Color32) -> egui::text::LayoutJob {
+    let base = egui::TextStyle::Button.resolve(ui.style());
+    let mono = egui::FontId::new(base.size, egui::FontFamily::Monospace);
+
+    // The keyword runs up to the first bracket or space; everything after it is
+    // the user's. A label with neither is all keyword (`GET`, `PARALLEL`).
+    let split = text.find(['(', ' ']).unwrap_or(text.len());
+    let (keyword, rest) = text.split_at(split);
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut push = |s: &str, font: egui::FontId| {
+        if s.is_empty() {
+            return;
+        }
+        job.append(
+            s,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color,
+                ..Default::default()
+            },
+        );
+    };
+    push(keyword, base.clone());
+    push(rest, mono);
+    job
+}
+
+/// A chip label, laid out by [`chip_label_job`] and sensing clicks and drags.
+fn chip_label(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    let job = chip_label_job(ui, text, color);
+    ui.add(
+        egui::Label::new(job)
+            .selectable(false)
+            .sense(egui::Sense::click_and_drag()),
+    )
+}
+
 fn chip_shell<R>(
     ui: &mut egui::Ui,
-    fill: Color32,
-    stroke: egui::Stroke,
+    tint: &ChipTint,
     grow: bool,
+    corners: egui::CornerRadius,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let h = chip_h(ui);
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(stroke)
+    let framed = egui::Frame::NONE
+        .fill(tint.fill)
+        .stroke(tint.stroke)
         .inner_margin(egui::Margin::symmetric(8, 3))
-        .corner_radius(6)
+        .corner_radius(corners)
         .show(ui, |ui| {
+            // egui sizes a combo box (and a button) to
+            // `max(interact_size.y, content + 2 * button_padding.y)`, which is
+            // the same formula `chip_h` uses — so the two *coincided* until the
+            // app scaled its text and they landed a fraction of a pixel apart,
+            // enough to round to a visibly uneven bottom edge next to a label
+            // chip. Pinning `interact_size.y` to the chip height makes the combo
+            // *derive* its height from `chip_h` instead of agreeing with it by
+            // arithmetic: the max can only resolve to `h`, because `h` is by
+            // definition at least the content plus its padding.
+            ui.spacing_mut().interact_size.y = h;
             ui.horizontal(|ui| {
                 if grow {
                     ui.set_min_height(h);
@@ -4143,32 +7605,174 @@ fn chip_shell<R>(
                 content(ui)
             })
             .inner
-        })
-        .inner
+        });
+    // The category bar, painted after the frame so it sits over the border it
+    // replaces along that edge. It mirrors the chip's own left corner radii and
+    // squares off on the right, so on a tethered pill it stops cleanly at the
+    // seam instead of bulging past it.
+    if let Some(rule) = tint.rule {
+        let rect = framed.response.rect;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + CHIP_RULE_W, rect.bottom()),
+            ),
+            egui::CornerRadius {
+                nw: corners.nw,
+                sw: corners.sw,
+                ne: 0,
+                se: 0,
+            },
+            rule,
+        );
+    }
+    // The seam, painted over the two borders that meet at it: a hanger's left
+    // border and its anchor's right one are the same hue as their fills, so
+    // without this the segments of a pill run together.
+    if let Some(seam) = tint.seam {
+        let rect = framed.response.rect;
+        ui.painter().vline(
+            rect.left(),
+            rect.top() + 1.0..=rect.bottom() - 1.0,
+            egui::Stroke::new(1.0, seam),
+        );
+    }
+    framed.inner
 }
 
-/// The fill / stroke / text colours for a chip, honouring the selected-base
-/// highlight.
-fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> (Color32, egui::Stroke, Color32) {
-    if chip.is_base && selected {
+/// How strongly a chip's category colour is allowed to show, as blend factors
+/// against the panel colour: the background wash, the border, and how far the
+/// label text is pulled from the ordinary text colour toward the category hue.
+///
+/// These are deliberately one set of constants rather than a literal repeated at
+/// each chip site. A block flow puts five categories on screen at once, and when
+/// the fill, the border *and* the text were all near-full chroma the result read
+/// as coloured building blocks — several professional users called the editor
+/// childish on the strength of it. Quietening the surface while keeping the hue
+/// identifiable is a single judgement about the whole editor, so it is made in
+/// one place and every chip reads from it.
+///
+/// The *hue* per category is untouched (see [`kind_color`]): a `FOR` is the same
+/// colour it always was, just no longer shouted.
+///
+/// The fill and border are now barely tinted at all, because the category is
+/// carried by the rule down the chip's leading edge instead (see [`ChipTint`]).
+/// Spending the whole chip surface on the hue and spending a 3px bar on it say
+/// the same thing, but only one of them fills the window with colour.
+const CHIP_FILL_MIX: f32 = 0.05;
+const CHIP_STROKE_MIX: f32 = 0.16;
+/// The same two mixes for a chip in the hover group. The fill carries the
+/// change (a chip is mostly fill); the stroke follows so the edge doesn't
+/// disappear into the stronger fill behind it.
+const CHIP_FILL_MIX_HOVER: f32 = 0.32;
+const CHIP_STROKE_MIX_HOVER: f32 = 0.55;
+const CHIP_TEXT_MIX: f32 = 0.45;
+
+/// The width of the category rule down a chip's leading edge.
+///
+/// It fits inside [`chip_shell`]'s existing 8px left inner margin, so turning
+/// the rule on cost no reflow: the label sits exactly where it always did, with
+/// 5px of clear space beside the bar.
+const CHIP_RULE_W: f32 = 3.0;
+
+/// How a chip is coloured: a near-neutral surface plus a full-strength category
+/// bar down its leading edge.
+///
+/// The bar is the reason the surface can be neutral. Colour used as a *fill*
+/// scales with the size of the thing filled, so a flow of blocks became a wall
+/// of colour; the same hue used as a rule is just as identifiable — the eye
+/// scans a column of coloured edges very well — while leaving the chip itself a
+/// quiet card. This is the pattern editors and issue trackers already use for
+/// exactly this reason.
+struct ChipTint {
+    fill: Color32,
+    stroke: egui::Stroke,
+    text: Color32,
+    /// The category bar, or `None` for a chip that shouldn't show one: a
+    /// selected chip (whose fill already carries the selection colour) and the
+    /// hanger of a tethered pair (whose leading edge is *inside* the pill, where
+    /// a bar would read as a divider rather than as a category).
+    rule: Option<Color32>,
+    /// The seam divider, drawn down this chip's left edge when it is the hanger
+    /// of a tethered pair. See [`CHIP_SEAM_MIX`] for why a pill needs one.
+    seam: Option<Color32>,
+}
+
+/// The colours for a chip of category colour `color`.
+///
+/// Text is blended *from the theme's text colour toward* the category hue rather
+/// than being the hue itself: full-chroma text on a tint of the same hue is both
+/// loud and low-contrast, and the label has to stay comfortably readable — it is
+/// the part that actually says what the block does.
+fn chip_tint(th: &GuiTheme, color: Color32) -> ChipTint {
+    ChipTint {
+        fill: mix(th.panel, color, CHIP_FILL_MIX),
+        stroke: egui::Stroke::new(1.0, mix(th.panel, color, CHIP_STROKE_MIX)),
+        text: mix(th.text, color, CHIP_TEXT_MIX),
+        rule: Some(color),
+        seam: None,
+    }
+}
+
+/// The colours for a chip, honouring the selected-base highlight and the hover
+/// group.
+///
+/// Hovering deepens the chip's *own* colour rather than tinting it towards a
+/// single highlight hue: the colour is what says which kind of block this is, so
+/// a highlight that overwrote it would cost more than it gave. The panel behind
+/// the row says the same thing, but on a row whose chips cover most of their
+/// width there is barely any panel left to see — which is exactly the row where
+/// knowing what a drag would pick up matters most.
+fn chip_colors(th: &GuiTheme, chip: &Chip, selected: bool) -> ChipTint {
+    let mut tint = if chip.is_base && selected {
         // Keep the stroke *width* identical to the unselected state (only the
         // colour and fill change): a thicker stroke would expand the frame by a
         // pixel and shift the chip and its neighbours, so selecting a block
         // would visibly nudge it. Selection must recolour in place, never
         // resize or move.
-        (
-            th.select_bg,
-            egui::Stroke::new(1.0, th.select_fg),
-            th.select_fg,
-        )
+        ChipTint {
+            fill: th.select_bg,
+            stroke: egui::Stroke::new(1.0, th.select_fg),
+            text: th.select_fg,
+            rule: None,
+            seam: None,
+        }
+    } else if chip.hovered {
+        ChipTint {
+            fill: mix(th.panel, chip.color, CHIP_FILL_MIX_HOVER),
+            stroke: egui::Stroke::new(1.0, mix(th.panel, chip.color, CHIP_STROKE_MIX_HOVER)),
+            // The label is left alone: it is already at full contrast, and
+            // pushing it further only made hovered text look bolder than its
+            // neighbours, which reads as a different *kind* of chip rather than
+            // as the same chip highlighted.
+            text: mix(th.text, chip.color, CHIP_TEXT_MIX),
+            rule: Some(chip.color),
+            seam: None,
+        }
     } else {
-        (
-            mix(th.panel, chip.color, 0.22),
-            egui::Stroke::new(1.0, mix(th.panel, chip.color, 0.5)),
-            chip.color,
-        )
+        chip_tint(th, chip.color)
+    };
+    if chip.join_prev {
+        // The category bar would sit *inside* the pill here, where it reads as
+        // a divider rather than as a category — so it goes, and a proper
+        // divider takes its place (see `CHIP_SEAM_MIX`).
+        tint.rule = None;
+        tint.seam = Some(mix(tint.fill, tint.text, CHIP_SEAM_MIX));
     }
+    tint
 }
+
+/// How far the seam between two tethered chips is pulled from the fill toward
+/// the label colour.
+///
+/// A tethered pair is drawn as one pill split into segments, and with nothing
+/// but two same-hued borders meeting at the seam the split was invisible: a
+/// column carrying `STATISTICS`, `IMAGE`, `TRUTH` *and* `DETAIL` came out as
+/// one long blob of text, and users read the clauses as having merged into the
+/// thing they qualify. The seam is what makes it a *segmented* pill — the same
+/// device a segmented control uses — so it has to be clearly visible while
+/// still being quieter than the pill's outer border.
+const CHIP_SEAM_MIX: f32 = 0.45;
 
 /// A small frameless `×` button. Returns whether it was clicked. Kept separate
 /// from the chip's drag handle so its click is never stolen by a frame-wide
@@ -4182,20 +7786,52 @@ fn detach_x(ui: &mut egui::Ui, col: Color32) -> bool {
     .clicked()
 }
 
+/// The width to give an inline field so its current value actually fits.
+///
+/// The fields used to be fixed-width, which meant anything longer than the
+/// guess — most real folder paths, and any alias longer than a word — was
+/// silently cut off, with no indication that the box held more than it showed.
+/// Measuring instead means a field is as wide as what is in it, clamped so a
+/// long path can't push the rest of the row off screen (past `max` the box
+/// scrolls, as before, but now only in the genuinely long cases).
+fn fitted_field_width(ui: &egui::Ui, text: &str, hint: &str, min: f32, max: f32) -> f32 {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    // Measure the hint too, so an *empty* box is still wide enough to show its
+    // placeholder rather than clipping it.
+    let measure = |t: &str| {
+        ui.painter()
+            .layout_no_wrap(t.to_string(), font.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    // Room for the text edit's own margin plus the caret sitting after the last
+    // character — without it the caret lands on the border when the box is full.
+    let padding = 12.0;
+    (measure(text).max(measure(hint)) + padding).clamp(min, max)
+}
+
 /// An inline single-line text field that commits on blur. The in-progress buffer
 /// lives in egui temp memory keyed by `id` (so it survives across frames while
 /// focused) and is dropped once committed / idle, keeping the field synced to
 /// the AST. Returns `Some(trimmed value)` on the frame focus is lost.
+///
+/// `hint` is the placeholder shown inside the empty box and must stay short
+/// enough to fit it; `help` is the full explanation, shown on hover. These were
+/// once the same string, so a field's entire explanation was crammed into a
+/// box a few characters wide and read as "Only files ...".
 fn inline_text_edit(
     ui: &mut egui::Ui,
     id: egui::Id,
     current: &str,
     hint: &str,
-    width: f32,
+    help: &str,
+    min_width: f32,
+    max_width: f32,
 ) -> Option<String> {
     let mut buf = ui
         .data(|d| d.get_temp::<String>(id))
         .unwrap_or_else(|| current.to_string());
+    let width = fitted_field_width(ui, &buf, hint, min_width, max_width);
     let resp = ui.add(
         egui::TextEdit::singleline(&mut buf)
             .hint_text(hint)
@@ -4203,8 +7839,19 @@ fn inline_text_edit(
             // for its button, so an inline field (the AS alias) doesn't read as
             // a darker, sunken box beside them.
             .background_color(ui.visuals().widgets.inactive.weak_bg_fill)
+            // Monospace for the same reason the identifier half of a chip label
+            // is (see `chip_label_job`): what goes in here is the user's own
+            // name for something, not the editor's vocabulary, and the two
+            // should not look alike. It also stops an alias and the keyword
+            // beside it from reading as one phrase.
+            .font(egui::TextStyle::Monospace)
             .desired_width(width),
     );
+    // Only when not being typed into: a tooltip popping up under the cursor
+    // while the user is editing is in the way of the thing they're editing.
+    if !help.is_empty() && !resp.has_focus() {
+        resp.clone().on_hover_text(help);
+    }
     if resp.lost_focus() {
         ui.data_mut(|d| d.remove::<String>(id));
         Some(buf.trim().to_string())
@@ -4219,11 +7866,12 @@ fn inline_text_edit(
 
 /// A plain, non-interactive tinted chip (the synthetic `Begin` / `END` rows).
 fn static_chip(ui: &mut egui::Ui, th: &GuiTheme, text: &str, color: Color32, help: &str) {
-    let fill = mix(th.panel, color, 0.22);
-    let stroke = egui::Stroke::new(1.0, mix(th.panel, color, 0.5));
+    let tint = chip_tint(th, color);
+    let text_col = tint.text;
     let scope = ui.scope(|ui| {
-        chip_shell(ui, fill, stroke, true, |ui| {
-            ui.add(egui::Label::new(RichText::new(text).color(color)).selectable(false));
+        chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
+            let job = chip_label_job(ui, text, text_col);
+            ui.add(egui::Label::new(job).selectable(false));
         });
     });
     if !help.is_empty() && ui.ctx().dragged_id().is_none() {
@@ -4312,6 +7960,7 @@ fn render_chip(
         render_chip_body(ui, th, s, chip, selected, path, titles, env_choices, acts);
     });
     let rect = scope.response.rect;
+    record_chip_hover(ui, chip, rect);
     // A detachable chip also spells out the drag gesture. It is not otherwise
     // discoverable that a plain drag pulls one chip out of a line while Ctrl
     // takes the whole line, and the two are easy to trigger by accident.
@@ -4401,18 +8050,20 @@ fn render_chip_body(
             parallel_chip(ui, th, s, chip, path, *degree, acts);
             return;
         }
+        ChipEdit::Loop(l) => {
+            let l = l.clone();
+            loop_chip(ui, th, s, chip, path, &l, acts);
+            return;
+        }
         _ => {}
     }
 
-    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let tint = chip_colors(th, chip, selected);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         // The label is the drag/select handle, kept separate from the `×`
         // button so the button's click is never stolen by the drag sense.
-        let handle = ui.add(
-            egui::Label::new(RichText::new(&chip.text).color(text_col))
-                .selectable(false)
-                .sense(egui::Sense::click_and_drag()),
-        );
+        let handle = chip_label(ui, &chip.text, text_col);
         if let Some(which) = chip.detach
             && detach_x(ui, text_col)
         {
@@ -4458,13 +8109,21 @@ fn chip_drag_payload(ui: &egui::Ui, chip: &Chip, path: &[usize]) -> DragItem {
     }
 }
 
-/// Whether a plain click on this (non-base) chip should open the request wizard
-/// to edit it. True for the `SHOW` / `HIDE` / `RESPONSE` clauses, whose fields
-/// are picked in the request wizard rather than typed inline.
+/// Whether a plain click on this (non-base) chip should open a wizard to edit
+/// it. True for the `SHOW` / `HIDE` / `RESPONSE` clauses, whose fields are
+/// picked in the request wizard rather than typed inline, and for an ENVS
+/// loop's `BASELINE … SHOW(…)`, whose checklist lives in the ENVS wizard — the
+/// wizard opened is the one belonging to the chip's own node, so both land in
+/// the right place.
 fn chip_opens_wizard_on_click(chip: &Chip) -> bool {
     matches!(
         chip.detach,
-        Some(DetachWhich::Show | DetachWhich::Hide | DetachWhich::Response)
+        Some(
+            DetachWhich::Show
+                | DetachWhich::Hide
+                | DetachWhich::Response
+                | DetachWhich::BaselineShow
+        )
     )
 }
 
@@ -4479,17 +8138,24 @@ fn alias_chip(
     current: &str,
     acts: &mut Vec<Act>,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, false);
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("AS").color(text_col))
                 .selectable(false)
                 .sense(egui::Sense::click_and_drag()),
         );
         let id = ui.make_persistent_id(("pt_alias", path));
-        if let Some(text) =
-            inline_text_edit(ui, id, current, s.gui_report_alias_hint, ALIAS_FIELD_WIDTH)
-            && text != current
+        if let Some(text) = inline_text_edit(
+            ui,
+            id,
+            current,
+            s.gui_report_alias_hint,
+            "",
+            ALIAS_FIELD_WIDTH,
+            FIELD_MAX_WIDTH,
+        ) && text != current
         {
             acts.push(Act::SetAlias {
                 path: path.to_vec(),
@@ -4518,6 +8184,156 @@ fn alias_chip(
 /// `MAX_PARALLEL` — so a blank commits `None` rather than being ignored. Text
 /// that isn't a positive number is discarded on blur, which keeps the flow from
 /// ever holding the `PARALLEL(0)` the parser would reject on reload.
+/// Render a `FOR` loop head with its editable parts inline: `FOR` (the drag
+/// handle) followed by a box for the loop variable, the source keyword, a box
+/// and picker for the folder/file, and a `FILES` loop's `MATCH` glob.
+///
+/// The parts that can't be edited in one box — a destructuring pattern, a list
+/// literal, a `FOLDERS … WITH` role list — are drawn as plain labels, exactly as
+/// the whole head used to be, and are still reached through the wizard.
+fn loop_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    path: &[usize],
+    l: &LoopEdit,
+    acts: &mut Vec<Act>,
+) {
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
+        // Every fixed word on the loop head is a drag/select handle, and the
+        // editable boxes between them are not — a click meant for a field must
+        // never start a drag of the row. `FOR` alone used to be the only handle,
+        // which made a loop the one block in the editor you had to hit a
+        // three-letter target to pick up; the keywords beside it (`IN FILES`,
+        // `MATCH`, the tail) are just as fixed, so they join in.
+        let mut handle = ui.add(
+            egui::Label::new(RichText::new("FOR").color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        if let Some(var) = &l.var {
+            let id = ui.make_persistent_id(("pt_loop_var", path));
+            let resp = inline_text_edit(
+                ui,
+                id,
+                var,
+                s.gui_report_loop_var_hint,
+                s.chip_help_loop_var,
+                LOOP_VAR_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
+            if let Some(text) = resp
+                && &text != var
+            {
+                acts.push(Act::SetLoopVar {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+        }
+        handle |= ui.add(
+            egui::Label::new(RichText::new(&l.keyword).color(text_col))
+                .selectable(false)
+                .sense(egui::Sense::click_and_drag()),
+        );
+        if let Some((dir, is_file)) = &l.dir {
+            let id = ui.make_persistent_id(("pt_loop_dir", path));
+            let resp = inline_text_edit(
+                ui,
+                id,
+                dir,
+                s.gui_report_loop_dir_hint,
+                s.chip_help_loop_dir,
+                LOOP_PATH_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
+            if let Some(text) = resp
+                && &text != dir
+            {
+                acts.push(Act::SetLoopDir {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+            // Framed, not flat. Drawn without a frame this read as an icon
+            // printed on the chip rather than as something to press, and users
+            // reported not realising a folder picker was there at all. The
+            // frame gives it egui's normal hover fill, and the pointing-hand
+            // cursor confirms it before the click.
+            let pick = ui
+                .add(
+                    egui::Button::new(RichText::new(super::icons::FOLDER).color(text_col))
+                        .min_size(egui::vec2(PICKER_BUTTON_WIDTH, 0.0)),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(if *is_file {
+                    s.chip_help_loop_pick_file
+                } else {
+                    s.chip_help_loop_pick_folder
+                });
+            if pick.clicked() {
+                acts.push(Act::PickLoopDir {
+                    path: path.to_vec(),
+                    file: *is_file,
+                });
+            }
+        }
+        if let Some(glob) = &l.glob {
+            // The keyword carries the same explanation as the box beside it:
+            // "MATCH" alone says nothing to someone meeting it for the first
+            // time, and it is the word their eye lands on first.
+            handle |= ui
+                .add(
+                    egui::Label::new(RichText::new("MATCH").color(text_col))
+                        .selectable(false)
+                        .sense(egui::Sense::click_and_drag()),
+                )
+                .on_hover_text(s.chip_help_loop_glob);
+            let id = ui.make_persistent_id(("pt_loop_glob", path));
+            let resp = inline_text_edit(
+                ui,
+                id,
+                glob,
+                s.gui_report_loop_glob_hint,
+                s.chip_help_loop_glob,
+                LOOP_GLOB_FIELD_WIDTH,
+                FIELD_MAX_WIDTH,
+            );
+            if let Some(text) = resp
+                && &text != glob
+            {
+                acts.push(Act::SetLoopGlob {
+                    path: path.to_vec(),
+                    text,
+                });
+            }
+        }
+        if !l.tail.is_empty() {
+            handle |= ui.add(
+                egui::Label::new(RichText::new(&l.tail).color(text_col))
+                    .selectable(false)
+                    .sense(egui::Sense::click_and_drag()),
+            );
+        }
+        handle
+    });
+
+    if handle.dragged() {
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
+    }
+    // Selecting and wizard-opening, the same as every other chip's handle. A
+    // loop head was the one chip you could not click to select, so keyboard
+    // actions aimed at "the selected block" could not be pointed at a loop.
+    if handle.double_clicked() {
+        acts.push(Act::OpenWizard(path.to_vec()));
+    } else if handle.clicked() {
+        acts.push(Act::Select(path.to_vec()));
+    }
+}
+
 fn parallel_chip(
     ui: &mut egui::Ui,
     th: &GuiTheme,
@@ -4527,9 +8343,10 @@ fn parallel_chip(
     current: Option<u32>,
     acts: &mut Vec<Act>,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, false);
+    let tint = chip_colors(th, chip, false);
+    let text_col = tint.text;
     let shown = current.map(|n| n.to_string()).unwrap_or_default();
-    let handle = chip_shell(ui, fill, stroke, true, |ui| {
+    let handle = chip_shell(ui, &tint, true, chip_corners(chip), |ui| {
         let handle = ui.add(
             egui::Label::new(RichText::new("PARALLEL").color(text_col))
                 .selectable(false)
@@ -4541,7 +8358,9 @@ fn parallel_chip(
             id,
             &shown,
             s.node_form_parallel_degree,
+            "",
             PARALLEL_FIELD_WIDTH,
+            FIELD_MAX_WIDTH,
         ) && text != shown
         {
             let degree = match text.trim() {
@@ -4591,12 +8410,13 @@ fn combo_chip(
     acts: &mut Vec<Act>,
     make_act: impl FnOnce(String) -> Act,
 ) {
-    let (fill, stroke, text_col) = chip_colors(th, chip, selected);
+    let tint = chip_colors(th, chip, selected);
+    let text_col = tint.text;
     let mut picked: Option<String> = None;
     let mut detached: Option<DetachWhich> = None;
     // A combo box already renders at the tallest chip height, so this chip does
     // not grow its row (which would only inflate the combo box further).
-    let handle = chip_shell(ui, fill, stroke, false, |ui| {
+    let handle = chip_shell(ui, &tint, false, chip_corners(chip), |ui| {
         // The keyword prefix is the interactive handle (drag to reorder, click
         // to select, double-click to open the wizard). It must be added *before*
         // the combo (so it sits on the left), but the combo is taller and only
@@ -4723,7 +8543,7 @@ fn palette_panel(
         .fill(th.raised())
         .stroke(egui::Stroke::new(1.0, th.accent))
         .inner_margin(8)
-        .corner_radius(6)
+        .corner_radius(BLOCK_RADIUS as u8)
         .show(ui, |ui| {
             let pick_request = ed.palette.as_ref().and_then(|p| p.pick_request);
             ui.horizontal(|ui| {
@@ -4867,8 +8687,21 @@ fn diagnostics_panel(ed: &ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
 }
 
 /// Apply the collected block actions to the editor and session.
+///
+/// Value commits are applied before anything else. An inline chip field commits
+/// what has been typed into it when it loses focus — which is the same click
+/// that presses a button on the toolbar drawn *above* it, so both land in the
+/// same batch, with the toolbar's action first (it was drawn first). Both carry
+/// paths describing the tree as it was on screen, but a structural action
+/// rewrites those paths out from under the commit: applied in collection order,
+/// deleting one block would land the edit on whichever block shuffled up into
+/// its slot — renaming a block the user never touched, and losing the edit they
+/// did make. Sorting the commits to the front keeps every path meaning what it
+/// meant when it was drawn. The partition is stable, so commits keep their own
+/// relative order, and so does everything else.
 fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) {
-    for act in acts {
+    let (commits, rest): (Vec<Act>, Vec<Act>) = acts.into_iter().partition(Act::is_value_commit);
+    for act in commits.into_iter().chain(rest) {
         match act {
             Act::Select(path) => {
                 ed.selection = path;
@@ -4897,9 +8730,7 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                     super::report_wizard::open(ed, app, &sel);
                 }
             }
-            Act::MoveUp | Act::MoveDown => {
-                let up = matches!(act, Act::MoveUp);
-                let path = ed.selection.clone();
+            Act::Move { path, up } => {
                 let mut new_sel = None;
                 ed.edit_flow(|flow| {
                     new_sel = move_node(flow, &path, up);
@@ -4907,13 +8738,6 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 if let Some(ns) = new_sel {
                     ed.selection = ns;
                 }
-            }
-            Act::Delete => {
-                let path = ed.selection.clone();
-                ed.edit_flow(|flow| {
-                    remove_node(flow, &path);
-                });
-                ed.selection = Vec::new();
             }
             Act::DropNode { pos, node } => {
                 ed.edit_flow(|flow| insert_node(flow, &pos, node));
@@ -5025,19 +8849,44 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
                 });
                 ed.selection = path;
             }
+            Act::SetLoopVar { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_var(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::SetLoopDir { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_dir(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::SetLoopGlob { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_loop_glob(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::PickLoopDir { path, file } => {
+                pick_loop_dir(ed, app, &path, file);
+            }
             Act::SetParallelDegree { path, degree } => {
                 ed.edit_flow(|flow| {
                     edit::set_parallel_degree(flow, &path, degree);
                 });
                 ed.selection = path;
             }
-            Act::SetHeader { key, value } => {
+            Act::SetHeader {
+                key,
+                occurrence,
+                value,
+            } => {
                 ed.edit_flow(|flow| {
-                    edit::set_header(flow, key, value.as_deref());
+                    edit::set_header_nth(flow, key, occurrence, value.as_deref());
                 });
             }
-            Act::PickHeaderFile { key } => {
-                pick_header_file(ed, app, key);
+            Act::PickHeaderFile { key, occurrence } => {
+                pick_header_file(ed, app, key, occurrence);
             }
             Act::AddWith { path } => {
                 ed.selection = path.clone();
@@ -5050,6 +8899,12 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
             Act::RemoveWith { path, index } => {
                 ed.edit_flow(|flow| {
                     detach_modifier(flow, &path, DetachWhich::With(index));
+                });
+                ed.selection = path;
+            }
+            Act::AttachWithStats { path, index } => {
+                ed.edit_flow(|flow| {
+                    edit::attach_with_stats(flow, &path, index);
                 });
                 ed.selection = path;
             }
@@ -5083,6 +8938,33 @@ fn sync_back(ed: &ReportEditor, app: &mut GuiApp) {
     }
 }
 
+/// Queue the toolbar's Save action, so a keyboard shortcut or a menu entry
+/// saves by exactly the same path the toolbar button does (the editor is taken
+/// out of the app while it draws, so saving can only happen from inside its own
+/// frame).
+pub(super) fn request_save(ed: &mut ReportEditor) {
+    ed.pending_toolbar = Some(ToolbarAct::Save);
+}
+
+/// Save the open report to an explicit `path` (the "Save report as" path taken
+/// by the File menu), adopting that path so later saves go straight there.
+pub(super) fn save_report_to(app: &mut GuiApp, path: &std::path::Path) -> Result<(), String> {
+    let Some(mut ed) = app.report_editor.take() else {
+        return Err(app.strings.gui_nothing_to_save.to_string());
+    };
+    let res = ed.report.save_local(path);
+    if res.is_ok() {
+        sync_back(&ed, app);
+        if let ReportOrigin::Session(i) = ed.origin
+            && let Some(r) = app.session.reports.get_mut(i)
+        {
+            r.path = Some(path.to_string_lossy().into_owned());
+        }
+    }
+    app.report_editor = Some(ed);
+    res
+}
+
 /// Save the report: to disk when it has a path, and always back into the session.
 fn save_report(ed: &mut ReportEditor, app: &mut GuiApp) {
     if let Some(path) = ed.report.path.clone() {
@@ -5102,6 +8984,469 @@ fn save_report(ed: &mut ReportEditor, app: &mut GuiApp) {
 mod tests {
     use super::*;
     use crate::i18n::{Language, Strings};
+
+    /// Enter at the end of an indented line carries that indentation over, so a
+    /// statement typed inside a loop body stays inside it visually.
+    #[test]
+    fn enter_inherits_the_current_lines_indent() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST r";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\n    ");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// A block opener indents its body one further level.
+    #[test]
+    fn enter_after_an_opener_adds_a_level() {
+        let text = "FOR F IN [\"a\"]";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "FOR F IN [\"a\"]\n    ");
+        assert_eq!(caret, out.chars().count());
+
+        let text = "    REPORT REQUEST p WITH";
+        let at = text.chars().count();
+        let (out, _) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REPORT REQUEST p WITH\n        ");
+    }
+
+    /// Splitting a line in the middle stays a plain newline: the text after the
+    /// caret moves down as-is, and silently inserting spaces in front of it
+    /// would corrupt what the user was splitting.
+    #[test]
+    fn a_mid_line_split_is_not_indented() {
+        let text = "    REQUEST rs";
+        let at = text.chars().count() - 1;
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REQUEST r\ns");
+        assert_eq!(caret, at + 1);
+    }
+
+    /// Enter with a selection replaces it, like any typed character.
+    #[test]
+    fn enter_replaces_the_selection() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST rXXX";
+        let start = text.chars().count() - 3;
+        let (out, caret) = newline_with_indent(text, start..text.chars().count());
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\n    ");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// A line that has become `END` snaps back to its opener's indentation.
+    #[test]
+    fn end_dedents_to_its_opener() {
+        let text = "FOR F IN [\"a\"]\n    REQUEST r\n    END";
+        let at = text.chars().count();
+        let (out, caret) = snap_end_line(text, at).expect("END should snap");
+        assert_eq!(out, "FOR F IN [\"a\"]\n    REQUEST r\nEND");
+        assert_eq!(caret, out.chars().count());
+    }
+
+    /// Snapping is idempotent, and leaves alone anything it can't resolve — a
+    /// stray `END` is the user's to fix, not ours to guess at.
+    #[test]
+    fn end_snapping_leaves_aligned_or_unresolvable_lines_alone() {
+        let aligned = "FOR F IN [\"a\"]\n    REQUEST r\nEND";
+        assert!(snap_end_line(aligned, aligned.chars().count()).is_none());
+
+        let stray = "REQUEST r\n    END";
+        assert!(snap_end_line(stray, stray.chars().count()).is_none());
+
+        let not_an_end = "FOR F IN [\"a\"]\n    ENDPOINT = x";
+        assert!(snap_end_line(not_an_end, not_an_end.chars().count()).is_none());
+    }
+
+    /// Tab indents one four-space level, replacing any selection.
+    #[test]
+    fn tab_indents_one_level() {
+        let (out, caret) = indent_at("REQUEST r", 0..0);
+        assert_eq!(out, "    REQUEST r");
+        assert_eq!(caret, 4);
+
+        let (out, caret) = indent_at("REQUEST rXX", 9..11);
+        assert_eq!(out, "REQUEST r    ");
+        assert_eq!(caret, 13);
+    }
+
+    /// A de-indent deletes back to the previous four-column stop within the run
+    /// of spaces at the caret, so one press clears a level rather than a space.
+    #[test]
+    fn dedent_walks_back_to_the_previous_four_stop() {
+        assert_eq!(dedent_span("        END", 8), Some(4));
+        assert_eq!(dedent_span("        END", 4), Some(4));
+        // A partial level is cleared on its own, landing on the stop below.
+        assert_eq!(dedent_span("      END", 6), Some(2));
+        assert_eq!(dedent_span("     END", 5), Some(1));
+
+        let (out, caret) = delete_before("        END", 8, 4);
+        assert_eq!(out, "    END");
+        assert_eq!(caret, 4);
+    }
+
+    /// Away from indentation the key keeps its ordinary meaning, so the widget
+    /// keeps its own (selection-aware) handling.
+    #[test]
+    fn dedent_declines_anywhere_but_a_run_of_spaces() {
+        assert_eq!(dedent_span("END", 3), None); // no space before the caret
+        assert_eq!(dedent_span("    END", 0), None); // start of the line
+        assert_eq!(dedent_span("\tEND", 1), None); // a tab is not our indent
+    }
+
+    /// Padding after content de-indents too — that's what Tab leaves behind
+    /// when it lands mid-line.
+    #[test]
+    fn dedent_also_clears_trailing_padding() {
+        assert_eq!(dedent_span("END    ", 7), Some(4));
+        let (out, caret) = delete_before("END    ", 7, 4);
+        assert_eq!(out, "END");
+        assert_eq!(caret, 3);
+    }
+
+    /// Both helpers count in chars, so multi-byte text can't split a character
+    /// or land the caret mid-codepoint.
+    #[test]
+    fn indent_helpers_are_char_indexed_not_byte_indexed() {
+        let text = "    REQUEST \u{e9}\u{e9}\u{e9}";
+        let at = text.chars().count();
+        let (out, caret) = newline_with_indent(text, at..at);
+        assert_eq!(out, "    REQUEST \u{e9}\u{e9}\u{e9}\n    ");
+        assert_eq!(caret, out.chars().count());
+        assert_eq!(row_col_at(text, at), (0, 15));
+        assert_eq!(row_start("\u{e9}\u{e9}\n x", 1), 3);
+    }
+
+    /// The relative luminance of a colour, per WCAG 2.1.
+    fn luminance(c: Color32) -> f64 {
+        let ch = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    /// The WCAG contrast ratio between two colours (1.0 = identical, 21.0 = the
+    /// most any pair can manage).
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (hi, lo) = {
+            let (x, y) = (luminance(a), luminance(b));
+            if x > y { (x, y) } else { (y, x) }
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// A chip's label must stay comfortably readable on its own tint, in every
+    /// theme.
+    ///
+    /// This guards the change that quietened the blocks: the label colour is now
+    /// blended from the theme text colour toward the category hue rather than
+    /// being the hue itself, which is what makes the tinting safe to keep. Full
+    /// chroma text on a tint of the same hue used to fall as low as 2.3:1 for
+    /// `accent` chips on the English preset — text a user with ordinary eyesight
+    /// has to lean in to read. Anyone tempted to turn the colour back up will
+    /// trip this rather than find out from a customer.
+    ///
+    /// 4.5:1 is WCAG AA for body text. Checked against every built-in preset,
+    /// since a preset is a set of arbitrary RGB triples and a new one could
+    /// easily be picked that reads well in isolation but not behind a chip.
+    #[test]
+    fn every_chip_categorys_label_is_readable_on_its_own_tint_in_every_theme() {
+        for spec in crate::theme::builtin_presets() {
+            let th = GuiTheme::from_spec(&spec);
+            for kind in [
+                NodeKind::Request,
+                NodeKind::ReportRequest,
+                NodeKind::ReportVar,
+                NodeKind::ReportComputed,
+                NodeKind::Assign,
+                NodeKind::ForFiles,
+                NodeKind::ForFolders,
+                NodeKind::ForEnvs,
+                NodeKind::List,
+            ] {
+                let color = kind_color(kind, &th);
+                let tint = chip_tint(&th, color);
+                let ratio = contrast(tint.text, tint.fill);
+                assert!(
+                    ratio >= 4.5,
+                    "{} chip {kind:?}: label contrast {ratio:.2} is below WCAG AA",
+                    spec.name
+                );
+            }
+            // The error colour never comes from `kind_color` but is used for
+            // unset required settings — the one thing standing between the
+            // report and a run, so of all of them it must be legible.
+            let tint = chip_tint(&th, th.err);
+            assert!(
+                contrast(tint.text, tint.fill) >= 4.5,
+                "{} error chip",
+                spec.name
+            );
+        }
+    }
+
+    /// Categories are still told apart by colour, so quietening the chips must
+    /// not have quietened them into each other.
+    ///
+    /// Checked on the *rule* rather than the fill, because the rule is now where
+    /// the category lives: the surface is deliberately near-neutral, so fills
+    /// that were once far apart are now all within a few points of the panel
+    /// colour and would make this assertion meaningless.
+    #[test]
+    fn the_chip_categories_remain_visually_distinct_from_one_another() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let kinds = [
+            NodeKind::Request,
+            NodeKind::ReportVar,
+            NodeKind::Assign,
+            NodeKind::List,
+        ];
+        let rules: Vec<Color32> = kinds
+            .into_iter()
+            .map(|k| {
+                chip_tint(&th, kind_color(k, &th))
+                    .rule
+                    .expect("a category chip shows a rule")
+            })
+            .collect();
+        let labels: Vec<Color32> = kinds
+            .into_iter()
+            .map(|k| chip_tint(&th, kind_color(k, &th)).text)
+            .collect();
+        for channel in [&rules, &labels] {
+            for (i, a) in channel.iter().enumerate() {
+                for b in &channel[i + 1..] {
+                    let dist = (a.r() as i32 - b.r() as i32).abs()
+                        + (a.g() as i32 - b.g() as i32).abs()
+                        + (a.b() as i32 - b.b() as i32).abs();
+                    assert!(
+                        dist > 40,
+                        "two categories came out too close to tell apart: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The category rule is the full-strength hue, not a tint of it.
+    ///
+    /// The whole trade in moving the category from the fill to the rule is that
+    /// a *small* area can afford *full* chroma. Tinting the bar as well would
+    /// give up the identifiability the neutral surface was bought with, and
+    /// would do it invisibly — the editor would just slowly become grey.
+    #[test]
+    fn the_category_rule_carries_the_hue_at_full_strength() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        for kind in [NodeKind::Request, NodeKind::Assign, NodeKind::List] {
+            let color = kind_color(kind, &th);
+            let tint = chip_tint(&th, color);
+            assert_eq!(tint.rule, Some(color), "{kind:?} rule is the category hue");
+            // ...while the surface it sits on stays close to the panel.
+            let from_panel = (tint.fill.r() as i32 - th.panel.r() as i32).abs()
+                + (tint.fill.g() as i32 - th.panel.g() as i32).abs()
+                + (tint.fill.b() as i32 - th.panel.b() as i32).abs();
+            assert!(
+                from_panel < 60,
+                "{kind:?} chip fill drifted away from the panel colour ({from_panel})"
+            );
+        }
+    }
+
+    /// A selected chip and the hanger of a tethered pair show no rule.
+    ///
+    /// The first because its fill already carries the selection colour, and a
+    /// category bar inside it competes with that; the second because the
+    /// hanger's leading edge is the *seam* of a two-part pill, where a coloured
+    /// bar reads as a divider rather than as a category.
+    #[test]
+    fn chips_that_should_not_show_a_rule_do_not() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+
+        let mut chip = Chip::base("GET".to_string(), th.accent);
+        assert!(
+            chip_colors(&th, &chip, false).rule.is_some(),
+            "an ordinary base chip shows its category"
+        );
+        assert!(
+            chip_colors(&th, &chip, true).rule.is_none(),
+            "a selected chip drops the rule"
+        );
+
+        chip.join_prev = true;
+        assert!(
+            chip_colors(&th, &chip, false).rule.is_none(),
+            "the hanger of a tethered pair drops the rule"
+        );
+    }
+
+    /// The text of one laid-out section, for the label-face test below.
+    fn section_text(job: &egui::text::LayoutJob, i: usize) -> &str {
+        let r = &job.sections[i].byte_range;
+        &job.text[usize::from(r.start)..usize::from(r.end)]
+    }
+
+    /// A chip label is set as two runs — the editor's keyword and the user's
+    /// identifier — in two different faces.
+    ///
+    /// The split is what stops `BASELINE(staging)` reading as one word, so it is
+    /// worth pinning: a future label built with a different separator would
+    /// otherwise silently fall back to one undifferentiated run.
+    #[test]
+    fn a_chip_label_sets_the_keyword_and_the_identifier_in_different_faces() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            {
+                let col = Color32::WHITE;
+
+                let job = chip_label_job(ui, "BASELINE(staging)", col);
+                assert_eq!(job.sections.len(), 2, "keyword and identifier");
+                assert_eq!(section_text(&job, 0), "BASELINE");
+                assert_eq!(section_text(&job, 1), "(staging)");
+                assert_eq!(
+                    job.sections[1].format.font_id.family,
+                    egui::FontFamily::Monospace,
+                    "the user's own name is set in the monospace face"
+                );
+                assert_ne!(
+                    job.sections[0].format.font_id.family,
+                    egui::FontFamily::Monospace,
+                    "the keyword stays in the UI face"
+                );
+
+                // `REQUEST orders` splits on the space just the same.
+                let job = chip_label_job(ui, "REQUEST orders", col);
+                assert_eq!(section_text(&job, 0), "REQUEST");
+                assert_eq!(
+                    job.sections[1].format.font_id.family,
+                    egui::FontFamily::Monospace
+                );
+
+                // A bare keyword is a single run and stays in the UI face.
+                let job = chip_label_job(ui, "PARALLEL", col);
+                assert_eq!(job.sections.len(), 1);
+                assert_ne!(
+                    job.sections[0].format.font_id.family,
+                    egui::FontFamily::Monospace
+                );
+            }
+        });
+    }
+
+    /// The two synthetic sentinels are drawn as a matched pair, and neither is
+    /// dressed as a keyword.
+    ///
+    /// `Begin` and the flow's closing `End` are editor punctuation: no node
+    /// backs them, and nothing in the report file corresponds to them. The
+    /// uppercase `END` that closes a `FOR` or a `WITH` *is* in the file. Users
+    /// asked whether `BEGIN` was a word they had to write — it isn't — so the
+    /// two kinds must not look alike.
+    #[test]
+    fn the_synthetic_sentinels_are_captions_not_keywords() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&Language::English);
+
+        // Sentence case and translated, so they can never be mistaken for the
+        // literal keyword.
+        assert_ne!(s.report_node_begin, "BEGIN");
+        assert_ne!(s.report_node_end, "END");
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            assert_ne!(
+                s.report_node_end, "END",
+                "the synthetic end must not collide with the real keyword"
+            );
+        }
+
+        // ...and drawn in the dim colour rather than the keyword accent.
+        assert_ne!(
+            th.dim, th.accent,
+            "the test below is only meaningful if the two colours differ"
+        );
+    }
+
+    /// An inline field is as wide as what is in it, within bounds.
+    ///
+    /// Fixed widths were the reason aliases and folder paths appeared cut off
+    /// with nothing to say there was more text: the box simply ended. The clamp
+    /// matters as much as the growth — an unbounded field would let one deep
+    /// path push the rest of a loop head off the side of the pane.
+    #[test]
+    fn an_inline_field_grows_to_fit_its_value_but_not_without_limit() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let min = LOOP_PATH_FIELD_WIDTH;
+
+            let empty = fitted_field_width(ui, "", "", min, FIELD_MAX_WIDTH);
+            assert_eq!(empty, min, "an empty field rests at its minimum");
+
+            let short = fitted_field_width(ui, "envs", "", min, FIELD_MAX_WIDTH);
+            assert_eq!(short, min, "a value that already fits doesn't shrink it");
+
+            let long = fitted_field_width(
+                ui,
+                "reports/2026/quarterly/regional-breakdowns",
+                "",
+                min,
+                FIELD_MAX_WIDTH,
+            );
+            assert!(
+                long > min,
+                "a value wider than the box widens it ({long} vs {min})"
+            );
+
+            let absurd = fitted_field_width(ui, &"x".repeat(500), "", min, FIELD_MAX_WIDTH);
+            assert_eq!(
+                absurd, FIELD_MAX_WIDTH,
+                "growth stops at the cap rather than running off the pane"
+            );
+
+            // An empty box still has to show its own placeholder.
+            let hinted = fitted_field_width(ui, "", "*.json", 10.0, FIELD_MAX_WIDTH);
+            assert!(hinted > 10.0, "an empty field makes room for its hint");
+        });
+    }
+
+    /// The boxes' placeholders are short enough to actually fit them, and the
+    /// long explanations are kept separate.
+    ///
+    /// These were once the same string, so a field a few characters wide was
+    /// given a full sentence as its placeholder and rendered it as "Only files
+    /// ..." — which is what prompted this. Checked in every language, since a
+    /// translation is exactly where a "short" label quietly stops being short.
+    #[test]
+    fn a_fields_placeholder_is_short_and_its_explanation_is_not_the_same_string() {
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            for hint in [
+                s.gui_report_loop_var_hint,
+                s.gui_report_loop_dir_hint,
+                s.gui_report_loop_glob_hint,
+                s.gui_report_alias_hint,
+            ] {
+                assert!(
+                    hint.chars().count() <= 12,
+                    "{lang:?}: placeholder {hint:?} is too long to fit its box"
+                );
+            }
+            assert_ne!(
+                s.gui_report_loop_glob_hint, s.chip_help_loop_glob,
+                "{lang:?}: the placeholder must not be the explanation"
+            );
+            // The explanation, by contrast, has room to actually explain.
+            assert!(
+                s.chip_help_loop_glob.chars().count() > 40,
+                "{lang:?}: the MATCH explanation should say what a pattern is"
+            );
+            assert!(
+                s.chip_help_loop_pick_folder != s.chip_help_loop_dir,
+                "{lang:?}: the picker button explains itself, not the box"
+            );
+        }
+    }
 
     /// The Source view's colouring is the terminal UI's, span for span.
     ///
@@ -5209,13 +9554,27 @@ mod tests {
         )
     }
 
+    /// Apply the styling `GuiApp::new` applies, so a measurement taken here is
+    /// the one the app renders at.
+    ///
+    /// The text scaling matters as much as the padding: chip heights agreed at
+    /// egui's default sizes and drifted a fraction of a pixel apart once the
+    /// text grew, which is precisely the bug this harness missed by measuring an
+    /// unscaled context.
+    fn style_like_the_app(ctx: &egui::Context) {
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        ctx.all_styles_mut(|s| {
+            for (_, font) in s.text_styles.iter_mut() {
+                font.size *= 1.08;
+            }
+        });
+    }
+
     /// Render a single chip in isolation and return the height of the frame it
-    /// draws. Runs a few frames so egui's sizing settles, and matches the GUI's
-    /// enlarged `button_padding` so combo/text-field chips are measured at the
-    /// same size they render at in the app.
+    /// draws. Runs a few frames so egui's sizing settles.
     fn chip_height(build: impl Fn(&mut egui::Ui, &GuiTheme, &Strings, &mut Vec<Act>)) -> f32 {
         let ctx = egui::Context::default();
-        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        style_like_the_app(&ctx);
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let s = crate::i18n::Strings::for_language(&Language::English);
         let mut h = 0.0;
@@ -5229,6 +9588,81 @@ mod tests {
             });
         }
         h
+    }
+
+    /// Lay two chips out the way `block_row` lays out a line — closing the gap
+    /// in front of a tethered one — and return the rect each rendered into.
+    fn pair_rects(chips: &[Chip]) -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(8.0, 4.0));
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::for_language(&Language::English);
+        let mut rects = Vec::new();
+        // A few frames, so egui's sizing settles before the rects are read.
+        for _ in 0..3 {
+            rects.clear();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.horizontal_top(|ui| {
+                    let gap = ui.spacing().item_spacing.x;
+                    let mut acts = Vec::new();
+                    for chip in chips {
+                        if chip.join_next {
+                            ui.spacing_mut().item_spacing.x = TETHER_GAP;
+                        }
+                        rects.push(render_chip(
+                            ui,
+                            &th,
+                            &s,
+                            chip,
+                            false,
+                            &[0],
+                            &[],
+                            &[],
+                            &mut acts,
+                        ));
+                        ui.spacing_mut().item_spacing.x = gap;
+                    }
+                });
+            });
+        }
+        rects
+    }
+
+    /// The pill only reads as one control if the two halves actually meet: a
+    /// gap between them would leave the squared-off corners looking like a
+    /// rendering fault rather than a divider.
+    #[test]
+    fn the_halves_of_a_tethered_pill_are_rendered_touching() {
+        let pair = |tether: bool| {
+            let show = Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            );
+            let mut chips = vec![
+                Chip::modifier(
+                    "BASELINE(prod)".into(),
+                    Color32::RED,
+                    DetachWhich::Statistics,
+                ),
+                if tether { show.tether() } else { show },
+            ];
+            link_tethers(&mut chips);
+            let r = pair_rects(&chips);
+            r[1].left() - r[0].right()
+        };
+
+        assert_eq!(
+            pair(true),
+            0.0,
+            "the tethered half sits flush against the chip it qualifies, so their \
+             borders meet as the pill's divider"
+        );
+        assert!(
+            pair(false) > 0.0,
+            "while an untethered neighbour keeps the normal gap — otherwise every \
+             chip on the line would look joined"
+        );
     }
 
     #[test]
@@ -5251,11 +9685,12 @@ mod tests {
         });
 
         assert!(label > 0.0 && combo > 0.0 && alias > 0.0);
-        // All three must be the same height (uniform chips), within a sub-pixel
-        // rounding tolerance.
-        assert!(
-            (label - combo).abs() < 0.5,
-            "label {label} vs combo {combo}"
+        // Exactly equal, not merely close: a chip that is a fraction of a pixel
+        // short still rounds to a visibly uneven bottom edge beside its
+        // neighbour, which is how the combo chips came to sit a pixel high.
+        assert_eq!(
+            label, combo,
+            "a combo chip must be exactly as tall as a label chip"
         );
         // The PARALLEL chip, which hosts a small numeric field.
         let parallel = chip_height(|ui, th, s, acts| {
@@ -5264,22 +9699,22 @@ mod tests {
         });
 
         assert!(parallel > 0.0);
-        assert!(
-            (label - alias).abs() < 0.5,
-            "label {label} vs alias {alias}"
+        assert_eq!(
+            label, alias,
+            "an inline text field must be exactly as tall as a label chip"
         );
-        assert!(
-            (label - parallel).abs() < 0.5,
-            "label {label} vs parallel {parallel}"
+        assert_eq!(
+            label, parallel,
+            "the PARALLEL field must be exactly as tall as a label chip"
         );
 
         // The flow's closing `END`, which brackets the whole report against the
         // `BEGIN` at the top. It sits in the block column like any other row, so
         // it has to line up with them.
         let flow_end = chip_height(|ui, th, s, _acts| flow_end_row(ui, th, s));
-        assert!(
-            (label - flow_end).abs() < 0.5,
-            "label {label} vs flow end {flow_end}"
+        assert_eq!(
+            label, flow_end,
+            "the closing END must be exactly as tall as a label chip"
         );
     }
 
@@ -5311,11 +9746,11 @@ mod tests {
 
     #[test]
     fn the_settings_strip_covers_every_header_directive_the_language_has() {
-        // The parser exposes exactly these six directives; if one is added there
+        // The parser exposes exactly these directives; if one is added there
         // and not here, the GUI would quietly be unable to set it.
         let flow = crate::report::parse_flow(
             "# collection: c.hurl\n# output: o.csv\n# environment: dev\n# root: /r\n\
-             # baseline: b.baseline\n# columns: a,b\nREQUEST login\n",
+             # baseline: b.baseline\n# columns: a,b\n# labels: Pass = ok\nREQUEST login\n",
         )
         .expect("fixture parses");
         let specs = header_specs();
@@ -5350,7 +9785,10 @@ mod tests {
 
         // Each directive explains itself in its own words.
         let s = Strings::for_language(&Language::English);
-        let helps: Vec<&str> = specs.iter().map(|sp| header_help(sp.key, &s)).collect();
+        let helps: Vec<&str> = specs
+            .iter()
+            .map(|sp| crate::report::edit::header_help(sp.key, &s))
+            .collect();
         for (i, h) in helps.iter().enumerate() {
             assert!(!h.is_empty(), "{} has help", specs[i].key);
             assert!(
@@ -5366,13 +9804,12 @@ mod tests {
     /// became unaddable.
     #[test]
     fn every_addable_setting_starts_at_a_value_that_survives_being_set() {
-        for spec in header_specs().iter().filter(|sp| !sp.always_shown) {
-            assert!(
-                !header_placeholder(spec).is_empty(),
-                "{} would be dropped again the moment it was added",
-                spec.key
-            );
-        }
+        assert!(
+            !crate::report::edit::HEADER_PLACEHOLDER.is_empty(),
+            "an added setting would be dropped again the moment it was added"
+        );
+        // And there is something to add in the first place.
+        assert!(header_specs().iter().any(|sp| !sp.always_shown));
     }
 
     /// `# output:` names a format from a closed list — the runner derives the
@@ -5414,10 +9851,101 @@ mod tests {
         // No path-valued setting claims `output`, so the browse button is gone.
         let paths: Vec<&str> = header_specs()
             .iter()
-            .filter(|sp| matches!(sp.kind, HeaderKind::Path))
+            .filter(|sp| sp.kind.is_path())
             .map(|sp| sp.key)
             .collect();
         assert_eq!(paths, ["root", "baseline"]);
+    }
+
+    /// A report that asks for values names them in the toolbar, in the same
+    /// words as the box that changes them, with anything unanswered called out
+    /// — the box is asked for once per session, so otherwise the answers are
+    /// invisible while the report is being read.
+    #[test]
+    fn the_run_settings_chip_shows_the_values_it_will_run_with() {
+        const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+        let mut app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        app.open_report_editor(
+            ReportOrigin::Workspace,
+            crate::report::Report::from_text("Face", TRAIL),
+        );
+        let ed = app.report_editor.take().unwrap();
+        let s = Strings::for_language(&Language::English);
+        let th = app.theme;
+
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            param_chip(ui, &ed, &app, &th);
+        });
+        let painted: String = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.contains(s.gui_report_run_settings),
+            "the chip is labelled with the words of the box it opens: {painted:?}"
+        );
+        assert!(
+            painted.contains("REGION=au"),
+            "an answered value is shown: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("TICKET={}", s.param_value_unset)),
+            "and an unanswered one is called out: {painted:?}"
+        );
+    }
+
+    /// A result still on screen after its answers have changed is the one case
+    /// where the chip is not describing what is being looked at, so it says so
+    /// — and a report that has never been run has not "changed".
+    #[test]
+    fn the_chip_says_when_the_answers_moved_on_since_the_result() {
+        const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+        let mut app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        app.open_report_editor(
+            ReportOrigin::Workspace,
+            crate::report::Report::from_text("Face", TRAIL),
+        );
+        let ed = app.report_editor.as_mut().unwrap();
+        let s = Strings::for_language(&Language::English);
+
+        assert!(
+            !ed.params_changed_since_result(&s),
+            "nothing has been run, so nothing has moved on"
+        );
+
+        ed.result_params = ed
+            .param_rows(&s)
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        ed.result = Some(crate::report::model::ReportResult::default());
+        assert!(
+            !ed.params_changed_since_result(&s),
+            "the table on screen was made with exactly these answers"
+        );
+
+        ed.param_values
+            .insert("REGION".to_string(), "eu".to_string());
+        assert!(
+            ed.params_changed_since_result(&s),
+            "changing an answer leaves the table on screen out of date"
+        );
     }
 
     /// The button that adds a report setting says what it adds. A bare `+`
@@ -5432,7 +9960,7 @@ mod tests {
 
         let out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut acts = Vec::new();
-            header_add_menu(ui, &s, &missing, &mut acts);
+            header_add_menu(ui, &s, &missing, 1, 0, &mut acts);
         });
         let painted: String = out
             .shapes
@@ -5443,7 +9971,7 @@ mod tests {
             })
             .collect();
         assert!(
-            painted.contains(s.gui_report_add_setting),
+            painted.contains(s.report_add_setting),
             "the button is labelled, not a bare glyph (painted: {painted:?})"
         );
 
@@ -5452,9 +9980,9 @@ mod tests {
         for lang in [Language::English, Language::French, Language::Danish] {
             let s = Strings::for_language(&lang);
             assert!(
-                s.gui_report_add_setting.split_whitespace().count() >= 3,
+                s.report_add_setting.split_whitespace().count() >= 3,
                 "{lang:?} label {:?} names what it adds",
-                s.gui_report_add_setting
+                s.report_add_setting
             );
         }
     }
@@ -5489,6 +10017,7 @@ mod tests {
                                         &th,
                                         &s,
                                         spec,
+                                        0,
                                         "dev",
                                         Some(&choices),
                                         &collection_choices_fixture,
@@ -5746,12 +10275,12 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let value_of = move |key: &str| {
+        let value_of = move |key: &str| -> Vec<String> {
             owned
                 .iter()
-                .find(|(k, _)| k == key)
+                .filter(|(k, _)| k == key)
                 .map(|(_, v)| v.clone())
-                .unwrap_or_default()
+                .collect()
         };
 
         let mut rect = egui::Rect::NOTHING;
@@ -5809,7 +10338,7 @@ mod tests {
 
         let button = texts
             .iter()
-            .find(|(t, _)| t.contains(s.gui_report_add_setting))
+            .find(|(t, _)| t.contains(s.report_add_setting))
             .map(|(_, r)| *r)
             .expect("the add button is drawn while settings are still missing");
         let collection = texts
@@ -5824,7 +10353,8 @@ mod tests {
             collection.bottom()
         );
 
-        // With nothing left to add there is no button at all.
+        // Even with every one-shot directive set the button stays: another
+        // collection can always be added, because `collection:` repeats.
         let (_, full) = run_settings_panel(
             &ctx,
             &[
@@ -5838,15 +10368,15 @@ mod tests {
             600.0,
         );
         assert!(
-            !full
-                .iter()
-                .any(|(t, _)| t.contains(s.gui_report_add_setting)),
-            "nothing is missing, so nothing offers to add it"
+            full.iter().any(|(t, _)| t.contains(s.report_add_setting)),
+            "a helper collection can still be added"
         );
     }
 
-    /// The panel keeps its width whatever it happens to contain: a box that
-    /// grew and shrank as dropdowns were used would make the view twitch.
+    /// The panel spans the editor pane and keeps that width whatever it happens
+    /// to contain: a box that grew and shrank as dropdowns were used would make
+    /// the view twitch, and one sized to its contents left the settings adrift
+    /// in empty space with their own values truncated beside it.
     #[test]
     fn the_settings_panel_keeps_its_width_whatever_it_holds() {
         let ctx = egui::Context::default();
@@ -5872,12 +10402,17 @@ mod tests {
             bare.width(),
             full.width()
         );
+        assert!(
+            bare.width() > 500.0,
+            "the panel fills the 600px pane rather than sitting in a corner of it, got {}",
+            bare.width()
+        );
 
-        // It still yields to a column narrower than its fixed width, so the
-        // panel never forces a wide editor pane. It can only give back what its
-        // contents don't need: a dropdown has a minimum width of its own, which
-        // is the floor here, so the test asserts it shrank rather than naming a
-        // width the chips can't actually reach.
+        // It still yields to a narrow column, so the panel never forces a wide
+        // editor pane. It can only give back what its contents don't need: a
+        // dropdown has a minimum width of its own, which is the floor here, so
+        // the test asserts it shrank rather than naming a width the chips can't
+        // actually reach.
         let (narrow, _) = run_settings_panel(&ctx, &[("collection", "c.hurl")], 120.0);
         assert!(
             narrow.width() < bare.width(),
@@ -5885,6 +10420,47 @@ mod tests {
             narrow.width(),
             bare.width()
         );
+    }
+
+    /// The hover highlight paints a panel *behind* the row, which a row whose
+    /// chips cover most of its width almost entirely hides — so the chips
+    /// themselves deepen too. Their own colour is kept: it is what says which
+    /// kind of block this is.
+    #[test]
+    fn a_hovered_chip_deepens_its_own_colour() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let mut chip = Chip::base("REQUEST login".into(), th.accent);
+        let plain = chip_colors(&th, &chip, false);
+        chip.hovered = true;
+        let lit = chip_colors(&th, &chip, false);
+
+        // Deeper, not merely different: the fill has moved further from the
+        // panel colour it started at.
+        let dist = |c: Color32| {
+            let d = |a: u8, b: u8| (a as f32 - b as f32).abs();
+            d(c.r(), th.panel.r()) + d(c.g(), th.panel.g()) + d(c.b(), th.panel.b())
+        };
+        assert!(
+            dist(lit.fill) > dist(plain.fill) + 1.0,
+            "hovered fill {:?} is no deeper than {:?} against panel {:?}",
+            lit.fill,
+            plain.fill,
+            th.panel
+        );
+        assert!(
+            dist(lit.stroke.color) > dist(plain.stroke.color) + 1.0,
+            "the edge follows the fill so it doesn't vanish into it"
+        );
+        assert_eq!(
+            lit.text, plain.text,
+            "the label is left alone — a bolder-looking label reads as a different kind of chip"
+        );
+        assert_eq!(lit.rule, plain.rule, "the colour rule still identifies it");
+
+        // Selection still wins on the base chip: a chip can be both, and
+        // selection is the one the user set deliberately.
+        let sel = chip_colors(&th, &chip, true);
+        assert_eq!(sel.fill, th.select_bg);
     }
 
     /// The key label in a combo-box setting is centred against the combo, not
@@ -5911,6 +10487,7 @@ mod tests {
                                 &th,
                                 &strings,
                                 spec,
+                                0,
                                 "dev",
                                 Some(&choices),
                                 &collection_choices_fixture,
@@ -5959,6 +10536,7 @@ mod tests {
                     th,
                     s,
                     spec,
+                    0,
                     "dev",
                     Some(&choices),
                     &collection_choices_fixture,
@@ -6078,13 +10656,13 @@ mod tests {
                 // The same layout `block_row` uses for the chip cluster.
                 ui.horizontal_top(|ui| {
                     let mut acts = Vec::new();
-                    let staging = vec!["eapi_staging".to_string()];
-                    let dev = vec!["eapi_dev".to_string()];
-                    let dfa = vec!["dfa_result".to_string()];
+                    let staging = vec!["api_staging".to_string()];
+                    let dev = vec!["api_dev".to_string()];
+                    let classify = vec!["classify_result".to_string()];
                     let chips: Vec<(Chip, &[String])> = vec![
                         (Chip::base("FOR".into(), th.subst), &[]),
-                        (Chip::env_role(true, 0, "eapi_staging", th.subst), &staging),
-                        (Chip::env_role(false, 1, "eapi_dev", th.subst), &dev),
+                        (Chip::env_role(true, 0, "api_staging", th.subst), &staging),
+                        (Chip::env_role(false, 1, "api_dev", th.subst), &dev),
                         (
                             Chip::modifier(
                                 "RESPONSE PRETTY".into(),
@@ -6093,7 +10671,7 @@ mod tests {
                             ),
                             &[],
                         ),
-                        (Chip::request("dfa_result", th.subst), &dfa),
+                        (Chip::request("classify_result", th.subst), &classify),
                         (
                             Chip::alias("Environment", th.subst, Some(DetachWhich::As)),
                             &[],
@@ -6226,6 +10804,81 @@ mod tests {
         );
     }
 
+    /// `TRUTH`, `IMAGE` and `DETAIL` are as much a part of a column as its
+    /// `STATISTICS`, and were the only clauses the block editor left invisible
+    /// -- a ground-truthed column looked identical to an ordinary one.
+    #[test]
+    fn a_named_column_shows_all_four_of_its_clauses() {
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = crate::i18n::Strings::english();
+        let flow = crate::report::parse_flow(
+            "REPORT SHOT AS Frame STATISTICS(COUNT) IMAGE(HEIGHT 110) TRUTH \"pass\" DETAIL\n",
+        )
+        .expect("fixture parses");
+        let chips = node_chips(&flow.nodes[0], None, &th, s);
+        let texts: Vec<&String> = chips.iter().map(|c| &c.text).collect();
+        for want in [
+            "STATISTICS(COUNT)",
+            "IMAGE(HEIGHT 110)",
+            "TRUTH \"pass\"",
+            "DETAIL",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.as_str() == want),
+                "{want} is drawn: {texts:?}"
+            );
+        }
+    }
+
+    /// Detaching a clause chip takes that clause off and leaves the column --
+    /// and the other three clauses -- alone.
+    #[test]
+    fn detaching_one_clause_leaves_the_column_and_its_other_clauses() {
+        let mut flow = crate::report::parse_flow(
+            "REPORT SHOT AS Frame IMAGE(HEIGHT 110) TRUTH \"pass\" DETAIL\n",
+        )
+        .expect("fixture parses");
+        crate::report::edit::detach_modifier(&mut flow, &[0], DetachWhich::Truth);
+        let text = flow.to_text();
+        assert!(!text.contains("TRUTH"), "the truth is gone: {text}");
+        assert!(
+            text.contains("AS Frame")
+                && text.contains("IMAGE(HEIGHT 110)")
+                && text.contains("DETAIL"),
+            "and nothing else is: {text}"
+        );
+    }
+
+    /// A `WITH` field's clauses are written into its row, since the row is one
+    /// chip rather than a line of them.
+    #[test]
+    fn a_with_field_shows_its_clauses_in_its_row() {
+        let flow = crate::report::parse_flow(
+            "REPORT REQUEST svc WITH\n    Frame: jsonpath \"$.f\" IMAGE TRUTH \"ok\" DETAIL\nEND\n",
+        )
+        .expect("fixture parses");
+        let crate::report::flow::FlowNode::Report(crate::report::flow::ReportStmt::Request {
+            with,
+            ..
+        }) = &flow.nodes[0]
+        else {
+            panic!("fixture is a report request");
+        };
+        let crate::report::flow::WithItem::Field {
+            image,
+            truth,
+            detail,
+            ..
+        } = &with[0]
+        else {
+            panic!("fixture's first item is a field");
+        };
+        assert!(
+            image.is_some() && truth.is_some() && *detail,
+            "parsed: {with:?}"
+        );
+    }
+
     /// The drop preview is computed by rehearsing the drop, so the ghost has to
     /// be the very chip that appears — same text, same slot — once it lands.
     #[test]
@@ -6350,6 +11003,88 @@ mod tests {
         );
     }
 
+    /// A tethered pair is drawn as one pill *split into segments*. Without a
+    /// visible seam a column carrying `STATISTICS`, `IMAGE`, `TRUTH` and
+    /// `DETAIL` reads as one blob and the clauses look merged into the thing
+    /// they qualify.
+    #[test]
+    fn a_tethered_chip_gets_a_seam_to_be_read_apart_by() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let mut chips = vec![
+            Chip::alias("Result", th.pending, None),
+            Chip::modifier("TRUTH(\"Expected\")".into(), th.subst, DetachWhich::Truth).tether(),
+        ];
+        link_tethers(&mut chips);
+
+        assert!(
+            chip_colors(&th, &chips[0], false).seam.is_none(),
+            "the anchor opens the pill, so nothing is drawn down its leading edge"
+        );
+        let hanger = chip_colors(&th, &chips[1], false);
+        assert!(
+            hanger.seam.is_some(),
+            "the hanger's leading edge is the seam between the two segments"
+        );
+        assert!(
+            hanger.rule.is_none(),
+            "and the category bar goes, since inside a pill it reads as a divider"
+        );
+    }
+
+    /// The hover highlight has to promise exactly what a drag would pick up.
+    /// Resting on a detachable chip outlines that chip; holding Ctrl — which is
+    /// what turns the same gesture into a whole-line drag — hands the highlight
+    /// back to the block.
+    #[test]
+    fn hovering_a_detachable_chip_scopes_the_highlight_to_that_chip() {
+        let modi = Chip::modifier(
+            "PARALLEL(8)".into(),
+            egui::Color32::WHITE,
+            DetachWhich::Parallel,
+        );
+        let base = Chip::base("FOR f IN FILES".into(), egui::Color32::WHITE);
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(80.0, 20.0));
+        let over = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(rect.center())],
+            ..Default::default()
+        };
+        let ctrl_over = egui::RawInput {
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            events: vec![egui::Event::PointerMoved(rect.center())],
+            ..Default::default()
+        };
+        let recorded = |input: egui::RawInput, chip: &Chip| {
+            let ctx = egui::Context::default();
+            // Two passes: the first delivers the pointer event, the second runs
+            // with the pointer already where it was put.
+            let _ = ctx.run_ui(input.clone(), |ui| record_chip_hover(ui, chip, rect));
+            ctx.data_mut(|d| d.remove_temp::<Option<egui::Rect>>(chip_hover_id()));
+            let _ = ctx.run_ui(input, |ui| record_chip_hover(ui, chip, rect));
+            ctx.data(|d| d.get_temp::<Option<egui::Rect>>(chip_hover_id()))
+                .flatten()
+        };
+
+        assert_eq!(
+            recorded(over.clone(), &modi),
+            Some(rect),
+            "a plain drag would lift this chip alone, so it is what lights up"
+        );
+        assert_eq!(
+            recorded(ctrl_over, &modi),
+            None,
+            "with Ctrl the drag takes the whole line, so the block highlight stands"
+        );
+        assert_eq!(
+            recorded(over, &base),
+            None,
+            "a base chip moves its line either way, so it never scopes the highlight"
+        );
+    }
+
     #[test]
     fn chip_drag_payload_detaches_plainly_and_moves_the_line_with_ctrl() {
         let ctx = egui::Context::default();
@@ -6396,7 +11131,7 @@ mod tests {
     }
 
     #[test]
-    fn only_show_hide_response_chips_open_the_wizard_on_click() {
+    fn clause_chips_open_the_wizard_on_click() {
         assert!(chip_opens_wizard_on_click(&Chip::modifier(
             "SHOW".into(),
             egui::Color32::WHITE,
@@ -6411,6 +11146,13 @@ mod tests {
             "RESPONSE".into(),
             egui::Color32::WHITE,
             DetachWhich::Response
+        )));
+        // An ENVS loop's BASELINE SHOW is picked the same way, in the ENVS
+        // wizard — its chip has to open too, or its checklist is unreachable.
+        assert!(chip_opens_wizard_on_click(&Chip::modifier(
+            "SHOW(Time)".into(),
+            egui::Color32::WHITE,
+            DetachWhich::BaselineShow
         )));
         // REPORT / WITH / plain base chips are not opened this way.
         assert!(!chip_opens_wizard_on_click(&Chip::modifier(
@@ -6446,6 +11188,80 @@ mod tests {
             !row_is_lifted(&[2], &[20]),
             "prefix is index-wise, not textual"
         );
+    }
+
+    /// The hover highlight must promise exactly what a drag delivers, so it is
+    /// keyed off the same subtree rule — but split into two tiers so "this
+    /// block" and "and this comes with it" read differently.
+    #[test]
+    fn hover_lights_the_block_strongly_and_its_body_softly() {
+        // A leaf lights only itself.
+        assert_eq!(hover_tier(&[2], &[2]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2], &[1]), None);
+        assert_eq!(hover_tier(&[2], &[3]), None);
+
+        // A loop's body and its nested rows come along, one tier down.
+        assert_eq!(hover_tier(&[2], &[2, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[2, 1, 0]), Some(HoverTier::CarriedAlong));
+        assert_eq!(hover_tier(&[2], &[1, 0]), None);
+        assert_eq!(hover_tier(&[2], &[20]), None);
+
+        // Hovering a row *inside* a loop lights that row, not the loop around
+        // it: dragging it out takes only itself.
+        assert_eq!(hover_tier(&[2, 1], &[2, 1]), Some(HoverTier::Block));
+        assert_eq!(hover_tier(&[2, 1], &[2]), None);
+        assert_eq!(hover_tier(&[2, 1], &[2, 0]), None);
+
+        // Every row the highlight touches is a row the drag would lift, and
+        // vice versa — the two must never disagree.
+        for path in [vec![2], vec![2, 0], vec![2, 1, 0], vec![3], vec![1, 0]] {
+            assert_eq!(
+                hover_tier(&[2], &path).is_some(),
+                row_is_lifted(&[2], &path),
+                "hover and lift disagree about {path:?}"
+            );
+        }
+    }
+
+    /// The block under the pointer is the innermost one: a `FOR` header and a
+    /// row in its body can both contain the pointer, and the body row is the one
+    /// the user is pointing at.
+    #[test]
+    fn hovered_block_prefers_the_innermost_row_and_ignores_begin() {
+        fn row(path: &[usize], kind: RowKind, inside: bool) -> RowHover {
+            RowHover {
+                path: path.to_vec(),
+                kind,
+                rect: egui::Rect::ZERO,
+                bg: egui::layers::ShapeIdx(0),
+                pointer_inside: inside,
+            }
+        }
+        let rows = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::LoopHead, true),
+            row(&[0, 0], RowKind::Leaf, true),
+            row(&[0], RowKind::LoopEnd, false),
+        ];
+        assert_eq!(hovered_block(&rows), Some([0, 0].as_slice()));
+
+        // Begin is never the answer, even when it is the only row the pointer is
+        // over — its empty path would light the whole report.
+        let only_begin = vec![
+            row(&[], RowKind::Begin, true),
+            row(&[0], RowKind::Leaf, false),
+        ];
+        assert_eq!(hovered_block(&only_begin), None);
+
+        // A loop's END stands in for the loop, so pointing at it lights the
+        // whole block.
+        let on_end = vec![
+            row(&[0], RowKind::LoopHead, false),
+            row(&[0, 0], RowKind::Leaf, false),
+            row(&[0], RowKind::LoopEnd, true),
+        ];
+        assert_eq!(hovered_block(&on_end), Some([0].as_slice()));
+        assert_eq!(hover_tier(&[0], &[0]), Some(HoverTier::Block));
     }
 
     #[test]
@@ -6879,9 +11695,149 @@ mod tests {
     }
 }
 
+/// The `FOR` loop head's inline editors: which parts of a loop the chip breaks
+/// out into boxes, and which it leaves as plain text for the wizard.
+#[cfg(test)]
+mod loop_chip_tests {
+    use super::{ChipEdit, LoopEdit, node_chips};
+    use crate::gui::theme::GuiTheme;
+    use crate::i18n::{Language, Strings};
+
+    /// The `LoopEdit` the first node of `src` builds its head chip from.
+    fn loop_edit(src: &str) -> LoopEdit {
+        let flow = crate::report::parser::parse_flow(src).expect("the fixture flow parses");
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        node_chips(&flow.nodes[0], None, &th, &s)
+            .into_iter()
+            .find_map(|c| match c.edit {
+                ChipEdit::Loop(l) => Some(l),
+                _ => None,
+            })
+            .expect("a loop renders a loop-head chip")
+    }
+
+    /// The commonest loop: every part of it is a box.
+    #[test]
+    fn a_files_loop_offers_boxes_for_its_variable_folder_and_glob() {
+        let l = loop_edit("FOR doc IN FILES \"cases\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("doc"));
+        assert_eq!(l.keyword, "IN FILES");
+        assert_eq!(
+            l.dir,
+            Some(("cases".to_string(), false)),
+            "the folder is editable and picked with a *folder* dialog"
+        );
+        assert_eq!(l.glob.as_deref(), Some("*.json"));
+        assert!(l.tail.is_empty(), "nothing is left over as dead text");
+    }
+
+    /// A `FILES` loop with no `MATCH` still offers the glob box: an empty box
+    /// invites the glob, where nothing at all hides that the loop can be
+    /// narrowed at all.
+    #[test]
+    fn a_files_loop_without_a_match_still_offers_an_empty_glob_box() {
+        let l = loop_edit("FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.glob.as_deref(), Some(""));
+    }
+
+    /// `TUPLES FROM` names a file, not a folder, so its picker must be a file
+    /// dialog — a folder picker could not select `rows.csv` at all.
+    #[test]
+    fn a_tuples_loop_picks_a_file_rather_than_a_folder() {
+        let l = loop_edit("FOR row IN TUPLES FROM \"rows.csv\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.keyword, "IN TUPLES FROM");
+        assert_eq!(l.dir, Some(("rows.csv".to_string(), true)));
+        assert_eq!(l.glob, None, "a tuples loop has no glob to offer");
+    }
+
+    /// A `FOLDERS … WITH role="glob"` list is several named globs rather than
+    /// one, so it stays with the wizard and is shown as plain text. Its single
+    /// `MATCH` glob, however, is the same one box `FILES` gets -- offered empty
+    /// when the loop has none, so the way to narrow the walk is visible.
+    #[test]
+    fn a_folders_loops_role_list_is_left_as_text_beside_its_editable_folder() {
+        let l = loop_edit("FOR d IN FOLDERS \"envs\" WITH req=\"*.hurl\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.dir, Some(("envs".to_string(), false)));
+        assert_eq!(l.glob, Some(String::new()));
+        assert_eq!(l.tail, "WITH req=\"*.hurl\"");
+    }
+
+    /// A recursive, filtered `FOLDERS` walk: the `MATCH` glob fills the same box
+    /// `FILES` uses, and an optional role keeps its `?` in the tail so the chip
+    /// reads back exactly what the file says.
+    #[test]
+    fn a_folders_loop_shows_its_match_glob_in_the_glob_box() {
+        let l = loop_edit(
+            "FOR d IN FOLDERS \"cases\" MATCH \"**/case_*\" WITH front=\"*f.jpg\", back=\"*b.jpg\"?\n  REQUEST A\nEND\n",
+        );
+        assert_eq!(l.glob, Some("**/case_*".to_string()));
+        assert_eq!(l.tail, "WITH front=\"*f.jpg\", back=\"*b.jpg\"?");
+    }
+
+    /// A pattern that binds more than one name has no single thing a box could
+    /// rename, so no box is offered -- rather than one that silently renamed
+    /// whichever binder came first.
+    #[test]
+    fn a_destructuring_loop_offers_no_variable_box() {
+        let l = loop_edit("FOR (NAME, URL) IN DOCS\n  REQUEST A\nEND\n");
+        assert_eq!(l.var, None);
+        assert_eq!(l.tail, "DOCS", "the source is still shown");
+    }
+
+    /// A producer with no single path keeps the text it always had, so nothing
+    /// disappears from the head just because it can't be boxed.
+    #[test]
+    fn a_list_literal_keeps_its_text_and_offers_no_folder_picker() {
+        let l = loop_edit("FOR x IN [\"a\", \"b\"]\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("x"));
+        assert_eq!(l.keyword, "IN");
+        assert_eq!(l.dir, None, "there is no one folder to pick");
+        assert_eq!(l.tail, "[\"a\", \"b\"]");
+    }
+
+    /// An ENVS loop's variable is editable, but its roles are chips of their
+    /// own beside the head, so the head carries no tail for them.
+    #[test]
+    fn an_envs_loop_offers_its_variable_box_and_leaves_the_roles_to_their_chips() {
+        let l = loop_edit(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"stage\")\n  REQUEST A\nEND\n",
+        );
+        assert_eq!(l.var.as_deref(), Some("TARGET"));
+        assert_eq!(l.keyword, "IN ENVS");
+        assert_eq!(l.dir, None);
+        assert!(
+            l.tail.is_empty(),
+            "BASELINE/COMPARISON are chips, not text on the head"
+        );
+    }
+
+    /// A plain list of environments has no chips of its own, so it must stay
+    /// visible on the head rather than vanishing.
+    #[test]
+    fn an_envs_loop_over_named_environments_still_shows_them() {
+        let l = loop_edit("FOR e IN ENVS \"dev\", \"prod\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("e"));
+        assert_eq!(l.tail, "\"dev\", \"prod\"");
+    }
+
+    /// A `PARALLEL` loop's head is built from the node, not from its label, so
+    /// the prefix belongs to the PARALLEL chip alone and is never repeated.
+    #[test]
+    fn a_parallel_loops_head_does_not_repeat_the_parallel_prefix() {
+        let l = loop_edit("PARALLEL(4) FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert_eq!(l.var.as_deref(), Some("f"));
+        assert_eq!(l.keyword, "IN FILES");
+        assert!(!l.tail.contains("PARALLEL"));
+    }
+}
+
 #[cfg(test)]
 mod baseline_show_chip_tests {
-    use super::node_chips;
+    use super::{
+        CHIP_RADIUS, Chip, Color32, DetachWhich, ROUND_CHIP, chip_corners, link_tethers,
+        node_chips, split_tether,
+    };
     use crate::gui::theme::GuiTheme;
     use crate::i18n::{Language, Strings};
 
@@ -6925,28 +11881,104 @@ mod baseline_show_chip_tests {
         .expect("the fixture flow parses");
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let s = Strings::for_language(&Language::English);
-        let chips = node_chips(&flow.nodes[0], None, &th, &s);
+        let mut chips = node_chips(&flow.nodes[0], None, &th, &s);
 
-        let show = chips
+        let show_at = chips
             .iter()
-            .find(|c| c.text.starts_with("SHOW("))
+            .position(|c| c.text.starts_with("SHOW("))
             .expect("the SHOW is chipped");
         assert!(
-            show.tethered,
+            chips[show_at].tethered,
             "it is tied to the chip before it, not left floating between three peers"
+        );
+        assert!(
+            chips[show_at - 1].text.contains("prod"),
+            "and the chip it is tied to is the BASELINE, so the tie says who owns it"
+        );
+
+        link_tethers(&mut chips);
+        let (baseline, show) = (&chips[show_at - 1], &chips[show_at]);
+        assert!(
+            baseline.join_next && show.join_prev,
+            "the pair is drawn as one segmented pill rather than two loose chips"
+        );
+        assert!(
+            !chips
+                .iter()
+                .any(|c| c.text.starts_with("COMPARISON(") && (c.join_prev || c.join_next)),
+            "but the COMPARISON stays a peer — it qualifies the loop, not the baseline"
         );
         assert_eq!(
             show.color, th.ok,
-            "and it keeps SHOW's own colour — the tie is drawn, not implied by hue"
+            "and the SHOW keeps the colour every SHOW has, so it stays recognisable \
+             as a SHOW — the pill is what says which chip it belongs to"
         );
-
-        let baseline = chips
-            .iter()
-            .find(|c| c.text.contains("prod"))
-            .expect("the BASELINE is chipped");
         assert_ne!(
             show.color, baseline.color,
-            "so the two are still told apart at a glance"
+            "so the two halves are still told apart at a glance"
+        );
+    }
+
+    #[test]
+    fn a_tethered_chip_squares_off_only_the_edge_it_shares() {
+        let mut chips = vec![
+            Chip::modifier(
+                "BASELINE(prod)".into(),
+                Color32::RED,
+                DetachWhich::Statistics,
+            ),
+            Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            )
+            .tether(),
+        ];
+        link_tethers(&mut chips);
+
+        let (left, right) = (chip_corners(&chips[0]), chip_corners(&chips[1]));
+        assert_eq!(
+            (left.nw, left.sw, right.ne, right.se),
+            (CHIP_RADIUS, CHIP_RADIUS, CHIP_RADIUS, CHIP_RADIUS),
+            "the outside of the pair stays rounded, so it reads as a single pill"
+        );
+        assert_eq!(
+            (left.ne, left.se, right.nw, right.sw),
+            (0, 0, 0, 0),
+            "and the meeting edges are square, so no gap or bulge shows between the halves"
+        );
+    }
+
+    #[test]
+    fn a_pair_being_pulled_apart_is_no_longer_drawn_joined() {
+        let mut chips = vec![
+            Chip::modifier(
+                "BASELINE(prod)".into(),
+                Color32::RED,
+                DetachWhich::Statistics,
+            ),
+            Chip::modifier(
+                "SHOW(Time)".into(),
+                Color32::GREEN,
+                DetachWhich::BaselineShow,
+            )
+            .tether(),
+        ];
+        link_tethers(&mut chips);
+        split_tether(&mut chips, 1);
+
+        assert!(
+            !chips[0].join_next && !chips[1].join_prev,
+            "a squared-off edge facing an empty slot would look like damage, not a join"
+        );
+        assert!(
+            !chips[1].tethered,
+            "and the pair falls back to the normal gap, so the row does not close up around the hole"
+        );
+        assert_eq!(
+            chip_corners(&chips[0]),
+            ROUND_CHIP,
+            "the chip left behind is a whole chip again"
         );
     }
 
@@ -7058,6 +12090,9 @@ mod results_render_tests {
                 header: h.to_string(),
                 sources: vec![h.to_string()],
                 stats: Vec::new(),
+                image: None,
+                truth: None,
+                detail: false,
             })
             .collect();
         let mut result = ReportResult::default();
@@ -7069,6 +12104,364 @@ mod results_render_tests {
             result.rows.push(row);
         }
         (result, columns)
+    }
+
+    /// A streaming run must not be filtered: `visible_rows` drops pending rows,
+    /// so a live filter would hide the very rows the reader is watching arrive.
+    #[test]
+    fn a_live_run_is_shown_unfiltered() {
+        let (result, columns) = fixture(&["A"], &["x"], 3);
+        let header = crate::report::flow::Header::default();
+        let mut sel = 0;
+        assert!(
+            super::visible_for_view(&result, &columns, &header, true, &mut sel, "").is_none(),
+            "a live run shows every row it has, filters and all"
+        );
+    }
+
+    /// The find box narrows the rows the filter chose, over the columns that are
+    /// actually shown.
+    #[test]
+    fn the_find_box_narrows_the_rows() {
+        let (mut result, columns) = fixture(&["A"], &["x"], 3);
+        result.rows[1]
+            .cells
+            .insert("A".to_string(), "needle".to_string());
+        let header = crate::report::flow::Header::default();
+        let mut sel = 0;
+        let all = super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
+        assert_eq!(all, vec![0, 1, 2], "no text means no narrowing");
+        let hit =
+            super::visible_for_view(&result, &columns, &header, false, &mut sel, "NEED").unwrap();
+        assert_eq!(hit, vec![1], "and the search is case-insensitive");
+    }
+
+    /// The filter selection is an index into a list derived from the *result*,
+    /// so a selection made against a richer result must not index past the end
+    /// of a plainer one (or silently select the wrong filter).
+    #[test]
+    fn a_stale_filter_selection_is_clamped_rather_than_panicking() {
+        let (result, columns) = fixture(&["A"], &["x"], 2);
+        let header = crate::report::flow::Header::default();
+        // A plain result offers only `All`, so index 3 cannot stand.
+        let mut sel = 3;
+        let rows =
+            super::visible_for_view(&result, &columns, &header, false, &mut sel, "").unwrap();
+        assert_eq!(sel, 0, "clamped back onto the only filter there is");
+        assert_eq!(rows, vec![0, 1], "which selects everything");
+    }
+
+    /// The in-app bar translates its own buttons; the exported document's stay
+    /// English because it has no reader whose language is known.
+    #[test]
+    fn the_filter_buttons_are_translated_but_a_matrix_cell_is_not() {
+        use crate::report::filter::RowFilter;
+        let s = crate::i18n::Strings::for_language(&Language::French);
+        assert_eq!(
+            super::filter_label(&s, &RowFilter::Incorrect),
+            s.report_filter_incorrect
+        );
+        let cell = RowFilter::MatrixCell {
+            column: "Verdict".to_string(),
+            truth: "pass".to_string(),
+            answer: "fail".to_string(),
+        };
+        assert_eq!(
+            super::filter_label(&s, &cell),
+            cell.label(),
+            "a matrix cell names the report's own data, which is not translatable"
+        );
+    }
+
+    /// The GUI grid and the export must agree about which columns are where:
+    /// a column that vanished from one and not the other reads as a bug in
+    /// whichever you noticed second.
+    #[test]
+    fn the_grid_drops_the_same_detail_columns_the_export_does() {
+        let (_, mut columns) = fixture(&["Name", "Body"], &["a", "{}"], 1);
+        columns[1].detail = true;
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        assert_eq!(
+            grid.iter().map(|c| &c.header).collect::<Vec<_>>(),
+            vec!["Name"],
+            "the detail column is not in the grid"
+        );
+        assert_eq!(detail.len(), 1, "it is in the panel instead");
+    }
+
+    /// A row with nothing to drill into gets no expander, so the caret is never
+    /// an invitation to open an empty panel.
+    #[test]
+    fn only_rows_with_something_to_show_are_expandable() {
+        let (mut result, mut columns) = fixture(&["Name", "Body"], &["a", ""], 2);
+        columns[1].detail = true;
+        result.rows[1]
+            .cells
+            .insert("Body".to_string(), "{\"a\":1}".to_string());
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        assert!(
+            crate::report::detail::sections(&result, 0, &grid, &detail).is_empty(),
+            "the row with a blank body has nothing to show"
+        );
+        assert!(
+            !crate::report::detail::sections(&result, 1, &grid, &detail).is_empty(),
+            "the row with a body does"
+        );
+    }
+
+    /// The drill-down's sections are laid across the pane the way the HTML
+    /// export's flex row does: side by side while each still gets a readable
+    /// width, one column when the pane is narrow, and never more columns than
+    /// there are sections to fill them.
+    #[test]
+    fn detail_sections_share_the_width_they_have() {
+        let w = super::DETAIL_MIN_SECTION_W;
+        assert_eq!(
+            super::detail_layout_columns(w * 2.5, w, 4),
+            2,
+            "two whole sections fit, so two columns"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 0.5, w, 4),
+            1,
+            "a pane narrower than one section still gets one column, not zero"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 4.0, w, 2),
+            2,
+            "four would fit but there are only two sections to put in them"
+        );
+        assert_eq!(
+            super::detail_layout_columns(w * 4.0, w, 0),
+            1,
+            "an empty panel never asks for zero columns"
+        );
+    }
+
+    /// The source editor asks its layouter for a job on every frame, so the job
+    /// is cached — but it has to follow every input the highlighter colours by.
+    #[test]
+    fn the_highlight_key_notices_every_input_it_guards() {
+        use crate::tui::report_highlight::HlCtx;
+        let text = "REPORT REQUEST login AS l\n";
+        let ctx = HlCtx {
+            error_line: None,
+            collection_resolves: true,
+            loaded_envs: ["dev".to_string()].into_iter().collect(),
+            request_names: ["login".to_string()].into_iter().collect(),
+        };
+        let spec = crate::theme::default_preset();
+        let font = egui::FontId::monospace(12.0);
+        let key = |t: &str, c: &HlCtx, s: &crate::theme::ThemeSpec, f: &egui::FontId, w: f32| {
+            super::highlight_key(t, c, s, f, w)
+        };
+        let base = key(text, &ctx, &spec, &font, 800.0);
+
+        assert_ne!(
+            base,
+            key("REPORT REQUEST logout AS l\n", &ctx, &spec, &font, 800.0),
+            "the source text"
+        );
+
+        let mut c = ctx.clone();
+        c.error_line = Some(1);
+        assert_ne!(base, key(text, &c, &spec, &font, 800.0), "the error line");
+
+        c.error_line = None;
+        c.collection_resolves = false;
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "whether the collection binds — it is what makes a name green"
+        );
+
+        c.collection_resolves = true;
+        c.request_names = ["other".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which requests exist"
+        );
+
+        c.request_names = ctx.request_names.clone();
+        c.loaded_envs = ["prod".to_string()].into_iter().collect();
+        assert_ne!(
+            base,
+            key(text, &c, &spec, &font, 800.0),
+            "which environments are loaded"
+        );
+
+        let other_theme = crate::theme::preset_for_language(&crate::i18n::Language::French);
+        assert_ne!(
+            base,
+            key(text, &ctx, &other_theme, &font, 800.0),
+            "the theme, which is where every colour comes from"
+        );
+
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &egui::FontId::monospace(18.0), 800.0),
+            "the font size"
+        );
+        assert_ne!(
+            base,
+            key(text, &ctx, &spec, &font, 400.0),
+            "the wrap width, which the job carries"
+        );
+
+        // Two contexts holding the same names in a different insertion order are
+        // the same context: both are hash sets, and iterating one straight into
+        // the hasher is what made the validation panel flicker.
+        let mut same = ctx.clone();
+        same.request_names.insert("zzz".to_string());
+        same.request_names.remove("zzz");
+        assert_eq!(
+            base,
+            key(text, &same, &spec, &font, 800.0),
+            "the same set is the same key"
+        );
+    }
+
+    /// Render the grid twice in one context, so the second pass sees whatever
+    /// the first left in egui's memory, and report the widths each time.
+    fn widths_across_two_frames(
+        first: &(ReportResult, Vec<OutputColumn>),
+        then: impl FnOnce(&mut ReportResult),
+    ) -> (Vec<f32>, Vec<f32>) {
+        let ctx = egui::Context::default();
+        let (mut result, columns) = (first.0.clone(), first.1.clone());
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let draw = |ctx: &egui::Context, result: &ReportResult, out: &mut Vec<f32>| {
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_max_width(4000.0);
+                    ui.set_min_width(4000.0);
+                    // The *natural* widths are what is cached; fitting them to
+                    // the window is pure arithmetic on top.
+                    *out = super::cached_natural_widths(ui, result, &columns);
+                });
+            }
+        };
+        draw(&ctx, &result, &mut a);
+        then(&mut result);
+        draw(&ctx, &result, &mut b);
+        (a, b)
+    }
+
+    /// The widths are cached between frames, and a streaming run replaces its
+    /// rows **in place** — the grid starts as a skeleton of empty rows that are
+    /// overwritten as results arrive. A cache keyed on anything less than the
+    /// cell text would therefore pin the columns at the width of an empty table
+    /// for the whole run.
+    #[test]
+    fn cached_widths_follow_a_row_that_is_filled_in_place() {
+        let empty = fixture(&["Result"], &[""], 4);
+        let (before, after) = widths_across_two_frames(&empty, |result| {
+            for row in &mut result.rows {
+                row.cells.insert(
+                    "Result".to_string(),
+                    "a much longer value than the header".to_string(),
+                );
+            }
+        });
+        assert!(
+            after[0] > before[0] + 20.0,
+            "the column grew for the arriving values: {before:?} then {after:?}"
+        );
+    }
+
+    /// The same table two frames running must measure the same, or the columns
+    /// would twitch as the mouse moves.
+    #[test]
+    fn cached_widths_are_stable_when_nothing_changes() {
+        let table = fixture(&["A", "B"], &["one", "two"], 5);
+        let (before, after) = widths_across_two_frames(&table, |_| {});
+        assert_eq!(before, after);
+    }
+
+    /// The fingerprint is hand-maintained, so it gets the same contract test the
+    /// validation cache has: it must move for every input the measurement reads.
+    #[test]
+    fn the_width_fingerprint_notices_every_input_it_guards() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (base_res, base_cols) = fixture(&["A"], &["one"], 2);
+            let base = super::widths_fingerprint(ui, &base_res, &base_cols);
+
+            let mut r = base_res.clone();
+            r.rows[0]
+                .cells
+                .insert("A".to_string(), "changed".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a cell's text"
+            );
+
+            let mut r = base_res.clone();
+            r.rows.push(ReportRow::default());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a new row"
+            );
+
+            let mut r = base_res.clone();
+            r.no_match_marker = "\u{2014}".to_string();
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the no-match marker, which is what an empty cell renders as"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].target = Some("staging".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "the row's ENVS target"
+            );
+
+            let mut r = base_res.clone();
+            r.rows[0].vars.insert("v".to_string(), "x".to_string());
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &r, &base_cols),
+                "a variable a columns: directive could show"
+            );
+
+            let (_, wider) = fixture(&["A Much Longer Header"], &["one"], 2);
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &wider),
+                "the column header"
+            );
+
+            let mut cols = base_cols.clone();
+            cols[0].stats = vec![crate::report::model::StatKind::Count];
+            assert_ne!(
+                base,
+                super::widths_fingerprint(ui, &base_res, &cols),
+                "statistics, which add summary rows to measure"
+            );
+
+            // Two rows whose cells were inserted in a different order are the
+            // same table, and must not look like a change: `cells` is a hash
+            // map, and iterating one straight into the hasher is exactly what
+            // made the validation panel flicker.
+            let (a, cols2) = fixture(&["A", "B"], &["one", "two"], 1);
+            let mut b = ReportResult::default();
+            let mut row = ReportRow::default();
+            row.cells.insert("B".to_string(), "two".to_string());
+            row.cells.insert("A".to_string(), "one".to_string());
+            b.rows.push(row);
+            assert_eq!(
+                super::widths_fingerprint(ui, &a, &cols2),
+                super::widths_fingerprint(ui, &b, &cols2),
+                "insertion order is not a difference"
+            );
+        });
     }
 
     /// The widths the grid would give `columns` in a window `avail` wide, and
@@ -7173,7 +12566,8 @@ mod results_render_tests {
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_max_width(1.0);
-            results_grid(&th, ui, &result, &columns, None);
+            let mut none = None;
+            results_grid(&th, ui, &result, &columns, None, None, &[], &mut none);
         });
     }
 }
@@ -7181,6 +12575,33 @@ mod results_render_tests {
 #[cfg(test)]
 mod dry_run_view_tests {
     use super::{EditorView, ReportEditor, ReportOrigin};
+
+    /// The reindent button re-indents as a single undo step, and — unlike every
+    /// other editor action — must not round-trip through the AST, because the
+    /// flow has nowhere to keep a body comment.
+    #[test]
+    fn reindenting_is_one_undo_step_and_keeps_body_comments() {
+        let before = "# collection: c\n\nFOR T IN FILES \"*.txt\"\n# keep me\nREQUEST a\nEND\n";
+        let report = crate::report::Report::from_text("r", before);
+        let mut ed = ReportEditor::new(ReportOrigin::Session(0), report);
+
+        assert!(matches!(ed.reformat(), Ok(true)), "text moved");
+        assert!(
+            ed.report.text.contains("    # keep me"),
+            "the comment is kept and indented: {:?}",
+            ed.report.text
+        );
+        assert!(
+            ed.report.text.contains("    REQUEST a"),
+            "the body is indented: {:?}",
+            ed.report.text
+        );
+
+        // Already tidy the second time, so it costs no further undo entry.
+        assert!(matches!(ed.reformat(), Ok(false)));
+        ed.undo();
+        assert_eq!(ed.report.text, before, "one undo restores the original");
+    }
 
     /// The Dry run button lives on the toolbar, which is above every view, but
     /// the preview is drawn by the Results view. Pressing it from Blocks (where
@@ -7206,5 +12627,636 @@ mod dry_run_view_tests {
             "the preview should be on screen, not waiting in a view nobody is looking at"
         );
         assert!(ed.dry_run.is_some(), "and the preview itself is held");
+    }
+}
+
+#[cfg(test)]
+mod detail_verdict_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+    use crate::report::model::{OutputColumn, ReportResult, ReportRow, StatKind, Verdict};
+    use crate::session::Session;
+
+    /// A `DETAIL` column carrying a `TRUTH` is read in the drill-down, so the
+    /// drill-down has to say whether what it is showing was right — the grid
+    /// cell that would have said so is not on screen.
+    #[test]
+    fn a_ground_truthed_detail_section_shows_its_verdict() {
+        let mut column = OutputColumn {
+            header: "Raw".to_string(),
+            sources: vec!["Raw".to_string()],
+            stats: Vec::<StatKind>::new(),
+            image: None,
+            truth: Some("Low Risk".to_string()),
+            detail: true,
+        };
+        column.detail = true;
+        let mut row = ReportRow::default();
+        row.cells.insert("Raw".to_string(), "High Risk".to_string());
+        let mut result = ReportResult {
+            column_order: vec!["Raw".into()],
+            rows: vec![row],
+            ..Default::default()
+        };
+        result
+            .verdicts
+            .insert((0, "Raw".into()), Verdict::Incorrect);
+        result.truths.insert((0, "Raw".into()), "Low Risk".into());
+        let columns = vec![column];
+        let (grid, detail) = crate::report::detail::split_columns(&columns);
+        let section = crate::report::detail::sections(&result, 0, &grid, &detail)
+            .into_iter()
+            .next()
+            .expect("the detail column has a section");
+
+        let app = GuiApp::for_test(Session::default());
+        let th = app.theme.clone();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(600.0, 400.0),
+        ));
+        let mut textures = std::collections::HashMap::new();
+        let out = ctx.run_ui(input, |ui| {
+            detail_section(&th, ui, &app, 0, section.clone(), &mut textures);
+        });
+        let mut text = String::new();
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        assert!(
+            text.contains("incorrect"),
+            "the section says it is wrong: {text}"
+        );
+        assert!(
+            text.contains("expected Low Risk"),
+            "and what was wanted instead, which is otherwise only in the script: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod toolbar_commit_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+
+    /// Every piece of text painted this frame, with the rect it was painted in,
+    /// so a test can click a widget by the label it shows.
+    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn input() -> egui::RawInput {
+        let mut i = egui::RawInput::default();
+        i.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 760.0),
+        ));
+        i
+    }
+
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        let mut i = input();
+        i.events.push(egui::Event::PointerMoved(pos));
+        i.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        i.events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        i
+    }
+
+    /// An app with one bound collection and the given report open in its editor.
+    fn app_with_report(text: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entry = crate::hurl::HurlEntry {
+            title: "A".into(),
+            url: "http://127.0.0.1:1/".into(),
+            ..Default::default()
+        };
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        let mut app = GuiApp::for_test(session);
+        let mut report = crate::report::Report::scratch("r");
+        report.set_text(text.to_string());
+        app.report_editor = Some(ReportEditor::new(ReportOrigin::Session(0), report));
+        app
+    }
+
+    /// The Source view asks for the highlighter context on every frame, so it
+    /// has to come back from the cache until one of the names in it moves.
+    #[test]
+    fn the_highlighter_context_is_reused_until_a_name_it_shows_changes() {
+        let mut app = app_with_report("# collection: api\nREQUEST A\n");
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.flow = ed.report.flow().ok();
+        }
+
+        let mut ed = app.report_editor.take().expect("editor");
+        let first = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            first.request_names.contains("A"),
+            "the bound collection's request is known: {:?}",
+            first.request_names
+        );
+        let again = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            std::rc::Rc::ptr_eq(&first, &again),
+            "nothing changed, so the context is not rebuilt"
+        );
+
+        // Renaming a request has to reach the colours.
+        app.session.collections[0].entries[0].title = "B".into();
+        let renamed = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            !std::rc::Rc::ptr_eq(&first, &renamed),
+            "a rename rebuilds the context"
+        );
+        assert!(
+            renamed.request_names.contains("B"),
+            "and the new name is the one highlighted: {:?}",
+            renamed.request_names
+        );
+
+        // So does loading an environment, which the view underlines by name.
+        let before_env = super::highlight_ctx(&mut ed, &app);
+        app.session
+            .global_envs
+            .push(crate::environment::parse_vars("staging".into(), ""));
+        let with_env = super::highlight_ctx(&mut ed, &app);
+        assert!(
+            !std::rc::Rc::ptr_eq(&before_env, &with_env),
+            "a newly loaded environment rebuilds the context"
+        );
+        assert!(with_env.loaded_envs.iter().any(|n| n == "staging"));
+    }
+
+    #[test]
+    fn export_offers_the_report_s_own_name_the_way_the_tui_does() {
+        // The terminal UI seeds its export picker with the report's name and
+        // its `# output:` format; the GUI dialog has to agree, or the same
+        // report exports under two different names depending on the front-end.
+        let mut app = app_with_report("# output: xlsx\n# collection: api\n");
+        let dir = std::env::temp_dir().join(format!("pb_exp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let trail = dir.join("Face FR tickets.trail");
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.report.path = Some(trail.clone());
+            ed.flow = ed.report.flow().ok();
+        }
+        super::open_export_dialog(&mut app);
+        let path = match app.dialog {
+            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            _ => panic!("Export opens PaperBoy's own dialog"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            path,
+            trail.with_extension("xlsx").to_string_lossy(),
+            "the file is named for the report, in the format it declares, beside it"
+        );
+    }
+
+    #[test]
+    fn a_scratch_report_exports_into_its_own_base_directory() {
+        // With no file of its own a report's export name is bare, and would
+        // land wherever PaperBoy was started from; `# root:` says where the
+        // report's world is, so that is where its results go.
+        let dir = std::env::temp_dir().join(format!("pb_exp_root_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let mut app = app_with_report(&format!("# root: {}\n# collection: api\n", dir.display()));
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.flow = ed.report.flow().ok();
+        }
+        super::open_export_dialog(&mut app);
+        let path = match app.dialog {
+            Some(super::super::app::Dialog::ExportResults { path }) => path,
+            _ => panic!("Export opens PaperBoy's own dialog"),
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            std::path::Path::new(&path).starts_with(&dir),
+            "an unsaved report's results are offered in its base directory: {path}"
+        );
+    }
+
+    /// The same collision inside the Blocks view, where the button queues a
+    /// *structural* edit: the field commit carries the path of the block it was
+    /// drawn on, so it has to be applied while that path still means what it
+    /// meant on screen. Applied after a deletion instead, it lands on whichever
+    /// block shuffled into that slot — renaming a block the user never touched.
+    #[test]
+    fn a_field_commit_is_not_applied_to_a_block_that_moved_under_it() {
+        let mut app = app_with_report(
+            "# collection: api\nREPORT REQUEST A AS One\nREPORT REQUEST A AS Two\nREPORT REQUEST A AS Three\n",
+        );
+        let ctx = egui::Context::default();
+
+        let out = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let painted = painted(&out.shapes);
+        let two = painted
+            .iter()
+            .find(|(t, _)| t == "Two")
+            .map(|(_, r)| *r)
+            .expect("the second block's alias field");
+        let trash = painted
+            .iter()
+            .find(|(t, _)| t.contains(app.strings.gui_report_delete_block))
+            .map(|(_, r)| *r)
+            .expect("the Delete block button");
+
+        // Click into the second block's alias and type, without leaving it.
+        let caret = egui::pos2(two.right() - 1.0, two.center().y);
+        let _ = ctx.run_ui(click_at(caret), |ui| super::ui(&mut app, ui));
+        let mut typing = input();
+        typing.events.push(egui::Event::Text("x".into()));
+        let _ = ctx.run_ui(typing, |ui| super::ui(&mut app, ui));
+
+        // With the *first* block selected, delete it while the second block's
+        // field still holds uncommitted text.
+        app.report_editor.as_mut().unwrap().selection = vec![0];
+        // egui resolves a click against the previous frame's widgets, so the
+        // Delete button has to have been drawn enabled once before it can be
+        // pressed.
+        let _ = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let _ = ctx.run_ui(click_at(trash.center()), |ui| super::ui(&mut app, ui));
+
+        let text = &app.report_editor.as_ref().expect("editor open").report.text;
+        assert!(!text.contains("AS One"), "the selected block is deleted");
+        assert!(
+            text.contains("AS Twox"),
+            "the edited block keeps its own edit: {text:?}"
+        );
+        assert!(
+            text.contains("AS Three"),
+            "and the block below it is left alone: {text:?}"
+        );
+    }
+
+    /// Typing in an inline chip field and pressing a toolbar button in one go
+    /// must keep what was typed: the field commits when the click takes its
+    /// focus away, and the button acts on the result. Before, the button acted
+    /// first and switched view, so the field was never redrawn, its commit
+    /// never ran, and the typing was silently thrown away.
+    #[test]
+    fn a_toolbar_press_keeps_what_was_being_typed() {
+        let mut app = app_with_report("# collection: api\nREPORT REQUEST A AS Old\n");
+        let ctx = egui::Context::default();
+
+        // Frame 1: lay the editor out so the alias field has a position.
+        let out = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        let painted = painted(&out.shapes);
+        let alias = painted
+            .iter()
+            .find(|(t, _)| t == "Old")
+            .map(|(_, r)| *r)
+            .expect("the alias field shows its current value");
+        let dry = painted
+            .iter()
+            .find(|(t, _)| t.contains(app.strings.gui_report_dry_run))
+            .map(|(_, r)| *r)
+            .expect("the Dry run button is on the toolbar");
+
+        // Frame 2: click into the alias field, putting the caret after "Old".
+        let caret = egui::pos2(alias.right() - 1.0, alias.center().y);
+        let _ = ctx.run_ui(click_at(caret), |ui| super::ui(&mut app, ui));
+
+        // Frame 3: type, without leaving the field.
+        let mut typing = input();
+        typing.events.push(egui::Event::Text("er".into()));
+        let _ = ctx.run_ui(typing, |ui| super::ui(&mut app, ui));
+        assert!(
+            app.report_editor
+                .as_ref()
+                .is_some_and(|ed| ed.report.text.contains("AS Old")),
+            "still uncommitted while the field has focus"
+        );
+
+        // Frame 4: press Dry run straight from the field.
+        let _ = ctx.run_ui(click_at(dry.center()), |ui| super::ui(&mut app, ui));
+        let ed = app.report_editor.as_ref().expect("the editor stays open");
+        assert!(
+            ed.report.text.contains("AS Older"),
+            "the typing survives the button press: {:?}",
+            ed.report.text
+        );
+        assert!(ed.view == EditorView::Results, "and the button still acted");
+    }
+}
+
+#[cfg(test)]
+mod param_view_tests {
+    use super::*;
+    use crate::report::Report;
+    use crate::session::Session;
+
+    const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+
+    fn editor(text: &str) -> (GuiApp, ReportEditor) {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", text));
+        let ed = app.report_editor.take().expect("editor is open");
+        (app, ed)
+    }
+
+    /// Every piece of text painted by one frame of the editor, in `ctx` — which
+    /// the caller owns, because a modal's layer is laid out on the frame after
+    /// the one that asked for it and a fresh context would never get there.
+    fn painted(ctx: &egui::Context, app: &mut GuiApp) -> String {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 760.0),
+        ));
+        let out = ctx.run_ui(input, |ui| super::ui(app, ui));
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for c in &out.shapes {
+            walk(&c.shape, &mut text);
+        }
+        text
+    }
+
+    /// The questions are a step on the way to a run, not a place: the editor
+    /// opens where the report is built, and Run is what asks.
+    #[test]
+    fn run_asks_the_questions_before_it_starts() {
+        let (mut app, mut ed) = editor(TRAIL);
+        assert!(ed.view == EditorView::Blocks, "opens where it is built");
+        assert!(ed.params_modal.is_none(), "and asks nothing unprompted");
+
+        ed.start_run(&mut app);
+        assert_eq!(ed.params_modal, Some(RunIntent::Run));
+        assert!(!ed.is_running(), "nothing has been run yet");
+    }
+
+    /// A preview is only worth looking at if it previews the run you mean, so
+    /// Dry run asks the same questions — and says so by leading with its own
+    /// button when the dialog opens.
+    #[test]
+    fn a_dry_run_asks_the_same_questions() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.start_dry_run(&mut app);
+        assert_eq!(ed.params_modal, Some(RunIntent::DryRun));
+        assert!(ed.dry_run.is_none(), "and previews nothing yet");
+    }
+
+    /// Answered once, not once per run: the whole point of previewing first is
+    /// to run the same thing afterwards without being asked again.
+    #[test]
+    fn once_answered_the_buttons_act_at_once() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        ed.params_confirmed = true;
+        ed.start_run(&mut app);
+        assert!(ed.params_modal.is_none(), "no second interrogation");
+    }
+
+    /// ...but changing what the report *asks* re-arms the questions: the
+    /// answers were confirmed against the old declarations.
+    #[test]
+    fn changing_a_declaration_asks_again() {
+        let (mut app, mut ed) = editor(TRAIL);
+        ed.params_confirmed = true;
+        ed.set_text(TRAIL.replace("\"au\", \"eu\"", "\"au\", \"eu\", \"us\""));
+        assert!(
+            !ed.params_confirmed,
+            "the choices are not the ones answered"
+        );
+
+        // Editing anything else leaves the answers alone.
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        ed.params_confirmed = true;
+        let same_questions = ed.report.text.replace("REQUEST x", "REQUEST y");
+        ed.set_text(same_questions);
+        assert!(ed.params_confirmed);
+        ed.start_run(&mut app);
+        assert!(ed.params_modal.is_none());
+    }
+
+    /// The form is built from the declarations, defaults included, and the row
+    /// with no default is the one flagged as missing.
+    #[test]
+    fn the_form_asks_one_question_per_parameter() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        let rows = ed.param_rows(&app.strings);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "TICKET");
+        assert_eq!(rows[0].prompt, "Ticket number", "the LABEL is the prompt");
+        assert!(rows[0].problem.is_some(), "nothing given and no default");
+        assert_eq!(rows[1].value, "au", "the declared default fills the row");
+        assert!(rows[1].problem.is_none());
+    }
+
+    /// The toolbar says what the next run will use without anything being
+    /// opened — the dialog only shows itself once.
+    #[test]
+    fn the_toolbar_shows_the_answers_it_will_run_with() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        let summary = ed.param_summary(&app.strings);
+        assert!(summary.contains("TICKET=FR-12"), "{summary}");
+        assert!(summary.contains("REGION=au"), "{summary}");
+    }
+
+    /// The dialog has to actually paint: the prompt, the value the run would
+    /// use, and the raw name beside it. A state-correct dialog that draws
+    /// nothing is the failure mode this guards.
+    #[test]
+    fn the_dialog_paints_the_question_the_value_and_the_name() {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::from_text("Face", TRAIL));
+        // Nothing of the dialog until it is asked for. (The *source* says
+        // "Ticket number" in either case, so the dialog's own lead line is
+        // what distinguishes the two.)
+        let lead = app.strings.param_view_lead;
+        let ctx = egui::Context::default();
+        let before = painted(&ctx, &mut app);
+        assert!(!before.contains(lead), "{before}");
+
+        if let Some(ed) = app.report_editor.as_mut() {
+            ed.params_modal = Some(RunIntent::Run);
+        }
+        // Twice: a modal's own layer is laid out on the frame after the one
+        // that asked for it.
+        painted(&ctx, &mut app);
+        let text = painted(&ctx, &mut app);
+        assert!(text.contains(lead), "the dialog is up: {text}");
+        assert!(text.contains("Ticket number"), "the prompt: {text}");
+        assert!(text.contains("TICKET"), "and the name the script uses");
+        assert!(
+            text.contains("au"),
+            "and the value the run would use: {text}"
+        );
+    }
+
+    /// Answers survive a trip to another tab, so nobody types them twice.
+    #[test]
+    fn the_answers_travel_with_a_parked_run() {
+        let (app, mut ed) = editor(TRAIL);
+        ed.seed_params(&app.session);
+        ed.param_values.insert("TICKET".into(), "FR-12".into());
+        let parked = ed.park_run();
+
+        let (_app2, mut fresh) = editor(TRAIL);
+        fresh.adopt_run(parked);
+        assert_eq!(
+            fresh.param_values.get("TICKET").map(String::as_str),
+            Some("FR-12")
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_run_tests {
+    use super::*;
+    use crate::gui::report_run::{RunUpdate, test_handle};
+    use crate::report::Report;
+    use crate::report::model::{ReportResult, ReportRow};
+    use crate::session::Session;
+
+    fn editor() -> (GuiApp, ReportEditor) {
+        let mut app = GuiApp::for_test(Session::default());
+        app.open_report_editor(ReportOrigin::Workspace, Report::scratch("nightly"));
+        let ed = app.report_editor.take().expect("editor is open");
+        (app, ed)
+    }
+
+    fn result_with(cell: &str) -> ReportResult {
+        let mut res = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), cell.to_string());
+        res.rows.push(row);
+        res
+    }
+
+    /// Stopping used to only raise the cancel flag and leave the handle in
+    /// place, so `is_running()` stayed true — and the button stayed a Stop
+    /// button — until the worker's `Done` finally arrived. Cancelling doesn't
+    /// abort an in-flight request, and a `PARALLEL` batch can take a long time
+    /// to wind down, so the report was unrunnable for a while. The TUI retires
+    /// the run at once; so must this.
+    #[test]
+    fn stopping_frees_the_report_to_be_run_again_at_once() {
+        let (mut app, mut ed) = editor();
+        let (handle, tx) = test_handle();
+        ed.run = Some(handle);
+        assert!(ed.is_running(), "a live handle is a live run");
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            !ed.is_running(),
+            "the run is retired immediately, without waiting for the worker"
+        );
+        assert!(matches!(app.session.status, Some(Status::ReportRunStopped)));
+
+        // The worker is still alive and still winding down: it has not sent
+        // `Done`, and sending now must not resurrect the run.
+        assert!(
+            tx.send(RunUpdate::Done(ReportResult::default())).is_err(),
+            "our end of the channel went with the handle, so late updates \
+             land nowhere rather than being folded in"
+        );
+        assert!(!ed.is_running());
+    }
+
+    /// Retiring the handle must not take the partial grid with it: rows that
+    /// completed before the stop keep their real responses, and the user can
+    /// still read, save or export them.
+    #[test]
+    fn stopping_keeps_the_rows_that_already_arrived_but_clears_the_progress() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        ed.run = Some(handle);
+        ed.result = Some(result_with("200"));
+        ed.progress = Some(crate::gui::report_run::RunProgress {
+            states: vec![crate::gui::report_run::RowState::Running],
+            index: Default::default(),
+            done: 0,
+            total: 1,
+        });
+
+        ed.stop_run(&mut app);
+
+        assert_eq!(
+            ed.result.as_ref().map(|r| r.rows.len()),
+            Some(1),
+            "the partial grid survives the stop"
+        );
+        assert!(
+            ed.progress.is_none(),
+            "but no row is left rendering as still running"
+        );
+    }
+
+    /// The cancel flag still has to be raised, or the detached worker would
+    /// carry on firing requests at the network after the user stopped it.
+    #[test]
+    fn stopping_still_tells_the_worker_to_wind_down() {
+        let (mut app, mut ed) = editor();
+        let (handle, _tx) = test_handle();
+        let flag = handle.cancel_flag_for_test();
+        ed.run = Some(handle);
+
+        ed.stop_run(&mut app);
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "dropping our end alone would not stop the worker: it watches the flag"
+        );
     }
 }

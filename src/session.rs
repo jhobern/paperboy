@@ -6,10 +6,18 @@
 //! environment, loading collections/environments, tab management and
 //! persistence) that used to live only inside the terminal UI's `TuiApp`.
 //!
-//! Both front-ends drive the exact same logic through this module so there is
-//! no duplication: the GUI owns a [`Session`] directly, and the terminal UI's
-//! pure/duplicated helpers delegate to the free functions here (see
-//! [`effective_env`], [`shadowed_env_keys`], [`active_theme_spec`]).
+//! Both front-ends own one of these and drive the exact same logic through it,
+//! so there is a single copy of the state in the process and a single writer of
+//! `state.json`. The GUI holds a [`Session`] as a field; the terminal UI's
+//! `TuiApp` holds one and `Deref`s to it, so `self.collections` in the terminal
+//! UI and `session.collections` in the GUI are the same data reached two ways.
+//! `TuiApp` keeps only *view* state of its own — cursors, scroll offsets,
+//! overlays, focus, wrap caches, and its richer report tabs.
+//!
+//! The practical consequence: a new persisted setting is added **here**, in
+//! [`Session`] and [`PersistedState`], and both front-ends get it. Before this
+//! was true the two copies could (and did) silently disagree — a default set in
+//! one place and not the other.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -17,6 +25,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::collection::Collection;
+use crate::env_panel::EnvSource;
 use crate::environment::{
     EnvUpdate, Environment, PendingEnvSecrets, looks_like_env, parse_vars_pending,
     spawn_resolution, spawn_resolution_many,
@@ -29,9 +38,9 @@ use crate::persistence::{
     self, GuiLayout, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState,
     PersistedTab,
 };
+use crate::remote_flow::WorkspaceGitOrigin;
 use crate::request::{self, AppVars, BatchRunUpdate, CaptureUpdate, RequestView};
 use crate::theme::{self, ThemeSpec};
-use crate::tui::remote::WorkspaceGitOrigin;
 
 // ── Shared pure helpers (called by both front-ends) ─────────────────────────
 
@@ -132,6 +141,11 @@ pub fn active_theme_spec(
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub enum PickerKind {
     Environment,
+    /// Where an imported Postman workspace is written. Kept apart from the
+    /// general last-browsed folder because imports are collected somewhere
+    /// deliberate — a folder of downloaded workspaces — and that choice must
+    /// not be dragged around by every unrelated file the user opens.
+    Import,
     Other,
 }
 
@@ -139,7 +153,6 @@ pub enum PickerKind {
 
 /// The whole front-end-agnostic application state. The GUI holds one of these;
 /// the terminal UI keeps its own view state but shares this module's logic.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct Session {
     pub language: Language,
     pub vars: AppVars,
@@ -149,9 +162,14 @@ pub struct Session {
     /// The active tab index (into `collections`).
     pub active_tab: usize,
 
-    /// The global environments, shared across every collection.
+    /// The global list of Environments, shared across all collections (in the
+    /// terminal UI, the "Global Environments" panel, `Pane::GlobalEnv`).
+    /// Individual collections may `linked_env_id` one of these; at most one may
+    /// be `active_env_id` at a time.
     pub global_envs: Vec<Environment>,
-    /// The activated Global Environment id, if any.
+    /// The currently-activated Global Environment, if any — its vars are used
+    /// for substitution in any collection (subject to being overridden by that
+    /// collection's own `linked_env_id`, if set, on name collision).
     pub active_env_id: Option<u64>,
 
     /// The shared response buffer written by the background request runner.
@@ -162,23 +180,65 @@ pub struct Session {
     pub pending_captures: Vec<Receiver<CaptureUpdate>>,
     pub pending_batch_runs: Vec<Receiver<BatchRunUpdate>>,
 
-    /// User-created themes and the explicitly-chosen theme name (`None` follows
-    /// the language preset).
+    /// User-created themes (persisted). Shown in the Theme editor alongside the
+    /// built-in presets; deletable (unlike presets).
     pub custom_themes: Vec<ThemeSpec>,
+    /// The explicitly-chosen theme name, or `None` to follow the language's
+    /// preset. Set the moment the user picks any theme in the Theme editor;
+    /// while `None`, changing language also changes the effective theme.
+    ///
+    /// A new install starts on [`theme::default_preset`] rather than on `None`:
+    /// the language presets are decorative, and the default should be the
+    /// neutral one. Restoring a saved state overwrites this, so an existing
+    /// install's choice — including `None` — is preserved across an upgrade.
     pub active_theme: Option<String>,
 
     // Persisted settings / preferences.
+    /// Confirm before quitting / before closing all collections.
     pub confirm_on_exit: bool,
     pub confirm_on_clear: bool,
+    /// Confirm before deleting a Global Environment. On by default; turn it off
+    /// to always delete immediately (the deletion stays undoable).
     pub confirm_on_delete_env: bool,
+    /// When set, a "Save / Discard / Cancel" prompt for unsaved in-memory edits
+    /// (switching collections in a Workspace, or pushing one to git) is skipped
+    /// and the "Save" action taken automatically. Off by default, so the prompt
+    /// is shown.
     pub always_save_when_prompted: bool,
+    /// Which of JSON / Hurl text the Request view shows by default, for every
+    /// request.
     pub default_request_view: RequestView,
+    /// Run "Run All" in batch mode — the whole collection in one Hurl execution,
+    /// so Hurl's cookie jar and `[Captures]` chain across every request. Off by
+    /// default, so Run All streams results as they finish (matching the CLI
+    /// default), at the cost of not carrying automatic cookies between requests.
     pub run_all_batch_mode: bool,
+    /// Width (columns) of the terminal UI's left column.
     pub list_width: u16,
     pub response_pct: u16,
+    pub env_source: EnvSource,
+    /// Git URLs the user has loaded a collection/environment from, most recent
+    /// first. Offered as a pickable list in the "Load from Git" wizard.
     pub recent_git_urls: Vec<String>,
+    /// Provider references the Postman API key has been read from, most recent
+    /// first. Offered in the import wizard so the item path only has to be
+    /// found once. Only references are kept — never a pasted key.
+    pub recent_key_refs: Vec<String>,
+    /// The parameter values each report was last run with, keyed by
+    /// [`crate::report::Report::param_key`] and offered back the next time its
+    /// run settings open. Most recently used first, and capped — a value
+    /// nobody has used for fifty reports is not worth carrying forever.
+    pub report_params: Vec<crate::persistence::PersistedReportParams>,
+    /// Folder the file browser last selected a file from; it reopens here.
     pub last_browse_dir: Option<PathBuf>,
+    /// Folder the last *environment* file was loaded from; the environment
+    /// picker reopens here (falling back to `last_browse_dir`), so it isn't
+    /// dragged around by loads of unrelated file types.
     pub last_env_dir: Option<PathBuf>,
+    /// Folder the last Postman import was written into; the next import
+    /// suggests the same place, so downloaded workspaces end up together
+    /// instead of wherever the app happened to be started from.
+    pub last_import_dir: Option<PathBuf>,
     /// Window/panel geometry and last-open view for the graphical front-end.
     /// The terminal UI never reads it but still round-trips it, so alternating
     /// between the two front-ends doesn't wipe the GUI's layout.
@@ -217,7 +277,12 @@ impl Default for Session {
             pending_captures: Vec::new(),
             pending_batch_runs: Vec::new(),
             custom_themes: Vec::new(),
-            active_theme: None,
+            // A fresh install opens on the default theme rather than on the
+            // current language's preset. `None` still means "follow language" —
+            // it is an explicit choice in the Theme menu — so an existing
+            // install that never picked a theme keeps following its language
+            // and is not repainted by an upgrade.
+            active_theme: Some(theme::default_preset().name),
             confirm_on_exit: true,
             confirm_on_clear: true,
             confirm_on_delete_env: true,
@@ -226,9 +291,13 @@ impl Default for Session {
             run_all_batch_mode: false,
             list_width: 38,
             response_pct: 42,
+            env_source: EnvSource::Both,
             recent_git_urls: Vec::new(),
+            recent_key_refs: Vec::new(),
+            report_params: Vec::new(),
             last_browse_dir: None,
             last_env_dir: None,
+            last_import_dir: None,
             gui: GuiLayout::default(),
             status: None,
             reports: Vec::new(),
@@ -439,6 +508,7 @@ impl Session {
     pub fn picker_dir(&self, kind: PickerKind) -> Option<&std::path::Path> {
         let specific = match kind {
             PickerKind::Environment => self.last_env_dir.as_deref(),
+            PickerKind::Import => self.last_import_dir.as_deref(),
             PickerKind::Other => None,
         };
         specific
@@ -457,10 +527,85 @@ impl Session {
         let Some(dir) = dir.filter(|d| d.is_dir()) else {
             return;
         };
-        if kind == PickerKind::Environment {
-            self.last_env_dir = Some(dir.clone());
+        match kind {
+            PickerKind::Environment => self.last_env_dir = Some(dir.clone()),
+            PickerKind::Import => self.last_import_dir = Some(dir.clone()),
+            PickerKind::Other => {}
         }
         self.last_browse_dir = Some(dir);
+    }
+
+    /// Record `key` as a most-recently-used Postman key *reference*: moved to
+    /// the front, deduplicated, capped at 10.
+    ///
+    /// A pasted key is refused outright. Finding the 1Password item path is the
+    /// tedious part of setting an import up and worth remembering; the key
+    /// itself is a live credential, and this list is written to disk.
+    ///
+    /// Returns whether anything changed, so a caller polling every frame does
+    /// not rewrite `state.json` sixty times a second.
+    pub fn remember_key_ref(&mut self, key: &str) -> bool {
+        let key = key.trim();
+        if key.is_empty() || crate::postman_flow::KeySource::detect(key).0.is_secret() {
+            return false;
+        }
+        if self.recent_key_refs.first().is_some_and(|k| k == key) {
+            return false;
+        }
+        self.recent_key_refs.retain(|known| known != key);
+        self.recent_key_refs.insert(0, key.to_string());
+        self.recent_key_refs.truncate(10);
+        true
+    }
+
+    /// The values report `key` was last run with, as a map ready for a run.
+    /// Empty when this report has never been run with parameters — which is
+    /// also what a report with no parameters looks like, so callers need no
+    /// special case.
+    pub fn remembered_params(&self, key: &str) -> crate::report::params::ParamValues {
+        self.report_params
+            .iter()
+            .find(|r| r.key == key)
+            .map(|r| r.values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remember the values report `key` was just run with, so its run settings
+    /// open on them next time. Returns whether anything actually changed, so a
+    /// caller polling every frame doesn't rewrite `state.json` for nothing.
+    ///
+    /// Values are stored sorted, and the report moves to the front of the
+    /// list: the cap has to evict something, and the report you last ran is
+    /// the one you are least likely to want forgotten.
+    pub fn remember_params(
+        &mut self,
+        key: &str,
+        values: &crate::report::params::ParamValues,
+    ) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let mut pairs: Vec<(String, String)> =
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort();
+        let entry = crate::persistence::PersistedReportParams {
+            key: key.to_string(),
+            values: pairs,
+        };
+        if self.report_params.first().is_some_and(|r| *r == entry) {
+            return false;
+        }
+        let had_key = self.report_params.iter().any(|r| r.key == key);
+        self.report_params.retain(|r| r.key != key);
+        // Nothing to remember: a report run entirely on its defaults shouldn't
+        // hold a slot, and clearing the values should forget them. Only a
+        // report that *had* an entry has changed by losing it.
+        if entry.values.is_empty() {
+            return had_key;
+        }
+        self.report_params.insert(0, entry);
+        self.report_params.truncate(50);
+        true
     }
 
     /// Close tab `idx` (the built-in Request tab at index 0 is never closed).
@@ -812,13 +957,20 @@ impl Session {
                 .last_env_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            last_import_dir: self
+                .last_import_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
             confirm_on_delete_env: self.confirm_on_delete_env,
             always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,
+            env_source: self.env_source,
             recent_git_urls: self.recent_git_urls.clone(),
+            recent_key_refs: self.recent_key_refs.clone(),
+            report_params: self.report_params.clone(),
             default_request_view: self.default_request_view,
             run_all_batch_mode: self.run_all_batch_mode,
             custom_themes: self.custom_themes.clone(),
@@ -866,23 +1018,36 @@ impl Session {
         if !state.tabs.is_empty() {
             let mut collections = Vec::with_capacity(state.tabs.len());
             let mut reloads = VecDeque::new();
+            let mut missing_workspace_name = None;
             for (idx, tab) in state.tabs.into_iter().enumerate() {
+                let had_root = tab.workspace_root.is_some();
+                let name = tab.name.clone();
                 let linked_env_id = tab
                     .linked_env_index
                     .and_then(|i| self.global_envs.get(i))
                     .map(|e| e.id);
                 let (col, pending_reload) = tab.into_collection(linked_env_id);
-                // A git-downloaded Workspace whose folder has vanished since
-                // the last session (typically `/tmp` swept between restarts)
-                // is queued rather than silently reset — the front-end offers
-                // to redownload it, pinned to the exact commit it recorded.
-                if let Some(reload) = pending_reload {
-                    reloads.push_back((idx, reload));
+                if had_root && col.workspace_root.is_none() {
+                    match pending_reload {
+                        // A git-downloaded Workspace whose folder has vanished
+                        // since the last session (typically `/tmp` swept between
+                        // restarts) is queued rather than silently reset — the
+                        // front-end offers to redownload it, pinned to the exact
+                        // commit it recorded.
+                        Some(reload) => reloads.push_back((idx, reload)),
+                        // Nothing to redownload (a local folder that was moved or
+                        // deleted), so just say so rather than presenting an
+                        // empty tab with no explanation.
+                        None => missing_workspace_name = Some(name),
+                    }
                 }
                 collections.push(col);
             }
             self.collections = collections;
             self.pending_workspace_reloads = reloads;
+            if let Some(name) = missing_workspace_name {
+                self.status = Some(Status::WorkspaceFolderMissing(name));
+            }
         }
 
         self.reports = state.reports;
@@ -897,6 +1062,10 @@ impl Session {
             .last_env_dir
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        self.last_import_dir = state
+            .last_import_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         self.gui = state.gui;
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
@@ -904,7 +1073,10 @@ impl Session {
         self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;
+        self.env_source = state.env_source;
         self.recent_git_urls = state.recent_git_urls;
+        self.recent_key_refs = state.recent_key_refs;
+        self.report_params = state.report_params;
         self.default_request_view = state.default_request_view;
         self.run_all_batch_mode = state.run_all_batch_mode;
         self.custom_themes = state.custom_themes;
@@ -918,10 +1090,77 @@ impl Session {
 }
 
 #[cfg(test)]
+mod param_memory_tests {
+    use super::*;
+
+    fn values(pairs: &[(&str, &str)]) -> crate::report::params::ParamValues {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_report_is_offered_the_values_it_was_last_run_with() {
+        let mut s = Session::default();
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert_eq!(
+            s.remembered_params("name:Face"),
+            values(&[("TICKET", "42")])
+        );
+        // Another report's answers are its own.
+        assert!(s.remembered_params("name:Other").is_empty());
+    }
+
+    #[test]
+    fn remembering_the_same_values_twice_doesnt_rewrite_the_state_file() {
+        let mut s = Session::default();
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert!(!s.remember_params("name:Face", &values(&[("TICKET", "42")])));
+        assert!(s.remember_params("name:Face", &values(&[("TICKET", "43")])));
+    }
+
+    #[test]
+    fn clearing_every_value_forgets_the_report_rather_than_keeping_an_empty_slot() {
+        let mut s = Session::default();
+        s.remember_params("name:Face", &values(&[("TICKET", "42")]));
+        assert!(s.remember_params("name:Face", &Default::default()));
+        assert!(s.remembered_params("name:Face").is_empty());
+        // Nothing was remembered, so there is nothing to forget the second time.
+        assert!(!s.remember_params("name:Face", &Default::default()));
+    }
+
+    #[test]
+    fn only_the_fifty_most_recently_run_reports_are_remembered() {
+        let mut s = Session::default();
+        for i in 0..60 {
+            s.remember_params(&format!("name:r{i}"), &values(&[("N", "1")]));
+        }
+        assert_eq!(s.report_params.len(), 50);
+        // The oldest fell off the end; the one just run is at the front.
+        assert!(s.remembered_params("name:r0").is_empty());
+        assert_eq!(s.remembered_params("name:r59"), values(&[("N", "1")]));
+    }
+
+    #[test]
+    fn remembered_values_survive_a_restart() {
+        let mut s = Session::default();
+        s.remember_params("name:Face", &values(&[("TICKET", "42"), ("ENV", "au")]));
+        let persisted = s.to_persisted();
+        let mut restored = Session::default();
+        restored.apply_persisted(persisted);
+        assert_eq!(
+            restored.remembered_params("name:Face"),
+            values(&[("TICKET", "42"), ("ENV", "au")])
+        );
+    }
+}
+
+#[cfg(test)]
 mod workspace_tests {
     use super::*;
     use crate::collection::WsRow;
-    use crate::tui::remote::WorkspaceGitFilter;
+    use crate::remote_flow::WorkspaceGitFilter;
 
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1047,6 +1286,53 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Quitting only warns about edits a quit would really destroy.
+    ///
+    /// A plain tab's requests are written to the session state exactly as they
+    /// stand, edit markers and all, so they come back edited next start — the
+    /// warning used to count those and so appeared on every single quit, and
+    /// went on appearing no matter how many times it was dismissed, because
+    /// nothing about the edits ever changed.
+    #[test]
+    fn quitting_only_counts_edits_that_a_restart_would_not_bring_back() {
+        let dir = tmp("lost");
+        let mut s = Session::default();
+        s.collections.clear();
+
+        // A plain tab, edited and never saved to its file.
+        let mut plain = crate::collection::Collection::new(
+            "plain".to_string(),
+            vec![crate::hurl::HurlEntry::default()],
+        );
+        plain.path = Some(dir.join("plain.hurl"));
+        plain.entries[0].modified = true;
+        s.collections.push(plain);
+
+        // And a Workspace tab, likewise.
+        let ci = s.open_workspace(dir.clone());
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        s.collections[ci].entries[0].modified = true;
+
+        assert_eq!(
+            s.collections[0].unsaved_edit_count(),
+            1,
+            "closing the plain tab would still throw its edit away"
+        );
+        assert_eq!(
+            s.collections[0].edits_lost_on_exit(),
+            0,
+            "but quitting would not: the session state keeps it, still flagged"
+        );
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            1,
+            "while a Workspace tab is re-read from disk on restore, so its edit \
+             really would be gone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The GUI's pixel geometry survives a save/load round-trip. (The matching
     /// terminal-UI half — that it carries the field through untouched — is
     /// asserted in `tui::tests`, where `TuiApp` is reachable.)
@@ -1059,6 +1345,8 @@ mod workspace_tests {
             response_height: Some(360.0),
             report_diag_height: Some(96.0),
             report_palette_width: Some(200.0),
+            report_detail_height: Some(280.0),
+            report_summary_height: Some(200.0),
             view: crate::persistence::GuiView::Report(2),
             report_source_view: true,
         };
@@ -1158,6 +1446,81 @@ mod workspace_tests {
         assert!(s.collections[ci].workspace_pending.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// "Save all changes" on the quit dialog has to reach the files a Workspace
+    /// tab is *not* showing as well as the one it is: switching away from an
+    /// edited file parks its entries, and those are exactly as lost on exit as
+    /// the loaded file's.
+    #[test]
+    fn saving_all_workspace_edits_writes_the_parked_files_too_not_just_the_loaded_one() {
+        let dir = tmp("save_all");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+
+        // Edit one file, switch away (parking it), then edit the next.
+        assert!(s.load_workspace_file(ci, dir.join("health.hurl")));
+        s.collections[ci].entries[0].url = "https://example.com/health/v2".into();
+        s.collections[ci].entries[0].modified = true;
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+        s.collections[ci].entries[0].url = "https://example.com/people".into();
+        s.collections[ci].entries[0].modified = true;
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            2,
+            "one edit parked and one loaded, both of them at risk"
+        );
+
+        let written = s.collections[ci]
+            .save_workspace_edits()
+            .expect("both files are writable");
+        assert_eq!(
+            written, 2,
+            "the parked file counts as much as the loaded one"
+        );
+
+        // Both edits are on disk, not merely marked as saved.
+        let parked = std::fs::read_to_string(dir.join("health.hurl")).unwrap();
+        assert!(
+            parked.contains("https://example.com/health/v2"),
+            "the file that was switched away from was written: {parked}"
+        );
+        let loaded = std::fs::read_to_string(dir.join("api/users.hurl")).unwrap();
+        assert!(
+            loaded.contains("https://example.com/people"),
+            "the file on screen was written: {loaded}"
+        );
+
+        assert_eq!(
+            s.collections[ci].edits_lost_on_exit(),
+            0,
+            "with everything written there is nothing left for the dialog to warn about"
+        );
+        assert!(
+            s.collections[ci].workspace_pending.is_empty(),
+            "and no stale snapshot is left to be written back over a saved file later"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary tab is left alone: its edits are persisted with the session,
+    /// so a bulk save has nothing it needs to rescue and no file to guess at.
+    #[test]
+    fn saving_all_workspace_edits_leaves_an_ordinary_tab_alone() {
+        let mut plain = crate::collection::Collection::new("scratch".into(), Vec::new());
+        let mut e = crate::hurl::HurlEntry::default();
+        e.title = "req".into();
+        e.modified = true;
+        plain.entries.push(e);
+
+        let written = plain.save_workspace_edits().expect("a no-op cannot fail");
+        assert_eq!(written, 0, "nothing was written");
+        assert!(
+            plain.has_unsaved_edits(),
+            "and the edit is still flagged, because it is still unsaved -- it is \
+             just not in danger"
+        );
     }
 
     fn git_origin(url: &str) -> WorkspaceGitOrigin {

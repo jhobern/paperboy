@@ -9,11 +9,20 @@
 //! in the proportional family every label uses, so every GUI icon is sourced
 //! from here rather than from a bare Unicode literal.
 //!
-//! These are thin, readable aliases over the `egui_phosphor::regular`
-//! constants so call sites read `icons::FOLDER` instead of a bare escape, and a
-//! future weight/variant swap is a one-file change.
+//! These are thin, readable aliases over the Phosphor constants so call sites
+//! read `icons::FOLDER` instead of a bare escape, and a future weight/variant
+//! swap is a one-file change.
+//!
+//! The weight is chosen in [`super::app::GuiApp::new`], not here: every Phosphor
+//! variant maps the *same* codepoints (`FOLDER` is `U+E24A` in all of them), so
+//! these constants are identical whichever weight is registered, and only one
+//! variant can be registered at a time — `add_to_fonts` always inserts under
+//! the font key `"phosphor"`, so a second call would replace the first rather
+//! than sit beside it. Mixing two icon weights in one build would therefore
+//! mean registering a second family by hand and paying for a second copy of the
+//! font; it isn't worth it for a weight change.
 
-use egui_phosphor::regular as p;
+use egui_phosphor::light as p;
 
 /// Collapsed tree row (folder/collection closed) — leading disclosure caret.
 pub const CARET_RIGHT: &str = p::CARET_RIGHT;
@@ -57,6 +66,9 @@ pub const TRASH: &str = p::TRASH;
 pub const STOP: &str = p::STOP;
 /// Export a report's results to a file.
 pub const EXPORT: &str = p::EXPORT;
+/// Hand an exported file to the desktop's default application (it leaves the
+/// app, hence the arrow out of a box rather than a second export glyph).
+pub const OPEN_EXTERNAL: &str = p::ARROW_SQUARE_OUT;
 /// A row queued in the streaming results grid (formerly `·`).
 pub const ROW_SCHEDULED: &str = p::DOT_OUTLINE;
 /// Preview a report's projected rows without sending anything (the dry run).

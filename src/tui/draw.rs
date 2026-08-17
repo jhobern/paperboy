@@ -16,7 +16,9 @@ use crate::tree;
 use super::app::*;
 use super::editor::*;
 use super::git_save::*;
+use super::listscroll::ListScroll;
 use super::new_request::*;
+use super::postman::*;
 use super::remote::*;
 use super::theme::*;
 use std::sync::Arc;
@@ -26,6 +28,11 @@ use tui_panel_select::wrapcache::TextPos;
 /// Marks a collection/environment title as loaded from git — shown before the
 /// name whenever `Collection::git_origin` / `env_git_origin` is set.
 pub(crate) const GIT_ICON: &str = "\u{2387}";
+/// Marks an Environments panel row as coming from the open Workspace folder,
+/// as opposed to an environment loaded from anywhere else. Deliberately a
+/// single-cell BMP glyph (⌂) rather than a folder emoji — see the note on
+/// [`SHADOW_ICON`] about terminals giving emoji double-cell width.
+pub(crate) const WORKSPACE_ICON: &str = "\u{2302}";
 /// Joins a collection tab to its linked Global Environment's sub-tab in the
 /// tab bar (see `draw_tabs`).
 pub(crate) const LINK_ICON: &str = "\u{1F517}";
@@ -167,11 +174,13 @@ enum LeftRow {
         /// workspace requests.
         depth: usize,
     },
-    /// A request of an expanded but *not-loaded* workspace collection: only its
-    /// cached name is known (no entry to draw method/status from), so it renders
-    /// as a dim, name-only leaf. Opening it (Enter/Right) loads its collection.
+    /// A request of an expanded but *not-loaded* workspace collection: its name
+    /// and method are cached, but there is no entry to draw run status or edit
+    /// markers from, so it renders dim apart from the method badge. Opening it
+    /// (Enter/Right) loads its collection.
     WsRequestName {
         name: String,
+        method: String,
         depth: usize,
     },
 }
@@ -218,10 +227,15 @@ impl LeftRow {
                     } => LeftRow::Entry { idx, depth },
                     WsRow::Request {
                         name,
+                        method,
                         depth,
                         loaded: false,
                         ..
-                    } => LeftRow::WsRequestName { name, depth },
+                    } => LeftRow::WsRequestName {
+                        name,
+                        method,
+                        depth,
+                    },
                 })
                 .collect()
         } else {
@@ -255,6 +269,40 @@ pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> 
             Style::default().fg(th.text).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(th.panel))
+}
+
+/// The width of a dialog's label column: the longest label plus a gap.
+///
+/// Wizards put the label beside its field rather than above it (the request
+/// editor's shape), which halves the rows a form takes and lines every value
+/// up on one column.
+pub(crate) fn label_column<'a>(labels: impl IntoIterator<Item = &'a str>) -> u16 {
+    labels
+        .into_iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16
+        + 2
+}
+
+/// A focused dialog panel whose shortcut hint sits on the bottom border.
+///
+/// The convention across the app: keys belong on the frame, not in the body,
+/// where they cost no row and never get mistaken for content or for a status
+/// message. Pass `style` to override the dim default (the confirm screens use
+/// the accent, because there the key *is* the next action).
+pub(crate) fn panel_hinted(title: String, hint: &str, th: &Theme) -> Block<'static> {
+    panel_hinted_styled(title, hint, Style::default().fg(th.dim), th)
+}
+
+pub(crate) fn panel_hinted_styled(
+    title: String,
+    hint: &str,
+    style: Style,
+    th: &Theme,
+) -> Block<'static> {
+    panel(title, true, th)
+        .title_bottom(Line::from(Span::styled(format!(" {hint} "), style)).centered())
 }
 
 pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -445,7 +493,9 @@ fn draw_report_node_request_overlay(
             }
             FormRow::With(wi) => {
                 let text = match form.with.get(wi) {
-                    Some(crate::report::flow::WithItem::Field { name, query, stats }) => {
+                    Some(crate::report::flow::WithItem::Field {
+                        name, query, stats, ..
+                    }) => {
                         let stats = if stats.is_empty() {
                             String::new()
                         } else {
@@ -548,6 +598,7 @@ fn draw_report_node_vars_overlay(
         .enumerate()
         .map(|(i, row)| {
             let text = match row {
+                VarsRow::Clause(cr) => clause_text(*cr, &form.clauses, s, i == form.selected),
                 VarsRow::Var(vi) => {
                     let r = &form.vars[*vi];
                     let mark = if r.included {
@@ -615,6 +666,7 @@ fn draw_report_node_computed_overlay(
         .enumerate()
         .map(|(i, row)| {
             let text = match row {
+                ComputedRow::Clause(cr) => clause_text(*cr, &form.clauses, s, i == form.selected),
                 ComputedRow::Template => caretted(
                     format!(
                         "{}: {}",
@@ -834,6 +886,74 @@ fn draw_simple_form_overlay(
 }
 
 /// Draw the `WITH` field overlay ([`Overlay::ReportNodeWithField`]): the column
+/// Render one row of the shared `TRUTH`/`IMAGE`/`DETAIL` clause block.
+///
+/// Lives here rather than in each of the three column forms so the block looks
+/// and behaves the same wherever it appears -- a `WITH` field, a `REPORT … AS`
+/// and a computed column all attach the same clauses.
+fn clause_text(
+    row: super::report_nodes::ClauseRow,
+    c: &crate::report::edit::ClauseForm,
+    s: &Strings,
+    is_sel: bool,
+) -> String {
+    use super::report_nodes::ClauseRow;
+    let check = |on: bool| {
+        if on {
+            s.checkbox_checked
+        } else {
+            s.checkbox_unchecked
+        }
+    };
+    // The sizing rows are children of the IMAGE toggle, so they are indented
+    // under it exactly as the STATISTICS checkboxes are under theirs.
+    let text = match row {
+        // Blank is the normal case -- most columns have nothing to be scored
+        // against -- so an empty row says so rather than showing an
+        // unexplained gap.
+        ClauseRow::Truth => {
+            let shown = if c.truth.trim().is_empty() && !is_sel {
+                s.report_node_clause_truth_none.to_string()
+            } else {
+                c.truth.clone()
+            };
+            let mut t = format!("{}: {shown}", s.report_node_clause_truth_label);
+            if is_sel {
+                t.push('▏');
+            }
+            t
+        }
+        ClauseRow::Detail => format!("{} {}", check(c.detail), s.report_node_clause_detail_toggle),
+        ClauseRow::Image => format!(
+            "{} {}",
+            check(c.image_on),
+            s.report_node_clause_image_toggle
+        ),
+        ClauseRow::Fit => format!("    {} {}", check(c.fit), s.report_node_clause_fit),
+        ClauseRow::Height | ClauseRow::Width => {
+            let (label, value) = if matches!(row, ClauseRow::Height) {
+                (s.report_node_clause_height, &c.height)
+            } else {
+                (s.report_node_clause_width, &c.width)
+            };
+            // A blank size means "leave this dimension to the writer", which
+            // is worth saying out loud: an empty field otherwise looks like a
+            // value that failed to load.
+            let shown = if value.is_empty() && !is_sel {
+                s.report_node_clause_size_auto.to_string()
+            } else {
+                value.clone()
+            };
+            let mut t = format!("    {label}: {shown}");
+            if is_sel {
+                t.push('▏');
+            }
+            t
+        }
+    };
+    text
+}
+
 /// name, the Hurl query behind it and the `STATISTICS(…)` checklist. Opened
 /// from a `WITH` row of the request form and returns there on Enter or Esc.
 fn draw_report_node_with_field_overlay(
@@ -890,6 +1010,24 @@ fn draw_report_node_with_field_overlay(
                 }
                 Line::from(Span::styled(text, base))
             }
+            WithFieldRow::Clause(cr) => Line::from(Span::styled(
+                clause_text(cr, &form.clauses, s, is_sel),
+                base,
+            )),
+            // The toggle sits flush left and the checkboxes it reveals are
+            // indented under it, so the list reads as its contents rather than
+            // as six more peers of Column name and Query.
+            WithFieldRow::Stats => {
+                let mark = if form.stats_on {
+                    s.checkbox_checked
+                } else {
+                    s.checkbox_unchecked
+                };
+                Line::from(Span::styled(
+                    format!("{mark} {}", s.report_node_with_stats_toggle),
+                    base,
+                ))
+            }
             WithFieldRow::Stat(si) => {
                 let (kind, on) = form.stats[si];
                 let mark = if on {
@@ -905,11 +1043,7 @@ fn draw_report_node_with_field_overlay(
                     Style::default().fg(th.dim)
                 };
                 Line::from(Span::styled(
-                    format!(
-                        "  {mark} {}({})",
-                        s.report_node_with_stats_label,
-                        kind.keyword()
-                    ),
+                    format!("    {mark} {}", kind.keyword()),
                     style,
                 ))
             }
@@ -1289,6 +1423,72 @@ fn draw_report_bind_overlay(
     }
 }
 
+/// Draw the node editor's settings menu ([`Overlay::ReportSettingMenu`]): the
+/// list of report-header directives left to add, or the values one of them can
+/// take. Deliberately the same shape as the node palette beside it — both are
+/// "pick one of these" and there is no reason for them to look different.
+fn draw_report_setting_menu_overlay(
+    f: &mut Frame,
+    menu: &super::report_nodes::SettingMenu,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    // The typed filter goes in the title, where it reads as part of the
+    // question ("TARGET_ENV  /stag") rather than as another row of the list.
+    let typed = if menu.filter.is_empty() {
+        String::new()
+    } else {
+        format!("  /{}", menu.filter)
+    };
+    let title = format!("{}{typed}  ({})", menu.title(s), s.report_setting_menu_hint);
+    let visible = menu.visible();
+    let n = visible.len().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 90);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    if visible.is_empty() {
+        // Say so rather than drawing an empty box, which reads as "broken"
+        // instead of "nothing is called that".
+        lines.push(Line::from(Span::styled(
+            s.report_setting_menu_no_match.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    for (i, opt) in visible.iter().enumerate().skip(scroll).take(inner_h) {
+        let style = if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        };
+        lines.push(Line::from(Span::styled((*opt).clone(), style)));
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..visible.len().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+}
+
 /// Draw the node editor's insert / request-pick palette
 /// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
 /// adding, request titles when choosing a request name.
@@ -1397,6 +1597,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     // content (the Main/Response caches used to compute it are refreshed by
     // `draw_collection_main`/`draw_response` inside `draw_body` above).
     paint_selection_highlight(f, app, &th);
+
+    // The report's questions are asked *over* the report, not instead of it:
+    // the point of asking on the way to a run is that you can still see what
+    // you're about to run. Drawn before `draw_overlay` so a value editor
+    // opened from a row (an overlay proper) lands on top of the box.
+    if let Some(idx) = app.active_report_index()
+        && app.reports[idx].params_open
+    {
+        super::reports::draw_report_run_settings_overlay(f, app, idx, &s, &th);
+    }
 
     if app.overlay.is_some() {
         draw_overlay(f, app, &s, &th);
@@ -1838,15 +2048,29 @@ pub(crate) fn draw_collection_left(
                     Style::default().fg(th.accent),
                 )))
             }
-            // A request of an expanded but not-loaded collection: dim, name only
-            // (its collection isn't loaded, so there's no method/status to show).
-            // The two-space pad lines the name up under the loaded rows' names.
-            LeftRow::WsRequestName { name, depth } => {
+            // A request of an expanded but not-loaded collection. Its name is
+            // dim — the loaded collection is the one in focus — but the method
+            // is coloured like everywhere else: which row is the POST is the
+            // question the badge answers, and it is worth answering before the
+            // file has been opened. The two-space pad and the run-status gap
+            // line the name up under the loaded rows' names.
+            LeftRow::WsRequestName {
+                name,
+                method,
+                depth,
+            } => {
                 let indent = "  ".repeat(*depth);
-                ListItem::new(Line::from(Span::styled(
-                    format!("{indent}  {name}"),
-                    Style::default().fg(th.dim),
-                )))
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{indent}  ")),
+                    Span::styled(
+                        format!("{method:<5}"),
+                        Style::default()
+                            .fg(method_color(method))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(name.clone(), Style::default().fg(th.dim)),
+                ]))
             }
             LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];
@@ -2035,11 +2259,16 @@ pub(crate) fn draw_collection_left(
             .fg(th.bg)
             .add_modifier(Modifier::BOLD),
     );
-    let mut st = ListState::default();
-    if !view_rows.is_empty() {
-        st.select(Some(sel));
-    }
-    f.render_stateful_widget(list, panes[0], &mut st);
+    // The viewport is carried across frames (see `ListScroll`), tagged with
+    // this tab so another tree's scroll position doesn't leak into it.
+    let sel = if view_rows.is_empty() {
+        None
+    } else {
+        Some(sel)
+    };
+    let list_offset =
+        app.list_scroll
+            .render_ctx(f, panes[0], list, sel, view_rows.len(), ci as u64);
     let list_inner = Rect {
         x: panes[0].x.saturating_add(1),
         y: panes[0].y.saturating_add(1),
@@ -2056,7 +2285,7 @@ pub(crate) fn draw_collection_left(
         list_inner,
         MouseHitTarget::Scroll(MouseScrollTarget::List),
     );
-    let first = st.offset();
+    let first = list_offset;
     let visible = list_inner.height as usize;
     for row in first..view_rows.len().min(first + visible) {
         app.push_mouse_hit(
@@ -2089,21 +2318,111 @@ pub(crate) fn draw_collection_left(
     draw_env_panel(f, panes[1], app, s, th);
 }
 
+/// The Environments panel's pinned first line: which environment the next run
+/// will substitute from.
+///
+/// The panel is a scrolling list — with a few hundred environments in it (a
+/// whole Postman workspace imports that many), the one with the checkmark is
+/// almost never on screen, and a filter can hide it outright. The answer to
+/// "what am I running against?" must not depend on scrolling to find it, so it
+/// is pinned above the list and drawn even when nothing is active: "nothing is
+/// active" is the answer people most need to be told, and a line that comes and
+/// goes would shift the list under the cursor.
+fn active_env_line(app: &TuiApp, s: &Strings, th: &Theme, width: u16) -> Line<'static> {
+    let active = app
+        .active_env_id
+        .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
+    let mut spans = vec![Span::styled(
+        s.env_active_label,
+        Style::default().fg(th.dim),
+    )];
+    match active {
+        Some(env) => {
+            let icon = if env.git_origin.is_some() {
+                format!("{GIT_ICON} ")
+            } else {
+                String::new()
+            };
+            // Room for the label, the checkmark and the icon; anything left
+            // over is the name, tail-elided so the start (which is what tells
+            // two environments apart) always survives.
+            let used = s.env_active_label.chars().count() + 2 + icon.chars().count();
+            let avail = (width as usize).saturating_sub(used);
+            spans.push(Span::styled(
+                format!("\u{2713} {icon}{}", elide(&env.name, avail)),
+                Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
+            ));
+        }
+        None => spans.push(Span::styled(s.env_active_none, Style::default().fg(th.dim))),
+    }
+    Line::from(spans)
+}
+
+/// Truncate `text` to `max` columns, marking the cut with an ellipsis.
+fn elide(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    text.chars()
+        .take(keep)
+        .chain(std::iter::once('\u{2026}'))
+        .collect()
+}
+
 pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     let focused = app.focus == Pane::GlobalEnv;
     // The activate/deactivate hint lives on this panel's bottom border (same
     // convention as the Requests list's Run/Run All hint) since it acts on
     // whichever row is selected here, regardless of which pane has focus.
-    let activate_hint = format!("a {}", s.foot_env_activate);
-    let block = panel(s.env_heading.to_string(), focused, th)
+    let activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
+    let source = app.effective_env_source();
+    let source_label = match source {
+        crate::env_panel::EnvSource::Both => s.env_source_both,
+        crate::env_panel::EnvSource::Global => s.env_source_global,
+        crate::env_panel::EnvSource::Workspace => s.env_source_workspace,
+    };
+    let title = if app.has_workspace_env_source() {
+        format!("{} · {}", s.env_heading, source_label)
+    } else {
+        s.env_heading.to_string()
+    };
+    let block = panel(title, focused, th)
         .title_bottom(Line::styled(activate_hint, Style::default().fg(th.dim)));
-    if app.global_envs.is_empty() {
-        let p = Paragraph::new(vec![
-            Line::styled(s.env_no_envs.to_string(), Style::default().fg(th.dim)),
-            Line::styled(
+    let rows = app.env_rows();
+    if rows.is_empty() {
+        let all_rows =
+            crate::env_panel::rows(&app.global_envs, &app.workspace_env_files(), "", source);
+        let any_rows = crate::env_panel::rows(
+            &app.global_envs,
+            &app.workspace_env_files(),
+            "",
+            crate::env_panel::EnvSource::Both,
+        );
+        // There are now three empty states with different fixes: load or create
+        // any environment, switch the source toggle, or clear/narrow the text
+        // filter. Say which one applies rather than sending the user to the
+        // wrong control.
+        let (first, hint) = if any_rows.is_empty() {
+            (
+                s.env_no_envs.to_string(),
                 format!("{} \u{2192} {}", s.file_menu, s.load_environment),
-                Style::default().fg(th.dim),
-            ),
+            )
+        } else if all_rows.is_empty() {
+            (
+                format!("{}{}", s.env_source_label, source_label),
+                s.env_source_no_matches.to_string(),
+            )
+        } else {
+            (
+                format!("{}{}", s.env_filter_label, app.env_query),
+                s.env_filter_no_matches.to_string(),
+            )
+        };
+        let p = Paragraph::new(vec![
+            active_env_line(app, s, th, area.width.saturating_sub(2)),
+            Line::styled(first, Style::default().fg(th.dim)),
+            Line::styled(hint, Style::default().fg(th.dim)),
         ])
         .block(block)
         .wrap(Wrap { trim: false });
@@ -2121,28 +2440,36 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         );
         return;
     }
-    let sel = app
-        .global_env_idx
-        .min(app.global_envs.len().saturating_sub(1));
+    // An active filter takes a one-line strip below the list, so it's obvious
+    // the list is being narrowed (and by what) rather than mysteriously short —
+    // the same treatment the file browser's and Help's filters get.
+    let show_source_strip =
+        app.has_workspace_env_source() && source != crate::env_panel::EnvSource::Both;
+    let (list_area, filter_area) =
+        if app.env_query.is_empty() && !app.env_filter_typing && !show_source_strip {
+            (area, None)
+        } else {
+            let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+            (parts[0], Some(parts[1]))
+        };
+    let sel = app.global_env_idx.min(rows.len().saturating_sub(1));
     // Columns available for the name text (after the border, the leftmost
     // pencil column and the active-marker column). The selected row is shown
     // highlighted rather than with a leftmost caret, so no column is reserved
     // for one. Used to clamp scrolling.
-    let text_w = area.width.saturating_sub(2 + 2 + 2);
+    let text_w = list_area.width.saturating_sub(2 + 2 + 2);
     app.global_env_scroll_w.set(text_w);
-    let sel_len = app
-        .global_envs
-        .get(sel)
-        .map(|e| e.name.chars().count())
-        .unwrap_or(0);
+    let sel_len = rows.get(sel).map(|r| r.name.chars().count()).unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((text_w as usize).saturating_sub(1));
     let hscroll = (app.global_env_hscroll as usize).min(max_scroll);
-    let items: Vec<ListItem> = app
-        .global_envs
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, env)| {
-            let is_active = app.active_env_id == Some(env.id);
+        .map(|(i, row)| {
+            let env = row
+                .env_id()
+                .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
+            let is_active = row.env_id().is_some() && app.active_env_id == row.env_id();
             // Active: green name + a checkmark marker; git origin shows the
             // same ⎇ icon convention used elsewhere.
             let (marker, marker_fg) = if is_active {
@@ -2150,20 +2477,35 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             } else {
                 ("  ", th.dim)
             };
-            let name_color = if is_active { th.ok } else { th.text };
+            // A workspace environment that hasn't been opened yet is dimmed:
+            // it is a file the panel is offering, not something loaded that
+            // could be activated or edited until Enter opens it.
+            let name_color = if is_active {
+                th.ok
+            } else if env.is_none() {
+                th.dim
+            } else {
+                th.text
+            };
             let selected = i == sel;
             let mark_fg = if selected { th.bg } else { marker_fg };
             // A pencil in the leftmost column flags an environment with unsaved
             // (added or modified) variables — placed left of the name so it
             // matches the Requests list's modified/added marker convention
             // (and stays put rather than trailing a scrolling name).
-            let (pencil, pencil_fg) = if app.changed_env_count(env.id) > 0 {
+            let dirty = env.is_some_and(|e| app.changed_env_count(e.id) > 0);
+            let (pencil, pencil_fg) = if dirty {
                 ("\u{270e} ", th.accent)
             } else {
                 ("  ", th.dim)
             };
             let pencil_fg = if selected { th.bg } else { pencil_fg };
-            let git_prefix = if env.git_origin.is_some() {
+            // The two sources this panel merges are told apart by a leading
+            // icon: ⌂ for "from the open workspace folder", ⎇ for "from a git
+            // remote". A plain loaded environment gets neither.
+            let prefix = if row.workspace {
+                format!("{WORKSPACE_ICON} ")
+            } else if env.is_some_and(|e| e.git_origin.is_some()) {
                 format!("{GIT_ICON} ")
             } else {
                 String::new()
@@ -2172,7 +2514,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
                 Span::styled(pencil, Style::default().fg(pencil_fg)),
                 Span::styled(marker, Style::default().fg(mark_fg)),
             ];
-            let full = format!("{git_prefix}{}", env.name);
+            let full = format!("{prefix}{}", row.name);
             if selected {
                 // Same truncate-with-arrow-hints convention as the Requests
                 // list / entries popup: scroll the whole name so a very long
@@ -2200,34 +2542,85 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
-    let mut st = ListState::default();
-    st.select(Some(sel));
-    f.render_stateful_widget(list, area, &mut st);
-    let inner = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
+    // The block is rendered here rather than through the list, so the first
+    // row inside the border can be held back for the pinned active line.
+    let inner_all = block.inner(list_area);
+    f.render_widget(block, list_area);
+    let (pin_area, items_area) = if inner_all.height > 1 {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner_all);
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, inner_all)
     };
+    if let Some(pin) = pin_area {
+        f.render_widget(Paragraph::new(active_env_line(app, s, th, pin.width)), pin);
+    }
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD));
+    let env_offset = app
+        .env_list_scroll
+        .render(f, items_area, list, Some(sel), rows.len());
+    if let Some(strip) = filter_area {
+        // While typing, a block cursor marks where the next character lands —
+        // the strip is the only thing with focus, so without it there is no
+        // sign the keyboard is being captured.
+        let mut spans = vec![
+            Span::styled(s.env_source_label, Style::default().fg(th.dim)),
+            Span::styled(source_label, Style::default().fg(th.accent)),
+            Span::raw("  "),
+            Span::styled(s.env_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                app.env_query.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if app.env_filter_typing {
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+            strip,
+        );
+    }
     app.push_mouse_hit(
         MouseLayer::Base,
-        inner,
+        inner_all,
         MouseHitTarget::FocusPane(Pane::GlobalEnv),
     );
     app.push_mouse_hit(
         MouseLayer::Base,
-        inner,
+        inner_all,
         MouseHitTarget::Scroll(MouseScrollTarget::GlobalEnv),
     );
-    let first = st.offset();
-    let visible = inner.height as usize;
-    for row in first..app.global_envs.len().min(first + visible) {
+    // Clicking the pinned line goes to the active environment's row — the
+    // reason to look at it is usually to get back to it.
+    if let Some(pin) = pin_area
+        && let Some(row) = rows
+            .iter()
+            .position(|r| r.env_id().is_some() && r.env_id() == app.active_env_id)
+    {
         app.push_mouse_hit(
             MouseLayer::Base,
-            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
+            pin,
+            MouseHitTarget::SelectGlobalEnvRow(row),
+        );
+    }
+    let first = env_offset;
+    let visible = items_area.height as usize;
+    for row in first..rows.len().min(first + visible) {
+        app.push_mouse_hit(
+            MouseLayer::Base,
+            Rect::new(
+                items_area.x,
+                items_area.y + (row - first) as u16,
+                items_area.width,
+                1,
+            ),
             MouseHitTarget::SelectGlobalEnvRow(row),
         );
     }
@@ -2360,9 +2753,11 @@ pub(crate) fn draw_env_popup(
         // status dot's colour, which must remain visible when selected.
         .highlight_style(Style::default().bg(th.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("› ");
-    let mut st = ListState::default();
-    st.select(Some(sel));
-    f.render_stateful_widget(list, area, &mut st);
+    // Tagged with the environment: opening a different one shows it from the
+    // top rather than wherever the last one happened to be scrolled to.
+    let var_offset =
+        app.env_var_scroll
+            .render_ctx(f, area, list, Some(sel), env.vars.len(), popup.env_id);
     app.set_mouse_layer(MouseLayer::Overlay);
     let inner = Rect {
         x: area.x.saturating_add(1),
@@ -2375,7 +2770,7 @@ pub(crate) fn draw_env_popup(
         inner,
         MouseHitTarget::Scroll(MouseScrollTarget::OverlayList),
     );
-    let first = st.offset();
+    let first = var_offset;
     let visible = inner.height as usize;
     for row in first..env.vars.len().min(first + visible) {
         app.push_mouse_hit(
@@ -3326,10 +3721,70 @@ pub(crate) fn draw_footer(
     );
 }
 
+/// Draw a browser's file list into `area`.
+///
+/// Normally this is just the `ratatui_explorer` widget, but that widget calls
+/// `FileExplorer::current()` — an unguarded `files[selected]` — while
+/// rendering, so it **panics on an empty list**. Since a type-to-filter query
+/// now narrows the `../` row away like any other, "matched nothing" is a state
+/// the user can reach by typing, and it has to draw. The placeholder rebuilds
+/// the explorer's own frame (accent border, panel fill, cwd on top, the action
+/// label and keys along the bottom) so only the rows change: the keys that get
+/// you out of an empty list are exactly the ones you need to still be able to
+/// read.
+fn draw_browser_list(
+    f: &mut Frame,
+    app: &TuiApp,
+    ex: &ratatui_explorer::FileExplorer,
+    area: Rect,
+    s: &Strings,
+    th: &Theme,
+) {
+    if !ex.files().is_empty() {
+        ex.widget().render_ref(area, f.buffer_mut());
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(th.accent))
+        .style(Style::default().bg(th.panel))
+        .title(Line::from(ex.cwd().display().to_string()))
+        .title_bottom(Line::from(app.browser_hint_line.clone()));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            s.browser_no_matches,
+            Style::default().fg(th.dim).add_modifier(Modifier::ITALIC),
+        )))
+        .block(block)
+        .style(Style::default().bg(th.panel)),
+        area,
+    );
+}
+
 /// Render the report-export format strip (`CSV JSON HTML XLSX`) into `row`,
 /// highlighting the format that matches `filename`'s extension (an unknown or
 /// absent extension highlights CSV, the writer's fallback). Cycled with ↑/↓
 /// while the filename field is focused — see `cycle_browser_export_format`.
+/// The one-line "Filter: <query>" strip drawn beneath a browser's list while a
+/// type-to-filter query is active, so it is obvious the list is being narrowed
+/// (and by what) rather than mysteriously short.
+fn draw_browser_filter_strip(f: &mut Frame, row: Rect, query: &str, s: &Strings, th: &Theme) {
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                query.to_string(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        // Fill the theme panel background (like the export-format strip and the
+        // Help filter) so the strip blends with the explorer's own `th.panel`
+        // block instead of showing the terminal's default background.
+        .style(Style::default().bg(th.panel)),
+        row,
+    );
+}
+
 fn draw_export_format_strip(f: &mut Frame, row: Rect, filename: &str, s: &Strings, th: &Theme) {
     use crate::report::writer::OUTPUT_EXTENSIONS;
     let cur = std::path::Path::new(filename)
@@ -3391,13 +3846,17 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let items = file_load_items(s);
             draw_menu_popup(f, s.file_load_menu, &items, *sel, th, Some(app));
         }
+        Overlay::FileImportMenu(sel) => {
+            let items = file_import_items(s);
+            draw_menu_popup(f, s.file_import_menu, &items, *sel, th, Some(app));
+        }
         Overlay::FileSaveMenu(sel) => {
             let items = app.file_save_items();
             let labels: Vec<&str> = items.iter().map(|it| it.label(s)).collect();
             draw_menu_popup(f, s.file_save_menu, &labels, *sel, th, Some(app));
         }
         Overlay::FileLoadSource(kind, sel) => {
-            let items = file_load_source_items(s);
+            let items = file_load_source_items(*kind, s);
             let title = format!("{} {}", s.file_load_menu, kind.name(s));
             draw_menu_popup(f, &title, &items, *sel, th, Some(app));
         }
@@ -3473,20 +3932,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     q
                 }
                 ConfirmAction::Clear => s.confirm_clear_q.to_string(),
-                // Scoped to the entity being saved: the collection warning counts
-                // only requests, the environment warning only variables.
-                ConfirmAction::Save(FileAction::SaveEnv) => s.confirm_save_env_q.replace(
-                    "{e}",
-                    &app.current_env_id()
-                        .map(|id| app.changed_env_count(id))
-                        .unwrap_or(0)
-                        .to_string(),
-                ),
-                ConfirmAction::Save(FileAction::SaveReport) => s.confirm_save_report_q.to_string(),
-                ConfirmAction::Save(_) => s.confirm_save_collection_q.replace(
-                    "{r}",
-                    &app.changed_request_count(app.active_tab).to_string(),
-                ),
                 ConfirmAction::Overwrite(_) => {
                     let name = app
                         .pending_save_path
@@ -3500,6 +3945,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::RevertWorkspaceFile(_, path) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    s.confirm_revert_file_q.replace("{f}", &name)
+                }
                 ConfirmAction::RevertRequest(ci, ei) => {
                     let name = app
                         .collections
@@ -3678,6 +4130,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("^r (Env popup)", s.help_revert_env),
                             ("F2 (Env panel)", s.help_env_rename),
                             ("a", s.help_env_activate),
+                            (
+                                "a / right-click (workspace, List pane)",
+                                s.help_env_activate_workspace,
+                            ),
+                            ("/", s.help_env_filter),
+                            ("o", s.help_env_source),
                             ("x", s.help_env_delete),
                             ("u (Env panel)", s.help_env_reopen),
                             ("p (List pane)", s.help_env_link),
@@ -3707,10 +4165,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Enter (nodes)", s.help_report_nodes_forms),
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
+                            ("/ (report)", s.help_report_filter),
                             ("Ctrl+S (report)", s.help_report_export),
+                            ("Ctrl+O (report)", s.help_report_open_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
                             ("b (report)", s.help_report_bind),
+                            ("p (report)", s.help_report_params),
                             ("Esc (report)", s.help_report_leave_edit),
                             ("Ctrl+←/→ (report)", s.help_report_word_move),
                             ("→ (report)", s.help_report_complete),
@@ -3922,7 +4383,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("Enter (nodes)", s.help_report_nodes_forms),
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
+                        ("/", s.help_report_filter),
                         ("Ctrl+S", s.help_report_export),
+                        ("Ctrl+O", s.help_report_open_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),
                         ("Esc", s.help_report_leave_edit),
@@ -3946,6 +4409,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             "REPORT COL AS N STATISTICS(MEAN)",
                             s.help_grammar_statistics,
                         ),
+                        ("REPORT COL AS N IMAGE(HEIGHT 110)", s.help_grammar_image),
                         ("WITH Name: query [STATISTICS]", s.help_grammar_with),
                         ("Result", s.help_grammar_result),
                         ("PARALLEL[(n)] FOR …", s.help_grammar_parallel),
@@ -3961,7 +4425,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("LIST NAME = SRC", s.help_grammar_list),
                         ("[ \"a\", (\"x\",\"y\") ]", s.help_grammar_list_literal),
                         ("FILES \"dir\" [MATCH \"g\"]", s.help_grammar_files),
-                        ("FOLDERS \"dir\" [WITH r=\"g\"]", s.help_grammar_folders),
+                        (
+                            "FOLDERS \"dir\" [MATCH \"g\"] [WITH r=\"g\"[?]]",
+                            s.help_grammar_folders,
+                        ),
                         ("TUPLES FROM \"data.csv\"", s.help_grammar_tuples),
                         ("ZIP(a, b, …)", s.help_grammar_zip),
                         ("CONCAT(a, b, …)", s.help_grammar_concat),
@@ -4099,6 +4566,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th, Some(app));
+        }
+        Overlay::ReportSettingMenu(menu) => {
+            draw_report_setting_menu_overlay(f, menu, s, th, Some(app));
         }
         Overlay::ReportNodeRequest(form) => {
             draw_report_node_request_overlay(f, form, s, th, Some(app));
@@ -4268,21 +4738,30 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // above it (CSV/JSON/HTML/XLSX; the active one derived from the
                 // typed extension, cycled with ↑/↓ while the name is focused).
                 let show_formats = *action == FileAction::SaveReportCsvChooseFolder;
-                let rows = if show_formats {
-                    Layout::vertical([
-                        Constraint::Min(3),
-                        Constraint::Length(1),
-                        Constraint::Length(3),
-                    ])
-                    .split(area)
-                } else {
-                    Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area)
-                };
-                ex.widget().render_ref(rows[0], f.buffer_mut());
-                let name_row = if show_formats { rows[2] } else { rows[1] };
-                if show_formats {
-                    draw_export_format_strip(f, rows[1], &app.browser_name.text(), s, th);
+                // The type-to-filter strip only appears while a query is
+                // active, so it takes a row of its own between the list and
+                // whatever sits below it rather than reserving space always.
+                let show_query = !app.browser_query.is_empty();
+                let mut heights = vec![Constraint::Min(3)];
+                if show_query {
+                    heights.push(Constraint::Length(1));
                 }
+                if show_formats {
+                    heights.push(Constraint::Length(1));
+                }
+                heights.push(Constraint::Length(3));
+                let rows = Layout::vertical(heights).split(area);
+                draw_browser_list(f, app, ex, rows[0], s, th);
+                let mut next = 1;
+                if show_query {
+                    draw_browser_filter_strip(f, rows[next], &app.browser_query, s, th);
+                    next += 1;
+                }
+                if show_formats {
+                    draw_export_format_strip(f, rows[next], &app.browser_name.text(), s, th);
+                    next += 1;
+                }
+                let name_row = rows[next];
                 let focused = app.browser_name_focused;
                 let label = if *action == FileAction::SaveWorkspaceChooseFolder {
                     s.browser_foldername_label
@@ -4319,25 +4798,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 // what) rather than mysteriously short.
                 let rows =
                     Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-                ex.widget().render_ref(rows[0], f.buffer_mut());
+                draw_browser_list(f, app, ex, rows[0], s, th);
                 register_browser_hits(app, ex, rows[0]);
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(s.browser_filter_label, Style::default().fg(th.dim)),
-                        Span::styled(
-                            app.browser_query.clone(),
-                            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                        ),
-                    ]))
-                    // Fill the theme panel background (like the export-format
-                    // strip and the Help filter) so the strip blends with the
-                    // explorer's own `th.panel` block instead of showing the
-                    // terminal's default background.
-                    .style(Style::default().bg(th.panel)),
-                    rows[1],
-                );
+                draw_browser_filter_strip(f, rows[1], &app.browser_query, s, th);
             } else {
-                ex.widget().render_ref(area, f.buffer_mut());
+                draw_browser_list(f, app, ex, area, s, th);
                 register_browser_hits(app, ex, area);
             }
         }
@@ -4346,6 +4811,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::EnvVarForm(form) => draw_env_var_form(f, form, s, th, Some(app)),
         Overlay::RemoteGit(w) => draw_remote_wizard_with_hits(f, w, s, th, Some(app)),
+        Overlay::PostmanImport(w) => draw_postman_wizard(f, w, s, th),
         Overlay::GitSave(w) => draw_git_save_wizard_with_hits(f, w, s, th, Some(app)),
         Overlay::EnvPopup(popup) => draw_env_popup(f, app, popup, s, th),
         Overlay::EnvLinkPicker(picker) => draw_env_link_picker(f, app, picker, s, th),
@@ -4637,9 +5103,26 @@ pub(crate) fn draw_workspace_picker(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("› ");
-    let mut st = ListState::default();
-    st.select(Some(picker.selected));
-    f.render_stateful_widget(list, rows[0], &mut st);
+    // Tagged with the folder and filter this listing came from, so a picker
+    // reopened somewhere else (or with the filter toggled, which rebuilds the
+    // whole list) starts at the top instead of in the middle of nowhere.
+    let ctx = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        picker.root.hash(&mut h);
+        picker.filter_hurl_json.hash(&mut h);
+        h.finish()
+    };
+    let fallback = ListScroll::default();
+    let scroll = app.map_or(&fallback, |a| &a.ws_picker_scroll);
+    let picker_offset = scroll.render_ctx(
+        f,
+        rows[0],
+        list,
+        Some(picker.selected),
+        picker.entries.len(),
+        ctx,
+    );
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Overlay);
         app.push_mouse_hit(
@@ -4647,7 +5130,7 @@ pub(crate) fn draw_workspace_picker(
             rows[0],
             MouseHitTarget::Scroll(MouseScrollTarget::WorkspacePicker),
         );
-        let first = st.offset();
+        let first = picker_offset;
         let visible = rows[0].height as usize;
         for row in first..picker.entries.len().min(first + visible) {
             app.push_mouse_hit(

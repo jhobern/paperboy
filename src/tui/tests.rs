@@ -10,20 +10,38 @@ use crate::collection::Collection;
 use crate::git_remote::{RefKind, RemoteRefs};
 use crate::hurl::HurlEntry;
 use crate::hurl::KvRow;
-use crate::i18n::Language;
+use crate::i18n::{Language, Status, Strings};
 use crate::persistence::PersistedState;
 
 use crate::request::RequestView;
 
 use super::app::*;
+use super::editor::Editor;
 use super::git_save::*;
 use super::new_request::*;
+use super::postman::{OPTION_ROWS, PostmanStage, PostmanWizard};
 use super::remote::*;
+use crate::remote_flow::{
+    FlowEvent, Phase, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
+};
+use crate::save_flow::{SaveTargetKind, TargetIntent};
 use tui_panel_select::wrapcache::TextPos;
 
 /// An app focused on a collection's Request-JSON (Main) pane. The entry URL
 /// points at TEST-NET-1 (RFC 5737) so a started request hangs on connect,
 /// keeping `loading == true` deterministically for the assertion.
+/// A default `TuiApp` with a few fields set.
+///
+/// Most of these settings live on the shared [`Session`](crate::session::Session)
+/// rather than on `TuiApp` itself, so they can't be named in a `TuiApp { .. }`
+/// struct literal; a closure keeps the "build one that differs in exactly this"
+/// shape the tests were written in.
+fn app_with(init: impl FnOnce(&mut TuiApp)) -> TuiApp {
+    let mut app = TuiApp::default();
+    init(&mut app);
+    app
+}
+
 fn app_in_main_pane() -> TuiApp {
     let mut app = TuiApp::default();
     let entry = HurlEntry {
@@ -80,6 +98,148 @@ fn mouse_click_visible_tab_activates_it_and_invalidates_hits() {
 
     assert_eq!(app.active_tab, 1);
     assert!(!app.mouse_hit_valid.get());
+}
+
+/// Walking up a long list moves the cursor through the visible rows; the list
+/// itself only scrolls once the cursor reaches an edge.
+///
+/// The bug this pins: a `ListState` rebuilt each frame starts at row zero, so
+/// ratatui scrolled the minimum needed to reveal the selection and the selected
+/// row sat on the bottom edge the whole way up, the tree sliding past it.
+#[test]
+fn the_list_scrolls_only_when_the_cursor_reaches_an_edge() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://host{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    // Jump to the bottom, which necessarily scrolls the list.
+    app.collections[0].list_cursor = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let bottom = app.list_scroll.offset();
+    assert!(bottom > 0, "a selection past the fold scrolled the list");
+
+    // Now step up one row. The cursor moves inside the viewport; the viewport
+    // itself must not move.
+    app.collections[0].list_cursor = 58;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_scroll.offset(),
+        bottom,
+        "stepping up inside the panel does not scroll it"
+    );
+
+    // Keep going until the cursor reaches the top of the viewport -- only then
+    // does the list scroll again.
+    app.collections[0].list_cursor = bottom;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(app.list_scroll.offset(), bottom, "still at the top row");
+    app.collections[0].list_cursor = bottom - 1;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_scroll.offset(),
+        bottom - 1,
+        "past the top edge, the list scrolls by one"
+    );
+}
+
+/// The same defect the tree had, in the panel below it: the Global
+/// Environments list is drawn from its own `ListState`, and a fresh one every
+/// frame would drag the list along under the cursor.
+#[test]
+fn the_environments_panel_scrolls_the_same_way_the_tree_does() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.global_envs = (0..60)
+        .map(|i| crate::environment::parse_vars(format!("env{i}"), ""))
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    app.global_env_idx = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let bottom = app.env_list_scroll.offset();
+    assert!(bottom > 0, "a selection past the fold scrolled the panel");
+
+    app.global_env_idx = 58;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.env_list_scroll.offset(),
+        bottom,
+        "stepping up inside the panel does not scroll it"
+    );
+}
+
+/// The report Source view clips long lines rather than wrapping them, so a line
+/// that runs past the right edge has to say so — otherwise the only way to find
+/// out something was cut off is to enter edit mode and walk along it.
+#[test]
+fn a_report_line_that_runs_off_the_edge_says_so() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    let long = "x".repeat(400);
+    app.reports[idx]
+        .report
+        .set_text(&format!("# collection: api\n# note: {long}\nshort\n"));
+    app.revalidate_report(idx);
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let inner = app.report_pane_areas[super::reports::ReportPane::Source.idx()];
+    assert!(inner.width > 0, "the source panel was drawn");
+    let buf = term.backend().buffer().clone();
+    let marker_col = inner.x + inner.width - 1;
+    let at = |row: u16| -> String { buf[(marker_col, inner.y + row)].symbol().to_string() };
+    assert_eq!(at(1), "\u{2026}", "the long line is marked as continuing");
+    assert_ne!(at(0), "\u{2026}", "a short line is not");
+    assert_ne!(at(2), "\u{2026}", "nor is the one after it");
+}
+
+/// Another tab's scroll position means nothing in this one, so a tab switch
+/// starts at the top rather than inheriting a viewport that has no relation to
+/// what is selected here.
+#[test]
+fn a_tab_switch_does_not_inherit_the_other_tabs_scroll() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections[0].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://host{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    app.collections
+        .push(Collection::new("second".to_string(), Vec::new()));
+    app.collections[1].entries = (0..60)
+        .map(|i| HurlEntry {
+            url: format!("https://other{i}.example"),
+            ..Default::default()
+        })
+        .collect();
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    app.collections[0].list_cursor = 59;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(app.list_scroll.offset() > 0);
+
+    app.active_tab = 1;
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert_eq!(
+        app.list_scroll.offset(),
+        0,
+        "the second tab's selection is its first row, so it starts at the top"
+    );
 }
 
 #[test]
@@ -657,10 +817,9 @@ fn deleting_an_environment_asks_for_confirmation_by_default() {
 
 #[test]
 fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
-    let mut app = TuiApp {
-        confirm_on_delete_env: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_delete_env = false;
+    });
     add_empty_global_env(&mut app, "staging");
     app.focus = Pane::GlobalEnv;
     app.global_env_idx = 0;
@@ -679,10 +838,9 @@ fn x_deletes_an_environment_immediately_when_confirmation_is_off() {
 
 #[test]
 fn u_reopens_the_most_recently_deleted_environment() {
-    let mut app = TuiApp {
-        confirm_on_delete_env: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_delete_env = false;
+    });
     add_empty_global_env(&mut app, "alpha");
     add_empty_global_env(&mut app, "bravo");
     app.focus = Pane::GlobalEnv;
@@ -1709,7 +1867,9 @@ fn a_disabled_header_row_renders_its_key_dimmed() {
     // path rather than as the live editor.
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
 
-    let th = super::theme::theme(&Language::English);
+    // Resolve through the app so this stays a test about text-vs-dim rather
+    // than about which palette happens to be the default.
+    let th = app.theme();
     let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
 
     // Enabled: the key text is drawn in the normal text colour.
@@ -2108,10 +2268,9 @@ fn declining_the_clear_confirmation_keeps_requests() {
 
 #[test]
 fn clearing_is_immediate_when_confirmation_is_disabled() {
-    let mut app = TuiApp {
-        confirm_on_clear: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_clear = false;
+    });
     app.collections[0]
         .entries
         .push(HurlEntry::from_fields("r", "GET", "http://h/x", vec![], ""));
@@ -2161,10 +2320,9 @@ fn declining_the_quit_confirmation_stays_open() {
 
 #[test]
 fn q_quits_immediately_when_confirmation_is_disabled() {
-    let mut app = TuiApp {
-        confirm_on_exit: false,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_exit = false;
+    });
     press(&mut app, KeyCode::Char('q'));
     assert!(app.quit, "q quits directly when confirmation is off");
 }
@@ -2303,12 +2461,11 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
 
 #[test]
 fn settings_survive_closing_all_collections() {
-    let mut app = TuiApp {
-        confirm_on_exit: false,
-        confirm_on_clear: false,
-        language: Language::French,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.confirm_on_exit = false;
+        a.confirm_on_clear = false;
+        a.language = Language::French;
+    });
 
     app.clear_all();
 
@@ -2342,10 +2499,9 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn browser_reopens_in_the_last_used_folder() {
     let dir = temp_dir("reopen");
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
 
     app.open_browser(FileAction::LoadEnv);
     match app.overlay {
@@ -2370,10 +2526,9 @@ fn selecting_a_file_remembers_its_folder() {
     let dir = temp_dir("select");
     std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::LoadEnv); // opens in `dir`: ["../", "staging.vars"]
 
     press(&mut app, KeyCode::Down); // highlight staging.vars
@@ -2390,10 +2545,9 @@ fn selecting_a_file_remembers_its_folder() {
 
 #[test]
 fn last_browse_dir_survives_persistence() {
-    let app = TuiApp {
-        last_browse_dir: Some(PathBuf::from("/some/dir")),
-        ..Default::default()
-    };
+    let app = app_with(|a| {
+        a.last_browse_dir = Some(PathBuf::from("/some/dir"));
+    });
 
     let snapshot = app.to_persisted();
     assert_eq!(snapshot.last_browse_dir.as_deref(), Some("/some/dir"));
@@ -2407,14 +2561,13 @@ fn last_browse_dir_survives_persistence() {
 fn env_picker_prefers_the_last_environment_folder() {
     let env_dir = temp_dir("envfolder");
     let other_dir = temp_dir("otherfolder");
-    let mut app = TuiApp {
+    let mut app = app_with(|app| {
         // A more-recent load of some other file type moved last_browse_dir…
-        last_browse_dir: Some(other_dir.clone()),
+        app.last_browse_dir = Some(other_dir.clone());
         // …but the environment picker should still reopen where the last
         // environment file came from.
-        last_env_dir: Some(env_dir.clone()),
-        ..Default::default()
-    };
+        app.last_env_dir = Some(env_dir.clone());
+    });
 
     app.open_browser(FileAction::LoadEnv);
     match app.overlay {
@@ -2431,10 +2584,9 @@ fn going_up_highlights_the_folder_just_left_so_right_returns() {
     let sub = dir.join("nested");
     std::fs::create_dir_all(&sub).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(sub.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(sub.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside `nested`
 
     // Left goes up to `dir`, and the folder we came from stays highlighted…
@@ -2467,10 +2619,9 @@ fn many_lefts_then_many_rights_return_to_the_starting_folder() {
     let d = c.join("d");
     std::fs::create_dir_all(&d).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(d.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(d.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside d
 
     // Three Lefts climb d → c → b → a.
@@ -2509,10 +2660,9 @@ fn descending_into_a_different_folder_clears_the_retrace_trail() {
     std::fs::create_dir_all(&c).unwrap();
     std::fs::create_dir_all(&z).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(a.join("b")),
-        ..Default::default()
-    };
+    let mut app = app_with(|app| {
+        app.last_browse_dir = Some(a.join("b"));
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside a/b
     press(&mut app, KeyCode::Left); // up to a, trail anchored at a/b
     assert!(app.browser_forward_path.is_some());
@@ -2549,10 +2699,9 @@ fn right_does_not_ascend_through_the_parent_row_but_enter_still_does() {
     let b = a.join("b");
     std::fs::create_dir_all(&b).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(b.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(b.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens inside b, highlight "../"
 
     // The "../" row is highlighted (index 0). Right must NOT ascend through it,
@@ -2589,10 +2738,9 @@ fn ctrl_r_resets_the_browser_to_the_folder_it_opened_in() {
     let sub = dir.join("nested");
     std::fs::create_dir_all(&sub).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::OpenCollection); // opens in `dir`
     assert_eq!(app.browser_origin_dir.as_ref(), Some(&dir));
 
@@ -2619,10 +2767,9 @@ fn selecting_an_env_file_updates_the_env_folder() {
     let dir = temp_dir("selectenv");
     std::fs::write(dir.join("staging.vars"), "A=1\n").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::LoadEnv);
     press(&mut app, KeyCode::Down); // highlight staging.vars
     press(&mut app, KeyCode::Enter); // select it
@@ -2637,16 +2784,30 @@ fn selecting_an_env_file_updates_the_env_folder() {
 
 #[test]
 fn last_env_dir_survives_persistence() {
-    let app = TuiApp {
-        last_env_dir: Some(PathBuf::from("/env/dir")),
-        ..Default::default()
-    };
+    let app = app_with(|a| {
+        a.last_env_dir = Some(PathBuf::from("/env/dir"));
+    });
     let snapshot = app.to_persisted();
     assert_eq!(snapshot.last_env_dir.as_deref(), Some("/env/dir"));
 
     let mut restored = TuiApp::default();
     restored.apply_persisted(snapshot);
     assert_eq!(restored.last_env_dir, Some(PathBuf::from("/env/dir")));
+}
+
+/// The folder imports are collected in outlives the session — the point is that
+/// workspaces downloaded weeks apart still end up side by side.
+#[test]
+fn last_import_dir_survives_persistence() {
+    let app = app_with(|a| {
+        a.last_import_dir = Some(PathBuf::from("/import/dir"));
+    });
+    let snapshot = app.to_persisted();
+    assert_eq!(snapshot.last_import_dir.as_deref(), Some("/import/dir"));
+
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.last_import_dir, Some(PathBuf::from("/import/dir")));
 }
 
 #[test]
@@ -2766,7 +2927,7 @@ fn file_load_submenu_mnemonic_activates_the_item_immediately() {
     );
     press(&mut app, KeyCode::Char('g')); // "From (G)it…"
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Collection),
         "the git source both selects and activates without needing Enter"
     );
 }
@@ -2871,7 +3032,9 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             .iter()
             .map(|it| it.label(&s))
             .collect::<Vec<_>>(),
-            file_load_source_items(&s).to_vec(),
+            file_import_items(&s).to_vec(),
+            file_load_source_items(FileKind::Collection, &s),
+            file_load_source_items(FileKind::Workspace, &s),
             file_save_dest_items(FileKind::Collection, &s),
             file_save_dest_items(FileKind::Environment, &s),
             file_save_dest_items(FileKind::Workspace, &s),
@@ -2896,6 +3059,103 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
     }
 }
 
+/// Import is a top-level File entry, not a leaf under Load ▸ Workspace ▸ …:
+/// "import" is what someone arriving from Postman looks for, and they will not
+/// find it by first deciding that what they want is a workspace.
+#[test]
+fn the_file_menu_offers_importing_from_postman_at_the_top_level() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(2))));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileImportMenu(0))),
+        "Enter on Import opens the two ways in"
+    );
+
+    // The file a user already exported: a browser, no API key, no account.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::Browser(action, _)) if *action == FileAction::ImportPostmanFile),
+        "the first route browses for an export: {:?}",
+        app.overlay.is_some()
+    );
+
+    // The second connects to Postman itself.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "the second route opens the account importer"
+    );
+
+    // Esc walks back up rather than closing the whole menu.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(2))));
+}
+
+/// Postman writes collections and environments to the same `.json` extension,
+/// and a user with one export in their Downloads folder has no reason to know
+/// which of PaperBoy's two shelves it belongs on. The import reads that off
+/// the file.
+#[test]
+fn a_postman_export_lands_on_the_right_shelf_whichever_kind_it_is() {
+    let dir = temp_dir("pb_import_export");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let collection = dir.join("api.json");
+    std::fs::write(
+        &collection,
+        r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+    )
+    .unwrap();
+    let environment = dir.join("staging.json");
+    std::fs::write(
+        &environment,
+        r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+    )
+    .unwrap();
+
+    let mut app = TuiApp::default();
+    let tabs = app.collections.len();
+    let envs = app.global_envs.len();
+    app.do_file_action(FileAction::ImportPostmanFile, collection.to_str().unwrap());
+    assert_eq!(
+        app.collections.len(),
+        tabs + 1,
+        "the collection opened as a tab"
+    );
+    assert_eq!(app.global_envs.len(), envs, "and not as an environment");
+
+    app.do_file_action(FileAction::ImportPostmanFile, environment.to_str().unwrap());
+    assert_eq!(
+        app.global_envs.len(),
+        envs + 1,
+        "the environment export opened as an environment"
+    );
+    assert_eq!(app.collections.len(), tabs + 1, "and not as a tab");
+
+    // Anything else says so rather than opening an empty something.
+    let other = dir.join("notes.json");
+    std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
+    app.do_file_action(FileAction::ImportPostmanFile, other.to_str().unwrap());
+    assert!(matches!(app.status, Some(Status::NotCollection)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn file_menu_opens_the_remote_git_wizards() {
     let mut app = TuiApp::default();
@@ -2906,7 +3166,7 @@ fn file_menu_opens_the_remote_git_wizards() {
     press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Collection),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Collection),
         "opens the collection git wizard"
     );
 
@@ -2919,7 +3179,7 @@ fn file_menu_opens_the_remote_git_wizards() {
     press(&mut app, KeyCode::Down); // -> From Git
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Environment),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Environment),
         "opens the environment git wizard"
     );
 }
@@ -2932,14 +3192,15 @@ fn connect_stage_toggles_fields_and_requires_a_url() {
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(w.stage, RemoteStage::Connect { field: 1, .. }));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(w.field, 1);
         }
         _ => panic!("wizard closed"),
     }
     // Enter with a blank URL surfaces an error rather than connecting.
     press(&mut app, KeyCode::Enter);
     match &app.overlay {
-        Some(Overlay::RemoteGit(w)) => assert!(matches!(w.stage, RemoteStage::Error(_))),
+        Some(Overlay::RemoteGit(w)) => assert_eq!(w.stage(), RemoteStage::Error),
         _ => panic!("wizard closed"),
     }
 }
@@ -2952,48 +3213,26 @@ fn esc_closes_the_wizard() {
     assert!(app.overlay.is_none(), "Esc closes the wizard");
 }
 
-#[test]
-fn ref_and_file_messages_advance_the_wizard() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-
-    // Refs -> PickRef with branches then tags.
-    let refs = RemoteRefs {
-        branches: vec!["main".into()],
-        tags: vec!["v1".into()],
-    };
-    assert!(app.apply_git_msg(&mut w, GitMsg::Refs(Ok(refs))));
-    match &w.stage {
-        RemoteStage::PickRef { refs, .. } => {
-            assert_eq!(refs.len(), 2);
-            assert_eq!(refs[0].gitref, "refs/heads/main");
-            assert_eq!(refs[1].gitref, "refs/tags/v1");
-        }
-        _ => panic!("expected PickRef"),
-    }
-
-    // Files -> PickFile and the temp repo is recorded.
-    let files = vec!["a.hurl".to_string(), "sub/b.hurl".to_string()];
-    let repo = std::env::temp_dir().join(format!("crab_test_repo_{}", std::process::id()));
-    std::fs::create_dir_all(&repo).unwrap();
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo.clone(), "deadbeef".to_string())))
-    ));
-    assert_eq!(w.repo.as_deref(), Some(repo.as_path()));
-    assert!(matches!(&w.stage, RemoteStage::PickFile { files, .. } if files.len() == 2));
-    std::fs::remove_dir_all(&repo).ok();
-}
+// The wizard's transitions themselves are tested in `crate::remote_flow`,
+// which both front-ends share. What is tested here is the terminal UI's half:
+// that it derives the right step to draw, and that it does the right thing
+// with a load once the flow hands one over.
 
 #[test]
 fn fetched_collection_content_is_loaded_as_a_tab() {
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.selected_path = Some("api/health.hurl".to_string());
+    let w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
     let before = app.collections.len();
 
     let hurl = "# Health\nGET http://127.0.0.1:8080/health\nHTTP 200\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api/health.hurl".to_string(),
+            text: hurl.to_string(),
+            origin: None,
+        },
+    );
 
     assert!(
         !keep_open,
@@ -3013,18 +3252,24 @@ fn fetched_collection_content_is_loaded_as_a_tab() {
 
 #[test]
 fn fetched_collection_from_git_records_its_git_origin() {
-    use super::editor::Editor;
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.chosen_ref = Some(RefChoice {
-        label: "[Branches] main".into(),
-        gitref: "refs/heads/main".into(),
-    });
-    w.url = Editor::new("https://example.test/repo.git", false);
-    w.selected_path = Some("api/health.hurl".to_string());
+    let w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
+    let origin = crate::git_remote::GitOrigin {
+        repo_url: "https://example.test/repo.git".into(),
+        path: "api/health.hurl".into(),
+        ref_kind: RefKind::Branch,
+        ref_name: "main".into(),
+    };
 
     let hurl = "GET http://127.0.0.1:8080/health\nHTTP 200\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(hurl.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api/health.hurl".to_string(),
+            text: hurl.to_string(),
+            origin: Some(origin),
+        },
+    );
     assert!(!keep_open, "a collection load closes the wizard");
 
     let ci = app.active_tab;
@@ -3049,11 +3294,17 @@ fn fetched_collection_from_git_records_its_git_origin() {
 #[test]
 fn fetched_environment_content_is_loaded() {
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Environment, Vec::new());
-    w.selected_path = Some("envs/staging.vars".to_string());
+    let w = RemoteWizard::new(RemoteKind::Environment, Vec::new());
 
     let vars = "BASE_URL=http://127.0.0.1:8080\nTOKEN=abc\n";
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok(vars.to_string())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "envs/staging.vars".to_string(),
+            text: vars.to_string(),
+            origin: None,
+        },
+    );
 
     assert!(!keep_open, "loading closes the wizard");
     assert_eq!(
@@ -3063,73 +3314,49 @@ fn fetched_environment_content_is_loaded() {
     );
 }
 
+/// An error takes precedence over whatever step it happened on, so the user
+/// sees what went wrong rather than a list that silently didn't change.
 #[test]
-fn a_git_error_is_shown_in_the_wizard() {
-    let mut app = TuiApp::default();
+fn an_error_is_what_the_wizard_draws_regardless_of_the_step_underneath() {
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    assert!(app.apply_git_msg(&mut w, GitMsg::Refs(Err("boom".into()))));
-    assert!(matches!(&w.stage, RemoteStage::Error(e) if e == "boom"));
+    assert_eq!(w.stage(), RemoteStage::Connect);
+    w.flow.fail("boom".into());
+    assert_eq!(w.stage(), RemoteStage::Error);
+    assert_eq!(w.flow.error(), Some("boom"));
+    // Dismissing it returns to the step it happened on rather than closing the
+    // wizard and discarding everything fetched so far.
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::RemoteGit(w)) => assert_eq!(w.stage(), RemoteStage::Connect),
+        _ => panic!("dismissing an error should not close the wizard"),
+    }
 }
 
 // ── Loading a Workspace from git ────────────────────────────────────────
 
 #[test]
-fn workspace_git_filter_matches_extensions_case_insensitively() {
-    assert!(WorkspaceGitFilter::HurlAndJson.matches("a/b.hurl"));
-    assert!(WorkspaceGitFilter::HurlAndJson.matches("a/b.JSON"));
-    assert!(!WorkspaceGitFilter::HurlAndJson.matches("a/b.txt"));
-    assert!(WorkspaceGitFilter::HurlOnly.matches("a/b.Hurl"));
-    assert!(!WorkspaceGitFilter::HurlOnly.matches("a/b.json"));
-    assert!(WorkspaceGitFilter::JsonOnly.matches("a/b.json"));
-    assert!(!WorkspaceGitFilter::JsonOnly.matches("a/b.hurl"));
-    assert!(WorkspaceGitFilter::All.matches("a/b.bin"));
-    assert!(WorkspaceGitFilter::All.matches("a/b"));
-}
-
-#[test]
-fn a_workspace_load_goes_to_the_file_filter_picker_instead_of_the_single_file_picker() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    let files = vec![
-        "a.hurl".to_string(),
-        "b.json".to_string(),
-        "big/blob.bin".to_string(),
-    ];
-    let repo = std::env::temp_dir().join(format!("crab_test_ws_repo_{}", std::process::id()));
-    std::fs::create_dir_all(&repo).unwrap();
-
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo.clone(), "deadbeef".to_string())))
-    ));
-    assert!(matches!(
-        &w.stage,
-        RemoteStage::PickWorkspaceFilter { sel: 0 }
-    ));
-    assert_eq!(
-        w.files.len(),
-        3,
-        "the full file listing is kept so the filter can be applied client-side"
-    );
-
-    std::fs::remove_dir_all(&repo).ok();
-}
-
-#[test]
 fn picking_a_workspace_filter_with_no_matches_shows_an_error_instead_of_downloading_nothing() {
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    w.files = vec!["big/blob.bin".to_string(), "readme.md".to_string()];
-    w.repo = Some(std::env::temp_dir().join("crab_test_ws_no_match"));
-    w.stage = RemoteStage::PickWorkspaceFilter { sel: 0 }; // .hurl/.json — matches nothing here
+    w.flow = RemoteFlow::seed(
+        RemoteKind::Workspace,
+        "https://example.test/repo.git",
+        Step::PickWorkspaceFilter,
+        vec!["big/blob.bin".to_string(), "readme.md".to_string()],
+        Some(std::env::temp_dir().join("crab_test_ws_no_match")),
+    );
+    // sel 0 is .hurl/.json, which matches nothing in that listing.
     app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
 
     press(&mut app, KeyCode::Enter);
 
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(&w.stage, RemoteStage::Error(_)),
+            assert_eq!(
+                w.stage(),
+                RemoteStage::Error,
                 "no matches shows an error instead of a silent no-op"
             );
         }
@@ -3139,24 +3366,24 @@ fn picking_a_workspace_filter_with_no_matches_shows_an_error_instead_of_download
 
 #[test]
 fn a_successful_workspace_download_opens_a_new_workspace_tab_bound_to_the_repo_dir() {
-    use super::editor::Editor;
     let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    w.url = Editor::new("https://example.test/my-repo.git", false);
+    let w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
     let repo = std::env::temp_dir().join(format!("crab_test_ws_ready_{}", std::process::id()));
     std::fs::create_dir_all(&repo).unwrap();
-    w.repo = Some(repo.clone());
 
     let before = app.collections.len();
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Workspace(Ok(repo.clone())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Workspace {
+            root: repo.clone(),
+            name: "my-repo".to_string(),
+            origin: None,
+        },
+    );
 
     assert!(
         !keep_open,
         "the wizard itself closes; the new storage-choice popup takes over"
-    );
-    assert!(
-        w.repo.is_none(),
-        "repo ownership moves to the pending choice so poll_git_updates won't delete it"
     );
     assert!(
         matches!(
@@ -3192,14 +3419,6 @@ fn a_successful_workspace_download_opens_a_new_workspace_tab_bound_to_the_repo_d
 }
 
 #[test]
-fn a_workspace_download_failure_is_shown_as_an_error() {
-    let mut app = TuiApp::default();
-    let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
-    assert!(app.apply_git_msg(&mut w, GitMsg::Workspace(Err("no space left".into()))));
-    assert!(matches!(&w.stage, RemoteStage::Error(e) if e == "no space left"));
-}
-
-#[test]
 fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     use crate::i18n::Strings;
     let s = Strings::for_language(&Language::English);
@@ -3221,7 +3440,7 @@ fn loading_a_workspace_offers_a_git_source_alongside_the_local_folder_picker() {
     // …and "From Git" (sel 1) opens the wizard in Workspace mode.
     app.activate_file_load_source(FileKind::Workspace, 1);
     assert!(
-        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Workspace),
+        matches!(&app.overlay, Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Workspace),
         "the git source opens the wizard in Workspace mode"
     );
 }
@@ -3367,7 +3586,7 @@ fn spawn_workspace_redownload_fetches_the_exact_pinned_commit_and_applies_the_fi
         commit_sha,
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
 
     let rx = spawn_workspace_redownload(origin);
@@ -3413,71 +3632,58 @@ fn spawn_workspace_redownload_fails_clearly_when_the_pinned_commit_is_gone() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Pump the wizard's background work until it reaches `want`, or the wizard
+/// closes because something finished loading. Real git calls are involved (all
+/// against a local repo, so they are quick), which is the point: this exercises
+/// the whole flow rather than hand-fed messages.
+fn pump_remote_until(app: &mut TuiApp, want: RemoteStage) {
+    for _ in 0..600 {
+        match &app.overlay {
+            Some(Overlay::RemoteGit(w)) if w.stage() == want => return,
+            Some(Overlay::RemoteGit(_)) => {}
+            // The wizard handed off to something else, which is as far as it
+            // goes; the caller asserts on whatever took over.
+            _ => return,
+        }
+        app.poll_git_updates();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("the wizard never reached {want:?}");
+}
+
 #[test]
 fn a_full_workspace_git_download_records_the_commit_sha_and_filter_as_the_origin() {
-    // End-to-end through the interactive wizard: PickRef -> Files (sha
-    // captured) -> PickWorkspaceFilter (filter captured, Enter spawns
-    // the real download) -> Workspace download succeeds -> the new
-    // tab's `workspace_git_origin` has everything a later redownload
-    // would need.
+    // End-to-end through the interactive wizard against a real (local,
+    // offline) repo: connect -> pick a branch -> pick a file-type filter ->
+    // the download lands, and the new tab's `workspace_git_origin` has
+    // everything a later redownload would need.
     let (repo_url, commit_sha, base) = seed_ws_bare_repo();
     let mut app = TuiApp::default();
     let mut w = RemoteWizard::new(RemoteKind::Workspace, Vec::new());
     w.url = crate::tui::editor::Editor::new(&repo_url, false);
-    w.chosen_ref = Some(RefChoice {
-        label: "[Branches] main".into(),
-        gitref: "refs/heads/main".into(),
-    });
+    app.overlay = Some(Overlay::RemoteGit(Box::new(w)));
 
-    // A real (local, offline) `list_files` call, exactly like
-    // `spawn_git_files` would do, so `w.repo` is an actual git checkout
-    // that the later filter-driven `checkout_files` step can act on
-    // (unlike a bare freshly-`mkdir`'d directory, which has no `.git`).
-    let (files, repo_dir, listed_sha) =
-        crate::git_remote::list_files(&repo_url, None, "refs/heads/main").unwrap();
-    assert_eq!(listed_sha, commit_sha);
-    assert!(app.apply_git_msg(
-        &mut w,
-        GitMsg::Files(Ok((files, repo_dir.clone(), listed_sha.clone())))
-    ));
-    assert_eq!(
-        w.chosen_sha.as_deref(),
-        Some(commit_sha.as_str()),
-        "the resolved commit sha is remembered"
-    );
-    assert!(matches!(
-        &w.stage,
-        RemoteStage::PickWorkspaceFilter { sel: 0 }
-    ));
+    // Enter on the URL field lists the repo's refs.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickRef);
 
-    // Pressing Enter on the (default, sel 0 = HurlAndJson) filter choice
-    // both records `chosen_workspace_filter` and spawns the real
-    // (local, offline) download.
-    app.on_key_remote(
-        Box::new(w),
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    );
-    let Some(Overlay::RemoteGit(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open")
-    };
-    assert_eq!(
-        w.chosen_workspace_filter,
-        Some(WorkspaceGitFilter::HurlAndJson)
-    );
-    assert!(matches!(w.stage, RemoteStage::Loading { .. }));
-    let rx =
-        w.rx.take()
-            .expect("the workspace download should have been spawned");
-    let msg = rx.recv().expect("the download thread should send a result");
+    // `main` is the only branch, so it is the highlighted row; Enter on it
+    // lists that ref's files and, for a Workspace, goes to the filter step.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickWorkspaceFilter);
 
-    let keep_open = app.apply_git_msg(&mut w, msg);
-    assert!(!keep_open);
-    assert!(matches!(
-        &app.overlay,
-        Some(Overlay::WorkspaceStorageChoice { sel: 0, .. })
-    ));
-    // Enter on the default choice (sel 0 = keep temporarily) reproduces
-    // the old direct behaviour, creating the tab immediately.
+    // Enter on the default filter (sel 0 = .hurl and .json) downloads.
+    press(&mut app, KeyCode::Enter);
+    pump_remote_until(&mut app, RemoteStage::PickWorkspaceFilter);
+
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::WorkspaceStorageChoice { sel: 0, .. })
+        ),
+        "the download finished and handed over to the storage-choice popup"
+    );
+    // Enter on the default choice (sel 0 = keep temporarily) creates the tab.
     press(&mut app, KeyCode::Enter);
     let ci = app.active_tab;
     let origin = app.collections[ci]
@@ -3485,10 +3691,13 @@ fn a_full_workspace_git_download_records_the_commit_sha_and_filter_as_the_origin
         .clone()
         .expect("a successful git Workspace download must record its origin");
     assert_eq!(origin.repo_url, repo_url);
-    assert_eq!(origin.commit_sha, commit_sha);
+    assert_eq!(
+        origin.commit_sha, commit_sha,
+        "the exact commit is pinned, not the branch"
+    );
     assert_eq!(origin.ref_kind, RefKind::Branch);
     assert_eq!(origin.ref_name, "main");
-    assert_eq!(origin.filter, WorkspaceGitFilter::HurlAndJson);
+    assert_eq!(origin.filter, WorkspaceGitFilter::PaperboyFiles);
 
     if let Some(root) = &app.collections[ci].workspace_root {
         assert!(root.join("a.hurl").exists());
@@ -3513,7 +3722,7 @@ fn into_collection_queues_a_pending_reload_only_when_the_vanished_root_came_from
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
 
     let mut col = Collection::new("ghost-repo".to_string(), Vec::new());
@@ -3548,7 +3757,7 @@ fn apply_persisted_queues_pending_reloads_and_opens_the_first_confirm_popup() {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let mut col = Collection::new("ghost-repo".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -3582,7 +3791,7 @@ fn declining_a_workspace_reload_shows_the_folder_missing_status_and_advances_the
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let reload = crate::persistence::PendingWorkspaceReload {
         tab_name: "ghost-repo".into(),
@@ -3615,7 +3824,7 @@ fn accepting_a_workspace_reload_redownloads_and_restores_the_previously_selected
         commit_sha,
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let reload = crate::persistence::PendingWorkspaceReload {
         tab_name: "ghost-repo".into(),
@@ -3737,7 +3946,7 @@ fn multiple_pending_workspace_reloads_are_offered_one_at_a_time() {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let dir_a = std::env::temp_dir().join(format!("paperboy_ws_multi_a_{}", std::process::id()));
     let dir_b = std::env::temp_dir().join(format!("paperboy_ws_multi_b_{}", std::process::id()));
@@ -4501,6 +4710,8 @@ fn help_shortcuts_tab_groups_entries_into_titled_sections() {
         s.help_reload_var,
         s.help_env_rename,
         s.help_env_activate,
+        s.help_env_activate_workspace,
+        s.help_env_filter,
         s.help_env_delete,
         s.help_env_reopen,
         s.help_env_link,
@@ -4921,6 +5132,91 @@ fn git_icon_shown_on_env_heading_independently_of_the_collection_origin() {
     );
 }
 
+/// With a few hundred environments loaded, the one with the checkmark is almost
+/// never on screen — and a filter can hide it outright. "What am I running
+/// against?" must not depend on scrolling, so the answer is pinned above the
+/// list.
+#[test]
+fn the_active_environment_is_pinned_above_the_list() {
+    use crate::environment::Environment;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let mut active_id = 0;
+    for i in 0..40 {
+        let id = add_global_env(
+            &mut app,
+            Environment {
+                id: i + 1,
+                name: format!("env-{i:02}"),
+                vars: Vec::new(),
+                path: None,
+                git_origin: None,
+            },
+        );
+        if i == 39 {
+            active_id = id;
+        }
+    }
+    app.active_env_id = Some(active_id);
+
+    let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("env-39"),
+        "the active environment is named even though its row is far down: {text}"
+    );
+
+    // A filter that excludes it entirely is the harder case: the list is empty,
+    // and the pinned line is the only thing left saying what is in force.
+    app.env_query = "zzz".to_string();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(
+        text.contains("env-39"),
+        "still named with the list filtered away: {text}"
+    );
+}
+
+/// With nothing active the line stays, saying so: a run with no environment
+/// substitutes nothing, which is worth being told, and a line that came and
+/// went would shift the list under the cursor.
+#[test]
+fn the_pinned_line_says_when_no_environment_is_active() {
+    use crate::environment::Environment;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    add_global_env(
+        &mut app,
+        Environment {
+            id: 0,
+            name: "staging".into(),
+            vars: Vec::new(),
+            path: None,
+            git_origin: None,
+        },
+    );
+    app.active_env_id = None;
+
+    let area = ratatui::layout::Rect::new(0, 0, 40, 10);
+    let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+    term.draw(|f| super::draw::draw_env_panel(f, area, &app, &s, &th))
+        .unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(text.contains(s.env_active_none), "got: {text}");
+}
+
 // ── "Save Collection to Git" wizard ─────────────────────────────────────
 
 #[test]
@@ -4963,7 +5259,8 @@ fn save_to_git_wizard_is_prefilled_from_the_collections_remembered_origin() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::Connect { field: 0 }));
+            assert_eq!(w.stage(), GitSaveStage::Connect);
+            assert_eq!(w.field, 0);
             assert_eq!(
                 w.url.text(),
                 "https://example.test/repo.git",
@@ -4975,7 +5272,7 @@ fn save_to_git_wizard_is_prefilled_from_the_collections_remembered_origin() {
                 "main",
                 "defaults to appending to the originally-loaded branch"
             );
-            assert!(w.target_kind == GitSaveTarget::Branch);
+            assert!(w.flow.target_kind == SaveTargetKind::Branch);
         }
         _ => panic!("expected the git-save wizard to open"),
     }
@@ -5002,9 +5299,10 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
         let Some(Overlay::GitSave(w)) = &mut app.overlay else {
             panic!()
         };
-        w.stage = GitSaveStage::ChoosePaths { field: 0 };
+        w.flow.seed_step(crate::save_flow::Step::ChoosePaths);
+        w.field = 0;
         assert!(
-            w.include_env,
+            w.flow.include_env,
             "an attached environment defaults to being included"
         );
     }
@@ -5014,8 +5312,9 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(!w.include_env, "space toggles the checkbox");
-            assert!(matches!(w.stage, GitSaveStage::ChoosePaths { field: 1 }));
+            assert!(!w.flow.include_env, "space toggles the checkbox");
+            assert_eq!(w.stage(), GitSaveStage::ChoosePaths);
+            assert_eq!(w.field, 1);
         }
         _ => panic!(),
     }
@@ -5023,7 +5322,7 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
     press(&mut app, KeyCode::Tab); // field 1 -> back to 0 (field 2 is now hidden)
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::ChoosePaths { field: 0 }))
+            assert_eq!((w.stage(), w.field), (GitSaveStage::ChoosePaths, 0))
         }
         _ => panic!("unchecking the env removed field 2 from the tab cycle"),
     }
@@ -5033,13 +5332,12 @@ fn choose_paths_checkbox_toggles_and_tab_skips_the_hidden_env_path_field() {
 fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existing() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: Some(RemoteRefs {
-            branches: vec!["main".into(), "develop".into()],
-            tags: vec!["v1".into()],
-        }),
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.flow.seed_refs_from(RemoteRefs {
+        branches: vec!["main".into(), "develop".into()],
+        tags: vec!["v1".into()],
+    });
+    w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Down); // open the dropdown at "main"
@@ -5049,8 +5347,8 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
         Some(Overlay::GitSave(w)) => {
             assert_eq!(w.target_name.text(), "develop");
             assert!(matches!(
-                w.stage,
-                GitSaveStage::ChooseTarget { sel: None, .. }
+                (w.stage(), w.sel),
+                (GitSaveStage::ChooseTarget, None)
             ));
         }
         _ => panic!(),
@@ -5059,8 +5357,8 @@ fn choose_target_picking_an_existing_branch_from_the_dropdown_marks_it_as_existi
     press(&mut app, KeyCode::Enter); // submit
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::CommitMessage));
-            assert!(w.target_intent == TargetIntent::ExistingBranch);
+            assert_eq!(w.stage(), GitSaveStage::CommitMessage);
+            assert!(w.flow.intent() == TargetIntent::ExistingBranch);
         }
         _ => panic!("expected to move to the commit-message step"),
     }
@@ -5071,13 +5369,12 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     let mut app = TuiApp::default();
     let mut w = Box::new(app_git_save_wizard(&mut app, "main"));
     w.target_name = super::editor::Editor::blank();
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: Some(RemoteRefs {
-            branches: vec!["main".into()],
-            tags: vec![],
-        }),
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.flow.seed_refs_from(RemoteRefs {
+        branches: vec!["main".into()],
+        tags: vec![],
+    });
+    w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
     for ch in "feature-x".chars() {
@@ -5087,10 +5384,10 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(matches!(w.stage, GitSaveStage::CommitMessage));
+            assert_eq!(w.stage(), GitSaveStage::CommitMessage);
             assert_eq!(w.target_name.text(), "feature-x");
             assert!(
-                w.target_intent == TargetIntent::NewRef,
+                w.flow.intent() == TargetIntent::NewRef,
                 "a name not on the remote is a brand-new ref"
             );
         }
@@ -5106,14 +5403,20 @@ fn choose_target_tab_toggles_between_branch_and_tag() {
 
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(w.target_kind == GitSaveTarget::Branch, "starts on Branch")
+            assert!(
+                w.flow.target_kind == SaveTargetKind::Branch,
+                "starts on Branch"
+            )
         }
         _ => panic!(),
     }
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
-            assert!(w.target_kind == GitSaveTarget::Tag, "Tab toggles to Tag")
+            assert!(
+                w.flow.target_kind == SaveTargetKind::Tag,
+                "Tab toggles to Tag"
+            )
         }
         _ => panic!(),
     }
@@ -5135,11 +5438,27 @@ fn app_git_save_wizard(app: &mut TuiApp, branch: &str) -> GitSaveWizard {
     });
     app.active_tab = ci;
     let mut w = GitSaveWizard::new(ci, &app.collections[ci], app.effective_env(ci));
-    w.stage = GitSaveStage::ChooseTarget {
-        sel: None,
-        refs: None,
-    };
+    w.flow.seed_step(crate::save_flow::Step::ChooseTarget);
+    w.sel = None;
     w
+}
+
+/// Drive the real event-loop polling until the in-flight push finishes, exactly
+/// as the running app does, rather than reaching into the worker's channel.
+fn pump_git_save(app: &mut TuiApp) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.poll_git_save_updates();
+        match &app.overlay {
+            Some(Overlay::GitSave(w)) if w.stage() == GitSaveStage::Pushing => {}
+            _ => return,
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the push never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -5214,24 +5533,24 @@ fn saving_to_git_appends_a_commit_and_updates_the_remembered_origin_and_markers(
     // `GitSaveWizard::new` already seeded (target = the original "main"
     // branch — the "append" case); the ChooseTarget/ChoosePaths key
     // handling itself is covered by the dedicated tests above.
-    w.include_env = false;
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.include_env = false;
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // spawns the real (local, offline) push
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    assert!(matches!(w.stage, GitSaveStage::Pushing));
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    let keep_open = app.apply_git_save_msg(&mut w, msg);
-    assert!(keep_open, "the Done stage stays open until dismissed");
-    assert!(
-        matches!(w.stage, GitSaveStage::Done),
-        "a successful push moves to Done"
-    );
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert_eq!(w.stage(), GitSaveStage::Pushing),
+        _ => panic!("wizard should still be open (Pushing)"),
+    }
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Done,
+            "a successful push moves to Done, and stays open until dismissed"
+        ),
+        _ => panic!("the Done stage stays open until dismissed"),
+    }
 
     assert!(matches!(app.status, Some(Status::GitSaved)));
     assert!(
@@ -5320,7 +5639,7 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
         commit_sha: "0000000000000000000000000000000000000000".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     };
     let mut col = Collection::new("api-workspace".into(), Vec::new());
     col.workspace_root = Some(ws.clone());
@@ -5340,30 +5659,30 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
     // to the commit message (target/branch key handling is shared with the
     // collection flow, already covered above).
     assert!(
-        matches!(w.stage, GitSaveStage::Connect { .. }),
+        w.stage() == GitSaveStage::Connect,
         "opens on the Connect step"
     );
     assert_eq!(w.target_name.text(), "main");
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // enumerate the tree + push
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    assert!(
-        matches!(w.stage, GitSaveStage::Pushing),
-        "a workspace with files pushes immediately"
-    );
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    let keep_open = app.apply_git_save_msg(&mut w, msg);
-    assert!(keep_open);
-    assert!(
-        matches!(w.stage, GitSaveStage::Done),
-        "a successful workspace push moves to Done"
-    );
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Pushing,
+            "a workspace with files pushes immediately"
+        ),
+        _ => panic!("wizard should still be open (Pushing)"),
+    }
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => assert!(
+            w.stage() == GitSaveStage::Done,
+            "a successful workspace push moves to Done"
+        ),
+        _ => panic!("the Done stage stays open until dismissed"),
+    }
     assert!(matches!(app.status, Some(Status::GitSaved)));
 
     // The remembered origin is repinned to the freshly-pushed commit (no
@@ -5374,7 +5693,7 @@ fn saving_a_workspace_to_git_commits_the_whole_tree_and_repins_the_origin_sha() 
         "the origin sha is repinned to the new commit"
     );
     assert_eq!(repinned.ref_name, "main");
-    assert!(matches!(repinned.filter, WorkspaceGitFilter::HurlAndJson));
+    assert!(matches!(repinned.filter, WorkspaceGitFilter::PaperboyFiles));
 
     // The pushed commit carries the edited + new files (and never the `.git`).
     git(&["fetch", "-q", "origin", "main"], &seed);
@@ -5454,7 +5773,7 @@ fn workspace_tab_with_unsaved_edit() -> (TuiApp, usize, std::path::PathBuf) {
         commit_sha: "abc123".into(),
         ref_kind: RefKind::Branch,
         ref_name: "main".into(),
-        filter: WorkspaceGitFilter::HurlAndJson,
+        filter: WorkspaceGitFilter::PaperboyFiles,
     });
 
     let mut app = TuiApp::default();
@@ -5631,28 +5950,29 @@ fn saving_to_a_tag_that_already_exists_is_rejected_and_never_overwritten() {
     let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
         panic!("wizard should be open")
     };
-    w.include_env = false;
-    w.target_kind = GitSaveTarget::Tag;
+    w.flow.include_env = false;
+    w.flow.target_kind = SaveTargetKind::Tag;
     w.target_name = super::editor::Editor::new("v1.0", false);
-    w.target_intent = TargetIntent::NewRef;
-    w.stage = GitSaveStage::CommitMessage;
+    w.flow.seed_intent(TargetIntent::NewRef);
+    w.flow.seed_step(crate::save_flow::Step::CommitMessage);
     app.overlay = Some(Overlay::GitSave(w));
 
     press(&mut app, KeyCode::Enter); // spawns the real push, which must self-reject
 
-    let Some(Overlay::GitSave(mut w)) = app.overlay.take() else {
-        panic!("wizard should still be open (Pushing)")
-    };
-    let rx = w.rx.take().expect("the push should have been spawned");
-    let msg = rx.recv().expect("the push thread should send a result");
-    app.apply_git_save_msg(&mut w, msg);
-
-    match &w.stage {
-        GitSaveStage::Error(e) => assert!(
-            e.contains("already exists") || e.contains("never"),
-            "got: {e}"
-        ),
-        _ => panic!("expected the tag-exists rejection, got a different stage"),
+    pump_git_save(&mut app);
+    match &app.overlay {
+        Some(Overlay::GitSave(w)) => {
+            let e = w.error_text();
+            assert_eq!(w.stage(), GitSaveStage::Error, "got: {e}");
+            // Specifically PaperBoy's own guard, not whatever git happened to
+            // say: the push must be refused before it is ever attempted.
+            assert_eq!(
+                e,
+                crate::i18n::Strings::for_language(&crate::i18n::Language::English).git_tag_exists,
+                "got: {e}"
+            );
+        }
+        _ => panic!("expected the tag-exists rejection to stay on screen"),
     }
     // The collection's remembered origin is untouched by a rejected save.
     assert_eq!(
@@ -7231,7 +7551,6 @@ fn request_json_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selec
 
 #[test]
 fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlight() {
-    use crate::i18n::Language;
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -7293,7 +7612,7 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
     // the highlight with the app's own explicit selection colour,
     // confined to the response panel.
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let select_bg = super::theme::theme(&Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     let buf = term.backend().buffer();
     let selected_cell = buf.cell((area.x + 2, area.y)).unwrap();
     assert_eq!(
@@ -7310,8 +7629,8 @@ fn mouse_drag_inside_the_response_panel_selects_scoped_text_and_paints_a_highlig
 /// `y` re-triggers a copy of the active selection without disturbing it
 /// (unlike Esc, which clears it) — an explicit fallback for terminals
 /// that don't act on the automatic OSC 52 write from mouse-release.
-/// `copy_to_clipboard` itself just writes to stdout (best-effort, see
-/// `clipboard.rs`), so this only asserts the selection survives the key
+/// `copy_to_clipboard` is pinned to `ClipboardMode::None` under `cfg(test)`
+/// (see `clipboard.rs`), so this only asserts the selection survives the key
 /// press and that `y` is a no-op when there is nothing selected.
 #[test]
 fn y_recopies_the_active_selection_without_clearing_it() {
@@ -7386,9 +7705,9 @@ fn y_without_an_active_selection_is_a_no_op() {
 /// panel (Request JSON or Response) — so a user can grab the entire
 /// body without first having to drag-select every line of what might be
 /// a huge response. `whole_panel_text`/`can_copy` are the pure pieces of
-/// that logic (`copy_to_clipboard` itself just writes to stdout, see
-/// `clipboard.rs`), so this asserts on those directly plus the fact
-/// that pressing `y` doesn't create/disturb any selection state.
+/// that logic (`copy_to_clipboard` is pinned to `ClipboardMode::None` under
+/// `cfg(test)`, see `clipboard.rs`), so this asserts on those directly plus
+/// the fact that pressing `y` doesn't create/disturb any selection state.
 #[test]
 fn whole_panel_text_returns_the_full_response_body_when_the_response_panel_has_focus() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -7772,10 +8091,9 @@ fn main_panel_copy_excludes_the_shadow_icon_but_keeps_other_exclamation_marks() 
 fn main_panel_shows_and_copies_hurl_text_when_the_default_view_is_hurl() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let mut app = TuiApp {
-        default_request_view: RequestView::Hurl,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
     let ci = app.active_tab;
     let entry = HurlEntry {
         method: "GET".into(),
@@ -7821,10 +8139,9 @@ fn main_panel_shows_and_copies_hurl_text_when_the_default_view_is_hurl() {
 fn hurl_view_shows_disabled_rows_as_comments() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let mut app = TuiApp {
-        default_request_view: RequestView::Hurl,
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
     let ci = app.active_tab;
     let mut entry = HurlEntry {
         method: "GET".into(),
@@ -7895,6 +8212,118 @@ fn y_with_no_selection_copies_the_whole_focused_panel_without_creating_a_selecti
     // there's still nothing highlighted on screen afterwards.
     assert!(app.text_selection().is_none());
     assert!(app.extra_selections().is_empty());
+}
+
+/// The Main and Response panels are the only panes with no keyboard shortcut
+/// that moves focus straight onto them, so a click has to do it — and used to
+/// not, leaving them unreachable with the mouse.
+#[test]
+fn clicking_a_text_panel_focuses_it() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "focus".into(),
+        method: "GET".into(),
+        url: "http://example.com/".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "a response body".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::List;
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let click = |app: &mut TuiApp, area: ratatui::layout::Rect| {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    let main = app.main_text_area;
+    assert!(main.width > 0 && main.height > 0, "main panel must render");
+    click(&mut app, main);
+    assert_eq!(app.focus, Pane::Main);
+
+    let resp = app.resp_text_area;
+    assert!(resp.width > 0 && resp.height > 0, "response must render");
+    click(&mut app, resp);
+    assert_eq!(app.focus, Pane::Response);
+}
+
+/// Clicking a panel to focus it must leave the clipboard alone. Mouse-up used
+/// to run the same "copy, or else copy the whole panel" path as `y`, so simply
+/// selecting the Response panel silently replaced whatever the user had copied
+/// with the entire response body.
+#[test]
+fn a_click_that_selects_nothing_does_not_copy() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "click".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "whole response body".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    let ev = |kind| MouseEvent {
+        kind,
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.status = None;
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left)));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left)));
+
+    assert_eq!(
+        app.focus,
+        Pane::Response,
+        "the click still selects the pane"
+    );
+    assert!(
+        !matches!(app.status, Some(Status::Copied)),
+        "a click with nothing selected must not copy"
+    );
+
+    // A real drag still copies on release, as before.
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left)));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 5,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(
+        matches!(app.status, Some(Status::Copied)),
+        "dragging out a selection must still copy on release"
+    );
 }
 
 #[test]
@@ -8360,7 +8789,6 @@ fn shift_arrow_extends_the_selection_and_scrolls_it_into_view() {
 /// without any special-case invalidation logic.
 #[test]
 fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
-    use crate::i18n::Language;
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
@@ -8434,7 +8862,7 @@ fn resizing_the_panel_keeps_the_selection_on_the_same_characters() {
     let area = app.resp_text_area;
     let screen_row = area.y + row as u16 - app.resp_panel.scroll().min(row as u16);
     let cell = buf.cell((area.x + col as u16, screen_row)).unwrap();
-    let select_bg = super::theme::theme(&Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     assert_eq!(
         cell.bg, select_bg,
         "the highlighted cell must follow the character to its new screen position after resize"
@@ -8569,7 +8997,7 @@ fn alt_click_drag_adds_a_region_instead_of_replacing_the_active_one() {
     // Both regions are actually painted on screen, with the app's own
     // distinct selection colour (not just tracked internally).
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let select_bg = super::theme::theme(&crate::i18n::Language::English).select_bg;
+    let select_bg = app.theme().select_bg;
     let buf = term.backend().buffer();
     assert_eq!(
         buf.cell((area.x + 2, area.y)).unwrap().bg,
@@ -8976,10 +9404,9 @@ fn load_browser_hides_non_matching_files_and_tab_toggles_the_filter() {
     }
     std::fs::create_dir_all(dir.join("sub")).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     let names = |app: &TuiApp| -> Vec<String> {
         match &app.overlay {
             Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
@@ -9034,6 +9461,8 @@ fn the_tui_preserves_the_guis_saved_layout() {
         response_height: Some(360.0),
         report_diag_height: Some(96.0),
         report_palette_width: Some(200.0),
+        report_detail_height: Some(280.0),
+        report_summary_height: Some(200.0),
         view: GuiView::Report(2),
         report_source_view: true,
     };
@@ -9063,10 +9492,9 @@ fn load_browser_type_to_filter_narrows_by_name() {
     std::fs::create_dir_all(dir.join("sub")).unwrap();
     std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     let names = |app: &TuiApp| -> Vec<String> {
         match &app.overlay {
             Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
@@ -9100,10 +9528,12 @@ fn load_browser_type_to_filter_narrows_by_name() {
         !shown.iter().any(|n| n == "sub/"),
         "non-matching folder hidden: {shown:?}"
     );
-    // …but never the way back out.
+    // …and "au" doesn't match "../" either, so the way out goes too rather
+    // than sitting at the top of the list as the one row you didn't ask for.
+    // Left and Esc still get you out — pinned by the tests below.
     assert!(
-        shown.iter().any(|n| n == "../"),
-        "the parent entry is always reachable: {shown:?}"
+        !shown.iter().any(|n| n == "../"),
+        "the parent entry is filtered like everything else: {shown:?}"
     );
 
     // Backspace widens the query back to "a": now all three files match.
@@ -9408,52 +9838,7 @@ fn save_prompt_renders_the_dimmed_extension_ghost() {
 }
 
 #[test]
-fn save_confirm_popup_substitutes_the_new_and_modified_counts() {
-    use crate::i18n::{Language, Strings};
-    use ratatui::{Terminal, backend::TestBackend};
-    let th = super::theme::theme(&Language::English);
-    let s = Strings::for_language(&Language::English);
-
-    // 3 user-added requests and 1 hand-added env var (TOKEN is not counted).
-    let mut app = app_with_resolved_secret("s3cr3t");
-    app.add_env_var(0, "TEAM".into(), "crabs".into());
-    for i in 0..3 {
-        let mut e = HurlEntry::from_fields(&format!("r{i}"), "GET", "http://h/x", vec![], "");
-        e.user_added = true;
-        app.collections[0].entries.push(e);
-    }
-    app.overlay = Some(Overlay::Confirm {
-        action: ConfirmAction::Save(FileAction::SaveCollection),
-        sel: 1,
-    });
-
-    let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
-        .unwrap();
-    let out = buffer_text(term.backend().buffer());
-
-    assert!(
-        !out.contains("{r}") && !out.contains("{e}"),
-        "placeholders are substituted:\n{out}"
-    );
-    assert!(out.contains('3'), "the request count is shown:\n{out}");
-    // The collection warning is scoped to requests only (not environment).
-    assert!(
-        out.contains("request"),
-        "the request count is labelled:\n{out}"
-    );
-    assert!(
-        !out.contains("environment"),
-        "the collection warning omits the environment:\n{out}"
-    );
-    assert!(
-        out.contains("Proceed?"),
-        "the confirmation asks to proceed:\n{out}"
-    );
-}
-
-#[test]
-fn save_collection_to_original_confirms_then_saves() {
+fn save_collection_to_original_writes_back_without_asking() {
     let dir = temp_dir("saveorig");
     let path = dir.join("api.hurl");
     std::fs::write(&path, "# seed\nGET http://h/x\nHTTP 200\n").unwrap();
@@ -9476,20 +9861,8 @@ fn save_collection_to_original_confirms_then_saves() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(
-            app.overlay,
-            Some(Overlay::Confirm {
-                action: ConfirmAction::Save(FileAction::SaveCollection),
-                ..
-            })
-        ),
-        "a changed collection confirms before overwriting the original",
-    );
-
-    press(&mut app, KeyCode::Char('y')); // confirm -> saves to the original path
-    assert!(
         app.overlay.is_none(),
-        "saving to the original does not prompt for a name"
+        "saving to the original neither confirms nor prompts for a name",
     );
     assert!(
         !app.collections[1].entries[0].user_added,
@@ -9973,7 +10346,7 @@ fn the_request_list_shows_a_named_entrys_name_instead_of_its_url() {
     app.collections.push(col);
     app.active_tab = 1;
 
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 1, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
@@ -11501,10 +11874,9 @@ fn picking_a_file_restores_the_wizard_with_the_path_and_inferred_content_type() 
     let dir = temp_dir("form_file_pick");
     std::fs::write(dir.join("avatar.png"), b"fake-png").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     open_form_on_file_value(&mut app);
     app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(matches!(app.overlay, Some(Overlay::Browser(..))));
@@ -11539,10 +11911,9 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
     let dir = temp_dir("form_file_cancel");
     std::fs::write(dir.join("avatar.png"), b"fake-png").unwrap();
 
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     open_form_on_file_value(&mut app);
     for ch in "old-value.png".chars() {
         press(&mut app, KeyCode::Char(ch));
@@ -12947,13 +13318,12 @@ fn editor_multiline_selection_uses_stream_semantics() {
 
 #[test]
 fn opening_the_git_wizard_offers_the_recent_urls_most_recent_first() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => assert_eq!(w.recent, app.recent_git_urls),
@@ -12963,40 +13333,30 @@ fn opening_the_git_wizard_offers_the_recent_urls_most_recent_first() {
 
 #[test]
 fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
 
     // Down (on the URL field) opens the dropdown instead of jumping fields.
     press(&mut app, KeyCode::Down);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Connect {
-                    field: 0,
-                    recent_sel: Some(0)
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!((w.field, w.recent_sel), (0, Some(0)));
         }
         _ => panic!("wizard closed"),
     }
     press(&mut app, KeyCode::Down);
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(
-                    w.stage,
-                    RemoteStage::Connect {
-                        field: 0,
-                        recent_sel: Some(1)
-                    }
-                ),
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(
+                (w.field, w.recent_sel),
+                (0, Some(1)),
                 "Down moves to the next item"
             );
         }
@@ -13008,12 +13368,8 @@ fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
             assert_eq!(w.url.text(), "https://example.test/b.git");
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Loading {
-                    phase: LoadPhase::Refs
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Loading);
+            assert_eq!(w.flow.busy(), Some(Phase::Refs));
         }
         _ => panic!("wizard closed"),
     }
@@ -13021,22 +13377,16 @@ fn down_opens_the_recent_urls_dropdown_and_enter_picks_one() {
 
 #[test]
 fn up_from_the_first_recent_item_closes_the_dropdown() {
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/a.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/a.git".into()];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     press(&mut app, KeyCode::Down); // open dropdown at index 0
     press(&mut app, KeyCode::Up); // back out of the dropdown
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(matches!(
-                w.stage,
-                RemoteStage::Connect {
-                    field: 0,
-                    recent_sel: None
-                }
-            ));
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!((w.field, w.recent_sel), (0, None));
         }
         _ => panic!("wizard closed"),
     }
@@ -13044,23 +13394,18 @@ fn up_from_the_first_recent_item_closes_the_dropdown() {
 
 #[test]
 fn typing_closes_the_dropdown_and_edits_the_field() {
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/a.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/a.git".into()];
+    });
     app.open_remote_wizard(RemoteKind::Collection);
     press(&mut app, KeyCode::Down); // open dropdown
     press(&mut app, KeyCode::Char('x'));
     match &app.overlay {
         Some(Overlay::RemoteGit(w)) => {
-            assert!(
-                matches!(
-                    w.stage,
-                    RemoteStage::Connect {
-                        field: 0,
-                        recent_sel: None
-                    }
-                ),
+            assert_eq!(w.stage(), RemoteStage::Connect);
+            assert_eq!(
+                (w.field, w.recent_sel),
+                (0, None),
                 "typing closes the dropdown"
             );
             assert_eq!(
@@ -13076,15 +13421,21 @@ fn typing_closes_the_dropdown_and_edits_the_field() {
 #[test]
 fn completing_a_git_load_remembers_the_url_most_recent_first() {
     use super::editor::Editor;
-    let mut app = TuiApp {
-        recent_git_urls: vec!["https://example.test/old.git".into()],
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec!["https://example.test/old.git".into()];
+    });
     let mut w = RemoteWizard::new(RemoteKind::Collection, app.recent_git_urls.clone());
     w.url = Editor::new("https://example.test/new.git", false);
-    w.selected_path = Some("api.hurl".into());
+    w.sync_fields();
 
-    let keep_open = app.apply_git_msg(&mut w, GitMsg::Content(Ok("GET http://h/x\n".into())));
+    let keep_open = app.apply_flow_event(
+        &w,
+        FlowEvent::Content {
+            path: "api.hurl".into(),
+            text: "GET http://h/x\n".into(),
+            origin: None,
+        },
+    );
     assert!(!keep_open, "a collection load closes the wizard");
     assert_eq!(
         app.recent_git_urls,
@@ -13098,13 +13449,12 @@ fn completing_a_git_load_remembers_the_url_most_recent_first() {
 
 #[test]
 fn reusing_the_same_url_moves_it_to_the_front_without_duplicating() {
-    let mut app = TuiApp {
-        recent_git_urls: vec![
+    let mut app = app_with(|a| {
+        a.recent_git_urls = vec![
             "https://example.test/a.git".into(),
             "https://example.test/b.git".into(),
-        ],
-        ..Default::default()
-    };
+        ];
+    });
     app.remember_git_url("https://example.test/b.git");
     assert_eq!(
         app.recent_git_urls,
@@ -13628,7 +13978,7 @@ fn requests_list_breadcrumb_shows_the_current_folder() {
     app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
     app.focus = Pane::List;
 
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 0, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
@@ -13855,10 +14205,9 @@ fn workspace_temp_dir(tag: &str) -> std::path::PathBuf {
 #[test]
 fn space_confirms_the_current_directory_as_a_workspace_root_and_opens_the_picker() {
     let dir = workspace_temp_dir("space_confirm");
-    let mut app = TuiApp {
-        last_browse_dir: Some(dir.clone()),
-        ..Default::default()
-    };
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
     app.open_browser(FileAction::OpenWorkspace);
 
     press(&mut app, KeyCode::Char(' '));
@@ -14481,8 +14830,12 @@ fn new_report_picker_shows_folders_and_workspace_files_but_hides_others() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A file row in a folder picker can't be the answer, so Enter there used to do
+/// nothing at all. It now means what Space means — take the folder on screen,
+/// with the name already in the field — because a key that does nothing on the
+/// row the user is looking at reads as a stuck dialog.
 #[test]
-fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
+fn new_report_picker_enter_on_a_workspace_file_saves_into_the_current_folder() {
     let dir = workspace_temp_dir("new_report_enter_file");
     let mut col = Collection::new("ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
@@ -14492,9 +14845,7 @@ fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
     app.new_report_seed_dir = Some(dir.clone());
     app.open_browser(FileAction::NewReportChooseFolder);
 
-    // Move the selection onto a shown file (a collection) and press Enter:
-    // files are non-selectable here, so Enter is inert and the folder
-    // browser stays open (rather than closing or opening anything).
+    // Move the selection onto a shown file (a collection) and press Enter.
     if let Some(Overlay::Browser(FileAction::NewReportChooseFolder, ex)) = &mut app.overlay {
         let idx = ex
             .files()
@@ -14505,13 +14856,16 @@ fn new_report_picker_enter_on_a_workspace_file_keeps_the_browser_open() {
     } else {
         panic!("expected the new-report folder browser");
     }
+    let name = app.browser_name.text();
+    assert!(!name.is_empty(), "the picker seeds a report name");
     press(&mut app, KeyCode::Enter);
     assert!(
-        matches!(
-            app.overlay,
-            Some(Overlay::Browser(FileAction::NewReportChooseFolder, _))
-        ),
-        "Enter on a non-selectable file leaves the new-report browser open"
+        !matches!(app.overlay, Some(Overlay::Browser(..))),
+        "Enter on a file row commits the folder instead of doing nothing"
+    );
+    assert!(
+        app.active_report_index().is_some(),
+        "the report was created in the folder on screen"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -15922,6 +16276,52 @@ fn two_expanded_collections_both_list_their_request_names() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every listed request says what it does, whether or not its file is the one
+/// loaded. Which row is the POST is the question the badge answers, and a
+/// reader shouldn't have to open a file to ask it.
+#[test]
+fn a_request_carries_its_method_even_when_its_collection_is_not_loaded() {
+    use crate::collection::WsRow;
+
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_methods_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("one.hurl"),
+        "# Login\nPOST https://example.com/login\n\n# Logout\nGET https://example.com/logout\n",
+    )
+    .unwrap();
+    let (mut app, ci) = workspace_app(&dir);
+    let one = dir.join("one.hurl");
+
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    let methods: Vec<(String, String, bool)> = app.collections[ci]
+        .ws_rows()
+        .into_iter()
+        .filter_map(|r| match r {
+            WsRow::Request {
+                name,
+                method,
+                loaded,
+                ..
+            } => Some((name, method, loaded)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            ("Login".to_string(), "POST".to_string(), false),
+            ("Logout".to_string(), "GET".to_string(), false),
+        ],
+        "a collection listed from cache still says what each request does"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A collection expanded but never loaded this session lists its request names
 /// straight from disk once `rebuild_expanded_titles` populates the cache — the
 /// path used by persistence restore.
@@ -16199,7 +16599,7 @@ fn the_loaded_collection_name_is_accent_and_others_are_dim() {
 
     let th = super::theme::theme(&Language::English);
     let s = Strings::for_language(&Language::English);
-    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| {
         let area = f.area();
         super::draw::draw_collection_left(f, area, &app, ci, &s, &th);
@@ -16694,9 +17094,7 @@ fn git_wizard_loading_popup_is_wide_enough_for_the_full_title_even_with_a_short_
     // still grow to fit the title, not just the message/hint.
     use ratatui::{Terminal, backend::TestBackend};
     let mut w = RemoteWizard::new(RemoteKind::Collection, Vec::new());
-    w.stage = RemoteStage::Loading {
-        phase: LoadPhase::File,
-    };
+    w.flow.seed_busy(Phase::File);
     let s = crate::i18n::Strings::for_language(&Language::English);
     let th = crate::tui::theme::theme(&Language::English);
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -17101,7 +17499,7 @@ fn theme_state(app: &TuiApp) -> &super::theme_editor::ThemeEditorState {
 }
 
 #[test]
-fn the_theme_list_starts_with_automatic_then_the_three_presets() {
+fn the_theme_list_starts_with_automatic_then_the_built_in_presets() {
     let app = TuiApp::default();
     let s = crate::i18n::Strings::for_language(&app.language);
     let entries = app.theme_picker_entries(&s);
@@ -17109,11 +17507,12 @@ fn the_theme_list_starts_with_automatic_then_the_three_presets() {
     assert_eq!(
         &entries[1..],
         &[
+            super::theme::PRESET_DEFAULT.to_string(),
             super::theme::PRESET_ENGLISH.to_string(),
             super::theme::PRESET_FRENCH.to_string(),
             super::theme::PRESET_DANISH.to_string(),
         ],
-        "the three presets follow, in language order"
+        "the neutral default leads, then one preset per bundled language"
     );
 }
 
@@ -17121,12 +17520,13 @@ fn the_theme_list_starts_with_automatic_then_the_three_presets() {
 fn selecting_a_preset_in_the_picker_activates_it() {
     let mut app = TuiApp::default();
     assert_eq!(
-        app.active_theme, None,
-        "starts on Automatic (follows language)"
+        app.active_theme.as_deref(),
+        Some(super::theme::PRESET_DEFAULT),
+        "a fresh install starts on the neutral default, not on Automatic"
     );
 
-    open_theme_editor(&mut app);
-    // Automatic(0) -> Britannia(1) -> Parisian Purple(2) -> Dannebrog(3).
+    open_theme_editor(&mut app); // opens on the active theme (Graphite, row 1)
+    // Graphite(1) -> Britannia(2) -> Parisian Purple(3) -> Dannebrog(4).
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
@@ -17136,7 +17536,8 @@ fn selecting_a_preset_in_the_picker_activates_it() {
         "hovering a preset activates it live"
     );
 
-    // Returning to Automatic clears the manual choice.
+    // Walking all the way back up to row 0 clears the manual choice.
+    press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
     press(&mut app, KeyCode::Up);
@@ -17211,9 +17612,10 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
     for c in "Nordic".chars() {
         press(&mut app, KeyCode::Char(c));
     }
-    // Move focus into the base list and pick Dannebrog (Britannia, Parisian,
-    // Dannebrog -> down twice from the first entry).
-    press(&mut app, KeyCode::Down); // Name -> Base (Britannia)
+    // Move focus into the base list and pick Dannebrog (Graphite, Britannia,
+    // Parisian, Dannebrog -> down three times from the first entry).
+    press(&mut app, KeyCode::Down); // Name -> Base (Graphite)
+    press(&mut app, KeyCode::Down); // -> Britannia
     press(&mut app, KeyCode::Down); // -> Parisian Purple
     press(&mut app, KeyCode::Down); // -> Dannebrog
     press(&mut app, KeyCode::Enter);
@@ -17510,7 +17912,11 @@ fn ctrl_d_deletes_a_custom_theme_but_never_a_preset() {
         matches!(app.status, Some(crate::i18n::Status::ThemeCannotDelete)),
         "presets can't be deleted"
     );
-    assert_eq!(app.all_themes().len(), 3, "the three presets remain");
+    assert_eq!(
+        app.all_themes().len(),
+        4,
+        "the built-in presets remain (Graphite plus one per language)"
+    );
 }
 
 #[test]
@@ -17536,8 +17942,25 @@ fn the_new_theme_popup_focus_toggles_between_name_and_base() {
 }
 
 #[test]
+fn a_fresh_install_starts_on_the_neutral_default_theme() {
+    // The language presets are decorative; a tool used at work should open on
+    // something quiet. "Follow language" stays available, it just isn't the
+    // starting point any more.
+    let app = TuiApp::default();
+    assert_eq!(
+        app.active_theme.as_deref(),
+        Some(super::theme::PRESET_DEFAULT)
+    );
+    assert_eq!(app.active_theme_spec().name, super::theme::PRESET_DEFAULT);
+}
+
+#[test]
 fn changing_language_follows_the_preset_unless_a_theme_is_set() {
-    let mut app = TuiApp::default();
+    let mut app = app_with(|app| {
+        // A fresh install now starts on the neutral default, so opt in to
+        // "Automatic" explicitly — that is the mode this test is about.
+        app.active_theme = None;
+    });
     assert_eq!(
         app.active_theme_spec().name,
         super::theme::PRESET_ENGLISH,
@@ -17770,9 +18193,11 @@ fn export_format_cycles_through_output_formats() {
     app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.xlsx");
     app.cycle_browser_export_format(true);
+    assert_eq!(app.browser_name.text(), "report.pdf");
+    app.cycle_browser_export_format(true);
     assert_eq!(app.browser_name.text(), "report.csv", "wraps back to csv");
     app.cycle_browser_export_format(false);
-    assert_eq!(app.browser_name.text(), "report.xlsx", "↑ steps backwards");
+    assert_eq!(app.browser_name.text(), "report.pdf", "↑ steps backwards");
     // An unknown extension is treated as csv, so the next format is json.
     app.browser_name = super::editor::Editor::new("data.txt", false);
     app.cycle_browser_export_format(true);
@@ -18573,6 +18998,9 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
                 asserts: Vec::new(),
                 captures: Vec::new(),
                 duration_ms: 7,
+                setup_ms: 0,
+                wait_ms: 0,
+                download_ms: 0,
                 ok: true,
                 error: None,
             }],
@@ -19993,7 +20421,8 @@ fn dry_run_overlay_renders_grid_not_bindings_list() {
     // name like "Ping.HttpStatus") and two data rows.
     let th = app.theme();
     let s = crate::i18n::Strings::for_language(&Language::English);
-    let lines = p.lines(&s, &th);
+    let (head, grid, tail) = p.line_sections(&s, &th, 0);
+    let lines: Vec<_> = head.into_iter().chain(grid).chain(tail).collect();
     // Each ratatui `Line` is built from spans — join them to get readable text.
     let text_of = |l: &ratatui::text::Line| -> String {
         l.spans.iter().map(|sp| sp.content.to_string()).collect()
@@ -20165,7 +20594,7 @@ fn report_with_result(text: &str, column_order: &[&str]) -> (TuiApp, usize) {
         column_order: column_order.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     (app, idx)
 }
@@ -20448,7 +20877,7 @@ fn report_load_from_git_opens_the_report_remote_wizard() {
     app.activate_file_load_source(FileKind::Report, 1);
     assert!(matches!(
         &app.overlay,
-        Some(Overlay::RemoteGit(w)) if w.kind == RemoteKind::Report
+        Some(Overlay::RemoteGit(w)) if w.kind() == RemoteKind::Report
     ));
 }
 
@@ -20477,8 +20906,8 @@ fn report_git_save_opens_the_wizard_for_a_git_loaded_report() {
     match &app.overlay {
         Some(Overlay::GitSave(w)) => {
             assert!(matches!(
-                w.source,
-                crate::tui::git_save::GitSaveSource::Report { report_idx } if report_idx == idx
+                w.flow.source,
+                crate::save_flow::SaveSource::Report { report_idx } if report_idx == idx
             ));
             assert_eq!(w.collection_path.text(), "reports/nightly.trail");
         }
@@ -20580,8 +21009,11 @@ fn report_save_writes_back_and_clears_dirty() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// "Save" on a report with unsaved edits writes them straight back: overwriting
+/// the file the edits came from is what the user asked for, so there is nothing
+/// to confirm.
 #[test]
-fn report_save_on_a_dirty_report_confirms_overwrite() {
+fn report_save_on_a_dirty_report_writes_back_without_asking() {
     let dir = p8_temp_dir("saveconfirm");
     let path = dir.join("smoke.trail");
     std::fs::write(&path, "# collection: api.hurl\nREQUEST Oauth\n").unwrap();
@@ -20593,15 +21025,16 @@ fn report_save_on_a_dirty_report_confirms_overwrite() {
         .report
         .set_text("# collection: api.hurl\nREQUEST Changed\n");
 
-    // A dirty report asks before overwriting the original file.
     app.begin_save(FileAction::SaveReport);
-    assert!(matches!(
-        app.overlay,
-        Some(Overlay::Confirm {
-            action: ConfirmAction::Save(FileAction::SaveReport),
-            ..
-        })
-    ));
+    assert!(app.overlay.is_none(), "no confirmation stands in the way");
+    assert!(
+        !app.reports[idx].report.dirty,
+        "and it was actually written"
+    );
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("Changed"),
+        "with the edits in it"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -21645,8 +22078,15 @@ fn report_node_request_form_opens_with_fields() {
     assert!(names.contains(&"Response"), "shows an intrinsic: {names:?}");
     assert!(names.contains(&"Time"), "shows an intrinsic: {names:?}");
     assert!(
-        form.fields.iter().all(|r| r.included),
-        "no SHOW clause ⇒ every field ticked"
+        names.contains(&"TimeWait"),
+        "offers the opt-in timing intrinsics: {names:?}"
+    );
+    // No SHOW clause ⇒ the ticks mirror what the request actually emits, which
+    // is every field bar the opt-in timing intrinsics.
+    assert!(
+        form.fields.iter().all(|r| r.included
+            != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&r.name.as_str())),
+        "no SHOW clause ⇒ every field ticked except the opt-in ones"
     );
 }
 
@@ -21658,9 +22098,9 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, Asserts, Error, Response, status. The Response field is the 5th
-    // field ⇒ row index 4 + 4 = 8.
-    for _ in 0..8 {
+    // Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error, Response,
+    // status. The Response field is the 8th field ⇒ row index 7 + 4 = 11.
+    for _ in 0..11 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -21675,8 +22115,9 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     assert!(app.overlay.is_none(), "the form closes on apply");
 }
 
-/// Applying with every field ticked writes no `SHOW` clause (the "emit all"
-/// default), and clears any pre-existing one.
+/// Applying with the default set ticked — every field bar the opt-in timing
+/// intrinsics — writes no `SHOW` clause, and clears any pre-existing one.
+/// Ticking an opt-in one does write a clause, since it changes what is emitted.
 #[test]
 fn report_node_request_form_all_ticked_removes_show() {
     let (mut app, idx) = node_show_app(&["status"]);
@@ -21710,7 +22151,9 @@ fn report_node_request_form_all_ticked_removes_show() {
             let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
                 unreachable!()
             };
-            !form.fields[i].included
+            let row = &form.fields[i];
+            !row.included
+                && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&row.name.as_str())
         };
         if unticked {
             press(&mut app, KeyCode::Char(' '));
@@ -21723,7 +22166,35 @@ fn report_node_request_form_all_ticked_removes_show() {
     let text = &app.reports[idx].report.text;
     assert!(
         !text.contains("SHOW("),
-        "all ticked ⇒ the SHOW clause is removed: {text:?}"
+        "the default set ticked ⇒ the SHOW clause is removed: {text:?}"
+    );
+}
+
+/// Ticking an opt-in timing intrinsic writes a `SHOW` clause naming it, so the
+/// breakdown reaches the report only when it is asked for.
+#[test]
+fn report_node_request_form_ticking_a_timing_part_writes_show() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
+    // Time, TimeSetup, … ⇒ TimeSetup is the 3rd field, row index 2 + 4 = 6.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Down);
+    }
+    {
+        let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+            panic!("form open");
+        };
+        assert_eq!(form.fields[2].name, "TimeSetup");
+        assert!(!form.fields[2].included, "opt-in starts un-ticked");
+    }
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("SHOW(") && text.contains("TimeSetup"),
+        "the opt-in field is named in SHOW: {text:?}"
     );
 }
 
@@ -22321,6 +22792,53 @@ fn embedded_report_left_right_do_not_change_active_tab() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The report you can see runs from the tree as well as from the body: with a
+/// report in the right pane, the tree's selection *is* that report, so `r` and
+/// `d` act on it without a trip through Tab.
+#[test]
+fn the_run_keys_reach_an_embedded_report_from_the_tree() {
+    let (mut app, ci, root) = workspace_with_reports();
+    let alpha = ws_row_pos(
+        &app,
+        ci,
+        "alpha.trail",
+        |r| matches!(r, crate::collection::WsRow::Report { name, .. } if name == "alpha.trail"),
+    );
+    select_row(&mut app, ci, alpha);
+    assert_eq!(app.focus, super::app::Pane::List, "focus is on the tree");
+    let idx = app.active_report_index().expect("a report is shown");
+
+    let _ = idx;
+    // The fixture's report names a request its collection doesn't have, so the
+    // preview is refused -- which is exactly the proof wanted here: the key
+    // reached the *report*, rather than falling through to the tree and doing
+    // nothing at all.
+    press(&mut app, KeyCode::Char('d'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "`d` reached the report from the tree: {:?}",
+        app.status
+    );
+    app.status = None;
+    press(&mut app, KeyCode::Char('r'));
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "`r` reached the report from the tree: {:?}",
+        app.status
+    );
+    assert_eq!(app.focus, super::app::Pane::List, "focus did not move");
+    app.status = None;
+
+    // And the tree keeps every key it already owned: `c` still starts a
+    // workspace copy rather than opening the report's column picker.
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        !matches!(app.overlay, Some(super::app::Overlay::ReportColumns(_))),
+        "`c` still belongs to the tree"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Enter on a report row opens the report's node editor (the report equivalent
 /// of a request's edit wizard) and moves focus into the report body — the
 /// report is already shown by the highlight, so Enter is the "edit it" action.
@@ -22420,6 +22938,580 @@ fn file_save_items_hide_request_while_a_report_is_shown() {
         "Workspace is offered"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Report run settings (PARAM)
+// ---------------------------------------------------------------------------
+
+/// A report that asks for values, with one of each interaction: a plain text
+/// parameter, a `CHOICE` (picked from a list) and a `NUMBER`.
+const PARAM_TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+PARAM NUMBER RUNS = \"3\"
+REPORT REQUEST x
+";
+
+fn report_app() -> TuiApp {
+    let mut app = TuiApp::default();
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app
+}
+
+/// The same report with its questions already up — what every test about the
+/// rows themselves starts from, since the box is now opened rather than landed
+/// on.
+fn report_app_asking() -> TuiApp {
+    let mut app = report_app();
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open);
+    app
+}
+
+/// A report that asks for something asks on the way to a run, not on the way
+/// in: opening it shows the report, and `p` (or Run) is what puts the
+/// questions up.
+#[test]
+fn a_report_that_asks_for_values_is_asked_on_the_way_to_a_run() {
+    let mut app = report_app();
+    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
+    assert!(!app.reports[0].params_open, "nothing is asked unprompted");
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open, "`p` puts the questions up");
+    let rows = app.report_param_rows(0);
+    assert_eq!(rows.len(), 3);
+    // The LABEL is what the row asks; without one, the name is turned into
+    // words rather than shown as an identifier.
+    assert_eq!(rows[0].prompt, "Ticket number");
+    assert_eq!(rows[1].prompt, "Region");
+    // Declared defaults are what it would run with today.
+    assert_eq!(rows[1].value, "au");
+    assert_eq!(rows[2].value, "3");
+    // A parameter with no default and nothing supplied is called out.
+    assert!(rows[0].problem.is_some(), "an unanswered TICKET is flagged");
+}
+
+/// The values a run will use are named on screen under the same words as the
+/// box that changes them, and the line says which key opens it — the box is
+/// asked for once per session, so without this the answers are invisible.
+#[test]
+fn the_binding_panel_names_the_run_settings_and_how_to_open_them() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app();
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = squashed(&buffer_text(term.backend().buffer()));
+
+    assert!(
+        text.contains(&format!("{}:", s.param_summary_prefix)),
+        "the summary is labelled with the same words as the box it opens: {text}"
+    );
+    assert!(
+        text.contains("REGION=au"),
+        "an answered value is shown: {text}"
+    );
+    assert!(
+        text.contains(&format!("TICKET={}", s.param_value_unset)),
+        "and an unanswered one is called out: {text}"
+    );
+    assert!(
+        text.contains(s.param_summary_hint),
+        "the line says what to press: {text}"
+    );
+}
+
+/// A table produced with one set of answers, still on screen after the answers
+/// have moved on, is the one case where the summary line isn't describing what
+/// is being looked at — so it says so.
+#[test]
+fn the_summary_says_when_the_answers_moved_on_since_the_table() {
+    let mut app = report_app();
+    assert!(
+        !app.report_params_changed_since_result(0),
+        "a report that has never been run has not changed"
+    );
+
+    app.record_result_params(0);
+    app.reports[0].result = Some(crate::report::model::ReportResult::default());
+    assert!(
+        !app.report_params_changed_since_result(0),
+        "nothing has been touched since"
+    );
+
+    let id = app.reports[0].report.id;
+    app.set_report_param(id, "REGION", "eu".to_string());
+    assert!(
+        app.report_params_changed_since_result(0),
+        "changing an answer leaves the table on screen out of date"
+    );
+}
+
+/// A report that asks for nothing is unaffected: it opens on its source and `p`
+/// says so rather than showing an empty form.
+#[test]
+fn a_report_that_asks_for_nothing_still_opens_on_its_source() {
+    let mut app = TuiApp::default();
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Plain",
+        "# name: Plain\n# collection: c.hurl\nREPORT REQUEST x\n",
+    ));
+    assert_eq!(app.reports[0].view, crate::tui::reports::ReportView::Source);
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        !app.reports[0].params_open,
+        "there is nothing to ask, so `p` puts up no box"
+    );
+    assert!(app.status.is_some(), "and it says why");
+}
+
+/// Enter on a `CHOICE` row offers exactly its choices, and picking one sets the
+/// value for the run without touching the report's source.
+#[test]
+fn a_choice_parameter_is_picked_from_its_own_choices() {
+    let mut app = report_app_asking();
+    let before = app.reports[0].report.text.clone();
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("a CHOICE opens its list, got {:?}", app.overlay.is_some());
+    };
+    assert_eq!(menu.options, vec!["au".to_string(), "eu".to_string()]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.report_param_rows(0)[1].value, "eu");
+    assert_eq!(
+        app.reports[0].report.text, before,
+        "a parameter's value belongs to the run, not to the report"
+    );
+}
+
+/// Enter on a text parameter opens a prompt; committing it answers the row and
+/// the complaint about it goes away.
+#[test]
+fn typing_a_value_answers_the_row_it_was_opened_from() {
+    let mut app = report_app_asking();
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            &app.overlay,
+            Some(Overlay::Prompt {
+                kind: PromptKind::ReportParamValue { .. },
+                ..
+            })
+        ),
+        "a TEXT parameter opens a text prompt"
+    );
+    for c in "1234".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    let rows = app.report_param_rows(0);
+    assert_eq!(rows[0].value, "1234");
+    assert!(
+        rows[0].problem.is_none(),
+        "an answered row is no longer flagged"
+    );
+}
+
+/// A value the type wouldn't accept is refused where it was typed, rather than
+/// silently reaching the run.
+#[test]
+fn a_value_that_doesnt_fit_its_type_is_flagged_in_the_form() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "RUNS", "soon".into());
+    let rows = app.report_param_rows(0);
+    assert!(
+        rows[2]
+            .problem
+            .as_deref()
+            .is_some_and(|p| p.contains("soon")),
+        "a NUMBER given words says so: {:?}",
+        rows[2].problem
+    );
+}
+
+/// Running with a required value still unanswered doesn't run: it says what is
+/// missing and puts the user back on the question.
+#[test]
+fn a_run_missing_a_required_value_is_refused_not_guessed() {
+    let mut app = TuiApp::default();
+    // Bound and valid, so the only thing standing between `r` and a run is the
+    // unanswered question. The collection is opened first so the report's own
+    // strip slot lands past it.
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    // The first `r` only puts the questions up (see the gate below); the second
+    // is the one that tries to run.
+    press(&mut app, KeyCode::Char('r'));
+    press(&mut app, KeyCode::Char('r'));
+    assert!(app.reports[0].result.is_none(), "nothing ran");
+    assert!(
+        app.reports[0].params_open,
+        "the user is put back on the row that needs answering"
+    );
+    assert!(
+        matches!(&app.status, Some(crate::i18n::Status::ReportRunBlocked(m)) if m.contains("Ticket number")),
+        "and told which one: {:?}",
+        app.status
+    );
+}
+
+/// Clicking the results grid selects the report body, the way clicking any
+/// other panel selects it. Before this the click moved the grid's own cell
+/// cursor while focus stayed on the panel beside it, so the next keypress went
+/// somewhere the user wasn't looking.
+#[test]
+fn clicking_the_results_grid_selects_the_report_body() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (mut app, idx) = report_with_multi_row_result();
+    app.focus = Pane::List;
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let area = app.report_pane_areas[super::reports::ReportPane::Results.idx()];
+    assert!(area.width > 0 && area.height > 1, "the grid is on screen");
+    // area.y is the pinned header; the first data row is below it.
+    app.on_mouse(mouse_down(area.x + 1, area.y + 1));
+
+    assert_eq!(app.focus, Pane::Main, "the click selects the report body");
+    assert!(
+        app.reports[idx].cell_cursor.is_some(),
+        "and still does its own job"
+    );
+}
+
+/// The run settings answer the mouse too: a click selects a row, and a second
+/// click on the same row opens its editor — the one-click/two-click gesture the
+/// node outline already uses.
+#[test]
+fn clicking_a_run_settings_row_selects_then_opens_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app_asking();
+    app.focus = Pane::List;
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+
+    let rect = hit_rect(&app, MouseHitTarget::ReportParamRow(1));
+    app.on_mouse(mouse_down(rect.x + 1, rect.y));
+    assert_eq!(app.focus, Pane::Main);
+    assert_eq!(
+        app.reports[0].param_selected, 1,
+        "the click selects the row"
+    );
+    assert!(app.overlay.is_none(), "one click doesn't open anything");
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::ReportParamRow(1));
+    app.on_mouse(mouse_down(rect.x + 1, rect.y));
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportSettingMenu(_))),
+        "a second click on the selected row opens its picker"
+    );
+}
+
+/// The run settings are a toggle, not a one-way door. A report that asks for
+/// values opens on them, so its user pressed nothing to get there: `p` has to
+/// take them back to the report as readily as it brought them here.
+#[test]
+fn the_run_settings_key_also_closes_them() {
+    let mut app = report_app_asking();
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        !app.reports[0].params_open,
+        "`p` again puts the questions away"
+    );
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open, "and brings them back");
+}
+
+/// An `ENV` parameter is picked from the loaded environments, and typing
+/// narrows that list instead of dismissing it — the whole point of the picker
+/// when a dozen environments are loaded and the wanted one is known by name.
+#[test]
+fn typing_in_an_env_picker_filters_it_instead_of_closing_it() {
+    let mut app = TuiApp::default();
+    for name in ["api_dev", "api_staging", "api_prod", "local"] {
+        add_empty_global_env(&mut app, name);
+    }
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Face",
+        "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
+    ));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("an ENV parameter opens the list of loaded environments");
+    };
+    assert_eq!(menu.options.len(), 4);
+
+    // "stag" is nobody's first letter, so a prefix match wouldn't do.
+    for c in "stag".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("typing narrows the list rather than dismissing the overlay");
+    };
+    assert_eq!(
+        menu.visible(),
+        vec![&"api_staging".to_string()],
+        "only the matching environment is left"
+    );
+    // …and that is what the overlay actually draws, not just what it knows.
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(term.backend().buffer());
+        assert!(screen.contains("api_staging"), "{screen}");
+        assert!(
+            !screen.contains("api_dev") && !screen.contains("local"),
+            "the filtered-out rows are off screen: {screen}"
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert_eq!(app.report_param_rows(0)[0].value, "api_staging");
+}
+
+/// Backspacing over the filter brings the hidden rows back — the list is
+/// narrowed for display, never thrown away.
+#[test]
+fn backspacing_the_filter_brings_the_other_rows_back() {
+    let mut app = TuiApp::default();
+    for name in ["api_dev", "api_staging"] {
+        add_empty_global_env(&mut app, name);
+    }
+    app.open_loaded_report(crate::report::Report::from_text(
+        "Face",
+        "# name: Face\n# collection: c.hurl\nPARAM ENV TARGET_ENV\nREPORT REQUEST x\n",
+    ));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('z'));
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("still open on a filter that matches nothing");
+    };
+    assert!(menu.visible().is_empty());
+    // Enter on nothing picks nothing rather than closing on a silent choice.
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_some(), "there is nothing to choose yet");
+    press(&mut app, KeyCode::Backspace);
+    let Some(Overlay::ReportSettingMenu(menu)) = &app.overlay else {
+        panic!("backspace over a non-empty filter stays in the menu");
+    };
+    assert_eq!(menu.visible().len(), 2);
+}
+
+/// Run on a report that asks for values stops at the questions first, and only
+/// the Run from inside the box starts it — so the values are always seen before
+/// a long run goes out under them. Having been answered, they aren't asked
+/// again: the second run of the same report goes straight out.
+#[test]
+fn run_stops_at_the_questions_before_it_starts() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+
+    press(&mut app, KeyCode::Char('r'));
+    assert!(
+        app.reports[0].params_open,
+        "the first Run puts the questions up"
+    );
+    assert!(
+        matches!(
+            &app.status,
+            Some(crate::i18n::Status::ReportRunSettingsFirst)
+        ),
+        "and says so rather than looking like a failed run: {:?}",
+        app.status
+    );
+    assert!(app.reports[0].result.is_none(), "nothing has run yet");
+
+    // The second Run — from inside the box — is the one that goes. (The fake
+    // runner is started directly, so the answer the `r` key would record is
+    // recorded here.)
+    app.answer_report_params(0);
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+    for _ in 0..200 {
+        app.poll_report_run_updates();
+        if app.running_reports.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        app.reports[0].result.is_some(),
+        "running from the settings starts the run"
+    );
+    assert!(
+        !app.reports[0].params_open,
+        "and the questions are put away by the answer"
+    );
+
+    // Asked once per editing session, not once per run: having answered, Run
+    // runs. `p` is the way back to the answers.
+    assert!(
+        !app.report_run_needs_settings(),
+        "the next Run doesn't ask the same questions again"
+    );
+}
+
+/// The answers a report was run with are offered again the next time it is
+/// opened: someone running the same report every week shouldn't retype them,
+/// and the values survive a restart because they live in the session state.
+#[test]
+fn a_report_is_offered_the_answers_it_was_last_run_with() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "c.hurl".to_string(),
+        vec![HurlEntry {
+            title: "x".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/x".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    app.revalidate_report(0);
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+    app.set_report_param(app.reports[0].report.id, "REGION", "eu".into());
+    app.answer_report_params(0);
+    let body = "{}".to_string();
+    app.start_report_run_faked(move |_| FakeReportRunner { body });
+
+    // A fresh app, same report: the run settings open on last week's answers.
+    let mut next = TuiApp::default();
+    next.session.apply_persisted(app.session.to_persisted());
+    next.open_loaded_report(crate::report::Report::from_text("Face", PARAM_TRAIL));
+    next.revalidate_report(0);
+    let rows = next.report_param_rows(0);
+    assert_eq!(rows[0].value, "1234");
+    assert_eq!(rows[1].value, "eu");
+    // An answered report has nothing left to complain about.
+    assert!(rows.iter().all(|r| r.problem.is_none()));
+}
+
+/// Esc leaves the run settings for the editor the user was last in, so the view
+/// isn't a trap for someone who does want to read the flow.
+#[test]
+fn esc_leaves_the_run_settings_for_the_source() {
+    let mut app = report_app_asking();
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.reports[0].params_open);
+    assert_eq!(
+        app.reports[0].view,
+        crate::tui::reports::ReportView::Source,
+        "the report was never left, so Esc has nothing to back out of"
+    );
+    press(&mut app, KeyCode::Char('p'));
+    assert!(app.reports[0].params_open, "`p` brings them back");
+}
+
+/// A preview asks the same questions a run does — a preview of a run you don't
+/// mean is worthless — and the answer counts for both, so previewing and then
+/// running doesn't ask twice.
+#[test]
+fn a_preview_asks_the_same_questions_and_the_answer_counts_for_the_run() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+
+    press(&mut app, KeyCode::Char('d'));
+    assert!(
+        app.reports[0].params_open,
+        "Dry run puts the same questions up"
+    );
+    assert!(
+        app.reports[0].dry_run.is_none(),
+        "and nothing has been previewed yet"
+    );
+
+    // `d` from inside the box is the preview; it counts as the answer.
+    press(&mut app, KeyCode::Char('d'));
+    assert!(!app.reports[0].params_open, "the questions are put away");
+    assert!(
+        !app.report_run_needs_settings(),
+        "and Run afterwards doesn't ask them again"
+    );
+}
+
+/// Changing *what the report asks for* asks again; editing anything else
+/// doesn't — the answer is filed against the declarations, not the text.
+#[test]
+fn changing_what_the_report_asks_for_asks_again() {
+    let mut app = report_app();
+    app.set_report_param(app.reports[0].report.id, "TICKET", "1234".into());
+    app.answer_report_params(0);
+    assert!(!app.report_run_needs_settings());
+
+    // An unrelated edit: same questions, same answer.
+    app.reports[0].report.text = app.reports[0]
+        .report
+        .text
+        .replace("REPORT REQUEST x", "REPORT REQUEST y");
+    app.revalidate_report(0);
+    assert!(
+        !app.report_run_needs_settings(),
+        "editing the flow doesn't re-ask what it didn't change"
+    );
+
+    // A new declaration: there is something new to answer.
+    app.reports[0].report.text = app.reports[0]
+        .report
+        .text
+        .replace("REPORT REQUEST y", "PARAM TEXT NOTE\nREPORT REQUEST y");
+    app.revalidate_report(0);
+    assert!(
+        app.report_run_needs_settings(),
+        "a report that asks for something new asks for it"
+    );
+}
+
+/// The questions are drawn *over* the report, not instead of it: the point of
+/// asking on the way to a run is that what you're about to run is still there.
+#[test]
+fn the_questions_are_drawn_over_the_report_not_instead_of_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app_asking();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let screen = buffer_text(term.backend().buffer());
+    assert!(screen.contains("Run settings"), "the box is up: {screen}");
+    assert!(
+        screen.contains("# name: Face"),
+        "and the report it is asking about is still on screen: {screen}"
+    );
+    assert!(
+        squashed(&screen).contains("REGION=au"),
+        "with the chosen values named under it: {screen}"
+    );
 }
 
 /// A standalone report (File → Load Report, no workspace) still opens as its own
@@ -22650,10 +23742,195 @@ fn report_with_multi_row_result() -> (TuiApp, usize) {
         column_order: cols.iter().map(|c| c.to_string()).collect(),
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
+}
+
+/// `follow_col_offset` is the whole of the horizontal-scroll policy, so pin
+/// down its edges: it never leaves the cursor off the left, scrolls right by
+/// the fewest columns that fit, and gives up gracefully on a column wider than
+/// the pane rather than pinning the view somewhere useless.
+#[test]
+fn follow_col_offset_keeps_the_cursor_column_in_view() {
+    use super::reports::follow_col_offset;
+
+    let widths = [10usize, 10, 10, 10];
+    // Column 0 with plenty of room: no movement.
+    assert_eq!(follow_col_offset(&widths, 0, 60, 0), 0);
+    // Two columns (10 + 2 + 10 = 22) fit in 24 but three (34) don't.
+    assert_eq!(follow_col_offset(&widths, 1, 24, 0), 0);
+    assert_eq!(follow_col_offset(&widths, 2, 24, 0), 1);
+    // Scrolling back left always wins over the remembered offset.
+    assert_eq!(follow_col_offset(&widths, 0, 24, 2), 0);
+    // A column wider than the pane becomes the leftmost one.
+    assert_eq!(follow_col_offset(&widths, 3, 4, 0), 3);
+    // Degenerate inputs don't panic.
+    assert_eq!(follow_col_offset(&[], 3, 40, 2), 0);
+    // A cursor past the end clamps to the last column (3): columns 1..=3 fit
+    // in 40 display columns, but all four (46) would not.
+    assert_eq!(follow_col_offset(&widths, 99, 40, 0), 1);
+}
+
+/// A click must land on the column the user actually sees, which means the
+/// hit-test has to be told how far the grid has been scrolled sideways.
+#[test]
+fn grid_col_at_x_accounts_for_the_horizontal_offset() {
+    use super::reports::grid_col_at_x;
+
+    let widths = [10usize, 10, 10];
+    // Unscrolled: x 0..=11 is column 0, 12..=23 is column 1.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 0), 0);
+    assert_eq!(grid_col_at_x(&widths, 12, false, 0), 1);
+    // Scrolled by one: the same x now lands one column further right.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 1), 1);
+    assert_eq!(grid_col_at_x(&widths, 12, false, 1), 2);
+    // The status-icon prefix is still stripped first.
+    assert_eq!(grid_col_at_x(&widths, 2, true, 1), 1);
+    // An out-of-range offset clamps rather than panicking.
+    assert_eq!(grid_col_at_x(&widths, 0, false, 9), 2);
+}
+
+/// The dry-run preview used to run every one of its lines through the wrapper,
+/// so a wide grid folded over several lines and looked nothing like the real
+/// results view. Only the prose around the grid should wrap; the grid itself
+/// must clip and scroll sideways, as the real one does.
+#[test]
+fn the_dry_run_preview_grid_clips_and_scrolls_instead_of_wrapping() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".to_string(),
+        vec![HurlEntry {
+            title: "Ping".to_string(),
+            method: "GET".to_string(),
+            url: "http://example/ping".to_string(),
+            ..Default::default()
+        }],
+    ));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\nFOR Iteration IN [\"alpha\", \"beta\"]\n    REPORT REQUEST Ping\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('d'));
+    assert!(app.reports[idx].dry_run.is_some(), "preview opened");
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut draw = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    let before = draw(&mut app);
+    assert!(
+        before.contains("Ping.HttpStatus"),
+        "the grid's first column shows: {before}"
+    );
+    // The wrap marker is what the old code left all over the grid.
+    let marker = super::draw::wrap_marker(&app.theme()).glyph.to_string();
+    let grid_row = before
+        .lines()
+        .find(|l| l.contains("Ping.HttpStatus"))
+        .unwrap()
+        .to_string();
+    assert!(
+        !grid_row.contains(&marker),
+        "the grid header must not be wrapped: {grid_row}"
+    );
+
+    // …and the columns past the right edge are reachable with Right.
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Right);
+    }
+    let after = draw(&mut app);
+    assert!(
+        app.reports[idx].results_col_offset > 0,
+        "Right must scroll the preview grid sideways"
+    );
+    assert!(
+        !after.contains("Ping.HttpStatus"),
+        "the first column has scrolled off: {after}"
+    );
+
+    // Left brings it back, and never scrolls past the start.
+    for _ in 0..20 {
+        press(&mut app, KeyCode::Left);
+    }
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+}
+
+/// The results grid clips rather than wraps, so columns past the right edge
+/// were simply unreachable. Walking the cell cursor right must carry the
+/// viewport with it and bring the last column on screen.
+#[test]
+fn walking_the_cell_cursor_right_scrolls_the_grid_sideways() {
+    use crate::report::model::{ReportResult, ReportRow};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    // Six columns of wide values: far more than a 60-column terminal shows.
+    let cols: Vec<String> = (0..6).map(|c| format!("Column{c}")).collect();
+    let mut row = ReportRow::default();
+    for (c, name) in cols.iter().enumerate() {
+        row.cells.insert(name.clone(), format!("value-{c}-wide"));
+    }
+    app.reports[idx].result = Some(ReportResult {
+        rows: vec![row],
+        column_order: cols.clone(),
+        no_match_marker: String::new(),
+        errors: Vec::new(),
+        ..Default::default()
+    });
+    app.reports[idx].view = super::reports::ReportView::Results;
+
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    let mut draw = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    let before = draw(&mut app);
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    assert!(
+        before.contains("Column0"),
+        "the first column starts on screen"
+    );
+    assert!(
+        !before.contains("Column5"),
+        "the last column starts off screen: {before}"
+    );
+
+    // Walk the cursor to the last column, redrawing as the user would see it.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Right);
+        draw(&mut app);
+    }
+    assert_eq!(app.reports[idx].cell_cursor, Some((0, 5)));
+    let after = draw(&mut app);
+    assert!(
+        app.reports[idx].results_col_offset > 0,
+        "the viewport must have followed the cursor"
+    );
+    assert!(
+        after.contains("Column5"),
+        "the last column must now be visible: {after}"
+    );
+
+    // …and walking back brings the first column back into view.
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Left);
+        draw(&mut app);
+    }
+    let back = draw(&mut app);
+    assert_eq!(app.reports[idx].results_col_offset, 0);
+    assert!(back.contains("Column0"), "scrolled back: {back}");
 }
 
 #[test]
@@ -22769,7 +24046,7 @@ fn report_with_n_rows(n: usize) -> (TuiApp, usize) {
         column_order: vec!["Col1".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     (app, idx)
@@ -22946,7 +24223,7 @@ fn cell_popup_pretty_prints_a_json_cell() {
         column_order: vec!["Body".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
     press(&mut app, KeyCode::Enter); // initialise cursor at (0,0)
@@ -23214,6 +24491,7 @@ fn report_statistics_render_a_summary_footer_row() {
         no_match_marker: String::new(),
         errors: Vec::new(),
         column_stats,
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
@@ -23285,7 +24563,7 @@ fn mouse_click_with_scroll_maps_to_correct_data_row() {
         column_order: vec!["A".to_string()],
         no_match_marker: String::new(),
         errors: Vec::new(),
-        column_stats: Default::default(),
+        ..Default::default()
     });
     app.reports[idx].view = super::reports::ReportView::Results;
 
@@ -23641,7 +24919,8 @@ fn shift_m_moves_the_highlighted_workspace_file_into_the_folder_confirmed_with_s
     cursor_on_ws_row(&mut app, &src);
     // A tab pointing at the file must follow it, or saving would write the
     // file back to where it no longer is.
-    app.collections[app.active_tab].path = Some(src.clone());
+    let tab = app.active_tab;
+    app.collections[tab].path = Some(src.clone());
 
     press(&mut app, KeyCode::Char('M'));
     let Some(Overlay::Browser(action, ex)) = app.overlay.as_ref() else {
@@ -23754,6 +25033,16 @@ fn quitting_warns_about_unsaved_request_edits_even_with_confirmation_off() {
     app.collections[ci].entries.push(e);
     assert_eq!(
         app.unsaved_request_edits(),
+        0,
+        "a plain tab's edits are kept in the session state, so a quit does not \
+         lose them and must not claim otherwise"
+    );
+
+    // A Workspace tab is the case that does lose them: it is bound to a folder,
+    // so its entries are re-read from disk rather than restored.
+    app.collections[ci].workspace_root = Some(std::path::PathBuf::from("/tmp/pb-test-ws"));
+    assert_eq!(
+        app.unsaved_request_edits(),
         1,
         "the edited request is what's at stake"
     );
@@ -23769,4 +25058,3415 @@ fn quitting_warns_about_unsaved_request_edits_even_with_confirmation_off() {
         ),
         "and the answer is asked for in the exit confirmation"
     );
+}
+
+// ── Environments panel: filter box and workspace environments ──────────────
+
+/// A workspace holding environment files, plus a TuiApp with it as the active
+/// tab and the Environments panel focused.
+fn env_panel_workspace(tag: &str, files: &[(&str, &str)]) -> (TuiApp, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("paperboy_envpanel_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, content) in files {
+        std::fs::write(dir.join(name), content).unwrap();
+    }
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    app.focus = Pane::GlobalEnv;
+    (app, dir)
+}
+
+/// With a workspace open the panel lists its environment files — including ones
+/// never opened — so a folder of them is browsable without hunting through the
+/// tree. Postman `.json` environments count, not just `.vars`.
+#[test]
+fn the_environments_panel_lists_the_open_workspaces_environment_files() {
+    let postman =
+        r#"{"environment":{"name":"Prod AU","values":[{"key":"url","value":"https://x"}]}}"#;
+    let (mut app, dir) = env_panel_workspace(
+        "lists",
+        &[
+            ("dev.vars", "TOKEN=t\n"),
+            ("Prod AU.json", postman),
+            // A Postman *collection* is not an environment and must not show.
+            ("orders.json", r#"{"info":{"name":"o"},"item":[]}"#),
+        ],
+    );
+    add_empty_global_env(&mut app, "hand-made");
+
+    let names: Vec<String> = app.env_rows().iter().map(|r| r.name.clone()).collect();
+    assert!(
+        names.contains(&"dev".to_string()) && names.contains(&"Prod AU".to_string()),
+        "both workspace environment files are listed, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"orders".to_string()),
+        "a Postman collection is not an environment"
+    );
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("hand-made"),
+        "environments from elsewhere follow the workspace's own"
+    );
+    assert!(
+        app.env_rows()
+            .iter()
+            .filter(|r| r.workspace)
+            .all(|r| r.env_id().is_none()),
+        "none of them are loaded yet"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enter on an unopened workspace row loads that file and opens its variables,
+/// so the panel is a way of *opening* a workspace environment, not just a list.
+#[test]
+fn enter_on_an_unopened_workspace_environment_row_loads_it() {
+    let (mut app, dir) = env_panel_workspace("enter", &[("dev.vars", "TOKEN=t\n")]);
+    app.global_env_idx = 0;
+    assert!(app.global_envs.is_empty());
+
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.global_envs.len(), 1, "the file was loaded");
+    assert_eq!(app.global_envs[0].name, "dev");
+    assert_eq!(
+        app.global_envs[0].path.as_deref(),
+        Some(dir.join("dev.vars").as_path())
+    );
+    let row = app.selected_env_row().unwrap();
+    assert!(
+        row.workspace && row.env_id() == Some(app.global_envs[0].id),
+        "the selection stayed on the row, which is now the loaded environment"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvPopup(_))),
+        "and its variables opened, as Enter on a loaded row does"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The panel lists an opened workspace environment once — as the environment it
+/// became — rather than once as a file and again as a global environment.
+#[test]
+fn an_opened_workspace_environment_is_not_listed_twice() {
+    let (mut app, dir) = env_panel_workspace("once", &[("dev.vars", "TOKEN=t\n")]);
+    press(&mut app, KeyCode::Enter);
+    app.overlay = None;
+
+    let rows = app.env_rows();
+    assert_eq!(rows.len(), 1, "one row, not two: {rows:?}");
+    assert!(rows[0].workspace && rows[0].env_id().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/` starts the filter, typing narrows the list, and Enter hands the keyboard
+/// back to the list with the filter still applied.
+#[test]
+fn slash_filters_the_environments_panel_by_name() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Westpac Prod");
+    add_empty_global_env(&mut app, "Westpac NZ Staging");
+    add_empty_global_env(&mut app, "Bendigo Prod");
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert_eq!(
+        app.focus,
+        Pane::GlobalEnv,
+        "`/` finds an environment from wherever you are"
+    );
+    assert!(app.env_filter_typing);
+
+    for c in "staging".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.env_query, "staging");
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["Westpac NZ Staging"],
+        "case-insensitive substring of the name"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.env_filter_typing, "Enter leaves the filter box");
+    assert_eq!(app.env_query, "staging", "but keeps the filter applied");
+}
+
+/// While filtering, the panel's own single-key actions must not fire: typing
+/// "a" into the box cannot be allowed to activate an environment.
+#[test]
+fn typing_a_filter_does_not_trigger_the_panels_letter_actions() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Aegon Staging");
+    let id = only_env_id(&app);
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "aegon".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    assert_eq!(app.env_query, "aegon");
+    assert_eq!(
+        app.active_env_id, None,
+        "`a` typed a letter, it didn't activate"
+    );
+    assert_eq!(app.global_envs.len(), 1, "`x` would have deleted, `q` quit");
+    assert!(!app.quit);
+
+    // Backspace trims, Esc clears the filter and leaves the box.
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.env_query, "aego");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.env_query.is_empty() && !app.env_filter_typing);
+
+    // With the filter gone the panel's keys work again.
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(app.active_env_id, Some(id));
+}
+
+/// The actions act on the row under the cursor, which is a row of the *filtered*
+/// list — the whole point being that you filter down to one and act on it.
+#[test]
+fn panel_actions_target_the_selected_row_of_the_filtered_list() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Alpha");
+    add_empty_global_env(&mut app, "Target");
+    add_empty_global_env(&mut app, "Zulu");
+    let target = app.global_envs[1].id;
+    app.focus = Pane::GlobalEnv;
+    app.confirm_on_delete_env = false;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "target".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.global_env_idx, 0, "the one match is the only row");
+
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(
+        app.active_env_id,
+        Some(target),
+        "activation followed the filtered selection, not list position 0"
+    );
+
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(
+        app.global_envs
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["Alpha", "Zulu"],
+        "and so did the delete"
+    );
+}
+
+/// A filter that matches nothing must leave the selection somewhere valid, and
+/// clearing it must bring the list back.
+#[test]
+fn a_filter_matching_nothing_empties_the_panel_without_stranding_the_selection() {
+    let mut app = TuiApp::default();
+    add_empty_global_env(&mut app, "Alpha");
+    add_empty_global_env(&mut app, "Beta");
+    app.focus = Pane::GlobalEnv;
+    app.global_env_idx = 1;
+
+    press(&mut app, KeyCode::Char('/'));
+    for c in "zzz".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(app.env_rows().is_empty());
+    assert_eq!(
+        app.global_env_idx, 0,
+        "clamped rather than left past the end"
+    );
+    assert_eq!(app.selected_env_row(), None);
+    // Acting on nothing is a no-op, not a panic. Enter also leaves the filter
+    // box, so the Esc below exercises the "clear an applied filter" path rather
+    // than the filter box's own Esc.
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.env_filter_typing);
+
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        app.env_rows().len(),
+        2,
+        "Esc on the panel clears an applied filter"
+    );
+}
+
+/// `o` narrows the Environments panel by source, and reuses the same clamping
+/// path as the name filter so the cursor never points past the visible rows.
+#[test]
+fn o_cycles_the_environment_source_filter_and_keeps_selection_valid() {
+    let (mut app, dir) = env_panel_workspace(
+        "source",
+        &[("dev.vars", "TOKEN=t\n"), ("prod.vars", "TOKEN=t\n")],
+    );
+    add_empty_global_env(&mut app, "hand-made");
+    app.global_env_idx = 2;
+
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Both);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["dev", "prod", "hand-made"]
+    );
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Global);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["hand-made"]
+    );
+    assert_eq!(app.global_env_idx, 0, "selection was clamped");
+
+    press(&mut app, KeyCode::Char('o'));
+    assert_eq!(app.env_source, crate::env_panel::EnvSource::Workspace);
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["dev", "prod"]
+    );
+
+    app.env_query = "prod".into();
+    assert_eq!(
+        app.env_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["prod"],
+        "source and name filters compose in the TUI too"
+    );
+
+    let snapshot = app.to_persisted();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(snapshot);
+    assert_eq!(restored.env_source, crate::env_panel::EnvSource::Workspace);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workspace with one `.vars` file, its tree row selected.
+fn workspace_on_env_row(tag: &str) -> (TuiApp, usize, usize, std::path::PathBuf) {
+    use crate::collection::WsRow;
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_actenv_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("api.hurl"), "GET https://example.com\n").unwrap();
+    std::fs::write(dir.join("staging.vars"), "BASE=https://staging\n").unwrap();
+    let (mut app, ci) = workspace_app(&dir);
+    app.collections[ci].workspace_auto_prompt_dismissed = true;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let env_idx = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Environment { .. }))
+        .expect("an environment row exists");
+    app.collections[ci].list_cursor = env_idx;
+    (app, ci, env_idx, dir)
+}
+
+/// `a` on a workspace environment file loads it *and* makes it active, so
+/// switching environment from the tree is one keystroke rather than "open it,
+/// then go find it in the Environments panel".
+#[test]
+fn a_on_a_workspace_environment_file_loads_and_activates_it() {
+    let (mut app, _ci, _row, dir) = workspace_on_env_row("key");
+    assert!(app.global_envs.is_empty());
+
+    press(&mut app, KeyCode::Char('a'));
+
+    assert_eq!(app.global_envs.len(), 1);
+    let id = app.global_envs[0].id;
+    assert_eq!(app.active_env_id, Some(id), "and it is now the active one");
+    assert_eq!(
+        app.selected_env_id(),
+        Some(id),
+        "the Environments panel's cursor followed it, so it can be seen"
+    );
+    assert!(
+        app.overlay.is_none(),
+        "activating shouldn't take over the screen the way opening it does"
+    );
+
+    // Pressing it again must not toggle activation back off: the gesture says
+    // "make this active", not "toggle".
+    press(&mut app, KeyCode::Char('a'));
+    assert_eq!(
+        app.global_envs.len(),
+        1,
+        "nor load a second copy of the file"
+    );
+    assert_eq!(app.active_env_id, Some(id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right-clicking the same row does the same thing — the gesture a GUI user
+/// reaches for, which a terminal has no room to answer with a context menu.
+#[test]
+fn right_clicking_a_workspace_environment_file_activates_it() {
+    let (mut app, ci, env_idx, dir) = workspace_on_env_row("mouse");
+    // Somewhere else, so the click has to move the selection itself.
+    app.collections[ci].list_cursor = 0;
+
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(env_idx));
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.collections[ci].list_cursor, env_idx);
+    assert_eq!(app.global_envs.len(), 1);
+    assert_eq!(app.active_env_id, Some(app.global_envs[0].id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right-clicking anything that isn't an environment file must not activate
+/// anything — the row kinds share a tree, so the guard has to be real.
+#[test]
+fn right_clicking_a_non_environment_row_does_nothing() {
+    let (mut app, ci, _env_idx, dir) = workspace_on_env_row("other");
+    let coll_idx = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Collection { .. }))
+        .expect("a collection row exists");
+
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(coll_idx));
+
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(app.global_envs.is_empty());
+    assert_eq!(app.active_env_id, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Right-clicking an *edited* request in the workspace tree offers to put it
+/// back the way it is on disk — the GUI hangs this on a context menu, which a
+/// terminal has no room for, so the gesture raises the same confirmation
+/// `Ctrl+R` does.
+#[test]
+fn right_clicking_an_edited_request_offers_to_revert_it() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_req");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let saved_url = app.collections[ci].entries[0].url.clone();
+    app.collections[ci].entries[0].url = "https://edited.example".to_string();
+    app.collections[ci].entries[0].modified = true;
+    let row = ws_row_pos(&app, ci, "the request", |r| {
+        matches!(r, crate::collection::WsRow::Request { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        matches!(
+            app.overlay,
+            Some(super::app::Overlay::Confirm {
+                action: super::app::ConfirmAction::RevertRequest(_, 0),
+                ..
+            })
+        ),
+        "the click asks before discarding anything"
+    );
+    // Confirm (the default is No, so move to Yes first).
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.collections[ci].entries[0].url, saved_url,
+        "the request is back to what the file holds"
+    );
+    assert!(!app.collections[ci].entries[0].modified);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same gesture on an edited collection *file* row drops every edit in
+/// that file, which is the only thing on offer for a file that isn't the loaded
+/// one (its edits are parked as a whole, with no per-request on-disk entry to
+/// put back).
+#[test]
+fn right_clicking_an_edited_collection_file_offers_to_revert_the_file() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_file");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let saved_url = app.collections[ci].entries[0].url.clone();
+    app.collections[ci].entries[0].url = "https://edited.example".to_string();
+    app.collections[ci].entries[0].modified = true;
+    let row = ws_row_pos(&app, ci, "alpha.hurl", |r| {
+        matches!(r, crate::collection::WsRow::Collection { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        matches!(
+            app.overlay,
+            Some(super::app::Overlay::Confirm {
+                action: super::app::ConfirmAction::RevertWorkspaceFile(..),
+                ..
+            })
+        ),
+        "the file row asks too"
+    );
+    press(&mut app, KeyCode::Left);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.collections[ci].entries[0].url, saved_url);
+    assert!(
+        !app.collections[ci].has_unsaved_edits(),
+        "the whole file is clean again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row with nothing to revert must not raise the dialog: right-click still
+/// belongs to whatever else wants it (an environment row activates, say).
+#[test]
+fn right_clicking_an_unedited_row_offers_no_revert() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = workspace_temp_dir("right_click_revert_clean");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+    app.active_tab = ci;
+    let row = ws_row_pos(&app, ci, "the request", |r| {
+        matches!(r, crate::collection::WsRow::Request { .. })
+    });
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let rect = hit_rect(&app, MouseHitTarget::SelectListRow(row));
+    app.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    assert!(
+        app.overlay.is_none(),
+        "an unedited request has nothing to revert"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── One state, two front-ends ───────────────────────────────────────────────
+
+/// The terminal UI used to keep its own copy of every shared setting, and its
+/// own hand-written `to_persisted`. The two could — and did — drift: the
+/// Graphite default had to be written into `Session::default` *and*
+/// `TuiApp::default`, and a third place still disagreed.
+///
+/// Comparing the two snapshots as a whole rather than field by field is
+/// deliberate: a setting added to only one of them fails this test without
+/// anyone having to remember to extend it.
+#[test]
+fn both_front_ends_persist_exactly_the_same_shared_state() {
+    let from_tui = TuiApp::default().to_persisted();
+    let from_session = crate::session::Session::default().to_persisted();
+
+    let strip = |state: &crate::persistence::PersistedState| {
+        let mut v = serde_json::to_value(state).unwrap();
+        // Reports are the one field the terminal UI legitimately overrides: it
+        // holds richer `ReportTab`s and chooses which are worth writing out.
+        v.as_object_mut().unwrap().remove("reports");
+        v
+    };
+    assert_eq!(strip(&from_tui), strip(&from_session));
+}
+
+/// A shared preference changed through the terminal UI has to survive the trip
+/// out to `state.json` and back, *and* land in the same session field the GUI
+/// reads — which is the whole point of there being one copy.
+#[test]
+fn a_shared_preference_set_in_the_terminal_ui_round_trips_through_the_session() {
+    let app = app_with(|app| {
+        app.list_width = 51;
+        app.confirm_on_delete_env = false;
+        app.env_source = crate::env_panel::EnvSource::Workspace;
+        app.recent_git_urls = vec!["https://example.invalid/repo.git".to_string()];
+    });
+
+    let mut session = crate::session::Session::default();
+    session.apply_persisted(app.to_persisted());
+
+    assert_eq!(session.list_width, 51);
+    assert!(!session.confirm_on_delete_env);
+    assert_eq!(session.env_source, crate::env_panel::EnvSource::Workspace);
+    assert_eq!(session.recent_git_urls, app.recent_git_urls);
+}
+
+/// The terminal UI has no use for pixel geometry, but it shares one state file
+/// with the GUI, so saving from the terminal must not wipe the window layout.
+/// This used to be a `gui_layout` field on `TuiApp` that nothing ever read;
+/// now it is simply the session's own field, carried for free.
+#[test]
+fn saving_from_the_terminal_ui_preserves_the_guis_window_layout() {
+    let saved = crate::persistence::PersistedState {
+        gui: crate::persistence::GuiLayout {
+            window: Some((1234.0, 900.0)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut app = TuiApp::default();
+    app.apply_persisted(saved);
+
+    assert_eq!(app.to_persisted().gui.window, Some((1234.0, 900.0)));
+}
+
+/// `TuiApp` derefs to its `Session`, which makes `Session::save` reachable as
+/// `self.save()` — and that would persist the session's plain `PersistedReport`s
+/// instead of the terminal UI's `ReportTab`s, quietly losing unsaved report
+/// edits. Nothing may take that route.
+#[test]
+fn the_terminal_ui_never_persists_through_the_sessions_own_save() {
+    for file in ["app.rs", "input.rs", "draw.rs", "remote.rs", "reports.rs"] {
+        let src = std::fs::read_to_string(format!("src/tui/{file}")).unwrap();
+        // Comments are skipped: this rule is itself explained in prose next to
+        // `save_state`, and the explanation names the call it forbids.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            !code.contains("self.save()"),
+            "src/tui/{file} calls Session::save through Deref; use save_state() instead"
+        );
+    }
+}
+
+// ── The idle event-loop tick must not disturb what's on screen ──────────
+
+/// Everything `tui::run` calls once per pass of its event loop, before it
+/// looks at any input. Kept in one place so the test below stays in step with
+/// the loop it stands in for.
+fn idle_tick(app: &mut TuiApp) {
+    app.poll_capture_updates();
+    app.poll_git_updates();
+    app.poll_workspace_redownload_updates();
+    app.poll_git_save_updates();
+    app.poll_batch_run_updates();
+    app.poll_report_run_updates();
+}
+
+/// A poll for one overlay's background work must leave every *other* overlay
+/// alone. This is a regression test for a real one: `poll_git_updates` called
+/// `self.overlay.take()` in the `let ... else` scrutinee, which takes the
+/// overlay whether or not the pattern matches. Any menu therefore vanished on
+/// the very next tick of the event loop — within ~120ms of opening — which
+/// made the File and Settings menus unusable and left no way to quit.
+#[test]
+fn an_idle_tick_does_not_close_an_open_menu() {
+    // Every overlay a user can open with no git operation in flight; each must
+    // survive an idle tick untouched.
+    let openers: Vec<(&str, fn(&mut TuiApp))> = vec![
+        ("File", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileMenu(0))
+        }),
+        ("File > Load", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileLoadMenu(0))
+        }),
+        ("File > Save", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::FileSaveMenu(0))
+        }),
+        ("Settings", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Options(0))
+        }),
+        ("Preferences", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Preferences(0))
+        }),
+        ("Help", |a: &mut TuiApp| a.overlay = Some(Overlay::Help(0))),
+        ("Quit confirm", |a: &mut TuiApp| {
+            a.overlay = Some(Overlay::Confirm {
+                action: ConfirmAction::Exit,
+                sel: 0,
+            })
+        }),
+    ];
+    for (name, open) in openers {
+        let mut app = TuiApp::default();
+        open(&mut app);
+        idle_tick(&mut app);
+        assert!(
+            app.overlay.is_some(),
+            "the {name} menu was closed by an idle event-loop tick"
+        );
+    }
+}
+
+/// The same guarantee driven the way a user gets there: press the key that
+/// opens the menu, then let the loop idle.
+#[test]
+fn the_file_menu_survives_the_event_loop_ticking_under_it() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(_))));
+    for _ in 0..5 {
+        idle_tick(&mut app);
+    }
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(_))),
+        "the File menu must stay open until the user closes it"
+    );
+}
+
+/// Quitting must keep working: the confirm dialog has to still be there for
+/// the keystroke that answers it.
+#[test]
+fn quitting_still_works_when_the_loop_ticks_between_keystrokes() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::Confirm {
+        action: ConfirmAction::Exit,
+        sel: 0,
+    });
+    idle_tick(&mut app);
+    press(&mut app, KeyCode::Enter);
+    assert!(app.quit, "answering the quit confirmation must quit");
+}
+
+/// The guarantee the whole family of overlay polls rests on: declining to
+/// match must leave the overlay exactly where it was.
+#[test]
+fn taking_an_overlay_that_does_not_match_leaves_it_open() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileMenu(0));
+
+    let got = take_overlay!(&mut app, Overlay::RemoteGit(w) => w);
+    assert!(got.is_none(), "a File menu is not the git wizard");
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileMenu(0))),
+        "an overlay the caller declined must be put back untouched"
+    );
+
+    // ...and matching still hands it over, leaving nothing behind.
+    let got = take_overlay!(&mut app, Overlay::FileMenu(sel) => sel);
+    assert_eq!(got, Some(0));
+    assert!(app.overlay.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Postman bulk import wizard
+// ---------------------------------------------------------------------------
+//
+// The state machine itself lives in `crate::postman_flow` and is tested there;
+// these cover what the terminal adds on top — the menu route in, the key
+// mapping, and what happens to the app when an import lands.
+
+use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
+use crate::postman_flow::Step as PostmanStep;
+use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary};
+
+/// Finding the 1Password item path is the tedious half of setting an import
+/// up, and it is the same path every time — so the wizard offers back the
+/// references that have worked before, exactly as the git wizard offers repos.
+/// The pasted key is the one thing never kept: that is the credential itself,
+/// and this list is written to `state.json`.
+#[test]
+fn a_working_key_reference_is_offered_back_next_time() {
+    use crate::postman_flow::KeySource;
+
+    let mut app = TuiApp::default();
+    assert!(
+        app.session
+            .remember_key_ref("{{ op://Private/Postman/credential }}")
+    );
+    assert!(app.session.remember_key_ref("{{ ssm:/postman/key }}"));
+    assert!(
+        !app.session.remember_key_ref("PMAK-secret"),
+        "a pasted key is a live credential, not an address"
+    );
+    assert!(
+        !app.session.remember_key_ref("{{ ssm:/postman/key }}"),
+        "already at the front: nothing changed, so nothing is rewritten"
+    );
+
+    app.open_postman_wizard();
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key_source, KeySource::OnePassword);
+    assert_eq!(
+        w.recent_entries(),
+        vec!["Private/Postman/credential".to_string()],
+        "only the references belonging to the chosen source are offered"
+    );
+
+    // Down opens the list, Enter takes the highlighted one into the field.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(postman_wizard(&mut app).recent_sel, Some(0));
+    press(&mut app, KeyCode::Enter);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key.text(), "Private/Postman/credential");
+    assert_eq!(w.recent_sel, None);
+
+    // Switching source switches the list with it.
+    let w = postman_wizard(&mut app);
+    w.key_source = KeySource::Ssm;
+    assert_eq!(
+        postman_wizard(&mut app).recent_entries(),
+        vec!["/postman/key".to_string()]
+    );
+}
+
+/// The list is only written once the key has actually worked: a half-typed
+/// item path must never come back as a suggestion.
+#[test]
+fn a_key_is_only_remembered_once_postman_has_accepted_it() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let w = postman_wizard(&mut app);
+    w.key_source = crate::postman_flow::KeySource::OnePassword;
+    w.key = Editor::new("Private/Half/typed", false);
+    w.sync_fields();
+    app.poll_postman_updates();
+    assert!(
+        app.session.recent_key_refs.is_empty(),
+        "nothing has been sent to Postman yet"
+    );
+}
+
+/// A finished import leaves a receipt saying what landed, where it went, and —
+/// the part nothing else on screen says — that the folder is now a tab.
+#[test]
+fn a_finished_import_leaves_a_receipt_saying_what_landed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    let s = Strings::for_language(&app.language);
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_step(crate::postman_flow::Step::Done);
+        w.done = Some(crate::postman_import::ImportSummary {
+            dest: "/tmp/pb/Alpha".into(),
+            workspace_name: "Alpha".into(),
+            collections: 3,
+            environments: 1,
+            failures: Vec::new(),
+            converted_with_notes: false,
+            elapsed: std::time::Duration::from_secs(4),
+        });
+    }
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = squashed(&buffer_text(term.backend().buffer()));
+
+    assert!(
+        text.contains(&format!("3 {}", s.postman_word_collections)),
+        "the receipt says what landed: {text}"
+    );
+    // Singular where it is one — "1 environments" reads like a machine.
+    assert!(
+        text.contains(&format!("1 {}", s.postman_word_environment)),
+        "counted in the number it really is: {text}"
+    );
+    assert!(
+        text.contains(&squashed(s.postman_done_opened)),
+        "and says the imported folder is now a tab: {text}"
+    );
+}
+
+fn postman_wizard(app: &mut TuiApp) -> &mut PostmanWizard {
+    match app.overlay.as_mut() {
+        Some(Overlay::PostmanImport(w)) => w,
+        other => panic!(
+            "the Postman wizard is not open: {other:?}",
+            other = other.is_some()
+        ),
+    }
+}
+
+fn a_workspace(name: &str, id: &str) -> WorkspaceSummary {
+    WorkspaceSummary {
+        id: id.to_string(),
+        name: name.to_string(),
+        kind: WorkspaceKind::Team,
+    }
+}
+
+#[test]
+fn postman_is_a_third_source_for_a_workspace_and_only_for_a_workspace() {
+    let s = Strings::for_language(&Language::English);
+    // A collection can come from a file or from git; only a Workspace — which
+    // is a whole folder — can be bulk-imported from Postman.
+    assert_eq!(file_load_source_items(FileKind::Collection, &s).len(), 2);
+    let ws = file_load_source_items(FileKind::Workspace, &s);
+    assert_eq!(ws.len(), 3);
+    assert_eq!(ws[2], s.file_source_postman);
+}
+
+#[test]
+fn the_workspace_load_menu_opens_the_postman_wizard() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::FileLoadSource(FileKind::Workspace, 2));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "the third source must open the Postman wizard"
+    );
+}
+
+#[test]
+fn the_connect_step_cycles_its_four_fields_and_types_into_the_focused_one() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    // Start from a known state: an API key may have been picked up from the
+    // environment, which would otherwise leak into the assertion below.
+    postman_wizard(&mut app).key = Editor::blank();
+
+    // The first row is the key-source choice, which has nothing to type into.
+    press(&mut app, KeyCode::Char('Z'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('K'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('W'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('U'));
+    // Tabbing off the end wraps to the source row (nothing to type) and then
+    // back to the key, rather than falling off the end.
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('9'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Char('2'));
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key.text(), "K2");
+    assert_eq!(w.workspace_ref.text(), "W");
+    assert_eq!(w.base_url.text(), "U");
+}
+
+/// The whole point of the source row: a user who keeps their key in 1Password
+/// types the item path they can read off 1Password's own "Copy Secret
+/// Reference", and the wizard writes the `{{ op://… }}` syntax for them.
+#[test]
+fn choosing_a_key_source_writes_the_reference_syntax_for_the_user() {
+    use crate::postman_flow::KeySource;
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
+
+    // 1Password is where the wizard opens, so nothing needs cycling.
+    assert_eq!(postman_wizard(&mut app).key_source, KeySource::OnePassword);
+
+    press(&mut app, KeyCode::Tab);
+    for c in "Private/Postman/credential".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let w = postman_wizard(&mut app);
+    assert!(
+        !w.key_source.is_secret(),
+        "an item path is an address, not the credential, so it is not masked"
+    );
+    w.sync_fields();
+    assert_eq!(
+        w.flow.key, "{{ op://Private/Postman/credential }}",
+        "the wizard assembles the reference the resolver understands"
+    );
+
+    // And Left comes back to a pasted key, which is a credential again.
+    press(&mut app, KeyCode::BackTab);
+    press(&mut app, KeyCode::Left);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.key_source, KeySource::Paste);
+    assert!(w.key_source.is_secret());
+}
+
+#[test]
+fn connecting_without_a_key_shows_the_error_and_dismissing_it_returns_to_connect() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
+
+    press(&mut app, KeyCode::Enter);
+    let s = Strings::for_language(&app.language);
+    assert_eq!(
+        postman_wizard(&mut app).flow.error(),
+        Some(s.postman_err_key_required)
+    );
+
+    // Any key clears it — and lands back on the step it interrupted, not on
+    // some default, so nothing already typed is lost.
+    press(&mut app, KeyCode::Char('x'));
+    let w = postman_wizard(&mut app);
+    assert!(w.flow.error().is_none());
+    assert_eq!(w.stage(), PostmanStage::Connect);
+}
+
+#[test]
+fn a_typed_workspace_id_skips_the_listing_and_suggests_a_destination() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-x", false);
+        w.workspace_ref = Editor::new("12345678-1234-1234-1234-123456789abc", false);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert!(
+        !w.dest.as_os_str().is_empty(),
+        "the options step must arrive with a destination already filled in"
+    );
+}
+
+#[test]
+fn the_options_step_toggles_the_row_under_the_cursor_and_leaves_the_others_alone() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(PathBuf::from("/tmp/x"));
+    }
+
+    // Row 0 is the destination chooser, not a toggle: Space must leave every
+    // option exactly as it found them.
+    press(&mut app, KeyCode::Char(' '));
+    {
+        let w = postman_wizard(&mut app);
+        assert_eq!(w.dest, PathBuf::from("/tmp/x"), "destination unchanged");
+        assert!(w.flow.include_collections && w.flow.include_environments);
+    }
+
+    press(&mut app, KeyCode::Tab); // collections
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab); // environments
+    press(&mut app, KeyCode::Tab); // format
+    press(&mut app, KeyCode::Char(' '));
+
+    let w = postman_wizard(&mut app);
+    assert!(!w.flow.include_collections, "collections toggled off");
+    assert!(w.flow.include_environments, "environments left alone");
+    assert_eq!(w.flow.format, ImportFormat::Hurl, "format flipped to Hurl");
+    assert!(!w.flow.overwrite, "overwrite left alone");
+}
+
+#[test]
+fn leaving_the_options_goes_back_to_the_list_when_there_is_one_and_to_the_key_when_there_is_not() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    // No listing was ever fetched (the id was typed), so back means the key.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Connect);
+
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        postman_wizard(&mut app).stage(),
+        PostmanStage::PickWorkspace
+    );
+}
+
+#[test]
+fn the_workspace_list_filters_as_you_type_and_enter_takes_the_visible_row() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+            a_workspace("Gamma", "ws-g"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Char('e')); // matches "Beta" only
+    assert_eq!(postman_wizard(&mut app).flow.visible_workspaces().len(), 1);
+
+    press(&mut app, KeyCode::Enter);
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(
+        w.flow.workspace_name(),
+        "Beta",
+        "Enter must take the row the filter is showing, not the unfiltered one"
+    );
+}
+
+#[test]
+fn a_finished_import_opens_the_folder_as_a_workspace() {
+    let root = temp_dir("postman_import").join("Imported");
+    std::fs::create_dir_all(root.join("Collections")).unwrap();
+
+    let mut app = TuiApp::default();
+    let before = app.collections.len();
+    app.apply_postman_event(ImportSummary {
+        dest: root.clone(),
+        workspace_name: "Alpha".to_string(),
+        collections: 2,
+        environments: 1,
+        failures: Vec::new(),
+        converted_with_notes: false,
+        elapsed: std::time::Duration::from_secs(1),
+    });
+
+    assert_eq!(app.collections.len(), before + 1, "a new tab was opened");
+    assert_eq!(
+        app.collections[app.active_tab].workspace_root.as_deref(),
+        Some(root.as_path()),
+        "the imported folder becomes the tab's workspace root"
+    );
+}
+
+#[test]
+fn items_that_could_not_be_fetched_are_reported_ahead_of_the_conversion_notes() {
+    let root = temp_dir("postman_status").join("Imported");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let summary = |failures: Vec<(String, String)>, notes: bool| ImportSummary {
+        dest: root.clone(),
+        workspace_name: "Alpha".to_string(),
+        collections: 1,
+        environments: 0,
+        failures,
+        converted_with_notes: notes,
+        elapsed: std::time::Duration::from_secs(1),
+    };
+
+    // Notes alone say so...
+    let mut app = TuiApp::default();
+    app.apply_postman_event(summary(Vec::new(), true));
+    assert!(matches!(app.status, Some(Status::PostmanNotes)));
+
+    // ...but missing data is the more urgent of the two, and only one status
+    // line fits, so it wins.
+    let mut app = TuiApp::default();
+    app.apply_postman_event(summary(
+        vec![("Billing API".to_string(), "404".to_string())],
+        true,
+    ));
+    assert!(matches!(app.status, Some(Status::PostmanSkipped(1))));
+}
+
+#[test]
+fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Confirm);
+    }
+    // No plan yet: the busy screen, not a confirmation of nothing.
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
+    // Enter here must not start anything — there is nothing to start.
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
+
+    postman_wizard(&mut app).flow.seed_plan(ImportPlan {
+        workspace_id: "ws-a".to_string(),
+        workspace_name: "Alpha".to_string(),
+        collections: Vec::new(),
+        environments: Vec::new(),
+        remaining_month: None,
+    });
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
+}
+
+#[test]
+fn every_step_of_the_postman_wizard_renders() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let plan = ImportPlan {
+        workspace_id: "ws-a".to_string(),
+        workspace_name: "Alpha".to_string(),
+        collections: Vec::new(),
+        environments: Vec::new(),
+        remaining_month: None,
+    };
+    let steps = [
+        PostmanStep::Connect,
+        PostmanStep::PickWorkspace,
+        PostmanStep::Options,
+        PostmanStep::Confirm,
+        PostmanStep::Downloading,
+        PostmanStep::Done,
+        PostmanStep::Failed("boom".to_string()),
+    ];
+    for step in steps {
+        let mut app = TuiApp::default();
+        app.open_postman_wizard();
+        {
+            let w = postman_wizard(&mut app);
+            w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+            w.flow.seed_workspaces(vec![a_workspace("Alpha", "ws-a")]);
+            w.flow.seed_plan(plan.clone());
+            w.flow.seed_step(step.clone());
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app))
+            .unwrap_or_else(|e| panic!("{step:?} failed to render: {e}"));
+    }
+}
+
+/// The destination is chosen in the file browser, like every other "save into
+/// a folder" in the app — Enter on the row must open the picker, not step past
+/// it, and the parked wizard must come back with everything else intact.
+#[test]
+fn enter_on_the_destination_row_opens_the_file_browser() {
+    let dir = temp_dir("postman_dest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-x", false);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(dir.join("Alpha"));
+    }
+
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Browser(FileAction::PostmanDestChooseFolder, _))
+        ),
+        "Enter on the destination row must open the folder picker"
+    );
+    assert!(
+        app.parked_postman.is_some(),
+        "the wizard must be parked, not discarded"
+    );
+    // The picker offers back the folder name already chosen.
+    assert_eq!(app.browser_name.text(), "Alpha");
+
+    // Committing a folder name puts the wizard back with the new destination.
+    app.finish_postman_dest(dir.clone(), "Beta".to_string());
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.dest, dir.join("Beta"));
+    assert_eq!(w.flow.dest, dir.join("Beta").to_string_lossy());
+    assert_eq!(w.key.text(), "PMAK-x", "the typed key survived the detour");
+}
+
+/// Cancelling the picker must not cost the destination the wizard already had.
+#[test]
+fn cancelling_the_destination_picker_restores_the_wizard_unchanged() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(PathBuf::from("/tmp/Alpha"));
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.dest, PathBuf::from("/tmp/Alpha"));
+}
+
+/// The folder picker opens with the name the wizard already worked out, so the
+/// common answer — "yes, here, called that" — should not cost a Tab and an
+/// Enter in a field the user never wanted to visit. Space takes the folder on
+/// screen under that name.
+#[test]
+fn space_in_the_destination_picker_takes_the_folder_and_the_suggested_name() {
+    let dir = temp_dir("postman_dest_space");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.set_dest(dir.join("Alpha"));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Browser(FileAction::PostmanDestChooseFolder, _))
+    ));
+    assert_eq!(app.browser_name.text(), "Alpha");
+
+    press(&mut app, KeyCode::Char(' '));
+
+    assert!(
+        app.browser_query.is_empty(),
+        "Space confirmed rather than filtering"
+    );
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.dest, dir.join("Alpha"));
+}
+
+/// A rejected API key fails while the workspaces are being listed, so the step
+/// it interrupts is the workspace picker — of a list that was never fetched.
+/// Dismissing the error used to land on that empty picker, with nothing to pick
+/// and no way back. It goes to the key prompt, with the key still there to fix.
+#[test]
+fn dismissing_a_bad_key_returns_to_the_key_prompt() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key = Editor::new("PMAK-wrong", false);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+        w.flow.fail("401 Unauthorized".to_string());
+    }
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Error);
+
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Connect);
+    assert_eq!(
+        w.key.text(),
+        "PMAK-wrong",
+        "the key is kept, to be corrected"
+    );
+}
+
+/// Imported workspaces are collected somewhere deliberate — a folder of
+/// downloads — so the second import offers the first one's folder rather than
+/// wherever the app happened to be started from (which was landing them inside
+/// whatever repository the terminal was sitting in).
+#[test]
+fn the_next_import_lands_next_to_the_last_one() {
+    let dir = std::env::temp_dir().join("pb-postman-import-home");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+
+    // First import: the folder is chosen in the browser.
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+    }
+    let w = take_overlay!(app, Overlay::PostmanImport(w) => w).unwrap();
+    app.parked_postman = Some(w);
+    app.finish_postman_dest(dir.clone(), "Alpha".to_string());
+    assert_eq!(app.last_import_dir.as_deref(), Some(dir.as_path()));
+    app.overlay = None;
+
+    // Second import: the destination is suggested there.
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![a_workspace("Beta", "ws-b")]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(postman_wizard(&mut app).dest, dir.join("Beta"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A download that stopped because the folder was already occupied is a folder
+/// mistake, not a wizard mistake: dismissing it lands back on the options, with
+/// the destination still filled in, so the folder can be changed and the import
+/// started again without retyping the key.
+#[test]
+fn a_full_destination_sends_you_back_to_pick_another_one() {
+    let dir = std::env::temp_dir().join("pb-postman-full-dest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.set_dest(dir.join("Alpha"));
+        w.flow.seed_step(PostmanStep::Downloading);
+    }
+    // A tick with the download on screen: this is what records the step the
+    // failure interrupts, since nobody presses a key while it runs.
+    app.poll_postman_updates();
+    postman_wizard(&mut app)
+        .flow
+        .fail(format!("{} already exists and is not empty", dir.display()));
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Error);
+
+    press(&mut app, KeyCode::Esc);
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(
+        w.dest,
+        dir.join("Alpha"),
+        "the choice is kept, to be edited"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Left/Right change the value on an options row, the way they do on every
+/// other two-way choice in the app. The format row draws its two options side
+/// by side, so an arrow pointed at one of them has to select it.
+#[test]
+fn arrows_change_the_option_under_the_cursor() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.option_row = 3; // the format row
+    }
+    let before = postman_wizard(&mut app).flow.format;
+
+    press(&mut app, KeyCode::Right);
+    let after = postman_wizard(&mut app).flow.format;
+    assert_ne!(after, before, "Right picked the other format");
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        postman_wizard(&mut app).flow.format,
+        before,
+        "Left picked it back"
+    );
+}
+
+/// The destination row is a path being typed into; arrows there move the
+/// cursor, they do not flip a setting.
+#[test]
+fn arrows_on_the_destination_row_do_not_toggle_anything() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Options);
+        w.option_row = 0;
+    }
+    let before = postman_wizard(&mut app).flow.include_collections;
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(postman_wizard(&mut app).flow.include_collections, before);
+}
+
+/// The confirmation screen has no fields to move between and no connection left
+/// to make, so it must not borrow the connect form's "Tab switch field · Enter
+/// connect" hint — Enter starts the import.
+#[test]
+fn the_confirmation_says_enter_imports_not_enter_connects() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        w.flow.seed_step(PostmanStep::Confirm);
+    }
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    assert!(text.contains(s.postman_confirm_hint), "got: {text}");
+    assert!(!text.contains(s.git_connect_hint));
+}
+
+/// The connect form is a label column and a value column with the keys on the
+/// border, like the request editor — not a stack of fields each explained by a
+/// paragraph underneath. What a field wants is a dim example *inside* it.
+#[test]
+fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    postman_wizard(&mut app).key = Editor::blank();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    // Every field's example is on the same row as its label.
+    for (label, example) in [
+        (s.postman_key_label_op, s.postman_key_hint_op),
+        (s.postman_workspace_label, s.postman_workspace_hint),
+        (s.postman_base_url_label, s.postman_base_url_hint),
+    ] {
+        let row = text
+            .lines()
+            .find(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("no row for {label}: {text}"));
+        assert!(row.contains(example), "{label} lost its example: {row}");
+    }
+
+    // The keys are on the frame, and the whole dialog is four rows of content
+    // plus the line explaining the chosen key source, rather than the dozen the
+    // stacked hints took.
+    let hint_row = text
+        .lines()
+        .position(|l| l.contains(s.postman_connect_hint))
+        .expect("the shortcut hint is on the border");
+    let first = text
+        .lines()
+        .position(|l| l.contains(s.postman_key_source_label))
+        .unwrap();
+    let help_rows = text
+        .lines()
+        .skip(first + 2)
+        .take_while(|l| !l.contains(s.postman_workspace_label))
+        .count();
+    assert!(
+        help_rows <= 2,
+        "the source help is a line or two, not a page"
+    );
+    assert_eq!(
+        hint_row - first,
+        4 + help_rows,
+        "four field rows and the source help, then the border"
+    );
+
+    // And the explanation belongs to the source that is showing.
+    assert!(
+        squashed(&text).contains(s.postman_key_help_op),
+        "the chosen source went unexplained: {text}"
+    );
+}
+
+/// Text as the panel would read aloud, with the line breaks the terminal put in
+/// taken back out, so a test can look for a sentence that wrapped.
+fn squashed(text: &str) -> String {
+    text.replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Each key source asks something different of the user: an item in a password
+/// manager, a parameter in AWS, the name of an environment variable, or the key
+/// itself. The picker only names them, so the form has to say what the chosen
+/// one means — including that two of them need a command-line tool.
+#[test]
+fn the_key_field_explains_whichever_source_is_chosen() {
+    use crate::postman_flow::KeySource;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+    for (src, help) in [
+        (KeySource::OnePassword, s.postman_key_help_op),
+        (KeySource::Ssm, s.postman_key_help_ssm),
+        (KeySource::Env, s.postman_key_help_env),
+        (KeySource::Paste, s.postman_key_help_paste),
+    ] {
+        postman_wizard(&mut app).key_source = src;
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = squashed(&buffer_text(term.backend().buffer()));
+        assert!(text.contains(help), "{src:?} went unexplained: {text}");
+    }
+}
+
+/// The value column must not move when the key source changes. The key row's
+/// label grows and shrinks with the source ("API key" vs "1Password item"), and
+/// a column sized to whichever label happens to be showing slid every field
+/// sideways as the user arrowed through the four sources.
+#[test]
+fn the_value_column_stays_put_as_the_key_source_changes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+    let mut columns = Vec::new();
+    for src in crate::postman_flow::KeySource::ALL {
+        postman_wizard(&mut app).key_source = src;
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // The workspace row's label never changes, so where its value starts
+        // is exactly where the column is.
+        let row = text
+            .lines()
+            .find(|l| l.contains(s.postman_workspace_label))
+            .unwrap_or_else(|| panic!("no workspace row: {text}"))
+            .to_string();
+        let at = row
+            .find(s.postman_workspace_hint)
+            .expect("the workspace row shows its example");
+        columns.push((src, at));
+    }
+
+    let (_, first) = columns[0];
+    assert!(
+        columns.iter().all(|(_, at)| *at == first),
+        "the value column moved between key sources: {columns:?}"
+    );
+}
+
+/// The hint under the options has to describe what Enter does on the row the
+/// cursor is actually on — it used to claim "Enter connect" everywhere, which
+/// was wrong on every row.
+#[test]
+fn the_options_hint_describes_what_enter_does_on_the_current_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let hint_for = |row: usize| {
+        let mut app = TuiApp::default();
+        app.open_postman_wizard();
+        {
+            let w = postman_wizard(&mut app);
+            w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+            w.flow.seed_step(PostmanStep::Options);
+            w.set_dest(PathBuf::from("/tmp/Alpha"));
+            w.option_row = row;
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        buffer_text(term.backend().buffer())
+    };
+
+    assert!(hint_for(0).contains(s.postman_options_hint_dest));
+    assert!(hint_for(1).contains(s.postman_options_hint_toggle));
+    assert!(hint_for(OPTION_ROWS - 1).contains(s.postman_options_hint_import));
+    // The old, wrong hint is gone from every row.
+    for row in 0..OPTION_ROWS {
+        assert!(
+            !hint_for(row).contains(s.git_connect_hint),
+            "row {row} still shows the git connect hint"
+        );
+    }
+}
+
+/// Every browser filters by typing, not just the three "open an existing X"
+/// pickers that started with it. The folder pickers are where it was missed and
+/// where it matters most: a `FOR … IN FILES` loop's source folder is chosen by
+/// walking a real corpus tree, which is exactly the crowded case the filter
+/// exists for.
+#[test]
+fn folder_pickers_filter_by_typing_too() {
+    let dir = temp_dir("folderfilter");
+    for d in ["auth-fixtures", "sub", "another"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenWorkspace,
+        FileAction::MoveWorkspaceItemChooseFolder,
+        FileAction::SaveWorkspaceChooseFolder,
+        FileAction::NewReportChooseFolder,
+        FileAction::PickFormFile(0),
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.browser_query, "au", "{action:?} did not take the query");
+        let shown = names(&app);
+        assert!(
+            shown.iter().any(|n| n == "auth-fixtures/"),
+            "matching folder shown for {action:?}: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|n| n == "sub/"),
+            "non-matching folder hidden for {action:?}: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|n| n == "../"),
+            "the parent entry is filtered too for {action:?}: {shown:?}"
+        );
+    }
+}
+
+/// `Space` picks the current directory in the three folder pickers, so it must
+/// never be swallowed into the filter query there — that would take away the
+/// only way to confirm. Everywhere else a space is an ordinary filter
+/// character, because file names contain them.
+#[test]
+fn space_still_confirms_in_the_folder_pickers() {
+    let dir = temp_dir("folderspace");
+    std::fs::create_dir_all(dir.join("cases")).unwrap();
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenWorkspace,
+        FileAction::MoveWorkspaceItemChooseFolder,
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.browser_query.is_empty(),
+            "{action:?} put a space into the query instead of confirming"
+        );
+        assert!(
+            !matches!(app.overlay, Some(Overlay::Browser(..))),
+            "{action:?} did not act on Space"
+        );
+    }
+
+    // A save-to-folder picker confirms on Space too, using the name already in
+    // its filename field — so a space never reaches the filter there either.
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::SaveWorkspaceChooseFolder);
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        app.browser_query.is_empty(),
+        "Space in a save-to-folder picker confirms rather than filtering"
+    );
+}
+
+/// In a "save to folder" picker the same keys mean different things either side
+/// of Tab: they narrow the folder list while the list has focus, and type a
+/// name once the filename field does. Without the focus check the filter would
+/// eat the filename.
+#[test]
+fn save_folder_typing_filters_the_list_but_names_the_file() {
+    let dir = temp_dir("savefolderfilter");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::SaveCollectionChooseFolder);
+    assert!(!app.browser_name_focused, "the list starts focused");
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    assert_eq!(app.browser_query, "au", "the list is being filtered");
+    let before = app.browser_name.text();
+
+    // Tab to the filename field: the same keys now type a name.
+    press(&mut app, KeyCode::Tab);
+    assert!(app.browser_name_focused);
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(app.browser_query, "au", "the query is left alone");
+    assert_ne!(
+        app.browser_name.text(),
+        before,
+        "the keystroke reached the filename field"
+    );
+}
+
+/// A query is typed to find something *here*, and almost never matches anything
+/// inside the folder it just found — carrying it across a descent left the new
+/// directory showing nothing but `../`, with no visible cause. Arriving
+/// anywhere new clears it.
+#[test]
+fn moving_to_another_folder_clears_the_filter() {
+    let dir = temp_dir("filterdescent");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    std::fs::write(dir.join("auth-fixtures").join("zebra.hurl"), "x").unwrap();
+
+    let mut app = app_with(|a| {
+        a.last_browse_dir = Some(dir.clone());
+    });
+    app.open_browser(FileAction::OpenCollection);
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('u'));
+    if let Some(Overlay::Browser(_, ex)) = &mut app.overlay {
+        let idx = ex
+            .files()
+            .iter()
+            .position(|f| f.name == "auth-fixtures/")
+            .expect("the matching folder is listed");
+        ex.set_selected_idx(idx);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        app.browser_query.is_empty(),
+        "the query does not follow us into the folder"
+    );
+    let shown = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex
+            .files()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>(),
+        _ => panic!("browser closed"),
+    };
+    assert!(
+        shown.iter().any(|n| n == "zebra.hurl"),
+        "so the folder shows its contents rather than looking empty: {shown:?}"
+    );
+
+    // And the same on the way back up.
+    press(&mut app, KeyCode::Char('z'));
+    assert_eq!(app.browser_query, "z");
+    press(&mut app, KeyCode::Left);
+    assert!(
+        app.browser_query.is_empty(),
+        "ascending clears it as well: {:?}",
+        app.browser_query
+    );
+}
+
+/// The filter strip has to actually appear, in the pickers that already had one
+/// and in the "save to folder" pickers that grew one — the latter now stack a
+/// list, the strip, an optional format row and the filename box, and a layout
+/// that silently dropped a row would leave the filter invisible while it was
+/// still narrowing the list.
+#[test]
+fn the_filter_strip_is_drawn_in_every_picker_shape() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = temp_dir("filterstrip");
+    std::fs::create_dir_all(dir.join("auth-fixtures")).unwrap();
+    let s = Strings::for_language(&crate::i18n::Language::English);
+
+    for action in [
+        FileAction::OpenCollection,             // list + strip
+        FileAction::PickReportNodeFolder,       // folder picker
+        FileAction::SaveCollectionChooseFolder, // list + strip + name box
+        FileAction::SaveReportCsvChooseFolder,  // list + strip + formats + name
+    ] {
+        let mut app = app_with(|a| {
+            a.last_browse_dir = Some(dir.clone());
+        });
+        app.open_browser(action);
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        // Nothing typed yet: no strip, so it costs no space when unused.
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(term.backend().buffer()).contains(s.browser_filter_label.trim()),
+            "{action:?} showed a filter strip with no query"
+        );
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('u'));
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("Filter: au"),
+            "{action:?} filtered the list without saying so:\n{text}"
+        );
+        // The list itself is still drawn, and still narrowed.
+        assert!(
+            text.contains("auth-fixtures"),
+            "{action:?} lost the list:\n{text}"
+        );
+    }
+}
+
+/// The way out is filtered on what it is *displayed* as. A `../` row's `path`
+/// is the parent directory, so matching on the path would keep it for a query
+/// like "home" — a name the user can't even see on that row — and drop it for
+/// "..", the one thing it plainly reads as.
+#[test]
+fn the_parent_row_is_matched_on_the_name_it_shows() {
+    let dir = temp_dir("dotdotmatch");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    // "." is part of "../", so the row stays.
+    press(&mut app, KeyCode::Char('.'));
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "a matching query keeps the parent row: {:?}",
+        names(&app)
+    );
+    press(&mut app, KeyCode::Char('.'));
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "\"..\" matches too: {:?}",
+        names(&app)
+    );
+
+    // The parent of a temp dir is somewhere under /tmp, but no part of that
+    // real path may be used to keep the row alive.
+    let parent_name = dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .expect("temp dir has a named parent");
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    for c in parent_name.chars().take(4) {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(
+        !names(&app).iter().any(|n| n == "../"),
+        "the parent's real name must not match the \"../\" row: {:?}",
+        names(&app)
+    );
+}
+
+/// Filtering the parent row means a query can now match *nothing*, leaving the
+/// list empty. `ratatui_explorer` indexes that list unguarded — `current()` is
+/// `files[selected]`, `Down` is `% files.len()`, `End` is `len() - 1` — so
+/// every key that used to be safe because `../` was always there has to be
+/// proven safe now that it isn't.
+#[test]
+fn an_empty_filtered_list_survives_every_key() {
+    let dir = temp_dir("emptyfilter");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    std::fs::write(dir.join("beta.hurl"), "GET https://x\n").unwrap();
+
+    for action in [
+        FileAction::PickReportNodeFolder,
+        FileAction::OpenCollection,
+        FileAction::SaveWorkspaceChooseFolder,
+        FileAction::PickFormFile(0),
+    ] {
+        let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+        app.open_browser(action);
+        for c in "zzq".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let empty = match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().is_empty(),
+            _ => panic!("browser not open for {action:?}"),
+        };
+        assert!(empty, "\"zzq\" should match nothing for {action:?}");
+
+        // None of these may panic, and none may close the picker.
+        for key in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::End,
+            KeyCode::Home,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Enter,
+            KeyCode::Right,
+        ] {
+            press(&mut app, key);
+            assert!(
+                matches!(app.overlay, Some(Overlay::Browser(..))),
+                "{key:?} closed the picker for {action:?}"
+            );
+        }
+
+        // It must also draw without panicking.
+        {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+            term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        }
+    }
+}
+
+/// …and the escape routes out of an empty list all still work, which is the
+/// safety property the old "`../` is exempt from the filter" rule used to
+/// guarantee for free.
+#[test]
+fn an_empty_filtered_list_can_still_be_escaped() {
+    let dir = temp_dir("emptyescape");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let names = |app: &TuiApp| -> Vec<String> {
+        match &app.overlay {
+            Some(Overlay::Browser(_, ex)) => ex.files().iter().map(|f| f.name.clone()).collect(),
+            _ => panic!("browser not open"),
+        }
+    };
+    let filter_to_nothing = || {
+        let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+        app.open_browser(FileAction::PickReportNodeFolder);
+        for c in "zzq".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app
+    };
+
+    // Backspace trims the query until things match again.
+    let mut app = filter_to_nothing();
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    assert_eq!(app.browser_query, "");
+    assert!(
+        names(&app).iter().any(|n| n == "../"),
+        "the parent row comes back once the query is gone: {:?}",
+        names(&app)
+    );
+
+    // Esc clears the query in one go, without closing the picker.
+    let mut app = filter_to_nothing();
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.browser_query, "");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Browser(..))),
+        "the first Esc only clears the query"
+    );
+    assert!(names(&app).iter().any(|n| n == "alpha/"));
+
+    // Left still climbs out, even with nothing on screen to climb from.
+    let mut app = filter_to_nothing();
+    press(&mut app, KeyCode::Left);
+    let cwd = match &app.overlay {
+        Some(Overlay::Browser(_, ex)) => ex.cwd().to_path_buf(),
+        _ => panic!("browser not open"),
+    };
+    assert_eq!(
+        Some(cwd.as_path()),
+        dir.parent(),
+        "Left ascends out of an empty filtered list"
+    );
+    assert_eq!(app.browser_query, "", "ascending clears the query");
+}
+
+/// An empty filtered list draws a "no matches" placeholder that keeps the
+/// picker's own frame — the folder on top and the key hints along the bottom.
+/// Those hints are the way out of the state, so losing them here would be the
+/// worst possible moment for the box to go blank.
+#[test]
+fn an_empty_filtered_list_still_shows_the_folder_and_the_keys() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let dir = temp_dir("emptydraw");
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = app_with(|a| a.last_browse_dir = Some(dir.clone()));
+    app.open_browser(FileAction::PickReportNodeFolder);
+    for c in "zzq".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let mut term = Terminal::new(TestBackend::new(110, 26)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(
+        text.contains(s.browser_no_matches),
+        "the placeholder explains why the box is empty:\n{text}"
+    );
+    // The bottom border shows the action label and as much of the key hint as
+    // fits the box, so match the start of each rather than the whole line.
+    assert!(
+        text.contains(s.report_node_folder_pick.trim_end_matches('…')),
+        "the picker still names itself:\n{text}"
+    );
+    let hint_head: String = s.browser_hint_node_folder.chars().take(20).collect();
+    assert!(
+        text.contains(&hint_head),
+        "the keys that get you out are still on the border:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{}zzq", s.browser_filter_label)),
+        "the filter strip still names the query:\n{text}"
+    );
+    // No stale rows left behind from before the query narrowed things away.
+    assert!(
+        !text.contains("alpha/"),
+        "the filtered-out rows are gone:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The node editor's report-settings section
+// ---------------------------------------------------------------------------
+
+/// Every header directive the language has is reachable from the terminal
+/// node editor, not just `collection:`. This is the gap that prompted the
+/// section: the GUI has edited all six from its settings strip since it was
+/// built, while the TUI could only bind a collection and left the rest to be
+/// typed into the raw source.
+#[test]
+fn the_node_editor_offers_every_header_directive_the_gui_does() {
+    let (app, idx) = node_show_app(&["status"]);
+    let shown: Vec<&str> = app.report_setting_rows(idx).iter().map(|r| r.key).collect();
+    let addable = app.missing_report_settings(idx);
+    let reachable: Vec<&str> = shown
+        .iter()
+        .copied()
+        .chain(addable.iter().copied())
+        .collect();
+
+    for spec in crate::report::edit::header_specs() {
+        assert!(
+            reachable.contains(&spec.key),
+            "{} is not reachable from the node editor: shown {shown:?}, addable {addable:?}",
+            spec.key
+        );
+    }
+    // The two that always show are the two that always show in the GUI.
+    assert_eq!(shown, vec!["collection", "output"]);
+}
+
+/// `# labels:` repeats — a vocabulary is nearly always at least two classes —
+/// so every declared class gets its own settings row, and another can be added
+/// once the first is set (the one-shot "add setting" entry is gone by then).
+#[test]
+fn every_declared_label_class_gets_its_own_settings_row() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n# labels: Pass = ok, real\n# labels: Fail = no, fake\nREQUEST upload\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_setting_rows(idx);
+    let labels: Vec<&crate::tui::report_nodes::SettingRow> =
+        rows.iter().filter(|r| r.key == "labels").collect();
+    assert_eq!(labels.len(), 2, "one row per class");
+    assert_eq!(labels[0].occurrence, 0);
+    assert_eq!(labels[1].occurrence, 1);
+    assert!(
+        labels[1].value.contains("Fail"),
+        "each row shows its own class: {:?}",
+        labels[1].value
+    );
+    assert!(
+        !app.missing_report_settings(idx).contains(&"labels"),
+        "an already-declared repeatable directive isn't offered as missing"
+    );
+}
+
+/// The cursor arrows out of the settings into the flow and back, so the pane
+/// reads as one list even though the two halves are indexed separately.
+#[test]
+fn the_settings_and_the_flow_arrow_through_as_one_list() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    // Opening the node editor starts in the flow.
+    assert_eq!(app.reports[idx].node_setting, None);
+
+    // Up off BEGIN lands on the last settings row (the "add setting" row).
+    press(&mut app, KeyCode::Up);
+    let last = app.setting_row_count(idx) - 1;
+    assert_eq!(app.reports[idx].node_setting, Some(last));
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.reports[idx].node_setting, Some(last - 1));
+
+    // Home goes to the top of the pane, which is the first setting.
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.reports[idx].node_setting, Some(0));
+    // …and Up at the top stays put rather than wrapping.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.reports[idx].node_setting, Some(0));
+
+    // Down through the settings and out the bottom, back onto BEGIN.
+    for _ in 0..=last {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(app.reports[idx].node_setting, None);
+    assert_eq!(app.reports[idx].node_selected, 0);
+}
+
+/// Enter on a closed-list directive opens a picker, and choosing writes the
+/// directive into the report's source.
+#[test]
+fn picking_an_output_format_writes_the_directive() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Home);
+    // Row 1 is `output`.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::ReportSettingMenu(m)) => {
+            assert!(m.options.iter().any(|o| o == "xlsx"), "{:?}", m.options);
+        }
+        _ => panic!("Enter on OUTPUT opens the format picker"),
+    }
+    // Walk to xlsx and choose it.
+    while !matches!(&app.overlay, Some(Overlay::ReportSettingMenu(m))
+        if m.options[m.selected] == "xlsx")
+    {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert!(
+        app.reports[idx].report.text.contains("output: xlsx"),
+        "{}",
+        app.reports[idx].report.text
+    );
+}
+
+/// `a` adds one of the directives that isn't set yet, and lands the cursor on
+/// the new row with its editor already open — adding a setting and filling it
+/// in is one gesture, not two.
+#[test]
+fn adding_a_setting_opens_its_editor_on_the_new_row() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Char('a'));
+    // Choose COLUMNS (free text, so it opens the prompt rather than a picker).
+    while !matches!(&app.overlay, Some(Overlay::ReportSettingMenu(m))
+        if m.options[m.selected] == "COLUMNS")
+    {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+
+    // The row exists…
+    let rows = app.report_setting_rows(idx);
+    let pos = rows.iter().position(|r| r.key == "columns");
+    assert!(pos.is_some(), "the added directive shows as a row");
+    assert_eq!(
+        app.reports[idx].node_setting, pos,
+        "cursor is on the new row"
+    );
+    // …and it reads as unset rather than showing the `?` sentinel as a value.
+    assert!(rows[pos.unwrap()].unset());
+    // …and its editor is open, seeded empty rather than with the placeholder.
+    match &app.overlay {
+        Some(Overlay::Prompt { kind, editor, .. }) => {
+            assert!(matches!(
+                kind,
+                PromptKind::ReportHeaderValue { key: "columns", .. }
+            ));
+            assert_eq!(editor.text(), "", "the `?` sentinel isn't offered to edit");
+        }
+        _ => panic!("adding a free-text setting opens its prompt"),
+    }
+
+    // Committing writes it.
+    for c in "Name,Status".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx]
+            .report
+            .text
+            .contains("columns: Name,Status"),
+        "{}",
+        app.reports[idx].report.text
+    );
+}
+
+/// Delete clears a directive, and an empty commit does the same — otherwise
+/// clearing the field would write back the `?` placeholder and look like
+/// nothing had happened.
+#[test]
+fn a_setting_can_be_cleared_from_the_row_or_from_its_prompt() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.apply_report_setting(idx, "columns", 0, Some("Name"));
+    assert!(app.reports[idx].report.text.contains("columns: Name"));
+
+    let pos = app
+        .report_setting_rows(idx)
+        .iter()
+        .position(|r| r.key == "columns")
+        .unwrap();
+    app.reports[idx].node_setting = Some(pos);
+    press(&mut app, KeyCode::Delete);
+    assert!(
+        !app.reports[idx].report.text.contains("columns:"),
+        "Delete removes the directive: {}",
+        app.reports[idx].report.text
+    );
+
+    // Again, this time via an empty commit in the prompt.
+    app.apply_report_setting(idx, "columns", 0, Some("Name"));
+    let pos = app
+        .report_setting_rows(idx)
+        .iter()
+        .position(|r| r.key == "columns")
+        .unwrap();
+    app.reports[idx].node_setting = Some(pos);
+    press(&mut app, KeyCode::Char('e'));
+    // Clear the seeded text, then commit.
+    for _ in 0..10 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("columns:"),
+        "an empty commit removes it too: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A settings change goes onto the node editor's undo stack, like every other
+/// edit made in this pane.
+#[test]
+fn a_settings_change_can_be_undone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = app.reports[idx].report.text.clone();
+    app.apply_report_setting(idx, "output", 0, Some("xlsx"));
+    assert_ne!(app.reports[idx].report.text, before);
+
+    app.reports[idx].node_setting = None;
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.reports[idx].report.text, before,
+        "Ctrl+Z takes a settings change back"
+    );
+}
+
+/// The section draws above the flow, showing what each directive is set to and
+/// prompting for the one that blocks the run.
+#[test]
+fn the_settings_section_draws_above_the_flow() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let (mut app, idx) = node_show_app(&["status"]);
+    let s = Strings::for_language(&Language::English);
+    app.apply_report_setting(idx, "collection", 0, None);
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert!(text.contains(s.report_settings_heading), "{text}");
+    assert!(text.contains("COLLECTION"), "{text}");
+    assert!(text.contains("OUTPUT"), "{text}");
+    // The unset required directive prompts rather than showing blank.
+    assert!(text.contains(s.report_setting_unset), "{text}");
+    assert!(text.contains(s.report_setting_add_row), "{text}");
+    // The settings come before BEGIN, not after it.
+    let settings_at = text.find(s.report_settings_heading).unwrap();
+    let begin_at = text.find(s.report_node_begin).unwrap();
+    assert!(
+        settings_at < begin_at,
+        "settings sit above the flow:\n{text}"
+    );
+}
+
+/// Draws a report tab and returns the number of rows the Validation panel
+/// occupies, borders included.
+fn validation_panel_rows(app: &mut TuiApp, width: u16, height: u16) -> usize {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    let lines: Vec<&str> = text.lines().collect();
+    let top = lines
+        .iter()
+        .position(|l| l.contains("Validation"))
+        .expect("validation panel drawn");
+    let bottom = lines[top + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('└'))
+        .expect("validation panel closed")
+        + top
+        + 1;
+    bottom - top + 1
+}
+
+/// A parse error is a single diagnostic but a whole sentence of text. Sizing the
+/// panel by counting diagnostics gave it one row and clipped the rest, which is
+/// the one state where you most need to read the message — so the panel is sized
+/// from the wrapped text instead.
+#[test]
+fn a_wrapping_parse_error_gets_the_rows_it_needs() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload\nFOR EACH OF THE MANY THINGS IN THE VERY LONG LIST OF THINGS DO SOMETHING\n",
+    );
+    app.revalidate_report(idx);
+    // Narrow enough that the message has to wrap several times.
+    assert!(validation_panel_rows(&mut app, 46, 40) > 3);
+}
+
+/// ...but it can never take over the pane: past the cap the panel scrolls.
+#[test]
+fn the_validation_panel_stops_growing_at_its_cap() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let mut text = String::from("# collection: api\n");
+    for i in 0..30 {
+        text.push_str(&format!("REPORT REQUEST missing{i}\n"));
+    }
+    app.reports[idx].report.set_text(&text);
+    app.revalidate_report(idx);
+    assert!(
+        app.reports[idx].diagnostics.len() > 10,
+        "expected plenty of diagnostics, got {}",
+        app.reports[idx].diagnostics.len()
+    );
+    // Five content rows plus the two borders.
+    assert_eq!(validation_panel_rows(&mut app, 90, 40), 7);
+}
+
+/// `F` re-indents the whole source. The case that prompted it: an existing
+/// block gets wrapped in a new outer loop, leaving its body one level short.
+#[test]
+fn shift_f_reindents_the_report_source() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n\nFOR T IN FILES \"*.txt\"\nFOR F IN FILES \"*.png\"\nREQUEST upload\nEND\nEND\n",
+    );
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Esc); // node editor -> source
+    press(&mut app, KeyCode::Char('F'));
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nFOR T IN FILES \"*.txt\"\n    FOR F IN FILES \"*.png\"\n        REQUEST upload\n    END\nEND\n"
+    );
+}
+
+/// It is one undo step, not one per line.
+#[test]
+fn a_reindent_can_be_undone_in_one_step() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = "# collection: api\n\nFOR T IN FILES \"*.txt\"\nREQUEST upload\nEND\n".to_string();
+    app.reports[idx].report.set_text(&before);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Char('F'));
+    assert_ne!(app.reports[idx].report.text, before, "reindented");
+    app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(app.reports[idx].report.text, before);
+}
+
+/// A script that doesn't parse has no known block structure, so it is left
+/// exactly as it was rather than guessed at.
+#[test]
+fn a_reindent_leaves_unparseable_source_alone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let before = "# collection: api\n\n      FOR X IN\n".to_string();
+    app.reports[idx].report.set_text(&before);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('F'));
+    assert_eq!(app.reports[idx].report.text, before);
+    assert!(matches!(app.status, Some(Status::ReportReformatFailed(_))));
+}
+
+/// The outline used to collapse a whole `WITH` block to "… WITH …", so its
+/// fields were invisible and there was no way in to add one.
+#[test]
+fn a_with_block_shows_its_fields_as_rows() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert!(
+        labels.contains(&"frame: jsonpath \"$.a\""),
+        "fields are rows: {labels:?}"
+    );
+    assert!(labels.contains(&"score: jsonpath \"$.b\""), "{labels:?}");
+    // The head drops its "…" placeholder, since the fields it stood for are
+    // now the rows below it.
+    assert!(
+        labels.contains(&"REPORT REQUEST upload AS u WITH"),
+        "{labels:?}"
+    );
+    // And the block is closed, like a loop's.
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == crate::tui::report_nodes::RowKind::WithEnd)
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+    );
+}
+
+/// Delete on a field removes that field. The field and the request share a
+/// path, so without a branch this would take the whole request with it.
+#[test]
+fn deleting_a_with_field_leaves_the_request_alone() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithField(0))
+        .expect("first field");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Delete);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("REPORT REQUEST upload AS u WITH"), "{text:?}");
+    assert!(!text.contains("frame:"), "the field went: {text:?}");
+    assert!(text.contains("score:"), "its sibling stayed: {text:?}");
+}
+
+/// Shift+Up on a field reorders the column within its block rather than moving
+/// the request among its siblings.
+#[test]
+fn a_with_field_reorders_within_its_own_block() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREQUEST upload\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\n    score: jsonpath \"$.b\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithField(1))
+        .expect("second field");
+    app.reports[idx].node_selected = at;
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    let text = &app.reports[idx].report.text;
+    let frame = text.find("frame:").expect("frame present");
+    let score = text.find("score:").expect("score present");
+    assert!(score < frame, "score moved above frame: {text:?}");
+    let req = text.find("REQUEST upload").expect("request present");
+    assert!(
+        req < text.find("REPORT REQUEST").expect("report request present"),
+        "the request itself didn't move: {text:?}"
+    );
+}
+
+/// The add row is the discoverable way in: it opens the field editor with a
+/// fresh field rather than editing an existing one.
+#[test]
+fn the_add_row_opens_an_empty_with_field_editor() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+        .expect("add row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    match &app.overlay {
+        Some(Overlay::ReportNodeWithField(form)) => {
+            assert!(form.index.is_none(), "a new field, not an edit of field 0");
+        }
+        _ => panic!("expected the WITH field editor"),
+    }
+}
+
+/// The reported bug: comment a loop out, make any structural edit, and the
+/// commented-out block was gone — every node-editor edit re-serializes the
+/// flow, and the AST had nowhere to keep a comment.
+#[test]
+fn a_structural_edit_no_longer_eats_commented_out_code() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\n\nREQUEST upload\n# FOR T IN FILES \"*.txt\"\n#     REQUEST upload\n# END\nREPORT REQUEST upload\n",
+    );
+    app.revalidate_report(idx);
+
+    // Any structural edit will do; deleting the last node is the simplest.
+    let rows = app.report_node_rows(idx).expect("rows");
+    app.reports[idx].node_selected = rows.len() - 1;
+    press(&mut app, KeyCode::Delete);
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("# FOR T IN FILES \"*.txt\"")
+            && text.contains("#     REQUEST upload")
+            && text.contains("# END"),
+        "the commented-out block survived, indentation and all: {text:?}"
+    );
+}
+
+/// And it is visible in the outline, so it can be found again to uncomment.
+#[test]
+fn a_comment_is_a_row_in_the_outline() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\n\nREQUEST upload\n# a note about upload\n");
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let comment = rows
+        .iter()
+        .find(|r| r.kind == crate::tui::report_nodes::RowKind::Comment)
+        .expect("the comment is a row");
+    assert_eq!(comment.label, "# a note about upload");
+}
+
+/// The same guarantee one level down: a commented-out column inside a `WITH`
+/// block used to be dropped on the floor by the parser, so editing the request
+/// from the node editor silently deleted it.
+#[test]
+fn a_structural_edit_keeps_a_commented_out_with_field() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(concat!(
+        "# collection: api\n\n",
+        "REPORT REQUEST upload AS u WITH\n",
+        "    Score: jsonpath \"$.score\"\n",
+        "    #    Frame: jsonpath \"$.frame\"\n",
+        "    Verdict: jsonpath \"$.verdict\"\n",
+        "END\n",
+        "REQUEST upload\n",
+    ));
+    app.revalidate_report(idx);
+
+    // Any structural edit will do; deleting the trailing node is the simplest.
+    let rows = app.report_node_rows(idx).expect("rows");
+    app.reports[idx].node_selected = rows.len() - 1;
+    press(&mut app, KeyCode::Delete);
+
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("#    Frame: jsonpath \"$.frame\""),
+        "the commented-out field survived: {text:?}"
+    );
+}
+
+/// …and it is visible in the outline, dimmed, so it can be found again to
+/// uncomment — but it is not offered to the field editor, since there is no
+/// field there to edit.
+#[test]
+fn a_with_comment_is_a_row_in_the_outline_but_not_a_field() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(concat!(
+        "# collection: api\n\n",
+        "REPORT REQUEST upload AS u WITH\n",
+        "    Score: jsonpath \"$.score\"\n",
+        "    #    Frame: jsonpath \"$.frame\"\n",
+        "END\n",
+    ));
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let pos = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithComment(1))
+        .expect("the commented field is a row");
+    assert!(
+        rows[pos].label.contains("Frame"),
+        "it shows what was commented out: {:?}",
+        rows[pos].label
+    );
+    app.reports[idx].node_selected = pos;
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !matches!(&app.overlay, Some(Overlay::ReportNodeWithField(_))),
+        "there is no field to edit on a comment"
+    );
+}
+
+/// The reported gap: the language allowed extra `# collection: … AS alias`
+/// lines but the node editor showed only one collection, so a helper was
+/// invisible and unreachable from the outline.
+#[test]
+fn the_settings_section_shows_a_row_per_collection() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    let rows = app.report_setting_rows(idx);
+    let cols: Vec<_> = rows.iter().filter(|r| r.key == "collection").collect();
+    assert_eq!(cols.len(), 2, "one row per declared collection");
+    assert_eq!(cols[0].value, "./api.hurl");
+    assert_eq!(cols[0].occurrence, 0);
+    assert_eq!(cols[1].value, "./h.hurl AS h");
+    assert_eq!(cols[1].occurrence, 1);
+    // Only the primary blocks the run, so only it is drawn as required.
+    assert!(cols[0].required);
+    assert!(!cols[1].required);
+}
+
+/// Editing a helper row must write to *that* line, not to the primary.
+#[test]
+fn editing_the_helper_row_does_not_rebind_the_report() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    app.apply_report_setting(idx, "collection", 1, Some("./other.hurl AS o"));
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("# collection: ./api.hurl"), "{text:?}");
+    assert!(text.contains("# collection: ./other.hurl AS o"), "{text:?}");
+}
+
+/// Deleting a helper row removes only that line.
+#[test]
+fn deleting_a_helper_row_keeps_the_primary_collection() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST upload\n");
+    app.revalidate_report(idx);
+    app.apply_report_setting(idx, "collection", 1, None);
+    let text = &app.reports[idx].report.text;
+    assert!(text.contains("# collection: ./api.hurl"), "{text:?}");
+    assert!(!text.contains("AS h"), "{text:?}");
+}
+
+/// A request in a helper collection tags as *known* in the outline, rather
+/// than misleadingly amber, and its `[Reports]` fields are offered.
+#[test]
+fn a_helper_request_reads_as_known_in_the_outline() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!(
+        "paperboy_tui_helper_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("h.hurl")).unwrap();
+    write!(f, "# fetch_frame\nGET http://example.test/frame\n\n").unwrap();
+    drop(f);
+
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.path = Some(dir.join("r.trail"));
+    app.reports[idx].report.set_text(
+        "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST h/fetch_frame\n",
+    );
+    app.revalidate_report(idx);
+
+    let rows = app.report_node_rows(idx).expect("rows");
+    let row = rows
+        .iter()
+        .find(|r| r.label.contains("fetch_frame"))
+        .expect("the helper request is a row");
+    assert_eq!(
+        row.req_ok,
+        Some(true),
+        "it resolves through its alias: {:?}",
+        row.label
+    );
+
+    // …and the same name *without* the alias does not, so the tint is really
+    // reading the alias rather than tinting everything green.
+    app.reports[idx]
+        .report
+        .set_text("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREQUEST fetch_frame\n");
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let row = rows
+        .iter()
+        .find(|r| r.label.contains("fetch_frame"))
+        .expect("row");
+    assert_eq!(row.req_ok, Some(false), "{:?}", row.label);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reported bug: opening the field editor from the outline's "add a field"
+/// row and then pressing Enter or Esc dropped the user into the *request* form
+/// — a wizard they had never asked for and then had to dismiss as well. It only
+/// hands back to the request form when it was opened as a sub-form of one.
+#[test]
+fn the_with_field_editor_closes_to_the_outline_when_opened_from_it() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    let src =
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n";
+    for close in [KeyCode::Enter, KeyCode::Esc] {
+        app.reports[idx].report.set_text(src);
+        app.revalidate_report(idx);
+        let rows = app.report_node_rows(idx).expect("rows");
+        let at = rows
+            .iter()
+            .position(|r| r.kind == crate::tui::report_nodes::RowKind::WithAdd)
+            .expect("add row");
+        app.reports[idx].node_selected = at;
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::ReportNodeWithField(_))),
+            "the add row opens the field editor"
+        );
+        press(&mut app, close);
+        assert!(
+            app.overlay.is_none(),
+            "{close:?} closes to the outline, not to another wizard"
+        );
+    }
+
+    // …but a field editor opened from the request form still returns there,
+    // which is what makes the request form usable as a hub.
+    app.reports[idx].report.set_text(src);
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| r.kind == crate::tui::report_nodes::RowKind::Leaf)
+        .expect("the request row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_ref() else {
+        panic!("the request row opens the request form");
+    };
+    let add = form
+        .visible_rows()
+        .iter()
+        .position(|r| matches!(r, super::report_nodes::FormRow::AddWith))
+        .expect("add-WITH row");
+    if let Some(Overlay::ReportNodeRequest(form)) = app.overlay.as_mut() {
+        form.selected = add;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::ReportNodeRequest(_))),
+        "a sub-form of the request form hands back to it"
+    );
+}
+
+/// A `WITH` field's ground truth is editable in the field form, and a field
+/// that already carries one round-trips it — the editors must never quietly
+/// drop a clause they can see.
+#[test]
+fn the_with_field_editor_edits_and_preserves_a_ground_truth() {
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let open_field = |app: &mut crate::tui::app::TuiApp| {
+        let rows = app.report_node_rows(idx).expect("rows");
+        let at = rows
+            .iter()
+            .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+            .expect("the field row");
+        app.reports[idx].node_selected = at;
+        press(app, KeyCode::Enter);
+    };
+
+    open_field(&mut app);
+    let truth_row = {
+        let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+            panic!("expected the field editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == WithFieldRow::Clause(ClauseRow::Truth))
+            .expect("a ground-truth row")
+    };
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+    }
+    for c in "{{ e }}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("TRUTH \"{{ e }}\""),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // Re-opening shows it, and applying without touching it leaves it alone.
+    open_field(&mut app);
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("expected the field editor");
+    };
+    assert_eq!(form.clauses.truth, "{{ e }}");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.reports[idx].report.text.contains("TRUTH \"{{ e }}\""));
+
+    // Clearing the row removes the clause rather than writing an empty one.
+    open_field(&mut app);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+        for _ in 0.."{{ e }}".len() {
+            form.clauses.truth.pop();
+        }
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("TRUTH"),
+        "no empty clause is left behind: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// `DETAIL` is a checkbox in the field editor, but the point of this test is
+/// the round-trip: opening a field that already carries the flag and applying
+/// without touching it must leave the flag exactly where it was.
+#[test]
+fn the_with_field_editor_preserves_a_detail_flag_it_cannot_show() {
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\" DETAIL\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("DETAIL"),
+        "the flag survives a round-trip through the editor: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// `IMAGE` is three questions (fit, height, width) that only matter once a
+/// column holds a picture, so -- exactly like the statistics checklist -- it
+/// hides behind a toggle, and `FIT` hides the two sizes it makes meaningless.
+#[test]
+fn the_with_field_editor_folds_the_image_sizes_behind_the_image_toggle() {
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+
+    let image_row = {
+        let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+            panic!("expected the field editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == WithFieldRow::Clause(ClauseRow::Image))
+            .expect("an image row")
+    };
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = image_row;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        form.visible_rows()
+            .contains(&WithFieldRow::Clause(ClauseRow::Height)),
+        "turning IMAGE on reveals the sizes"
+    );
+
+    // Type a height, then a width.
+    let height_row = image_row + 2;
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = height_row;
+    }
+    for c in "96".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("IMAGE(HEIGHT 96)"),
+        "the sizes reach the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // FIT answers the same question as the sizes, so picking it hides them --
+    // and clears them, so nothing invisible can still be writing a clause.
+    press(&mut app, KeyCode::Enter);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = image_row + 1;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        !form
+            .visible_rows()
+            .contains(&WithFieldRow::Clause(ClauseRow::Height)),
+        "FIT hides the sizes"
+    );
+    press(&mut app, KeyCode::Enter);
+    let text = &app.reports[idx].report.text;
+    assert!(
+        text.contains("IMAGE(FIT)") && !text.contains("HEIGHT"),
+        "FIT replaces the height rather than joining it: {text}"
+    );
+}
+
+/// The clause block is shared, so the `REPORT <var> AS` form gets it too -- and
+/// only while a single variable is ticked, since `REPORT (A, B)` has no one
+/// column for a ground truth to belong to.
+#[test]
+fn the_vars_editor_offers_the_clause_block_for_a_single_variable() {
+    use crate::tui::report_nodes::{ClauseRow, VarsRow};
+    let (mut app, idx) = node_editor_app(&["Oauth"]);
+    app.reports[idx]
+        .report
+        .set_text("# collection: api\nTIER=gold\nREPORT TIER AS Tier\n");
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down); // select the REPORT row
+    press(&mut app, KeyCode::Enter);
+
+    let truth_row = {
+        let Some(Overlay::ReportNodeVars(form)) = app.overlay.as_ref() else {
+            panic!("expected the vars editor");
+        };
+        form.visible_rows()
+            .iter()
+            .position(|r| *r == VarsRow::Clause(ClauseRow::Truth))
+            .expect("a ground-truth row")
+    };
+    if let Some(Overlay::ReportNodeVars(form)) = app.overlay.as_mut() {
+        form.selected = truth_row;
+    }
+    for c in "{{ want }}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx]
+            .report
+            .text
+            .contains("TRUTH \"{{ want }}\""),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// The statistics checklist is six rows that most fields don't want, so it is
+/// folded behind a toggle. Turning it on seeds `COUNT` (the one statistic that
+/// means something for a text column too) and turning it off clears the ticks,
+/// so a collapsed list can never still be writing a clause.
+#[test]
+fn the_with_field_editor_hides_the_statistics_behind_a_toggle() {
+    use crate::tui::report_nodes::{ClauseRow, WithFieldRow};
+    let (mut app, idx) = node_show_app(&["status"]);
+    app.reports[idx].report.set_text(
+        "# collection: api\nREPORT REQUEST upload AS u WITH\n    frame: jsonpath \"$.a\"\nEND\n",
+    );
+    app.revalidate_report(idx);
+    let rows = app.report_node_rows(idx).expect("rows");
+    let at = rows
+        .iter()
+        .position(|r| matches!(r.kind, crate::tui::report_nodes::RowKind::WithField(_)))
+        .expect("the field row");
+    app.reports[idx].node_selected = at;
+    press(&mut app, KeyCode::Enter);
+
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("expected the field editor");
+    };
+    assert_eq!(
+        form.visible_rows(),
+        vec![
+            WithFieldRow::Name,
+            WithFieldRow::Query,
+            WithFieldRow::Clause(ClauseRow::Truth),
+            WithFieldRow::Clause(ClauseRow::Detail),
+            WithFieldRow::Clause(ClauseRow::Image),
+            WithFieldRow::Stats
+        ],
+        "a field with no STATISTICS shows the toggle only"
+    );
+
+    // Space on the toggle reveals the checklist with COUNT seeded.
+    let toggle = 5;
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = toggle;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert!(
+        form.visible_rows().len() > 6,
+        "the checklist appears while the toggle is on"
+    );
+    assert_eq!(
+        form.stats
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>(),
+        vec![crate::report::model::StatKind::Count],
+        "turning it on seeds COUNT"
+    );
+
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        app.reports[idx].report.text.contains("STATISTICS(COUNT)"),
+        "the clause reaches the source: {}",
+        app.reports[idx].report.text
+    );
+
+    // Toggling back off clears the ticks, so the clause goes away entirely
+    // rather than lingering out of sight.
+    assert_eq!(
+        app.reports[idx].node_selected, at,
+        "applying leaves the cursor on the field just edited, not on the request"
+    );
+    press(&mut app, KeyCode::Enter);
+    if let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_mut() {
+        form.selected = toggle;
+    }
+    press(&mut app, KeyCode::Char(' '));
+    let Some(Overlay::ReportNodeWithField(form)) = app.overlay.as_ref() else {
+        panic!("still in the field editor");
+    };
+    assert_eq!(
+        form.visible_rows(),
+        vec![
+            WithFieldRow::Name,
+            WithFieldRow::Query,
+            WithFieldRow::Clause(ClauseRow::Truth),
+            WithFieldRow::Clause(ClauseRow::Detail),
+            WithFieldRow::Clause(ClauseRow::Image),
+            WithFieldRow::Stats
+        ],
+        "the checklist collapses again"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        !app.reports[idx].report.text.contains("STATISTICS"),
+        "no hidden clause survives: {}",
+        app.reports[idx].report.text
+    );
+}
+
+/// A report tab holding a finished, ground-truthed run: three scored rows (one
+/// of them wrong and a regression) and one nobody labelled.
+fn truthed_report_app() -> (TuiApp, usize) {
+    use crate::report::model::{ReportResult, ReportRow, Trend, Verdict};
+    use crate::tui::reports::ReportView;
+    let row = |cells: &[(&str, &str)]| ReportRow {
+        cells: cells
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    let mut res = ReportResult {
+        column_order: vec!["Name".into(), "Verdict".into(), "Correct".into()],
+        rows: vec![
+            row(&[("Name", "a"), ("Verdict", "pass"), ("Correct", "correct")]),
+            row(&[("Name", "b"), ("Verdict", "fail"), ("Correct", "correct")]),
+            row(&[("Name", "c"), ("Verdict", "pass"), ("Correct", "incorrect")]),
+            row(&[("Name", "d"), ("Verdict", "pass")]),
+        ],
+        ..Default::default()
+    };
+    res.column_truths
+        .insert("Verdict".into(), "{{ expected }}".into());
+    for (r, (v, t)) in [
+        (Verdict::Correct, "pass"),
+        (Verdict::Correct, "fail"),
+        (Verdict::Incorrect, "fail"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        res.verdicts.insert((r, "Verdict".into()), v);
+        res.truths.insert((r, "Verdict".into()), t.into());
+    }
+    res.trends.insert((2, "Verdict".into()), Trend::Regressed);
+
+    let mut app = TuiApp::default();
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(
+        "# collection: api\n# labels: Pass = pass\n# labels: Fail = fail\nREPORT REQUEST r\n",
+    );
+    app.reports[idx].result = Some(res);
+    app.reports[idx].view = ReportView::Results;
+    (app, idx)
+}
+
+/// The terminal results view states the run's score, from the same shared
+/// module the GUI's cards and the HTML export's read it from.
+#[test]
+fn the_results_view_states_the_ground_truth_score() {
+    let (app, idx) = truthed_report_app();
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &Strings::english());
+    assert!(
+        text.iter()
+            .any(|l| l.contains("3/4") && l.contains("66.7%")),
+        "the compared count and accuracy are on screen: {text:?}"
+    );
+    // And a report with no ground truth pays no lines for a summary of nothing.
+    let mut plain = TuiApp::default();
+    plain.new_report_tab();
+    let i = plain.active_report_index().unwrap();
+    plain.reports[i].result = Some(crate::report::model::ReportResult::default());
+    assert!(
+        crate::tui::reports::results_head_text(&plain.reports[i], &Strings::english()).is_empty()
+    );
+}
+
+/// The terminal's summary leads with what moved, from the same shared module
+/// the GUI's cards and the exported header block read it from.
+#[test]
+fn the_results_view_says_what_moved_since_the_baseline() {
+    use crate::report::model::Trend;
+    let (mut app, idx) = truthed_report_app();
+    let s = Strings::english();
+    // The fixture has one regression and nothing else moved.
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        text.iter()
+            .any(|l| l.starts_with("Movement") && l.contains("Regressed 1")),
+        "the regression is the figure being scanned for: {text:?}"
+    );
+
+    // A run where every scored row landed where it did last time says so in
+    // words rather than in a row of zeroes.
+    if let Some(res) = app.reports[idx].result.as_mut() {
+        res.trends.clear();
+        res.trends.insert((0, "Verdict".into()), Trend::Unchanged);
+    }
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        text.iter().any(|l| l.contains("Nothing moved")),
+        "and a still run says so: {text:?}"
+    );
+
+    // A run with no baseline has nothing to have moved from, so it says
+    // nothing at all.
+    if let Some(res) = app.reports[idx].result.as_mut() {
+        res.trends.clear();
+    }
+    let text = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        !text.iter().any(|l| l.starts_with("Movement")),
+        "no baseline, no movement line: {text:?}"
+    );
+}
+
+/// The filter is reported in the results panel's *title*, not as a line inside
+/// the grid: it describes the pane rather than the run, and a row of prose
+/// above the table costs a row of the table on every screen. The key that
+/// changes it is named in the title's hint and in the help overlay, not
+/// repeated over the rows.
+#[test]
+fn the_filter_is_named_in_the_panel_title_and_not_over_the_rows() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    let s = Strings::english();
+    let head = crate::tui::reports::results_head_text(&app.reports[idx], &s);
+    assert!(
+        !head.iter().any(|l| l.contains("Filter")),
+        "the grid's pinned summary is metrics only: {head:?}"
+    );
+
+    let title = crate::tui::reports::results_title_filter(&app.reports[idx], &s)
+        .expect("this run offers filters, so its title says which one is up");
+    assert!(
+        title.contains("All") && title.contains("4 of 4"),
+        "the title says which rows are on screen: {title}"
+    );
+    app.reports[idx].results_filter = RowFilter::Incorrect;
+    let title = crate::tui::reports::results_title_filter(&app.reports[idx], &s).unwrap();
+    assert!(
+        title.contains("Incorrect") && title.contains("1 of 4"),
+        "and follows the filter: {title}"
+    );
+    assert!(
+        !title.contains("Ctrl+F"),
+        "the key is named in the hint and the help overlay, not here: {title}"
+    );
+
+    // A run with nothing to filter says nothing about filtering.
+    let mut plain = TuiApp::default();
+    plain.new_report_tab();
+    let i = plain.active_report_index().unwrap();
+    plain.reports[i].result = Some(crate::report::model::ReportResult::default());
+    assert!(crate::tui::reports::results_title_filter(&plain.reports[i], &s).is_none());
+}
+
+/// `/` walks the filters the run offers, and the grid follows it.
+#[test]
+fn slash_cycles_the_results_filter_and_narrows_the_grid() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    assert_eq!(app.reports[idx].results_filter, RowFilter::All);
+    assert_eq!(app.reports[idx].visible_result_rows(), vec![0, 1, 2, 3]);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(
+        app.reports[idx].results_filter,
+        RowFilter::Incorrect,
+        "no row differs from a baseline here, so Incorrect is the next filter"
+    );
+    assert_eq!(
+        app.reports[idx].visible_result_rows(),
+        vec![2],
+        "and the grid is down to the one wrong row"
+    );
+    assert!(app.overlay.is_none(), "and it opens no menu on the way");
+
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(app.reports[idx].results_filter, RowFilter::Regressed);
+    app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    assert_eq!(
+        app.reports[idx].results_filter,
+        RowFilter::All,
+        "and it wraps back round to the whole table"
+    );
+}
+
+/// With a filter up, "row 3" means the third row *on screen* — everything that
+/// addresses a row by position has to agree, or the drill-down opens a row the
+/// reader can't see.
+#[test]
+fn a_filtered_grid_addresses_the_rows_it_is_showing() {
+    use crate::report::filter::RowFilter;
+    let (mut app, idx) = truthed_report_app();
+    app.reports[idx].results_filter = RowFilter::Incorrect;
+    // Down from nothing lands on the first *visible* row and stays there:
+    // there is only one.
+    app.result_cursor_move(1, 0);
+    assert_eq!(app.reports[idx].cell_cursor.map(|(r, _)| r), Some(0));
+    app.result_cursor_move(5, 0);
+    assert_eq!(
+        app.reports[idx].cell_cursor.map(|(r, _)| r),
+        Some(0),
+        "the cursor cannot walk past the last row being shown"
+    );
+    app.open_result_cell_popup();
+    let Some(Overlay::ReportCellPopup { content, .. }) = app.overlay.as_ref() else {
+        panic!("Enter opens the drill-down");
+    };
+    assert_eq!(
+        content, "c",
+        "and it opens row `c`, the row on screen, not the third row of the run"
+    );
+}
+
+/// Ctrl+O opens what Ctrl+S wrote. It can't launch a browser in a test, so this
+/// checks the part that decides *whether* to: an export is remembered, a rerun
+/// forgets it (the file would describe a run that is no longer on screen), and
+/// asking without one says how to make one instead of silently doing nothing.
+#[test]
+fn ctrl_o_only_offers_to_open_an_export_that_still_describes_the_run() {
+    let (mut app, idx) = truthed_report_app();
+    assert!(
+        app.reports[idx].last_export.is_none(),
+        "a run that was never exported has no file to open"
+    );
+    app.open_exported_report();
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::ReportRunBlocked(_))),
+        "and Ctrl+O says so rather than doing nothing: {:?}",
+        app.status
+    );
+
+    let dir = std::env::temp_dir().join(format!("pb_open_export_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r.csv");
+    app.write_active_report_csv(&path);
+    assert_eq!(
+        app.reports[idx].last_export.as_deref(),
+        Some(path.as_path()),
+        "a successful export is the file Ctrl+O would open"
+    );
+
+    // A fresh run replaces the rows; the file on disk now describes the old
+    // ones, so the offer to open it goes away with them.
+    app.reports[idx].last_export = None;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Saving an edited request in a Workspace tab leaves the selection on that
+/// request, rather than throwing it to the top of the tree.
+///
+/// The two lists index differently: a Workspace tab's `list_cursor` walks the
+/// file tree, an ordinary tab's walks the requests. Committing the wizard used
+/// to write a requests-list index into the workspace's cursor, so editing the
+/// first request of a file jumped the selection to the workspace's first row.
+#[test]
+fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {
+    use crate::collection::WsRow;
+    let dir = workspace_temp_dir("save_keeps_selection");
+    let (mut app, ci) = workspace_app(&dir);
+    app.load_workspace_file(ci, dir.join("alpha.hurl"));
+
+    // Row 2 is alpha.hurl's only request, inlined under the file; the request
+    // is entry 0, so a requests-list index would land on row 0 instead.
+    let request_row = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .position(|r| matches!(r, WsRow::Request { .. }))
+        .expect("the open file's request is inlined in the tree");
+    assert_ne!(
+        request_row, 0,
+        "the two indexes have to disagree to prove anything"
+    );
+    app.collections[ci].list_cursor = request_row;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+
+    // Enter opens the edit wizard on it; Ctrl+Enter commits.
+    press(&mut app, KeyCode::Enter);
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert_eq!(
+        app.collections[ci].list_cursor, request_row,
+        "the selection stays on the request that was just saved"
+    );
+    assert!(
+        matches!(
+            app.collections[ci]
+                .ws_rows()
+                .get(app.collections[ci].list_cursor),
+            Some(WsRow::Request { .. })
+        ),
+        "and that row is still a request, not a file or folder"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

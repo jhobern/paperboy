@@ -866,6 +866,39 @@ pub fn render_line_field(
     }
 }
 
+/// [`render_line_field`], but an empty field shows `placeholder` dimmed —
+/// an example of what belongs there, in the space where the answer will go.
+///
+/// A form whose every field carries a sentence of explanation underneath is a
+/// wall of prose; the same example inside the field is read at the moment it
+/// is needed and costs no rows. The cursor is still placed at the start when
+/// focused, so an empty focused field reads as "type here, like this".
+pub fn render_line_field_placeholder(
+    f: &mut Frame,
+    area: Rect,
+    ed: &Editor,
+    style: &EditorTheme,
+    focused: bool,
+    mask: bool,
+    placeholder: &str,
+) {
+    if !ed.text().is_empty() || placeholder.is_empty() {
+        render_line_field(f, area, ed, style, focused, mask);
+        return;
+    }
+    if area.width == 0 {
+        return;
+    }
+    let shown: String = placeholder.chars().take(area.width as usize).collect();
+    f.render_widget(
+        Paragraph::new(shown).style(Style::default().fg(style.dim)),
+        area,
+    );
+    if focused {
+        f.set_cursor_position(Position::new(area.x, area.y));
+    }
+}
+
 /// Render a single, start-anchored line of read-only `text` into `area` in the
 /// given `color`, drawing `marker` in the last column when the text is wider
 /// than the area (i.e. it has been truncated). The text is clipped to the

@@ -16,11 +16,20 @@
 pub mod baseline;
 pub mod compare;
 pub mod context;
+pub mod detail;
 pub mod dry_run;
 pub mod edit;
+pub mod filter;
 pub mod flow;
+pub mod image;
+pub mod indent;
+pub mod jsondiff;
+pub mod labels;
+pub mod metrics;
 pub mod model;
+pub mod params;
 pub mod parser;
+pub mod pdf;
 pub mod producers;
 // The `Report` domain type lives in `report::report`; the repeated name trips
 // clippy::module_inception, but renaming the file would obscure that this is

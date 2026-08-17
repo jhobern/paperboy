@@ -97,7 +97,11 @@ fn open_report(app: &mut GuiApp, i: usize) {
 /// Create a fresh scratch report, append it to the session, and open it.
 fn new_report(app: &mut GuiApp) {
     let n = app.session.reports.len() + 1;
-    let report = Report::scratch(format!("Report {n}"));
+    let name = app
+        .strings
+        .gui_new_report_name
+        .replace("{n}", &n.to_string());
+    let report = Report::scratch(name);
     app.session.reports.push(PersistedReport {
         name: report.name.clone(),
         text: report.text.clone(),

@@ -32,6 +32,21 @@ use super::model::{ReportResult, ReportRow};
 /// comparison run; rename it in `columns:` like any column (`Result AS …`).
 pub const RESULT_COLUMN: &str = "Result";
 
+/// The reserved column holding a row's [`Trend`](crate::report::model::Trend):
+/// how its ground-truth verdict moved relative to the baseline. Inserted by the
+/// finalize phase only for a report that has *both* a truth and a comparison —
+/// there is nothing to trend against otherwise.
+pub const TREND_COLUMN: &str = "Trend";
+
+/// The reserved column holding a row's ground-truth verdict (see
+/// [`crate::report::model::Verdict`]), inserted by the run's finalize phase for
+/// a report that declares any `TRUTH "…"` column.
+///
+/// Reserved and English for the same reason [`RESULT_COLUMN`] is: it is report
+/// *data* — read by scripts, diffed between runs, sorted in a spreadsheet — and
+/// not UI chrome that follows the interface language.
+pub const CORRECT_COLUMN: &str = "Correct";
+
 /// `Result` value when the candidate matches the baseline on every compared
 /// field. A descriptive phrase (rather than a bare "OK") so a matching row is
 /// self-explanatory in an exported CSV/JSON. Kept a plain data constant like
@@ -44,10 +59,20 @@ pub const NO_BASELINE: &str = "no baseline";
 pub const NO_CANDIDATE: &str = "no candidate";
 
 /// Per-request intrinsic column suffixes. These are excluded from the compared
-/// "reported fields": `Time` always differs, and `HttpStatus`/`Asserts`/`Error`/
-/// `Response` already have their own columns. A request with *no* reported
-/// fields falls back to comparing its `Response` (see [`comparable_keys`]).
-const INTRINSICS: [&str; 5] = ["HttpStatus", "Time", "Asserts", "Error", "Response"];
+/// "reported fields": `Time` (and its `TimeSetup`/`TimeWait`/`TimeDownload`
+/// parts) always differs, and `HttpStatus`/`Asserts`/`Error`/`Response` already
+/// have their own columns. A request with *no* reported fields falls back to
+/// comparing its `Response` (see [`comparable_keys`]).
+const INTRINSICS: [&str; 8] = [
+    "HttpStatus",
+    "Time",
+    "TimeSetup",
+    "TimeWait",
+    "TimeDownload",
+    "Asserts",
+    "Error",
+    "Response",
+];
 
 /// The baseline/comparison environment roles that drive a comparison run.
 pub struct Roles {
@@ -59,19 +84,31 @@ pub struct Roles {
     /// Field suffixes from the `BASELINE(…) SHOW(…)` clause.  For each such
     /// field, matching baseline cells (`<alias>.<field>`) are copied into the
     /// candidate row as `baseline.<alias>.<field>` — but only for aliases where
-    /// the candidate itself emits that field.
-    baseline_show: Vec<String>,
+    /// the candidate itself emits that field.  The emit phase reads this too, so
+    /// that naming an intrinsic here also keeps it on the rows (see
+    /// [`Exec::baseline_show`](super::run)).
+    pub(crate) baseline_show: Vec<String>,
 }
 
 /// Extract the comparison roles a flow configures, or `None` when it has no
 /// `ENVS` role clause with a baseline (a plain `ENVS` list, or no `ENVS` loop at
 /// all, produces per-env rows with no diff — unchanged behaviour).
 pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
+    comparison_roles_with(flow, &HashMap::new())
+}
+
+/// As [`comparison_roles`], with the run's parameter values in hand so a role
+/// written as `BASELINE("{{TARGET}}")` names the same environment the run
+/// actually visited. Without this the collapse would look for a row whose
+/// target is the literal `{{TARGET}}` and find nothing — every comparison
+/// would come back unmatched.
+pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
     let mut baseline_show = Vec::new();
     collect_roles(
         &flow.nodes,
+        params,
         &mut baseline,
         &mut comparisons,
         &mut baseline_show,
@@ -89,6 +126,7 @@ pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
 /// Walk the flow tree, unioning every `ENVS BASELINE/COMPARISON` clause's names.
 fn collect_roles(
     nodes: &[FlowNode],
+    params: &HashMap<String, String>,
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
     baseline_show: &mut Vec<String>,
@@ -106,24 +144,27 @@ fn collect_roles(
                     // its snapshot path (a `FILE(…)`); either way the produced /
                     // injected rows carry that string as their target.
                     for r in b {
-                        baseline.insert(r.target().to_string());
+                        baseline.insert(crate::environment::substitute(r.target(), params));
                     }
                     for r in c {
-                        let name = r.target().to_string();
+                        let name = crate::environment::substitute(r.target(), params);
                         if !comparisons.contains(&name) {
                             comparisons.push(name);
                         }
                     }
+                    // Only the names travel here: any `STATISTICS(…)` a field
+                    // carries is a *render* hint, collected with the rest of
+                    // the flow's column statistics, not part of the copy rule.
                     for field in s {
-                        if !baseline_show.contains(field) {
-                            baseline_show.push(field.clone());
+                        if !baseline_show.contains(&field.field) {
+                            baseline_show.push(field.field.clone());
                         }
                     }
                 }
-                collect_roles(body, baseline, comparisons, baseline_show);
+                collect_roles(body, params, baseline, comparisons, baseline_show);
             }
             FlowNode::ForEach { body, .. } => {
-                collect_roles(body, baseline, comparisons, baseline_show)
+                collect_roles(body, params, baseline, comparisons, baseline_show)
             }
             _ => {}
         }
@@ -141,6 +182,7 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         result.column_order.insert(0, RESULT_COLUMN.to_string());
     }
 
+    let excluded = excluded_keys(result);
     let rows = std::mem::take(&mut result.rows);
 
     let mut baseline_by_key: HashMap<Vec<String>, ReportRow> = HashMap::new();
@@ -182,8 +224,17 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         let mut emitted = false;
         for comp in &roles.comparisons {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
-                let verdict = compute_result(baseline, &cand);
+                let verdict = compute_result(baseline, &cand, &excluded);
                 cand.cells.insert(RESULT_COLUMN.to_string(), verdict);
+                // Keep the baseline row alive past this collapse when the
+                // report scores a ground truth: the `Trend` needs to know
+                // whether the baseline's own answer was right, and this is the
+                // last point at which that row exists.
+                if result.track_baseline
+                    && let Some(base) = baseline
+                {
+                    result.baseline_rows.insert(out.len(), (*base).clone());
+                }
                 // Copy baseline cells for each SHOW field, but only for aliases
                 // where the candidate row already emits that field.  This avoids
                 // inventing columns for requests that don't report the field at all.
@@ -220,12 +271,38 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     result.rows = out;
 }
 
+/// The cell keys a diff must ignore, whatever their names: `IMAGE` columns
+/// (whose values are picture sources — typically signed, timestamped URLs that
+/// differ on every run) and timing columns (see
+/// [`ReportResult::timing_columns`]).
+///
+/// Both are exclusions of *provenance*, not of name, which is why they are read
+/// off the result rather than matched against a list here the way the intrinsics
+/// under their own names are in [`comparable_keys`].
+pub(super) fn excluded_keys(result: &ReportResult) -> HashSet<String> {
+    result
+        .column_images
+        .keys()
+        .chain(&result.timing_columns)
+        .cloned()
+        .collect()
+}
+
 /// Compare `cand` against its `baseline`, returning the `Result` cell: a
 /// compact single-line JSON object keyed by environment name (baseline with
 /// `(baseline)` suffix, candidate as-is) showing only differing fields. Field
 /// values that parse as JSON are embedded structurally; others as JSON strings.
 /// Returns [`MATCH`] when all agree, or [`NO_BASELINE`] when there is no baseline.
-pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> String {
+///
+/// `exclude` names cell keys the diff must ignore. `IMAGE` columns go in it:
+/// the picture sources such a column holds are typically timestamped or signed
+/// URLs that differ on every run, so comparing them would fill the `Result`
+/// column with changes that mean nothing while burying the ones that do.
+pub(super) fn compute_result(
+    baseline: Option<&ReportRow>,
+    cand: &ReportRow,
+    exclude: &HashSet<String>,
+) -> String {
     let Some(base) = baseline else {
         return NO_BASELINE.to_string();
     };
@@ -234,6 +311,9 @@ pub(super) fn compute_result(baseline: Option<&ReportRow>, cand: &ReportRow) -> 
     let mut cand_diffs = serde_json::Map::new();
 
     for key in comparable_keys(cand, base) {
+        if exclude.contains(&key) {
+            continue;
+        }
         let b = base.cells.get(&key).map(String::as_str).unwrap_or("");
         let c = cand.cells.get(&key).map(String::as_str).unwrap_or("");
         if b != c {
@@ -334,6 +414,82 @@ mod tests {
         }
     }
 
+    /// The reported bug: a `WITH` field that aliases the `Time` intrinsic under
+    /// a friendlier name (`"Response Time": Time STATISTICS(MEAN, MEDIAN)`)
+    /// produced a column whose *name* is not an intrinsic, so it was diffed —
+    /// and a time never repeats, so every row of the report read as changed.
+    /// The exclusion has to follow where the value came from, not what it is
+    /// called.
+    #[test]
+    fn a_renamed_time_column_is_not_a_difference() {
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "CLEAR")],
+                ),
+            ],
+            ..Default::default()
+        };
+        // Without the provenance record the two times are simply two differing
+        // cells, so this is the control: the row reads as changed.
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert!(
+            result.rows[0].cells[RESULT_COLUMN].contains("Response Time"),
+            "control: an unrecorded column is compared"
+        );
+
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "CLEAR")],
+                ),
+            ],
+            timing_columns: ["f.Response Time".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert_eq!(
+            result.rows[0].cells[RESULT_COLUMN], MATCH,
+            "a renamed time is excluded like the intrinsic it came from"
+        );
+
+        // …but only that column: a real difference beside it still reports.
+        let mut result = ReportResult {
+            rows: vec![
+                row(
+                    &["c1"],
+                    "prod",
+                    &[("f.Response Time", "118"), ("f.overall", "CLEAR")],
+                ),
+                row(
+                    &["c1"],
+                    "staging",
+                    &[("f.Response Time", "204"), ("f.overall", "NOT_CLEAR")],
+                ),
+            ],
+            timing_columns: ["f.Response Time".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        let verdict = &result.rows[0].cells[RESULT_COLUMN];
+        assert!(verdict.contains("overall"), "{verdict}");
+        assert!(!verdict.contains("Response Time"), "{verdict}");
+    }
+
     #[test]
     fn roles_extracted_only_when_baseline_present() {
         let plain = parse_flow("FOR T IN ENVS \"au\", \"eu\"\n  REQUEST r\nEND\n").unwrap();
@@ -357,6 +513,59 @@ mod tests {
         let r = comparison_roles(&flow).expect("roles");
         assert!(r.baseline.contains("prod"));
         assert_eq!(r.comparisons, vec!["staging"]);
+    }
+
+    /// An `IMAGE` column holds a *picture source* — usually a signed, expiring
+    /// URL that differs on every run. Diffing it would report a change on every
+    /// row and bury the ones that matter, so it is excluded.
+    #[test]
+    fn image_columns_are_left_out_of_the_diff() {
+        use crate::report::flow::ImageSpec;
+        let rows = || {
+            vec![
+                row(
+                    &["a"],
+                    "prod",
+                    &[
+                        ("face.Frame", "https://x/1?sig=aaa"),
+                        ("face.overall", "CLEAR"),
+                    ],
+                ),
+                row(
+                    &["a"],
+                    "staging",
+                    &[
+                        ("face.Frame", "https://x/2?sig=bbb"),
+                        ("face.overall", "CLEAR"),
+                    ],
+                ),
+            ]
+        };
+        let mut result = ReportResult {
+            rows: rows(),
+            ..Default::default()
+        };
+        result
+            .column_images
+            .insert("face.Frame".to_string(), ImageSpec::default());
+        apply(&mut result, &roles(&["prod"], &["staging"]));
+        assert_eq!(
+            result.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string()),
+            "the differing picture source must not count as a change"
+        );
+
+        // Without the IMAGE clause the very same values do count — the
+        // exclusion is the clause's doing, not a special case for URLs.
+        let mut plain = ReportResult {
+            rows: rows(),
+            ..Default::default()
+        };
+        apply(&mut plain, &roles(&["prod"], &["staging"]));
+        assert_ne!(
+            plain.rows[0].cells.get(RESULT_COLUMN),
+            Some(&MATCH.to_string())
+        );
     }
 
     #[test]

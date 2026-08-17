@@ -44,11 +44,12 @@ use crate::environment::substitute;
 use crate::hurl::HurlEntry;
 use crate::hurl::{EntryOutcome, RunOutput};
 
+use super::compare::{CORRECT_COLUMN, RESULT_COLUMN, TREND_COLUMN};
 use super::flow::{
     Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleRef, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
-use super::model::{ReportResult, ReportRow};
+use super::model::{ReportResult, ReportRow, Trend, Verdict};
 use super::producers::{self, ProducerItem};
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
@@ -67,6 +68,16 @@ pub trait EntryRunner: Sync {
     /// interpreter only ever passes single-entry `base`s, so `entries` holds one
     /// [`EntryOutcome`] on success.
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput;
+
+    /// Whether this runner sends nothing over the network. A dry run answers
+    /// `true`, which also suppresses the convenience fetch an `IMAGE` column
+    /// does for an `http(s)` value — a "no requests sent" run that quietly made
+    /// a hundred GETs would be lying. Local paths and `data:` URIs still
+    /// resolve, so a dry run of a file-driven image report still shows its
+    /// pictures.
+    fn offline(&self) -> bool {
+        false
+    }
 }
 
 /// Production [`EntryRunner`]: routes each send through
@@ -92,6 +103,10 @@ impl EntryRunner for LiveRunner {
 pub struct DryRunner;
 
 impl EntryRunner for DryRunner {
+    fn offline(&self) -> bool {
+        true
+    }
+
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
             entries: vec![EntryOutcome {
@@ -105,6 +120,9 @@ impl EntryRunner for DryRunner {
                 asserts: Vec::new(),
                 captures: Vec::new(),
                 duration_ms: 0,
+                setup_ms: 0,
+                wait_ms: 0,
+                download_ms: 0,
                 ok: true,
                 error: None,
             }],
@@ -145,8 +163,14 @@ pub type RowSink<'a> = dyn Fn(RowEvent) + Sync + 'a;
 /// environments an `ENVS` loop may select, the report file's directory (for
 /// resolving relative producer paths), and the runner.
 pub struct RunContext<'a> {
-    /// The bound collection's entries, resolved by title (see [`resolve_title`]).
+    /// The *primary* collection's entries, resolved by title (see
+    /// [`resolve_title`]).
     pub entries: &'a [HurlEntry],
+    /// Aliased helper collections declared by extra `# collection: … AS x`
+    /// directives. Their requests are addressed `alias/name` (see
+    /// [`resolve_qualified`]) so a report can call a request that deliberately
+    /// isn't part of the API collection under test.
+    pub helpers: &'a [HelperCollection],
     /// Global + pinned environment variables, already merged (pinned wins). The
     /// lowest layer of the variable precedence stack.
     pub base_vars: HashMap<String, String>,
@@ -158,10 +182,50 @@ pub struct RunContext<'a> {
     pub root: Option<PathBuf>,
     /// How each request is actually sent.
     pub runner: &'a dyn EntryRunner,
+    /// The language run errors are phrased in. They are user-facing text shown
+    /// in the report's error panel, so the ones this module raises come from
+    /// the `i18n` table like any other string. Defaults to English via
+    /// [`Strings::english`] for callers that have no language of their own
+    /// (the tests, a dry run).
+    pub strings: &'a crate::i18n::Strings,
+    /// The values chosen for this run's `PARAM` declarations, keyed by the
+    /// parameter's raw name. A name that isn't supplied falls back to the
+    /// default written in the report; empty for a report with no parameters,
+    /// and for a run that simply accepts every default.
+    pub params: super::params::ParamValues,
     /// Optional per-row streaming hook (see [`RowSink`]). `None` for a plain,
     /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
     /// front-end wants each row as it completes to fill a live grid.
     pub sink: Option<&'a RowSink<'a>>,
+}
+
+/// A helper collection loaded for a report, under the alias its requests are
+/// addressed through.
+#[derive(Debug, Clone, Default)]
+pub struct HelperCollection {
+    pub alias: String,
+    pub entries: Vec<HurlEntry>,
+}
+
+/// Resolve a request name that may be alias-qualified.
+///
+/// A leading `alias/` segment is only treated as an alias when that alias is
+/// actually declared — `/` is also the virtual-folder separator inside a title,
+/// so an undeclared prefix must still fall through to a normal title lookup.
+/// (A declared alias that collides with a top-level folder is rejected by
+/// validation rather than resolved by precedence: PaperTrail never picks
+/// silently between two readings of a name.)
+pub fn resolve_qualified<'a>(
+    entries: &'a [HurlEntry],
+    helpers: &'a [HelperCollection],
+    name: &str,
+) -> Option<&'a HurlEntry> {
+    if let Some((alias, rest)) = name.split_once('/')
+        && let Some(h) = helpers.iter().find(|h| h.alias == alias)
+    {
+        return resolve_title(&h.entries, rest);
+    }
+    resolve_title(entries, name)
 }
 
 /// Resolve a request `name` against the bound collection's entries, mirroring
@@ -188,6 +252,14 @@ pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a Hur
     }
 }
 
+/// The value each declared parameter has for this run — what the run was given,
+/// or the declaration's own default. The map an `ENVS` clause's names are
+/// resolved through outside the run itself (see
+/// [`compare::comparison_roles_with`](super::compare::comparison_roles_with)).
+fn effective_params(flow: &ReportFlow, ctx: &RunContext) -> super::params::ParamValues {
+    super::params::effective(&flow.params(), &ctx.params)
+}
+
 /// Run a whole flow and collect its rows, applying the final comparison/baseline
 /// collapse. This is the batch entry point (CSV export, dry run, tests); for a
 /// live streaming run a front-end sets [`RunContext::sink`] and calls
@@ -207,6 +279,9 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
+    ex.baseline_show = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx))
+        .map(|r| r.baseline_show)
+        .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
     // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
@@ -222,7 +297,20 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+        timing_columns: ex.timing_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
+        column_images: flow.column_images(),
+        column_truths: flow.column_truths(),
+        column_details: flow.column_details(),
+        images: HashMap::new(),
+        verdicts: HashMap::new(),
+        truths: HashMap::new(),
+        // A completed run has nothing outstanding; only a streaming front-end
+        // populates this, for the skeleton it is filling in.
+        pending: std::collections::HashSet::new(),
+        baseline_rows: HashMap::new(),
+        track_baseline: false,
+        trends: HashMap::new(),
     }
 }
 
@@ -231,7 +319,14 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// snapshot (a no-op otherwise). Done off the row model so the CSV writer and
 /// the TUI grid both pick it up unchanged. Applied once, after the emit phase.
 pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
-    if let Some(roles) = super::compare::comparison_roles(flow) {
+    // Decided *before* the collapse, because the collapse is the only moment at
+    // which both sides of a comparison exist: a truth-bearing report needs the
+    // baseline row kept so `Trend` can ask what the baseline itself answered.
+    result.track_baseline = result
+        .resolved_columns(&flow.header)
+        .iter()
+        .any(|c| c.truth.is_some());
+    if let Some(roles) = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx)) {
         super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
         .header
@@ -252,6 +347,166 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
                 .push(format!("baseline {}: {e}", path.display())),
         }
     }
+    resolve_truths(result, flow);
+    resolve_images(result, flow, ctx);
+}
+
+/// Score every `TRUTH` column against its ground truth, filling
+/// [`ReportResult::verdicts`] and [`ReportResult::truths`].
+///
+/// Placed after the comparison collapse for the same reason
+/// [`resolve_images`] is — that is where the row set is final — and *before*
+/// it, so that a picture is fetched for the rows a reader will actually score.
+///
+/// The truth is a template, interpolated against the row's own variable
+/// snapshot: the label almost always arrives as a loop binding (a `TUPLES FROM
+/// "labels.csv"` field, a `FOLDERS` name), so it differs per row and there is
+/// nothing to resolve until the row exists. A template that still holds an
+/// unresolved `{{ … }}` after substitution names something that was not in
+/// scope; that row is `Untested` rather than wrong, because the report has no
+/// ground truth for it — not because the answer was bad.
+fn resolve_truths(result: &mut ReportResult, flow: &ReportFlow) {
+    let columns = result.resolved_columns(&flow.header);
+    let truth_columns: Vec<&super::model::OutputColumn> =
+        columns.iter().filter(|c| c.truth.is_some()).collect();
+    if truth_columns.is_empty() {
+        return;
+    }
+    let labels = super::labels::LabelMap::parse(&flow.header.labels());
+    let mut verdicts = HashMap::new();
+    let mut truths = HashMap::new();
+    let mut trends = HashMap::new();
+    for (r, row) in result.rows.iter().enumerate() {
+        // Cells underneath, variables on top: a reported column is visible to a
+        // truth template too, but a loop binding of the same name is the more
+        // local thing and wins.
+        let mut scope = row.cells.clone();
+        scope.extend(row.vars.iter().map(|(k, v)| (k.clone(), v.clone())));
+        for col in &truth_columns {
+            let Some(template) = col.truth.as_deref() else {
+                continue;
+            };
+            let expected = substitute(template, &scope);
+            let untested = expected.trim().is_empty() || expected.contains("{{");
+            let score = |answer: &str| {
+                if untested {
+                    Verdict::Untested
+                } else if labels.same(&expected, answer) {
+                    Verdict::Correct
+                } else {
+                    Verdict::Incorrect
+                }
+            };
+            let verdict = score(&col.value(row, &result.no_match_marker));
+            // The same ground truth scores the baseline's answer, because the
+            // truth belongs to the *row* (the manifest line, the folder), not
+            // to the target that answered it. Only the answer differs.
+            if let Some(base) = result.baseline_rows.get(&r)
+                && let Some(t) =
+                    Trend::of(score(&col.value(base, &result.no_match_marker)), verdict)
+            {
+                trends.insert((r, col.header.clone()), t);
+            }
+            if verdict != Verdict::Untested {
+                truths.insert((r, col.header.clone()), expected);
+            }
+            verdicts.insert((r, col.header.clone()), verdict);
+        }
+    }
+    // The reserved `Correct` column: the row's verdict at a glance, so a
+    // ground-truthed report is readable in CSV — which has no colour — and
+    // sortable in a spreadsheet. Placed after the comparison's `Result` when
+    // there is one, so the two verdict columns read together at the left.
+    if !verdicts.is_empty() && !result.column_order.iter().any(|c| c == CORRECT_COLUMN) {
+        let at = usize::from(
+            result
+                .column_order
+                .first()
+                .is_some_and(|c| c == RESULT_COLUMN),
+        );
+        result.column_order.insert(at, CORRECT_COLUMN.to_string());
+    }
+    // `Trend` sits immediately after `Correct`, so the verdict columns read
+    // together at the left: what the answer was, and which way it moved.
+    if !trends.is_empty() && !result.column_order.iter().any(|c| c == TREND_COLUMN) {
+        let at = result
+            .column_order
+            .iter()
+            .position(|c| c == CORRECT_COLUMN)
+            .map_or(0, |i| i + 1);
+        result.column_order.insert(at, TREND_COLUMN.to_string());
+    }
+    for (r, row) in result.rows.iter_mut().enumerate() {
+        // A row can carry several ground-truthed columns. The roll-up favours
+        // the bad news: one wrong answer makes the row wrong, however many
+        // other columns were right.
+        let mut roll: Option<Verdict> = None;
+        for col in &truth_columns {
+            match verdicts.get(&(r, col.header.clone())) {
+                Some(Verdict::Incorrect) => {
+                    roll = Some(Verdict::Incorrect);
+                    break;
+                }
+                Some(Verdict::Correct) => roll = Some(Verdict::Correct),
+                Some(Verdict::Untested) => roll = roll.or(Some(Verdict::Untested)),
+                None => {}
+            }
+        }
+        if let Some(v) = roll {
+            row.cells
+                .insert(CORRECT_COLUMN.to_string(), v.as_str().to_string());
+        }
+        // The row's trend, favouring the bad news for the same reason the
+        // verdict roll-up does: one regressed column makes the row a
+        // regression, however many others improved.
+        if let Some(t) = Trend::rollup(
+            truth_columns
+                .iter()
+                .filter_map(|col| trends.get(&(r, col.header.clone())).copied()),
+        ) {
+            row.cells
+                .insert(TREND_COLUMN.to_string(), t.as_str().to_string());
+        }
+    }
+    result.verdicts = verdicts;
+    result.truths = truths;
+    result.trends = trends;
+}
+
+/// Resolve every `IMAGE` column's cell value to picture bytes, filling
+/// [`ReportResult::images`].
+///
+/// Done here, after the comparison collapse, because that is the point at which
+/// the row set and the resolved columns are final — resolving earlier would
+/// fetch pictures for baseline rows that are about to be folded away.
+///
+/// Failures are recorded as run *notes*, never errors: a report whose subject is
+/// an API run must not fail because an illustration beside it was unreachable.
+/// The cell simply stays as its text, which is what CSV and JSON would have
+/// written anyway.
+fn resolve_images(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) {
+    let columns = result.resolved_columns(&flow.header);
+    let image_columns: Vec<&super::model::OutputColumn> =
+        columns.iter().filter(|c| c.image.is_some()).collect();
+    if image_columns.is_empty() {
+        return;
+    }
+    let mut resolver = super::image::ImageResolver::new();
+    resolver.offline = ctx.runner.offline();
+    let mut images = HashMap::new();
+    for (r, row) in result.rows.iter().enumerate() {
+        for col in &image_columns {
+            let value = col.value(row, &result.no_match_marker);
+            if value.is_empty() || value == result.no_match_marker {
+                continue;
+            }
+            if let Some(img) = resolver.resolve(&value, ctx.root.as_deref()) {
+                images.insert((r, col.header.clone()), img);
+            }
+        }
+    }
+    result.images = images;
+    result.errors.extend(resolver.notes);
 }
 
 /// Mutable interpreter state threaded through the walk.
@@ -288,9 +543,21 @@ struct Exec<'a> {
     broadcast: HashMap<String, String>,
     /// Produced column keys in first-seen order (the default column order).
     column_order: Vec<String>,
+    /// Produced column keys whose value came from a *timing* intrinsic, however
+    /// the column is named — see [`ReportResult::timing_columns`].
+    timing_columns: Vec<String>,
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
+    /// Field names from the flow's `ENVS BASELINE(…) SHOW(…)` clause. These
+    /// count as explicitly-shown fields for *every* request in the run, because
+    /// the finalize-phase copy that produces `baseline.<alias>.<field>` can only
+    /// see fields the rows actually carry — and intrinsics like `Time` are
+    /// suppressed by default on any request that declares its own fields. Without
+    /// this the documented `BASELINE("prod") SHOW(Time)` example emits nothing at
+    /// all. It is a flow-wide property, so it is seeded once and inherited by
+    /// every forked iteration.
+    baseline_show: Vec<String>,
 }
 
 /// A cloneable snapshot of an [`Exec`]'s scope/capture/target state (no output
@@ -308,6 +575,7 @@ struct ExecState {
     target: Option<String>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
+    baseline_show: Vec<String>,
 }
 
 /// The per-iteration output collected from a forked [`Exec`], reassembled in
@@ -315,6 +583,7 @@ struct ExecState {
 struct IterOut {
     rows: Vec<ReportRow>,
     columns: Vec<String>,
+    timing_columns: Vec<String>,
     errors: Vec<String>,
 }
 
@@ -331,7 +600,9 @@ impl<'a> Exec<'a> {
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
+            timing_columns: Vec::new(),
             errors: Vec::new(),
+            baseline_show: Vec::new(),
         }
     }
 
@@ -348,6 +619,7 @@ impl<'a> Exec<'a> {
             target: self.target.clone(),
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
+            baseline_show: self.baseline_show.clone(),
         }
     }
 
@@ -365,7 +637,9 @@ impl<'a> Exec<'a> {
             target_env: state.target_env,
             broadcast: state.broadcast,
             column_order: Vec::new(),
+            timing_columns: Vec::new(),
             errors: Vec::new(),
+            baseline_show: state.baseline_show,
         }
     }
 
@@ -450,6 +724,14 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Record that `key` holds a timing measurement, so the comparison phase can
+    /// leave it out of the diff no matter what the column is called.
+    fn note_timing_column(&mut self, key: &str) {
+        if !self.timing_columns.iter().any(|c| c == key) {
+            self.timing_columns.push(key.to_string());
+        }
+    }
+
     /// Walk a block, returning the rows it produces. This-level `REPORT` cells
     /// are accumulated and either broadcast into the rows produced by nested
     /// loops or, when the block has no loop, emitted as a single row.
@@ -469,12 +751,36 @@ impl<'a> Exec<'a> {
 
         for (node_index, node) in nodes.iter().enumerate() {
             match node {
+                // Comments are carried through the AST so edits don't delete
+                // them; they do nothing at run time.
+                FlowNode::Comment(_) => {}
                 FlowNode::Assign { key, value } => {
                     let v = substitute(&unquote(value), &self.vars_for());
                     self.set_var(key, v);
                 }
                 FlowNode::ListDecl { name, producer } => {
                     self.lists.insert(name.clone(), producer.clone());
+                }
+                // A parameter binds exactly like an assignment of the value
+                // this run chose for it, falling back to the declared default.
+                // The value is already unquoted by the parser, so unlike an
+                // `Assign` (whose value is the raw rest of the line) it only
+                // needs interpolating.
+                //
+                // A value that can't be used (a required parameter nobody
+                // supplied, a choice that isn't on the list) is recorded as a
+                // run error and the name is left unset rather than bound to an
+                // empty string: a report of plausible-looking rows built from
+                // a URL with a hole in it is worse than one that says why it
+                // couldn't run.
+                FlowNode::Param(p) => {
+                    match super::params::value_for(p, &self.ctx.params, self.ctx.strings) {
+                        Ok(raw) => {
+                            let v = substitute(&raw, &self.vars_for());
+                            self.set_var(&p.name, v);
+                        }
+                        Err(e) => self.errors.push(e),
+                    }
                 }
                 FlowNode::Request { name } => {
                     self.run_request(name);
@@ -564,7 +870,7 @@ impl<'a> Exec<'a> {
     /// forward. Records an error (but does not abort) if the name is unresolved
     /// or the send fails.
     fn run_request(&mut self, name: &str) -> Option<EntryOutcome> {
-        let base = match resolve_title(self.ctx.entries, name) {
+        let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
@@ -649,7 +955,7 @@ impl<'a> Exec<'a> {
         name: &str,
         alias: Option<&str>,
         response_fmt: Option<ResponseFmt>,
-        show: &[String],
+        show: &[ShowField],
         hide: &[String],
         with: &[WithItem],
     ) -> Vec<(String, String)> {
@@ -658,7 +964,7 @@ impl<'a> Exec<'a> {
             .unwrap_or_else(|| leaf(name).to_string());
         let mut cells: Vec<(String, String)> = Vec::new();
 
-        let base = match resolve_title(self.ctx.entries, name) {
+        let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
@@ -708,6 +1014,9 @@ impl<'a> Exec<'a> {
         // Intrinsics (fixed order).
         cells.push((format!("{alias}.HttpStatus"), eo.status.to_string()));
         cells.push((format!("{alias}.Time"), eo.duration_ms.to_string()));
+        cells.push((format!("{alias}.TimeSetup"), eo.setup_ms.to_string()));
+        cells.push((format!("{alias}.TimeWait"), eo.wait_ms.to_string()));
+        cells.push((format!("{alias}.TimeDownload"), eo.download_ms.to_string()));
         cells.push((format!("{alias}.Asserts"), asserts_summary(&eo)));
         cells.push((
             format!("{alias}.Error"),
@@ -731,15 +1040,29 @@ impl<'a> Exec<'a> {
             // counterpart to renaming an intrinsic in the `columns:` directive.
             // `Response` uses the format-resolved body so it honours RESPONSE
             // RAW/PRETTY. Anything else is a Hurl query evaluated by `eval_field`.
-            let value = match query.trim() {
+            let query = query.trim();
+            let value = match query {
                 "HttpStatus" => eo.status.to_string(),
                 "Time" => eo.duration_ms.to_string(),
+                "TimeSetup" => eo.setup_ms.to_string(),
+                "TimeWait" => eo.wait_ms.to_string(),
+                "TimeDownload" => eo.download_ms.to_string(),
                 "Asserts" => asserts_summary(&eo),
                 "Error" => eo.error.clone().unwrap_or_default(),
                 "Response" => response.clone(),
                 q => eval_field(q, &eo).unwrap_or_default(),
             };
-            cells.push((format!("{alias}.{fname}"), value));
+            let key = format!("{alias}.{fname}");
+            // A field that aliases a timing intrinsic is still a *time*, so the
+            // comparison phase has to know. It can't tell from the column name
+            // — that is the user's, not the intrinsic's — and a renamed time
+            // differs on every single run, so without this every row of a
+            // comparison report reads as changed. See
+            // [`ReportResult::timing_columns`].
+            if TIMING_INTRINSIC_FIELDS.contains(&query) {
+                self.note_timing_column(&key);
+            }
+            cells.push((key, value));
         }
 
         // Column selection is applied to the fully-built `cells` list.
@@ -761,13 +1084,33 @@ impl<'a> Exec<'a> {
             cells.retain(|(k, _)| {
                 let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
                 // [Reports] and WITH fields are always kept; intrinsics survive
-                // only when SHOW explicitly lists them.
-                !INTRINSIC_FIELDS.contains(&suffix) || show.iter().any(|s| s == suffix)
+                // only when SHOW explicitly lists them — either the statement's
+                // own SHOW, or the loop-level `ENVS BASELINE(…) SHOW(…)`, whose
+                // whole purpose is to put that field beside its baseline copy.
+                !INTRINSIC_FIELDS.contains(&suffix)
+                    || show.iter().any(|s| s.name() == suffix)
+                    || self.baseline_show.iter().any(|s| s == suffix)
+            });
+        } else {
+            // Bare request: intrinsics are kept, except the opt-in ones.  The
+            // timing breakdown is diagnostic detail, so adding it must not
+            // silently widen every existing report's output — it appears only
+            // when SHOW asks for it.  Everything else on a bare request is
+            // already present, so SHOW is otherwise a no-op for inclusion; only
+            // HIDE can narrow the output further.
+            //
+            // A loop-level `ENVS BASELINE(…) SHOW(…)` counts as asking, exactly
+            // as it does in the declared-fields branch above: its whole purpose
+            // is to put that field beside its baseline copy, and the copy is
+            // made in the finalize phase from the cell that has to still be
+            // here for it to find.
+            cells.retain(|(k, _)| {
+                let suffix = k.strip_prefix(&format!("{alias}.")).unwrap_or(k.as_str());
+                !OPT_IN_INTRINSIC_FIELDS.contains(&suffix)
+                    || show.iter().any(|s| s.name() == suffix)
+                    || self.baseline_show.iter().any(|s| s == suffix)
             });
         }
-        // Bare request: all cells (all 5 intrinsics) are kept.  SHOW on a bare
-        // request names fields that are already present, so it is a no-op for
-        // inclusion; only HIDE can narrow the output further.
 
         // Apply HIDE in all branches: remove any field whose suffix is in `hide`.
         if !hide.is_empty() {
@@ -826,6 +1169,7 @@ impl<'a> Exec<'a> {
             IterOut {
                 rows,
                 columns: sub.column_order,
+                timing_columns: sub.timing_columns,
                 errors: sub.errors,
             }
         };
@@ -851,8 +1195,19 @@ impl<'a> Exec<'a> {
         // all-live.
         let mut live: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
+        // An environment (or a snapshot path) may be named through a parameter
+        // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
+        // another pair of stacks without being edited. Resolved against the
+        // run's parameters only, and identically in `finalize`, so the rows
+        // this loop produces carry the targets the collapse then looks for.
+        // The parameters are bound in the prelude — validation refuses a
+        // `PARAM` written any later — so by the time a loop is reached they are
+        // ordinary variables, and `finalize` reaches the same names from the
+        // declarations themselves.
+        let vars = self.vars_for();
+        let resolve = |s: &String| crate::environment::substitute(s, &vars);
         match clause {
-            EnvClause::Plain(names) => live = names.clone(),
+            EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
             EnvClause::Roles {
                 baseline,
                 comparisons,
@@ -860,8 +1215,8 @@ impl<'a> Exec<'a> {
             } => {
                 for r in baseline.iter().chain(comparisons) {
                     match r {
-                        RoleRef::Env(n) => live.push(n.clone()),
-                        RoleRef::File(p) => files.push(p.clone()),
+                        RoleRef::Env(n) => live.push(resolve(n)),
+                        RoleRef::File(p) => files.push(resolve(p)),
                     }
                 }
             }
@@ -887,6 +1242,7 @@ impl<'a> Exec<'a> {
             IterOut {
                 rows,
                 columns: sub.column_order,
+                timing_columns: sub.timing_columns,
                 errors: sub.errors,
             }
         };
@@ -976,6 +1332,9 @@ impl<'a> Exec<'a> {
             for c in &out.columns {
                 self.note_column(c);
             }
+            for c in &out.timing_columns {
+                self.note_timing_column(c);
+            }
             self.errors.extend(out.errors);
             rows.extend(out.rows);
         }
@@ -988,6 +1347,16 @@ impl<'a> Exec<'a> {
     fn check_arity(&mut self, pattern: &Pattern, item: &ProducerItem) {
         let want = pattern.binders.len();
         let got = item.values.len();
+        // A single binder over an item that also carries *named* fields is the
+        // documented `TUPLES FROM "manifest.csv"` idiom (`FOR ROW IN TUPLES …`,
+        // reading the columns as `{{ front }}`, `{{ expected }}`, …): the row
+        // is deliberately taken whole rather than destructured, and the header
+        // names are the interface. Counting that as a mismatch put one error on
+        // the run for every row of the manifest — the loudest possible
+        // complaint about the usage the cookbook recommends.
+        if want == 1 && !item.named.is_empty() {
+            return;
+        }
         let ok = if pattern.rest {
             want <= got
         } else {
@@ -1045,15 +1414,30 @@ impl<'a> Exec<'a> {
                     .map(|p| ProducerItem::scalar(p.to_string_lossy().into_owned()))
                     .collect())
             }
-            Producer::Folders { dir, roles } => {
+            Producer::Folders { dir, glob, roles } => {
                 let dir = producers::resolve_path(root, &self.subst_unquoted(dir));
-                let roles: Vec<(String, String)> = roles
+                let glob = glob.as_ref().map(|g| self.subst_unquoted(g));
+                let roles: Vec<RoleBinding> = roles
                     .iter()
-                    .map(|(r, g)| (r.clone(), self.subst_unquoted(g)))
+                    .map(|r| RoleBinding {
+                        name: r.name.clone(),
+                        glob: self.subst_unquoted(&r.glob),
+                        optional: r.optional,
+                    })
                     .collect();
+                // A recursive walk searches a tree, so the intermediate folders
+                // it must visit simply aren't results; a flat walk enumerates a
+                // known set, so a mis-shaped member stays a loud failure.
+                let on_missing = if glob.as_deref().is_some_and(|g| g.contains("**")) {
+                    producers::Missing::Skip
+                } else {
+                    producers::Missing::Error
+                };
                 let mut items = Vec::new();
-                for folder in producers::list_folders(&dir)? {
-                    let named = producers::folder_roles(&folder, &roles)?;
+                for folder in producers::list_folders(&dir, glob.as_deref())? {
+                    let Some(named) = producers::folder_roles(&folder, &roles, on_missing)? else {
+                        continue;
+                    };
                     items.push(ProducerItem {
                         values: vec![folder.to_string_lossy().into_owned()],
                         named,
@@ -1115,8 +1499,36 @@ fn asserts_summary(eo: &EntryOutcome) -> String {
 /// The intrinsic column suffixes every `REPORT REQUEST` emits (before any
 /// `[Reports]`/`WITH` fields), in their fixed emission order. Shared so
 /// validation of a `SHOW(...)` selector knows the always-present field names.
-pub(crate) const INTRINSIC_FIELDS: [&str; 5] =
-    ["HttpStatus", "Time", "Asserts", "Error", "Response"];
+///
+/// `Time` is the whole transfer; `TimeSetup`/`TimeWait`/`TimeDownload` are its
+/// parts (see [`crate::hurl::EntryOutcome::setup_ms`]) and always sum to it.
+/// They exist because `Time` alone can't answer "was the server slow, or was my
+/// own machine?" — under a wide `PARALLEL` run, connection setup and a
+/// saturated uplink inflate `Time` while the server is untouched, and only the
+/// breakdown shows that.
+/// The subset of [`INTRINSIC_FIELDS`] that a request emits *only* when SHOW
+/// names it. Unlike the rest, these are diagnostic detail rather than part of
+/// the default shape of a report, so they stay out of the way until asked for.
+pub(crate) const OPT_IN_INTRINSIC_FIELDS: [&str; 3] = ["TimeSetup", "TimeWait", "TimeDownload"];
+
+/// The intrinsics that measure *elapsed time*. They are the ones no two runs
+/// ever agree on, so they are excluded from comparison diffs — both under their
+/// own names (by [`crate::report::compare`]) and under any name a `[Reports]`
+/// or `WITH` field aliases them to (recorded per run in
+/// [`crate::report::model::ReportResult::timing_columns`]).
+pub(crate) const TIMING_INTRINSIC_FIELDS: [&str; 4] =
+    ["Time", "TimeSetup", "TimeWait", "TimeDownload"];
+
+pub(crate) const INTRINSIC_FIELDS: [&str; 8] = [
+    "HttpStatus",
+    "Time",
+    "TimeSetup",
+    "TimeWait",
+    "TimeDownload",
+    "Asserts",
+    "Error",
+    "Response",
+];
 
 /// Evaluate one `[Reports]`/`WITH` field query against an already-received
 /// response, *tolerantly*: a non-match (or an unsupported query type) returns
@@ -1240,6 +1652,9 @@ mod tests {
         headers: Vec<(String, String)>,
         asserts: Vec<(bool,)>,
         duration_ms: u64,
+        setup_ms: u64,
+        wait_ms: u64,
+        download_ms: u64,
         error: Option<String>,
     }
 
@@ -1327,6 +1742,9 @@ mod tests {
                     .collect(),
                 captures: c.captures,
                 duration_ms: c.duration_ms,
+                setup_ms: c.setup_ms,
+                wait_ms: c.wait_ms,
+                download_ms: c.download_ms,
                 ok: c.error.is_none(),
                 error: c.error.clone(),
             };
@@ -1362,6 +1780,7 @@ mod tests {
         let flow = parse_flow(src).expect("flow parses");
         let ctx = RunContext {
             entries,
+            helpers: &[],
             base_vars: base_vars
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1379,9 +1798,196 @@ mod tests {
                 .collect(),
             root: None,
             runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         run_flow(&flow, &ctx)
+    }
+
+    /// Run `src` with both named environments and explicit parameter values —
+    /// what a comparison whose stacks are chosen at run time needs.
+    fn run_envs_with_params(
+        src: &str,
+        entries: &[HurlEntry],
+        named_envs: &[(&str, &[(&str, &str)])],
+        params: &[(&str, &str)],
+        fake: &Fake,
+    ) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: named_envs
+                .iter()
+                .map(|(name, kvs)| {
+                    (
+                        name.to_string(),
+                        kvs.iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    /// Which two stacks a comparison runs against is the thing most worth
+    /// parameterising, so an `ENVS` clause may name them through parameters.
+    /// Both halves have to agree: the loop visits the resolved environments and
+    /// the finalize-phase collapse looks for those same targets — resolve one
+    /// and not the other and every comparison comes back unmatched.
+    #[test]
+    fn a_comparison_can_be_pointed_at_its_stacks_by_parameter() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let src = "PARAM BASELINE_ENV = \"prod\"\nPARAM COMPARE_ENV = \"staging\"\n\
+                   FOR T IN ENVS BASELINE(\"{{BASELINE_ENV}}\"), COMPARISON(\"{{COMPARE_ENV}}\")\n\
+                       REPORT REQUEST r AS proc\nEND\n";
+        let envs = [
+            ("prod", &[][..]),
+            ("staging", &[][..]),
+            ("prod-eu", &[][..]),
+            ("staging-eu", &[][..]),
+        ];
+
+        // On its declared defaults: one collapsed row, no run errors.
+        let res = run_envs_with_params(src, &entries, &envs, &[], &fake);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0].target.as_deref(), Some("staging"));
+
+        // Pointed at another pair without the file being edited.
+        let res = run_envs_with_params(
+            src,
+            &entries,
+            &envs,
+            &[("BASELINE_ENV", "prod-eu"), ("COMPARE_ENV", "staging-eu")],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(
+            res.rows[0].target.as_deref(),
+            Some("staging-eu"),
+            "the collapse kept the candidate row for the chosen comparison env"
+        );
+    }
+
+    /// Run `src` with explicit parameter values, as a run settings form or a
+    /// `--param` flag would supply them.
+    fn run_with_params(
+        src: &str,
+        entries: &[HurlEntry],
+        params: &[(&str, &str)],
+        fake: &Fake,
+    ) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    fn param_entries() -> Vec<HurlEntry> {
+        vec![HurlEntry {
+            title: "get".into(),
+            method: "GET".into(),
+            url: "http://x/{{TARGET}}".into(),
+            reports: vec![("Url".into(), "url".into())],
+            ..Default::default()
+        }]
+    }
+
+    /// The whole point of a parameter: the same file runs against a different
+    /// value without being edited.
+    #[test]
+    fn a_chosen_parameter_value_reaches_the_request() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM ENV TARGET = \"staging\"\nREPORT TARGET AS Target\nREPORT REQUEST get\n";
+
+        let on_defaults = run_with_params(src, &entries, &[], &fake);
+        assert!(on_defaults.errors.is_empty(), "{:?}", on_defaults.errors);
+        assert_eq!(on_defaults.rows[0].cells.get("Target").unwrap(), "staging");
+
+        let overridden = run_with_params(src, &entries, &[("TARGET", "prod")], &fake);
+        assert_eq!(overridden.rows[0].cells.get("Target").unwrap(), "prod");
+    }
+
+    /// A required parameter nobody supplied must stop with a reason, not run
+    /// with a hole in every URL. The name is left unset so the requests that
+    /// depend on it are visibly wrong rather than plausibly wrong.
+    #[test]
+    fn a_missing_required_parameter_is_a_run_error() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM TEXT TARGET\nREPORT REQUEST get\n";
+        let result = run_with_params(src, &entries, &[], &fake);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(result.errors[0].contains("TARGET"), "{:?}", result.errors);
+
+        let supplied = run_with_params(src, &entries, &[("TARGET", "au")], &fake);
+        assert!(supplied.errors.is_empty(), "{:?}", supplied.errors);
+    }
+
+    /// A value from outside the file is held to the declaration's own rules —
+    /// otherwise the type is only advice to the form that collected it.
+    #[test]
+    fn a_supplied_value_that_breaks_its_own_rules_stops_the_run() {
+        let entries = param_entries();
+        let fake = Fake::new(&[(
+            "get",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let src = "PARAM CHOICE(\"au\", \"eu\") TARGET = \"au\"\nREPORT REQUEST get\n";
+        let bad = run_with_params(src, &entries, &[("TARGET", "us")], &fake);
+        assert_eq!(bad.errors.len(), 1, "{:?}", bad.errors);
+        assert!(bad.errors[0].contains("us"), "{:?}", bad.errors);
     }
 
     #[test]
@@ -1599,6 +2205,9 @@ mod tests {
             header: "m".into(),
             sources: vec!["process.missing".into()],
             stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
         };
         assert_eq!(col.value(&res.rows[0], &res.no_match_marker), "\u{2205}");
     }
@@ -1750,10 +2359,13 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -1822,10 +2434,13 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -1894,10 +2509,13 @@ mod tests {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: Some(&sink),
         };
         let result = run_flow_raw(&flow, &ctx);
@@ -2014,10 +2632,13 @@ mod tests {
         let flow = parse_flow(src).expect("flow parses");
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: None,
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2103,16 +2724,114 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(d.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
         assert!(res.rows[0].cells.get("FILE").unwrap().ends_with("a.jpg"));
         assert_eq!(fake.call_count(), 2);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// End-to-end: a recursive `FOLDERS … MATCH "**"` walk with roles yields one
+    /// row per *case* folder, wherever it sits in the tree, and silently passes
+    /// over the intermediate container folders that carry no role files. Without
+    /// the skip, every `<type>`/`<batch>` folder on the way down would fail the
+    /// run for a role that was never meant to match there.
+    #[test]
+    fn recursive_folders_loop_skips_containers_and_binds_roles() {
+        let d = tmpdir("folders_rec");
+        for case in ["batch_a/june/case_1", "batch_b/case_2"] {
+            let c = d.join(case);
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::write(c.join("scan_front.jpg"), "x").unwrap();
+        }
+        // One case also has a back image; the other doesn't, which is exactly
+        // what the optional role is for.
+        std::fs::write(d.join("batch_a/june/case_1/scan_back.jpg"), "x").unwrap();
+
+        let fake = Fake::new(&[(
+            "up",
+            Canned {
+                status: 200,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("up", &[])];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" MATCH \"**\" WITH front=\"*_front.jpg\", back=\"*_back.jpg\"?\n    REPORT REQUEST up\n    REPORT (CASE)\n    REPORT \"{{front}}\" AS Front\n    REPORT \"{{back}}\" AS Back\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
+        // Sorted by full path, so `batch_a/june/case_1` comes first.
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Front")
+                .unwrap()
+                .ends_with("scan_front.jpg")
+        );
+        assert!(
+            res.rows[0]
+                .cells
+                .get("Back")
+                .unwrap()
+                .ends_with("scan_back.jpg")
+        );
+        // The case with no back image still produced a row, with an empty cell.
+        assert_eq!(res.rows[1].cells.get("Back").unwrap(), "");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A *flat* `FOLDERS` walk enumerates a known set, so a member missing a
+    /// required role is still a loud failure rather than a quiet omission.
+    #[test]
+    fn flat_folders_loop_still_fails_on_a_missing_required_role() {
+        let d = tmpdir("folders_flat");
+        std::fs::create_dir_all(d.join("case_1")).unwrap();
+        let fake = Fake::new(&[]);
+        let entries: [HurlEntry; 0] = [];
+        let flow = parse_flow(
+            "FOR CASE IN FOLDERS \".\" WITH front=\"*_front.jpg\"\n    REPORT (CASE)\nEND\n",
+        )
+        .unwrap();
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(d.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.rows.is_empty());
+        assert!(
+            res.errors.iter().any(|e| e.contains("front")),
+            "{:?}",
+            res.errors
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -2201,6 +2920,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -2215,6 +2937,7 @@ mod tests {
         .unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: [
                 (
@@ -2234,6 +2957,8 @@ mod tests {
             .collect(),
             root: None,
             runner: &EchoEnv,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -2287,6 +3012,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -2303,12 +3031,15 @@ mod tests {
         // First run (VERDICT=CLEAR) → save as a `.baseline` snapshot.
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
                 .into_iter()
                 .collect(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&flow, &ctx);
@@ -2320,12 +3051,15 @@ mod tests {
         let flow2 = parse_flow(&format!("# baseline: proc.baseline\n{flow_src}")).unwrap();
         let ctx2 = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "REVIEW".to_string())]
                 .into_iter()
                 .collect(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let second = run_flow(&flow2, &ctx2);
@@ -2381,6 +3115,9 @@ mod tests {
                         asserts: Vec::new(),
                         captures: Vec::new(),
                         duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
                         ok: true,
                         error: None,
                     }],
@@ -2398,12 +3135,15 @@ mod tests {
         let base_flow = parse_flow(body_src).unwrap();
         let base_ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: [("VERDICT".to_string(), "CLEAR".to_string())]
                 .into_iter()
                 .collect(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
@@ -2418,6 +3158,7 @@ mod tests {
         let cmp_flow = parse_flow(&cmp_src).unwrap();
         let cmp_ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: [(
                 "staging".to_string(),
@@ -2429,6 +3170,8 @@ mod tests {
             .collect(),
             root: Some(dir.clone()),
             runner: &Echo,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
@@ -2505,10 +3248,13 @@ mod tests {
         let flow = parse_flow(flow_src).unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(dir.clone()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let first = run_flow(&flow, &ctx);
@@ -2539,10 +3285,13 @@ mod tests {
         let flow = parse_flow("# baseline: nope.baseline\nREPORT REQUEST proc\n").unwrap();
         let ctx = RunContext {
             entries: &entries,
+            helpers: &[],
             base_vars: HashMap::new(),
             named_envs: HashMap::new(),
             root: Some(std::env::temp_dir()),
             runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
             sink: None,
         };
         let res = run_flow(&flow, &ctx);
@@ -3126,6 +3875,94 @@ mod tests {
     }
 
     #[test]
+    fn time_breakdown_is_opt_in_on_a_bare_request() {
+        // A bare request keeps its default intrinsics but not the timing parts:
+        // adding them must not silently widen every existing report.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run("REPORT REQUEST r\n", &entries, &[], &[], &fake);
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.Time"), Some(&"90".to_string()));
+        assert_eq!(cells.get("r.TimeSetup"), None);
+        assert_eq!(cells.get("r.TimeWait"), None);
+        assert_eq!(cells.get("r.TimeDownload"), None);
+    }
+
+    #[test]
+    fn show_selects_individual_time_breakdown_columns() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r SHOW(Time, TimeWait)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.TimeWait"), Some(&"25".to_string()));
+        // SHOW on a bare request only opts the breakdown in; the other
+        // intrinsics it does not name stay as they were.
+        assert_eq!(cells.get("r.Time"), Some(&"90".to_string()));
+        assert_eq!(cells.get("r.HttpStatus"), Some(&"200".to_string()));
+        assert_eq!(cells.get("r.TimeSetup"), None);
+        assert_eq!(cells.get("r.TimeDownload"), None);
+    }
+
+    #[test]
+    fn time_breakdown_is_available_to_with_fields_and_declared_show() {
+        // With declared fields, intrinsics are suppressed unless SHOWn, and the
+        // breakdown can also be aliased by a WITH field query like any other
+        // intrinsic.
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"x\":7}".into(),
+                duration_ms: 90,
+                setup_ms: 60,
+                wait_ms: 25,
+                download_ms: 5,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let res = run(
+            "REPORT REQUEST r SHOW(TimeSetup) WITH\n    Server: TimeWait\n    Body: TimeDownload\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("r.TimeSetup"), Some(&"60".to_string()));
+        assert_eq!(cells.get("r.Server"), Some(&"25".to_string()));
+        assert_eq!(cells.get("r.Body"), Some(&"5".to_string()));
+        assert_eq!(cells.get("r.Time"), None, "intrinsics suppressed");
+        assert_eq!(res.column_order, vec!["r.TimeSetup", "r.Server", "r.Body"]);
+    }
+
+    #[test]
     fn worked_ex5_reports_with_show_additive_union() {
         // [Reports] has `A`; WITH { B: ... }; SHOW(Response) → r.Response, r.A, r.B.
         let fake = Fake::new(&[(
@@ -3155,6 +3992,575 @@ mod tests {
         assert_eq!(res.column_order, vec!["r.Response", "r.A", "r.B"]);
     }
 
+    /// End-to-end: a file-driven report whose column carries `IMAGE` resolves
+    /// each row's value into [`ReportResult::images`], keyed by `(row, header)`,
+    /// while the cell text is left exactly as produced.
+    #[test]
+    fn an_image_column_resolves_local_files_during_the_run() {
+        let dir = tmpdir("images");
+        let png = crate::report::image::tests::png_1x1();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        std::fs::write(dir.join("b.png"), &png).unwrap();
+        // A third value that is not a picture at all: it must leave the cell as
+        // text and note the problem, never fail the report.
+        std::fs::write(dir.join("c.png"), b"not an image").unwrap();
+
+        let flow = parse_flow(
+            "FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame IMAGE(HEIGHT 60)\nEND\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        assert_eq!(res.rows.len(), 3);
+        let row_of = |name: &str| {
+            res.rows
+                .iter()
+                .position(|r| r.cells.get("Frame").is_some_and(|v| v.ends_with(name)))
+                .unwrap_or_else(|| panic!("row for {name}"))
+        };
+        for name in ["a.png", "b.png"] {
+            let img = res
+                .images
+                .get(&(row_of(name), "Frame".to_string()))
+                .unwrap_or_else(|| panic!("resolved {name}"));
+            assert_eq!(img.mime, "image/png");
+            assert_eq!(img.bytes, png);
+        }
+        assert!(
+            !res.images
+                .contains_key(&(row_of("c.png"), "Frame".to_string())),
+            "a non-picture value resolves to nothing"
+        );
+        assert!(
+            !res.rows[row_of("c.png")].cells["Frame"].is_empty(),
+            "and its cell keeps its text"
+        );
+        assert!(
+            res.errors.iter().any(|e| e.contains("c.png")),
+            "with a note saying why: {:?}",
+            res.errors
+        );
+        // The clause reaches the resolved columns, so a writer can size the box.
+        let cols = res.resolved_columns(&flow.header);
+        assert_eq!(
+            cols[0].image.and_then(|i| i.height),
+            Some(60),
+            "the IMAGE clause reaches the output column"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end ground truth: each row's `TRUTH` template is interpolated
+    /// against that row's own variables, compared through the declared label
+    /// classes, and scored into [`ReportResult::verdicts`] — while the cell
+    /// text of both the answer and the truth is left exactly as written.
+    #[test]
+    fn a_truth_column_scores_each_row_through_the_label_classes() {
+        let dir = tmpdir("truth");
+        std::fs::write(
+            dir.join("labels.csv"),
+            "answer,expected\nLow Risk,real\nLow Risk,fake\nHigh Risk,\n",
+        )
+        .unwrap();
+        let flow = parse_flow(
+            "# labels: Pass = pass, real, low risk\n             # labels: Fail = fail, fake, high risk\n             FOR ROW IN TUPLES FROM \"labels.csv\"\n             \x20   REPORT \"{{ answer }}\" AS Verdict TRUTH \"{{ expected }}\"\n             END\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+
+        assert_eq!(res.rows.len(), 3);
+        let verdict = |r: usize| res.verdicts.get(&(r, "Verdict".to_string())).copied();
+        assert_eq!(
+            verdict(0),
+            Some(Verdict::Correct),
+            "`Low Risk` and `real` are the same class"
+        );
+        assert_eq!(verdict(1), Some(Verdict::Incorrect));
+        assert_eq!(
+            verdict(2),
+            Some(Verdict::Untested),
+            "a blank ground truth is never scored as a pass"
+        );
+        assert_eq!(
+            res.truths
+                .get(&(0, "Verdict".to_string()))
+                .map(String::as_str),
+            Some("real"),
+            "the resolved truth is kept beside the verdict"
+        );
+        assert!(
+            !res.truths.contains_key(&(2, "Verdict".to_string())),
+            "an untested row has no truth to record"
+        );
+        assert_eq!(
+            res.rows[0].cells.get("Verdict").map(String::as_str),
+            Some("Low Risk"),
+            "scoring never rewrites the reported value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of the whole ground-truth feature: in a comparison, a change
+    /// *towards* the truth is good and a change *away* from it is bad. Both
+    /// rows below read `changed` in `Result` — structurally they are the same
+    /// event — and only `Trend` tells them apart.
+    #[test]
+    fn a_comparison_trends_each_row_towards_or_away_from_its_truth() {
+        struct EchoEnv;
+        impl EntryRunner for EchoEnv {
+            fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
+                let v = vars.get("VERDICT").cloned().unwrap_or_default();
+                let body = format!("{{\"overall\":\"{v}\"}}");
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: body.clone(),
+                        raw_body: body,
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+
+        let dir = tmpdir("trend");
+        // Row `a` is what staging got right and prod got wrong; row `b` is the
+        // opposite. Same run, same diff, opposite meanings.
+        std::fs::write(dir.join("truth.csv"), "name,expected\na,REVIEW\nb,CLEAR\n").unwrap();
+        let entries = [entry("proc", &[])];
+        let flow = parse_flow(
+            "FOR TARGET IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n    FOR ROW IN TUPLES FROM \"truth.csv\"\n        REPORT REQUEST proc WITH\n            overall: jsonpath \"$.overall\" TRUTH \"{{ expected }}\"\n        END\n    END\nEND\n",
+        )
+        .expect("flow parses");
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: [
+                (
+                    "prod".to_string(),
+                    [("VERDICT".to_string(), "CLEAR".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                (
+                    "staging".to_string(),
+                    [("VERDICT".to_string(), "REVIEW".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            root: Some(dir.clone()),
+            runner: &EchoEnv,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(res.rows.len(), 2, "one candidate row per manifest line");
+        let trend = |r: usize| res.rows[r].cells.get(TREND_COLUMN).map(String::as_str);
+        assert_eq!(
+            trend(0),
+            Some(Trend::Fixed.as_str()),
+            "prod answered CLEAR where the truth is REVIEW; staging got it right"
+        );
+        assert_eq!(
+            trend(1),
+            Some(Trend::Regressed.as_str()),
+            "and the other way round on the second row"
+        );
+        assert_eq!(
+            res.trends.get(&(0, "proc.overall".to_string())).copied(),
+            Some(Trend::Fixed),
+            "the per-cell trend is recorded too, for tinting the cell itself"
+        );
+        // Structurally the two rows are the same event, which is exactly why
+        // `Trend` has to be a column of its own rather than a reading of
+        // `Result`.
+        for r in &res.rows {
+            assert!(
+                r.cells
+                    .get(crate::report::compare::RESULT_COLUMN)
+                    .is_some_and(|v| v.contains("overall")),
+                "both rows report the same structural change"
+            );
+        }
+        let at = |c: &str| res.column_order.iter().position(|x| x == c);
+        assert_eq!(
+            at(TREND_COLUMN)
+                .zip(at(CORRECT_COLUMN))
+                .map(|(t, c)| t == c + 1),
+            Some(true),
+            "Trend sits right after Correct: {:?}",
+            res.column_order
+        );
+    }
+
+    /// The `# baseline:` snapshot path has to trend too: "is it better than last
+    /// week's run?" is the same question as "is it better than prod?", and a
+    /// reader must not have to know which mechanism produced the comparison.
+    #[test]
+    fn a_snapshot_comparison_trends_against_what_the_snapshot_answered() {
+        let dir = tmpdir("trend_snap");
+        std::fs::write(dir.join("truth.csv"), "name,expected\na,yes\nb,no\n").unwrap();
+        let body = "FOR ROW IN TUPLES FROM \"truth.csv\"\n    REPORT \"{{ ANSWER }}\" AS Verdict TRUTH \"{{ expected }}\"\nEND\n";
+        let fake = Fake::new(&[]);
+        let mut ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: [("ANSWER".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
+        let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
+        let snap = dir.join("prev.baseline");
+        super::super::baseline::Baseline::from_result(&first)
+            .save(&snap)
+            .unwrap();
+
+        // This run answers `no` everywhere, so each row moves the opposite way.
+        ctx.base_vars = [("ANSWER".to_string(), "no".to_string())]
+            .into_iter()
+            .collect();
+        let src = format!("# baseline: prev.baseline\n{body}");
+        let res = run_flow(&parse_flow(&src).expect("flow parses"), &ctx);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(res.errors.is_empty(), "snapshot loaded: {:?}", res.errors);
+        let trend = |r: usize| res.rows[r].cells.get(TREND_COLUMN).map(String::as_str);
+        assert_eq!(trend(0), Some(Trend::Regressed.as_str()));
+        assert_eq!(trend(1), Some(Trend::Fixed.as_str()));
+    }
+
+    /// A report with a truth but no comparison has nothing to trend against, so
+    /// the column must not appear at all -- an empty `Trend` column on every row
+    /// of an ordinary run would be pure noise.
+    #[test]
+    fn a_truth_without_a_comparison_produces_no_trend_column() {
+        let flow = parse_flow("REPORT \"yes\" AS A TRUTH \"yes\"\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(
+            !res.column_order.iter().any(|c| c == TREND_COLUMN),
+            "no comparison, no Trend: {:?}",
+            res.column_order
+        );
+        assert!(res.trends.is_empty());
+    }
+
+    /// The reserved `Correct` column summarises the row, so a ground-truthed
+    /// report is readable in CSV (which has no colour) and sortable in a
+    /// spreadsheet. The roll-up favours the bad news.
+    #[test]
+    fn the_correct_column_rolls_up_a_row_and_favours_the_bad_news() {
+        let flow =
+            parse_flow("REPORT \"yes\" AS A TRUTH \"yes\"\nREPORT \"yes\" AS B TRUTH \"no\"\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.rows[0].cells.get(CORRECT_COLUMN).map(String::as_str),
+            Some("incorrect"),
+            "one wrong column makes the row wrong"
+        );
+        assert_eq!(
+            res.column_order.first().map(String::as_str),
+            Some(CORRECT_COLUMN),
+            "and the column leads the table"
+        );
+    }
+
+    /// `FOR ROW IN TUPLES FROM "manifest.csv"` is the documented way to read a
+    /// manifest's columns by name, so it must not be reported as a
+    /// destructuring mismatch — that put one error on the run per manifest row.
+    #[test]
+    fn a_single_binder_over_a_named_manifest_row_is_not_an_arity_mismatch() {
+        let dir = tmpdir("tuplearity");
+        std::fs::write(dir.join("m.csv"), "answer,expected\nyes,yes\n").unwrap();
+        let flow =
+            parse_flow("FOR ROW IN TUPLES FROM \"m.csv\"\n    REPORT \"{{ answer }}\" AS A\nEND\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.rows[0].cells.get("A").map(String::as_str), Some("yes"));
+
+        // A pattern that really does destructure is still checked.
+        let flow = parse_flow("FOR (a, b, c) IN TUPLES FROM \"m.csv\"\n    REPORT a\nEND\n")
+            .expect("flow parses");
+        let res = run_flow(&flow, &ctx);
+        assert!(
+            res.errors.iter().any(|e| e.contains("binds 3")),
+            "{:?}",
+            res.errors
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A truth naming something that was never in scope leaves the row
+    /// `Untested`: the report has no ground truth for it, which is not the same
+    /// as the answer being wrong.
+    #[test]
+    fn a_truth_referencing_an_unknown_variable_is_untested() {
+        let flow =
+            parse_flow("REPORT \"yes\" AS Verdict TRUTH \"{{ nowhere }}\"\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.verdicts.get(&(0, "Verdict".to_string())).copied(),
+            Some(Verdict::Untested)
+        );
+    }
+
+    /// Without `# labels:` the comparison still works, folding case and
+    /// surrounding space only — so the directive is optional rather than
+    /// boilerplate.
+    #[test]
+    fn a_truth_without_declared_labels_compares_literally() {
+        let flow = parse_flow(
+            "APPROVED = approved\nREPORT \" Approved \" AS Verdict TRUTH \"{{ APPROVED }}\"\n",
+        )
+        .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert_eq!(
+            res.verdicts.get(&(0, "Verdict".to_string())).copied(),
+            Some(Verdict::Correct)
+        );
+    }
+
+    /// A report with no `TRUTH` clause anywhere scores nothing at all, so every
+    /// existing report is byte-identical.
+    #[test]
+    fn a_report_without_a_truth_clause_records_no_verdicts() {
+        let flow = parse_flow("REPORT \"yes\" AS Verdict\n").expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.verdicts.is_empty() && res.truths.is_empty());
+    }
+
+    /// A column *without* `IMAGE` is never resolved, however picture-like its
+    /// values look — the clause is the only thing that turns text into a
+    /// picture, so a report never pays for IO it didn't ask for.
+    #[test]
+    fn a_column_without_the_clause_resolves_no_images() {
+        let dir = tmpdir("noimages");
+        std::fs::write(dir.join("a.png"), crate::report::image::tests::png_1x1()).unwrap();
+        let flow =
+            parse_flow("FOR SHOT IN FILES \".\" MATCH \"*.png\"\n    REPORT SHOT AS Frame\nEND\n")
+                .expect("flow parses");
+        let fake = Fake::new(&[]);
+        let ctx = RunContext {
+            entries: &[],
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: Some(dir.clone()),
+            runner: &fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let res = run_flow(&flow, &ctx);
+        assert!(res.images.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same, for a **bare** request and one of the opt-in timing
+    /// intrinsics. A bare request suppresses `TimeSetup` unless SHOW asks for
+    /// it, and a loop-level `BASELINE(…) SHOW(…)` is just as much an ask: it
+    /// exists precisely to put that field beside its baseline copy. Without
+    /// this the documented clause silently produces no baseline column, which
+    /// is the bug `baseline_show` was added to fix — reintroduced for the
+    /// opt-in fields.
+    #[test]
+    fn baseline_show_surfaces_an_opt_in_intrinsic_on_a_bare_request() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[])];
+        let src = "FOR T IN ENVS BASELINE(\"prod\") SHOW(TimeSetup), COMPARISON(\"staging\")\n    REPORT REQUEST r AS proc\nEND\n";
+        let res = run(
+            src,
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert!(
+            cells.contains_key("proc.TimeSetup"),
+            "the SHOWn field has to survive the opt-in filter: {:?}",
+            cells.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cells.contains_key("baseline.proc.TimeSetup"),
+            "and the baseline copy has something to copy from: {:?}",
+            cells.keys().collect::<Vec<_>>()
+        );
+        // The other opt-in intrinsics stay out of the way.
+        assert!(!cells.contains_key("proc.TimeWait"));
+    }
+
+    /// `BASELINE(…) SHOW(Time)` on the loop must surface the intrinsic even
+    /// though the request declares its own `[Reports]` field (which normally
+    /// suppresses intrinsics): otherwise the finalize-phase copy has no
+    /// `<alias>.Time` cell to work from and the clause silently does nothing.
+    /// This is the documented tutorial example (§10.2).
+    #[test]
+    fn baseline_show_surfaces_the_intrinsic_on_a_request_with_declared_fields() {
+        let fake = Fake::new(&[(
+            "r",
+            Canned {
+                status: 200,
+                raw_body: "{\"a\":1}".into(),
+                duration_ms: 7,
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry("r", &[("A", "jsonpath \"$.a\"")])];
+        let src = "FOR T IN ENVS BASELINE(\"prod\") SHOW(Time), COMPARISON(\"staging\")\n    REPORT REQUEST r AS proc\nEND\n";
+        let res = run(
+            src,
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        let cells = &res.rows[0].cells;
+        assert_eq!(cells.get("proc.Time"), Some(&"7".to_string()));
+        assert_eq!(cells.get("baseline.proc.Time"), Some(&"7".to_string()));
+        // The other intrinsics stay suppressed - only the SHOWn one comes back.
+        assert_eq!(cells.get("proc.HttpStatus"), None);
+        assert_eq!(cells.get("proc.Response"), None);
+        // And it must reach the rendered columns, not just the row model.
+        let flow = parse_flow(src).unwrap();
+        let cols = res.resolved_columns(&flow.header);
+        let headers: Vec<&str> = cols.iter().map(|c| c.header.as_str()).collect();
+        assert!(
+            headers.contains(&"baseline.proc.Time"),
+            "columns were {headers:?}"
+        );
+    }
+
     #[test]
     fn worked_ex6_hide_removes_any_field() {
         // Based on worked_ex5 with HIDE(A) → A is removed regardless of source.
@@ -3180,5 +4586,260 @@ mod tests {
         assert!(cells.contains_key("r.Response"));
         assert_eq!(cells.get("r.B"), Some(&"2".to_string()));
         assert_eq!(res.column_order, vec!["r.Response", "r.B"]);
+    }
+}
+
+#[cfg(test)]
+mod helper_collection_tests {
+    use super::*;
+    use crate::report::flow::split_collection_ref;
+
+    fn e(title: &str) -> HurlEntry {
+        HurlEntry {
+            title: title.to_string(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_alias_is_split_off_the_reference() {
+        assert_eq!(
+            split_collection_ref("./helpers.hurl AS helpers"),
+            ("./helpers.hurl", Some("helpers"))
+        );
+        assert_eq!(
+            split_collection_ref("git:origin/qa/shared.hurl as shared"),
+            ("git:origin/qa/shared.hurl", Some("shared"))
+        );
+    }
+
+    /// A path that merely *contains* "as" is not an alias declaration — the
+    /// keyword has to stand alone as its own word.
+    #[test]
+    fn a_path_containing_as_is_left_alone() {
+        assert_eq!(
+            split_collection_ref("./as-built/api.hurl"),
+            ("./as-built/api.hurl", None)
+        );
+        assert_eq!(
+            split_collection_ref("./my report.hurl"),
+            ("./my report.hurl", None)
+        );
+    }
+
+    #[test]
+    fn collections_lists_the_primary_first_then_helpers() {
+        let flow = crate::report::parser::parse_flow(
+            "# collection: ./api.hurl\n# collection: ./helpers.hurl AS h\n\nREQUEST a\n",
+        )
+        .expect("parses");
+        let cols = flow.header.collections();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(
+            cols[0],
+            crate::report::flow::CollectionRef {
+                reference: "./api.hurl",
+                alias: None
+            }
+        );
+        assert_eq!(cols[1].alias, Some("h"));
+        // `collection()` still answers with the primary, alias stripped.
+        assert_eq!(flow.header.collection(), Some("./api.hurl"));
+    }
+
+    #[test]
+    fn a_qualified_name_resolves_within_its_helper() {
+        let primary = [e("upload")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("fetch_frame")],
+        }];
+        assert_eq!(
+            resolve_qualified(&primary, &helpers, "h/fetch_frame").map(|e| &e.title),
+            Some(&"fetch_frame".to_string())
+        );
+        // Without the alias it isn't reachable — helpers are opt-in by name.
+        assert!(resolve_qualified(&primary, &helpers, "fetch_frame").is_none());
+        assert!(resolve_qualified(&primary, &helpers, "upload").is_some());
+    }
+
+    /// End to end: a report that calls a helper request produces its row, with
+    /// the helper's entry actually sent.
+    #[test]
+    fn a_flow_runs_a_request_from_a_helper_collection() {
+        use std::sync::Mutex;
+        struct Recorder(Mutex<Vec<String>>);
+        impl EntryRunner for Recorder {
+            fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+                self.0.lock().unwrap().push(base.title.clone());
+                RunOutput {
+                    entries: vec![EntryOutcome {
+                        method: base.method.clone(),
+                        url: base.url.clone(),
+                        status: 200,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                        body: String::new(),
+                        raw_body: String::new(),
+                        asserts: Vec::new(),
+                        captures: Vec::new(),
+                        duration_ms: 0,
+                        setup_ms: 0,
+                        wait_ms: 0,
+                        download_ms: 0,
+                        ok: true,
+                        error: None,
+                    }],
+                    error: None,
+                }
+            }
+        }
+        let flow = crate::report::parser::parse_flow(
+            "# collection: ./api.hurl\n# collection: ./h.hurl AS h\n\nREPORT REQUEST h/fetch_frame\n",
+        )
+        .expect("parses");
+        let primary = [e("upload")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("fetch_frame")],
+        }];
+        let runner = Recorder(Mutex::new(Vec::new()));
+        let ctx = RunContext {
+            entries: &primary,
+            helpers: &helpers,
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        let result = run_flow(&flow, &ctx);
+        assert_eq!(
+            *runner.0.lock().unwrap(),
+            vec!["fetch_frame".to_string()],
+            "the helper's own entry was sent"
+        );
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    /// `/` is also the virtual-folder separator, so a prefix that isn't a
+    /// declared alias must still be read as part of a title.
+    #[test]
+    fn an_undeclared_prefix_is_still_a_folder_path() {
+        let primary = [e("auth/login")];
+        let helpers = [HelperCollection {
+            alias: "h".into(),
+            entries: vec![e("login")],
+        }];
+        assert!(resolve_qualified(&primary, &helpers, "auth/login").is_some());
+    }
+}
+
+/// A `WITH` field (or a `[Reports]` field) may alias a timing intrinsic under a
+/// name of its own. The run records those columns so the comparison phase can
+/// leave them out of the diff — see
+/// [`crate::report::model::ReportResult::timing_columns`].
+#[cfg(test)]
+mod timing_column_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Timed(Mutex<Vec<u64>>);
+    impl EntryRunner for Timed {
+        fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
+            // A different duration on each call, which is what makes an
+            // unexcluded time column differ on every comparison.
+            let mut n = self.0.lock().unwrap();
+            let ms = 100 + n.len() as u64;
+            n.push(ms);
+            RunOutput {
+                entries: vec![EntryOutcome {
+                    method: base.method.clone(),
+                    url: base.url.clone(),
+                    status: 200,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                    body: "{\"verdict\":\"CLEAR\"}".into(),
+                    raw_body: "{\"verdict\":\"CLEAR\"}".into(),
+                    asserts: Vec::new(),
+                    captures: Vec::new(),
+                    duration_ms: ms,
+                    setup_ms: 1,
+                    wait_ms: 2,
+                    download_ms: 3,
+                    ok: true,
+                    error: None,
+                }],
+                error: None,
+            }
+        }
+    }
+
+    fn run(src: &str) -> ReportResult {
+        let flow = crate::report::parser::parse_flow(src).expect("parses");
+        let entries = [HurlEntry {
+            title: "face".into(),
+            method: "GET".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        }];
+        let runner = Timed(Mutex::new(Vec::new()));
+        let ctx = RunContext {
+            entries: &entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: &runner,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_with_field_aliasing_a_time_is_recorded_as_a_timing_column() {
+        let result = run(concat!(
+            "# collection: ./api.hurl\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    \"Response Time\": Time STATISTICS(MEAN, MEDIAN)\n",
+            "    Setup: TimeSetup\n",
+            "    Verdict: jsonpath \"$.verdict\"\n",
+            "END\n",
+        ));
+        let mut cols: Vec<&str> = result.timing_columns.iter().map(String::as_str).collect();
+        cols.sort();
+        assert_eq!(
+            cols,
+            vec!["f.Response Time", "f.Setup"],
+            "both aliased times are recorded, and nothing else is"
+        );
+        // The values really are the timings, not something that merely looks
+        // like one.
+        assert_eq!(result.rows[0].cells["f.Response Time"], "100");
+        assert_eq!(result.rows[0].cells["f.Setup"], "1");
+    }
+
+    /// Only the *timing* intrinsics. A renamed status is a genuine difference
+    /// when it differs, so it stays in the diff.
+    #[test]
+    fn a_renamed_status_is_not_a_timing_column() {
+        let result = run(concat!(
+            "# collection: ./api.hurl\n\n",
+            "REPORT REQUEST face AS f WITH\n",
+            "    Status: HttpStatus\n",
+            "    Body: Response\n",
+            "END\n",
+        ));
+        assert!(
+            result.timing_columns.is_empty(),
+            "{:?}",
+            result.timing_columns
+        );
     }
 }

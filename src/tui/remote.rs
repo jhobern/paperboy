@@ -1,385 +1,117 @@
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
-
+use super::listscroll::ListScroll;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::git_remote::{self, RefKind, RemoteRefs};
 use crate::i18n::Strings;
+use crate::remote_flow::{RemoteFlow, RemoteKind, Step, WorkspaceGitFilter};
+
+// The wizard's data model, its file/ref narrowing and its background workers
+// live in `crate::remote_flow`, shared with the GUI so the two front-ends
+// cannot drift apart. What remains here is the terminal UI's presentation of
+// it: the stage the user is on and how each popup is drawn.
+pub(crate) use crate::remote_flow::{filter_indices, spawn_workspace_redownload};
 
 use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp};
 use super::draw::*;
 use super::editor::*;
 use super::theme::*;
 
-/// Whether the remote-git wizard is loading a collection, an environment, a
-/// PaperTrail `.trail`, or a whole Workspace (many collection files at once,
-/// filtered by extension).
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum RemoteKind {
-    Collection,
-    Environment,
-    Report,
-    Workspace,
-}
-
-/// Which files to download when loading a Workspace from git, offered as a
-/// small fixed picklist right after the branch/tag is chosen — a big repo
-/// may hold plenty of large, unrelated files that should never be pulled
-/// down just to browse its collections.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum WorkspaceGitFilter {
-    HurlAndJson,
-    HurlOnly,
-    JsonOnly,
-    All,
-}
-
-impl WorkspaceGitFilter {
-    pub(crate) const ALL: [WorkspaceGitFilter; 4] = [
-        WorkspaceGitFilter::HurlAndJson,
-        WorkspaceGitFilter::HurlOnly,
-        WorkspaceGitFilter::JsonOnly,
-        WorkspaceGitFilter::All,
-    ];
-
-    pub(crate) fn label(self, s: &Strings) -> &'static str {
-        match self {
-            WorkspaceGitFilter::HurlAndJson => s.git_ws_filter_hurl_json,
-            WorkspaceGitFilter::HurlOnly => s.git_ws_filter_hurl,
-            WorkspaceGitFilter::JsonOnly => s.git_ws_filter_json,
-            WorkspaceGitFilter::All => s.git_ws_filter_all,
-        }
-    }
-
-    /// Whether `path` (a repo-relative path as returned by `git ls-tree`)
-    /// should be downloaded under this filter (case-insensitive extension
-    /// match, mirroring `crate::workspace::scan_workspace`'s local filter).
-    pub(crate) fn matches(self, path: &str) -> bool {
-        let ext = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str());
-        match self {
-            WorkspaceGitFilter::All => true,
-            WorkspaceGitFilter::HurlAndJson => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
-            }
-            WorkspaceGitFilter::HurlOnly => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl"))
-            }
-            WorkspaceGitFilter::JsonOnly => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("json"))
-            }
-        }
-    }
-}
-
-/// Where a Workspace's downloaded files came from in git — remembered on
-/// [`crate::collection::Collection::workspace_git_origin`] so that if the
-/// temp download folder vanishes (e.g. the OS clears `/tmp` between
-/// sessions), the app can offer to redownload the exact same commit rather
-/// than losing track of the workspace entirely. Pinned to a commit **sha**,
-/// not just a branch/tag name, so a redownload restores exactly what was
-/// there before (not "whatever the branch points at now") — and a failed
-/// fetch of that exact sha is a reliable sign the remote's history no
-/// longer contains it (force-push, rebase, deleted branch/tag), reported to
-/// the user as such. Never holds a token (tokens are intentionally never
-/// persisted, same as [`crate::git_remote::GitOrigin`]).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WorkspaceGitOrigin {
-    pub(crate) repo_url: String,
-    pub(crate) commit_sha: String,
-    pub(crate) ref_kind: RefKind,
-    pub(crate) ref_name: String,
-    pub(crate) filter: WorkspaceGitFilter,
-}
-
-/// A branch or tag choice: `label` is shown to the user, `gitref` is the full
-/// ref (e.g. `refs/heads/main`) passed to `git fetch`.
-#[derive(Clone)]
-pub(crate) struct RefChoice {
-    pub(crate) label: String,
-    pub(crate) gitref: String,
-}
-
-/// Result messages from background git operations, delivered over a channel and
-/// polled each frame (like environment secret resolution).
-pub(crate) enum GitMsg {
-    Refs(Result<RemoteRefs, String>),
-    /// `(files, repo, commit_sha)` — `commit_sha` is the exact commit the
-    /// listing was fetched at (`FETCH_HEAD` resolved), remembered so a
-    /// Workspace load can later be redownloaded pinned to this exact commit
-    /// rather than "whatever the branch points at now".
-    Files(Result<(Vec<String>, PathBuf, String), String>),
-    Content(Result<String, String>),
-    /// A Workspace load's filtered batch of files finished downloading into
-    /// `repo` (the same temp repo dir from `Files`) — on success it becomes
-    /// the new tab's `workspace_root`, exactly like a real local folder.
-    Workspace(Result<PathBuf, String>),
-}
-
-/// Which step of the remote-git wizard is on screen.
+/// Which step of the wizard the terminal UI is drawing.
+///
+/// This is a *view* of [`RemoteFlow`]'s state, not a second copy of it: it
+/// carries no data, and [`RemoteWizard::stage`] derives it fresh each time. An
+/// in-flight operation and an error both take precedence over the underlying
+/// step, because that is what the user needs to see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteStage {
-    /// Editing the URL (field 0) and token (field 1). `recent_sel` is `Some`
-    /// while the "recently used URLs" dropdown below the URL field has
-    /// keyboard focus (indexing into [`RemoteWizard::recent`]).
-    Connect {
-        field: u8,
-        recent_sel: Option<usize>,
-    },
-    /// A background git op is running; show a phase message until it completes.
-    Loading { phase: LoadPhase },
-    /// Choose a branch/tag from `refs` (filtered by `filter`).
-    PickRef {
-        refs: Vec<RefChoice>,
-        filter: String,
-        sel: usize,
-    },
-    /// Choose a file path from `files` (filtered by `filter`).
-    PickFile {
-        files: Vec<String>,
-        filter: String,
-        sel: usize,
-    },
-    /// Workspace load only: choose which files to actually download (see
-    /// [`WorkspaceGitFilter`]) before checking anything out.
-    PickWorkspaceFilter { sel: usize },
-    /// A git op failed; show the (token-redacted) error until dismissed.
-    Error(String),
+    Connect,
+    Loading,
+    PickRef,
+    PickFile,
+    PickWorkspaceFilter,
+    Error,
 }
 
-/// The background git operation currently in flight (for the loading message).
-#[derive(Clone, Copy)]
-pub(crate) enum LoadPhase {
-    Refs,
-    Files,
-    File,
-    /// Downloading a Workspace's filtered batch of files.
-    WorkspaceFiles,
-}
-
-/// State for the "load from a remote git repo" wizard overlay.
+/// The terminal UI's "load from a remote git repo" wizard overlay.
+///
+/// Everything that decides what happens next lives in `flow`; what is left here
+/// is how the terminal presents it — text editors with cursors, a filter string
+/// and a highlighted row.
 pub(crate) struct RemoteWizard {
-    pub(crate) kind: RemoteKind,
+    pub(crate) flow: RemoteFlow,
     pub(crate) url: Editor,
     pub(crate) token: Editor,
-    pub(crate) stage: RemoteStage,
-    /// Background git op in flight, if any.
-    pub(crate) rx: Option<Receiver<GitMsg>>,
-    /// Temp repo from `list_files`, kept alive so the chosen file can be checked
-    /// out from it. Cleaned up when the wizard closes.
-    pub(crate) repo: Option<PathBuf>,
-    /// The file path the user chose (used to title the loaded tab).
-    pub(crate) selected_path: Option<String>,
     /// Recently used git URLs (most recent first), offered as a pickable
     /// dropdown below the URL field. A snapshot taken when the wizard opened.
     pub(crate) recent: Vec<String>,
-    /// The branch/tag the user picked in `PickRef`, kept around (rather than
-    /// discarded once `spawn_git_files` consumes it) so a `GitOrigin` can be
-    /// recorded once the file finishes loading.
-    pub(crate) chosen_ref: Option<RefChoice>,
-    /// The file listing from `list_files`, kept around (instead of only
-    /// living inside the `PickFile` stage) so the Workspace filter step can
-    /// reuse it without a second network fetch.
-    pub(crate) files: Vec<String>,
-    /// The [`WorkspaceGitFilter`] chosen in `PickWorkspaceFilter`, kept
-    /// around so it can be baked into the [`WorkspaceGitOrigin`] recorded
-    /// once the download finishes.
-    pub(crate) chosen_workspace_filter: Option<WorkspaceGitFilter>,
-    /// The commit sha `list_files` resolved the chosen ref to, kept around
-    /// for the same reason as `chosen_workspace_filter` above.
-    pub(crate) chosen_sha: Option<String>,
+    /// Connect step: which field has focus (0 = URL, 1 = token).
+    pub(crate) field: u8,
+    /// `Some` while the recent-URLs dropdown has keyboard focus, indexing into
+    /// [`RemoteWizard::recent`].
+    pub(crate) recent_sel: Option<usize>,
+    /// The list steps' typed filter and highlighted row. Shared by the ref and
+    /// file pickers because only one of them is ever on screen, and both are
+    /// reset whenever the step changes.
+    pub(crate) filter: String,
+    pub(crate) sel: usize,
+    /// Where the ref/file list is scrolled to, carried between frames (see
+    /// [`ListScroll`]). Shared by both pickers for the same reason `filter`
+    /// and `sel` are: only one is ever on screen at a time.
+    pub(crate) list_scroll: ListScroll,
 }
 
 impl RemoteWizard {
     pub(crate) fn new(kind: RemoteKind, recent: Vec<String>) -> Self {
         Self {
-            kind,
+            flow: RemoteFlow::new(kind),
             url: Editor::blank(),
             token: Editor::blank(),
-            stage: RemoteStage::Connect {
-                field: 0,
-                recent_sel: None,
-            },
-            rx: None,
-            repo: None,
-            selected_path: None,
             recent,
-            chosen_ref: None,
-            files: Vec::new(),
-            chosen_workspace_filter: None,
-            chosen_sha: None,
+            field: 0,
+            recent_sel: None,
+            filter: String::new(),
+            sel: 0,
+            list_scroll: ListScroll::default(),
         }
     }
 
-    pub(crate) fn token_opt(&self) -> Option<String> {
-        let t = self.token.text();
-        if t.trim().is_empty() { None } else { Some(t) }
+    pub(crate) fn kind(&self) -> RemoteKind {
+        self.flow.kind
     }
-}
 
-/// Indices of `items` whose text contains `filter` (case-insensitive).
-pub(crate) fn filter_indices<'a>(items: impl Iterator<Item = &'a str>, filter: &str) -> Vec<usize> {
-    let f = filter.to_lowercase();
-    items
-        .enumerate()
-        .filter(|(_, s)| f.is_empty() || s.to_lowercase().contains(&f))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Narrow a git file listing to the paths worth showing in a single-file
-/// picker, so loading from a big repo isn't buried under unrelated files:
-///   * a Collection load shows only `.hurl` / `.json` files;
-///   * an Environment load shows only `.vars` / `.env` files (including
-///     `.env`-style dotfiles like `.env` and `.env.dev-au`).
-///
-/// If nothing matches (an unusually named repo), the full list is returned
-/// unchanged rather than leaving the user staring at an empty picker.
-pub(crate) fn relevant_files(kind: RemoteKind, files: &[String]) -> Vec<String> {
-    let keep = |path: &String| -> bool {
-        let p = std::path::Path::new(path);
-        let ext = p.extension().and_then(|e| e.to_str());
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        match kind {
-            RemoteKind::Collection => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
-            }
-            RemoteKind::Environment => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
-                    || name.eq_ignore_ascii_case(".env")
-                    || name.to_ascii_lowercase().starts_with(".env.")
-            }
-            RemoteKind::Report => {
-                matches!(ext, Some(e) if e.eq_ignore_ascii_case("trail"))
-            }
-            // A Workspace load uses the file-type filter step, not this picker.
-            RemoteKind::Workspace => true,
+    /// The step to draw, derived from the flow.
+    pub(crate) fn stage(&self) -> RemoteStage {
+        if self.flow.error().is_some() {
+            return RemoteStage::Error;
         }
-    };
-    let filtered: Vec<String> = files.iter().filter(|p| keep(p)).cloned().collect();
-    if filtered.is_empty() {
-        files.to_vec()
-    } else {
-        filtered
+        if self.flow.busy().is_some() {
+            return RemoteStage::Loading;
+        }
+        match self.flow.step() {
+            Step::Connect => RemoteStage::Connect,
+            Step::PickRef => RemoteStage::PickRef,
+            Step::PickFile => RemoteStage::PickFile,
+            // The terminal UI hands the "keep or save" question to its own
+            // overlay once the download lands, so the wizard is gone by then.
+            Step::PickWorkspaceFilter | Step::WorkspaceStorage => RemoteStage::PickWorkspaceFilter,
+        }
     }
-}
 
-/// Build the flat, filterable branch+tag choice list (branches first).
-pub(crate) fn build_ref_choices(refs: &RemoteRefs, s: &Strings) -> Vec<RefChoice> {
-    let mut out = Vec::with_capacity(refs.branches.len() + refs.tags.len());
-    for b in &refs.branches {
-        out.push(RefChoice {
-            label: format!("[{}] {b}", s.git_branches),
-            gitref: git_remote::branch_ref(b),
-        });
+    /// Copy the on-screen editors into the flow. Called before any transition
+    /// that needs them, so the flow never has to know about [`Editor`].
+    pub(crate) fn sync_fields(&mut self) {
+        self.flow.url = self.url.text();
+        self.flow.token = self.token.text();
     }
-    for t in &refs.tags {
-        out.push(RefChoice {
-            label: format!("[{}] {t}", s.git_tags),
-            gitref: git_remote::tag_ref(t),
-        });
+
+    /// Reset the list filter and highlight, for when the step changes under us.
+    pub(crate) fn reset_list(&mut self) {
+        self.filter.clear();
+        self.sel = 0;
     }
-    out
-}
-
-pub(crate) fn spawn_git_refs(url: String, token: Option<String>) -> Receiver<GitMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(GitMsg::Refs(git_remote::list_refs(&url, token.as_deref())));
-    });
-    rx
-}
-
-pub(crate) fn spawn_git_files(
-    url: String,
-    token: Option<String>,
-    gitref: String,
-) -> Receiver<GitMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let res = git_remote::list_files(&url, token.as_deref(), &gitref);
-        // If the wizard was cancelled the receiver is gone; clean up the temp
-        // repo we created so it doesn't linger on disk.
-        if let Err(mpsc::SendError(GitMsg::Files(Ok((_, dir, _))))) = tx.send(GitMsg::Files(res)) {
-            git_remote::cleanup(&dir);
-        }
-    });
-    rx
-}
-
-pub(crate) fn spawn_git_checkout(repo: PathBuf, path: String) -> Receiver<GitMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(GitMsg::Content(git_remote::checkout_file(&repo, &path)));
-    });
-    rx
-}
-
-/// Check out a Workspace's filtered batch of `paths` into `repo`, then hand
-/// `repo` itself back as the new tab's future `workspace_root`.
-pub(crate) fn spawn_git_checkout_workspace(repo: PathBuf, paths: Vec<String>) -> Receiver<GitMsg> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let res = git_remote::checkout_files(&repo, &paths).map(|_| repo.clone());
-        // The temp repo becomes the persisted `workspace_root`, so drop its
-        // `origin` remote to keep the access token out of its `.git/config`.
-        if res.is_ok() {
-            git_remote::scrub_remote(&repo);
-        }
-        // If the wizard was cancelled the receiver is gone; clean up the temp
-        // repo (which now holds the downloaded workspace files) so it doesn't
-        // linger on disk.
-        if let Err(mpsc::SendError(GitMsg::Workspace(Ok(dir)))) = tx.send(GitMsg::Workspace(res)) {
-            git_remote::cleanup(&dir);
-        }
-    });
-    rx
-}
-
-/// Attempt to redownload a Workspace's files from git, pinned to the exact
-/// `commit_sha` recorded when it was first downloaded (see
-/// [`WorkspaceGitOrigin`]) — used when the local temp folder has vanished
-/// (e.g. `/tmp` was cleared) since the last session. Unlike the interactive
-/// wizard flow, this never prompts for a branch/tag or a file-type filter —
-/// both are already known — and never asks for a token (tokens are never
-/// persisted), so a private repo will fail here with an auth error; the
-/// user's only recourse in that case is to reload it manually through
-/// "Load Workspace from Git…", which does prompt for a token. A failure to
-/// fetch the exact recorded sha most often means the remote's history no
-/// longer contains it (force-push, rebase, or the branch/tag was deleted).
-pub(crate) fn spawn_workspace_redownload(
-    origin: WorkspaceGitOrigin,
-) -> Receiver<Result<PathBuf, String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = match git_remote::list_files(&origin.repo_url, None, &origin.commit_sha) {
-            Ok((files, repo, _sha)) => {
-                let matched: Vec<String> = files
-                    .into_iter()
-                    .filter(|p| origin.filter.matches(p))
-                    .collect();
-                match git_remote::checkout_files(&repo, &matched) {
-                    Ok(()) => Ok(repo),
-                    Err(e) => {
-                        git_remote::cleanup(&repo);
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        };
-        // If the caller gave up waiting (app closed mid-fetch), clean up any
-        // downloaded folder rather than leaking it.
-        if let Err(mpsc::SendError(Ok(dir))) = tx.send(result) {
-            git_remote::cleanup(&dir);
-        }
-    });
-    rx
 }
 
 /// A filterable, scrollable list popup (used for the branch/tag and file
@@ -392,19 +124,19 @@ pub(crate) fn draw_filter_list(
     items: &[String],
     sel: usize,
     th: &Theme,
-) {
+    scroll: &ListScroll,
+) -> usize {
     let w = (f.area().width * 7 / 10).max(50);
     let h = (f.area().height * 7 / 10).max(10);
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), s.git_filter_hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::vertical([
         Constraint::Length(1), // filter line
         Constraint::Min(1),    // list
-        Constraint::Length(1), // hint
     ])
     .split(inner);
 
@@ -429,16 +161,9 @@ pub(crate) fn draw_filter_list(
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{203a} ");
-    let mut st = ListState::default();
-    if !vis.is_empty() {
-        st.select(Some(sel.min(vis.len() - 1)));
-    }
-    f.render_stateful_widget(list, rows[1], &mut st);
-
-    f.render_widget(
-        Paragraph::new(Line::styled(s.git_filter_hint, Style::default().fg(th.dim))),
-        rows[2],
-    );
+    let sel = (!vis.is_empty()).then(|| sel.min(vis.len() - 1));
+    let offset = scroll.render(f, rows[1], list, sel, vis.len());
+    offset
 }
 
 /// A small fixed-choice popup (used by the Workspace git-load file-type
@@ -460,13 +185,12 @@ pub(crate) fn draw_choice_popup(
         .unwrap_or(20)
         .max(title.chars().count());
     let w = (content_w as u16 + 6).clamp(30, f.area().width.max(1));
-    let h = (items.len() as u16 + 3).min(f.area().height.max(1));
+    let h = (items.len() as u16 + 2).min(f.area().height.max(1));
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
-    let block = panel(title.to_string(), true, th);
+    let block = panel_hinted(title.to_string(), hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
 
     let list_items: Vec<ListItem> = items
         .iter()
@@ -482,12 +206,7 @@ pub(crate) fn draw_choice_popup(
         .highlight_symbol("\u{203a} ");
     let mut st = ListState::default();
     st.select(Some(sel.min(items.len().saturating_sub(1))));
-    f.render_stateful_widget(list, rows[0], &mut st);
-
-    f.render_widget(
-        Paragraph::new(Line::styled(hint.to_string(), Style::default().fg(th.dim))),
-        rows[1],
-    );
+    f.render_stateful_widget(list, inner, &mut st);
 }
 
 #[cfg(test)]
@@ -505,48 +224,62 @@ pub(crate) fn draw_remote_wizard_with_hits(
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Overlay);
     }
-    let title = match w.kind {
+    let title = match w.kind() {
         RemoteKind::Collection => s.git_collection_menu,
         RemoteKind::Environment => s.git_env_menu,
         RemoteKind::Report => s.git_report_menu,
         RemoteKind::Workspace => s.git_workspace_menu,
     };
-    match &w.stage {
-        RemoteStage::Connect { field, recent_sel } => {
+    match w.stage() {
+        RemoteStage::Connect => {
+            let (field, recent_sel) = (w.field, w.recent_sel);
+            // Laid out like the request wizard: label column, value beside it,
+            // keys on the border. What each field wants is shown as a dim
+            // example inside the empty field rather than as a sentence under
+            // it.
+            let fields = [
+                (s.git_url_label, s.git_url_hint, &w.url, false),
+                (s.git_token_label, s.git_token_hint, &w.token, true),
+            ];
+            let label_w = label_column(fields.iter().map(|(l, _, _, _)| *l));
             // Grow the popup to fit the recent-URLs dropdown, if any (capped so
             // it never grows unreasonably tall).
             let recent_rows = w.recent.len().min(5) as u16;
-            let h = 10 + recent_rows;
-            let area = centered_rect(74, h, f.area());
+            let area = centered_rect(74, recent_rows + 4, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let hint = if recent_rows > 0 {
+                format!("{}  \u{b7}  {}", s.git_connect_hint, s.git_recent_hint)
+            } else {
+                s.git_connect_hint.to_string()
+            };
+            let block = panel_hinted(title.to_string(), &hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
             let rows = Layout::vertical([
-                Constraint::Length(1),           // url label
-                Constraint::Length(1),           // url field
+                Constraint::Length(1),           // url
                 Constraint::Length(recent_rows), // recent-urls dropdown
-                Constraint::Length(1),           // spacer
-                Constraint::Length(1),           // token label
-                Constraint::Length(1),           // token field
-                Constraint::Min(1),              // hint
+                Constraint::Length(1),           // token
             ])
             .split(inner);
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_url_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[0],
-            );
-            render_line_field(f, rows[1], &w.url, *field == 0, false, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[1],
-                    MouseHitTarget::RemoteWizardRow(0),
+
+            for (i, (label, placeholder, ed, mask)) in fields.iter().enumerate() {
+                let row = if i == 0 { rows[0] } else { rows[2] };
+                let cols = Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)])
+                    .split(row);
+                f.render_widget(
+                    Paragraph::new(Span::styled(*label, Style::default().fg(th.accent))),
+                    cols[0],
                 );
+                render_line_field_hinted(f, cols[1], ed, field == i as u8, *mask, placeholder, th);
+                if let Some(app) = app {
+                    app.push_mouse_hit(
+                        MouseLayer::Overlay,
+                        row,
+                        MouseHitTarget::RemoteWizardRow(i),
+                    );
+                }
             }
+
             if recent_rows > 0 {
                 let items: Vec<ListItem> = w
                     .recent
@@ -554,7 +287,7 @@ pub(crate) fn draw_remote_wizard_with_hits(
                     .take(5)
                     .enumerate()
                     .map(|(i, u)| {
-                        let style = if *recent_sel == Some(i) {
+                        let style = if recent_sel == Some(i) {
                             Style::default()
                                 .bg(th.accent)
                                 .fg(th.bg)
@@ -562,96 +295,80 @@ pub(crate) fn draw_remote_wizard_with_hits(
                         } else {
                             Style::default().fg(th.dim)
                         };
-                        ListItem::new(Line::styled(u.clone(), style))
+                        ListItem::new(Line::styled(
+                            format!("{:pad$}{u}", "", pad = label_w as usize),
+                            style,
+                        ))
                     })
                     .collect();
-                f.render_widget(List::new(items), rows[2]);
+                f.render_widget(List::new(items), rows[1]);
                 if let Some(app) = app {
                     for i in 0..w.recent.len().min(5) {
                         app.push_mouse_hit(
                             MouseLayer::Overlay,
-                            Rect::new(rows[2].x, rows[2].y + i as u16, rows[2].width, 1),
+                            Rect::new(rows[1].x, rows[1].y + i as u16, rows[1].width, 1),
                             MouseHitTarget::RemoteWizardRow(10 + i),
                         );
                     }
                 }
             }
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    s.git_token_label,
-                    Style::default().fg(th.accent),
-                )),
-                rows[4],
-            );
-            render_line_field(f, rows[5], &w.token, *field == 1, true, th);
-            if let Some(app) = app {
-                app.push_mouse_hit(
-                    MouseLayer::Overlay,
-                    rows[5],
-                    MouseHitTarget::RemoteWizardRow(1),
-                );
-            }
-            let hint = if recent_rows > 0 {
-                format!("{}  ·  {}", s.git_connect_hint, s.git_recent_hint)
-            } else {
-                s.git_connect_hint.to_string()
-            };
-            f.render_widget(
-                Paragraph::new(Line::styled(hint, Style::default().fg(th.dim))),
-                rows[6],
-            );
         }
-        RemoteStage::Loading { phase } => {
-            let msg = match phase {
-                LoadPhase::Refs => s.git_loading_refs,
-                LoadPhase::Files => s.git_loading_files,
-                LoadPhase::File => s.git_loading_file,
-                LoadPhase::WorkspaceFiles => s.git_loading_workspace_files,
-            };
+        RemoteStage::Loading => {
+            let msg = w.flow.busy().map_or(s.git_loading_refs, |p| p.label(s));
             let width = (msg
                 .len()
                 .max(s.git_loading_hint.len())
                 .max(title.chars().count()) as u16
                 + 4)
             .min(f.area().width);
-            let area = centered_rect(width, 4, f.area());
+            let area = centered_rect(width, 3, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_loading_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows =
-                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
             f.render_widget(
                 Paragraph::new(Span::styled(
                     msg,
                     Style::default().fg(th.text).add_modifier(Modifier::BOLD),
                 )),
-                rows[0],
-            );
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    s.git_loading_hint,
-                    Style::default().fg(th.dim),
-                )),
-                rows[1],
+                inner,
             );
         }
-        RemoteStage::PickRef { refs, filter, sel } => {
-            let labels: Vec<String> = refs.iter().map(|r| r.label.clone()).collect();
-            draw_filter_list(f, s, s.git_pick_ref_title, filter, &labels, *sel, th);
-            register_remote_filter_hits(f, app, filter, &labels, *sel);
+        RemoteStage::PickRef => {
+            let labels: Vec<String> = w.flow.ref_choices(s).into_iter().map(|r| r.label).collect();
+            let first = draw_filter_list(
+                f,
+                s,
+                s.git_pick_ref_title,
+                &w.filter,
+                &labels,
+                w.sel,
+                th,
+                &w.list_scroll,
+            );
+            register_remote_filter_hits(f, app, &w.filter, &labels, first);
         }
-        RemoteStage::PickFile { files, filter, sel } => {
-            draw_filter_list(f, s, s.git_pick_file_title, filter, files, *sel, th);
-            register_remote_filter_hits(f, app, filter, files, *sel);
+        RemoteStage::PickFile => {
+            let files = w.flow.pickable_files();
+            let first = draw_filter_list(
+                f,
+                s,
+                s.git_pick_file_title,
+                &w.filter,
+                &files,
+                w.sel,
+                th,
+                &w.list_scroll,
+            );
+            register_remote_filter_hits(f, app, &w.filter, &files, first);
         }
-        RemoteStage::PickWorkspaceFilter { sel } => {
+        RemoteStage::PickWorkspaceFilter => {
             let labels: Vec<&str> = WorkspaceGitFilter::ALL.iter().map(|f| f.label(s)).collect();
             draw_choice_popup(
                 f,
                 s.git_pick_workspace_filter_title,
                 &labels,
-                *sel,
+                w.sel,
                 s.git_workspace_filter_hint,
                 th,
             );
@@ -663,13 +380,13 @@ pub(crate) fn draw_remote_wizard_with_hits(
                     .unwrap_or(20)
                     .max(s.git_pick_workspace_filter_title.chars().count());
                 let w = (content_w as u16 + 6).clamp(30, f.area().width.max(1));
-                let h = (labels.len() as u16 + 3).min(f.area().height.max(1));
+                let h = (labels.len() as u16 + 2).min(f.area().height.max(1));
                 let area = centered_rect(w, h, f.area());
                 let inner = Rect {
                     x: area.x.saturating_add(1),
                     y: area.y.saturating_add(1),
                     width: area.width.saturating_sub(2),
-                    height: area.height.saturating_sub(3),
+                    height: area.height.saturating_sub(2),
                 };
                 for i in 0..labels.len().min(inner.height as usize) {
                     app.push_mouse_hit(
@@ -680,33 +397,32 @@ pub(crate) fn draw_remote_wizard_with_hits(
                 }
             }
         }
-        RemoteStage::Error(e) => {
+        RemoteStage::Error => {
+            let e = w.flow.error().unwrap_or_default().to_string();
             let width = (f.area().width * 6 / 10).max(40);
-            let area = centered_rect(width, 8, f.area());
+            let area = centered_rect(width, 7, f.area());
             f.render_widget(Clear, area);
-            let block = panel(title.to_string(), true, th);
+            let block = panel_hinted(title.to_string(), s.git_error_hint, th);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
             f.render_widget(
-                Paragraph::new(e.clone())
+                Paragraph::new(e)
                     .style(Style::default().fg(th.err))
                     .wrap(Wrap { trim: true }),
-                rows[0],
-            );
-            f.render_widget(
-                Paragraph::new(Line::styled(s.git_error_hint, Style::default().fg(th.dim))),
-                rows[1],
+                inner,
             );
         }
     }
 
+    /// `first` is the scroll offset the list was actually drawn with — taken
+    /// from the draw call rather than recomputed here, because the viewport is
+    /// carried between frames now and only the render knows where it ended up.
     fn register_remote_filter_hits(
         f: &Frame,
         app: Option<&TuiApp>,
         filter: &str,
         items: &[String],
-        sel: usize,
+        first: usize,
     ) {
         let Some(app) = app else {
             return;
@@ -720,23 +436,12 @@ pub(crate) fn draw_remote_wizard_with_hits(
             width: area.width.saturating_sub(2),
             height: area.height.saturating_sub(2),
         };
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
         let vis = filter_indices(items.iter().map(|s| s.as_str()), filter);
         if vis.is_empty() {
             return;
         }
         let visible = rows[1].height as usize;
-        let selected = sel.min(vis.len() - 1);
-        let first = if selected >= visible {
-            selected + 1 - visible
-        } else {
-            0
-        };
         app.push_mouse_hit(
             MouseLayer::Overlay,
             rows[1],
@@ -754,54 +459,5 @@ pub(crate) fn draw_remote_wizard_with_hits(
                 MouseHitTarget::RemoteWizardRow(row),
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn files() -> Vec<String> {
-        [
-            "api/health.hurl",
-            "postman/orders.json",
-            "envs/dev.vars",
-            ".env",
-            ".env.dev-au",
-            "reports/nightly.trail",
-            "README.md",
-            "src/main.rs",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
-    #[test]
-    fn relevant_files_for_a_collection_keeps_only_hurl_and_json() {
-        let out = relevant_files(RemoteKind::Collection, &files());
-        assert_eq!(out, vec!["api/health.hurl", "postman/orders.json"]);
-    }
-
-    #[test]
-    fn relevant_files_for_an_environment_keeps_vars_and_dotenv_style_files() {
-        let out = relevant_files(RemoteKind::Environment, &files());
-        assert_eq!(out, vec!["envs/dev.vars", ".env", ".env.dev-au"]);
-    }
-
-    #[test]
-    fn relevant_files_for_a_report_keeps_only_report_files() {
-        let out = relevant_files(RemoteKind::Report, &files());
-        assert_eq!(out, vec!["reports/nightly.trail"]);
-    }
-
-    #[test]
-    fn relevant_files_falls_back_to_everything_when_nothing_matches() {
-        let noise: Vec<String> = ["a.md", "b.rs", "c.txt"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        // Never strand the user with an empty picker on an oddly-named repo.
-        assert_eq!(relevant_files(RemoteKind::Collection, &noise), noise);
     }
 }

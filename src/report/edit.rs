@@ -19,8 +19,8 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    EnvClause, FlowNode, HeaderLine, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleRef, WithItem,
+    Binder, EnvClause, FlowNode, HeaderLine, ImageSpec, ParallelSpec, Pattern, Producer,
+    ReportFlow, ReportStmt, ResponseFmt, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 use crate::report::parse_flow;
@@ -61,11 +61,66 @@ pub(crate) enum RowKind {
     LoopHead,
     /// The synthetic `END` closing a loop.
     LoopEnd,
+    /// A `# …` comment line. A node like any other — it can be selected, moved
+    /// and deleted — but it is drawn dimmed, because it isn't a statement.
+    Comment,
+    /// One field of an expanded `REPORT REQUEST … WITH … END` block, at this
+    /// index into the request's `with` list. `path` addresses the *request*, not
+    /// the field, so anything acting on a `WITH` row must branch on this kind
+    /// rather than treating the path as a node to delete or move.
+    WithField(usize),
+    /// A `# …` comment line *inside* an expanded `WITH` block, at this index
+    /// into the request's `with` list. Separate from [`RowKind::WithField`] so
+    /// it can be drawn dimmed and kept out of the field editor, but it indexes
+    /// the same list, so deleting and reordering treat the two alike.
+    WithComment(usize),
+    /// The "add a field" affordance at the end of an expanded `WITH` block.
+    WithAdd,
+    /// The synthetic `END` closing an expanded `WITH` block.
+    WithEnd,
+}
+
+impl RowKind {
+    /// Whether this row belongs to an expanded `WITH` block rather than being a
+    /// flow node in its own right.
+    pub(crate) fn is_with(self) -> bool {
+        matches!(
+            self,
+            RowKind::WithField(_) | RowKind::WithComment(_) | RowKind::WithAdd | RowKind::WithEnd
+        )
+    }
+
+    /// The index into the request's `with` list this row stands for, for the
+    /// rows that address one item (a field or a comment).
+    pub(crate) fn with_item(self) -> Option<usize> {
+        match self {
+            RowKind::WithField(i) | RowKind::WithComment(i) => Some(i),
+            _ => None,
+        }
+    }
 }
 
 /// Flatten a flow into the display rows, tagging request rows with whether they
 /// resolve (via `resolves`). Row 0 is the `Begin` root.
+///
+/// `WITH` blocks stay collapsed to a single `… WITH …` row — see
+/// [`flatten_expanded`] for the form that opens them up.
 pub(crate) fn flatten(flow: &ReportFlow, resolves: &impl Fn(&str) -> bool) -> Vec<NodeRow> {
+    flatten_expanded(flow, resolves, false)
+}
+
+/// As [`flatten`], but with `expand_with` a `REPORT REQUEST … WITH` block is
+/// opened out: the request row, one [`RowKind::WithField`] row per field, an
+/// [`RowKind::WithAdd`] row, and a closing [`RowKind::WithEnd`].
+///
+/// It is opt-in because the two front-ends show `WITH` differently — the GUI
+/// draws each field as a chip on the request's own row, so expanding would
+/// double it up, while the TUI outline has no room for chips and needs the rows.
+pub(crate) fn flatten_expanded(
+    flow: &ReportFlow,
+    resolves: &impl Fn(&str) -> bool,
+    expand_with: bool,
+) -> Vec<NodeRow> {
     let mut rows = vec![NodeRow {
         depth: 0,
         label: String::new(),
@@ -74,8 +129,29 @@ pub(crate) fn flatten(flow: &ReportFlow, resolves: &impl Fn(&str) -> bool) -> Ve
         req_ok: None,
     }];
     let mut prefix = Vec::new();
-    push_nodes(&flow.nodes, &mut prefix, 1, resolves, &mut rows);
+    push_nodes(
+        &flow.nodes,
+        &mut prefix,
+        1,
+        resolves,
+        expand_with,
+        &mut rows,
+    );
     rows
+}
+
+/// The `WITH` fields of a report-request node, or `None` for anything else.
+pub(crate) fn node_with_items(node: &FlowNode) -> Option<&[WithItem]> {
+    match node {
+        FlowNode::Report(ReportStmt::Request { with, .. }) => Some(with),
+        _ => None,
+    }
+}
+
+/// The row label for one `WITH` item — the same text it is written with in
+/// source, so the outline and the source view read alike.
+pub(crate) fn with_item_label(item: &WithItem) -> String {
+    crate::report::flow::with_item_text(item)
 }
 
 fn push_nodes(
@@ -83,6 +159,7 @@ fn push_nodes(
     prefix: &mut Vec<usize>,
     depth: usize,
     resolves: &impl Fn(&str) -> bool,
+    expand_with: bool,
     rows: &mut Vec<NodeRow>,
 ) {
     for (i, node) in nodes.iter().enumerate() {
@@ -96,7 +173,7 @@ fn push_nodes(
                 path: prefix.clone(),
                 req_ok,
             });
-            push_nodes(body, prefix, depth + 1, resolves, rows);
+            push_nodes(body, prefix, depth + 1, resolves, expand_with, rows);
             rows.push(NodeRow {
                 depth,
                 label: String::new(),
@@ -105,13 +182,53 @@ fn push_nodes(
                 req_ok: None,
             });
         } else {
+            let with = expand_with
+                .then(|| node_with_items(node))
+                .flatten()
+                .filter(|w| !w.is_empty());
             rows.push(NodeRow {
                 depth,
-                label: node.label(),
-                kind: RowKind::Leaf,
+                // Expanded, the head loses its "…" placeholder: the fields it
+                // stood for are the rows immediately below.
+                label: match with {
+                    Some(_) => format!("{} WITH", node.header_line()),
+                    None => node.label(),
+                },
+                kind: match node {
+                    FlowNode::Comment(_) => RowKind::Comment,
+                    _ => RowKind::Leaf,
+                },
                 path: prefix.clone(),
                 req_ok,
             });
+            if let Some(with) = with {
+                for (wi, item) in with.iter().enumerate() {
+                    rows.push(NodeRow {
+                        depth: depth + 1,
+                        label: with_item_label(item),
+                        kind: match item {
+                            WithItem::Comment(_) => RowKind::WithComment(wi),
+                            _ => RowKind::WithField(wi),
+                        },
+                        path: prefix.clone(),
+                        req_ok: None,
+                    });
+                }
+                rows.push(NodeRow {
+                    depth: depth + 1,
+                    label: String::new(),
+                    kind: RowKind::WithAdd,
+                    path: prefix.clone(),
+                    req_ok: None,
+                });
+                rows.push(NodeRow {
+                    depth,
+                    label: String::new(),
+                    kind: RowKind::WithEnd,
+                    path: prefix.clone(),
+                    req_ok: None,
+                });
+            }
         }
         prefix.pop();
     }
@@ -149,7 +266,16 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
             parent: row.path.clone(),
             index: 0,
         },
-        RowKind::Leaf | RowKind::LoopEnd => {
+        // A `WITH` row isn't a flow node, but a flow insert asked for from one
+        // still has to land *somewhere* sensible: after the request that owns
+        // the block, which is where the whole `WITH … END` ends on screen.
+        RowKind::Leaf
+        | RowKind::Comment
+        | RowKind::LoopEnd
+        | RowKind::WithField(_)
+        | RowKind::WithComment(_)
+        | RowKind::WithAdd
+        | RowKind::WithEnd => {
             let (last, rest) = row.path.split_last().unwrap_or((&0, &[]));
             InsertPos {
                 parent: rest.to_vec(),
@@ -359,6 +485,9 @@ impl NodeKind {
                 template: "value".into(),
                 name: "column".into(),
                 stats: Vec::new(),
+                image: None,
+                truth: None,
+                detail: false,
             }),
             NodeKind::Assign => FlowNode::Assign {
                 key: "NAME".into(),
@@ -377,6 +506,7 @@ impl NodeKind {
                 pattern: Pattern::single("FOLDER"),
                 producer: Producer::Folders {
                     dir: String::new(),
+                    glob: None,
                     roles: Vec::new(),
                 },
                 body: Vec::new(),
@@ -614,6 +744,18 @@ pub(crate) enum DetachWhich {
     WithBlock,
     /// The `STATISTICS(…)` clause of a named report column.
     Statistics,
+    /// The `IMAGE[(…)]` clause of a named report column.
+    ///
+    /// The three column clauses attach to a *column*, so these target the
+    /// statement's own (`REPORT <var> AS …`, `REPORT "…" AS …`). A `WITH`
+    /// field's clauses are written into its row's text alongside its
+    /// `STATISTICS(…)` and are edited through the field's own wizard, exactly
+    /// as that one is.
+    Image,
+    /// The `TRUTH "…"` clause of a named report column.
+    Truth,
+    /// The `DETAIL` flag of a named report column.
+    Detail,
 }
 
 /// Every variable name in scope at `path` — the candidates a `REPORT <var>`
@@ -673,8 +815,8 @@ pub(crate) fn vars_in_scope(
                     push(name, &mut out);
                 }
                 if let Producer::Folders { roles, .. } = producer {
-                    for (role, _) in roles {
-                        push(role, &mut out);
+                    for role in roles {
+                        push(&role.name, &mut out);
                     }
                 }
                 nodes = body;
@@ -704,7 +846,7 @@ pub(crate) fn vars_in_scope(
 pub(crate) fn baseline_show_choices(
     entries: &[crate::hurl::HurlEntry],
     body: &[FlowNode],
-    selected: &[String],
+    selected: &[ShowField],
 ) -> Vec<(String, bool)> {
     let mut names: Vec<String> = Vec::new();
     let push = |n: &str, names: &mut Vec<String>| {
@@ -723,11 +865,11 @@ pub(crate) fn baseline_show_choices(
         }
     }
     for f in selected {
-        push(f, &mut names);
+        push(f.name(), &mut names);
     }
     names
         .iter()
-        .map(|n| (n.clone(), selected.iter().any(|sel| sel == n)))
+        .map(|n| (n.clone(), selected.iter().any(|sel| sel.name() == n)))
         .collect()
 }
 
@@ -792,6 +934,9 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     name: "field".into(),
                     query: "HttpStatus".into(),
                     stats: Vec::new(),
+                    image: None,
+                    truth: None,
+                    detail: false,
                 });
             }
         }
@@ -805,6 +950,9 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
                     var,
                     name: "name".into(),
                     stats: Vec::new(),
+                    image: None,
+                    truth: None,
+                    detail: false,
                 });
             }
             _ => {}
@@ -841,6 +989,40 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
         },
     }
     true
+}
+
+/// Attach `STATISTICS(COUNT)` to the `WITH` field at `index` of the report
+/// request at `path`, returning whether anything changed.
+///
+/// A `WITH` field is a report column in its own right — it has a name, and the
+/// grammar lets it carry its own `STATISTICS(…)` — but it is not a `FlowNode`,
+/// so [`attach_modifier`] (which addresses nodes by path) can't reach it. That
+/// left the block editor able to *show* a field's `STATISTICS` while giving no
+/// way to add one: the clause bounced off the `WITH` row, and dropping it on the
+/// request line above attaches to nothing, because a request's columns are named
+/// by its fields rather than by the request.
+///
+/// `COUNT` is the seed for the same reason it is in [`attach_to_node`]: it is
+/// the one statistic that means something for a text column as well as a numeric
+/// one. The field wizard refines it.
+pub(crate) fn attach_with_stats(flow: &mut ReportFlow, path: &[usize], index: usize) -> bool {
+    let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path) else {
+        return false;
+    };
+    match with.get_mut(index) {
+        Some(WithItem::Field { stats, .. }) if stats.is_empty() => {
+            *stats = vec![StatKind::Count];
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether [`attach_with_stats`] would do anything — i.e. whether the `WITH`
+/// item at `index` is a named field that hasn't already got a `STATISTICS`
+/// clause. Drives the drop highlight, so the preview and the drop agree.
+pub(crate) fn with_stats_applies(with: &[WithItem], index: usize) -> bool {
+    matches!(with.get(index), Some(WithItem::Field { stats, .. }) if stats.is_empty())
 }
 
 /// Report the variable a `SET` assignment at `path` defines: insert a
@@ -977,21 +1159,298 @@ pub(crate) fn set_parallel_degree(
     }
 }
 
-/// Set the `# key: value` header directive, or remove it entirely when `value`
-/// is `None` (or blank).
+/// Rename the loop variable of the `FOR` at `path` — the inline text box on the
+/// loop chip.
 ///
-/// A directive that already exists is edited in place so the user's own
-/// ordering and any interleaved comments survive; a new one is inserted after
-/// the last existing directive rather than appended, which keeps the directives
-/// together above any trailing comment block.
+/// Only a loop that binds a *single* named value can be renamed this way:
+/// `FOR f IN FILES "."` and `FOR t IN ENVS …` both can, while a destructuring
+/// pattern (`FOR name, url IN …`) or one with a `...` rest cannot, because the
+/// chip has one box and there would be no saying which binder it meant. Those
+/// keep to the wizard.
 ///
-/// Returns `true` when the header actually changed.
-pub(crate) fn set_header(flow: &mut ReportFlow, key: &str, value: Option<&str>) -> bool {
+/// The name is checked against the parser's own identifier rule, so a box left
+/// empty or filled with something like `my file` is rejected rather than
+/// written out as text that would no longer parse. Returns whether it changed.
+pub(crate) fn set_loop_var(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    if !crate::report::parser::is_ident(t) {
+        return false;
+    }
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach { pattern, .. }) => {
+            if pattern.rest || pattern.binders.len() != 1 {
+                return false;
+            }
+            match &mut pattern.binders[0] {
+                Binder::Named(name) => {
+                    if name == t {
+                        return false;
+                    }
+                    *name = t.to_string();
+                    true
+                }
+                // `_` discards the value; renaming it would be introducing a
+                // binder, not editing one.
+                Binder::Discard => false,
+            }
+        }
+        Some(FlowNode::ForEnvs { var, .. }) => {
+            if var == t {
+                return false;
+            }
+            *var = t.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The folder/file a `FOR` loop draws from, when it is a single path the chip
+/// can show a picker for: `FILES "dir"`, `FOLDERS "dir"` and `TUPLES FROM
+/// "file"`. `None` for every other producer — a list literal, a `ZIP`/`CONCAT`
+/// of several, or a named `LIST` have no one path to pick.
+pub(crate) fn loop_dir(flow: &ReportFlow, path: &[usize]) -> Option<String> {
+    match node_at(flow, path) {
+        Some(FlowNode::ForEach { producer, .. }) => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => Some(dir.clone()),
+            Producer::Tuples { path } => Some(path.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Point the loop at `path` at a different folder/file — the chip's picker and
+/// its inline path box.
+///
+/// Empty is rejected: a `FILES ""` reads as the process working directory,
+/// which is never what clearing a box was meant to ask for. Returns whether it
+/// changed.
+pub(crate) fn set_loop_dir(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach { producer, .. }) => match producer {
+            Producer::Files { dir, .. } | Producer::Folders { dir, .. } => {
+                if dir == t {
+                    return false;
+                }
+                *dir = t.to_string();
+                true
+            }
+            Producer::Tuples { path } => {
+                if path == t {
+                    return false;
+                }
+                *path = t.to_string();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Set (or clear, when `text` is blank) the `MATCH "glob"` of a `FILES` loop.
+/// Clearing is meaningful here, unlike the folder: a `FILES` with no `MATCH`
+/// simply takes every file.
+pub(crate) fn set_loop_glob(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    match node_at_mut(flow, path) {
+        Some(FlowNode::ForEach {
+            producer: Producer::Files { glob, .. } | Producer::Folders { glob, .. },
+            ..
+        }) => {
+            let next = (!t.is_empty()).then(|| t.to_string());
+            if *glob == next {
+                return false;
+            }
+            *glob = next;
+            true
+        }
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The report's header directives, as an editable list
+// ---------------------------------------------------------------------------
+
+/// A header directive as the editors present it: which of the `# key: value`
+/// lines exist, how each one is edited, and whether it is worth showing when
+/// unset.
+///
+/// Lives here rather than in either front-end because *both* editors offer the
+/// same settings over the same directives, and when this table lived only in
+/// the GUI the terminal UI silently fell behind it — it could bind a collection
+/// and nothing else. One table, and a directive added to the language shows up
+/// in both editors or neither.
+pub(crate) struct HeaderSpec {
+    pub(crate) key: &'static str,
+    /// `true` for the directives worth showing even when unset (as a prompt),
+    /// rather than hiding them behind the "add setting" menu.
+    pub(crate) always_shown: bool,
+    /// `true` when leaving this unset actually stops the report running, so the
+    /// prompt is drawn in the error colour. Only `collection:` qualifies:
+    /// everything else either has a working default (`output:` falls back to
+    /// `csv`, `root:` to the report's folder) or is simply absent.
+    pub(crate) required: bool,
+    pub(crate) kind: HeaderKind,
+    /// `true` when the directive may appear more than once (`collection:` for
+    /// helper collections, `labels:` for label classes). The editors show one
+    /// row per occurrence and offer an "add another" entry; every other
+    /// directive has exactly one row.
+    pub(crate) repeatable: bool,
+}
+
+/// How one header directive is edited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeaderKind {
+    /// Pick from the open collections.
+    Collection,
+    /// Pick from the loaded global environments.
+    Environment,
+    /// Pick one of the writers PaperTrail can produce.
+    ///
+    /// `# output:` names a *format*, never a filename — the runner derives the
+    /// file from the report's own name (only the CLI's `-o` flag takes a path),
+    /// and `output_extension_from_header` rejects anything that isn't one of
+    /// [`crate::report::writer::OUTPUT_EXTENSIONS`]. So this is a closed list,
+    /// and offering a free-text field with a file browser (as this first did)
+    /// only invited values the report would refuse to run with.
+    Format,
+    /// A folder, typed or chosen with the file picker.
+    Folder,
+    /// A file, typed or chosen with the file picker.
+    File,
+    /// Free text (the `columns:` list).
+    Text,
+}
+
+impl HeaderKind {
+    /// Whether this directive's value is a filesystem path — the two that are
+    /// get a file/folder browser as well as a text field.
+    pub(crate) fn is_path(self) -> bool {
+        matches!(self, HeaderKind::Folder | HeaderKind::File)
+    }
+}
+
+/// Every header directive the editors offer, in the order they are shown.
+pub(crate) fn header_specs() -> [HeaderSpec; 7] {
+    [
+        HeaderSpec {
+            key: "collection",
+            always_shown: true,
+            required: true,
+            kind: HeaderKind::Collection,
+            repeatable: true,
+        },
+        HeaderSpec {
+            key: "output",
+            repeatable: false,
+            always_shown: true,
+            required: false,
+            kind: HeaderKind::Format,
+        },
+        HeaderSpec {
+            key: "environment",
+            repeatable: false,
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Environment,
+        },
+        HeaderSpec {
+            key: "root",
+            repeatable: false,
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Folder,
+        },
+        HeaderSpec {
+            key: "baseline",
+            repeatable: false,
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::File,
+        },
+        HeaderSpec {
+            key: "columns",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Text,
+            repeatable: false,
+        },
+        // Ground truth's vocabulary: one line per label class, so it repeats.
+        HeaderSpec {
+            key: "labels",
+            always_shown: false,
+            required: false,
+            kind: HeaderKind::Text,
+            repeatable: true,
+        },
+    ]
+}
+
+/// The explanation of what one header directive does — the GUI's hover help and
+/// the terminal UI's status line, from one place so the two say the same thing.
+pub(crate) fn header_help(key: &str, s: &Strings) -> &'static str {
+    match key {
+        "collection" => s.chip_help_hdr_collection,
+        "output" => s.chip_help_hdr_output,
+        "environment" => s.chip_help_hdr_environment,
+        "root" => s.chip_help_hdr_root,
+        "baseline" => s.chip_help_hdr_baseline,
+        "labels" => s.chip_help_hdr_labels,
+        _ => s.chip_help_hdr_columns,
+    }
+}
+
+/// The value a freshly-added optional directive starts at.
+///
+/// Always `?`, the "present but not filled in yet" sentinel every editor here
+/// already understands (it renders as the unset prompt). It must not be the
+/// empty string: [`set_header`] treats an empty value as *remove this
+/// directive*, so an empty placeholder made picking a setting from the add menu
+/// do nothing at all — which is exactly what `columns:` used to do.
+pub(crate) const HEADER_PLACEHOLDER: &str = "?";
+
+/// Whether a directive's stored value counts as "not filled in yet" — either
+/// absent altogether or still holding the [`HEADER_PLACEHOLDER`] sentinel.
+pub(crate) fn header_unset(value: &str) -> bool {
+    value.is_empty() || value == HEADER_PLACEHOLDER
+}
+
+/// The `n`th (0-based) occurrence of a repeatable directive, as `set_header_nth`
+/// and the editors index them.
+fn nth_directive(flow: &ReportFlow, key: &str, n: usize) -> Option<usize> {
+    flow.header
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| matches!(l, HeaderLine::Directive { key: k, .. } if k.eq_ignore_ascii_case(key)))
+        .map(|(i, _)| i)
+        .nth(n)
+}
+
+/// Set, change or clear the `n`th occurrence of a repeatable directive.
+///
+/// Indexing matters because `# collection:` repeats: always editing the first
+/// match would silently rewrite the primary collection when the user meant to
+/// edit a helper. Clearing (`None`) removes that one line, so removing helper 1
+/// of 3 leaves the other two alone.
+///
+/// Returns `true` when the header actually changed. A request to set an
+/// occurrence that doesn't exist yet appends one, so `n == count` adds.
+pub(crate) fn set_header_nth(
+    flow: &mut ReportFlow,
+    key: &str,
+    n: usize,
+    value: Option<&str>,
+) -> bool {
     let value = value.map(str::trim).filter(|v| !v.is_empty());
-    let existing = flow.header.lines.iter().position(
-        |l| matches!(l, HeaderLine::Directive { key: k, .. } if k.eq_ignore_ascii_case(key)),
-    );
-    match (existing, value) {
+    match (nth_directive(flow, key, n), value) {
         (Some(i), Some(v)) => {
             let HeaderLine::Directive { value: old, .. } = &mut flow.header.lines[i] else {
                 return false;
@@ -1006,24 +1465,32 @@ pub(crate) fn set_header(flow: &mut ReportFlow, key: &str, value: Option<&str>) 
             flow.header.lines.remove(i);
             true
         }
-        (None, Some(v)) => {
-            let at = flow
-                .header
-                .lines
-                .iter()
-                .rposition(|l| matches!(l, HeaderLine::Directive { .. }))
-                .map_or(0, |i| i + 1);
-            flow.header.lines.insert(
-                at,
-                HeaderLine::Directive {
-                    key: key.to_string(),
-                    value: v.to_string(),
-                },
-            );
-            true
-        }
+        (None, Some(v)) => add_header(flow, key, v),
         (None, None) => false,
     }
+}
+
+/// Append another occurrence of a repeatable directive, after the last existing
+/// directive so the header stays one block above any trailing comments.
+pub(crate) fn add_header(flow: &mut ReportFlow, key: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let at = flow
+        .header
+        .lines
+        .iter()
+        .rposition(|l| matches!(l, HeaderLine::Directive { .. }))
+        .map_or(0, |i| i + 1);
+    flow.header.lines.insert(
+        at,
+        HeaderLine::Directive {
+            key: key.to_string(),
+            value: value.to_string(),
+        },
+    );
+    true
 }
 
 /// Append a new `WITH` field (a `name: query` column) to the report-request at
@@ -1041,6 +1508,9 @@ pub(crate) fn add_with_field(
             name: name.to_string(),
             query: query.to_string(),
             stats,
+            image: None,
+            truth: None,
+            detail: false,
         });
         Some(with.len() - 1)
     } else {
@@ -1048,9 +1518,105 @@ pub(crate) fn add_with_field(
     }
 }
 
+/// The editable state of a column's three trailing clauses — `TRUTH "…"`,
+/// `IMAGE[(…)]` and `DETAIL`.
+///
+/// They attach to every named column form (`REPORT … AS`, a computed column and
+/// a `WITH` field) in exactly the same way, so both front-ends' six forms share
+/// this one model rather than each re-deriving when a blank height means "no
+/// size" and when it means "no clause". Sizes are held as typed *text*, not as
+/// numbers: a half-typed `11` must not momentarily rewrite the flow as a
+/// 11-pixel picture, and a field the user has cleared has to stay cleared while
+/// they think about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClauseForm {
+    /// The ground-truth template. Empty ⇒ no `TRUTH` clause.
+    pub(crate) truth: String,
+    /// The `DETAIL` placement flag.
+    pub(crate) detail: bool,
+    /// Whether the column carries an `IMAGE` clause at all. Held rather than
+    /// derived from the sizes, because a bare `IMAGE` (no options) is a valid
+    /// and common spelling — the sizes being empty cannot mean "off".
+    pub(crate) image_on: bool,
+    /// `FIT`: size to the cell instead of to a box.
+    pub(crate) fit: bool,
+    /// `HEIGHT`, as typed. Empty or unparseable ⇒ absent.
+    pub(crate) height: String,
+    /// `WIDTH`, as typed.
+    pub(crate) width: String,
+}
+
+impl ClauseForm {
+    /// The form state for a column that already carries these clauses.
+    pub(crate) fn of(image: Option<ImageSpec>, truth: Option<&str>, detail: bool) -> Self {
+        let px = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+        ClauseForm {
+            truth: truth.unwrap_or_default().to_string(),
+            detail,
+            image_on: image.is_some(),
+            fit: image.is_some_and(|i| i.fit),
+            height: image.map(|i| px(i.height)).unwrap_or_default(),
+            width: image.map(|i| px(i.width)).unwrap_or_default(),
+        }
+    }
+
+    /// The `TRUTH` clause to write. Blank means *no clause*, so clearing the
+    /// row removes it rather than writing an empty truth nothing can match.
+    pub(crate) fn truth(&self) -> Option<String> {
+        Some(self.truth.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    /// The `IMAGE` clause to write.
+    ///
+    /// `FIT` wins over the sizes rather than being combined with them: the two
+    /// answer the same question ("how big?") and a spec that says both is one
+    /// the writers would have to arbitrate.
+    pub(crate) fn image(&self) -> Option<ImageSpec> {
+        if !self.image_on {
+            return None;
+        }
+        if self.fit {
+            return Some(ImageSpec {
+                fit: true,
+                ..Default::default()
+            });
+        }
+        let px = |s: &String| s.trim().parse::<u32>().ok().filter(|n| *n > 0);
+        Some(ImageSpec {
+            height: px(&self.height),
+            width: px(&self.width),
+            fit: false,
+        })
+    }
+
+    /// Flip the `IMAGE` clause on or off, keeping the size rows in step, the
+    /// same way the `STATISTICS` toggle keeps its checkboxes in step: turning
+    /// it off clears the sizes, so a hidden row can never still be
+    /// contributing to the clause.
+    pub(crate) fn toggle_image(&mut self) {
+        self.image_on = !self.image_on;
+        if !self.image_on {
+            self.fit = false;
+            self.height.clear();
+            self.width.clear();
+        }
+    }
+
+    /// Flip `FIT`, clearing the sizes it overrides so the rows never show a
+    /// height that isn't going to be used.
+    pub(crate) fn toggle_fit(&mut self) {
+        self.fit = !self.fit;
+        if self.fit {
+            self.height.clear();
+            self.width.clear();
+        }
+    }
+}
+
 /// Overwrite the `name`/`query` of the `WITH` *field* at `index` of the
-/// report-request at `path`, preserving any `STATISTICS(…)`. Returns whether it
-/// changed (`false` if the node/index is not a `WITH` field).
+/// report-request at `path`, along with its `STATISTICS(…)` and the three
+/// column clauses. Returns whether it changed (`false` if the node/index is not
+/// a `WITH` field).
 pub(crate) fn set_with_field(
     flow: &mut ReportFlow,
     path: &[usize],
@@ -1058,17 +1624,24 @@ pub(crate) fn set_with_field(
     name: &str,
     query: &str,
     stats: Vec<StatKind>,
+    clauses: &ClauseForm,
 ) -> bool {
     if let Some(FlowNode::Report(ReportStmt::Request { with, .. })) = node_at_mut(flow, path)
         && let Some(WithItem::Field {
             name: n,
             query: q,
             stats: st,
+            image: im,
+            truth: tr,
+            detail: de,
         }) = with.get_mut(index)
     {
         *n = name.to_string();
         *q = query.to_string();
         *st = stats;
+        *im = clauses.image();
+        *tr = clauses.truth();
+        *de = clauses.detail;
         true
     } else {
         false
@@ -1116,9 +1689,9 @@ pub(crate) enum CarriedMod {
     /// this one always has room at the destination.
     With(WithItem),
     Response(ResponseFmt),
-    Show(Vec<String>),
+    Show(Vec<ShowField>),
     Hide(Vec<String>),
-    BaselineShow(Vec<String>),
+    BaselineShow(Vec<ShowField>),
     Role {
         baseline: bool,
         role: RoleRef,
@@ -1317,6 +1890,9 @@ impl CarriedMod {
                         var,
                         name: name.clone(),
                         stats: Vec::new(),
+                        image: None,
+                        truth: None,
+                        detail: false,
                     });
                 }
                 _ => {}
@@ -1528,6 +2104,47 @@ fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
             }
             false
         }
+        // The three column clauses are cleared through one helper each, since
+        // every one of them has to reach both the statement's own column and a
+        // `WITH` field, and the only difference between them is the field.
+        DetachWhich::Image => {
+            clear_clause(node, |image, _, _| *image = None);
+            false
+        }
+        DetachWhich::Truth => {
+            clear_clause(node, |_, truth, _| *truth = None);
+            false
+        }
+        DetachWhich::Detail => {
+            clear_clause(node, |_, _, detail| *detail = false);
+            false
+        }
+    }
+}
+
+/// Apply `f` to a named report column's `(image, truth, detail)`, if `node` is
+/// one. The lookup is the same for all three clauses, so it lives here rather
+/// than three times over.
+fn clear_clause(
+    node: &mut FlowNode,
+    f: impl FnOnce(&mut Option<ImageSpec>, &mut Option<String>, &mut bool),
+) {
+    if let FlowNode::Report(
+        ReportStmt::VarAs {
+            image,
+            truth,
+            detail,
+            ..
+        }
+        | ReportStmt::Computed {
+            image,
+            truth,
+            detail,
+            ..
+        },
+    ) = node
+    {
+        f(image, truth, detail);
     }
 }
 
@@ -1739,6 +2356,107 @@ mod tests {
         assert!(detach_modifier(&mut f, &[0], DetachWhich::Report));
     }
 
+    /// The loop chip's inline name box: it renames the one thing a single-binder
+    /// loop binds, and refuses anything the parser would not take back.
+    #[test]
+    fn set_loop_var_renames_a_single_binder_and_rejects_names_that_would_not_parse() {
+        let mut f = flow("FOR file IN FILES \".\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert!(set_loop_var(&mut f, &[0], "doc"));
+        assert!(
+            f.to_text().contains("FOR doc IN FILES"),
+            "the rename reached the source: {}",
+            f.to_text()
+        );
+
+        assert!(
+            !set_loop_var(&mut f, &[0], "doc"),
+            "no change is not a change"
+        );
+        for bad in ["", "   ", "my file", "2fast", "a-b"] {
+            assert!(
+                !set_loop_var(&mut f, &[0], bad),
+                "{bad:?} is not an identifier and must be refused"
+            );
+        }
+        assert!(
+            f.to_text().contains("FOR doc IN FILES"),
+            "and a refused name leaves the loop alone"
+        );
+
+        // An ENVS loop binds one name too, so it renames the same way.
+        let mut e = flow("FOR t IN ENVS BASELINE(\"prod\")\n  REQUEST A\nEND\n");
+        assert!(set_loop_var(&mut e, &[0], "target"));
+        assert!(e.to_text().contains("FOR target IN ENVS"));
+    }
+
+    /// A destructuring loop has more than one name, and the chip has one box --
+    /// there would be no saying which binder it meant, so it stays with the
+    /// wizard rather than guessing.
+    #[test]
+    fn set_loop_var_refuses_a_pattern_that_binds_more_than_one_name() {
+        let mut f = flow("FOR (NAME, URL) IN DOCS\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut f, &[0], "x"));
+        assert!(
+            f.to_text().contains("FOR (NAME, URL) IN"),
+            "the pattern is untouched: {}",
+            f.to_text()
+        );
+
+        // A `...` rest binds an unknown number of positions, so one box can
+        // speak for none of them either.
+        let mut r = flow("FOR (HEAD, ...) IN DOCS\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut r, &[0], "x"));
+
+        // `_` discards its position; renaming it would be adding a binder.
+        let mut d = flow("FOR _ IN FILES \".\"\n  REQUEST A\nEND\n");
+        assert!(!set_loop_var(&mut d, &[0], "x"));
+    }
+
+    /// The folder box and its picker, over the three producers that have one
+    /// path to point at.
+    #[test]
+    fn the_loop_folder_can_be_read_and_repointed_for_the_producers_that_have_one() {
+        let mut files = flow("FOR f IN FILES \"cases\" MATCH \"*.json\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&files, &[0]).as_deref(), Some("cases"));
+        assert!(set_loop_dir(&mut files, &[0], "other/cases"));
+        assert!(files.to_text().contains("FILES \"other/cases\""));
+        assert!(
+            !set_loop_dir(&mut files, &[0], "   "),
+            "clearing the folder would silently mean the working directory"
+        );
+
+        let mut folders = flow("FOR d IN FOLDERS \"envs\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&folders, &[0]).as_deref(), Some("envs"));
+        assert!(set_loop_dir(&mut folders, &[0], "environments"));
+        assert!(folders.to_text().contains("FOLDERS \"environments\""));
+
+        let mut tuples = flow("FOR t IN TUPLES FROM \"rows.csv\"\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&tuples, &[0]).as_deref(), Some("rows.csv"));
+        assert!(set_loop_dir(&mut tuples, &[0], "data/rows.csv"));
+        assert!(tuples.to_text().contains("TUPLES FROM \"data/rows.csv\""));
+
+        // A list literal has no single path, so the chip shows no picker.
+        let list = flow("FOR x IN [\"a\", \"b\"]\n  REQUEST A\nEND\n");
+        assert_eq!(loop_dir(&list, &[0]), None);
+    }
+
+    /// Unlike the folder, an empty glob is a real answer: `FILES` with no
+    /// `MATCH` takes every file.
+    #[test]
+    fn the_loop_glob_can_be_set_and_cleared() {
+        let mut f = flow("FOR f IN FILES \"cases\"\n  REQUEST A\nEND\n");
+        assert!(!f.to_text().contains("MATCH"));
+        assert!(set_loop_glob(&mut f, &[0], "*.json"));
+        assert!(f.to_text().contains("MATCH \"*.json\""));
+
+        assert!(set_loop_glob(&mut f, &[0], ""));
+        assert!(
+            !f.to_text().contains("MATCH"),
+            "clearing the box drops the clause: {}",
+            f.to_text()
+        );
+    }
+
     #[test]
     fn set_parallel_degree_edits_the_concurrency_limit_and_rejects_zero() {
         let mut f = flow("PARALLEL FOR X IN FILES \"/d\"\n    REQUEST A\nEND\n");
@@ -1767,12 +2485,12 @@ REQUEST A
         );
 
         // Editing in place keeps the directive where the user put it.
-        assert!(set_header(&mut f, "collection", Some("other.hurl")));
+        assert!(set_header_nth(&mut f, "collection", 0, Some("other.hurl")));
         assert!(f.to_text().contains("# collection: other.hurl"));
         assert_eq!(f.header.collection(), Some("other.hurl"));
 
         // A new directive lands with the others, not at the top of the file.
-        assert!(set_header(&mut f, "output", Some("out.csv")));
+        assert!(set_header_nth(&mut f, "output", 0, Some("out.csv")));
         assert_eq!(f.header.output(), Some("out.csv"));
         let text = f.to_text();
         assert!(
@@ -1782,17 +2500,17 @@ REQUEST A
 
         // Setting the same value again is not a change, so it can't push a
         // pointless undo entry or mark the report dirty.
-        assert!(!set_header(&mut f, "output", Some("out.csv")));
+        assert!(!set_header_nth(&mut f, "output", 0, Some("out.csv")));
 
         // Clearing removes the line rather than leaving `# output:` empty,
         // which the parser would read as a directive set to the empty string.
-        assert!(set_header(&mut f, "output", None));
+        assert!(set_header_nth(&mut f, "output", 0, None));
         assert_eq!(f.header.output(), None);
         assert!(!f.to_text().contains("# output"));
-        assert!(!set_header(&mut f, "output", None));
+        assert!(!set_header_nth(&mut f, "output", 0, None));
 
         // Blank input means "unset", not "set to nothing".
-        assert!(!set_header(&mut f, "root", Some("   ")));
+        assert!(!set_header_nth(&mut f, "root", 0, Some("   ")));
         assert_eq!(f.header.root(), None);
     }
 
@@ -1806,7 +2524,7 @@ REQUEST A
 REQUEST A
 ",
         );
-        assert!(set_header(&mut f, "environment", Some("dev")));
+        assert!(set_header_nth(&mut f, "environment", 0, Some("dev")));
         let text = f.to_text();
         assert!(text.contains("# a note to self"), "{text:?}");
         assert!(
@@ -1960,6 +2678,56 @@ REQUEST A
             "detaching leaves the column itself alone: {}",
             flow.to_text()
         );
+    }
+
+    /// A `WITH` field is the report column a request actually names, so it is
+    /// what STATISTICS attaches to — the request line above summarises nothing.
+    /// The block editor could show a field's STATISTICS but had no way to add
+    /// one, because a field isn't a node a modifier can be dropped on.
+    #[test]
+    fn statistics_attaches_to_a_with_field() {
+        let mut flow =
+            parse_flow("REPORT REQUEST svc WITH\n    Elapsed: Time\n    RESPONSE RAW\nEND\n")
+                .expect("fixture parses");
+        // The request line itself still refuses it: its columns are its fields.
+        assert!(
+            !attach_modifier(&mut flow, &[0], Modifier::Statistics),
+            "a report request names no single column"
+        );
+
+        assert!(
+            with_stats_applies(with_of(&flow), 0),
+            "a named field takes it"
+        );
+        assert!(attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            flow.to_text().contains("Elapsed: Time STATISTICS(COUNT)"),
+            "the clause lands on the field: {}",
+            flow.to_text()
+        );
+
+        // Only once, and never on a bare `WITH RESPONSE` item (which has no name
+        // to put a column under) or a field that isn't there.
+        assert!(!with_stats_applies(with_of(&flow), 0), "already has one");
+        assert!(!attach_with_stats(&mut flow, &[0], 0));
+        assert!(
+            !with_stats_applies(with_of(&flow), 1),
+            "RESPONSE RAW is not a column"
+        );
+        assert!(!attach_with_stats(&mut flow, &[0], 1));
+        assert!(!attach_with_stats(&mut flow, &[0], 9), "no such field");
+
+        // And it round-trips back through the parser as a field clause.
+        let again = parse_flow(&flow.to_text()).expect("reparses");
+        assert_eq!(again.to_text(), flow.to_text());
+    }
+
+    /// The `WITH` items of the report request at the root of `flow`.
+    fn with_of(flow: &ReportFlow) -> &[WithItem] {
+        match &flow.nodes[0] {
+            FlowNode::Report(ReportStmt::Request { with, .. }) => with,
+            other => panic!("expected a report request, got {other:?}"),
+        }
     }
 
     /// Every refusal has to distinguish "wrong kind of block" from "it's
@@ -2436,12 +3204,15 @@ REQUEST A
             "Code",
             "HttpStatus",
             vec![StatKind::Count, StatKind::Mean],
+            &ClauseForm::default(),
         ));
         match node_at(&f, &[0]) {
             Some(FlowNode::Report(ReportStmt::Request { with, .. })) => {
                 assert!(matches!(
                     &with[0],
-                    WithItem::Field { name, query, stats }
+                    WithItem::Field {
+                        name, query, stats, ..
+                    }
                         if name == "Code"
                             && query == "HttpStatus"
                             && stats == &[StatKind::Count, StatKind::Mean]
@@ -2458,13 +3229,95 @@ REQUEST A
             0,
             "Code",
             "HttpStatus",
-            Vec::new()
+            Vec::new(),
+            &ClauseForm::default(),
         ));
         assert!(!f.to_text().contains("STATISTICS"));
 
         // A non-request node has no WITH block to add to.
         let mut g = flow("REPORT userId\n");
         assert_eq!(add_with_field(&mut g, &[0], "X", "Y", Vec::new()), None);
-        assert!(!set_with_field(&mut g, &[0], 0, "X", "Y", Vec::new()));
+        assert!(!set_with_field(
+            &mut g,
+            &[0],
+            0,
+            "X",
+            "Y",
+            Vec::new(),
+            &ClauseForm::default()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod repeatable_header_tests {
+    use super::*;
+    use crate::report::parser::parse_flow;
+
+    fn flow(src: &str) -> ReportFlow {
+        parse_flow(src).expect("parses")
+    }
+
+    /// The bug `set_header_nth` exists to avoid: editing helper 1 must not
+    /// rewrite the primary collection.
+    #[test]
+    fn editing_a_helper_leaves_the_primary_collection_alone() {
+        let mut f = flow("# collection: ./api.hurl\n# collection: ./a.hurl AS a\n\nREQUEST x\n");
+        assert!(set_header_nth(
+            &mut f,
+            "collection",
+            1,
+            Some("./b.hurl AS b")
+        ));
+        let all = f.header.get_all("collection");
+        assert_eq!(all, vec!["./api.hurl", "./b.hurl AS b"]);
+    }
+
+    #[test]
+    fn clearing_one_helper_keeps_the_others() {
+        let mut f = flow(
+            "# collection: ./api.hurl\n# collection: ./a.hurl AS a\n# collection: ./b.hurl AS b\n\nREQUEST x\n",
+        );
+        assert!(set_header_nth(&mut f, "collection", 1, None));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./api.hurl", "./b.hurl AS b"]
+        );
+    }
+
+    /// Setting an occurrence that doesn't exist yet appends one, which is how
+    /// the editors' "add a helper collection" works.
+    #[test]
+    fn setting_past_the_end_appends_another_directive() {
+        let mut f = flow("# collection: ./api.hurl\n\nREQUEST x\n");
+        assert!(set_header_nth(
+            &mut f,
+            "collection",
+            1,
+            Some("./h.hurl AS h")
+        ));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./api.hurl", "./h.hurl AS h"]
+        );
+        // And it lands in the header block, above the flow.
+        assert!(
+            f.to_text()
+                .starts_with("# collection: ./api.hurl\n# collection: ./h.hurl AS h\n"),
+            "{:?}",
+            f.to_text()
+        );
+    }
+
+    /// `set_header` keeps its old first-match-wins meaning for the directives
+    /// that only ever appear once.
+    #[test]
+    fn set_header_still_edits_the_first_occurrence() {
+        let mut f = flow("# collection: ./api.hurl\n# collection: ./a.hurl AS a\n\nREQUEST x\n");
+        assert!(set_header_nth(&mut f, "collection", 0, Some("./new.hurl")));
+        assert_eq!(
+            f.header.get_all("collection"),
+            vec!["./new.hurl", "./a.hurl AS a"]
+        );
     }
 }

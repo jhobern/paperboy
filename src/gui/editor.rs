@@ -133,6 +133,86 @@ fn highlight_code_editable(
     job
 }
 
+/// Which substitution statuses appear in `text` — the legend's whole input.
+///
+/// The legend used to be collected by running the *highlighter* over the buffer
+/// and throwing the resulting [`LayoutJob`] away, so every frame paid for a
+/// second full colouring pass to learn four booleans. This walks the same
+/// placeholders without building anything, and stops as soon as it has seen
+/// everything there is to see.
+fn substitution_statuses(
+    text: &str,
+    vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+) -> SubstSeen {
+    let mut seen = SubstSeen::default();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let Some(close_rel) = rest[open + 2..].find("}}") else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        let inner = rest[open + 2..close].trim();
+        if let Some(info) = vars.get(inner) {
+            seen.mark(info.kind);
+            if shadowed.contains(inner) {
+                seen.shadowed = true;
+            }
+        }
+        rest = &rest[close + 2..];
+    }
+    seen
+}
+
+/// [`highlight_code_editable`], reused between frames while nothing it depends
+/// on has changed. See the report source editor's equivalent for why: the
+/// layouter is asked for a job on every frame, and rebuilding it re-scans the
+/// whole buffer.
+fn cached_code_job(
+    ui: &egui::Ui,
+    text: &str,
+    vars: &HashMap<String, SubstInfo>,
+    shadowed: &HashSet<String>,
+    th: &GuiTheme,
+    font: FontId,
+) -> LayoutJob {
+    use std::hash::{Hash, Hasher};
+    let id = egui::Id::new("code_edit_highlight");
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    crate::gui::report_editor::fnv1a(text.as_bytes(), crate::gui::report_editor::FNV_OFFSET)
+        .hash(&mut h);
+    font.size.to_bits().hash(&mut h);
+    // Both are hash maps/sets, so combine each entry order-independently.
+    let mut refs = 0u64;
+    for (k, info) in vars {
+        // Only the name and the kind, deliberately: the *editable* highlighter
+        // leaves `{{ VAR }}` in place and merely colours it, so the resolved
+        // value never reaches the buffer and hashing it would be dead cost.
+        // (`highlight_code`, which does substitute, is not cached through here.)
+        refs ^= crate::gui::report_editor::fnv1a(
+            k.as_bytes(),
+            crate::gui::report_editor::FNV_OFFSET ^ info.kind as u64,
+        );
+    }
+    for k in shadowed {
+        refs ^= crate::gui::report_editor::fnv1a(k.as_bytes(), 0x9e37_79b9_7f4a_7c15);
+    }
+    refs.hash(&mut h);
+    // The colours themselves come from the theme.
+    format!("{:?}", (th.text, th.subst, th.pending, th.err, th.ok)).hash(&mut h);
+    let key = h.finish();
+
+    if let Some((cached_key, job)) = ui.data(|d| d.get_temp::<(u64, LayoutJob)>(id))
+        && cached_key == key
+    {
+        return job;
+    }
+    let mut ignored = SubstSeen::default();
+    let job = highlight_code_editable(text, vars, shadowed, th, font, &mut ignored);
+    ui.data_mut(|d| d.insert_temp(id, (key, job.clone())));
+    job
+}
+
 /// Re-parse edited Code-view `text` back into the selected entry. On success it
 /// applies the result (preserving the UI-only `user_added` flag for Hurl; the
 /// JSON view carries over the fields it doesn't expose from the current entry)
@@ -202,12 +282,16 @@ fn draw_code_section(
     let mut changed = false;
 
     // Representation toggle (Hurl source vs. resolved JSON), mirroring the TUI.
+    let (lbl_json, lbl_hurl) = (
+        app.strings.gui_code_repr_json,
+        app.strings.gui_code_repr_hurl,
+    );
     ui.horizontal(|ui| {
-        if widgets::selectable(ui, !*code_show_hurl, "JSON").clicked() {
+        if widgets::selectable(ui, !*code_show_hurl, lbl_json).clicked() {
             *code_show_hurl = false;
             app.code_edit.key = None;
         }
-        if widgets::selectable(ui, *code_show_hurl, "Hurl").clicked() {
+        if widgets::selectable(ui, *code_show_hurl, lbl_hurl).clicked() {
             *code_show_hurl = true;
             app.code_edit.key = None;
         }
@@ -230,15 +314,7 @@ fn draw_code_section(
     }
 
     // Legend: which substitution statuses appear in the current buffer.
-    let mut seen = SubstSeen::default();
-    let _ = highlight_code_editable(
-        &app.code_edit.buf,
-        subst_vars,
-        shadowed,
-        theme,
-        FontId::monospace(12.0),
-        &mut seen,
-    );
+    let seen = substitution_statuses(&app.code_edit.buf, subst_vars, shadowed);
 
     // A fixed-height editor that fills the panel (not shrink-wrapped to its
     // text), leaving room below for the legend and any parse error.
@@ -257,15 +333,7 @@ fn draw_code_section(
     let theme_l = theme;
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let mut s = SubstSeen::default();
-        let mut job = highlight_code_editable(
-            buf.as_str(),
-            subst_vars_l,
-            shadowed_l,
-            theme_l,
-            font,
-            &mut s,
-        );
+        let mut job = cached_code_job(ui, buf.as_str(), subst_vars_l, shadowed_l, theme_l, font);
         job.wrap.max_width = wrap;
         ui.fonts_mut(|f| f.layout_job(job))
     };
@@ -347,9 +415,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // Mirrors the TUI edit-request wizard, which shows the request Name above
     // the Method/URL row. The Name is the display title in the request tree.
     let send_label = format!("{} {}", app.strings.gui_send, super::icons::PLAY);
+    // The keyboard shortcuts have nowhere else to announce themselves.
+    let app_strings_send_tooltip = app.strings.gui_send_tooltip;
     {
         let entry = &mut app.session.collections[ci].entries[sel];
         let name_label = app.strings.gui_name;
+        let url_hint = app.strings.gui_hint_url;
         ui.horizontal(|ui| {
             ui.label(RichText::new(name_label).color(theme.dim));
             let name = ui.add(
@@ -363,24 +434,26 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         });
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if widgets::method_combo(ui, "method", &mut entry.method) {
+            if widgets::method_combo(ui, &theme, "method", &mut entry.method) {
                 changed = true;
             }
             let send_w = 92.0;
             let url = ui.add_sized(
                 [ui.available_width() - send_w, 24.0],
                 egui::TextEdit::singleline(&mut entry.url)
-                    .hint_text("https://api.example.com/path")
+                    .hint_text(url_hint)
                     .font(egui::TextStyle::Monospace),
             );
             if url.changed() {
                 changed = true;
             }
-            let btn = ui.add_sized(
-                [80.0, 24.0],
-                egui::Button::new(RichText::new(send_label).strong().color(theme.select_fg))
-                    .fill(theme.accent),
-            );
+            let btn = ui
+                .add_sized(
+                    [80.0, 24.0],
+                    egui::Button::new(RichText::new(send_label).strong().color(theme.select_fg))
+                        .fill(theme.accent),
+                )
+                .on_hover_text(app_strings_send_tooltip);
             if btn.clicked() {
                 send = true;
             }
@@ -465,6 +538,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // be shown/coloured, and which keys the linked env shadows. Computed here
     // (before the entry is mutably borrowed by the section closure) and only
     // when the Code tab is active, since it borrows the whole collection.
+    //
+    // Deliberately rebuilt each frame rather than cached: measured at 39us for
+    // a 60-request collection against a 40-variable environment, and a cache
+    // key would have to walk the same entries and variables to notice a change,
+    // so it would cost about what it saved. The highlighter downstream *is*
+    // cached, which is where the frame time actually went.
     let (subst_vars, shadowed) = if section == EditorSection::Code {
         let env = app.session.effective_env(ci);
         (
@@ -501,10 +580,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     } else {
         // Resolved up front: the section body borrows the collection mutably,
         // so the session can't be consulted from inside it.
-        let browse_fallback = app
-            .session
-            .picker_dir(crate::session::PickerKind::Other)
-            .map(|p| p.to_path_buf());
+        // Which Form/Multipart file value asked for a picker this frame, if
+        // any. Collected below, once the body has released the collection.
+        let mut browse: Option<usize> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -535,19 +613,41 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry, browse_fallback.as_deref())
-                            {
+                            if draw_section(*sec, ui, &theme, st, entry, &mut browse) {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry, browse_fallback.as_deref()) {
+                        if draw_section(other, ui, &theme, st, entry, &mut browse) {
                             changed = true;
                         }
                     }
                 }
             });
+        if let Some(field) = browse {
+            let seed = app.session.collections[ci].entries[sel]
+                .form_fields
+                .get(field)
+                .and_then(|f| super::filepick::seed_dir(&f.value))
+                .or_else(|| {
+                    app.session
+                        .picker_dir(crate::session::PickerKind::Other)
+                        .map(|p| p.to_path_buf())
+                });
+            app.request_pick(
+                super::filepick::PickKind::File {
+                    filters: Vec::new(),
+                },
+                app.strings.gui_browse,
+                seed.as_deref(),
+                super::menu::PickAction::FormFieldFile {
+                    ci,
+                    entry: sel,
+                    field,
+                },
+            );
+        }
     }
 
     app.show_hurl = code_show_hurl;
@@ -590,7 +690,7 @@ fn draw_section(
     st: &Strings,
     entry: &mut HurlEntry,
     // Where a `[Form]` file picker opens when the field is still blank.
-    browse_fallback: Option<&std::path::Path>,
+    browse: &mut Option<usize>,
 ) -> bool {
     let mut changed = false;
     match section {
@@ -646,7 +746,7 @@ fn draw_section(
             ui.add_space(8.0);
             ui.separator();
             ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
-            if form_editor(ui, theme, st, &mut entry.form_fields, browse_fallback) {
+            if form_editor(ui, theme, st, &mut entry.form_fields, browse) {
                 changed = true;
             }
         }
@@ -774,7 +874,7 @@ fn assert_editor(
                 egui::TextEdit::singleline(&mut asserts[i])
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
-                    .hint_text("jsonpath \"$.status\" == \"ok\""),
+                    .hint_text(s.gui_hint_assert),
             );
             if r.changed() {
                 changed = true;
@@ -798,7 +898,7 @@ fn form_editor(
     theme: &super::theme::GuiTheme,
     s: &Strings,
     fields: &mut Vec<FormField>,
-    browse_fallback: Option<&std::path::Path>,
+    browse: &mut Option<usize>,
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -861,7 +961,7 @@ fn form_editor(
                 fields[i].kind = kind;
                 let hint = match kind {
                     FormFieldKind::Text => s.gui_hint_value,
-                    _ => "/path/to/file",
+                    _ => s.gui_hint_file_path,
                 };
                 // Value fills the last column; the remove ✕ is tucked to its
                 // right (see the note in `widgets::kv_editor`).
@@ -877,16 +977,10 @@ fn form_editor(
                     if matches!(kind, FormFieldKind::File | FormFieldKind::Base64File)
                         && ui.button(s.gui_browse).clicked()
                     {
-                        if let Some(p) = super::filepick::pick_file(
-                            s.gui_browse,
-                            super::filepick::seed_dir(&fields[i].value)
-                                .as_deref()
-                                .or(browse_fallback),
-                            &[],
-                        ) {
-                            fields[i].value = p.to_string_lossy().into_owned();
-                            changed = true;
-                        }
+                        // Recorded rather than opened: the picker needs `app`,
+                        // which the section body has already borrowed mutably.
+                        // See `super::filepick`.
+                        *browse = Some(i);
                     }
                     if ui
                         .add(
@@ -1054,5 +1148,271 @@ mod tests {
         assert!(!changed, "malformed JSON must not report a change");
         assert!(code.error.is_some(), "malformed JSON records an error");
         assert_eq!(session.collections[0].entries[0].method, before_method);
+    }
+}
+
+#[cfg(test)]
+mod highlight_cache_tests {
+    use super::*;
+    use crate::gui::theme::GuiTheme;
+    use crate::request::{SubstInfo, SubstKind};
+
+    fn vars() -> HashMap<String, SubstInfo> {
+        [
+            (
+                "BASE",
+                SubstInfo {
+                    shown: Some("https://x".into()),
+                    kind: SubstKind::Literal,
+                },
+            ),
+            (
+                "TOKEN",
+                SubstInfo {
+                    shown: None,
+                    kind: SubstKind::Pending,
+                },
+            ),
+            (
+                "SECRET",
+                SubstInfo {
+                    shown: Some("s".into()),
+                    kind: SubstKind::Loaded,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// The legend used to be built by running the highlighter over the whole
+    /// buffer and throwing the coloured job away. The cheap scan that replaced
+    /// it has to report exactly what that pass did, or the legend would start
+    /// listing the wrong statuses.
+    #[test]
+    fn the_legend_scan_agrees_with_the_highlighter_it_replaced() {
+        let vars = vars();
+        let shadowed: HashSet<String> = ["SECRET".to_string()].into_iter().collect();
+        for text in [
+            "",
+            "GET {{ BASE }}/a",
+            "GET {{BASE}}/a\nAuth: {{ TOKEN }}\nX: {{ SECRET }}\n",
+            "{{ UNKNOWN }} and an unclosed {{ one",
+            "no placeholders at all",
+        ] {
+            let mut from_highlighter = SubstSeen::default();
+            let _ = highlight_code_editable(
+                text,
+                &vars,
+                &shadowed,
+                &GuiTheme::from_spec(&crate::theme::default_preset()),
+                FontId::monospace(12.0),
+                &mut from_highlighter,
+            );
+            let scanned = substitution_statuses(text, &vars, &shadowed);
+            assert_eq!(
+                (
+                    scanned.loaded,
+                    scanned.literal,
+                    scanned.pending,
+                    scanned.failed,
+                    scanned.shadowed
+                ),
+                (
+                    from_highlighter.loaded,
+                    from_highlighter.literal,
+                    from_highlighter.pending,
+                    from_highlighter.failed,
+                    from_highlighter.shadowed
+                ),
+                "disagreed on {text:?}"
+            );
+        }
+    }
+
+    /// The cache keys on a variable's name and kind but not its value, which is
+    /// only safe because the editable highlighter leaves the `{{ VAR }}` token
+    /// in the buffer rather than substituting into it. Pin that, so the key
+    /// would have to be widened if the Code view ever started substituting.
+    #[test]
+    fn the_editable_highlighter_shows_the_placeholder_not_the_value() {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        let font = FontId::monospace(12.0);
+        let shadowed = HashSet::new();
+        let text = "GET {{ BASE }}/a";
+
+        let render = |shown: &str| {
+            let vars: HashMap<String, SubstInfo> = [(
+                "BASE".to_string(),
+                SubstInfo {
+                    shown: Some(shown.to_string()),
+                    kind: SubstKind::Literal,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut out = String::new();
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    out = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone()).text;
+                });
+            }
+            out
+        };
+
+        assert_eq!(
+            render("https://staging"),
+            text,
+            "the buffer keeps its placeholders; only their colour comes from the value"
+        );
+        assert_eq!(render("https://staging"), render("https://prod"));
+    }
+
+    /// The cached job must be the one the highlighter would have built, and must
+    /// follow an edit rather than holding on to the previous buffer.
+    #[test]
+    fn the_cached_job_matches_a_freshly_built_one_and_follows_an_edit() {
+        let vars = vars();
+        let shadowed = HashSet::new();
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        let font = FontId::monospace(12.0);
+
+        let sections = |text: &str| {
+            let mut got = Vec::new();
+            // Twice, so the second pass is the one served from the cache.
+            for _ in 0..2 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let job = cached_code_job(ui, text, &vars, &shadowed, &th, font.clone());
+                    got = job
+                        .sections
+                        .iter()
+                        .map(|s| (s.byte_range.clone(), s.format.color))
+                        .collect();
+                });
+            }
+            got
+        };
+
+        let fresh = |text: &str| {
+            let mut ignored = SubstSeen::default();
+            highlight_code_editable(text, &vars, &shadowed, &th, font.clone(), &mut ignored)
+                .sections
+                .iter()
+                .map(|s| (s.byte_range.clone(), s.format.color))
+                .collect::<Vec<_>>()
+        };
+
+        let one = "GET {{ BASE }}/a";
+        assert_eq!(sections(one), fresh(one), "same colouring, cached or not");
+
+        let two = "GET {{ TOKEN }}/a";
+        assert_eq!(
+            sections(two),
+            fresh(two),
+            "an edit re-colours rather than serving the previous buffer"
+        );
+        assert_ne!(
+            sections(one),
+            sections(two),
+            "and the two really do colour differently"
+        );
+    }
+}
+
+/// Write back the file a Form/Multipart value's Browse dialog returned.
+///
+/// Every index is re-checked rather than trusted: the user can switch request,
+/// close the collection or delete the row while the dialog is up, and writing a
+/// path into whatever now sits at that index would be worse than dropping it.
+pub(super) fn apply_picked_form_file(
+    app: &mut GuiApp,
+    ci: usize,
+    entry: usize,
+    field: usize,
+    picked: Option<std::path::PathBuf>,
+) {
+    let Some(path) = picked else {
+        return; // cancelled
+    };
+    let Some(col) = app.session.collections.get_mut(ci) else {
+        return;
+    };
+    let Some(e) = col.entries.get_mut(entry) else {
+        return;
+    };
+    let Some(f) = e.form_fields.get_mut(field) else {
+        return;
+    };
+    f.value = path.to_string_lossy().into_owned();
+    e.modified = true;
+    col.invalidate_request_json();
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn app_with_form_field(value: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entry = crate::hurl::HurlEntry {
+            title: "A".into(),
+            url: "http://127.0.0.1:1/".into(),
+            form_fields: vec![crate::hurl::FormField {
+                key: "f".into(),
+                kind: crate::hurl::FormFieldKind::File,
+                value: value.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        GuiApp::for_test(session)
+    }
+
+    #[test]
+    fn a_picked_form_file_lands_in_its_field_and_marks_it_modified() {
+        let mut app = app_with_form_field("");
+        apply_picked_form_file(&mut app, 0, 0, 0, Some("/tmp/face.jpg".into()));
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            "/tmp/face.jpg"
+        );
+        assert!(app.session.collections[0].entries[0].modified);
+    }
+
+    /// Cancelling must leave the value the user already typed alone -- backing
+    /// out of a picker is not a request to clear the field.
+    #[test]
+    fn cancelling_leaves_the_field_untouched() {
+        let mut app = app_with_form_field("kept.jpg");
+        apply_picked_form_file(&mut app, 0, 0, 0, None);
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            "kept.jpg"
+        );
+        assert!(!app.session.collections[0].entries[0].modified);
+    }
+
+    /// The dialog outlives its context: by the time a path arrives the row it
+    /// was opened for may be gone, and the path must be dropped rather than
+    /// written into whatever now sits at that index.
+    #[test]
+    fn a_path_for_a_row_that_no_longer_exists_is_dropped() {
+        let mut app = app_with_form_field("");
+        apply_picked_form_file(&mut app, 0, 0, 7, Some("/tmp/x.jpg".into()));
+        apply_picked_form_file(&mut app, 0, 9, 0, Some("/tmp/x.jpg".into()));
+        apply_picked_form_file(&mut app, 5, 0, 0, Some("/tmp/x.jpg".into()));
+        assert_eq!(
+            app.session.collections[0].entries[0].form_fields[0].value,
+            ""
+        );
+        assert!(!app.session.collections[0].entries[0].modified);
     }
 }

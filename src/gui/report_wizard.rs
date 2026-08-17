@@ -18,7 +18,7 @@ use crate::report::context;
 use crate::report::edit::node_at;
 use crate::report::flow::{
     EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef,
-    WithItem,
+    ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -57,6 +57,8 @@ pub struct VarsForm {
     /// emits two columns and so has no one name to give.
     alias: String,
     stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 impl VarsForm {
@@ -80,18 +82,31 @@ impl VarsForm {
         let chosen = self.chosen();
         let (first, rest) = chosen.split_first()?;
         let alias = self.alias.trim();
+        let image = self.clauses.image();
+        let truth = self.clauses.truth();
         // An alias applies to exactly one column, so a multi-variable pick
-        // ignores it rather than silently dropping the extra variables.
-        if rest.is_empty() && !alias.is_empty() {
+        // ignores it rather than silently dropping the extra variables. A
+        // clause is enough on its own to need the `AS` form, so an unnamed
+        // column falls back to the variable's own name rather than losing it.
+        if rest.is_empty()
+            && (!alias.is_empty() || image.is_some() || truth.is_some() || self.clauses.detail)
+        {
             return Some(FlowNode::Report(ReportStmt::VarAs {
                 var: first.clone(),
-                name: alias.to_string(),
+                name: if alias.is_empty() {
+                    first.clone()
+                } else {
+                    alias.to_string()
+                },
                 stats: self
                     .stats
                     .iter()
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
+                image,
+                truth,
+                detail: self.clauses.detail,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -105,6 +120,8 @@ pub struct ComputedForm {
     template: String,
     alias: String,
     stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 /// The `VARIABLE = VALUE` (`Assign`) form: two plain text fields.
@@ -157,6 +174,8 @@ pub struct WithFieldForm {
     /// The `STATISTICS(…)` checklist: `(stat, on)` over every choosable stat, in
     /// [`StatKind::CHOOSABLE`] order. None ticked ⇒ no clause.
     stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    clauses: crate::report::edit::ClauseForm,
 }
 
 impl WithFieldForm {
@@ -181,6 +200,10 @@ pub struct RequestForm {
     alias: String,
     /// The `SHOW(…)` checklist: `(field, included)`. All ticked ⇒ no clause.
     fields: Vec<(String, bool)>,
+    /// Any `STATISTICS(…)` the `SHOW(…)` fields carried. The checklist has no
+    /// row for them; they are kept so applying the form can't delete a clause
+    /// the user wrote in the source.
+    show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// The `HIDE(…)` checklist over the same field list: `(field, hidden)`.
     /// None ticked ⇒ no clause. `HIDE` subtracts from whatever `SHOW` selected,
     /// so both lists cover the same names.
@@ -190,16 +213,26 @@ pub struct RequestForm {
 }
 
 impl RequestForm {
-    /// The `SHOW(…)` list for the ticked rows; empty when every field is ticked
-    /// (⇒ emit all, no clause).
-    fn show(&self) -> Vec<String> {
-        if self.fields.iter().all(|(_, on)| *on) {
+    /// The `SHOW(…)` list for the ticked rows; empty when the ticked set is
+    /// exactly what the request emits without a clause — every field except the
+    /// opt-in timing intrinsics (⇒ no clause).
+    fn show(&self) -> Vec<ShowField> {
+        if self
+            .fields
+            .iter()
+            .all(|(n, on)| *on != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&n.as_str()))
+        {
             return Vec::new();
         }
         self.fields
             .iter()
             .filter(|(_, on)| *on)
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| ShowField {
+                field: n.clone(),
+                // Carried through, never edited: the checklist has no row for a
+                // `STATISTICS(…)` clause, and editing must not delete one.
+                stats: self.show_stats.get(n).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -265,6 +298,9 @@ pub struct EnvsForm {
     /// `baseline_show` means "no SHOW clause", which is NOT the same as "show
     /// everything" — so nothing is ticked by default.
     baseline_show_fields: Vec<(String, bool)>,
+    /// Any `STATISTICS(…)` on the `BASELINE(…) SHOW(…)` fields, carried through
+    /// untouched for the same reason as [`RequestForm::show_stats`].
+    show_stats: std::collections::HashMap<String, Vec<StatKind>>,
 }
 
 impl EnvsForm {
@@ -284,11 +320,14 @@ impl EnvsForm {
     /// means "copy nothing across", which is the language's default, so there
     /// is no ambiguity with the request-level `SHOW` where empty means "show
     /// everything".
-    fn selected_baseline_show(&self) -> Vec<String> {
+    fn selected_baseline_show(&self) -> Vec<ShowField> {
         self.baseline_show_fields
             .iter()
             .filter(|(_, on)| *on)
-            .map(|(n, _)| n.clone())
+            .map(|(n, _)| ShowField {
+                field: n.clone(),
+                stats: self.show_stats.get(n).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -377,12 +416,26 @@ fn build_vars(
     path: &[usize],
     node: &FlowNode,
 ) -> VarsForm {
-    let (chosen, alias, stats) = match node {
-        FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), String::new(), Vec::new()),
-        FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
-            (vec![var.clone()], name.clone(), stats.clone())
+    let (chosen, alias, stats, image, truth, detail) = match node {
+        FlowNode::Report(ReportStmt::Vars(vars)) => {
+            (vars.clone(), String::new(), Vec::new(), None, None, false)
         }
-        _ => (Vec::new(), String::new(), Vec::new()),
+        FlowNode::Report(ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+            truth,
+            detail,
+        }) => (
+            vec![var.clone()],
+            name.clone(),
+            stats.clone(),
+            *image,
+            truth.clone(),
+            *detail,
+        ),
+        _ => (Vec::new(), String::new(), Vec::new(), None, None, false),
     };
     let entries = context::resolve_bound_collection(&app.session.collections, flow, report_path)
         .map(|ci| app.session.collections[ci].entries.as_slice())
@@ -408,6 +461,7 @@ fn build_vars(
             .iter()
             .map(|k| (*k, stats.contains(k)))
             .collect(),
+        clauses: crate::report::edit::ClauseForm::of(image, truth.as_deref(), detail),
     }
 }
 
@@ -475,10 +529,14 @@ pub fn open(ed: &mut ReportEditor, app: &GuiApp, path: &[usize]) {
             template,
             name,
             stats,
+            image,
+            truth,
+            detail,
         }) => Wizard::Computed(ComputedForm {
             path: path.to_vec(),
             template: template.clone(),
             alias: name.clone(),
+            clauses: crate::report::edit::ClauseForm::of(*image, truth.as_deref(), *detail),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -508,17 +566,37 @@ pub fn open_with_field(ed: &mut ReportEditor, path: &[usize], index: Option<usiz
                 _ => None,
             })
     });
-    let (index, name, query, stats) = match existing {
-        Some(WithItem::Field { name, query, stats }) => (index, name, query, stats),
+    let (index, name, query, stats, clauses) = match existing {
+        Some(WithItem::Field {
+            name,
+            query,
+            stats,
+            image,
+            truth,
+            detail,
+        }) => (
+            index,
+            name,
+            query,
+            stats,
+            crate::report::edit::ClauseForm::of(image, truth.as_deref(), detail),
+        ),
         // Editing a non-field (bare `WITH RESPONSE`) or a stale index falls
         // through to a fresh append rather than silently doing nothing.
-        _ => (None, String::new(), String::new(), Vec::new()),
+        _ => (
+            None,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            crate::report::edit::ClauseForm::default(),
+        ),
     };
     ed.wizard = Some(Wizard::WithField(WithFieldForm {
         path: path.to_vec(),
         index,
         name,
         query,
+        clauses,
         stats: StatKind::CHOOSABLE
             .iter()
             .map(|k| (*k, stats.contains(k)))
@@ -712,18 +790,22 @@ fn build_request(
         }
     }
     for f in &show {
-        push(f, &mut names);
+        push(f.name(), &mut names);
     }
     // A HIDE entry naming a field nothing else knows about still has to appear
     // in the checklist, or applying the form would silently drop it.
     for f in &hide {
         push(f, &mut names);
     }
+    // No SHOW clause means "everything this request already emits" — which
+    // excludes the opt-in timing intrinsics, so they must start un-ticked or
+    // simply opening and applying the form would switch them on.
     let all = show.is_empty();
     let fields = names
         .iter()
         .map(|n| {
-            let on = all || show.iter().any(|s| s == n);
+            let on = (all && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&n.as_str()))
+                || show.iter().any(|s| s.name() == n);
             (n.clone(), on)
         })
         .collect();
@@ -740,6 +822,11 @@ fn build_request(
         response,
         alias: alias.unwrap_or_default(),
         fields,
+        show_stats: show
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect(),
         hide_fields,
         with,
     }
@@ -821,6 +908,11 @@ fn build_envs(
     EnvsForm {
         path,
         var,
+        show_stats: baseline_show
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect(),
         compare,
         parallel: parallel.is_some(),
         degree: degree_text(&parallel),
@@ -904,17 +996,32 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
         .map(|p| p.to_path_buf());
     let s = &app.strings;
     let mut outcome = Outcome::None;
+    // A folder picker can't be opened from inside the form: it needs `app`,
+    // which the modal closure has already borrowed. The click is recorded here
+    // and acted on once the closure has let go.
+    let mut browse = false;
 
     let modal = egui::Modal::new(egui::Id::new("pt_node_wizard")).show(ctx, |ui| {
         ui.set_min_width(360.0);
+        // A modal has no title bar to hang a close button off, so it gets its
+        // own: every dialog in the app can be left by the corner as well as by
+        // Escape.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            if ui
+                .button(RichText::new(super::icons::CLOSE).color(th.dim))
+                .clicked()
+            {
+                outcome = Outcome::Cancel;
+            }
+        });
         let wiz = ed.wizard.as_mut().expect("wizard is Some");
         match wiz {
             Wizard::Request(f) => request_ui(ui, &th, s, f),
             Wizard::Envs(f) => envs_ui(ui, &th, s, f),
-            Wizard::Files(f) => files_ui(ui, &th, s, f, fallback.as_deref()),
+            Wizard::Files(f) => files_ui(ui, &th, s, f, &mut browse),
             Wizard::Assign(f) => assign_ui(ui, &th, s, f),
             Wizard::List(f) => list_ui(ui, &th, s, f),
-            Wizard::Folders(f) => folders_ui(ui, &th, s, f, fallback.as_deref()),
+            Wizard::Folders(f) => folders_ui(ui, &th, s, f, &mut browse),
             Wizard::Vars(f) => vars_ui(ui, &th, s, f),
             Wizard::Computed(f) => computed_ui(ui, &th, s, f),
             Wizard::Raw(f) => raw_ui(ui, &th, s, f),
@@ -936,6 +1043,24 @@ pub fn show(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
     });
     if modal.should_close() {
         outcome = Outcome::Cancel;
+    }
+
+    // Now that the closure has released `app`, a Browse click can open its
+    // dialog -- off the frame loop, so the modal keeps painting behind it.
+    if browse {
+        let current = match ed.wizard.as_ref() {
+            Some(Wizard::Files(f)) => f.dir.clone(),
+            Some(Wizard::Folders(f)) => f.dir.clone(),
+            _ => String::new(),
+        };
+        app.request_pick(
+            super::filepick::PickKind::Folder,
+            app.strings.report_node_files_folder_label,
+            super::filepick::seed_dir(&current)
+                .as_deref()
+                .or(fallback.as_deref()),
+            super::menu::PickAction::ReportWizardDir,
+        );
     }
 
     match outcome {
@@ -1002,6 +1127,7 @@ fn request_ui(
     if f.report && !f.fields.is_empty() {
         ui.add_space(6.0);
         ui.label(RichText::new(s.node_form_show).color(th.dim));
+        ui.label(RichText::new(s.node_form_show_hint).color(th.dim));
         egui::ScrollArea::vertical()
             .id_salt("pt_req_fields")
             .max_height(160.0)
@@ -1155,7 +1281,7 @@ fn files_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FilesForm,
-    fallback: Option<&std::path::Path>,
+    browse: &mut bool,
 ) {
     ui.heading(RichText::new(s.report_node_files_title).color(th.text));
     ui.add_space(4.0);
@@ -1170,12 +1296,7 @@ fn files_ui(
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
                 if ui.button(s.gui_browse).clicked() {
-                    if let Some(p) = super::filepick::pick_folder(
-                        s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
-                    ) {
-                        f.dir = p.to_string_lossy().into_owned();
-                    }
+                    *browse = true;
                 }
             });
             ui.end_row();
@@ -1234,7 +1355,7 @@ fn folders_ui(
     th: &super::theme::GuiTheme,
     s: &crate::i18n::Strings,
     f: &mut FoldersForm,
-    fallback: Option<&std::path::Path>,
+    browse: &mut bool,
 ) {
     ui.heading(RichText::new(s.node_folders_title).color(th.text));
     ui.add_space(4.0);
@@ -1249,12 +1370,7 @@ fn folders_ui(
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut f.dir).desired_width(220.0));
                 if ui.button(s.gui_browse).clicked() {
-                    if let Some(p) = super::filepick::pick_folder(
-                        s.report_node_files_folder_label,
-                        super::filepick::seed_dir(&f.dir).as_deref().or(fallback),
-                    ) {
-                        f.dir = p.to_string_lossy().into_owned();
-                    }
+                    *browse = true;
                 }
             });
             ui.end_row();
@@ -1301,6 +1417,86 @@ fn stats_ui(
     });
 }
 
+/// Draw the `TRUTH`/`IMAGE`/`DETAIL` clause block shared by the `WITH`-field,
+/// reported-variable and computed-column forms.
+///
+/// One helper rather than three copies: the clauses attach identically to all
+/// three column shapes, and three near-identical blocks would be three chances
+/// for one of them to drift.
+fn clauses_ui(
+    ui: &mut egui::Ui,
+    th: &super::theme::GuiTheme,
+    s: &crate::i18n::Strings,
+    c: &mut crate::report::edit::ClauseForm,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(s.report_node_clause_truth_label).color(th.dim));
+        ui.add(
+            egui::TextEdit::singleline(&mut c.truth)
+                .hint_text(s.report_node_clause_truth_none)
+                .desired_width(220.0)
+                .font(egui::TextStyle::Monospace),
+        );
+    });
+    ui.checkbox(
+        &mut c.detail,
+        RichText::new(s.report_node_clause_detail_toggle).color(th.text),
+    );
+    // The three sizing questions only matter once a column holds a picture, so
+    // they hide behind the toggle exactly as the statistics checklist does.
+    let mut image_on = c.image_on;
+    if ui
+        .checkbox(
+            &mut image_on,
+            RichText::new(s.report_node_clause_image_toggle).color(th.text),
+        )
+        .changed()
+    {
+        c.toggle_image();
+    }
+    if !c.image_on {
+        return;
+    }
+    ui.indent("pt_clause_image", |ui| {
+        let mut fit = c.fit;
+        if ui
+            .checkbox(
+                &mut fit,
+                RichText::new(s.report_node_clause_fit).color(th.text),
+            )
+            .changed()
+        {
+            c.toggle_fit();
+        }
+        // FIT answers the same question as the sizes, so it replaces them
+        // rather than sitting alongside a value the writers would have to
+        // arbitrate between.
+        if c.fit {
+            return;
+        }
+        for (label, value) in [
+            (s.report_node_clause_height, &mut c.height),
+            (s.report_node_clause_width, &mut c.width),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(th.dim));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(value)
+                            .hint_text(s.report_node_clause_size_auto)
+                            .desired_width(80.0),
+                    )
+                    .changed()
+                {
+                    // Sizes are pixels; a stray letter would drop the whole
+                    // clause when it failed to parse, so it never gets in.
+                    value.retain(|ch| ch.is_ascii_digit());
+                }
+            });
+        }
+    });
+}
+
 fn vars_ui(
     ui: &mut egui::Ui,
     th: &super::theme::GuiTheme,
@@ -1332,6 +1528,8 @@ fn vars_ui(
             ui.add_space(6.0);
             stats_ui(ui, th, s, &mut f.stats);
         }
+        ui.add_space(6.0);
+        clauses_ui(ui, th, s, &mut f.clauses);
     }
 }
 
@@ -1361,6 +1559,8 @@ fn computed_ui(
         });
     ui.add_space(6.0);
     stats_ui(ui, th, s, &mut f.stats);
+    ui.add_space(6.0);
+    clauses_ui(ui, th, s, &mut f.clauses);
 }
 
 fn with_field_ui(
@@ -1391,6 +1591,8 @@ fn with_field_ui(
 
     ui.add_space(6.0);
     stats_ui(ui, th, s, &mut f.stats);
+    ui.add_space(6.0);
+    clauses_ui(ui, th, s, &mut f.clauses);
 }
 
 fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
@@ -1469,12 +1671,12 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             let path = f.path.clone();
             // Preserve the loop body and any WITH role globs; var/dir and the
             // PARALLEL toggle and degree are what this form edits.
-            let (body, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
+            let (body, glob, roles) = match ed.flow.as_ref().and_then(|fl| node_at(fl, &path)) {
                 Some(FlowNode::ForEach {
                     body,
-                    producer: Producer::Folders { roles, .. },
+                    producer: Producer::Folders { glob, roles, .. },
                     ..
-                }) => (body.clone(), roles.clone()),
+                }) => (body.clone(), glob.clone(), roles.clone()),
                 _ => return,
             };
             let parallel = parallel_spec(f.parallel, &f.degree);
@@ -1486,6 +1688,7 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                 }),
                 producer: Producer::Folders {
                     dir: f.dir.clone(),
+                    glob,
                     roles,
                 },
                 body,
@@ -1515,6 +1718,9 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
                     .filter(|(_, on)| *on)
                     .map(|(k, _)| *k)
                     .collect(),
+                image: f.clauses.image(),
+                truth: f.clauses.truth(),
+                detail: f.clauses.detail,
             });
             ed.wizard_apply(app, &path, node);
         }
@@ -1535,12 +1741,29 @@ fn apply(ed: &mut ReportEditor, app: &mut GuiApp) {
             }
             let index = f.index;
             let stats = f.stats();
+            let clauses = f.clauses.clone();
             ed.commit_edit(app, |flow| match index {
                 Some(i) => {
-                    crate::report::edit::set_with_field(flow, &path, i, &name, &query, stats);
+                    crate::report::edit::set_with_field(
+                        flow, &path, i, &name, &query, stats, &clauses,
+                    );
                 }
                 None => {
-                    crate::report::edit::add_with_field(flow, &path, &name, &query, stats);
+                    // Appending only takes the name/query/statistics, so the
+                    // clause block is written straight afterwards onto the row
+                    // the append just created -- one code path for the clauses
+                    // rather than two that could drift.
+                    if let Some(i) = crate::report::edit::add_with_field(
+                        flow,
+                        &path,
+                        &name,
+                        &query,
+                        stats.clone(),
+                    ) {
+                        crate::report::edit::set_with_field(
+                            flow, &path, i, &name, &query, stats, &clauses,
+                        );
+                    }
                 }
             });
             ed.selection = path;
@@ -1606,6 +1829,7 @@ mod tests {
         EnvsForm {
             path: vec![0],
             var: "TARGET".into(),
+            show_stats: Default::default(),
             compare: true,
             parallel: false,
             degree: String::new(),
@@ -1637,6 +1861,7 @@ mod tests {
             other: String::new(),
             alias: "Plan".into(),
             stats: StatKind::CHOOSABLE.iter().map(|k| (*k, false)).collect(),
+            clauses: crate::report::edit::ClauseForm::default(),
         };
         assert!(
             matches!(
@@ -1653,6 +1878,50 @@ mod tests {
         );
     }
 
+    /// A clause is a reason to write the `AS` form even without a name: the
+    /// column has to exist for a ground truth to score, so an unnamed one takes
+    /// the variable's own name rather than losing the clause.
+    #[test]
+    fn a_clause_alone_promotes_a_variable_to_the_named_form() {
+        let mut form = VarsForm {
+            path: vec![0],
+            vars: vec![("FILE".into(), true)],
+            other: String::new(),
+            alias: String::new(),
+            stats: Vec::new(),
+            clauses: crate::report::edit::ClauseForm::default(),
+        };
+        assert!(
+            matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(_)))),
+            "with no name and no clauses it is still a plain column"
+        );
+        form.clauses.truth = "{{ want }}".into();
+        let Some(FlowNode::Report(ReportStmt::VarAs { name, truth, .. })) = form.node() else {
+            panic!("a ground truth needs the named form")
+        };
+        assert_eq!(name, "FILE", "the column falls back to the variable name");
+        assert_eq!(truth.as_deref(), Some("{{ want }}"));
+    }
+
+    /// `FIT` and a pixel size answer the same question, so the form keeps one:
+    /// picking `FIT` clears the sizes rather than emitting a spec the writers
+    /// would have to arbitrate.
+    #[test]
+    fn fit_replaces_a_typed_size_rather_than_joining_it() {
+        let mut c = crate::report::edit::ClauseForm::default();
+        c.toggle_image();
+        c.height = "96".into();
+        let spec = c.image().expect("an image clause");
+        assert_eq!((spec.height, spec.width, spec.fit), (Some(96), None, false));
+        c.toggle_fit();
+        let spec = c.image().expect("still an image clause");
+        assert_eq!((spec.height, spec.width, spec.fit), (None, None, true));
+        assert!(c.height.is_empty(), "the hidden size is cleared, not kept");
+        // And turning the whole clause off leaves nothing behind.
+        c.toggle_image();
+        assert_eq!(c.image(), None);
+    }
+
     /// The free-text row exists for variables the static scan cannot see, so it
     /// has to reach the node even with nothing ticked.
     #[test]
@@ -1663,6 +1932,7 @@ mod tests {
             other: "  RUNTIME_ONLY ".into(),
             alias: String::new(),
             stats: Vec::new(),
+            clauses: crate::report::edit::ClauseForm::default(),
         };
         assert!(
             matches!(form.node(), Some(FlowNode::Report(ReportStmt::Vars(ref v))) if v == &["RUNTIME_ONLY".to_string()]),
@@ -1699,6 +1969,27 @@ mod tests {
             baseline_show,
             vec!["Time".to_string(), "Response".to_string()],
             "the ticked fields become the SHOW list, in the checklist's own order"
+        );
+    }
+
+    /// The checklist has no widget for a `STATISTICS(...)` clause, so it must
+    /// carry one through untouched -- ticking a box in a form that never showed
+    /// the clause must not silently delete it from the source.
+    #[test]
+    fn editing_the_baseline_checklist_keeps_a_show_field_s_statistics_clause() {
+        let mut form = compare_form(vec![("Time".into(), true), ("Status".into(), true)]);
+        form.show_stats.insert("Time".into(), vec![StatKind::Mean]);
+        let Some(EnvClause::Roles { baseline_show, .. }) = form.clause() else {
+            panic!("a compare form describes a Roles clause")
+        };
+        let time = baseline_show
+            .iter()
+            .find(|f| f.field == "Time")
+            .expect("Time stays in the SHOW list");
+        assert_eq!(
+            time.stats,
+            vec![StatKind::Mean],
+            "its STATISTICS clause survives the round trip: {baseline_show:?}"
         );
     }
 
@@ -1767,5 +2058,22 @@ mod tests {
             vec!["login".to_string()],
             "only the reported request is a source of fields"
         );
+    }
+}
+
+/// Write back the folder the wizard's Browse dialog returned, frames later.
+///
+/// The wizard is still open behind the dialog -- it is drawn from `ed.wizard`
+/// every frame -- so this writes straight into whichever form is showing, and
+/// does nothing if the user closed or switched it in the meantime.
+pub(super) fn apply_picked_dir(app: &mut GuiApp, picked: Option<std::path::PathBuf>) {
+    let Some(dir) = picked else {
+        return; // cancelled
+    };
+    let dir = dir.to_string_lossy().into_owned();
+    match app.report_editor.as_mut().and_then(|e| e.wizard.as_mut()) {
+        Some(Wizard::Files(f)) => f.dir = dir,
+        Some(Wizard::Folders(f)) => f.dir = dir,
+        _ => {}
     }
 }

@@ -28,6 +28,61 @@ pub struct Header {
     pub lines: Vec<HeaderLine>,
 }
 
+/// One declared collection: a reference plus, for a helper, the alias its
+/// requests are addressed through (`alias/request`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionRef<'a> {
+    pub reference: &'a str,
+    pub alias: Option<&'a str>,
+}
+
+/// Split `<ref> [AS <alias>]`.
+///
+/// The keyword is matched case-insensitively and only when it stands alone as
+/// the second-to-last whitespace-separated word, so a path that merely contains
+/// "as" (`./as-built/api.hurl`, `git:origin/as.hurl`) is not mangled. The alias
+/// is returned unvalidated — checking it is an identifier, is present on every
+/// helper and absent on the primary is validation's job, which can report a
+/// useful message rather than silently treating the line as a plain path.
+pub fn split_collection_ref(value: &str) -> (&str, Option<&str>) {
+    let value = value.trim();
+    let mut it = value.rsplitn(2, char::is_whitespace);
+    let (Some(last), Some(head)) = (it.next(), it.next()) else {
+        return (value, None);
+    };
+    let head = head.trim_end();
+    if head
+        .rsplit(char::is_whitespace)
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("AS"))
+        && !last.is_empty()
+    {
+        let reference = head[..head.len() - 2].trim_end();
+        if !reference.is_empty() {
+            return (reference, Some(last));
+        }
+    }
+    (value, None)
+}
+
+/// Split a `# labels:` value into its canonical label and its synonym list.
+///
+/// `Pass = ok, low risk` becomes `("Pass", "ok, low risk")`. A line with no `=`
+/// yet is all label and no synonyms, so a half-typed directive still splits --
+/// the structured editors need to show one as it is being written, not refuse
+/// it. Both halves are trimmed; neither is validated here (that is
+/// [`crate::report::labels::LabelMap`]'s job), so what the user typed always
+/// survives a round-trip through a form.
+/// Only the GUI's settings panel splits a class today -- the TUI edits the
+/// directive as one line -- so a non-GUI build has no caller outside the tests.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn split_label_class(value: &str) -> (&str, &str) {
+    match value.split_once('=') {
+        Some((name, synonyms)) => (name.trim(), synonyms.trim()),
+        None => (value.trim(), ""),
+    }
+}
+
 /// One line of the header: either a recognised `# key: value` directive or a
 /// free-form `#` comment (preserved as-is).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +102,54 @@ impl Header {
         })
     }
 
+    /// Every value of the directives named `key`, in the order they were
+    /// written. Repeatable directives (`collection:`) need all of them; `get`
+    /// only ever sees the first.
+    pub fn get_all(&self, key: &str) -> Vec<&str> {
+        self.lines
+            .iter()
+            .filter_map(|l| match l {
+                HeaderLine::Directive { key: k, value } if k.eq_ignore_ascii_case(key) => {
+                    Some(value.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The bound collection reference (`collection:` directive), required for a
-    /// runnable flow.
+    /// runnable flow. This is the *primary* collection: the first one declared,
+    /// with any `AS alias` suffix stripped. Helper collections are `collections()`.
     pub fn collection(&self) -> Option<&str> {
-        self.get("collection")
+        self.get("collection").map(|v| split_collection_ref(v).0)
+    }
+
+    /// Every declared collection, in directive order, primary first.
+    ///
+    /// The primary carries no alias; each helper must (that is enforced by
+    /// validation, not here, so the editors can still show a half-typed line).
+    pub fn collections(&self) -> Vec<CollectionRef<'_>> {
+        self.get_all("collection")
+            .into_iter()
+            .map(|v| {
+                let (reference, alias) = split_collection_ref(v);
+                CollectionRef { reference, alias }
+            })
+            .collect()
     }
     pub fn output(&self) -> Option<&str> {
         self.get("output")
+    }
+    /// The declared label classes (`labels:` directives), one per line, in the
+    /// order written — which is also the order a confusion matrix's axes take.
+    ///
+    /// Repeatable, like `collection:`: each line declares one canonical label
+    /// and its synonyms (`Pass = pass, ok, low risk`). Parsing them into a
+    /// lookup is [`crate::report::labels::LabelMap`]'s job; the header only
+    /// hands back the raw text, so a half-typed line in an editor is still
+    /// round-tripped rather than dropped.
+    pub fn labels(&self) -> Vec<&str> {
+        self.get_all("labels")
     }
     pub fn columns(&self) -> Option<&str> {
         self.get("columns")
@@ -88,8 +184,34 @@ impl Header {
 pub enum FlowNode {
     /// `KEY=value` — set `{{KEY}}` in the current scope (includes `PRELUDE_*`).
     Assign { key: String, value: String },
+    /// `PARAM <kind> NAME = "default" [LABEL "…"]` — declare a run parameter.
+    ///
+    /// A parameter behaves exactly like an [`Assign`](FlowNode::Assign) of its
+    /// effective value, so `{{NAME}}` interpolation needs no new concept; what
+    /// it adds is that the value is *offered to the user before the run*, with
+    /// a type the front-ends can put a sensible control behind. It is a
+    /// statement rather than a header directive because it binds a variable
+    /// (and so belongs in the same precedence ladder as everything else), and
+    /// because unknown header lines are silently treated as comments — an
+    /// older PaperBoy would run a parameterised report with nothing bound
+    /// instead of saying it can't.
+    ///
+    /// Validation confines it to the prelude (before the first statement that
+    /// does anything), so the whole parameter set can be read off a flow
+    /// without executing it.
+    Param(ParamDecl),
     /// `LIST NAME = <producer>` — declare a named, iteration-only list.
     ListDecl { name: String, producer: Producer },
+    /// A whole-line `# …` comment in the body.
+    ///
+    /// Comments are kept in the AST, not skipped as trivia, because every
+    /// structural edit re-serializes the flow — so anything the AST can't hold
+    /// is deleted the moment you touch the report in the node editor. Commenting
+    /// a block out and losing it is the case that made this non-negotiable.
+    ///
+    /// Holds the text *after* the `#`, verbatim (leading space included), so a
+    /// comment round-trips byte for byte.
+    Comment(String),
     /// `REQUEST <name>` — send a request, emit no column.
     Request { name: String },
     /// `REPORT …` — send/compute and emit column(s) into the current row.
@@ -128,6 +250,118 @@ pub struct ParallelSpec {
     pub degree: Option<u32>,
 }
 
+/// A declared run parameter: what a `PARAM` statement binds.
+///
+/// The `default` is what the checked-in `.trail` file says; a front-end may
+/// offer a different value for a particular run, but never writes the chosen
+/// value back into the file — a report under version control keeps meaning the
+/// same thing to everyone who opens it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamDecl {
+    /// The control to put behind it, and the values it accepts.
+    pub kind: ParamKind,
+    /// The variable it binds; `{{NAME}}` reads it like any other variable.
+    pub name: String,
+    /// The value used when nothing is supplied. `None` = the parameter is
+    /// required and the run settings open with it empty and flagged.
+    pub default: Option<String>,
+    /// A human-friendly prompt for the run settings. `None` → one is derived
+    /// from the name (see [`ParamDecl::prompt`]).
+    pub label: Option<String>,
+}
+
+impl ParamDecl {
+    /// What to put beside the field in the run settings.
+    ///
+    /// The `LABEL` when one was written, and otherwise a readable rendering of
+    /// the identifier itself. Deriving one matters more than it sounds: most
+    /// parameters will never carry a label, and a form shouting `TICKET_REF`
+    /// at someone who only ever runs the report — never edits it — is the
+    /// difference between a tool and a script someone else wrote. `LABEL` is
+    /// then an override for the cases the derivation can't get right
+    /// (acronyms, wording), not a chore on every declaration.
+    ///
+    /// The raw name stays the identity everywhere it matters — `{{NAME}}`, the
+    /// CLI's `--param`, the remembered values — so renaming a label never
+    /// loses anything.
+    pub fn prompt(&self) -> String {
+        match &self.label {
+            Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+            _ => derive_prompt(&self.name),
+        }
+    }
+}
+
+/// Turn an identifier into something readable: `TICKET_REF` → "Ticket ref",
+/// `api_version` → "Api version", `imageWidth` → "imageWidth".
+///
+/// Underscores become spaces, and a word that is all one case is
+/// sentence-cased. Anything already mixed-case is left exactly as written —
+/// it was deliberate, and second-guessing `iOSBuild` produces worse names than
+/// leaving it alone.
+fn derive_prompt(name: &str) -> String {
+    let words: Vec<String> = name
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mixed = w.chars().any(|c| c.is_ascii_uppercase())
+                && w.chars().any(|c| c.is_ascii_lowercase());
+            if mixed {
+                w.to_string()
+            } else {
+                w.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let mut out = words.join(" ");
+    // Only the first letter is raised: "Ticket ref", not "Ticket Ref". Title
+    // Case reads like a heading; these are field labels in a form.
+    if let Some(first) = out.chars().next()
+        && first.is_ascii_lowercase()
+        && !out
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.chars().any(|c| c.is_ascii_uppercase()))
+    {
+        out.replace_range(0..first.len_utf8(), &first.to_ascii_uppercase().to_string());
+    }
+    out
+}
+
+/// The type of a `PARAM` — what the run settings offer and what validation
+/// will accept.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ParamKind {
+    /// Free text (the default when no type is written).
+    #[default]
+    Text,
+    /// A number, offered as a number field and checked as one.
+    Number,
+    /// The name of a loaded environment.
+    Env,
+    /// A directory path, offered with a folder picker.
+    Folder,
+    /// A file path, offered with a file picker.
+    File,
+    /// One of a fixed set, offered as a drop-down. The list is never empty
+    /// (validation rejects `CHOICE()`), and a default must be one of it.
+    Choice(Vec<String>),
+}
+
+impl ParamKind {
+    /// The keyword this kind is written as, without any `CHOICE` options.
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            ParamKind::Text => "TEXT",
+            ParamKind::Number => "NUMBER",
+            ParamKind::Env => "ENV",
+            ParamKind::Folder => "FOLDER",
+            ParamKind::File => "FILE",
+            ParamKind::Choice(_) => "CHOICE",
+        }
+    }
+}
+
 /// The column-emitting `REPORT` statement in its three forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportStmt {
@@ -141,7 +375,7 @@ pub enum ReportStmt {
         /// `[Reports]`/`WITH` field names) are emitted, in listed order — so a
         /// noisy `Response` (e.g. a base64 blob) can be dropped. Empty = no
         /// `SHOW` clause, i.e. emit every field (the default).
-        show: Vec<String>,
+        show: Vec<ShowField>,
         /// `HIDE(a, b, …)`: remove these field suffixes from the final output
         /// after all other selection rules have been applied. Takes effect in
         /// every branch (SHOW, WITH-restricted, and default). Cannot overlap
@@ -159,13 +393,66 @@ pub enum ReportStmt {
         var: String,
         name: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
+        truth: Option<String>,
+        detail: bool,
     },
-    /// `REPORT "<template>" AS <name> [STATISTICS(…)]` — a computed column.
+    /// `REPORT "<template>" AS <name> [STATISTICS(…)] [IMAGE(…)]` — a computed
+    /// column.
     Computed {
         template: String,
         name: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
+        truth: Option<String>,
+        detail: bool,
     },
+}
+
+/// An `IMAGE[(HEIGHT n | WIDTH n | FIT, …)]` clause on a column.
+///
+/// This is a **render hint, never a value**: the cell's text stays exactly what
+/// it was (a path, a URL, a base64 blob), and `IMAGE` only tells a writer that
+/// can show pictures to draw that value as one. That is what keeps CSV and JSON
+/// exports lossless, keeps baseline comparison textual, and lets a format with
+/// no picture support degrade to the text automatically rather than needing a
+/// fallback rule of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageSpec {
+    /// Target height in pixels. With no `width`, the picture scales
+    /// proportionally to this height.
+    pub height: Option<u32>,
+    /// Target width in pixels. With no `height`, the picture scales
+    /// proportionally to this width.
+    pub width: Option<u32>,
+    /// `FIT`: size the picture to the cell rather than to a fixed box.
+    pub fit: bool,
+}
+
+/// The height, in pixels, an `IMAGE` column's pictures are drawn at when the
+/// clause names no size. Chosen to match the row height the reports this
+/// feature was built for use, so a bare `IMAGE` produces a usable report.
+pub const DEFAULT_IMAGE_HEIGHT: u32 = 110;
+
+impl ImageSpec {
+    /// The `(width, height)` box to scale a picture of `(w, h)` natural pixels
+    /// into, preserving aspect ratio unless both dimensions were given.
+    /// `None` for a `FIT` spec, whose sizing is the writer's business.
+    pub fn scaled_size(&self, natural: (u32, u32)) -> Option<(f64, f64)> {
+        if self.fit {
+            return None;
+        }
+        let (nw, nh) = (natural.0.max(1) as f64, natural.1.max(1) as f64);
+        Some(match (self.width, self.height) {
+            (Some(w), Some(h)) => (w as f64, h as f64),
+            (Some(w), None) => (w as f64, w as f64 * nh / nw),
+            (None, Some(h)) => (h as f64 * nw / nh, h as f64),
+            (None, None) => {
+                let h = DEFAULT_IMAGE_HEIGHT as f64;
+                (h * nw / nh, h)
+            }
+        })
+    }
 }
 
 /// An item inside a `REPORT REQUEST … WITH … END` block.
@@ -181,7 +468,15 @@ pub enum WithItem {
         name: String,
         query: String,
         stats: Vec<StatKind>,
+        image: Option<ImageSpec>,
+        truth: Option<String>,
+        detail: bool,
     },
+    /// A whole-line `#` comment written inside the block, kept so that
+    /// commenting a field out doesn't destroy it the next time an editor
+    /// re-serializes the flow. The text is stored exactly as written after the
+    /// `#`, like [`FlowNode::Comment`].
+    Comment(String),
 }
 
 /// How a reported response body is rendered.
@@ -198,10 +493,14 @@ pub enum Producer {
     List(Vec<Element>),
     /// `FILES "dir" [MATCH "glob"]`.
     Files { dir: String, glob: Option<String> },
-    /// `FOLDERS "dir" [WITH role="glob", …]`.
+    /// `FOLDERS "dir" [MATCH "glob"] [WITH role="glob"[?], …]`.
+    ///
+    /// `glob` filters subfolder *names* the way `FILES … MATCH` filters file
+    /// names, and likewise recurses when it contains `**`.
     Folders {
         dir: String,
-        roles: Vec<(String, String)>,
+        glob: Option<String>,
+        roles: Vec<RoleBinding>,
     },
     /// `TUPLES FROM "file"`.
     Tuples { path: String },
@@ -212,6 +511,35 @@ pub enum Producer {
     Concat(Vec<Producer>),
     /// A previously declared `LIST` referenced by name.
     Named(String),
+}
+
+/// One `FOLDERS … WITH role="glob"` binding: the role name, the glob that picks
+/// its file inside each folder, and whether the role is **optional**.
+///
+/// A required role must match exactly one file. An optional role (written with a
+/// trailing `?`) may match none — it then binds the empty string, so a group
+/// missing a genuinely optional input (a document with no back side, a folder
+/// with no expected-result file) still produces a row instead of failing the
+/// run. Matching *more* than one file is an error either way: ambiguity is never
+/// silently resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleBinding {
+    pub name: String,
+    pub glob: String,
+    pub optional: bool,
+}
+
+#[cfg(test)]
+impl RoleBinding {
+    /// A required role (the default form) -- a test convenience, since the
+    /// parser and the editors always build the struct literally.
+    pub fn required(name: impl Into<String>, glob: impl Into<String>) -> Self {
+        RoleBinding {
+            name: name.into(),
+            glob: glob.into(),
+            optional: false,
+        }
+    }
 }
 
 /// One element of a list literal: a scalar or a tuple.
@@ -289,6 +617,73 @@ impl RoleRef {
     }
 }
 
+/// One field of a `SHOW(…)` clause: the field suffix, plus the optional
+/// `STATISTICS(…)` to summarise the column it produces.
+///
+/// The statistics live on the field rather than in the `# columns:` header
+/// because that header is an *exhaustive* whitelist — asking for a mean there
+/// means restating every other column you still wanted. A clause written where
+/// the column is declared also survives the column set changing around it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShowField {
+    pub field: String,
+    pub stats: Vec<StatKind>,
+}
+
+impl ShowField {
+    /// The field name, for the selection logic (which cares only about which
+    /// suffixes were named).
+    pub fn name(&self) -> &str {
+        &self.field
+    }
+
+    /// The clause as written, e.g. `Time STATISTICS(MEAN)`.
+    pub fn to_text(&self) -> String {
+        format!("{}{}", self.field, stats_text(&self.stats))
+    }
+}
+
+impl From<&str> for ShowField {
+    fn from(field: &str) -> Self {
+        ShowField {
+            field: field.to_string(),
+            stats: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for ShowField {
+    fn from(field: String) -> Self {
+        ShowField {
+            field,
+            stats: Vec::new(),
+        }
+    }
+}
+
+impl PartialEq<str> for ShowField {
+    fn eq(&self, other: &str) -> bool {
+        self.field == other
+    }
+}
+
+/// A field with no statistics is just its name, so a caller (and a test) can
+/// compare against a plain string list without unpacking the struct.
+impl PartialEq<String> for ShowField {
+    fn eq(&self, other: &String) -> bool {
+        self.stats.is_empty() && &self.field == other
+    }
+}
+
+/// Render a `SHOW(…)` field list back to source.
+pub(crate) fn show_text(fields: &[ShowField]) -> String {
+    fields
+        .iter()
+        .map(ShowField::to_text)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The environment clause of `FOR … IN ENVS …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvClause {
@@ -305,7 +700,7 @@ pub enum EnvClause {
     Roles {
         baseline: Vec<RoleRef>,
         comparisons: Vec<RoleRef>,
-        baseline_show: Vec<String>,
+        baseline_show: Vec<ShowField>,
     },
 }
 
@@ -316,6 +711,22 @@ pub enum EnvClause {
 const INDENT: &str = "    ";
 
 impl ReportFlow {
+    /// The parameters this report declares, in the order they are written —
+    /// which is the order the run settings present them in.
+    ///
+    /// Only top-level nodes are looked at: a `PARAM` inside a loop is a
+    /// validation error, and reading a nested one here would let it reach the
+    /// run settings anyway.
+    pub fn params(&self) -> Vec<&ParamDecl> {
+        self.nodes
+            .iter()
+            .filter_map(|n| match n {
+                FlowNode::Param(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Serialize to canonical PaperTrail text (round-trips with `parse_flow`).
     pub fn to_text(&self) -> String {
         let mut out = String::new();
@@ -324,8 +735,10 @@ impl ReportFlow {
                 HeaderLine::Directive { key, value } => {
                     let _ = writeln!(out, "# {key}: {value}");
                 }
+                // Verbatim: the text already holds whatever spacing followed
+                // the `#` (see the parser), so it must not be re-padded here.
                 HeaderLine::Comment(c) => {
-                    let _ = writeln!(out, "# {c}");
+                    let _ = writeln!(out, "#{c}");
                 }
             }
         }
@@ -349,6 +762,151 @@ impl ReportFlow {
         collect_column_stats(&self.nodes, &mut out);
         out
     }
+
+    /// Collect the per-column `IMAGE[(…)]` render hints requested anywhere in
+    /// the flow, keyed by output-column header, exactly as
+    /// [`column_stats`](Self::column_stats) does for statistics — the two
+    /// clauses attach at the same three places and are resolved the same way.
+    pub fn column_images(&self) -> std::collections::HashMap<String, ImageSpec> {
+        let mut out = std::collections::HashMap::new();
+        collect_column_images(&self.nodes, &mut out);
+        out
+    }
+
+    /// Collect the per-column `TRUTH "<template>"` clauses declared anywhere in
+    /// the flow, keyed by output-column header, exactly as
+    /// [`column_images`](Self::column_images) does — the three clauses attach at
+    /// the same three places and are resolved the same way.
+    ///
+    /// The value is the **unevaluated template**. It is interpolated per row,
+    /// after the run, against that row's variable snapshot: a ground truth is by
+    /// definition something known before the request was sent, so it is read
+    /// from the loop that chose the input (a labels manifest, a folder name),
+    /// never from the response it is judging.
+    pub fn column_truths(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        collect_column_truths(&self.nodes, &mut out);
+        out
+    }
+
+    /// The columns flagged `DETAIL` — shown in a row's drill-down rather than
+    /// in the table itself.
+    ///
+    /// Like `IMAGE`, this is *placement*, not content: a `DETAIL` column is
+    /// still a full column of the model, so it is exported to CSV and JSON,
+    /// compared, and stored in a baseline snapshot. Only the renderers that
+    /// have somewhere else to put it treat it differently, which is what lets
+    /// every other format ignore the flag without losing data.
+    pub fn column_details(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        collect_column_details(&self.nodes, &mut out);
+        out
+    }
+}
+
+fn collect_column_images(
+    nodes: &[FlowNode],
+    out: &mut std::collections::HashMap<String, ImageSpec>,
+) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, image, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, image, .. }) => {
+                if let Some(img) = image {
+                    out.insert(name.clone(), *img);
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        image: Some(img),
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"), *img);
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_images(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_column_details(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, detail, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, detail, .. }) => {
+                if *detail {
+                    out.insert(name.clone());
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        detail: true,
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"));
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_details(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_column_truths(nodes: &[FlowNode], out: &mut std::collections::HashMap<String, String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Report(ReportStmt::VarAs { name, truth, .. })
+            | FlowNode::Report(ReportStmt::Computed { name, truth, .. }) => {
+                if let Some(t) = truth {
+                    out.insert(name.clone(), t.clone());
+                }
+            }
+            FlowNode::Report(ReportStmt::Request {
+                name, alias, with, ..
+            }) => {
+                let a = alias
+                    .clone()
+                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                for item in with {
+                    if let WithItem::Field {
+                        name: fname,
+                        truth: Some(t),
+                        ..
+                    } = item
+                    {
+                        out.insert(format!("{a}.{fname}"), t.clone());
+                    }
+                }
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                collect_column_truths(body, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_column_stats(
@@ -368,11 +926,22 @@ fn collect_column_stats(
             // request's leaf name. Compute that key statically so the stats
             // attach at render time just like a `REPORT … STATISTICS(…)`.
             FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
+                name,
+                alias,
+                with,
+                show,
+                ..
             }) => {
                 let a = alias
                     .clone()
                     .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+                // A `SHOW(field STATISTICS(…))` names the same `alias.field`
+                // column a `WITH` field would.
+                for f in show {
+                    if !f.stats.is_empty() {
+                        out.insert(format!("{a}.{}", f.field), f.stats.clone());
+                    }
+                }
                 for item in with {
                     if let WithItem::Field {
                         name: fname, stats, ..
@@ -383,7 +952,24 @@ fn collect_column_stats(
                     }
                 }
             }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            // `BASELINE(…) SHOW(field STATISTICS(…))` summarises the copied
+            // baseline column, which the comparison names
+            // `baseline.<alias>.<field>` — one per alias that emits the field,
+            // and those aliases aren't known until the run produces them. The
+            // key is therefore matched by suffix at render time (see
+            // `ReportResult::resolved_columns`), recorded here under the bare
+            // field with a `baseline.` marker prefix.
+            FlowNode::ForEnvs { body, clause, .. } => {
+                if let EnvClause::Roles { baseline_show, .. } = clause {
+                    for f in baseline_show {
+                        if !f.stats.is_empty() {
+                            out.insert(format!("baseline.*.{}", f.field), f.stats.clone());
+                        }
+                    }
+                }
+                collect_column_stats(body, out);
+            }
+            FlowNode::ForEach { body, .. } => {
                 collect_column_stats(body, out);
             }
             _ => {}
@@ -405,6 +991,12 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         }
         FlowNode::ListDecl { name, producer } => {
             let _ = writeln!(out, "LIST {name} = {}", producer_text(producer));
+        }
+        FlowNode::Param(p) => {
+            let _ = writeln!(out, "{}", param_text(p));
+        }
+        FlowNode::Comment(text) => {
+            let _ = writeln!(out, "#{text}");
         }
         FlowNode::Request { name } => {
             let _ = writeln!(out, "REQUEST {}", name_text(name));
@@ -477,7 +1069,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }
             if !show.is_empty() {
-                let _ = write!(out, " SHOW({})", show.join(", "));
+                let _ = write!(out, " SHOW({})", show_text(show));
             }
             if !hide.is_empty() {
                 let _ = write!(out, " HIDE({})", hide.join(", "));
@@ -488,15 +1080,8 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 out.push_str(" WITH\n");
                 for item in with {
                     indent(out, depth + 1);
-                    match item {
-                        WithItem::ResponseFmt(fmt) => {
-                            let _ = writeln!(out, "RESPONSE {}", fmt_text(*fmt));
-                        }
-                        WithItem::Field { name, query, stats } => {
-                            let _ =
-                                writeln!(out, "{}: {query}{}", name_text(name), stats_text(stats));
-                        }
-                    }
+                    out.push_str(&with_item_text(item));
+                    out.push('\n');
                 }
                 indent(out, depth);
                 out.push_str("END\n");
@@ -509,25 +1094,41 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
                 let _ = writeln!(out, "REPORT ({})", vars.join(", "));
             }
         }
-        ReportStmt::VarAs { var, name, stats } => {
+        ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+            truth,
+            detail,
+        } => {
             let _ = writeln!(
                 out,
-                "REPORT {var} AS {}{}",
+                "REPORT {var} AS {}{}{}{}{}",
                 name_text(name),
-                stats_text(stats)
+                stats_text(stats),
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             );
         }
         ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
+            truth,
+            detail,
         } => {
             let _ = writeln!(
                 out,
-                "REPORT {} AS {}{}",
+                "REPORT {} AS {}{}{}{}{}",
                 quote(template),
                 name_text(name),
-                stats_text(stats)
+                stats_text(stats),
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
             );
         }
     }
@@ -535,12 +1136,86 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
 
 /// Render a `STATISTICS(…)` clause (with a leading space) for a report
 /// statement, or the empty string when no statistics are requested.
+/// One `WITH` item as it is written inside the block (no indentation, no
+/// newline). Shared with the node editor so an outline row and the source line
+/// it stands for can't drift apart.
+pub(crate) fn with_item_text(item: &WithItem) -> String {
+    match item {
+        WithItem::ResponseFmt(fmt) => format!("RESPONSE {}", fmt_text(*fmt)),
+        WithItem::Comment(text) => format!("#{text}"),
+        WithItem::Field {
+            name,
+            query,
+            stats,
+            image,
+            truth,
+            detail,
+        } => format!(
+            "{}: {query}{}{}{}{}",
+            name_text(name),
+            stats_text(stats),
+            image_text(image.as_ref()),
+            truth_text(truth.as_deref()),
+            detail_text(*detail)
+        ),
+    }
+}
+
+/// Render the `DETAIL` flag (with a leading space), or the empty string. A bare
+/// keyword with no argument, because it says *where* a column goes and there is
+/// only one other place for it to be.
+pub(crate) fn detail_text(detail: bool) -> String {
+    if detail {
+        " DETAIL".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn stats_text(stats: &[StatKind]) -> String {
     if stats.is_empty() {
         return String::new();
     }
     let list: Vec<&str> = stats.iter().map(|s| s.keyword()).collect();
     format!(" STATISTICS({})", list.join(", "))
+}
+
+/// Render an `IMAGE[(…)]` clause (with a leading space), or the empty string
+/// when the column carries none. A spec with no options round-trips as the bare
+/// keyword rather than `IMAGE()`, which is how it is written.
+pub(crate) fn image_text(image: Option<&ImageSpec>) -> String {
+    let Some(img) = image else {
+        return String::new();
+    };
+    let mut opts: Vec<String> = Vec::new();
+    if img.fit {
+        opts.push("FIT".to_string());
+    }
+    if let Some(w) = img.width {
+        opts.push(format!("WIDTH {w}"));
+    }
+    if let Some(h) = img.height {
+        opts.push(format!("HEIGHT {h}"));
+    }
+    if opts.is_empty() {
+        " IMAGE".to_string()
+    } else {
+        format!(" IMAGE({})", opts.join(", "))
+    }
+}
+
+/// Render a `TRUTH "<template>"` clause (with a leading space), or the empty
+/// string when the column declares no ground truth.
+///
+/// The template is re-quoted rather than written verbatim because it is a
+/// string literal in the grammar: a truth of `{{ expected }}` and one of
+/// `pass` are both perfectly ordinary values, and only the quotes tell them
+/// apart from the keywords around them.
+pub(crate) fn truth_text(truth: Option<&str>) -> String {
+    match truth {
+        Some(t) => format!(" TRUTH {}", quote(t)),
+        None => String::new(),
+    }
 }
 
 fn fmt_text(fmt: ResponseFmt) -> &'static str {
@@ -578,16 +1253,22 @@ fn producer_text(p: &Producer) -> String {
             Some(g) => format!("FILES {} MATCH {}", quote(dir), quote(g)),
             None => format!("FILES {}", quote(dir)),
         },
-        Producer::Folders { dir, roles } => {
-            if roles.is_empty() {
-                format!("FOLDERS {}", quote(dir))
-            } else {
+        Producer::Folders { dir, glob, roles } => {
+            let mut out = format!("FOLDERS {}", quote(dir));
+            if let Some(g) = glob {
+                out.push_str(&format!(" MATCH {}", quote(g)));
+            }
+            if !roles.is_empty() {
                 let rs: Vec<String> = roles
                     .iter()
-                    .map(|(k, v)| format!("{k}={}", quote(v)))
+                    .map(|r| {
+                        let opt = if r.optional { "?" } else { "" };
+                        format!("{}={}{opt}", r.name, quote(&r.glob))
+                    })
                     .collect();
-                format!("FOLDERS {} WITH {}", quote(dir), rs.join(", "))
+                out.push_str(&format!(" WITH {}", rs.join(", ")));
             }
+            out
         }
         Producer::Tuples { path } => format!("TUPLES FROM {}", quote(path)),
         Producer::Zip(ps) => {
@@ -629,7 +1310,7 @@ fn env_clause_text(c: &EnvClause) -> String {
                 let names: Vec<String> = baseline.iter().map(role_ref_text).collect();
                 let mut token = format!("BASELINE({})", names.join(", "));
                 if !baseline_show.is_empty() {
-                    token.push_str(&format!(" SHOW({})", baseline_show.join(", ")));
+                    token.push_str(&format!(" SHOW({})", show_text(baseline_show)));
                 }
                 parts.push(token);
             }
@@ -682,6 +1363,8 @@ impl FlowNode {
             FlowNode::ListDecl { name, producer } => {
                 format!("LIST {name} = {}", producer_text(producer))
             }
+            FlowNode::Param(p) => param_text(p),
+            FlowNode::Comment(text) => format!("#{text}"),
             FlowNode::Request { name } => format!("REQUEST {name}"),
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {
@@ -733,7 +1416,7 @@ impl FlowNode {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
                 }
                 if !show.is_empty() {
-                    let _ = write!(out, " SHOW({})", show.join(", "));
+                    let _ = write!(out, " SHOW({})", show_text(show));
                 }
                 if !hide.is_empty() {
                     let _ = write!(out, " HIDE({})", hide.join(", "));
@@ -790,7 +1473,7 @@ fn report_label(stmt: &ReportStmt) -> String {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }
             if !show.is_empty() {
-                let _ = write!(out, " SHOW({})", show.join(", "));
+                let _ = write!(out, " SHOW({})", show_text(show));
             }
             if !hide.is_empty() {
                 let _ = write!(out, " HIDE({})", hide.join(", "));
@@ -807,20 +1490,75 @@ fn report_label(stmt: &ReportStmt) -> String {
                 format!("REPORT ({})", vars.join(", "))
             }
         }
-        ReportStmt::VarAs { var, name, stats } => {
-            format!("REPORT {var} AS {name}{}", stats_text(stats))
+        ReportStmt::VarAs {
+            var,
+            name,
+            stats,
+            image,
+            truth,
+            detail,
+        } => {
+            format!(
+                "REPORT {var} AS {name}{}{}{}{}",
+                stats_text(stats),
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
+            )
         }
         ReportStmt::Computed {
             template,
             name,
             stats,
+            image,
+            truth,
+            detail,
         } => {
-            format!("REPORT {} AS {name}{}", quote(template), stats_text(stats))
+            format!(
+                "REPORT {} AS {name}{}{}{}{}",
+                quote(template),
+                stats_text(stats),
+                image_text(image.as_ref()),
+                truth_text(truth.as_deref()),
+                detail_text(*detail)
+            )
         }
     }
 }
 
 /// Double-quote a string, escaping `\` and `"`.
+/// One `PARAM` statement as canonical text.
+///
+/// The kind is always written out, even when it is the `TEXT` default that may
+/// have been omitted in the source: the canonical form says what a parameter
+/// is, so nobody has to know which type you get by saying nothing. Values are
+/// always quoted so a default or label containing spaces survives.
+fn param_text(p: &ParamDecl) -> String {
+    let mut out = String::from("PARAM ");
+    out.push_str(p.kind.keyword());
+    if let ParamKind::Choice(options) = &p.kind {
+        out.push('(');
+        for (i, o) in options.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&quote(o));
+        }
+        out.push(')');
+    }
+    out.push(' ');
+    out.push_str(&p.name);
+    if let Some(default) = &p.default {
+        out.push_str(" = ");
+        out.push_str(&quote(default));
+    }
+    if let Some(label) = &p.label {
+        out.push_str(" LABEL ");
+        out.push_str(&quote(label));
+    }
+    out
+}
+
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

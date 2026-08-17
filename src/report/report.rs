@@ -53,6 +53,26 @@ pub struct Report {
 }
 
 impl Report {
+    /// The key this report's last-used parameter values are remembered under.
+    ///
+    /// Its file path when it has one, otherwise where it came from in git, and
+    /// only failing both its name — a scratch report has no identity beyond
+    /// what it is called, and remembering values under a name shared with a
+    /// later scratch report is a far smaller surprise than losing them on
+    /// every restart.
+    ///
+    /// Deliberately *not* the report's `id`, which is process-unique and so
+    /// would forget everything the moment the app closed.
+    pub fn param_key(&self) -> String {
+        if let Some(p) = &self.path {
+            return p.to_string_lossy().into_owned();
+        }
+        if let Some(g) = &self.git_origin {
+            return format!("git:{}#{}@{}", g.repo_url, g.path, g.ref_name);
+        }
+        format!("name:{}", self.name)
+    }
+
     /// A brand-new, unsaved scratch report with the starter [`SCRATCH_TEMPLATE`].
     pub fn scratch(name: impl Into<String>) -> Self {
         Self {

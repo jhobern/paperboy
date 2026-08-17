@@ -103,17 +103,17 @@ strings! {
     gui_unsaved_quit_q => "{n} request(s) in {t} have edits that have not been saved. Quitting now will lose them.", "{n} requête(s) dans {t} ont des modifications non enregistrées. Quitter maintenant les perdra.", "{n} anmodning(er) i {t} har ændringer, der ikke er gemt. Hvis du afslutter nu, går de tabt.";
     gui_unsaved_close_tab_q => "{n} request(s) in \"{t}\" have edits that have not been saved. Closing this tab will lose them.", "{n} requête(s) dans «\u{a0}{t}\u{a0}» ont des modifications non enregistrées. Fermer cet onglet les perdra.", "{n} anmodning(er) i \"{t}\" har ændringer, der ikke er gemt. Hvis du lukker denne fane, går de tabt.";
     gui_quit_anyway => "Quit anyway", "Quitter quand même", "Afslut alligevel";
+    gui_save_all_and_quit => "Save all changes", "Tout enregistrer", "Gem alle ændringer";
+    gui_saved_n_files => "Saved {n} file(s)", "{n} fichier(s) enregistré(s)", "Gemte {n} fil(er)";
     gui_close_anyway => "Close anyway", "Fermer quand même", "Luk alligevel";
     default_request_view_label => "Default Request View", "Vue de requête par défaut", "Standard anmodningsvisning";
     view_json_label => "JSON", "JSON", "JSON";
     view_hurl_label => "Hurl", "Hurl", "Hurl";
     confirm_exit_q => "Quit PaperBoy?", "Quitter PaperBoy\u{a0}?", "Afslut PaperBoy?";
     confirm_clear_q => "Close all collections? This removes all tabs and requests.", "Fermer toutes les collections\u{a0}? Cela supprime tous les onglets et requêtes.", "Luk alle samlinger? Dette fjerner alle faner og anmodninger.";
-    confirm_save_collection_q => "There are {r} new or modified request entries. Saving will overwrite the original collection file. Proceed?", "Il y a {r} requête(s) nouvelle(s) ou modifiée(s). L'enregistrement écrasera le fichier de collection d'origine. Continuer\u{a0}?", "Der er {r} nye eller ændrede anmodninger. Gemning vil overskrive den oprindelige samlingsfil. Fortsæt?";
-    confirm_save_env_q => "There are {e} new or modified environment entries. Saving will overwrite the original environment file. Proceed?", "Il y a {e} variable(s) d'environnement nouvelle(s) ou modifiée(s). L'enregistrement écrasera le fichier d'environnement d'origine. Continuer\u{a0}?", "Der er {e} nye eller ændrede miljøvariabler. Gemning vil overskrive den oprindelige miljøfil. Fortsæt?";
-    confirm_save_report_q => "This report has unsaved edits. Saving will overwrite the original report file. Proceed?", "Ce rapport a des modifications non enregistrées. L'enregistrement écrasera le fichier de rapport d'origine. Continuer\u{a0}?", "Denne rapport har ugemte ændringer. Gemning vil overskrive den oprindelige rapportfil. Fortsæt?";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
+    confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every unsaved edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications non enregistrées seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ikke-gemte ændringer går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
     confirm_yes => "Yes", "Oui", "Ja";
@@ -122,14 +122,19 @@ strings! {
     file_menu_label => "(F)ile", "(F)ichier", "(F)il";
     file_menu_item_load => "(L)oad", "(C)harger", "(I)ndlæs";
     file_menu_item_save => "(S)ave", "(E)nregistrer", "(G)em";
+    file_menu_item_import => "(I)mport", "(I)mporter", "Im(p)ortér";
     file_load_menu => "Load", "Charger", "Indlæs";
     file_save_menu => "Save", "Enregistrer", "Gem";
+    file_import_menu => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
+    file_import_item_file => "(E)xported file…", "Fichier (e)xporté…", "(E)ksporteret fil…";
+    file_import_item_account => "Postman (a)ccount…", "Compte Post(m)an…", "Postman-k(o)nto…";
     file_kind_collection => "Collection", "Collection", "Samling";
     file_kind_environment => "Environment", "Environnement", "Miljø";
     file_kind_workspace => "Workspace", "Workspace", "Workspace";
     file_kind_report => "Report", "Rapport", "Rapport";
     file_source_local => "(L)ocal file…", "Fichier (l)ocal…", "(L)okal fil…";
     file_source_git => "From (G)it…", "Depuis (G)it…", "Fra (G)it…";
+    file_source_postman => "From a (P)ostman account…", "Depuis un compte (P)ostman…", "Fra en (P)ostman-konto…";
     file_dest_save => "(S)ave", "(E)nregistrer", "(G)em";
     file_dest_save_as => "Save (A)s…", "Enregistrer s(o)us…", "Gem s(o)m…";
     file_dest_git => "To (G)it…", "Vers (G)it…", "Til Gi(t)…";
@@ -161,14 +166,14 @@ strings! {
     save_unreadable_empty_file => "Won't save — the multipart file field '{field}' in '{req}' has no file path, which PaperBoy couldn't read back. Pick a file or remove the field.", "Enregistrement refusé — le champ fichier multipart « {field} » dans « {req} » n'a pas de chemin, que PaperBoy ne pourrait pas relire. Choisissez un fichier ou supprimez le champ.", "Gemmer ikke — multipart-filfeltet '{field}' i '{req}' har ingen filsti, som PaperBoy ikke kunne læse igen. Vælg en fil, eller fjern feltet.";
     file_not_environment => "Not a valid environment file (expected KEY=value lines).", "Fichier d'environnement invalide (lignes CLÉ=valeur attendues).", "Ikke en gyldig miljøfil (forventede NØGLE=værdi-linjer).";
     open_workspace => "Choose Workspace Folder…", "Choisir le dossier Workspace…", "Vælg Workspace-mappe…";
-    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · ^r nulstil · Esc annuller";
+    browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
     foot_workspace => "browse workspace", "parcourir workspace", "gennemse workspace";
     workspace_picker_title => "Workspace", "Workspace", "Workspace";
-    workspace_picker_hint => "Enter open · n new collection · R new report · Tab filter · ↑↓ move · Esc cancel", "Entrée ouvrir · n nouvelle collection · R nouveau rapport · Tab filtre · ↑↓ déplacer · Échap annuler", "Enter åbn · n ny samling · R ny rapport · Tab filter · ↑↓ flyt · Esc annuller";
-    workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · ↑↓ flyt · Esc annuller";
-    workspace_picker_hint_move => "Enter move request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée déplacer la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter flyt forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
-    workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · ↑↓ move · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · ↑↓ déplacer · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · ↑↓ flyt · Esc annuller";
+    workspace_picker_hint => "Enter open · n new collection · R new report · Tab filter · Esc cancel", "Entrée ouvrir · n nouvelle collection · R nouveau rapport · Tab filtre · Échap annuler", "Enter åbn · n ny samling · R ny rapport · Tab filter · Esc annuller";
+    workspace_picker_hint_add => "Enter add request here · n new collection · Tab toggle filter · Esc cancel", "Entrée ajouter la requête ici · n nouvelle collection · Tab basculer filtre · Échap annuler", "Enter tilføj forespørgsel her · n ny samling · Tab skift filter · Esc annuller";
+    workspace_picker_hint_move => "Enter move request here · Tab toggle filter · Esc cancel", "Entrée déplacer la requête ici · Tab basculer filtre · Échap annuler", "Enter flyt forespørgsel her · Tab skift filter · Esc annuller";
+    workspace_picker_hint_copy => "Enter copy request here · Tab toggle filter · Esc cancel", "Entrée copier la requête ici · Tab basculer filtre · Échap annuler", "Enter kopiér forespørgsel her · Tab skift filter · Esc annuller";
     request_deleted => "{m} request deleted. Press (u) to restore request.", "Requête {m} supprimée. Appuyez sur (u) pour la restaurer.", "{m}-forespørgsel slettet. Tryk (u) for at gendanne.";
     tab_closed => "Collection closed. Press (u) to reopen tab.", "Collection fermée. Appuyez sur (u) pour rouvrir l'onglet.", "Samling lukket. Tryk (u) for at genåbne fanen.";
     env_deleted => "Environment '{n}' deleted. Press (u) to reopen environment.", "Environnement «\u{a0}{n}\u{a0}» supprimé. Appuyez sur (u) pour le rouvrir.", "Miljøet '{n}' slettet. Tryk (u) for at genåbne miljøet.";
@@ -264,6 +269,16 @@ strings! {
     env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
+    env_active_label => "Active: ", "Actif : ", "Aktiv: ";
+    env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
+    env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
+    env_source_label => "Source: ", "Source : ", "Kilde: ";
+    env_source_both => "Both", "Les deux", "Begge";
+    env_source_global => "Global", "Global", "Global";
+    env_source_workspace => "Workspace", "Workspace", "Workspace";
+    env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
+    foot_env_filter => "filter", "filtrer", "filtrér";
     env_collision_title => "Environment name already exists", "Ce nom d'environnement existe déjà", "Miljønavnet findes allerede";
     env_collision_replace => "Replace existing", "Remplacer l'existant", "Erstat eksisterende";
     env_collision_keep_both => "Keep both (duplicate name)", "Conserver les deux (nom en double)", "Behold begge (dublet navn)";
@@ -282,25 +297,28 @@ strings! {
     git_workspace_menu => "Load Workspace from Git…", "Charger un Workspace depuis Git…", "Indlæs Workspace fra Git…";
     git_report_menu => "Load Report from Git…", "Charger un rapport depuis Git…", "Indlæs rapport fra Git…";
     git_url_label => "Git URL", "URL Git", "Git-URL";
-    git_token_label => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
-    git_connect_hint => "Tab switch field · Enter connect · Esc cancel", "Tab changer de champ · Entrée connecter · Échap annuler", "Tab skift felt · Enter forbind · Esc annuller";
-    git_recent_hint => "↓ recent URLs · Enter select", "↓ URL récentes · Entrée sélectionner", "↓ seneste URL'er · Enter vælg";
+    git_url_hint => "https://github.com/owner/repo", "https://github.com/owner/repo", "https://github.com/owner/repo";
+    git_token_label => "Token", "Jeton", "Token";
+    git_token_hint => "blank for a public repo", "vide pour un dépôt public", "tom for et offentligt repo";
+    git_connect_hint => "Enter connect · Esc cancel", "Entrée connecter · Échap annuler", "Enter forbind · Esc annuller";
+    gui_git_recent => "Recent", "Récents", "Seneste";
+    git_recent_hint => "↓ recent URLs", "↓ URL récentes", "↓ seneste URL'er";
     git_pick_ref_title => "Select a branch or tag", "Sélectionnez une branche ou une étiquette", "Vælg en gren eller et tag";
     git_pick_file_title => "Select a file", "Sélectionnez un fichier", "Vælg en fil";
-    git_filter_hint => "Type to filter · ↑↓ move · Enter select · Esc cancel", "Filtrer en tapant · ↑↓ déplacer · Entrée choisir · Échap annuler", "Skriv for at filtrere · ↑↓ flyt · Enter vælg · Esc annuller";
+    git_filter_hint => "Type to filter · Enter select · Esc cancel", "Filtrer en tapant · Entrée choisir · Échap annuler", "Skriv for at filtrere · Enter vælg · Esc annuller";
     git_loading_refs => "Fetching branches and tags…", "Récupération des branches et étiquettes…", "Henter grene og tags…";
     git_loading_files => "Fetching file list…", "Récupération de la liste des fichiers…", "Henter filliste…";
     git_loading_file => "Fetching file…", "Récupération du fichier…", "Henter fil…";
     git_loading_workspace_files => "Downloading matching files…", "Téléchargement des fichiers correspondants…", "Henter matchende filer…";
     git_loading_hint => "(Esc to cancel)", "(Échap pour annuler)", "(Esc for at annullere)";
-    git_error_hint => "Press Esc to close", "Appuyez sur Échap pour fermer", "Tryk på Esc for at lukke";
+    git_error_hint => "Esc close", "Échap fermer", "Esc luk";
     git_url_required => "A Git URL is required.", "Une URL Git est requise.", "En Git-URL er påkrævet.";
     git_branches => "Branches", "Branches", "Grene";
     git_tags => "Tags", "Étiquettes", "Tags";
     git_filter_label => "filter: ", "filtre\u{a0}: ", "filter: ";
     git_pick_workspace_filter_title => "Choose which files to download", "Choisissez les fichiers à télécharger", "Vælg hvilke filer der skal hentes";
-    git_workspace_filter_hint => "↑↓ move · Enter select · Esc cancel", "↑↓ déplacer · Entrée choisir · Échap annuler", "↑↓ flyt · Enter vælg · Esc annuller";
-    git_ws_filter_hurl_json => ".hurl and .json files (recommended)", "Fichiers .hurl et .json (recommandé)", ".hurl- og .json-filer (anbefalet)";
+    git_workspace_filter_hint => "Enter select · Esc cancel", "Entrée choisir · Échap annuler", "Enter vælg · Esc annuller";
+    git_ws_filter_hurl_json => "Files PaperBoy can open (recommended)", "Fichiers lisibles par PaperBoy (recommandé)", "Filer PaperBoy kan åbne (anbefalet)";
     git_ws_filter_hurl => ".hurl files only", "Fichiers .hurl uniquement", "Kun .hurl-filer";
     git_ws_filter_json => ".json files only", "Fichiers .json uniquement", "Kun .json-filer";
     git_ws_filter_all => "All files", "Tous les fichiers", "Alle filer";
@@ -317,16 +335,19 @@ strings! {
     workspace_reload_save_hint => "Tip: save this Workspace to a permanent local folder if you want it to always be available without redownloading.", "Astuce : enregistrez cet Espace de travail dans un dossier local permanent si vous voulez qu'il soit toujours disponible sans nouveau téléchargement.", "Tip: gem denne Workspace i en permanent lokal mappe, hvis du vil have den altid tilgængelig uden at skulle downloade igen.";
     file_not_workspace => "The active tab isn't a Workspace.", "L'onglet actif n'est pas un Workspace.", "Den aktive fane er ikke en Workspace.";
     move_workspace_item => "Move — Choose Destination Folder", "Déplacer — Choisir le dossier de destination", "Flyt — Vælg destinationsmappe";
-    browser_hint_workspace_move => "Enter open folder · Space move here · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace déplacer ici · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum flyt hertil · ← overordnet · ^r nulstil · Esc annuller";
+    browser_hint_header_folder => "Enter open folder · Space choose as report root · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme racine du rapport · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som rapportrod · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
+    browser_hint_node_folder => "Enter open folder · Space choose this folder · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir ce dossier · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg denne mappe · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
+    browser_hint_workspace_move => "Enter open folder · Space move here · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace déplacer ici · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum flyt hertil · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     save_workspace => "Save Workspace — Choose Destination Folder", "Enregistrer le Workspace — Choisir le dossier de destination", "Gem Workspace — Vælg destinationsmappe";
     save_collection_folder => "Save Collection — Choose Destination Folder", "Enregistrer la collection — Choisir le dossier de destination", "Gem samling — Vælg destinationsmappe";
-    browser_hint_collection_save => "Enter open folder · Tab file name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du fichier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab filnavn · ← overordnet · ^r nulstil · Esc annuller";
-    browser_hint_new_report => "Enter open folder · Tab name (use sub/name for a new folder) · ^n scratch tab · ← up · Esc cancel", "Entrée ouvrir dossier · Tab nom (sous-dossier/nom pour créer un dossier) · ^n onglet brouillon · ← remonter · Échap annuler", "Enter åbn mappe · Tab navn (undermappe/navn opretter en mappe) · ^n kladdefane · ← op · Esc annuller";
-    browser_hint_workspace_save => "Enter open folder · Tab folder name · ← parent · ^r reset · Esc cancel", "Entrée ouvrir dossier · Tab nom du dossier · ← dossier parent · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Tab mappenavn · ← overordnet · ^r nulstil · Esc annuller";
+    browser_hint_collection_save => "Enter open folder · Space save here · Tab rename · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace enregistrer ici · Tab renommer · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum gem her · Tab omdøb · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
+    browser_hint_new_report => "Enter open folder · Space create here · Tab name (use sub/name for a new folder) · type to filter · ^n scratch tab · ← up · Esc cancel", "Entrée ouvrir dossier · Espace créer ici · Tab nom (sous-dossier/nom pour créer un dossier) · taper pour filtrer · ^n onglet brouillon · ← remonter · Échap annuler", "Enter åbn mappe · Mellemrum opret her · Tab navn (undermappe/navn opretter en mappe) · skriv for at filtrere · ^n kladdefane · ← op · Esc annuller";
+    browser_hint_workspace_save => "Enter open folder · Space save here · Tab rename · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace enregistrer ici · Tab renommer · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum gem her · Tab omdøb · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     browser_filename_label => "File name", "Nom du fichier", "Filnavn";
     browser_foldername_label => "Folder name", "Nom du dossier", "Mappenavn";
     browser_name_hint => "Enter save · Esc back to list", "Entrée enregistrer · Échap retour à la liste", "Enter gem · Esc tilbage til listen";
     browser_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    browser_no_matches => "No matching files", "Aucun fichier correspondant", "Ingen matchende filer";
     workspace_save_success => "Workspace saved.", "Workspace enregistré.", "Workspace gemt.";
     workspace_save_failed => "Could not save the workspace ({e}).", "Impossible d'enregistrer le Workspace ({e}).", "Kunne ikke gemme workspace ({e}).";
     git_workspace_storage_q => "Workspace downloaded. Keep it in a temporary folder, or save it to a permanent location now?", "Workspace téléchargé. Le garder dans un dossier temporaire, ou l'enregistrer dans un emplacement permanent maintenant ?", "Workspace downloadet. Behold den i en midlertidig mappe, eller gem den på en permanent placering nu?";
@@ -335,6 +356,8 @@ strings! {
     git_no_origin => "This collection wasn't loaded from Git.", "Cette collection n'a pas été chargée depuis Git.", "Denne samling blev ikke indlæst fra Git.";
     git_save_title => "Save to Git", "Enregistrer sur Git", "Gem til Git";
     git_save_workspace_empty => "The workspace has no files to save.", "Le workspace n'a aucun fichier à enregistrer.", "Dette workspace har ingen filer at gemme.";
+    git_save_source_gone => "That tab was closed — there is nothing left to save.", "Cet onglet a été fermé — il n'y a plus rien à enregistrer.", "Fanen blev lukket — der er ikke længere noget at gemme.";
+    gui_git_err_ws_not_from_git => "This workspace was not downloaded from Git, so there is nowhere to push it back to.", "Ce workspace n'a pas été téléchargé depuis Git, il n'y a donc nulle part où le renvoyer.", "Dette workspace blev ikke hentet fra Git, så der er ingen steder at sende det tilbage til.";
     git_save_ws_unsaved_q => "The current file has unsaved changes. A Git push commits the files as they are on disk, so those changes won't be included unless you save them first.\n\nWhat would you like to do?", "Le fichier actuel a des modifications non enregistrées. Un envoi vers Git valide les fichiers tels qu'ils sont sur le disque, donc ces modifications ne seront pas incluses si vous ne les enregistrez pas d'abord.\n\nQue souhaitez-vous faire ?", "Den aktuelle fil har ugemte ændringer. En Git-push committer filerne, som de er på disken, så disse ændringer medtages ikke, medmindre du gemmer dem først.\n\nHvad vil du gøre?";
     git_save_ws_unsaved_save => "Save changes, then push", "Enregistrer les modifications, puis envoyer", "Gem ændringer, og push derefter";
     git_save_ws_unsaved_ignore => "Push the saved version (discard unsaved changes)", "Envoyer la version enregistrée (ignorer les modifications non enregistrées)", "Push den gemte version (kassér ugemte ændringer)";
@@ -347,10 +370,10 @@ strings! {
     git_save_collection_path_label => "Collection path in repo", "Chemin de la collection dans le dépôt", "Samlingens sti i repoet";
     git_save_report_path_label => "Report path in repo", "Chemin du rapport dans le dépôt", "Rapportens sti i repoet";
     git_save_env_path_label => "Environment path in repo", "Chemin de l'environnement dans le dépôt", "Miljøets sti i repoet";
-    git_save_step_hint => "Tab switch field · Enter continue · Esc cancel", "Tab changer de champ · Entrée continuer · Échap annuler", "Tab skift felt · Enter fortsæt · Esc annuller";
+    git_save_step_hint => "Enter continue · Esc cancel", "Entrée continuer · Échap annuler", "Enter fortsæt · Esc annuller";
     git_save_branch_label => "Branch", "Branche", "Gren";
     git_save_tag_label => "Tag", "Étiquette", "Tag";
-    git_save_target_hint => "Tab Branch/Tag · type a name · ↑↓ pick existing · Enter continue · Esc cancel", "Tab Branche/Étiquette · saisir un nom · ↑↓ choisir existant · Entrée continuer · Échap annuler", "Tab Gren/Tag · skriv et navn · ↑↓ vælg eksisterende · Enter fortsæt · Esc annuller";
+    git_save_target_hint => "Tab Branch/Tag · Enter continue · Esc cancel", "Tab Branche/Étiquette · Entrée continuer · Échap annuler", "Tab Gren/Tag · Enter fortsæt · Esc annuller";
     git_save_commit_msg_label => "Commit message", "Message de commit", "Commit-besked";
     git_save_commit_msg_hint => "Enter push · Esc cancel", "Entrée pousser · Échap annuler", "Enter push · Esc annuller";
     git_save_pushing => "Pushing to Git…", "Envoi vers Git…", "Sender til Git…";
@@ -442,6 +465,9 @@ strings! {
     help_env_link => "link / unlink a Global Environment to the active collection", "lier / délier un environnement global à la collection active", "link / afkobl et globalt miljø til den aktive samling";
     help_env_view_linked => "view the active collection's linked Global Environment", "afficher l'environnement global lié à la collection active", "vis den aktive samlings tilknyttede globale miljø";
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
+    help_env_filter => "filter the environments list by name (Esc clears it)", "filtrer la liste des environnements par nom (Échap l'efface)", "filtrér miljølisten efter navn (Esc rydder det)";
+    help_env_source => "cycle environment source", "changer la source des environnements", "skift miljøkilde";
+    help_env_activate_workspace => "activate the selected workspace environment file", "activer le fichier d'environnement sélectionné de l'espace de travail", "aktivér arbejdsområdets valgte miljøfil";
     help_revert_request => "revert the selected request to its last saved version on disk", "rétablir la requête sélectionnée à sa dernière version enregistrée sur le disque", "gendan den valgte anmodning til dens sidst gemte version på disken";
     help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
     help_resize => "shrink / grow response pane", "réduire / agrandir le panneau de réponse", "formindsk / forøg svarpanelet";
@@ -482,6 +508,7 @@ strings! {
     help_report_export => "export the last run (CSV / JSON / HTML / xlsx by extension)", "exporter la dernière exécution (CSV / JSON / HTML / xlsx selon l'extension)", "eksportér den seneste kørsel (CSV / JSON / HTML / xlsx efter filtype)";
     help_report_baseline => "save the last run as a .baseline snapshot — reference it later with BASELINE(FILE) or COMPARISON(FILE)", "enregistrer la dernière exécution comme instantané .baseline — à réutiliser via BASELINE(FILE) ou COMPARISON(FILE)", "gem den seneste kørsel som et .baseline-øjebliksbillede — genbrug det med BASELINE(FILE) eller COMPARISON(FILE)";
     help_report_columns => "pick, reorder and rename the report's output columns", "choisir, réordonner et renommer les colonnes de sortie du rapport", "vælg, omorden og omdøb rapportens outputkolonner";
+    help_report_params => "show or hide the values this report asks for before it runs (its PARAMs)", "afficher ou masquer les valeurs que ce rapport demande avant son exécution (ses PARAM)", "vis eller skjul de værdier, denne rapport beder om, før den kører (dens PARAM)";
     help_report_bind => "bind the report to one of the open collections", "lier le rapport à l'une des collections ouvertes", "bind rapporten til en af de åbne samlinger";
     help_tab_reports => "Reports", "Rapports", "Rapporter";
     help_reports_about_heading => "What is a report?", "Qu'est-ce qu'un rapport ?", "Hvad er en rapport?";
@@ -499,6 +526,7 @@ strings! {
     help_grammar_show => "keep only these response fields (drop a heavy Response)", "ne garder que ces champs de réponse (retirer une réponse volumineuse)", "behold kun disse svarfelter (drop et tungt Response)";
     help_grammar_hide => "drop these response fields (applied last)", "retirer ces champs de réponse (appliqué en dernier)", "fjern disse svarfelter (anvendes sidst)";
     help_grammar_statistics => "summary footer for a column: MEAN/MEDIAN/… or DISTRIBUTION", "pied de résumé d'une colonne : MEAN/MEDIAN/… ou DISTRIBUTION", "opsummeringsfod for en kolonne: MEAN/MEDIAN/… eller DISTRIBUTION";
+    help_grammar_image => "draw the column's value (URL, path, base64) as a picture; HEIGHT/WIDTH/FIT size it", "dessine la valeur de la colonne (URL, chemin, base64) comme une image ; HEIGHT/WIDTH/FIT la dimensionnent", "tegn kolonnens værdi (URL, sti, base64) som et billede; HEIGHT/WIDTH/FIT angiver størrelsen";
     help_grammar_with => "field may alias an intrinsic, add STATISTICS, or be quoted", "un champ peut aliaser un intrinsèque, STATISTICS, ou être cité", "et felt kan aliasere en intrinsic, STATISTICS eller citeres";
     help_grammar_parallel => "prefix a FOR to run its iterations concurrently", "préfixer un FOR pour exécuter ses itérations en parallèle", "sæt foran et FOR for at køre dets gentagelser samtidigt";
     help_grammar_for => "loop over a source, binding VAR each pass; END closes it", "boucler sur une source, en liant VAR à chaque passage ; END la ferme", "gennemløb en kilde og bind VAR hver gang; END lukker den";
@@ -507,7 +535,7 @@ strings! {
     help_grammar_list => "name a source so a loop can reuse it below", "nommer une source pour qu'une boucle la réutilise", "navngiv en kilde, så en løkke kan genbruge den nedenfor";
     help_grammar_list_literal => "an inline list of scalars or (\"a\", \"b\") tuples", "une liste littérale de scalaires ou de tuples (\"a\", \"b\")", "en inline-liste af skalarer eller (\"a\", \"b\")-tupler";
     help_grammar_files => "file paths under a folder (glob *, ** — not regex)", "chemins de fichiers dans un dossier (glob *, ** — pas regex)", "filstier i en mappe (glob *, ** — ikke regex)";
-    help_grammar_folders => "subfolders; each role-glob binds one file per folder", "sous-dossiers ; chaque glob de rôle lie un fichier par dossier", "undermapper; hvert rolle-glob binder én fil per mappe";
+    help_grammar_folders => "subfolders (glob filters names, ** recurses); each role-glob binds one file per folder, r=\"g\"? optional", "sous-dossiers (le glob filtre les noms, ** descend) ; chaque glob de rôle lie un fichier par dossier, r=\"g\"? facultatif", "undermapper (glob filtrerer navne, ** går i dybden); hvert rolle-glob binder én fil per mappe, r=\"g\"? valgfri";
     help_grammar_tuples => "rows from a .csv/.tsv/.json file (headers name fields)", "lignes d'un fichier .csv/.tsv/.json (les en-têtes nomment les champs)", "rækker fra en .csv/.tsv/.json-fil (overskrifter navngiver felter)";
     help_grammar_zip => "pair sources positionally (must be equal length)", "apparier les sources par position (longueurs égales)", "par kilder positionelt (skal have samme længde)";
     help_grammar_concat => "append sources end-to-end (same arity)", "concaténer les sources bout à bout (même arité)", "sammenkæd kilder efter hinanden (samme aritet)";
@@ -525,11 +553,14 @@ strings! {
     prompt_save_hint_sl => "Enter save · Esc cancel", "Entrée enregistrer · Échap annuler", "Enter gem · Esc annuller";
     prompt_reset_hint => "^R reset", "^R réinitialiser", "^R nulstil";
     browser_select_file => "Select file", "Sélectionner un fichier", "Vælg fil";
-    browser_hint => "Enter open · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
+    browser_hint => "Enter open · type to filter · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · taper pour filtrer · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · skriv for at filtrere · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     browser_hint_filter => "Enter open · Tab all/matching · type to filter · ← parent · ^h hidden · ^r reset · Esc cancel", "Entrée ouvrir · Tab tous/correspondants · taper pour filtrer · ← dossier parent · ^h fichiers cachés · ^r réinitialiser · Échap annuler", "Enter åbn · Tab alle/matchende · skriv for at filtrere · ← overordnet · ^h skjulte · ^r nulstil · Esc annuller";
     tabs_heading => "Collections", "Collections", "Samlinger";
-    suggest_hint => "↓↑ select · Enter fill", "↓↑ sélectionner · Entrée remplir", "↓↑ vælg · Enter udfyld";
+    suggest_hint => "Enter fill", "Entrée remplir", "Enter udfyld";
     report_default_name => "Untitled Report", "Rapport sans titre", "Unavngiven rapport";
+    // The GUI numbers its scratch reports so several can be told apart in the
+    // list; `{n}` is the report's position.
+    gui_new_report_name => "Report {n}", "Rapport {n}", "Rapport {n}";
     status_not_report => "The active tab is not a report.", "L'onglet actif n'est pas un rapport.", "Den aktive fane er ikke en rapport.";
     report_bound_status => "Report bound to", "Rapport lié à", "Rapport bundet til";
     report_source_heading => "Report Source", "Source du rapport", "Rapportkilde";
@@ -549,7 +580,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · v source · Ctrl+S export · B baseline", "Entrée exploration · v source · Ctrl+S export · B référence", "Enter udforsk · v kilde · Ctrl+S export · B basislinje";
+    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+S export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+S export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+S export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -562,11 +593,22 @@ strings! {
     report_status_rows => "rows", "lignes", "rækker";
     report_status_errors => "errors", "erreurs", "fejl";
     report_exported_prefix => "Report exported to", "Rapport exporté vers", "Rapport eksporteret til";
+    report_opened_prefix => "Opened", "Ouvert", "Åbnede";
+    // Ctrl+O on a run that hasn't been written anywhere: there is no file for
+    // the desktop to open, and saying so is more use than doing nothing.
+    report_open_no_export => "Export the run first (Ctrl+S), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+S), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+S); derefter åbner Ctrl+O filen.";
+    help_report_open_export => "open the exported file in the desktop's default application", "ouvrir le fichier exporté dans l'application par défaut du bureau", "åbn den eksporterede fil i skrivebordets standardprogram";
     report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
+    // "Nothing to save" is true but unhelpful for an export: the reader knows
+    // there is a report, so the message has to say what is missing. A run in
+    // flight is a different problem from a run never started -- one is "wait",
+    // the other is "press Run" (`report_export_no_result`, above).
+    report_export_still_running => "The report is still running. Wait for it to finish, then export.", "Le rapport est toujours en cours d'exécution. Attendez la fin, puis exportez.", "Rapporten kører stadig. Vent, til den er færdig, og eksportér så.";
     report_baseline_no_result => "Run the report before saving a baseline.", "Exécutez le rapport avant d'enregistrer une référence.", "Kør rapporten før du gemmer en basislinje.";
     report_hint_dry => "d dry-run", "d simulation", "d prøvekørsel";
     report_hint_bind => "b bind", "b lier", "b bind";
     report_hint_nodes => "Enter nodes", "Entrée nœuds", "Enter noder";
+    report_hint_format => "F reindent", "F réindenter", "F genindryk";
     report_hint_view => "v output", "v sortie", "v output";
     gui_report_dry_run => "Dry run", "Simulation", "Prøvekørsel";
     gui_report_dry_run_tooltip => "Preview the rows this report would produce — loops expanded and variables resolved, but no requests sent.", "Prévisualiser les lignes que ce rapport produirait — boucles développées et variables résolues, mais aucune requête envoyée.", "Forhåndsvis de rækker denne rapport ville producere — løkker udvidet og variabler løst, men ingen anmodninger sendt.";
@@ -577,23 +619,24 @@ strings! {
     report_dry_run_no_rows => "No rows would be produced.", "Aucune ligne ne serait produite.", "Ingen rækker ville blive produceret.";
     report_dry_run_problems_heading => "Problems", "Problèmes", "Problemer";
     report_dry_run_no_problems => "No problems found.", "Aucun problème détecté.", "Ingen problemer fundet.";
-    report_dry_run_hint => "↑/↓ scroll · Esc close", "↑/↓ défiler · Échap fermer", "↑/↓ rul · Esc luk";
+    report_dry_run_hint => "←/→ columns · Esc close", "←/→ colonnes · Échap fermer", "←/→ kolonner · Esc luk";
     report_dry_run_preview_notice => "Dry run — loop bindings resolved; HTTP response fields blank", "Simulation — liaisons de boucle résolues ; champs de réponse HTTP vides", "Prøvekørsel — løkkebindinger løst; HTTP-svarfelter tomme";
     report_dry_run_warnings_heading => "Warnings", "Avertissements", "Advarsler";
-    report_cell_popup_hint => "↑/↓ scroll · y copy · Esc close", "↑/↓ défiler · y copier · Échap fermer", "↑/↓ rul · y kopier · Esc luk";
+    report_cell_popup_hint => "y copy · Esc close", "y copier · Échap fermer", "y kopier · Esc luk";
     report_columns_title => "Columns", "Colonnes", "Kolonner";
     report_columns_hint => "Space toggle · Shift+↑/↓ move · Enter apply · Esc cancel", "Espace bascule · Maj+↑/↓ déplacer · Entrée appliquer · Échap annuler", "Mellemrum skift · Skift+↑/↓ flyt · Enter anvend · Esc annuller";
     report_columns_need_run => "Run the report first so its columns are known", "Exécutez d'abord le rapport pour connaître ses colonnes", "Kør rapporten først, så dens kolonner kendes";
     report_columns_none_selected => "Select at least one column", "Sélectionnez au moins une colonne", "Vælg mindst én kolonne";
     report_columns_applied => "Columns updated", "Colonnes mises à jour", "Kolonner opdateret";
     report_bind_title => "Bind Collection", "Lier la collection", "Bind samling";
-    report_bind_hint => "↑/↓ select · Enter bind · Esc cancel", "↑/↓ sélectionner · Entrée lier · Échap annuler", "↑/↓ vælg · Enter bind · Esc annuller";
+    report_bind_hint => "Enter bind · Esc cancel", "Entrée lier · Échap annuler", "Enter bind · Esc annuller";
     report_bind_unsaved => "(unsaved)", "(non enregistré)", "(ikke gemt)";
     report_bind_no_collections => "Open a collection tab first, then bind the report to it", "Ouvrez d'abord un onglet de collection, puis liez-y le rapport", "Åbn først en samlingsfane, og bind derefter rapporten til den";
     report_running => "Running report… (r to cancel)", "Exécution du rapport… (r pour annuler)", "Kører rapport… (r for at annullere)";
     report_running_progress => "Running report… {done}/{total} (r to cancel)", "Exécution du rapport… {done}/{total} (r pour annuler)", "Kører rapport… {done}/{total} (r for at annullere)";
     report_run_stopped => "Run stopped — partial results kept", "Exécution interrompue — résultats partiels conservés", "Kørsel stoppet — delvise resultater beholdt";
     status_request_reverted => "request reverted to last saved", "requête rétablie à la dernière sauvegarde", "anmodning gendannet til sidst gemte";
+    status_file_reverted => "file reverted to last saved:", "fichier rétabli à la dernière sauvegarde :", "fil gendannet til sidst gemte:";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
     status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
@@ -603,9 +646,9 @@ strings! {
     report_node_begin => "Begin", "Début", "Start";
     report_node_end => "End", "Fin", "Slut";
     node_menu_title => "Add Node", "Ajouter un nœud", "Tilføj node";
-    node_menu_hint => "↑/↓ select · Enter add · Esc cancel", "↑/↓ sélectionner · Entrée ajouter · Échap annuler", "↑/↓ vælg · Enter tilføj · Esc annuller";
+    node_menu_hint => "Enter add · Esc cancel", "Entrée ajouter · Échap annuler", "Enter tilføj · Esc annuller";
     node_pick_request_title => "Choose Request", "Choisir une requête", "Vælg forespørgsel";
-    node_pick_request_hint => "↑/↓ select · Enter choose · Esc cancel", "↑/↓ sélectionner · Entrée choisir · Échap annuler", "↑/↓ vælg · Enter vælg · Esc annuller";
+    node_pick_request_hint => "Enter choose · Esc cancel", "Entrée choisir · Échap annuler", "Enter vælg · Esc annuller";
     node_pick_request_none => "No requests in the bound collection", "Aucune requête dans la collection liée", "Ingen forespørgsler i den bundne samling";
     node_kind_request => "REQUEST — send a request", "REQUEST — envoyer une requête", "REQUEST — send en forespørgsel";
     node_kind_report_request => "REPORT REQUEST — send and report its fields", "REPORT REQUEST — envoyer et rapporter ses champs", "REPORT REQUEST — send og rapportér dens felter";
@@ -631,6 +674,7 @@ strings! {
     mod_reject_parallel => "PARALLEL can only be added to a FOR loop.", "PARALLEL ne peut être ajouté qu'à une boucle FOR.", "PARALLEL kan kun tilføjes til en FOR-løkke.";
     mod_reject_with => "WITH can only be added to a reported request (add REPORT first).", "WITH ne peut être ajouté qu'à une requête rapportée (ajoutez d'abord REPORT).", "WITH kan kun tilføjes til en rapporteret forespørgsel (tilføj REPORT først).";
     mod_reject_as => "AS can only name a reported request or a single reported variable.", "AS ne peut nommer qu'une requête rapportée ou une seule variable rapportée.", "AS kan kun navngive en rapporteret forespørgsel eller én rapporteret variabel.";
+    mod_reject_with_field => "A WITH field only takes STATISTICS — its other clauses are set in the field editor.", "Un champ WITH n'accepte que STATISTICS — ses autres clauses se règlent dans l'éditeur de champ.", "Et WITH-felt tager kun STATISTICS — dets øvrige klausuler sættes i felteditoren.";
     mod_reject_statistics => "STATISTICS summarises a named column — drop it on a REPORT … AS … or a computed column", "STATISTICS résume une colonne nommée — déposez-le sur un REPORT … AS … ou une colonne calculée", "STATISTICS opsummerer en navngivet kolonne — slip den på et REPORT … AS … eller en beregnet kolonne";
     mod_reject_request_only => "This can only be added to a reported request (add REPORT first).", "Ceci ne peut être ajouté qu'à une requête rapportée (ajoutez d'abord REPORT).", "Dette kan kun tilføjes til en rapporteret forespørgsel (tilføj REPORT først).";
     mod_reject_compare_only => "This can only be added to a FOR … IN ENVS comparison loop.", "Ceci ne peut être ajouté qu'à une boucle de comparaison FOR … IN ENVS.", "Dette kan kun tilføjes til en FOR … IN ENVS-sammenligningsløkke.";
@@ -640,8 +684,22 @@ strings! {
     report_node_undone => "Undid last node change", "Dernière modification de nœud annulée", "Fortrød sidste nodeændring";
     report_node_undo_empty => "Nothing to undo", "Rien à annuler", "Intet at fortryde";
     report_node_folder_pick => "Choose loop folder", "Choisir le dossier de la boucle", "Vælg løkkemappe";
+    report_header_root_pick => "Choose report root folder", "Choisir le dossier racine du rapport", "Vælg rapportens rodmappe";
+    report_header_baseline_pick => "Choose baseline file", "Choisir le fichier de référence", "Vælg baseline-fil";
+    gui_report_reindent => "Reindent", "Réindenter", "Genindryk";
+    gui_report_reindent_help => "Re-indent every line to its block depth. Only whitespace changes — comments and blank lines are kept.", "Réindenter chaque ligne selon sa profondeur de bloc. Seuls les espaces changent : les commentaires et les lignes vides sont conservés.", "Genindryk hver linje til dens blokdybde. Kun mellemrum ændres — kommentarer og tomme linjer bevares.";
+    report_reformat_unsafe => "Reformatting would have changed what the report does, so nothing was changed", "Le reformatage aurait modifié le comportement du rapport ; rien n'a été changé", "Omformatering ville have ændret, hvad rapporten gør, så intet blev ændret";
+    report_reformatted => "Report reindented", "Rapport réindenté", "Rapport genindrykket";
+    report_already_tidy => "The report is already correctly indented", "Le rapport est déjà correctement indenté", "Rapporten er allerede korrekt indrykket";
+    report_reformat_failed_prefix => "Can't reindent:", "Réindentation impossible :", "Kan ikke genindrykke:";
+    report_with_add_row => "add a field…", "ajouter un champ…", "tilføj et felt…";
+    report_settings_heading => "Report Settings", "Réglages du rapport", "Rapportindstillinger";
+    report_setting_add_row => "add a setting…", "ajouter un réglage…", "tilføj en indstilling…";
+    report_setting_no_choices => "Nothing to choose from — load an environment first, or press e to type a name", "Rien à choisir — chargez d'abord un environnement, ou appuyez sur e pour saisir un nom", "Intet at vælge imellem — indlæs først et miljø, eller tryk e for at skrive et navn";
+    report_setting_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
+    report_setting_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
-    report_node_request_hint => "↑↓ move · Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
+    report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
     report_node_name_none => "pick a request", "choisir une requête", "vælg en forespørgsel";
     report_node_report_label => "Report (emit columns)", "Rapport (émettre des colonnes)", "Rapport (udsend kolonner)";
@@ -650,7 +708,7 @@ strings! {
     report_node_alias_label => "Alias", "Alias", "Alias";
     report_node_alias_none => "(request name)", "(nom de la requête)", "(forespørgselsnavn)";
     report_node_envs_title => "Configure ENVS loop", "Configurer la boucle ENVS", "Konfigurer ENVS-løkke";
-    report_node_envs_hint => "↑↓ move · ←/→ pick · Space toggle · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "↑↓ déplacer · ←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · ←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
+    report_node_envs_hint => "←/→ pick · Space toggle · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
     report_node_envs_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
     report_node_envs_mode_label => "Mode", "Mode", "Tilstand";
     report_node_envs_mode_plain => "Iterate", "Itérer", "Iterér";
@@ -660,24 +718,33 @@ strings! {
     report_node_envs_file => "FILE", "FILE", "FILE";
     report_node_envs_none => "no environments loaded — load one to pick", "aucun environnement chargé — en charger un pour choisir", "ingen miljøer indlæst — indlæs et for at vælge";
     report_node_vars_title => "Report a variable", "Rapporter une variable", "Rapportér en variabel";
-    report_node_vars_hint => "↑↓ move · Space tick · type a name/alias · Enter apply · Esc cancel", "↑↓ déplacer · Espace cocher · saisir un nom/alias · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum markér · skriv et navn/alias · Enter anvend · Esc annuller";
+    report_node_vars_hint => "Space tick · type a name/alias · Enter apply · Esc cancel", "Espace cocher · saisir un nom/alias · Entrée appliquer · Échap annuler", "Mellemrum markér · skriv et navn/alias · Enter anvend · Esc annuller";
     report_node_vars_other_label => "Other variable", "Autre variable", "Anden variabel";
     report_node_vars_none => "no variables in scope here — type one below", "aucune variable disponible ici — saisissez-en une ci-dessous", "ingen variabler i omfang her — skriv en nedenfor";
     report_node_computed_title => "Computed column", "Colonne calculée", "Beregnet kolonne";
-    report_node_computed_hint => "↑↓ move · type template/name · Space toggle stat · Enter apply · Esc cancel", "↑↓ déplacer · saisir modèle/nom · Espace bascule stat · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv skabelon/navn · Mellemrum skift statistik · Enter anvend · Esc annuller";
+    report_node_computed_hint => "type template/name · Space toggle stat · Enter apply · Esc cancel", "saisir modèle/nom · Espace bascule stat · Entrée appliquer · Échap annuler", "skriv skabelon/navn · Mellemrum skift statistik · Enter anvend · Esc annuller";
     report_node_computed_template_label => "Template", "Modèle", "Skabelon";
     report_node_computed_template_hint => "text with {{ vars }}", "texte avec {{ vars }}", "tekst med {{ vars }}";
     report_node_computed_name_label => "Column name", "Nom de la colonne", "Kolonnenavn";
-    report_node_assign_hint => "↑↓ move · type name/value · Enter apply · Esc cancel", "↑↓ déplacer · saisir nom/valeur · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv navn/værdi · Enter anvend · Esc annuller";
-    report_node_list_hint => "↑↓ move · type value · Space add · Del remove · Enter apply · Esc cancel", "↑↓ déplacer · saisir la valeur · Espace ajouter · Suppr retirer · Entrée appliquer · Échap annuler", "↑↓ flyt · skriv værdi · Mellemrum tilføj · Del fjern · Enter anvend · Esc annuller";
+    report_node_assign_hint => "type name/value · Enter apply · Esc cancel", "saisir nom/valeur · Entrée appliquer · Échap annuler", "skriv navn/værdi · Enter anvend · Esc annuller";
+    report_node_list_hint => "type value · Space add · Del remove · Enter apply · Esc cancel", "saisir la valeur · Espace ajouter · Suppr retirer · Entrée appliquer · Échap annuler", "skriv værdi · Mellemrum tilføj · Del fjern · Enter anvend · Esc annuller";
     report_node_list_add => "+ Add a value", "+ Ajouter une valeur", "+ Tilføj en værdi";
     report_node_with_add => "+ Add a WITH field", "+ Ajouter un champ WITH", "+ Tilføj et WITH-felt";
     report_node_with_title => "Configure WITH field", "Configurer le champ WITH", "Konfigurer WITH-felt";
-    report_node_with_hint => "↑↓ move · type name/query · Space toggle stat · Enter apply · Esc back", "↑↓ déplacer · saisir nom/requête · Espace bascule stat · Entrée appliquer · Échap retour", "↑↓ flyt · skriv navn/forespørgsel · Mellemrum skift statistik · Enter anvend · Esc tilbage";
+    report_node_with_hint => "type name/query · Space toggle · Enter apply · Esc cancel", "saisir nom/requête · Espace basculer · Entrée appliquer · Échap annuler", "skriv navn/forespørgsel · Mellemrum skift · Enter anvend · Esc annullér";
     report_node_with_name_label => "Column name", "Nom de la colonne", "Kolonnenavn";
     report_node_with_query_label => "Query", "Requête", "Forespørgsel";
     report_node_with_stats_label => "STATISTICS", "STATISTICS", "STATISTICS";
+    report_node_with_stats_toggle => "Summary statistics", "Statistiques de synthèse", "Opsummerende statistik";
     report_node_with_query_none => "whole response", "réponse entière", "hele svaret";
+    report_node_clause_truth_label => "Ground truth", "Vérité terrain", "Grundsandhed";
+    report_node_clause_truth_none => "not scored", "non évalué", "ikke vurderet";
+    report_node_clause_detail_toggle => "Detail only (drill-down)", "Détail seulement (volet)", "Kun detalje (udfoldning)";
+    report_node_clause_image_toggle => "Show as a picture", "Afficher comme image", "Vis som billede";
+    report_node_clause_fit => "Fit to the cell", "Ajuster à la cellule", "Tilpas til cellen";
+    report_node_clause_height => "Height (px)", "Hauteur (px)", "Højde (px)";
+    report_node_clause_width => "Width (px)", "Largeur (px)", "Bredde (px)";
+    report_node_clause_size_auto => "auto", "auto", "auto";
     report_node_parallel_degree_label => "Max at once", "Maximum simultané", "Maks. samtidige";
     report_node_parallel_degree_none => "no limit", "sans limite", "ingen grænse";
     report_node_baseline_show_label => "SHOW from baseline", "SHOW depuis la référence", "SHOW fra reference";
@@ -686,7 +753,7 @@ strings! {
     checkbox_unchecked => "[ ]", "[ ]", "[ ]";
     report_node_files_title => "Configure FILES loop", "Configurer la boucle FILES", "Konfigurer FILES-løkke";
     report_node_folders_title => "Configure FOLDERS loop", "Configurer la boucle FOLDERS", "Konfigurer FOLDERS-løkke";
-    report_node_files_hint => "↑↓ move · Space folder/parallel · type var/match/limit · Enter apply · Esc cancel", "↑↓ déplacer · Espace dossier/parallèle · saisir var/match · Entrée appliquer · Échap annuler", "↑↓ flyt · Mellemrum mappe/parallel · skriv var/match · Enter anvend · Esc annuller";
+    report_node_files_hint => "Space folder/parallel · type var/match/limit · Enter apply · Esc cancel", "Espace dossier/parallèle · saisir var/match · Entrée appliquer · Échap annuler", "Mellemrum mappe/parallel · skriv var/match · Enter anvend · Esc annuller";
     report_node_files_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
     report_node_files_folder_label => "Folder", "Dossier", "Mappe";
     report_node_files_match_label => "Match (glob)", "Filtre (glob)", "Match (glob)";
@@ -711,6 +778,10 @@ strings! {
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
+    // The two representations the Raw Request view can show. Both are format
+    // names rather than words, so they read the same in every language.
+    gui_code_repr_json => "JSON", "JSON", "JSON";
+    gui_code_repr_hurl => "Hurl", "Hurl", "Hurl";
     gui_code_parse_error => "Invalid request text — edits not applied.", "Texte de requête invalide — modifications non appliquées.", "Ugyldig anmodningstekst — ændringer ikke anvendt.";
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";
@@ -742,6 +813,12 @@ strings! {
     gui_hint_description => "note", "note", "note";
     gui_hint_option => "option", "option", "indstilling";
     gui_hint_field => "field", "champ", "felt";
+    // Example-shaped hints. The URL and the Hurl assertion are literal syntax
+    // (a URL, a Hurl expression), so they stay identical across languages;
+    // only the file-path placeholder has words to translate.
+    gui_hint_url => "https://api.example.com/path", "https://api.example.com/path", "https://api.example.com/path";
+    gui_hint_assert => "jsonpath \"$.status\" == \"ok\"", "jsonpath \"$.status\" == \"ok\"", "jsonpath \"$.status\" == \"ok\"";
+    gui_hint_file_path => "/path/to/file", "/chemin/vers/fichier", "/sti/til/fil";
     gui_hint_key_upper => "KEY", "CLÉ", "NØGLE";
     // Response viewer.
     gui_error => "Error", "Erreur", "Fejl";
@@ -759,6 +836,18 @@ strings! {
     gui_load_vars_tooltip => "Load a .vars file", "Charger un fichier .vars", "Indlæs en .vars-fil";
     gui_new_environment => "New environment", "Nouvel environnement", "Nyt miljø";
     gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
+    gui_env_filter_hint => "Filter environments…", "Filtrer les environnements…", "Filtrér miljøer…";
+    gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
+    gui_env_source_both => "Both", "Les deux", "Begge";
+    gui_env_source_global => "Global", "Global", "Global";
+    gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
+    gui_env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
+    gui_env_open_workspace_tooltip => "In this workspace — click to open and expand it", "Dans cet espace de travail — cliquez pour l'ouvrir et le développer", "I dette arbejdsområde — klik for at åbne og udvide det";
+    gui_ws_revert_request => "Revert request to saved", "Rétablir la requête à la sauvegarde", "Gendan anmodning til gemt";
+    gui_ws_revert_file => "Revert file to saved", "Rétablir le fichier à la sauvegarde", "Gendan fil til gemt";
+    gui_revert_title => "Revert to saved", "Rétablir à la sauvegarde", "Gendan til gemt";
+    gui_revert_go => "Revert", "Rétablir", "Gendan";
+    gui_ws_set_active_env => "Set as active environment", "Définir comme environnement actif", "Angiv som aktivt miljø";
     gui_active => "Active", "Actif", "Aktiv";
     gui_active_tooltip => "Use this environment for substitution", "Utiliser cet environnement pour la substitution", "Brug dette miljø til substitution";
     gui_linked => "Linked", "Lié", "Tilknyttet";
@@ -785,16 +874,39 @@ strings! {
     gui_menu_file => "File", "Fichier", "Fil";
     gui_menu_view => "View", "Affichage", "Vis";
     gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
+    // The Alt-key mnemonic for each top-level menu: the letter that opens it
+    // after Alt (and the one underlined in its title while Alt is armed).
+    //
+    // Per language, and *not* derived from the first letter of the title,
+    // because the titles are translated and their initials collide: in French,
+    // "Fichier" and... nothing else, but in Danish "Fil" and "Vis" are fine
+    // while a fourth menu could easily clash. Keeping them in the table means a
+    // translator picks a letter that suits their own words (French uses P for
+    // "Paramètres", Danish I for "Indstillinger"), and the uniqueness test
+    // below catches a collision at build time rather than in the field.
+    gui_menu_file_key => "F", "F", "F";
+    gui_menu_view_key => "V", "A", "V";
+    gui_menu_settings_key => "S", "P", "I";
     gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";
     gui_menu_open => "Open", "Ouvrir", "Åbn";
-    gui_menu_open_git => "Open from Git", "Ouvrir depuis Git", "Åbn fra Git";
+    gui_menu_kind_response => "Response", "Réponse", "Svar";
+    gui_menu_from_file => "From a file…", "Depuis un fichier…", "Fra en fil…";
+    gui_menu_from_folder => "From a folder…", "Depuis un dossier…", "Fra en mappe…";
+    gui_menu_from_git => "From Git…", "Depuis Git…", "Fra Git…";
+    gui_menu_from_postman => "From a Postman account…", "Depuis un compte Postman…", "Fra en Postman-konto…";
+    gui_menu_import => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
+    gui_menu_import_file => "From an exported file (.json)…", "Depuis un fichier exporté (.json)…", "Fra en eksporteret fil (.json)…";
+    gui_menu_import_account => "From my Postman account…", "Depuis mon compte Postman…", "Fra min Postman-konto…";
+    help_menu_import_file => "A collection or environment you exported from Postman. Nothing but the file is needed.", "Une collection ou un environnement exporté depuis Postman. Rien d'autre que le fichier n'est nécessaire.", "En samling eller et miljø, du har eksporteret fra Postman. Der kræves intet andet end filen.";
+    help_menu_import_account => "Connects to Postman with an API key and brings whole workspaces across.", "Se connecte à Postman avec une clé d’API et récupère des workspaces entiers.", "Forbinder til Postman med en API-nøgle og henter hele workspaces.";
+    gui_import_postman_button => "Import from Postman…", "Importer depuis Postman…", "Importér fra Postman…";
+    gui_menu_to_file => "To a file…", "Vers un fichier…", "Til en fil…";
+    gui_menu_to_git => "To Git…", "Vers Git…", "Til Git…";
     gui_menu_save => "Save", "Enregistrer", "Gem";
-    gui_menu_save_git => "Save to Git", "Enregistrer sur Git", "Gem til Git";
-    gui_menu_item_collection => "Collection…", "Collection…", "Samling…";
-    gui_menu_item_environment => "Environment…", "Environnement…", "Miljø…";
-    gui_menu_item_workspace => "Workspace…", "Espace de travail…", "Workspace…";
-    gui_menu_item_response => "Response…", "Réponse…", "Svar…";
-    gui_menu_item_collection_or_env => "Collection or environment…", "Collection ou environnement…", "Samling eller miljø…";
+    gui_menu_save_as => "Save As…", "Enregistrer sous…", "Gem som…";
+    gui_shortcut_save => "Ctrl+S", "Ctrl+S", "Ctrl+S";
+    help_menu_save => "Write this straight back to the file it came from", "Réécrire directement dans le fichier d'origine", "Skriv direkte tilbage til filen, den kom fra";
+    help_menu_save_unsaved => "This has never been saved, so you will be asked where to put it", "Ceci n'a jamais été enregistré\u{a0}; l'emplacement vous sera demandé", "Dette er aldrig blevet gemt, så du bliver spurgt om hvor";
     gui_set_base_url => "Set base URL…", "Définir l'URL de base…", "Angiv basis-URL…";
     gui_close_tab => "Close tab", "Fermer l'onglet", "Luk fane";
     gui_quit => "Quit", "Quitter", "Afslut";
@@ -818,10 +930,12 @@ strings! {
     gui_open_collection_title => "Open collection", "Ouvrir une collection", "Åbn samling";
     gui_open_environment_title => "Open environment", "Ouvrir un environnement", "Åbn miljø";
     gui_filter_collections => "Collections (Hurl / Postman)", "Collections (Hurl / Postman)", "Samlinger (Hurl / Postman)";
+    gui_filter_postman_export => "Postman export (.json)", "Export Postman (.json)", "Postman-eksport (.json)";
     gui_filter_environments => "Environments", "Environnements", "Miljøer";
     gui_filter_all => "All files", "Tous les fichiers", "Alle filer";
     gui_browse => "Browse…", "Parcourir…", "Gennemse…";
     gui_open_workspace_title => "Open workspace folder", "Ouvrir un dossier d'espace de travail", "Åbn workspace-mappe";
+    postman_export_open_title => "Open a Postman export", "Ouvrir un export Postman", "Åbn en Postman-eksport";
     gui_not_a_folder => "That path is not a folder.", "Ce chemin n'est pas un dossier.", "Den sti er ikke en mappe.";
     gui_workspace_filter => "Filter", "Filtre", "Filter";
     gui_ws_new => "New", "Nouveau", "Ny";
@@ -829,21 +943,28 @@ strings! {
     gui_ws_new_collection => "New collection…", "Nouvelle collection…", "Ny samling…";
     gui_ws_new_report => "New report…", "Nouveau rapport…", "Ny rapport…";
     gui_ws_new_environment => "New environment…", "Nouvel environnement…", "Nyt miljø…";
+    gui_ws_new_folder => "New folder…", "Nouveau dossier…", "Ny mappe…";
     gui_ws_new_in_folder => "New in this folder", "Nouveau dans ce dossier", "Ny i denne mappe";
     gui_ws_new_in_root => "New in this workspace", "Nouveau dans cet espace de travail", "Ny i dette arbejdsområde";
     gui_ws_new_collection_title => "Name the new collection", "Nommez la nouvelle collection", "Navngiv den nye samling";
+    gui_ws_new_folder_title => "Name the new folder", "Nommez le nouveau dossier", "Navngiv den nye mappe";
     gui_ws_new_report_title => "Name the new report", "Nommez le nouveau rapport", "Navngiv den nye rapport";
     gui_ws_new_environment_title => "Name the new environment", "Nommez le nouvel environnement", "Navngiv det nye miljø";
     gui_workspace_filter_tooltip => "Toggle showing only .hurl/.json/.vars/.trail files", "Basculer l'affichage des seuls fichiers .hurl/.json/.vars/.trail", "Skift visning af kun .hurl/.json/.vars/.trail-filer";
     gui_close => "Close", "Fermer", "Luk";
     gui_cancel => "Cancel", "Annuler", "Annuller";
     gui_could_not_parse => "Could not parse that file.", "Impossible d'analyser ce fichier.", "Kunne ikke fortolke den fil.";
+    gui_not_postman_export => "That file is not a Postman collection or environment export.", "Ce fichier n'est pas un export de collection ou d'environnement Postman.", "Den fil er ikke en Postman-eksport af en samling eller et miljø.";
     gui_could_not_read => "Could not read file:", "Impossible de lire le fichier\u{a0}:", "Kunne ikke læse filen:";
     gui_could_not_write => "Could not write file:", "Impossible d'écrire le fichier\u{a0}:", "Kunne ikke skrive filen:";
+    gui_open_report_title => "Open report", "Ouvrir un rapport", "Åbn rapport";
+    gui_save_report_title => "Save report", "Enregistrer le rapport", "Gem rapport";
+    gui_filter_reports => "PaperTrail reports", "Rapports PaperTrail", "PaperTrail-rapporter";
     gui_save_collection_title => "Save collection", "Enregistrer la collection", "Gem samling";
     gui_save_environment_title => "Save environment", "Enregistrer l'environnement", "Gem miljø";
     gui_save_response_title => "Save response", "Enregistrer la réponse", "Gem svar";
     gui_save_results_title => "Export report results", "Exporter les résultats du rapport", "Eksportér rapportresultater";
+    gui_save_baseline_title => "Save report baseline", "Enregistrer la référence du rapport", "Gem rapport-basislinje";
     gui_unsupported_format => "Unsupported format:", "Format non pris en charge\u{a0}:", "Ikke-understøttet format:";
     gui_save => "Save", "Enregistrer", "Gem";
     gui_nothing_to_save => "Nothing to save.", "Rien à enregistrer.", "Intet at gemme.";
@@ -861,6 +982,8 @@ strings! {
     gui_new_report => "New report", "Nouveau rapport", "Ny rapport";
     gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
     // PaperTrail block editor (report_editor.rs).
+    gui_report_run_settings => "Run settings", "Réglages d'exécution", "Kørselsindstillinger";
+    gui_report_run_settings_shortcut => "Click, or press p, to change them.", "Cliquez, ou appuyez sur p, pour les modifier.", "Klik, eller tryk p, for at ændre dem.";
     gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
     gui_report_view_source => "Source", "Source", "Kilde";
     gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
@@ -879,7 +1002,8 @@ strings! {
     node_form_response => "Response", "Réponse", "Svar";
     node_form_response_default => "Default", "Défaut", "Standard";
     node_form_alias => "Column name (AS)", "Nom de colonne (AS)", "Kolonnenavn (AS)";
-    node_form_show => "Show fields (all ticked = show all)", "Afficher les champs (tous cochés = tout afficher)", "Vis felter (alle markeret = vis alle)";
+    node_form_show => "Show fields", "Afficher les champs", "Vis felter";
+    node_form_show_hint => "Ticking every field is the same as showing them all", "Cocher tous les champs revient à tous les afficher", "At markere alle felter svarer til at vise dem alle";
     node_envs_environments => "Environments", "Environnements", "Miljøer";
     node_envs_baseline_show => "SHOW — baseline fields to carry onto every comparison row", "SHOW — champs de référence à reporter sur chaque ligne de comparaison", "SHOW — referencefelter der føres over på hver sammenligningsrække";
     node_envs_baseline_show_hint => "Ticked fields appear beside each comparison as baseline.<field>. Tick nothing for no SHOW clause.", "Les champs cochés apparaissent à côté de chaque comparaison sous la forme baseline.<champ>. Ne rien cocher = aucune clause SHOW.", "Afkrydsede felter vises ved siden af hver sammenligning som baseline.<felt>. Kryds intet af for ingen SHOW-klausul.";
@@ -901,11 +1025,13 @@ strings! {
     chip_help_hdr_environment => "ENVIRONMENT — one loaded Global Environment to run with, instead of whichever is active. For comparing several, use a FOR … IN ENVS loop instead.", "ENVIRONMENT — un environnement global chargé à utiliser, au lieu de celui qui est actif. Pour en comparer plusieurs, utilisez plutôt une boucle FOR … IN ENVS.", "ENVIRONMENT — ét indlæst globalt miljø at køre med i stedet for det aktive. Skal flere sammenlignes, så brug en FOR … IN ENVS-løkke.";
     chip_help_hdr_root => "ROOT — the folder that relative file paths in this report are resolved against. Defaults to the report's own folder.", "ROOT — le dossier auquel les chemins relatifs de ce rapport se rapportent. Par défaut, le dossier du rapport.", "ROOT — mappen som relative filstier i denne rapport slås op i forhold til. Som standard rapportens egen mappe.";
     chip_help_hdr_baseline => "BASELINE — a saved run (`.baseline`) to diff this run against, filling the Result column. Ignored when the flow already compares environments.", "BASELINE — une exécution enregistrée (`.baseline`) à comparer à celle-ci, pour remplir la colonne Résultat. Ignoré si le flux compare déjà des environnements.", "BASELINE — en gemt kørsel (`.baseline`) at sammenligne denne med, som udfylder Resultat-kolonnen. Ignoreres, hvis flowet allerede sammenligner miljøer.";
+    chip_help_hdr_labels => "One class of the answers this report scores: a name and the spellings that mean it, as 'Pass = pass, ok, real'.", "Une classe des réponses évaluées par ce rapport : un nom et les orthographes qui le signifient, comme 'Réussi = pass, ok, real'.", "Én klasse af de svar, denne rapport vurderer: et navn og de stavemåder, der betyder det, som 'Bestået = pass, ok, real'.";
+    report_add_label_class => "Add label class", "Ajouter une classe d'étiquettes", "Tilføj etiketklasse";
     chip_help_hdr_columns => "COLUMNS — the column order of the results grid, as a comma-separated list of names. Unnamed columns follow in the order they are reported.", "COLUMNS — l'ordre des colonnes de la grille de résultats, sous forme de liste de noms séparés par des virgules. Les colonnes non citées suivent dans leur ordre d'apparition.", "COLUMNS — kolonnerækkefølgen i resultatgitteret, som en kommasepareret liste af navne. Unævnte kolonner følger i den rækkefølge, de rapporteres.";
-    gui_report_settings_help => "Report settings — these apply to the whole report rather than running as a step, so they sit above BEGIN and can't be reordered or dragged.", "Réglages du rapport — ils s'appliquent à l'ensemble du rapport au lieu de s'exécuter comme une étape ; ils se placent donc au-dessus de BEGIN et ne peuvent être ni réordonnés ni déplacés.", "Rapportindstillinger — de gælder hele rapporten i stedet for at køre som et trin, så de ligger over BEGIN og kan ikke omarrangeres eller trækkes.";
+    report_settings_help => "Report settings — these apply to the whole report rather than running as a step, so they sit above BEGIN and can't be reordered or dragged.", "Réglages du rapport — ils s'appliquent à l'ensemble du rapport au lieu de s'exécuter comme une étape ; ils se placent donc au-dessus de BEGIN et ne peuvent être ni réordonnés ni déplacés.", "Rapportindstillinger — de gælder hele rapporten i stedet for at køre som et trin, så de ligger over BEGIN og kan ikke omarrangeres eller trækkes.";
     gui_report_empty_flow => "No steps yet — drag a block here from the palette.", "Aucune étape pour l'instant — glissez un bloc ici depuis la palette.", "Ingen trin endnu — træk en blok herind fra paletten.";
-    gui_report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
-    gui_report_setting_unset => "not set", "non défini", "ikke sat";
+    report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
+    report_setting_unset => "not set", "non défini", "ikke sat";
     gui_report_ws_collections => "In this workspace", "Dans cet espace de travail", "I dette arbejdsområde";
     gui_report_other_collections => "Open elsewhere", "Ouvertes ailleurs", "Åbne andre steder";
     gui_report_show_all_collections => "Show collections outside this workspace", "Afficher les collections hors de cet espace de travail", "Vis samlinger uden for dette arbejdsområde";
@@ -913,6 +1039,7 @@ strings! {
     gui_report_no_collections => "No collections here yet — open one, or Browse\u{2026}", "Aucune collection ici pour l'instant — ouvrez-en une, ou Parcourir\u{2026}", "Ingen samlinger her endnu — åbn en, eller Gennemse\u{2026}";
     gui_report_browse => "Browse…", "Parcourir…", "Gennemse…";
     chip_help_flow_end => "END — where the report finishes. Everything between BEGIN and here runs, top to bottom.", "END — fin du rapport. Tout ce qui se trouve entre BEGIN et ici s'exécute, de haut en bas.", "END — hvor rapporten slutter. Alt mellem BEGIN og her køres oppefra og ned.";
+    chip_help_comment => "A comment — ignored when the report runs. Kept exactly as written.", "Un commentaire — ignoré à l'exécution du rapport. Conservé tel quel.", "En kommentar — ignoreres når rapporten kører. Bevares præcis som skrevet.";
     chip_help_end => "END — closes the FOR loop above it. Drop blocks between the loop and its END to repeat them.", "END — ferme la boucle FOR au-dessus. Déposez des blocs entre la boucle et son END pour les répéter.", "END — afslutter FOR-løkken ovenfor. Slip blokke mellem løkken og dens END for at gentage dem.";
     chip_help_request => "REQUEST — runs this request from the bound collection. Pick which one from the dropdown.", "REQUEST — exécute cette requête de la collection liée. Choisissez laquelle dans la liste déroulante.", "REQUEST — kører denne forespørgsel fra den tilknyttede samling. Vælg hvilken i rullelisten.";
     chip_help_report => "REPORT — turns the line into report output. Detach it with × to run the request without reporting on it.", "REPORT — transforme la ligne en sortie de rapport. Détachez-le avec × pour exécuter la requête sans la rapporter.", "REPORT — gør linjen til rapportoutput. Fjern det med × for at køre forespørgslen uden at rapportere den.";
@@ -925,13 +1052,32 @@ strings! {
     chip_help_var => "The value reported into the column — a variable set earlier in the flow, or a loop's variable.", "La valeur rapportée dans la colonne — une variable définie plus haut dans le flux, ou la variable d'une boucle.", "Værdien der rapporteres i kolonnen — en variabel sat tidligere i flowet eller en løkkes variabel.";
     chip_help_computed => "A computed column: the quoted template is expanded with {{variables}} and reported under its AS name.", "Une colonne calculée : le modèle entre guillemets est développé avec {{variables}} et rapporté sous son nom AS.", "En beregnet kolonne: den citerede skabelon udvides med {{variabler}} og rapporteres under sit AS-navn.";
     chip_help_assign => "Sets a variable for the rest of the flow. Open it to edit the name and value.", "Définit une variable pour la suite du flux. Ouvrez-le pour modifier le nom et la valeur.", "Sætter en variabel for resten af flowet. Åbn den for at redigere navn og værdi.";
+    chip_help_param => "Declares a value the report asks for before it runs, with a default. Read it as {{NAME}} like any other variable.", "Déclare une valeur que le rapport demande avant de s'exécuter, avec une valeur par défaut. Lisez-la comme {{NAME}}, comme toute autre variable.", "Erklærer en værdi, som rapporten beder om, før den kører, med en standardværdi. Læs den som {{NAME}} ligesom enhver anden variabel.";
     chip_help_list => "Declares a named list of values that a FOR loop can iterate over. Open it to edit the entries.", "Déclare une liste nommée de valeurs qu'une boucle FOR peut parcourir. Ouvrez-la pour modifier les entrées.", "Erklærer en navngiven liste af værdier, som en FOR-løkke kan gennemløbe. Åbn den for at redigere posterne.";
     chip_help_for => "FOR — repeats everything up to its END once per item. Open it to change the loop variable and its source.", "FOR — répète tout jusqu'à son END une fois par élément. Ouvrez-le pour changer la variable de boucle et sa source.", "FOR — gentager alt frem til sit END én gang pr. element. Åbn den for at ændre løkkevariablen og dens kilde.";
+    chip_help_loop_var => "The loop variable — the name each item is bound to inside the loop.", "La variable de boucle — le nom auquel chaque élément est lié dans la boucle.", "Løkkevariablen — navnet hvert element bindes til inde i løkken.";
+    chip_help_loop_dir => "The folder this loop reads from.", "Le dossier dans lequel cette boucle lit.", "Mappen denne løkke læser fra.";
+    chip_help_loop_glob => "A filename pattern, like *.json or report-*.csv. The loop skips any file whose name doesn't match it. Leave it blank to use every file in the folder.", "Un motif de nom de fichier, comme *.json ou rapport-*.csv. La boucle ignore tout fichier dont le nom n'y correspond pas. Laissez vide pour utiliser tous les fichiers du dossier.", "Et filnavnsmønster, som *.json eller rapport-*.csv. Løkken springer alle filer over, hvis navn ikke matcher. Lad det stå tomt for at bruge alle filer i mappen.";
+    // Short placeholders shown *inside* the empty boxes. Kept to a word or a
+    // literal example: the box is a few characters wide, so the full sentence
+    // (the `chip_help_*` strings above, now shown on hover) only ever appeared
+    // as an unreadable stub like "Only files ...".
+    gui_report_loop_var_hint => "name", "nom", "navn";
+    gui_report_loop_dir_hint => "folder", "dossier", "mappe";
+    gui_report_loop_glob_hint => "*.json", "*.json", "*.json";
+    // The folder/file picker button beside a loop's path box.
+    chip_help_loop_pick_folder => "Browse for the folder to loop over", "Parcourir pour choisir le dossier à parcourir", "Gennemse efter mappen, der skal løbes igennem";
+    chip_help_loop_pick_file => "Browse for the file to read the rows from", "Parcourir pour choisir le fichier dont les lignes seront lues", "Gennemse efter filen, som rækkerne skal læses fra";
+    gui_pick_loop_folder => "Choose the folder to loop over", "Choisissez le dossier à parcourir", "Vælg mappen der skal løkkes over";
+    gui_pick_loop_file => "Choose the file to loop over", "Choisissez le fichier à parcourir", "Vælg filen der skal løkkes over";
     chip_help_parallel => "PARALLEL — runs the loop's iterations at the same time. Type a number to cap how many run at once; leave it blank to use the default.", "PARALLEL — exécute les itérations de la boucle en même temps. Saisissez un nombre pour limiter combien s'exécutent à la fois ; laissez vide pour la valeur par défaut.", "PARALLEL — kører løkkens gennemløb samtidigt. Skriv et tal for at begrænse hvor mange der kører ad gangen; lad det stå tomt for standarden.";
     chip_help_for_envs => "FOR … IN ENVS — runs everything up to its END once per environment listed, with that environment's variables active. The name after FOR is what each run is labelled with in the report, not a value you set. Open it to choose the environments.", "FOR … IN ENVS — exécute tout jusqu'à son END une fois par environnement listé, avec les variables de cet environnement actives. Le nom après FOR sert d'étiquette à chaque exécution dans le rapport, ce n'est pas une valeur que vous définissez. Ouvrez-le pour choisir les environnements.", "FOR … IN ENVS — kører alt frem til sit END én gang pr. angivet miljø, med det miljøs variabler aktive. Navnet efter FOR er det, hver kørsel navngives med i rapporten, ikke en værdi du sætter. Åbn den for at vælge miljøerne.";
     chip_help_baseline_show => "SHOW — the BASELINE's fields carried onto every comparison row. Belongs to the BASELINE beside it; edit it in the ENVS form.", "SHOW — les champs de la BASELINE reportés sur chaque ligne de comparaison. Appartient à la BASELINE voisine ; modifiable dans le formulaire ENVS.", "SHOW — BASELINE-felterne der føres over på hver sammenligningsrække. Hører til den BASELINE ved siden af; redigér den i ENVS-formularen.";
     chip_help_baseline => "BASELINE — the environment the others are compared against. Pick it from the dropdown.", "BASELINE — l'environnement auquel les autres sont comparés. Choisissez-le dans la liste déroulante.", "BASELINE — det miljø de andre sammenlignes med. Vælg det i rullelisten.";
     chip_help_comparison => "COMPARISON — an environment compared against the baseline. Pick it from the dropdown.", "COMPARISON — un environnement comparé à la référence. Choisissez-le dans la liste déroulante.", "COMPARISON — et miljø der sammenlignes med referencen. Vælg det i rullelisten.";
+    chip_help_image => "IMAGE — this column holds a picture, embedded in the report at this size rather than written as a file path. Open the block to change the size.", "IMAGE — cette colonne contient une image, intégrée au rapport à cette taille plutôt qu'écrite comme chemin de fichier. Ouvrez le bloc pour changer la taille.", "IMAGE — denne kolonne indeholder et billede, indlejret i rapporten i denne størrelse i stedet for skrevet som en filsti. Åbn blokken for at ændre størrelsen.";
+    chip_help_truth => "TRUTH — the value this column is expected to hold, so the run can be scored right or wrong against it.", "TRUTH — la valeur attendue de cette colonne, afin que l'exécution puisse être jugée correcte ou non.", "TRUTH — den værdi, denne kolonne forventes at have, så kørslen kan bedømmes rigtig eller forkert.";
+    chip_help_detail => "DETAIL — keep this column out of the grid and show it in a row's drill-down instead.", "DETAIL — garder cette colonne hors du tableau et l'afficher dans le détail d'une ligne.", "DETAIL — hold denne kolonne uden for tabellen og vis den i rækkens detaljevisning i stedet.";
     chip_help_statistics => "STATISTICS — summary rows (count, mean, …) for this column. Open the block to choose which.", "STATISTICS — lignes de synthèse (comptage, moyenne, …) pour cette colonne. Ouvrez le bloc pour les choisir.", "STATISTICS — opsummeringsrækker (antal, gennemsnit, …) for denne kolonne. Åbn blokken for at vælge hvilke.";
     chip_help_drag_gesture => "Drag this chip out (or click ×) to remove just it · drop it on another line to move it there (Shift to copy) · Ctrl+drag to move the whole line", "Faites glisser cette puce (ou cliquez sur ×) pour ne retirer qu'elle · déposez-la sur une autre ligne pour l'y déplacer (Maj pour copier) · Ctrl+glisser pour déplacer toute la ligne", "Træk denne chip ud (eller klik på ×) for kun at fjerne den · slip den på en anden linje for at flytte den dertil (Shift for at kopiere) · Ctrl+træk for at flytte hele linjen";
     chip_help_roles_fixed => "Environments for the comparison. This form (several environments, or a saved FILE snapshot) is edited in the loop's form — open the block to change it.", "Environnements de la comparaison. Cette forme (plusieurs environnements, ou un instantané FILE enregistré) se modifie dans le formulaire de la boucle — ouvrez le bloc pour la changer.", "Miljøer til sammenligningen. Denne form (flere miljøer eller et gemt FILE-øjebliksbillede) redigeres i løkkens formular — åbn blokken for at ændre den.";
@@ -953,10 +1099,50 @@ strings! {
     gui_report_run => "Run", "Exécuter", "Kør";
     gui_report_stop => "Stop", "Arrêter", "Stop";
     gui_report_export => "Export…", "Exporter…", "Eksportér…";
+    gui_report_open_export => "Open", "Ouvrir", "Åbn";
+    gui_report_export_go => "Export", "Exporter", "Eksportér";
+    gui_report_export_format => "Format:", "Format :", "Format:";
+    gui_report_save_baseline => "Baseline…", "Référence…", "Basislinje…";
     gui_report_no_results => "No results yet — press Run to execute this report.", "Aucun résultat pour l'instant — appuyez sur Exécuter pour lancer ce rapport.", "Ingen resultater endnu — tryk på Kør for at køre denne rapport.";
     gui_report_running => "Running…", "Exécution…", "Kører…";
-    gui_report_cell_hint => "Click a cell to inspect its full value", "Cliquez sur une cellule pour voir sa valeur complète", "Klik på en celle for at se dens fulde værdi";
+    // `{c}` is substituted with the expander caret *glyph* at draw time: the
+    // GUI draws its icons from the Phosphor icon font, which a bare Unicode
+    // triangle written here is not in -- it came out as a tofu box.
+    gui_report_cell_hint => "Click a row marked {c} to open its details, or any other cell to inspect its full value", "Cliquez sur une ligne marquée {c} pour ouvrir ses détails, ou sur toute autre cellule pour voir sa valeur complète", "Klik på en række markeret med {c} for at åbne dens detaljer, eller på en anden celle for at se dens fulde værdi";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
+    // The results view's filter bar and metric cards. `RowFilter::label` is
+    // deliberately English -- it names buttons in an exported document that has
+    // no language -- so the in-app bar labels its own buttons from here.
+    report_filter_all => "All", "Tout", "Alle";
+    report_filter_differences => "Differences", "Différences", "Forskelle";
+    report_filter_incorrect => "Incorrect", "Incorrect", "Forkerte";
+    report_filter_regressions => "Regressions", "Régressions", "Regressioner";
+    report_find_placeholder => "Find in rows…", "Rechercher dans les lignes…", "Søg i rækker…";
+    report_rows_shown => "{shown} of {total} rows", "{shown} lignes sur {total}", "{shown} af {total} rækker";
+    // The terminal results view's pinned summary: one metric line per scored
+    // column, and the filter line `f` cycles. The GUI says the same things in
+    // cards and buttons; a terminal has one line to say them in.
+    // Sits in the results panel's title bar (not in the grid): it describes the
+    // pane, and the key that changes it is named in the title's hint and in the
+    // help overlay rather than repeated here on every screen.
+    report_filter_title => "Filter: {f}, {r}", "Filtre\u{a0}: {f}, {r}", "Filter: {f}, {r}";
+    report_metric_compared => "Compared", "Comparés", "Sammenlignet";
+    report_metric_incorrect => "Incorrect", "Incorrects", "Forkerte";
+    report_metric_accuracy => "Accuracy", "Exactitude", "Nøjagtighed";
+    // How a run moved against its baseline. Accuracy alone can't tell two 98%
+    // runs apart when one of them fixed three rows and broke three others.
+    report_metric_movement => "Movement", "Évolution", "Bevægelse";
+    report_metric_fixed => "Fixed", "Corrigés", "Rettede";
+    report_metric_regressed => "Regressed", "Régressions", "Forværrede";
+    report_metric_still_wrong => "Still wrong", "Toujours faux", "Stadig forkerte";
+    report_metric_nothing_moved => "Nothing moved", "Rien n'a changé", "Intet flyttede sig";
+    report_detail_title => "Row {n} details", "Détails de la ligne {n}", "Detaljer for række {n}";
+    report_detail_close => "Close this row's details", "Fermer les détails de cette ligne", "Luk denne rækkes detaljer";
+    report_detail_changed => "{c} — changed fields", "{c} — champs modifiés", "{c} — ændrede felter";
+    report_matrix_caption => "Rows: ground truth. Columns: reported value. {n} scored row(s).", "Lignes\u{a0}: vérité terrain. Colonnes\u{a0}: valeur rapportée. {n} ligne(s) évaluée(s).", "Rækker: sandhed. Kolonner: rapporteret værdi. {n} bedømt(e) række(r).";
+    report_matrix_all_matched => "Every scored row matched its ground truth.", "Chaque ligne évaluée correspond à sa vérité terrain.", "Alle bedømte rækker matchede deres sandhed.";
+    help_report_matrix_cell => "Show the rows this count is made of", "Afficher les lignes qui composent ce total", "Vis de rækker, dette tal består af";
+    help_report_filter => "Show only the rows this filter selects", "N'afficher que les lignes sélectionnées par ce filtre", "Vis kun de rækker, dette filter vælger";
     // Git remote flow (used by remote.rs).
     gui_git_repo_url => "Repository URL", "URL du dépôt", "Lager-URL";
     gui_git_token => "Access token (optional)", "Jeton d'accès (facultatif)", "Adgangstoken (valgfrit)";
@@ -965,6 +1151,90 @@ strings! {
     gui_git_tags => "Tags", "Étiquettes", "Tags";
     gui_git_browse_files => "Browse files", "Parcourir les fichiers", "Gennemse filer";
     gui_git_back => "Back", "Retour", "Tilbage";
+    gui_git_next => "Next", "Suivant", "Næste";
+    gui_git_tag => "Tag", "Étiquette", "Tag";
+    gui_git_existing_branch => "Use an existing branch…", "Utiliser une branche existante…", "Brug en eksisterende gren…";
+    gui_git_saved => "Saved to Git.", "Enregistré sur Git.", "Gemt til Git.";
+    // -- Postman bulk import ------------------------------------------------
+    postman_busy_listing => "Listing your Postman workspaces…", "Liste des espaces de travail Postman…", "Henter dine Postman-workspaces…";
+    postman_busy_planning => "Checking what that workspace holds…", "Vérification du contenu de cet espace de travail…", "Undersøger hvad dette workspace indeholder…";
+    postman_busy_downloading => "Downloading from Postman…", "Téléchargement depuis Postman…", "Henter fra Postman…";
+    postman_err_key_required => "A Postman API key is needed.", "Une clé d'API Postman est nécessaire.", "Der kræves en Postman-API-nøgle.";
+    postman_err_key_ref => "Could not resolve that reference. Check it, and that op / aws is installed and signed in.", "Impossible de résoudre cette référence. Vérifiez-la, ainsi que l’installation et la connexion de op / aws.", "Kunne ikke slå referencen op. Tjek den, og at op / aws er installeret og logget ind.";
+    postman_err_bad_workspace => "That is not a workspace id or a Postman workspace address.", "Ce n'est ni un identifiant d'espace de travail ni une adresse d'espace de travail Postman.", "Det er hverken et workspace-id eller en Postman-workspace-adresse.";
+    postman_err_dest_required => "Choose a folder to import into.", "Choisissez un dossier de destination.", "Vælg en mappe at importere til.";
+    postman_err_nothing_selected => "Choose collections, environments, or both.", "Choisissez les collections, les environnements, ou les deux.", "Vælg samlinger, miljøer eller begge dele.";
+    postman_err_no_workspace => "No workspace was chosen.", "Aucun espace de travail n'a été choisi.", "Der blev ikke valgt noget workspace.";
+    postman_err_no_workspaces => "This key can see no workspaces. A key carries its owner’s access, so check your Postman account is a member.", "Cette clé ne voit aucun espace de travail. Une clé porte les accès de son propriétaire : vérifiez que votre compte Postman en est membre.", "Denne nøgle kan ikke se nogen workspaces. En nøgle bærer ejerens adgang, så tjek at din Postman-konto er medlem.";
+    postman_err_worker_ended => "The import stopped unexpectedly.", "L'importation s'est arrêtée de façon inattendue.", "Importen stoppede uventet.";
+    postman_word_collection => "collection", "collection", "samling";
+    postman_word_collections => "collections", "collections", "samlinger";
+    postman_word_environment => "environment", "environnement", "miljø";
+    postman_word_environments => "environments", "environnements", "miljøer";
+    postman_unit_seconds => "seconds", "secondes", "sekunder";
+    postman_unit_minutes => "minutes", "minutes", "minutter";
+    postman_title => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
+    postman_connect_hint => "Enter connect · Esc cancel", "Entrée connecter · Échap annuler", "Enter forbind · Esc annuller";
+    postman_key_label => "API key", "Clé d’API", "API-nøgle";
+    postman_key_source_label => "Key from", "Clé depuis", "Nøgle fra";
+    postman_key_source_paste => "Typed here", "Saisie directe", "Indtastet her";
+    postman_key_source_op => "1Password", "1Password", "1Password";
+    postman_key_source_ssm => "AWS Parameter Store", "AWS Parameter Store", "AWS Parameter Store";
+    postman_key_source_env => "Environment variable", "Variable d'environnement", "Miljøvariabel";
+    postman_key_label_op => "1Password item", "Élément 1Password", "1Password-element";
+    postman_key_label_ssm => "Parameter", "Paramètre", "Parameter";
+    postman_key_label_env => "Variable", "Variable", "Variabel";
+    postman_key_hint_op => "vault/item/field", "coffre/élément/champ", "boks/element/felt";
+    postman_key_hint_ssm => "e.g. /team/postman/api-key", "ex. /team/postman/api-key", "f.eks. /team/postman/api-key";
+    postman_key_hint_env => "e.g. POSTMAN_API_KEY", "ex. POSTMAN_API_KEY", "f.eks. POSTMAN_API_KEY";
+    postman_key_hint => "PMAK-…", "PMAK-…", "PMAK-…";
+    postman_key_help_op => "PaperBoy reads the key from 1Password each time it runs, so no key is kept here. Needs the 1Password CLI (op) installed.", "PaperBoy lit la clé dans 1Password à chaque exécution ; aucune clé n'est conservée ici. Nécessite la CLI 1Password (op).", "PaperBoy læser nøglen fra 1Password ved hver kørsel, så ingen nøgle gemmes her. Kræver 1Password-CLI'en (op) installeret.";
+    postman_key_help_ssm => "PaperBoy reads the key from AWS Parameter Store each time it runs, so no key is kept here. Needs the AWS CLI installed.", "PaperBoy lit la clé dans AWS Parameter Store à chaque exécution ; aucune clé n'est conservée ici. Nécessite la CLI AWS.", "PaperBoy læser nøglen fra AWS Parameter Store ved hver kørsel, så ingen nøgle gemmes her. Kræver AWS-CLI'en installeret.";
+    postman_key_help_env => "PaperBoy reads the key from this environment variable each time it runs, so no key is kept here.", "PaperBoy lit la clé dans cette variable d'environnement à chaque exécution ; aucune clé n'est conservée ici.", "PaperBoy læser nøglen fra denne miljøvariabel ved hver kørsel, så ingen nøgle gemmes her.";
+    postman_key_help_paste => "Used as typed, for this import only. Postman makes these under Settings → API keys.", "Utilisée telle quelle, pour cet import uniquement. Postman les crée dans Paramètres → Clés d'API.", "Bruges som indtastet, kun til denne import. Postman opretter dem under Indstillinger → API-nøgler.";
+    postman_workspace_label => "Workspace", "Espace de travail", "Workspace";
+    postman_workspace_hint => "leave blank to choose from a list", "laisser vide pour choisir dans une liste", "lad stå tom for at vælge fra en liste";
+    postman_base_url_label => "API host", "Hôte de l’API", "API-vært";
+    postman_base_url_hint => "api.getpostman.com · EU: api.eu.postman.com", "api.getpostman.com · UE : api.eu.postman.com", "api.getpostman.com · EU: api.eu.postman.com";
+    postman_pick_workspace => "Choose a workspace", "Choisissez un espace de travail", "Vælg et workspace";
+    postman_include_collections => "Collections", "Collections", "Samlinger";
+    postman_include_environments => "Environments", "Environnements", "Miljøer";
+    postman_dest_label => "Import into", "Importer dans", "Importér til";
+    postman_dest_unset => "(no folder chosen)", "(aucun dossier choisi)", "(ingen mappe valgt)";
+    postman_browse => "[Enter to choose…]", "[Entrée pour choisir…]", "[Enter for at vælge…]";
+    postman_dest_folder => "Import into", "Importer dans", "Importér til";
+    postman_options_hint_dest => "Enter choose folder · Esc back", "Entrée choisir le dossier · Échap retour", "Enter vælg mappe · Esc tilbage";
+    postman_options_hint_toggle => "Space change · Esc back", "Espace changer · Échap retour", "Mellemrum skift · Esc tilbage";
+    postman_options_hint_import => "Enter import · Esc back", "Entrée importer · Échap retour", "Enter importér · Esc tilbage";
+    postman_format_label => "Format", "Format", "Format";
+    postman_format_raw => "Postman JSON (keeps everything)", "JSON Postman (conserve tout)", "Postman-JSON (bevarer alt)";
+    postman_format_hurl => "Convert to Hurl (.hurl and .vars)", "Convertir en Hurl (.hurl et .vars)", "Konvertér til Hurl (.hurl og .vars)";
+    postman_format_hurl_note => "Anything that could not be converted is listed in a notes file saved with the import.", "Tout ce qui n'a pas pu être converti est listé dans un fichier de notes enregistré avec l'import.", "Alt, der ikke kunne konverteres, listes i en notefil, der gemmes sammen med importen.";
+    postman_overwrite => "Replace the folder if it already exists", "Remplacer le dossier s'il existe déjà", "Erstat mappen hvis den allerede findes";
+    postman_confirm_title => "Ready to import", "Prêt à importer", "Klar til at importere";
+    postman_error_hint => "Esc back", "Échap retour", "Esc tilbage";
+    postman_confirm_hint => "Enter import · Esc back", "Entrée importer · Échap retour", "Enter importér · Esc tilbage";
+    postman_rate_limit_note => "Paced to stay inside Postman’s rate limit.", "Rythme adapté à la limite de débit de Postman.", "Tempo tilpasset Postmans hastighedsgrænse.";
+    postman_background => "Importing from Postman", "Import depuis Postman", "Importerer fra Postman";
+    postman_background_button => "Continue in the background", "Continuer en arrière-plan", "Fortsæt i baggrunden";
+    postman_background_hint => "Put this away and keep working; the import carries on and reappears when it needs you.", "Masquer et continuer à travailler ; l'import se poursuit et réapparaît s'il a besoin de vous.", "Læg denne væk og arbejd videre; importen fortsætter og dukker op igen, når den har brug for dig.";
+    postman_background_reveal => "Click to show the import", "Cliquez pour afficher l'import", "Klik for at vise importen";
+    postman_estimate => "About", "Environ", "Cirka";
+    postman_budget_warning => "This would use a large share of this account's remaining monthly API budget.", "Cela consommerait une grande partie du budget d'API mensuel restant de ce compte.", "Dette ville bruge en stor del af kontoens resterende månedlige API-budget.";
+    postman_waiting_paced => "Pausing to stay within Postman's rate limit", "Pause pour respecter la limite de débit de Postman", "Pauser for at holde sig inden for Postmans hastighedsgrænse";
+    postman_waiting_limited => "Postman asked us to wait", "Postman nous a demandé d'attendre", "Postman bad os vente";
+    postman_remaining => "left", "restant", "tilbage";
+    postman_recent_hint => "↓ saved references", "↓ références enregistrées", "↓ gemte referencer";
+    postman_budget_label => "Postman allowance", "Quota Postman", "Postman-kvote";
+    postman_budget_window => "calls left before reset", "appels restants avant réinitialisation", "kald tilbage før nulstilling";
+    postman_budget_month => "left this month", "restants ce mois-ci", "tilbage denne måned";
+    postman_budget_pace => "one call every", "un appel toutes les", "ét kald hver";
+    postman_done_title => "Import complete", "Importation terminée", "Import fuldført";
+    postman_done_opened => "It is open in a new workspace tab — choose a collection on the left to see its requests.", "Il est ouvert dans un nouvel onglet d'espace de travail — choisissez une collection à gauche pour voir ses requêtes.", "Den er åben i en ny arbejdsområdefane — vælg en samling til venstre for at se dens forespørgsler.";
+    postman_done_saved_to => "Saved to", "Enregistré dans", "Gemt i";
+    postman_skipped => "could not be fetched and were skipped", "n'ont pas pu être récupérés et ont été ignorés", "kunne ikke hentes og blev sprunget over";
+    postman_notes_written => "Some things could not be converted to Hurl — see CONVERSION-NOTES.md in the imported folder.", "Certains éléments n'ont pas pu être convertis en Hurl — voir CONVERSION-NOTES.md dans le dossier importé.", "Nogle ting kunne ikke konverteres til Hurl — se CONVERSION-NOTES.md i den importerede mappe.";
+    postman_start => "Import", "Importer", "Importér";
     gui_git_filter => "Filter", "Filtrer", "Filter";
     gui_git_load => "Load", "Charger", "Indlæs";
     gui_git_save => "Save", "Enregistrer", "Gem";
@@ -975,30 +1245,24 @@ strings! {
     gui_git_pick_ref => "Pick a branch or tag", "Choisir une branche ou une étiquette", "Vælg en gren eller et tag";
     gui_git_load_title => "Load from Git", "Charger depuis Git", "Indlæs fra Git";
     gui_git_save_collection_title => "Save collection to Git", "Enregistrer la collection sur Git", "Gem samling til Git";
-    gui_git_connecting => "Connecting to remote…", "Connexion au dépôt distant…", "Forbinder til fjernlager…";
-    gui_git_fetching_files => "Fetching file list…", "Récupération de la liste des fichiers…", "Henter filliste…";
-    gui_git_loading_file => "Loading selected file…", "Chargement du fichier sélectionné…", "Indlæser valgt fil…";
-    gui_git_saving => "Saving to remote…", "Enregistrement sur le dépôt distant…", "Gemmer til fjernlager…";
+    gui_git_save_workspace_title => "Save workspace to Git", "Enregistrer l'espace de travail sur Git", "Gem workspace til Git";
+    gui_git_save_report_title => "Save report to Git", "Enregistrer le rapport sur Git", "Gem rapport til Git";
     gui_git_fetched_at => "Fetched at", "Récupéré à", "Hentet ved";
     gui_git_no_files => "No .hurl or .vars files match. Enable “Show all files” to browse everything.", "Aucun fichier .hurl ou .vars ne correspond. Activez « Afficher tous les fichiers » pour tout parcourir.", "Ingen .hurl- eller .vars-filer matcher. Slå “Vis alle filer” til for at gennemse alt.";
     gui_git_checkout_gone => "The temporary checkout was cleaned up. Go Back and Browse files again to retry.", "L'extraction temporaire a été nettoyée. Revenez en arrière et parcourez à nouveau les fichiers pour réessayer.", "Den midlertidige udtjekning blev ryddet op. Gå tilbage og gennemse filer igen for at prøve igen.";
-    gui_git_update_prefix => "Update", "Mettre à jour", "Opdater";
     gui_git_err_no_file => "No file was selected.", "Aucun fichier n'a été sélectionné.", "Ingen fil blev valgt.";
     gui_git_err_no_ref => "No branch or tag was selected.", "Aucune branche ou étiquette n'a été sélectionnée.", "Ingen gren eller tag blev valgt.";
     gui_git_err_not_env => "The selected file is not a valid .vars environment.", "Le fichier sélectionné n'est pas un environnement .vars valide.", "Den valgte fil er ikke et gyldigt .vars-miljø.";
     gui_git_err_not_collection => "The selected file is not a valid collection.", "Le fichier sélectionné n'est pas une collection valide.", "Den valgte fil er ikke en gyldig samling.";
     gui_git_err_collection_missing => "Collection not found.", "Collection introuvable.", "Samling ikke fundet.";
     gui_git_err_collection_closed => "Collection was closed before the save finished.", "La collection a été fermée avant la fin de l'enregistrement.", "Samlingen blev lukket, før lagringen var færdig.";
-    gui_git_err_unexpected_save => "Unexpected save result while loading.", "Résultat d'enregistrement inattendu pendant le chargement.", "Uventet lagringsresultat under indlæsning.";
-    gui_git_err_unexpected_load => "Unexpected load result while saving.", "Résultat de chargement inattendu pendant l'enregistrement.", "Uventet indlæsningsresultat under lagring.";
-    gui_git_err_worker_ended => "Background git operation ended unexpectedly.", "L'opération git en arrière-plan s'est terminée de manière inattendue.", "Baggrunds-git-handlingen sluttede uventet.";
     gui_git_err_url_required => "Repository URL is required.", "L'URL du dépôt est requise.", "Lager-URL er påkrævet.";
     gui_git_err_pick_ref_first => "Choose a branch or tag first.", "Choisissez d'abord une branche ou une étiquette.", "Vælg først en gren eller et tag.";
     gui_git_err_browse_again => "Browse files again before loading.", "Parcourez à nouveau les fichiers avant de charger.", "Gennemse filer igen før indlæsning.";
     gui_git_err_pick_file => "Choose a file to load.", "Choisissez un fichier à charger.", "Vælg en fil at indlæse.";
-    gui_git_err_branch_required => "Branch is required.", "La branche est requise.", "Gren er påkrævet.";
     gui_git_err_path_required => "Path in repository is required.", "Le chemin dans le dépôt est requis.", "Sti i lageret er påkrævet.";
     gui_git_err_path_relative => "Path must be relative and must not contain “..”.", "Le chemin doit être relatif et ne doit pas contenir « .. ».", "Stien skal være relativ og må ikke indeholde “..”.";
+    gui_git_load_report_title => "Load report from Git", "Charger un rapport depuis Git", "Indlæs rapport fra Git";
     gui_git_load_workspace_title => "Load workspace from Git", "Charger un espace de travail depuis Git", "Indlæs workspace fra Git";
     gui_git_ws_pick_filter => "Choose which files to download. Nothing else in the repository is ever fetched.", "Choisissez les fichiers à télécharger. Rien d'autre dans le dépôt n'est jamais récupéré.", "Vælg hvilke filer der skal hentes. Intet andet i lageret bliver nogensinde hentet.";
     gui_git_ws_match_count => "{n} of {total} files match", "{n} fichiers sur {total} correspondent", "{n} af {total} filer matcher";
@@ -1021,6 +1285,10 @@ strings! {
     diag_collection_unset => "No collection chosen — a report has nothing to run against until one is set.", "Aucune collection choisie — un rapport n'a rien à exécuter tant qu'aucune n'est définie.", "Ingen samling valgt — en rapport har intet at køre mod, før en er sat.";
     diag_output_unsupported => "Unsupported output format '{}' — supported formats are {}.", "Format de sortie '{}' non pris en charge — les formats acceptés sont {}.", "Outputformatet '{}' understøttes ikke — de understøttede formater er {}.";
     diag_duplicate_column => "Two columns are both headed '{}' — give each one a distinct name with AS.", "Deux colonnes portent le même titre '{}' — donnez à chacune un nom distinct avec AS.", "To kolonner har begge overskriften '{}' — giv hver af dem et særskilt navn med AS.";
+    diag_labels_malformed => "The label setting '{}' declares nothing — write it as 'Name = synonym, synonym'.", "Le réglage d'étiquettes '{}' ne déclare rien — écrivez-le sous la forme 'Nom = synonyme, synonyme'.", "Etiketindstillingen '{}' erklærer ingenting — skriv den som 'Navn = synonym, synonym'.";
+    diag_labels_conflict => "'{}' is claimed by both '{}' and '{}' — it counts as '{}'.", "'{}' est revendiqué à la fois par '{}' et '{}' — il compte comme '{}'.", "'{}' hævdes af både '{}' og '{}' — den tælles som '{}'.";
+    diag_truth_empty => "Column '{}' has an empty ground truth, so it will never be scored.", "La colonne '{}' a une vérité terrain vide, elle ne sera donc jamais évaluée.", "Kolonnen '{}' har en tom grundsandhed, så den bliver aldrig vurderet.";
+    diag_truth_on_image => "Column '{}' is shown as a picture, so its ground truth compares the address of the picture rather than what it shows.", "La colonne '{}' est affichée comme une image, sa vérité terrain compare donc l'adresse de l'image plutôt que son contenu.", "Kolonnen '{}' vises som et billede, så dens grundsandhed sammenligner billedets adresse frem for det, det viser.";
     diag_environment_unset => "The environment setting is empty — either name an environment or remove the setting.", "Le réglage d'environnement est vide — nommez un environnement ou supprimez le réglage.", "Miljøindstillingen er tom — navngiv et miljø, eller fjern indstillingen.";
     diag_environment_not_loaded => "Environment '{}' is not loaded.", "L'environnement '{}' n'est pas chargé.", "Miljøet '{}' er ikke indlæst.";
     diag_baseline_ignored => "The baseline setting is ignored, because this report already compares a BASELINE environment with COMPARISON environments.", "Le réglage baseline est ignoré, car ce rapport compare déjà un environnement BASELINE à des environnements COMPARISON.", "Baseline-indstillingen ignoreres, fordi denne rapport allerede sammenligner et BASELINE-miljø med COMPARISON-miljøer.";
@@ -1028,10 +1296,54 @@ strings! {
     diag_no_columns => "This report emits no columns, so it will produce an empty table — attach REPORT to a request to make it one.", "Ce rapport ne produit aucune colonne, il donnera donc un tableau vide — attachez REPORT à une requête pour en créer une.", "Denne rapport udsender ingen kolonner, så den giver en tom tabel — sæt REPORT på en forespørgsel for at lave en.";
     diag_collection_not_loaded => "The collection isn't loaded, so request names can't be checked yet.", "La collection n'est pas chargée, les noms de requêtes ne peuvent donc pas encore être vérifiés.", "Samlingen er ikke indlæst, så forespørgselsnavne kan ikke tjekkes endnu.";
     diag_list_shadowed => "LIST '{}' hides an earlier list of the same name.", "LIST '{}' masque une liste antérieure du même nom.", "LIST '{}' skjuler en tidligere liste med samme navn.";
+    diag_env_ref_not_a_param => "ENVS names an environment through '{}', but no PARAM declares it — write '{}' as a parameter, or name the environment outright.", "ENVS désigne un environnement via « {} », mais aucun PARAM ne le déclare — déclarez « {} » comme paramètre, ou nommez l'environnement directement.", "ENVS navngiver et miljø via '{}', men ingen PARAM erklærer det — erklær '{}' som en parameter, eller navngiv miljøet direkte.";
+    diag_env_ref_default_not_loaded => "ENVS names '{}', which currently means '{}' — an environment that isn't loaded.", "ENVS désigne « {} », qui signifie actuellement « {} » — un environnement qui n'est pas chargé.", "ENVS navngiver '{}', som i øjeblikket betyder '{}' — et miljø, der ikke er indlæst.";
+    param_pick_path => "Pick a value for this parameter…", "Choisissez une valeur pour ce paramètre…", "Vælg en værdi til denne parameter…";
+    param_row_required => "needs a value", "doit être renseigné", "kræver en værdi";
+    param_blocked_hint => "Fill in the values marked above before running.", "Renseignez les valeurs signalées ci-dessus avant de lancer.", "Udfyld de markerede værdier ovenfor, før du kører.";
+    param_run_settings_first => "This report asks for some values — check them, then run again to start.", "Ce rapport demande des valeurs : vérifiez-les, puis relancez pour démarrer.", "Denne rapport beder om nogle værdier — tjek dem, og kør igen for at starte.";
+    param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
+    param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
+    param_view_lead => "Set the values this run will use.", "Définissez les valeurs utilisées par cette exécution.", "Angiv de værdier, denne kørsel skal bruge.";
+    param_view_hint => "Enter set  r run  d preview  Esc cancel", "Entrée définir  r exécuter  d aperçu  Échap annuler", "Enter angiv  r kør  d forhåndsvis  Esc annullér";
+    param_summary_prefix => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
+    param_summary_hint => "p to change", "p pour modifier", "p for at ændre";
+    param_changed_since_run => "changed since this run", "modifié depuis cette exécution", "ændret siden denne kørsel";
+    param_previewed_with => "Previewed with", "Aperçu avec", "Forhåndsvist med";
+    param_result_ran_with => "The table below was run with {}.", "Le tableau ci-dessous a été exécuté avec {}.", "Tabellen nedenfor blev kørt med {}.";
+    param_value_unset => "(not set)", "(non renseigné)", "(ikke angivet)";
+    param_open_hint => "p run settings", "p paramètres d'exécution", "p kørselsindstillinger";
+    param_required => "'{}' has no value and no default — set it before running (--param {}=…).", "« {} » n'a ni valeur ni valeur par défaut — renseignez-le avant d'exécuter (--param {}=…).", "'{}' har hverken en værdi eller en standardværdi — angiv den før kørslen (--param {}=…).";
+    param_not_a_choice => "'{}' was given '{}', which isn't one of its choices ({}).", "« {} » a reçu « {} », qui ne fait pas partie de ses choix ({}).", "'{}' fik '{}', som ikke er et af dens valg ({}).";
+    param_not_a_number => "'{}' was given '{}', which isn't a number.", "« {} » a reçu « {} », qui n'est pas un nombre.", "'{}' fik '{}', som ikke er et tal.";
+    diag_param_not_in_prelude => "PARAM '{}' comes too late to be offered before the run â move it above the first step.", "Le PARAM '{}' arrive trop tard pour être proposé avant l'exécution â placez-le au-dessus de la première étape.", "PARAM '{}' kommer for sent til at kunne tilbydes før kørslen â flyt den op over det første trin.";
+    diag_param_duplicate => "PARAM '{}' is declared more than once.", "Le PARAM '{}' est déclaré plusieurs fois.", "PARAM '{}' er erklæret mere end én gang.";
+    diag_param_prompt_clash => "Two parameters both ask for '{}' — give one of them a LABEL of its own.", "Deux paramètres demandent tous deux « {} » — donnez à l'un d'eux un LABEL qui lui soit propre.", "To parametre beder begge om '{}' — giv den ene sit eget LABEL.";
+    diag_param_no_choices => "PARAM '{}' is a CHOICE with nothing to choose from.", "Le PARAM '{}' est un CHOICE sans aucun choix.", "PARAM '{}' er et CHOICE uden noget at vælge imellem.";
+    diag_param_bad_choice => "PARAM '{}' has default '{}', which isn't one of its choices ({}).", "Le PARAM '{}' a la valeur par défaut '{}', qui ne fait pas partie de ses choix ({}).", "PARAM '{}' har standardværdien '{}', som ikke er et af dens valg ({}).";
+    diag_param_not_a_number => "PARAM '{}' has default '{}', which isn't a number.", "Le PARAM '{}' a la valeur par défaut '{}', qui n'est pas un nombre.", "PARAM '{}' har standardværdien '{}', som ikke er et tal.";
+    diag_param_env_not_loaded => "PARAM '{}' defaults to environment '{}', which isn't loaded â pick another before running.", "Le PARAM '{}' utilise par défaut l'environnement '{}', qui n'est pas chargé â choisissez-en un autre avant d'exécuter.", "PARAM '{}' bruger som standard miljøet '{}', som ikke er indlæst â vælg et andet før kørslen.";
     diag_show_unknown => "SHOW field '{}' on request '{}' isn't a field that request produces, so it will be ignored.", "Le champ SHOW '{}' de la requête '{}' n'est pas un champ produit par cette requête, il sera donc ignoré.", "SHOW-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer, så det ignoreres.";
     diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
     diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
     diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
+    report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
+    report_alias_unset => "alias", "alias", "alias";
+    // The two halves of a `# labels:` class. The hints are examples rather than
+    // descriptions: the whole point of splitting the directive into two fields
+    // is to show what goes where, and "Low Risk" teaches that faster than
+    // "canonical label" does.
+    report_label_class_unset => "Low Risk", "Risque faible", "Lav risiko";
+    report_label_synonyms_unset => "real, genuine, pass", "réel, authentique, succès", "ægte, autentisk, bestået";
+    report_label_synonyms_help => "Other spellings that mean this label. A truth of \"real\" and a response of \"Low Risk\" score as a match when both are listed here.", "Autres formulations qui désignent cette étiquette. Une vérité « real » et une réponse « Low Risk » comptent comme identiques si les deux figurent ici.", "Andre stavemåder, der betyder denne etiket. En sandhed \"real\" og et svar \"Low Risk\" tæller som ens, når begge står her.";
+    report_helper_collection_help => "Another collection whose requests this report can call, written 'path AS alias'. Its requests are then used as 'alias/request'. Handy for a request that supports the report but isn't part of the API being tested — it stays out of Run All.", "Une autre collection dont ce rapport peut appeler les requêtes, écrite 'chemin AS alias'. Ses requêtes s'utilisent alors comme 'alias/requête'. Pratique pour une requête qui sert au rapport sans faire partie de l'API testée : elle reste hors de « Tout exécuter ».", "En anden samling, hvis forespørgsler denne rapport kan kalde, skrevet 'sti AS alias'. Dens forespørgsler bruges så som 'alias/forespørgsel'. Nyttigt til en forespørgsel, der understøtter rapporten uden at være en del af den API, der testes — den holdes uden for Kør alle.";
+    diag_collection_primary_alias => "The first '# collection:' is the report's own collection, so it takes no 'AS' alias. Aliases name the extra helper collections below it.", "La première '# collection:' est la collection du rapport : elle ne prend pas d'alias 'AS'. Les alias nomment les collections d'appoint qui la suivent.", "Den første '# collection:' er rapportens egen samling og tager derfor ikke et 'AS'-alias. Aliasser navngiver de ekstra hjælpesamlinger under den.";
+    diag_collection_alias_missing => "Helper collection '{}' needs an alias: write '# collection: {0} AS name'. Its requests are then used as 'name/request'.", "La collection d'appoint '{}' a besoin d'un alias : écrivez '# collection: {0} AS nom'. Ses requêtes s'utilisent alors comme 'nom/requête'.", "Hjælpesamlingen '{}' mangler et alias: skriv '# collection: {0} AS navn'. Dens forespørgsler bruges så som 'navn/forespørgsel'.";
+    diag_collection_alias_invalid => "'{}' is not a usable collection alias. Use letters, digits and underscores, starting with a letter or underscore.", "'{}' n'est pas un alias de collection utilisable. Utilisez des lettres, des chiffres et des tirets bas, en commençant par une lettre ou un tiret bas.", "'{}' kan ikke bruges som samlingsalias. Brug bogstaver, tal og understregninger, og begynd med et bogstav eller en understregning.";
+    diag_collection_alias_duplicate => "Two helper collections are both called '{}'. Give each one its own alias so 'alias/request' names exactly one request.", "Deux collections d'appoint s'appellent '{}'. Donnez à chacune son propre alias pour que 'alias/requête' désigne une seule requête.", "To hjælpesamlinger hedder begge '{}'. Giv hver sit eget alias, så 'alias/forespørgsel' peger på præcis én forespørgsel.";
+    diag_collection_alias_shadows_folder => "The alias '{}' is also a folder in the bound collection, so '{0}/…' could mean either. Rename the alias.", "L'alias '{}' est aussi un dossier de la collection liée : '{0}/…' devient ambigu. Renommez l'alias.", "Aliasset '{}' er også en mappe i den bundne samling, så '{0}/…' kan betyde begge dele. Omdøb aliasset.";
+    diag_collection_helper_not_open => "it lives on a git remote, so open it as a collection first", "elle se trouve sur un dépôt git distant : ouvrez-la d'abord comme collection", "den ligger på en git-fjernserver, så åbn den som samling først";
+    diag_collection_helper_unreadable => "Helper collection '{}' could not be read: {}", "Impossible de lire la collection d'appoint '{}' : {}", "Hjælpesamlingen '{}' kunne ikke læses: {}";
     diag_request_not_found => "Request '{}' was not found in the bound collection.", "La requête '{}' est introuvable dans la collection liée.", "Forespørgslen '{}' blev ikke fundet i den bundne samling.";
     diag_request_ambiguous_leaf => "Request '{}' is ambiguous — {} requests end with that name; qualify it with its folder path.", "La requête '{}' est ambiguë — {} requêtes se terminent par ce nom\u{a0}; qualifiez-la avec son chemin de dossier.", "Forespørgslen '{}' er tvetydig — {} forespørgsler slutter med det navn; kvalificér den med dens mappesti.";
     diag_envs_empty => "This ENVS loop has no environments to run over.", "Cette boucle ENVS n'a aucun environnement à parcourir.", "Denne ENVS-løkke har ingen miljøer at køre over.";
@@ -1086,6 +1398,11 @@ pub fn fill(template: &str, args: &[&str]) -> String {
 #[derive(Clone, Debug)]
 pub enum Status {
     Saved,
+    /// A bulk save wrote this many files -- the answer to "Save all changes"
+    /// on the quit dialog, which spans however many collections were holding
+    /// edits rather than the single file `Saved` speaks for.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    SavedFiles(usize),
     Loaded,
     Cleared,
     NoResponse,
@@ -1104,6 +1421,13 @@ pub enum Status {
     /// The active collection has no remembered git origin, so "Save to Git"
     /// can't be opened.
     NoGitOrigin,
+    /// A Postman import converted to Hurl and had to leave something behind;
+    /// the details are in `CONVERSION-NOTES.md` in the imported folder.
+    PostmanNotes,
+    /// A Postman import finished, but this many items could not be fetched.
+    /// Reported rather than swallowed: a workspace that silently arrived two
+    /// collections short is worse than one that says so.
+    PostmanSkipped(usize),
     /// A collection (and optionally its environment) was successfully pushed
     /// to git.
     GitSaved,
@@ -1231,14 +1555,31 @@ pub enum Status {
     /// A report couldn't be run or exported; holds an already-translated reason
     /// (built from [`Strings`] at the call site).
     ReportRunBlocked(String),
+    /// Run was pressed on a report that asks for values: the run settings were
+    /// opened instead, and Run again starts the run.
+    ReportRunSettingsFirst,
     /// A structural node edit was reverted with Ctrl+Z (node-editor undo).
     ReportNodeUndone(String),
     /// Ctrl+Z was pressed in the node editor with an empty undo stack.
     ReportNodeNothingToUndo(String),
+    /// `a` was pressed on the node editor's settings section when every
+    /// optional header directive is already present.
+    /// Enter was pressed on a settings row whose picker has nothing to offer —
+    /// only reachable for `environment:` with no environments loaded.
+    ReportSettingNoChoices,
+    /// The report source was re-indented.
+    ReportReformatted,
+    /// Reformat was asked for on a report that is already correctly indented.
+    ReportAlreadyTidy,
+    /// Reformat declined; holds the reason (a parse error, or the safety check
+    /// that compares the re-indented AST with the original's).
+    ReportReformatFailed(String),
     /// A report's results were written to a CSV file; holds its path.
     ReportExported(String),
     /// A report's last run was saved as a `.baseline` snapshot; holds its path.
     ReportBaselineSaved(String),
+    /// An exported report was handed to the desktop's opener; holds its path.
+    ReportOpened(String),
     /// The column picker was opened without a prior run (columns unknown).
     ReportColumnsNeedRun,
     /// The column picker was applied with nothing selected.
@@ -1261,6 +1602,9 @@ pub enum Status {
     /// The selected request was reverted to its last-saved on-disk version,
     /// discarding its in-memory edits. Holds the HTTP method for the message.
     RequestReverted(String),
+    /// A whole workspace collection file was reverted to its on-disk version,
+    /// discarding every in-memory edit to it. Holds the file name.
+    FileReverted(String),
     /// A Global Environment's unsaved edits were discarded, restoring the
     /// last-saved values (added vars dropped, modified ones restored). Names it.
     EnvReverted(String),
@@ -1297,13 +1641,16 @@ impl Status {
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
                     | Status::ReportExported(_)
+                    | Status::ReportOpened(_)
                     | Status::ReportBaselineSaved(_)
                     | Status::ReportColumnsApplied
                     | Status::ReportBound(_)
                     | Status::ReportNodeUndone(_)
                     | Status::RequestReverted(_)
+                    | Status::FileReverted(_)
                     | Status::EnvReverted(_)
                     | Status::WorkspaceTreeFilter(_)
+                    | Status::ReportRunSettingsFirst
             ),
         }
     }
@@ -1312,6 +1659,7 @@ impl Status {
     pub fn text(&self, s: &Strings) -> String {
         match self {
             Status::Saved => s.file_saved.to_string(),
+            Status::SavedFiles(n) => s.gui_saved_n_files.replace("{n}", &n.to_string()),
             Status::Loaded => s.file_loaded.to_string(),
             Status::Cleared => s.clear_all_done.to_string(),
             Status::Copied => s.copied_to_clipboard.to_string(),
@@ -1322,6 +1670,8 @@ impl Status {
             Status::ReportBound(name) => format!("{} {name}", s.report_bound_status),
             Status::ReportBindNoCollections => s.report_bind_no_collections.to_string(),
             Status::NoGitOrigin => s.git_no_origin.to_string(),
+            Status::PostmanNotes => s.postman_notes_written.to_string(),
+            Status::PostmanSkipped(n) => format!("{n} {}", s.postman_skipped),
             Status::GitSaved => s.git_save_success.to_string(),
             Status::WaitingSecrets(keys) => {
                 format!("{} {}", s.env_waiting_secrets, keys.join(", "))
@@ -1409,9 +1759,17 @@ impl Status {
                 }
             }
             Status::ReportRunBlocked(reason) => reason.clone(),
+            Status::ReportRunSettingsFirst => s.param_run_settings_first.to_string(),
             Status::ReportNodeUndone(msg) => msg.clone(),
             Status::ReportNodeNothingToUndo(msg) => msg.clone(),
+            Status::ReportReformatted => s.report_reformatted.to_string(),
+            Status::ReportAlreadyTidy => s.report_already_tidy.to_string(),
+            Status::ReportReformatFailed(why) => {
+                format!("{} {why}", s.report_reformat_failed_prefix)
+            }
+            Status::ReportSettingNoChoices => s.report_setting_no_choices.to_string(),
             Status::ReportExported(path) => format!("{} {path}", s.report_exported_prefix),
+            Status::ReportOpened(path) => format!("{} {path}", s.report_opened_prefix),
             Status::ReportBaselineSaved(path) => {
                 format!("{} {path}", s.report_baseline_saved_prefix)
             }
@@ -1425,6 +1783,7 @@ impl Status {
                 .replace("{total}", &total.to_string()),
             Status::ReportRunStopped => s.report_run_stopped.to_string(),
             Status::RequestReverted(method) => format!("{method} {}", s.status_request_reverted),
+            Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
             Status::WorkspaceTreeFilter(on) => {

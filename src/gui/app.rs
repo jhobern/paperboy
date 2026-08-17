@@ -15,7 +15,7 @@ use crate::session::Session;
 use super::report_editor::ReportOrigin;
 use super::theme::GuiTheme;
 use super::{
-    Focus, editor, environments, menu, remote, report_editor, reports, requests, response,
+    Focus, editor, environments, menu, postman, remote, report_editor, reports, requests, response,
 };
 
 /// Which section of the request editor (centre-top) is shown.
@@ -63,6 +63,15 @@ pub enum Dialog {
         name: String,
         count: usize,
     },
+    /// Exporting a report's results: a filename, and the format to write it in.
+    ///
+    /// Its own dialog rather than the native save picker's filter dropdown,
+    /// because that dropdown only *filters* — picking "Excel" in it left the
+    /// name ending `.csv` and the format is chosen by the extension, so the
+    /// dropdown appeared to do nothing. Here the format and the name are the
+    /// same decision, sat next to each other, and changing one rewrites the
+    /// other. The native picker is still a Browse… away.
+    ExportResults { path: String },
     /// A restored Workspace tab's downloaded folder has vanished since the
     /// last session (typically `/tmp` swept between restarts). Offers to
     /// redownload it, pinned to the exact commit it recorded.
@@ -70,25 +79,46 @@ pub enum Dialog {
         ci: usize,
         reload: Box<crate::persistence::PendingWorkspaceReload>,
     },
+    /// Throw away in-memory edits and go back to what is on disk. `entry` is
+    /// `Some(idx)` for one request of the loaded file, `None` for the whole
+    /// file. Confirmed because a revert has no undo.
+    RevertToSaved {
+        ci: usize,
+        path: std::path::PathBuf,
+        entry: Option<usize>,
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpenKind {
     Collection,
     Environment,
+    /// Open a `.trail` PaperTrail report in the report editor.
+    Report,
     /// Open a folder as a Workspace (a filesystem tree of collections /
     /// environments / reports), rather than a single file.
     Workspace,
+    /// A `.json` file exported from Postman. The same load as a collection or
+    /// an environment — which of the two it is is read off the file — but
+    /// asked for in the user's own terms: they have an export, not a
+    /// "collection in Postman's JSON dialect".
+    PostmanExport,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SaveKind {
     Collection,
+    /// Write the open report editor's `.trail` source to a chosen file.
+    Report,
     /// Save the Global Environment with this id to a `.vars` file.
     Environment(u64),
     Response,
     /// Export the open report editor's last run results (format by extension).
     ReportResults,
+    /// Save the open report editor's last run as a `.baseline` snapshot, for a
+    /// later run to diff against via `BASELINE(FILE(…))`.
+    ReportBaseline,
 }
 
 #[derive(Clone)]
@@ -97,11 +127,22 @@ pub enum RenameTarget {
     Tab { ci: usize },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `NewWorkspaceFolder` carries the folder the new one goes inside.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PromptKind {
     BaseUrl,
     NewEnvName,
     NewCollectionName,
+    /// Name for a new subfolder in a Workspace tab's tree, with the tab and the
+    /// folder it goes inside. Asked for in-app rather than through the
+    /// platform's dialog, as the file kinds are: a save dialog is built around
+    /// choosing a *file* name, and the folder pickers offer existing folders,
+    /// so neither asks the question "what should this new folder be called?"
+    /// as directly as a text box does.
+    NewWorkspaceFolder {
+        ci: usize,
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Editable-code-view state for the request editor's Code section. Holds the
@@ -130,6 +171,12 @@ pub struct GuiApp {
     /// Display-only: the Copy button always yields the full body.
     pub response_compact: bool,
     pub dialog: Option<Dialog>,
+    /// A native file/folder dialog currently open on a worker thread, with the
+    /// note of what to do once it answers. See [`super::filepick`] for why a
+    /// picker can't simply be called and awaited: doing so froze the window for
+    /// as long as the dialog was up, and stalled every other per-frame poll
+    /// with it.
+    pub pending_pick: Option<super::filepick::PendingPick<super::menu::PickAction>>,
     /// Recomputed each frame from the active theme spec.
     pub theme: GuiTheme,
     /// Recomputed each frame from the active language.
@@ -144,14 +191,28 @@ pub struct GuiApp {
     /// row that was clicked is nowhere near the panel that ends up holding it.
     /// Cleared once the panel has had its chance to honour it.
     pub reveal_env: Option<u64>,
+    /// Filter text for the Environments panel's search box (a case-insensitive
+    /// substring of the environment name). Runtime-only, like the terminal
+    /// UI's — a filter is a way of finding something now, not a setting.
+    pub env_query: String,
     /// Report row selected in the reports panel, if the reports view is open.
     pub show_reports: bool,
     /// The open PaperTrail report editor (Scratch-style blocks + source view),
     /// if any. Opened from the reports list or a Workspace tree `.trail` file;
     /// takes over the centre pane while present. See [`report_editor`].
     pub report_editor: Option<report_editor::ReportEditor>,
+    /// Report runs that currently have no editor on screen, by
+    /// [`RunKey`](super::report_run::RunKey).
+    ///
+    /// The editor is a view that gets dropped and rebuilt whenever the user
+    /// clicks a tab or opens another file; a run must survive that, both because
+    /// dropping its handle cancels the worker and because the rows it has
+    /// already collected are the whole point of having run it.
+    pub report_runs:
+        std::collections::HashMap<super::report_run::RunKey, super::report_run::ParkedRun>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
+    pub postman: super::postman::PostmanUi,
     /// An in-flight Workspace redownload (see [`Dialog::WorkspaceReload`]):
     /// the tab it will rebind, the file that was selected before (relative to
     /// the old, dead root) and the worker's result channel.
@@ -168,6 +229,8 @@ pub struct GuiApp {
     /// request edits, so the close request that follows isn't intercepted a
     /// second time (which would make the window impossible to close).
     pub(super) allow_close: bool,
+    /// Keyboard access to the top-level menus (Alt, then the mnemonic letter).
+    pub(super) alt_menus: super::menu::AltMenus,
 }
 
 /// The raw PNG bytes of the application logo, embedded at compile time so the
@@ -203,8 +266,15 @@ impl GuiApp {
         // Register the Phosphor icon font so the tree/button icons render (see
         // `gui::icons`). egui's bundled fonts don't cover them, so without this
         // every icon shows as an empty "tofu" box.
+        //
+        // Light rather than Regular: icons repeat down the tree and across every
+        // toolbar, so their stroke weight sets how busy the chrome looks. At
+        // Regular they compete with the labels they sit beside — the eye lands
+        // on the icon first even though the *name* is what the user is looking
+        // for. Light keeps them legible while letting the text lead. Every
+        // variant shares the same codepoints, so `gui::icons` needs no change.
         let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
         cc.egui_ctx.set_fonts(fonts);
 
         // Larger default text so the client reads comfortably as a desktop app.
@@ -227,18 +297,23 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            env_query: String::new(),
             dialog: None,
+            pending_pick: None,
             theme,
             strings,
             show_hurl: session_view_is_hurl,
             code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,
+            report_runs: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
+            postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
             logo: None,
             layout_dirty: false,
             allow_close: false,
+            alt_menus: Default::default(),
         };
         app.restore_view();
         app.restore_workspace_selection();
@@ -259,18 +334,23 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            env_query: String::new(),
             dialog: None,
+            pending_pick: None,
             theme,
             strings,
             show_hurl: false,
             code_edit: CodeEdit::default(),
             show_reports: false,
             report_editor: None,
+            report_runs: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
+            postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
             logo: None,
             layout_dirty: false,
             allow_close: false,
+            alt_menus: Default::default(),
         }
     }
 
@@ -285,35 +365,77 @@ impl GuiApp {
     /// closes that gap; the path was already checked to still exist when the
     /// state was loaded.
     fn restore_workspace_selection(&mut self) {
-        let ci = self.active_ci();
-        let Some(selected) = self
-            .session
-            .collections
-            .get(ci)
-            .filter(|c| c.workspace_root.is_some())
-            .and_then(|c| c.workspace_selected.clone())
-        else {
+        let Some(selected) = self.workspace_selection() else {
             return;
         };
         if crate::workspace::is_report_file(&selected) {
-            // A report *tab* being restored by `restore_view` outranks this:
-            // that is what the centre column was actually showing.
-            if self.report_editor.is_some() {
-                return;
-            }
-            match crate::report::Report::load_local(&selected) {
-                Ok(report) => {
-                    self.open_report_editor(ReportOrigin::Workspace, report);
-                    self.show_reports = false;
-                    self.focus = Focus::Main;
-                }
-                // A report that has since become unreadable is not worth
-                // interrupting the launch over — the tree still shows it.
-                Err(_) => {}
-            }
+            self.reopen_workspace_report(&selected);
         } else if crate::workspace::is_env_file(&selected) {
             self.session.open_workspace_environment(&selected);
         }
+    }
+
+    /// The path the active tab's tree has selected, if it is a Workspace tab.
+    fn workspace_selection(&self) -> Option<std::path::PathBuf> {
+        self.session
+            .collections
+            .get(self.active_ci())
+            .filter(|c| c.workspace_root.is_some())
+            .and_then(|c| c.workspace_selected.clone())
+    }
+
+    /// Open the Workspace-tree report at `path` in the centre column.
+    fn reopen_workspace_report(&mut self, path: &std::path::Path) {
+        // A report *tab* being restored by `restore_view` outranks this: that
+        // is what the centre column was actually showing.
+        if self.report_editor.is_some() {
+            return;
+        }
+        match crate::report::Report::load_local(path) {
+            Ok(report) => {
+                self.open_report_editor(ReportOrigin::Workspace, report);
+                self.show_reports = false;
+                self.focus = Focus::Main;
+            }
+            // A report that has since become unreadable is not worth
+            // interrupting the launch over — the tree still shows it.
+            Err(_) => {}
+        }
+    }
+
+    /// Switch to tab `idx`, leaving the tab being left as it was found and
+    /// putting the one arrived at back the way it was.
+    ///
+    /// A report opened from a Workspace tree belongs to that tab, so it is
+    /// closed on the way out (a standalone session report is the centre
+    /// column's own and stays). Coming *back* then has to reopen it, or leaving
+    /// a tab for a moment silently swapped the report you were editing for
+    /// whichever collection the tree happened to load last — which is what the
+    /// tab-switching path did before: it closed the editor and never reopened
+    /// one. The tree already records what was selected (`workspace_selected`),
+    /// the same field a restart restores from, so a tab switch is just a
+    /// restore of the tab being arrived at.
+    pub fn switch_to_tab(&mut self, idx: usize) {
+        self.session.activate_tab(idx);
+        if self
+            .report_editor
+            .as_ref()
+            .is_some_and(|e| e.is_workspace())
+        {
+            self.close_report_editor();
+        }
+        // Only the *report* half of the tab's selection is restored here, not
+        // the environment half: `open_workspace_environment` loads a fresh copy
+        // every time it is called, so replaying it on each tab switch would
+        // pile up "staging (2)", "staging (3)" globals. At launch there is
+        // nothing loaded yet, so restoring both is right there and only there.
+        if let Some(selected) = self.workspace_selection()
+            && crate::workspace::is_report_file(&selected)
+        {
+            self.reopen_workspace_report(&selected);
+        }
+        self.focus = Focus::Tabs;
+        self.session.save();
     }
 
     /// Reopen the centre column on whatever it was showing last time.
@@ -342,6 +464,45 @@ impl GuiApp {
         }
     }
 
+    /// Close the report editor, keeping its run alive.
+    ///
+    /// Every path that takes the editor off screen goes through here rather
+    /// than assigning `None`, because assigning `None` drops the
+    /// [`RunHandle`](super::report_run::RunHandle) — which cancels the worker
+    /// and throws away the rows it had already collected.
+    pub fn close_report_editor(&mut self) {
+        let Some(mut ed) = self.report_editor.take() else {
+            return;
+        };
+        let key = ed.run_key();
+        let parked = ed.park_run();
+        if parked.is_worth_keeping() {
+            self.report_runs.insert(key, parked);
+        } else {
+            self.report_runs.remove(&key);
+        }
+    }
+
+    /// Keep every parked run moving, and repaint while any is still going.
+    ///
+    /// A run that nobody is looking at still has to fold its streamed rows into
+    /// its grid, so that coming back to it shows where it actually got to
+    /// rather than where it was when you left.
+    fn poll_parked_runs(&mut self, ctx: &egui::Context) {
+        // The run being shown is polled by the editor itself.
+        let showing = self.report_editor.as_ref().map(|e| e.run_key());
+        let mut live = false;
+        for (key, parked) in self.report_runs.iter_mut() {
+            if Some(key) == showing.as_ref() {
+                continue;
+            }
+            live |= parked.pump();
+        }
+        if live {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+
     /// Open `report` in the block editor, restoring the panel sizes the user
     /// last dragged it to.
     ///
@@ -356,6 +517,17 @@ impl GuiApp {
         }
         if let Some(w) = self.session.gui.report_palette_width {
             ed.palette_w = w;
+        }
+        if let Some(h) = self.session.gui.report_detail_height {
+            ed.detail_h = h;
+        }
+        if let Some(h) = self.session.gui.report_summary_height {
+            ed.summary_h = h;
+        }
+        // Whatever was open keeps its run, and this report takes back its own.
+        self.close_report_editor();
+        if let Some(parked) = self.report_runs.remove(&ed.run_key()) {
+            ed.adopt_run(parked);
         }
         self.report_editor = Some(ed);
     }
@@ -436,6 +608,16 @@ impl GuiApp {
                 &mut dirty,
                 &mut self.session.gui.report_palette_width,
                 ed.palette_w,
+            );
+            Self::record_size(
+                &mut dirty,
+                &mut self.session.gui.report_detail_height,
+                ed.detail_h,
+            );
+            Self::record_size(
+                &mut dirty,
+                &mut self.session.gui.report_summary_height,
+                ed.summary_h,
             );
         }
 
@@ -598,8 +780,16 @@ impl GuiApp {
         resp.inner
     }
 
+    /// Whether a dialog is up. Every one of them covers the app with a sheet
+    /// that swallows clicks, so the keyboard has to stand down to match —
+    /// otherwise Ctrl+S while a git wizard is open saves whatever happens to be
+    /// behind it, which is not what the person typing meant.
+    pub fn dialog_is_open(&self) -> bool {
+        self.dialog.is_some() || self.remote.is_open() || self.postman.is_open()
+    }
+
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() {
+        if self.dialog_is_open() {
             return; // let the modal own the keyboard
         }
         // Tab / Shift+Tab cycle the focused *panel*, exactly like the terminal
@@ -640,6 +830,17 @@ impl GuiApp {
         });
         if send {
             self.run_active();
+        }
+        // Ctrl+S saves whatever is in front of the user, by exactly the code
+        // the File > Save entry runs -- the shortcut and the menu item must not
+        // be able to disagree about what "save" means.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
+            super::menu::save_active(self);
+        }
+        // Ctrl+Shift+S is Save As: the same target, but always asking where.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::S)) {
+            let kind = super::menu::active_save_kind(self);
+            super::menu::save_via_picker(self, kind);
         }
         // Ctrl+W closes the active tab.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {
@@ -696,18 +897,7 @@ impl GuiApp {
                 }
                 let resp = super::widgets::selectable(ui, selected, text);
                 if resp.clicked() {
-                    self.session.activate_tab(i);
-                    self.focus = Focus::Tabs;
-                    // Close a Workspace-opened report editor when leaving its
-                    // tab; a standalone (session) report stays open.
-                    if self
-                        .report_editor
-                        .as_ref()
-                        .is_some_and(|e| e.is_workspace())
-                    {
-                        self.report_editor = None;
-                    }
-                    self.session.save();
+                    self.switch_to_tab(i);
                 }
                 // Middle-click closes a tab (not the built-in Request tab).
                 if i != 0 && resp.middle_clicked() {
@@ -770,6 +960,25 @@ impl GuiApp {
                 .map(|s| s.text(&self.strings))
                 .unwrap_or_default();
             ui.colored_label(self.theme.dim, msg);
+            // An import that was sent to the background reports from here, and
+            // clicking it is the way back to the dialog. Computed before the
+            // click so `self.postman` isn't borrowed twice.
+            if let Some(line) = self.postman.background_line(&self.strings) {
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} {line}", super::icons::RUNNING))
+                                .color(self.theme.accent),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(self.strings.postman_background_reveal)
+                    .clicked()
+                {
+                    self.postman.reveal();
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let spec = self.session.active_theme_spec();
                 ui.colored_label(
@@ -796,6 +1005,29 @@ impl GuiApp {
                 ui.colored_label(self.theme.dim, self.strings.gui_env_label);
             });
         });
+    }
+}
+
+impl GuiApp {
+    /// Open a native file dialog on a worker thread, to be collected by
+    /// [`super::menu::poll_pending_pick`] once it answers.
+    ///
+    /// Ignored when a dialog is already open. Before the pickers were moved off
+    /// the frame loop this couldn't arise -- a blocked window accepts no
+    /// further clicks -- but a live window will happily let the user press
+    /// Browse twice, and two native choosers fighting over one destination
+    /// field is worse than the second click doing nothing.
+    pub fn request_pick(
+        &mut self,
+        kind: super::filepick::PickKind,
+        title: &str,
+        dir: Option<&std::path::Path>,
+        action: super::menu::PickAction,
+    ) {
+        if self.pending_pick.is_some() {
+            return;
+        }
+        self.pending_pick = Some(super::filepick::spawn(kind, title, dir, action));
     }
 }
 
@@ -833,6 +1065,8 @@ impl GuiApp {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
 
+        super::menu::poll_pending_pick(self);
+        self.poll_parked_runs(&ctx);
         self.handle_global_keys(&ctx);
         self.intercept_close(&ctx);
 
@@ -953,6 +1187,7 @@ impl GuiApp {
 
         menu::show_dialog(self, &ctx);
         remote::show(self, &ctx);
+        postman::show(self, &ctx);
         self.poll_workspace_redownload();
         self.poll_workspace_reload_prompts();
         if self.workspace_redownload.is_some() {
@@ -975,11 +1210,14 @@ impl GuiApp {
         if !ctx.input(|i| i.viewport().close_requested()) || self.allow_close {
             return;
         }
+        // Only what a quit would actually destroy: a plain tab's edits are
+        // saved with the session and are still there (still flagged) next start,
+        // so warning about them cried wolf every single time.
         let count: usize = self
             .session
             .collections
             .iter()
-            .map(|c| c.unsaved_edit_count())
+            .map(|c| c.edits_lost_on_exit())
             .sum();
         if count == 0 {
             return;
@@ -992,12 +1230,35 @@ impl GuiApp {
                 .session
                 .collections
                 .iter()
-                .filter(|c| c.has_any_unsaved_edits())
+                .filter(|c| c.edits_lost_on_exit() > 0)
                 .map(|c| c.name.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
             self.dialog = Some(Dialog::UnsavedQuit { count, tabs });
         }
+    }
+
+    /// Write out every edit that quitting would otherwise destroy, and report
+    /// how many files were written. Backs "Save all changes" on the quit
+    /// dialog.
+    ///
+    /// The set of files is [`Collection::edits_lost_on_exit`]'s, not
+    /// [`Collection::unsaved_edit_count`]'s: an ordinary tab's edits survive a
+    /// quit inside the session state, so writing them out to a `.hurl` on the
+    /// way past would be making a decision -- where the file goes, and that the
+    /// edit is finished -- that the user never asked this button to make.
+    ///
+    /// A failure stops at the offending file rather than pressing on, so the
+    /// caller can name it. Files already written stay written and are no longer
+    /// flagged, so answering the dialog again retries only what is left.
+    pub(super) fn save_all_unsaved_edits(&mut self) -> Result<usize, String> {
+        let mut written = 0usize;
+        for c in &mut self.session.collections {
+            written += c.save_workspace_edits()?;
+        }
+        self.session.save();
+        self.session.status = Some(crate::i18n::Status::SavedFiles(written));
+        Ok(written)
     }
 }
 
@@ -1056,6 +1317,66 @@ mod tests {
         e.url = "https://example.com".into();
         e.modified = true;
         crate::collection::Collection::new(name.to_string(), vec![e])
+    }
+
+    /// The same, but bound to a Workspace folder — the one kind of tab whose
+    /// edits a quit really does destroy, since its entries are re-read from
+    /// disk on restore rather than restored from the session state.
+    fn edited_workspace_collection(name: &str) -> crate::collection::Collection {
+        let mut c = edited_collection(name);
+        c.workspace_root = Some(std::path::PathBuf::from("/tmp/paperboy-test-ws"));
+        c
+    }
+
+    /// "Save all changes" has to leave nothing behind for the dialog to object
+    /// to a second time -- otherwise the button would appear to do nothing.
+    #[test]
+    fn saving_all_changes_writes_the_workspace_file_and_clears_the_quit_warning() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_gui_save_all_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("health.hurl");
+        std::fs::write(&file, "GET https://example.com/health\n").unwrap();
+
+        // save_all_unsaved_edits() persists the session, which would otherwise
+        // land on the developer's own state.json.
+        super::requests::tests::redirect_saved_state();
+
+        let mut session = Session::default();
+        session.collections.clear();
+        let mut col = edited_workspace_collection("ws");
+        col.workspace_root = Some(dir.clone());
+        col.path = Some(file.clone());
+        col.entries[0].url = "https://example.com/health/v2".into();
+        session.collections.push(col);
+        let mut app = GuiApp::for_test(session);
+
+        assert_eq!(
+            app.session.collections[0].edits_lost_on_exit(),
+            1,
+            "the fixture starts with exactly the edit the dialog would warn about"
+        );
+
+        let written = app
+            .save_all_unsaved_edits()
+            .expect("the temporary file is writable");
+        assert_eq!(written, 1, "the one edited file was written");
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            on_disk.contains("https://example.com/health/v2"),
+            "the edit reached the file rather than just being marked saved: {on_disk}"
+        );
+        assert_eq!(
+            app.session.collections[0].edits_lost_on_exit(),
+            0,
+            "so a second close request would go straight through"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Closing a tab that is holding edits with nowhere on disk to go asks
@@ -1124,7 +1445,9 @@ mod tests {
 
         let mut session = Session::default();
         session.collections.clear();
-        session.collections.push(edited_collection("dirty"));
+        session
+            .collections
+            .push(edited_workspace_collection("dirty"));
         let mut app = GuiApp::for_test(session);
 
         let ctx = egui::Context::default();
@@ -1170,5 +1493,214 @@ mod tests {
             "a clean session must never have its quit interrupted"
         );
         assert!(app.dialog.is_none());
+    }
+}
+
+#[cfg(test)]
+mod report_run_persistence_tests {
+    use super::*;
+    use crate::gui::report_editor::ReportOrigin;
+    use crate::gui::report_run::{RunKey, RunUpdate};
+    use crate::report::Report;
+    use crate::report::model::{ReportResult, ReportRow};
+    use crate::session::Session;
+
+    fn app() -> GuiApp {
+        GuiApp::for_test(Session::default())
+    }
+
+    fn report(name: &str) -> Report {
+        let mut r = Report::scratch(name);
+        r.path = Some(std::path::PathBuf::from(format!("/tmp/{name}.trail")));
+        r
+    }
+
+    fn result_with(cell: &str) -> ReportResult {
+        let mut res = ReportResult::default();
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), cell.to_string());
+        res.rows.push(row);
+        res
+    }
+
+    /// Clicking a tab used to close a Workspace report editor, and closing it
+    /// dropped the `RunHandle` — which cancels the worker. A report you left for
+    /// a moment came back cancelled and empty. The run has to outlive the view.
+    #[test]
+    fn closing_the_editor_neither_cancels_the_run_nor_loses_the_rows() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        let ed = app.report_editor.as_mut().expect("editor is open");
+        ed.result = Some(result_with("first"));
+        ed.run = Some(handle);
+
+        app.close_report_editor();
+        assert!(app.report_editor.is_none(), "the view is gone");
+
+        let parked = app
+            .report_runs
+            .get(&RunKey::Path("/tmp/nightly.trail".into()))
+            .expect("but the run was kept");
+        assert!(
+            !parked.run.as_ref().expect("still holding it").cancelled(),
+            "the worker keeps going: dropping the handle is what cancels it"
+        );
+        assert_eq!(parked.result.as_ref().expect("rows kept").rows.len(), 1);
+    }
+
+    /// A Workspace tab's report is the tab's, so leaving the tab and coming
+    /// back has to land on it again. It used to be closed on the way out and
+    /// never reopened, so the tab came back showing whichever collection the
+    /// tree had loaded — a report you glanced away from was silently swapped
+    /// for something else.
+    #[test]
+    fn a_workspace_tab_comes_back_to_the_report_it_was_on() {
+        super::super::requests::tests::redirect_saved_state();
+        let dir = std::env::temp_dir().join(format!("pb-tab-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trail = dir.join("nightly.trail");
+        std::fs::write(&trail, "REPORT REQUEST login AS Login\n").unwrap();
+
+        let mut session = Session::default();
+        let mut col = crate::collection::Collection::new("ws".to_string(), Vec::new());
+        col.workspace_root = Some(dir.clone());
+        col.workspace_selected = Some(trail.clone());
+        session.collections.push(col);
+        let ws = session.collections.len() - 1;
+
+        let mut app = GuiApp::for_test(session);
+        app.switch_to_tab(ws);
+        assert!(
+            app.report_editor.is_some(),
+            "arriving at the tab opens what its tree had selected"
+        );
+
+        app.switch_to_tab(0);
+        assert!(
+            app.report_editor.is_none(),
+            "leaving it closes the editor, since the report belongs to that tab"
+        );
+
+        app.switch_to_tab(ws);
+        let ed = app
+            .report_editor
+            .as_ref()
+            .expect("and coming back reopens it");
+        assert_eq!(
+            ed.path(),
+            Some(trail.as_path()),
+            "the same report, not another file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and coming back to the report picks it up where it got to, rather than
+    /// showing an empty grid.
+    #[test]
+    fn reopening_a_report_takes_its_run_back() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let (handle, tx) = crate::gui::report_run::test_handle();
+        let ed = app.report_editor.as_mut().expect("editor is open");
+        ed.result = Some(result_with("first"));
+        ed.run = Some(handle);
+        app.close_report_editor();
+
+        // A row arrives while nobody is looking, and the parked run folds it in.
+        let mut row = ReportRow::default();
+        row.cells.insert("A".to_string(), "second".to_string());
+        tx.send(RunUpdate::Row(Box::new(row)))
+            .expect("worker sends");
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.poll_parked_runs(ui.ctx())
+        });
+
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let ed = app.report_editor.as_ref().expect("editor is back");
+        assert!(ed.run.is_some(), "still streaming");
+        assert!(ed.result.is_some(), "and showing what it collected");
+        assert!(
+            !app.report_runs
+                .contains_key(&RunKey::Path("/tmp/nightly.trail".into())),
+            "the run is held in one place at a time, not two"
+        );
+    }
+
+    /// A report is loaded afresh from disk each time it is opened from a
+    /// Workspace tree, so its `id` differs on the way back in — the run has to
+    /// be filed under something that survives, which is the path.
+    #[test]
+    fn a_reloaded_report_is_recognised_as_the_same_one() {
+        let a = report("nightly");
+        let b = report("nightly");
+        assert_ne!(a.id, b.id, "a fresh load really does mint a new id");
+        assert_eq!(RunKey::of(&a), RunKey::of(&b), "but it is the same report");
+
+        // An unsaved scratch report has no path to be known by, so it falls back
+        // to the id it keeps for as long as the session holds it.
+        let scratch = Report::scratch("untitled");
+        assert_eq!(RunKey::of(&scratch), RunKey::Id(scratch.id));
+    }
+
+    /// Opening a *different* report parks the first one's run rather than
+    /// cancelling it, so two reports can be in flight at once.
+    #[test]
+    fn opening_another_report_leaves_the_first_one_running() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("first"));
+        let (handle, _tx) = crate::gui::report_run::test_handle();
+        app.report_editor.as_mut().unwrap().run = Some(handle);
+
+        app.open_report_editor(ReportOrigin::Workspace, report("second"));
+        let parked = app
+            .report_runs
+            .get(&RunKey::Path("/tmp/first.trail".into()))
+            .expect("the first run was parked");
+        assert!(!parked.run.as_ref().unwrap().cancelled());
+    }
+
+    /// An editor with nothing to keep leaves nothing behind — the parking area
+    /// is for runs, not for every report ever opened.
+    #[test]
+    fn closing_an_editor_that_never_ran_parks_nothing() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("idle"));
+        app.close_report_editor();
+        assert!(app.report_runs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pick_guard_tests {
+    use super::*;
+
+    /// A live window lets the user press Browse again while the first chooser
+    /// is still up; the second press must not open a rival dialog.
+    #[test]
+    fn a_second_request_is_ignored_while_one_is_open() {
+        let mut app = GuiApp::for_test(crate::session::Session::default());
+        app.request_pick(
+            super::super::filepick::PickKind::Folder,
+            "first",
+            None,
+            super::super::menu::PickAction::GitWorkspaceDir,
+        );
+        assert!(app.pending_pick.is_some());
+        app.request_pick(
+            super::super::filepick::PickKind::Folder,
+            "second",
+            None,
+            super::super::menu::PickAction::PostmanDest,
+        );
+        // Still the first: the guard refuses rather than replacing, so the
+        // dialog the user is looking at is the one that will be honoured.
+        assert!(matches!(
+            app.pending_pick.as_ref().and_then(|p| p.action()),
+            Some(super::super::menu::PickAction::GitWorkspaceDir)
+        ));
     }
 }

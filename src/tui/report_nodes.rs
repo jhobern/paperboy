@@ -21,15 +21,17 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::app::{MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, PromptKind, TuiApp};
+use super::app::{
+    FileAction, MouseHitTarget, MouseLayer, MouseScrollTarget, Overlay, PromptKind, TuiApp,
+};
 use super::draw::panel;
 use super::editor::Editor;
 use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
 use crate::report::flow::{
-    Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt,
-    RoleRef, WithItem,
+    Element, EnvClause, FlowNode, ImageSpec, ParallelSpec, Pattern, Producer, ReportStmt,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -39,9 +41,10 @@ use crate::report::model::StatKind;
 // one implementation. Re-export it under the historical names so this file's
 // TUI-specific rendering / key handling / overlays read unchanged.
 pub(crate) use crate::report::edit::{
-    InsertPos, NodeKind, NodeRow, RowKind, flatten, insert_node, insert_pos_after,
-    loop_producer_dir, loop_producer_dir_mut, move_node, node_at, node_at_mut, parse_one_node,
-    remove_node, replace_node, request_node,
+    ClauseForm, DetachWhich, HEADER_PLACEHOLDER, HeaderKind, InsertPos, NodeKind, NodeRow, RowKind,
+    detach_modifier, flatten_expanded, header_specs, header_unset, insert_node, insert_pos_after,
+    loop_producer_dir, loop_producer_dir_mut, move_node, node_at, node_at_mut, node_with_items,
+    parse_one_node, remove_node, replace_node, request_node,
 };
 
 /// The two-step insert/pick palette overlay ([`Overlay::ReportNodeMenu`]).
@@ -136,6 +139,10 @@ pub(crate) struct RequestForm {
     pub(crate) alias: String,
     /// The `SHOW(…)` field checklist.
     pub(crate) fields: Vec<ShowRow>,
+    /// Any `STATISTICS(…)` the `SHOW(…)` fields carried, kept so editing the
+    /// checklist can't silently delete a clause the form has no row for — the
+    /// same carry-through rule the `IMAGE`/`TRUTH` clauses get.
+    pub(crate) show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
@@ -164,7 +171,7 @@ impl RequestForm {
         report: bool,
         alias: Option<String>,
         response: Option<ResponseFmt>,
-        current_show: &[String],
+        current_show: &[ShowField],
         report_fields: &[String],
         with: Vec<WithItem>,
         hide: Vec<String>,
@@ -193,18 +200,23 @@ impl RequestForm {
         }
         // Preserve any unknown SHOW entry so applying can't drop it.
         for f in current_show {
-            push(f, &mut names);
+            push(f.name(), &mut names);
         }
         // A `HIDE` entry naming something no request offers is kept too, for
         // the same reason: applying must not drop what the user wrote.
         for f in &hide {
             push(f, &mut names);
         }
+        // No SHOW clause means "everything this request already emits" — which
+        // excludes the opt-in timing intrinsics, so they must start un-ticked or
+        // simply opening and applying the form would switch them on.
         let all = current_show.is_empty();
         let fields: Vec<ShowRow> = names
             .iter()
             .map(|name| {
-                let included = all || current_show.iter().any(|s| s == name);
+                let included = (all
+                    && !crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&name.as_str()))
+                    || current_show.iter().any(|s| s.name() == name);
                 ShowRow {
                     name: name.clone(),
                     included,
@@ -224,6 +236,12 @@ impl RequestForm {
             request,
             titles,
             report,
+            // Carried, never edited: the checklist has no row for a statistic.
+            show_stats: current_show
+                .iter()
+                .filter(|f| !f.stats.is_empty())
+                .map(|f| (f.field.clone(), f.stats.clone()))
+                .collect(),
             response,
             alias: alias.unwrap_or_default(),
             fields,
@@ -264,17 +282,24 @@ impl RequestForm {
         self.visible_rows().len().saturating_sub(1)
     }
 
-    /// The `SHOW(…)` field list for the ticked rows, in row order. When every
-    /// field is ticked it returns empty (⇒ no `SHOW` clause, the "emit all"
-    /// default), so leaving everything on removes any existing clause.
-    fn show(&self) -> Vec<String> {
-        if self.fields.iter().all(|r| r.included) {
+    /// The `SHOW(…)` field list for the ticked rows, in row order. When the
+    /// ticked set is exactly what the request emits with no clause — every
+    /// field except the opt-in timing intrinsics — it returns empty (⇒ no
+    /// `SHOW` clause), so leaving the form as it opened removes any existing
+    /// clause rather than freezing the current selection into one.
+    fn show(&self) -> Vec<ShowField> {
+        if self.fields.iter().all(|r| {
+            r.included != crate::report::run::OPT_IN_INTRINSIC_FIELDS.contains(&r.name.as_str())
+        }) {
             return Vec::new();
         }
         self.fields
             .iter()
             .filter(|r| r.included)
-            .map(|r| r.name.clone())
+            .map(|r| ShowField {
+                field: r.name.clone(),
+                stats: self.show_stats.get(&r.name).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -336,6 +361,9 @@ pub(crate) enum VarsRow {
     Alias,
     /// One `STATISTICS(…)` checkbox — likewise single-variable only.
     Stat(usize),
+    /// One row of the shared trailing-clause block ([`ClauseRow`]) — likewise
+    /// single-variable only, since the clauses attach to a column.
+    Clause(ClauseRow),
 }
 
 /// The `REPORT <var>` configure form ([`Overlay::ReportNodeVars`]): which
@@ -357,6 +385,8 @@ pub(crate) struct VarsForm {
     pub(crate) other: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     pub(crate) selected: usize,
 }
 
@@ -370,6 +400,9 @@ impl VarsForm {
         chosen: &[String],
         alias: Option<String>,
         stats: &[StatKind],
+        image: Option<ImageSpec>,
+        truth: Option<String>,
+        detail: bool,
         in_scope: Vec<String>,
     ) -> Self {
         let mut names = in_scope;
@@ -379,6 +412,7 @@ impl VarsForm {
             }
         }
         VarsForm {
+            clauses: ClauseForm::of(image, truth.as_deref(), detail),
             report_id,
             path,
             vars: names
@@ -421,6 +455,7 @@ impl VarsForm {
         if self.chosen().len() == 1 {
             rows.push(VarsRow::Alias);
             rows.extend((0..self.stats.len()).map(VarsRow::Stat));
+            rows.extend(clause_rows(&self.clauses).into_iter().map(VarsRow::Clause));
         }
         rows
     }
@@ -443,8 +478,18 @@ impl VarsForm {
             .collect();
         // A single variable with a name or statistics is the `VarAs` form;
         // anything else is the plain variable list.
-        if rest.is_empty() && (!alias.is_empty() || !stats.is_empty()) {
+        let image = self.clauses.image();
+        let truth = self.clauses.truth();
+        if rest.is_empty()
+            && (!alias.is_empty()
+                || !stats.is_empty()
+                || image.is_some()
+                || truth.is_some()
+                || self.clauses.detail)
+        {
             return Some(FlowNode::Report(ReportStmt::VarAs {
+                truth,
+                detail: self.clauses.detail,
                 var: first.clone(),
                 // `STATISTICS` needs a column to attach to, so an unnamed one
                 // falls back to the variable's own name.
@@ -454,6 +499,7 @@ impl VarsForm {
                     alias.to_string()
                 },
                 stats,
+                image,
             }));
         }
         Some(FlowNode::Report(ReportStmt::Vars(chosen)))
@@ -469,6 +515,8 @@ pub(crate) enum ComputedRow {
     Alias,
     /// One `STATISTICS(…)` checkbox.
     Stat(usize),
+    /// One row of the shared trailing-clause block ([`ClauseRow`]).
+    Clause(ClauseRow),
 }
 
 /// The `REPORT "<template>" AS <name>` configure form
@@ -485,6 +533,8 @@ pub(crate) struct ComputedForm {
     pub(crate) template: String,
     pub(crate) alias: String,
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     pub(crate) selected: usize,
 }
 
@@ -492,6 +542,11 @@ impl ComputedForm {
     pub(crate) fn visible_rows(&self) -> Vec<ComputedRow> {
         let mut rows = vec![ComputedRow::Template, ComputedRow::Alias];
         rows.extend((0..self.stats.len()).map(ComputedRow::Stat));
+        rows.extend(
+            clause_rows(&self.clauses)
+                .into_iter()
+                .map(ComputedRow::Clause),
+        );
         rows
     }
 
@@ -509,6 +564,8 @@ impl ComputedForm {
             return None;
         }
         Some(FlowNode::Report(ReportStmt::Computed {
+            truth: self.clauses.truth(),
+            detail: self.clauses.detail,
             template: template.to_string(),
             name: alias.to_string(),
             stats: self
@@ -517,6 +574,7 @@ impl ComputedForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
+            image: self.clauses.image(),
         }))
     }
 }
@@ -616,14 +674,117 @@ impl ListForm {
     }
 }
 
+/// One row of the trailing-clause block shared by every named-column form.
+///
+/// `TRUTH`, `IMAGE` and `DETAIL` attach identically to a `REPORT … AS`, a
+/// computed column and a `WITH` field, so all three forms embed this block
+/// rather than growing three near-identical sets of rows (and three chances to
+/// let one of them drift).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ClauseRow {
+    /// The `TRUTH "…"` template, editable inline. A plain text row rather than
+    /// a toggle: it is a value, usually a `{{ … }}` reference to a label the
+    /// loop bound, and blank means the column isn't scored.
+    Truth,
+    /// The `DETAIL` on/off toggle.
+    Detail,
+    /// The `IMAGE` on/off toggle. Like the `STATISTICS` toggle, the sizing rows
+    /// below only exist while it is on -- most columns are not pictures, and
+    /// three permanently-showing size rows would bury the two rows every column
+    /// actually needs.
+    Image,
+    /// `FIT`: size to the cell. Only shown while [`ClauseRow::Image`] is on.
+    Fit,
+    /// `HEIGHT`, typed as digits. Only shown while `IMAGE` is on and `FIT` off,
+    /// since `FIT` is what makes a fixed size meaningless.
+    Height,
+    /// `WIDTH`, likewise.
+    Width,
+}
+
+/// The clause rows to show for `c`, in order.
+pub(crate) fn clause_rows(c: &ClauseForm) -> Vec<ClauseRow> {
+    let mut rows = vec![ClauseRow::Truth, ClauseRow::Detail, ClauseRow::Image];
+    if c.image_on {
+        rows.push(ClauseRow::Fit);
+        if !c.fit {
+            rows.push(ClauseRow::Height);
+            rows.push(ClauseRow::Width);
+        }
+    }
+    rows
+}
+
+/// Apply `key` to the clause block. Returns whether the row consumed it, so a
+/// form can fall through to its own handling for a row this block doesn't own.
+pub(crate) fn clause_key(c: &mut ClauseForm, row: ClauseRow, key: KeyEvent) -> bool {
+    // Sizes take digits only: the clause holds pixels, and letting a stray
+    // letter in would silently drop the whole size when it failed to parse.
+    let digits = |field: &mut String, key: KeyEvent| match key.code {
+        KeyCode::Char(ch) if ch.is_ascii_digit() => {
+            field.push(ch);
+            true
+        }
+        KeyCode::Backspace => {
+            field.pop();
+            true
+        }
+        _ => false,
+    };
+    match row {
+        ClauseRow::Truth => match key.code {
+            KeyCode::Char(ch) => {
+                c.truth.push(ch);
+                true
+            }
+            KeyCode::Backspace => {
+                c.truth.pop();
+                true
+            }
+            _ => false,
+        },
+        ClauseRow::Detail => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.detail = !c.detail;
+                return true;
+            }
+            false
+        }
+        ClauseRow::Image => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.toggle_image();
+                return true;
+            }
+            false
+        }
+        ClauseRow::Fit => {
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                c.toggle_fit();
+                return true;
+            }
+            false
+        }
+        ClauseRow::Height => digits(&mut c.height, key),
+        ClauseRow::Width => digits(&mut c.width, key),
+    }
+}
+
 /// One row of the [`WithFieldForm`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WithFieldRow {
     /// The column name (`WITH name: …`), editable inline.
     Name,
     /// The Hurl query the column's value comes from, editable inline.
     Query,
-    /// One `STATISTICS(…)` checkbox (index into [`StatKind::CHOOSABLE`]).
+    /// One row of the shared trailing-clause block ([`ClauseRow`]).
+    Clause(ClauseRow),
+    /// The `STATISTICS(…)` on/off toggle. The individual statistic checkboxes
+    /// only exist while it is on: most columns want no summary at all, and a
+    /// permanently-showing list of six checkboxes buried the two rows that
+    /// every field actually needs.
+    Stats,
+    /// One `STATISTICS(…)` checkbox (index into [`StatKind::CHOOSABLE`]). Only
+    /// present while [`WithFieldRow::Stats`] is on.
     Stat(usize),
 }
 
@@ -646,6 +807,20 @@ pub(crate) struct WithFieldForm {
     /// `(stat, ticked)` over [`StatKind::CHOOSABLE`], in that order. None
     /// ticked ⇒ no `STATISTICS(…)` clause.
     pub(crate) stats: Vec<(StatKind, bool)>,
+    /// Whether the field carries a `STATISTICS(…)` clause at all — the state of
+    /// the [`WithFieldRow::Stats`] toggle, which is what reveals the individual
+    /// checkboxes. Held rather than derived from `stats` so that unticking the
+    /// last statistic doesn't collapse the list out from under the user; the
+    /// two are kept in step by the toggle (see the key handler).
+    pub(crate) stats_on: bool,
+    /// Where Enter/Esc return to: `true` when this form was opened as a
+    /// sub-form of the request form (so it hands back there), `false` when it
+    /// was opened straight from a `WITH` row of the node outline, where the
+    /// only sensible thing to return to is the outline itself. Getting this
+    /// wrong dumped the user into a request form they never asked for.
+    pub(crate) return_to_request: bool,
+    /// The `TRUTH`/`IMAGE`/`DETAIL` clause block, as edited.
+    pub(crate) clauses: ClauseForm,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -656,33 +831,85 @@ impl WithFieldForm {
         path: Vec<usize>,
         index: Option<usize>,
         existing: Option<&WithItem>,
+        return_to_request: bool,
     ) -> Self {
-        let (name, query, stats) = match existing {
-            Some(WithItem::Field { name, query, stats }) => {
-                (name.clone(), query.clone(), stats.clone())
-            }
+        let (name, query, stats, clauses) = match existing {
+            Some(WithItem::Field {
+                name,
+                query,
+                stats,
+                image,
+                truth,
+                detail,
+            }) => (
+                name.clone(),
+                query.clone(),
+                stats.clone(),
+                ClauseForm::of(*image, truth.as_deref(), *detail),
+            ),
             // A bare `WITH RESPONSE` isn't a named field, so editing it falls
             // through to a fresh one rather than silently rewriting it.
-            _ => (String::new(), String::new(), Vec::new()),
+            _ => (
+                String::new(),
+                String::new(),
+                Vec::new(),
+                ClauseForm::default(),
+            ),
         };
         WithFieldForm {
+            clauses,
             report_id,
             path,
             index,
             name,
             query,
+            stats_on: !stats.is_empty(),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
                 .collect(),
+            return_to_request,
             selected: 0,
         }
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<WithFieldRow> {
         let mut rows = vec![WithFieldRow::Name, WithFieldRow::Query];
-        rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
+        rows.extend(
+            clause_rows(&self.clauses)
+                .into_iter()
+                .map(WithFieldRow::Clause),
+        );
+        rows.push(WithFieldRow::Stats);
+        if self.stats_on {
+            rows.extend((0..self.stats.len()).map(WithFieldRow::Stat));
+        }
         rows
+    }
+
+    /// Flip the `STATISTICS(…)` clause on or off, keeping the checkboxes in
+    /// step with it: turning it on with nothing ticked seeds `COUNT` (the one
+    /// statistic that means something for a text column as well as a numeric
+    /// one, as elsewhere in the editors), and turning it off clears the ticks,
+    /// so a hidden list can never still be contributing a clause.
+    fn toggle_stats(&mut self) {
+        self.stats_on = !self.stats_on;
+        if self.stats_on {
+            if !self.stats.iter().any(|(_, on)| *on) {
+                let seed = self
+                    .stats
+                    .iter()
+                    .position(|(k, _)| *k == StatKind::Count)
+                    .unwrap_or(0);
+                if let Some((_, on)) = self.stats.get_mut(seed) {
+                    *on = true;
+                }
+            }
+        } else {
+            for (_, on) in &mut self.stats {
+                *on = false;
+            }
+        }
     }
 
     fn last_row(&self) -> usize {
@@ -705,6 +932,9 @@ impl WithFieldForm {
                 .filter(|(_, on)| *on)
                 .map(|(k, _)| *k)
                 .collect(),
+            image: self.clauses.image(),
+            detail: self.clauses.detail,
+            truth: self.clauses.truth(),
         })
     }
 }
@@ -763,6 +993,9 @@ pub(crate) struct EnvsForm {
     /// Seeded from the report directory plus any snapshot paths already in the
     /// clause, so an existing `FILE(…)` value is always in the cycle.
     pub(crate) snapshots: Vec<String>,
+    /// Any `STATISTICS(…)` the `BASELINE(…) SHOW(…)` fields carried — carried
+    /// through untouched, like [`RequestForm::show_stats`].
+    pub(crate) show_stats: std::collections::HashMap<String, Vec<StatKind>>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
     /// `PARALLEL(n)`'s max-concurrency as typed text, so the row can be left
@@ -845,10 +1078,15 @@ impl EnvsForm {
             .into_iter()
             .map(|(name, included)| ShowRow { name, included })
             .collect();
-        for name in &baseline_show_names {
-            if !baseline_show.iter().any(|r| &r.name == name) {
+        let show_stats: std::collections::HashMap<String, Vec<StatKind>> = baseline_show_names
+            .iter()
+            .filter(|f| !f.stats.is_empty())
+            .map(|f| (f.field.clone(), f.stats.clone()))
+            .collect();
+        for f in &baseline_show_names {
+            if !baseline_show.iter().any(|r| r.name == f.field) {
                 baseline_show.push(ShowRow {
-                    name: name.clone(),
+                    name: f.field.clone(),
                     included: true,
                 });
             }
@@ -857,6 +1095,7 @@ impl EnvsForm {
             report_id,
             path,
             var,
+            show_stats,
             compare,
             parallel: parallel.is_some(),
             degree: parallel
@@ -896,11 +1135,14 @@ impl EnvsForm {
     }
 
     /// The ticked `BASELINE(…) SHOW(…)` fields, in checklist order.
-    fn selected_baseline_show(&self) -> Vec<String> {
+    fn selected_baseline_show(&self) -> Vec<ShowField> {
         self.baseline_show
             .iter()
             .filter(|r| r.included)
-            .map(|r| r.name.clone())
+            .map(|r| ShowField {
+                field: r.name.clone(),
+                stats: self.show_stats.get(&r.name).cloned().unwrap_or_default(),
+            })
             .collect()
     }
 
@@ -1094,7 +1336,7 @@ pub(crate) struct FilesForm {
     pub(crate) folders: bool,
     /// A `FOLDERS` loop's `WITH role="glob"` clauses, preserved verbatim across
     /// an edit (the form doesn't expose them, but must not drop them).
-    pub(crate) roles: Vec<(String, String)>,
+    pub(crate) roles: Vec<RoleBinding>,
     /// Selected row: an index into [`Self::visible_rows`] (clamped on use).
     pub(crate) selected: usize,
 }
@@ -1113,7 +1355,7 @@ impl FilesForm {
         glob: Option<String>,
         parallel: Option<ParallelSpec>,
         folders: bool,
-        roles: Vec<(String, String)>,
+        roles: Vec<RoleBinding>,
     ) -> Self {
         let selected = if dir.trim().is_empty() { 1 } else { 0 };
         FilesForm {
@@ -1134,12 +1376,9 @@ impl FilesForm {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<FilesRow> {
-        let mut rows = vec![FilesRow::Var, FilesRow::Folder];
-        // `FOLDERS` has no `MATCH` clause in the grammar, so the row would be
-        // a field that can't be written.
-        if !self.folders {
-            rows.push(FilesRow::Match);
-        }
+        // Both producers take a `MATCH` glob: over file names for `FILES`, over
+        // folder names (recursing on `**`) for `FOLDERS`.
+        let mut rows = vec![FilesRow::Var, FilesRow::Folder, FilesRow::Match];
         rows.push(FilesRow::Parallel);
         if self.parallel {
             rows.push(FilesRow::Degree);
@@ -1159,6 +1398,7 @@ impl FilesForm {
         if self.folders {
             Producer::Folders {
                 dir: self.dir.clone(),
+                glob: self.glob_opt(),
                 roles: self.roles.clone(),
             }
         } else {
@@ -1217,8 +1457,12 @@ impl TuiApp {
             .resolve_bound_collection(&rt.report)
             .map(|ci| self.collections[ci].entries.as_slice())
             .unwrap_or(&[]);
-        let resolves = |name: &str| crate::report::run::resolve_title(entries, name).is_some();
-        Ok(flatten(&flow, &resolves))
+        let helpers = rt.helpers.as_slice();
+        let resolves =
+            |name: &str| crate::report::run::resolve_qualified(entries, helpers, name).is_some();
+        // Expanded: the TUI outline has no room for the GUI's per-field chips,
+        // so a `WITH` block's fields are rows of their own.
+        Ok(flatten_expanded(&flow, &resolves, true))
     }
 
     /// The bound collection's request titles (for the request picker), empty
@@ -1227,15 +1471,17 @@ impl TuiApp {
         let Some(idx) = self.report_index_by_id(report_id) else {
             return Vec::new();
         };
-        self.resolve_bound_collection(&self.reports[idx].report)
-            .map(|ci| {
-                self.collections[ci]
-                    .entries
-                    .iter()
-                    .map(|e| e.title.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let entries = self
+            .resolve_bound_collection(&self.reports[idx].report)
+            .map(|ci| self.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+        // Qualified, so a helper's request is offered in the form the source
+        // must contain — and so cycling can find the current value's position
+        // when a node already names one.
+        crate::report::context::request_choices(entries, &self.reports[idx].helpers)
+            .into_iter()
+            .map(|c| c.qualified)
+            .collect()
     }
 
     /// Handle a key in the structured node editor. Returns `true` when the key
@@ -1247,6 +1493,11 @@ impl TuiApp {
         let Ok(rows) = self.report_node_rows(idx) else {
             return false;
         };
+        // The cursor may be up in the settings section, which is indexed
+        // separately and answers to its own keys.
+        if let Some(sel) = self.reports[idx].node_setting {
+            return self.on_key_report_settings(key, idx, sel);
+        }
         let last = rows.len().saturating_sub(1);
         let sel = self.reports[idx].node_selected.min(last);
         self.reports[idx].node_selected = sel;
@@ -1264,14 +1515,40 @@ impl TuiApp {
             KeyCode::Char('K') => self.move_selected_node(idx, true),
             KeyCode::Char('J') => self.move_selected_node(idx, false),
             KeyCode::Up | KeyCode::Char('k') => {
-                self.reports[idx].node_selected = sel.saturating_sub(1);
+                if sel == 0 {
+                    // Off the top of the flow and into the settings above it,
+                    // landing on their last row so the two sections arrow
+                    // through as one list.
+                    let n = self.setting_row_count(idx);
+                    if n > 0 {
+                        self.reports[idx].node_setting = Some(n - 1);
+                    }
+                } else {
+                    self.reports[idx].node_selected = sel - 1;
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.reports[idx].node_selected = (sel + 1).min(last);
             }
-            KeyCode::Home => self.reports[idx].node_selected = 0,
+            KeyCode::Home => {
+                // Home is the top of the *pane*, which is the first setting.
+                self.reports[idx].node_selected = 0;
+                if self.setting_row_count(idx) > 0 {
+                    self.reports[idx].node_setting = Some(0);
+                }
+            }
             KeyCode::End => self.reports[idx].node_selected = last,
-            KeyCode::Char('a') | KeyCode::Insert => self.open_report_node_menu(idx),
+            KeyCode::Char('a') | KeyCode::Insert => {
+                // Inside a `WITH` block, "add" means another field of that
+                // block — asking for a flow node there would land it after the
+                // request, which is never what the cursor position implied.
+                match rows.get(sel).map(|r| (r.kind, r.path.clone())) {
+                    Some((k, path)) if k.is_with() => {
+                        self.open_with_field_editor(idx, &path, usize::MAX)
+                    }
+                    _ => self.open_report_node_menu(idx),
+                }
+            }
             // Enter opens the friendly, structured "configure this node" form
             // (its shape depends on the node kind — request options, a loop's
             // folder, …). `e` is the raw escape hatch that edits the node's
@@ -1410,6 +1687,17 @@ impl TuiApp {
             self.open_report_node_menu(idx);
             return;
         }
+        // A `WITH` row configures its own field. Its `END` has nothing to
+        // configure, and must not fall through to the request's form — that
+        // would make the block's last row silently edit the request instead.
+        if let Some(wi) = self.with_row_index(row) {
+            let path = row.path.clone();
+            self.open_with_field_editor(idx, &path, wi);
+            return;
+        }
+        if row.kind == RowKind::WithEnd {
+            return;
+        }
         let path = row.path.clone();
         // Try the request form, then the loop folder browser; fall back to the
         // raw line editor for kinds without a dedicated form yet.
@@ -1531,10 +1819,11 @@ impl TuiApp {
             return Vec::new();
         };
         let rt = &self.reports[idx];
-        let Some(ci) = self.resolve_bound_collection(&rt.report) else {
-            return Vec::new();
-        };
-        crate::report::run::resolve_title(&self.collections[ci].entries, name)
+        let entries = self
+            .resolve_bound_collection(&rt.report)
+            .map(|ci| self.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+        crate::report::run::resolve_qualified(entries, &rt.helpers, name)
             .map(|e| e.reports.iter().map(|(f, _)| f.clone()).collect())
             .unwrap_or_default()
     }
@@ -1572,11 +1861,25 @@ impl TuiApp {
         let Some((report_id, path, node)) = self.selected_node(idx) else {
             return false;
         };
-        let (chosen, alias, stats) = match &node {
-            FlowNode::Report(ReportStmt::Vars(vars)) => (vars.clone(), None, Vec::new()),
-            FlowNode::Report(ReportStmt::VarAs { var, name, stats }) => {
-                (vec![var.clone()], Some(name.clone()), stats.clone())
+        let (chosen, alias, stats, image, truth, detail) = match &node {
+            FlowNode::Report(ReportStmt::Vars(vars)) => {
+                (vars.clone(), None, Vec::new(), None, None, false)
             }
+            FlowNode::Report(ReportStmt::VarAs {
+                var,
+                name,
+                stats,
+                image,
+                truth,
+                detail,
+            }) => (
+                vec![var.clone()],
+                Some(name.clone()),
+                stats.clone(),
+                *image,
+                truth.clone(),
+                *detail,
+            ),
             _ => return false,
         };
         // The candidate list needs the bound collection to include the captures
@@ -1591,7 +1894,7 @@ impl TuiApp {
             Err(_) => Vec::new(),
         };
         self.overlay = Some(Overlay::ReportNodeVars(Box::new(VarsForm::build(
-            report_id, path, &chosen, alias, &stats, in_scope,
+            report_id, path, &chosen, alias, &stats, image, truth, detail, in_scope,
         ))));
         true
     }
@@ -1627,6 +1930,13 @@ impl TuiApp {
                 let rows = form.visible_rows();
                 let sel = form.selected.min(rows.len().saturating_sub(1));
                 match rows.get(sel).copied() {
+                    Some(VarsRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
+                        // Toggling IMAGE or FIT adds or removes rows below,
+                        // which can leave the selection past the end.
+                        form.selected = form.selected.min(form.last_row());
+                        keep(self, form);
+                    }
                     Some(VarsRow::Var(vi)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some(row) = form.vars.get_mut(vi)
@@ -1687,6 +1997,9 @@ impl TuiApp {
             template,
             name,
             stats,
+            image,
+            truth,
+            detail,
         }) = node
         else {
             return false;
@@ -1696,6 +2009,7 @@ impl TuiApp {
             path,
             template,
             alias: name,
+            clauses: ClauseForm::of(image, truth.as_deref(), detail),
             stats: StatKind::CHOOSABLE
                 .iter()
                 .map(|k| (*k, stats.contains(k)))
@@ -1741,6 +2055,11 @@ impl TuiApp {
                 let rows = form.visible_rows();
                 let sel = form.selected.min(rows.len().saturating_sub(1));
                 match rows.get(sel).copied() {
+                    Some(ComputedRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
+                        form.selected = form.selected.min(form.last_row());
+                        keep(self, form);
+                    }
                     Some(ComputedRow::Template) => {
                         match key.code {
                             KeyCode::Char(c) => form.template.push(c),
@@ -1972,9 +2291,10 @@ impl TuiApp {
     }
 
     /// Key handling for the `WITH` field form ([`Overlay::ReportNodeWithField`]).
-    /// ↑/↓ (or Tab) move; the Name/Query rows take typed text; stat rows toggle
-    /// with Space/`x`; Enter applies and reopens the request form; Esc cancels
-    /// back to it, so the sub-form always returns where it came from.
+    /// ↑/↓ (or Tab) move; the Name/Query rows take typed text; the statistics
+    /// toggle and the stat rows it reveals toggle with Space/`x`; Enter applies
+    /// and Esc cancels, both returning where the form was opened from — the
+    /// request form when it is a sub-form of one, the node outline otherwise.
     pub(crate) fn report_node_with_field_key_handler(
         &mut self,
         key: KeyEvent,
@@ -1994,13 +2314,23 @@ impl TuiApp {
                 keep(self, form);
             }
             KeyCode::Enter => {
-                let (report_id, path) = (form.report_id, form.path.clone());
-                self.apply_report_node_with_field(*form);
-                self.reopen_report_node_request(report_id, &path);
+                let (report_id, path, back) =
+                    (form.report_id, form.path.clone(), form.return_to_request);
+                let written = self.apply_report_node_with_field(*form);
+                self.close_report_node_with_field(report_id, &path, back);
+                // Applying replaces the whole request node, so the shared
+                // `select_node_path` puts the cursor on the request line. That
+                // was invisible while the form always handed back to the
+                // request form; now that it closes to the outline, the cursor
+                // has to stay on the field the user was editing.
+                if !back && let Some(wi) = written {
+                    self.select_with_row(report_id, &path, wi);
+                }
             }
             KeyCode::Esc => {
-                let (report_id, path) = (form.report_id, form.path.clone());
-                self.reopen_report_node_request(report_id, &path);
+                let (report_id, path, back) =
+                    (form.report_id, form.path.clone(), form.return_to_request);
+                self.close_report_node_with_field(report_id, &path, back);
             }
             _ => {
                 let rows = form.visible_rows();
@@ -2031,6 +2361,16 @@ impl TuiApp {
                         }
                         keep(self, form);
                     }
+                    Some(WithFieldRow::Clause(cr)) => {
+                        clause_key(&mut form.clauses, cr, key);
+                        keep(self, form);
+                    }
+                    Some(WithFieldRow::Stats) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x')) {
+                            form.toggle_stats();
+                        }
+                        keep(self, form);
+                    }
                     Some(WithFieldRow::Stat(si)) => {
                         if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
                             && let Some((_, on)) = form.stats.get_mut(si)
@@ -2049,16 +2389,13 @@ impl TuiApp {
     /// block — replacing the field at `index`, or appending when it is `None`.
     /// A blank name is a no-op (an unnamed column can't be serialized), which
     /// is also how "cancel by clearing the name" behaves.
-    pub(crate) fn apply_report_node_with_field(&mut self, form: WithFieldForm) {
-        let Some(idx) = self.report_index_by_id(form.report_id) else {
-            return;
-        };
-        let Some(item) = form.item() else {
-            return;
-        };
-        let Ok(flow) = self.reports[idx].report.flow() else {
-            return;
-        };
+    ///
+    /// Returns the `with` index it wrote, so the caller can leave the outline
+    /// cursor on the field the user just edited.
+    pub(crate) fn apply_report_node_with_field(&mut self, form: WithFieldForm) -> Option<usize> {
+        let idx = self.report_index_by_id(form.report_id)?;
+        let item = form.item()?;
+        let flow = self.reports[idx].report.flow().ok()?;
         let Some(FlowNode::Report(ReportStmt::Request {
             name,
             alias,
@@ -2068,13 +2405,19 @@ impl TuiApp {
             with,
         })) = node_at(&flow, &form.path)
         else {
-            return;
+            return None;
         };
         let mut with = with.clone();
-        match form.index {
-            Some(i) if i < with.len() => with[i] = item,
-            _ => with.push(item),
-        }
+        let written = match form.index {
+            Some(i) if i < with.len() => {
+                with[i] = item;
+                i
+            }
+            _ => {
+                with.push(item);
+                with.len() - 1
+            }
+        };
         let node = FlowNode::Report(ReportStmt::Request {
             name: name.clone(),
             alias: alias.clone(),
@@ -2084,6 +2427,21 @@ impl TuiApp {
             with,
         });
         self.apply_node_replace(idx, &form.path, node);
+        Some(written)
+    }
+
+    /// Dismiss the `WITH` field form, returning where it was opened from:
+    /// the request form when it was a sub-form of one, otherwise simply closing
+    /// to the node outline. Closing to the outline is the whole point of the
+    /// flag — opened from a `WITH` row (or its "add a field" row), the form
+    /// used to hand the user a request form they had never asked for and then
+    /// made them dismiss that too.
+    fn close_report_node_with_field(&mut self, report_id: u64, path: &[usize], to_request: bool) {
+        if to_request {
+            self.reopen_report_node_request(report_id, path);
+        } else {
+            self.overlay = None;
+        }
     }
 
     /// Reopen the request form for the node at `path` after a `WITH` sub-form
@@ -2255,16 +2613,17 @@ impl TuiApp {
                     Vec::new(),
                 ),
                 // `FOLDERS` shares the form: same variable, same folder picker,
-                // same PARALLEL rows — it just has no `MATCH` glob.
+                // same `MATCH` glob (which also drives its recursion) and the
+                // same PARALLEL rows.
                 Some(FlowNode::ForEach {
                     pattern,
-                    producer: Producer::Folders { dir, roles },
+                    producer: Producer::Folders { dir, glob, roles },
                     parallel,
                     ..
                 }) if pattern.is_single() => (
                     pattern.named().next().unwrap_or("FOLDER").to_string(),
                     dir.clone(),
-                    None,
+                    glob.clone(),
                     *parallel,
                     true,
                     roles.clone(),
@@ -2630,6 +2989,7 @@ impl TuiApp {
                                 form.path.clone(),
                                 Some(wi),
                                 existing.as_ref(),
+                                true,
                             );
                             // The parent form is applied first so the rows the
                             // user already changed aren't lost behind the
@@ -2648,8 +3008,13 @@ impl TuiApp {
                     },
                     Some(FormRow::AddWith) => {
                         if matches!(key.code, KeyCode::Char(' ')) {
-                            let sub =
-                                WithFieldForm::build(form.report_id, form.path.clone(), None, None);
+                            let sub = WithFieldForm::build(
+                                form.report_id,
+                                form.path.clone(),
+                                None,
+                                None,
+                                true,
+                            );
                             self.apply_report_node_request(*form);
                             self.overlay = Some(Overlay::ReportNodeWithField(Box::new(sub)));
                         } else {
@@ -2676,8 +3041,87 @@ impl TuiApp {
             self.open_report_node_menu(idx);
             return;
         }
+        // A `WITH` row addresses a field of the request at `row.path`, not a
+        // node, so it opens the field editor rather than the line prompt (there
+        // is no single-line source form for one field of a block).
+        if let Some(wi) = self.with_row_index(row) {
+            self.open_with_field_editor(idx, &row.path, wi);
+            return;
+        }
+        if row.kind == RowKind::WithEnd {
+            return;
+        }
         let path = row.path.clone();
         self.open_report_node_line_prompt(idx, &path);
+    }
+
+    /// The `WITH` field index a row edits: the field itself, or a fresh one for
+    /// the block's add row. `None` for anything that isn't an editable `WITH`
+    /// row (a comment inside the block, the block's `END`, or a plain flow
+    /// row).
+    fn with_row_index(&self, row: &NodeRow) -> Option<usize> {
+        match row.kind {
+            RowKind::WithField(i) => Some(i),
+            RowKind::WithAdd => Some(usize::MAX),
+            _ => None,
+        }
+    }
+
+    /// Open the `WITH` field editor for field `wi` of the request at `path`.
+    /// `usize::MAX` means "a new field", which is how the add row and `a` ask
+    /// for one.
+    fn open_with_field_editor(&mut self, idx: usize, path: &[usize], wi: usize) {
+        let report_id = self.reports[idx].report.id;
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let existing = node_at(&flow, path)
+            .and_then(node_with_items)
+            .and_then(|w| w.get(wi))
+            .cloned();
+        let form = WithFieldForm::build(
+            report_id,
+            path.to_vec(),
+            existing.is_some().then_some(wi),
+            existing.as_ref(),
+            false,
+        );
+        self.overlay = Some(Overlay::ReportNodeWithField(Box::new(form)));
+    }
+
+    /// Swap the `WITH` field at `wi` with its neighbour, reordering the report
+    /// column it defines.
+    fn move_with_field(&mut self, idx: usize, path: &[usize], wi: usize, up: bool) {
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            let Some(FlowNode::Report(ReportStmt::Request { with, .. })) =
+                node_at_mut(&mut flow, path)
+            else {
+                return;
+            };
+            let other = if up {
+                match wi.checked_sub(1) {
+                    Some(o) => o,
+                    None => return, // already first
+                }
+            } else if wi + 1 < with.len() {
+                wi + 1
+            } else {
+                return; // already last
+            };
+            with.swap(wi, other);
+            let text = flow.to_text();
+            rt.set_text_undoable(text);
+            // Follow the field: the cursor is on a row number, and the field
+            // just moved one row against the direction of travel.
+            let sel = rt.node_selected;
+            rt.node_selected = if up { sel.saturating_sub(1) } else { sel + 1 };
+        }
+        self.revalidate_report(idx);
+        self.save_state();
     }
 
     /// Open the single-line "edit as source" prompt for the node at `path`.
@@ -2840,6 +3284,37 @@ impl TuiApp {
         if row.kind == RowKind::Begin {
             return; // the root can't be deleted
         }
+        // Deleting on a `WITH` row removes that one field, not the request that
+        // owns it — they share a path, so this branch is what keeps Delete from
+        // taking the whole block with it.
+        if let Some(wi) = row.kind.with_item() {
+            let path = row.path.clone();
+            {
+                let rt = &mut self.reports[idx];
+                let Ok(mut flow) = rt.report.flow() else {
+                    return;
+                };
+                // Bounds are checked here rather than from the return value:
+                // `detach_modifier`'s bool answers "would this leave a statement
+                // that stands on its own", not "did anything change", and for a
+                // WITH field it is always false.
+                if node_at(&flow, &path)
+                    .and_then(node_with_items)
+                    .is_none_or(|w| wi >= w.len())
+                {
+                    return;
+                }
+                detach_modifier(&mut flow, &path, DetachWhich::With(wi));
+                let text = flow.to_text();
+                rt.set_text_undoable(text);
+            }
+            self.revalidate_report(idx);
+            self.save_state();
+            return;
+        }
+        if row.kind.is_with() {
+            return; // the add row and the block's END aren't deletable
+        }
         let path = row.path.clone();
         {
             let rt = &mut self.reports[idx];
@@ -2866,6 +3341,15 @@ impl TuiApp {
             .min(rows.len().saturating_sub(1));
         let Some(row) = rows.get(sel) else { return };
         if row.kind == RowKind::Begin {
+            return;
+        }
+        // Reordering a `WITH` field reorders a report column, so it stays within
+        // its own block rather than moving the request among its siblings.
+        if let Some(wi) = row.kind.with_item() {
+            self.move_with_field(idx, &row.path.clone(), wi, up);
+            return;
+        }
+        if row.kind.is_with() {
             return;
         }
         let path = row.path.clone();
@@ -2934,13 +3418,31 @@ impl TuiApp {
 
     /// Move the node-view selection onto the row addressing `path` (the head
     /// row of a loop, or the leaf), clamping if it no longer exists.
+    /// Put the outline cursor on the `WITH` row at index `wi` of the request at
+    /// `path`. A no-op when the row has gone (the field was removed, or the
+    /// block collapsed), leaving the cursor wherever the caller left it.
+    fn select_with_row(&mut self, report_id: u64, path: &[usize], wi: usize) {
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let Ok(rows) = self.report_node_rows(idx) else {
+            return;
+        };
+        if let Some(at) = rows
+            .iter()
+            .position(|r| r.path == path && r.kind.with_item() == Some(wi))
+        {
+            self.reports[idx].node_selected = at;
+        }
+    }
+
     fn select_node_path(&mut self, idx: usize, path: &[usize]) {
         let Ok(rows) = self.report_node_rows(idx) else {
             return;
         };
         let target = rows
             .iter()
-            .position(|r| r.path == path && r.kind != RowKind::LoopEnd)
+            .position(|r| r.path == path && r.kind != RowKind::LoopEnd && !r.kind.is_with())
             .unwrap_or_else(|| rows.len().saturating_sub(1));
         self.reports[idx].node_selected = target;
     }
@@ -2993,17 +3495,89 @@ pub(crate) fn draw_report_nodes(
         .min(rows.len().saturating_sub(1));
     app.reports[idx].node_selected = sel;
 
-    let h = inner.height as usize;
+    // The report's own settings are drawn as leading lines of this same list,
+    // above `BEGIN`, exactly where the graphical editor's settings strip sits:
+    // they describe the whole report rather than running as a step.
+    //
+    // They scroll *with* the outline rather than being pinned above it. A pinned
+    // strip would have to win its rows off a pane that is already the smallest
+    // thing on screen — and when there was no room for it, it would vanish while
+    // the cursor could still be moved onto it. One list has one cursor and one
+    // scroll offset, so whatever is selected is always on screen.
+    let settings = app.report_setting_rows(idx);
+    let add_row = !app.missing_report_settings(idx).is_empty();
+    let set_sel = app.reports[idx].node_setting;
     let w = inner.width as usize;
-    let first = if sel >= h { sel + 1 - h } else { 0 };
-    let lines: Vec<Line> = rows
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(h)
-        .map(|(i, row)| render_node_row(row, i == sel, w, s, th))
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    let key_w = settings.iter().map(|r| r.key.len()).max().unwrap_or(0);
+
+    // Line 0 is the "Settings" heading; then one line per directive; then the
+    // optional "add a setting" row; then a rule; then the flow.
+    let head_lines = if settings.is_empty() {
+        0
+    } else {
+        1 + settings.len() + usize::from(add_row) + 1
+    };
+    let mut lines: Vec<Line> = Vec::with_capacity(head_lines + rows.len());
+    // Which mouse target each line carries, parallel to `lines`.
+    let mut targets: Vec<Option<MouseHitTarget>> = Vec::with_capacity(head_lines + rows.len());
+    if !settings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            s.report_settings_heading.to_string(),
+            Style::default().fg(th.dim).add_modifier(Modifier::BOLD),
+        )));
+        targets.push(None);
+        for (i, row) in settings.iter().enumerate() {
+            lines.push(render_setting_row(row, key_w, set_sel == Some(i), w, s, th));
+            targets.push(Some(MouseHitTarget::ReportSettingRow(i)));
+        }
+        if add_row {
+            let i = settings.len();
+            let style = if set_sel == Some(i) {
+                Style::default()
+                    .fg(th.bg)
+                    .bg(th.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.dim)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  + {}", s.report_setting_add_row),
+                style,
+            )));
+            targets.push(Some(MouseHitTarget::ReportSettingRow(i)));
+        }
+        // A rule between the settings and the flow, so the outline still reads
+        // as starting at BEGIN rather than continuing the list of settings.
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w),
+            Style::default().fg(th.dim),
+        )));
+        targets.push(None);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        lines.push(render_node_row(
+            row,
+            i == sel && set_sel.is_none(),
+            w,
+            s,
+            th,
+        ));
+        targets.push(Some(MouseHitTarget::ReportNodeRow(i)));
+    }
+
+    // Scroll so the cursor — wherever it is in the combined list — is visible.
+    let cursor = match set_sel {
+        Some(i) => 1 + i,
+        None => head_lines + sel,
+    };
+    let h = inner.height as usize;
+    let total = lines.len();
+    let first = if cursor >= h { cursor + 1 - h } else { 0 };
+
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(first).take(h).collect::<Vec<_>>()),
+        inner,
+    );
     app.push_mouse_hit(
         MouseLayer::Base,
         inner,
@@ -3011,23 +3585,86 @@ pub(crate) fn draw_report_nodes(
             crate::tui::reports::ReportPane::Source,
         )),
     );
-    for row in first..rows.len().min(first + h) {
-        app.push_mouse_hit(
-            MouseLayer::Base,
-            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
-            MouseHitTarget::ReportNodeRow(row),
-        );
+    for (line, target) in targets.iter().enumerate().skip(first).take(h) {
+        if let Some(target) = target {
+            app.push_mouse_hit(
+                MouseLayer::Base,
+                Rect::new(inner.x, inner.y + (line - first) as u16, inner.width, 1),
+                *target,
+            );
+        }
     }
 
-    if rows.len() > h {
+    if total > h {
         let bar = Rect {
             x: area.x + area.width - 1,
             y: inner.y,
             width: 1,
             height: inner.height,
         };
-        draw_scrollbar(f, bar, rows.len(), h, first, th);
+        draw_scrollbar(f, bar, total, h, first, th);
     }
+}
+
+/// One settings row: `KEY  value`, with the key dimmed like a label and the
+/// value carrying the colour. An unset **required** directive (only
+/// `collection:`) is drawn in the error colour, because it is the one thing
+/// standing between the report and a run and should look like it.
+fn render_setting_row(
+    row: &SettingRow,
+    key_w: usize,
+    selected: bool,
+    width: usize,
+    s: &Strings,
+    th: &Theme,
+) -> Line<'static> {
+    let unset = row.unset();
+    let (value, value_colour) = if unset {
+        (
+            s.report_setting_unset.to_string(),
+            if row.required { th.err } else { th.dim },
+        )
+    } else {
+        (row.value.clone(), th.text)
+    };
+    let key_colour = if unset && row.required {
+        th.err
+    } else {
+        th.dim
+    };
+    let text = format!(
+        "  {:<key_w$}  {value}",
+        row.key.to_uppercase(),
+        key_w = key_w
+    );
+    let text = truncate_to_width(&text, width);
+    if selected {
+        return Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Split back at the value so the key and the value can be coloured apart
+    // without laying the string out twice.
+    let head_len = 2 + key_w + 2;
+    let (head, tail) = text.split_at(head_len.min(text.len()));
+    Line::from(vec![
+        Span::styled(head.to_string(), Style::default().fg(key_colour)),
+        Span::styled(tail.to_string(), Style::default().fg(value_colour)),
+    ])
+}
+
+/// Cut `text` to `width` display columns, marking the cut with an ellipsis.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn render_node_row(
@@ -3043,6 +3680,14 @@ fn render_node_row(
         RowKind::LoopHead => (row.label.clone(), th.accent, false),
         RowKind::LoopEnd => ("END".to_string(), th.accent, false),
         RowKind::Leaf => (row.label.clone(), th.text, false),
+        // Dimmed: it is in the file, but it isn't a statement.
+        RowKind::Comment => (row.label.clone(), th.dim, false),
+        RowKind::WithField(_) => (row.label.clone(), th.text, false),
+        RowKind::WithComment(_) => (row.label.clone(), th.dim, false),
+        // The affordance that answers "how do I add a column here?" — dimmed
+        // like the settings section's own add row, since it isn't source.
+        RowKind::WithAdd => (format!("+ {}", s.report_with_add_row), th.dim, false),
+        RowKind::WithEnd => ("END".to_string(), th.accent, false),
     };
     // Request rows recolour by whether the name resolves (green / amber),
     // matching the source view's highlighting.
@@ -3150,5 +3795,631 @@ mod tests {
         form.toggle_file(0);
         assert!(!form.entries[0].file);
         assert_eq!(form.entries[0].name, "prod");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The settings section: the report's `# key: value` header directives
+// ---------------------------------------------------------------------------
+//
+// The flow below `BEGIN` says what the report *does*; these say what it does it
+// *to* — which collection, which environment, where relative paths resolve,
+// what the output is written as. The graphical editor has always shown them as
+// a strip of chips above the blocks; the terminal editor could only bind a
+// collection (`b`), so every other directive had to be typed into the raw
+// source. This section closes that gap, and shares the GUI's directive table
+// (`report::edit::header_specs`) so neither editor can quietly fall behind the
+// other again.
+//
+// It reuses the outline's own four keys rather than inventing a second
+// vocabulary for the same pane: Enter configures, `e` edits as raw text,
+// Delete removes, `a` adds.
+
+/// One row of the node editor's settings section.
+pub(crate) struct SettingRow {
+    pub(crate) key: &'static str,
+    pub(crate) kind: HeaderKind,
+    pub(crate) required: bool,
+    /// Which occurrence of `key` this row edits. Always 0 except for
+    /// `collection:`, which repeats: occurrence 0 is the primary collection and
+    /// each one after it is an aliased helper (`path AS alias`). Without this
+    /// every helper row would write back over the primary.
+    pub(crate) occurrence: usize,
+    /// The directive's stored value; empty when the directive is absent, or the
+    /// [`HEADER_PLACEHOLDER`] sentinel when it was added but not filled in.
+    pub(crate) value: String,
+}
+
+impl SettingRow {
+    /// Whether this directive is still waiting for a value.
+    pub(crate) fn unset(&self) -> bool {
+        header_unset(&self.value)
+    }
+}
+
+impl TuiApp {
+    /// The settings rows shown above the flow: every always-shown directive
+    /// plus whichever optional ones the report actually sets.
+    ///
+    /// Returns an empty list when the flow doesn't parse — the node editor
+    /// shows a parse error in place of everything in that case, and a settings
+    /// strip floating above the error would just be a second thing to read.
+    pub(crate) fn report_setting_rows(&self, idx: usize) -> Vec<SettingRow> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        header_specs()
+            .into_iter()
+            .flat_map(|spec| {
+                // A repeatable directive gets one row per occurrence —
+                // `collection:` for each aliased helper, `labels:` for each
+                // class — so they can be seen and edited here rather than only
+                // in the raw source.
+                let values = if spec.repeatable {
+                    let all = flow.header.get_all(spec.key);
+                    if all.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        all.into_iter().map(str::to_string).collect()
+                    }
+                } else {
+                    vec![flow.header.get(spec.key).unwrap_or_default().to_string()]
+                };
+                values
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, value)| spec.always_shown || !value.is_empty())
+                    .map(|(occurrence, value)| SettingRow {
+                        key: spec.key,
+                        kind: spec.kind,
+                        required: spec.required && occurrence == 0,
+                        occurrence,
+                        value,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The optional directives this report doesn't have yet — the contents of
+    /// the "add setting" menu, and (when empty) the reason that row isn't
+    /// drawn at all.
+    pub(crate) fn missing_report_settings(&self, idx: usize) -> Vec<&'static str> {
+        let Some(rt) = self.reports.get(idx) else {
+            return Vec::new();
+        };
+        let Ok(flow) = rt.report.flow() else {
+            return Vec::new();
+        };
+        header_specs()
+            .into_iter()
+            .filter(|spec| {
+                !spec.always_shown && flow.header.get(spec.key).unwrap_or_default().is_empty()
+            })
+            .map(|spec| spec.key)
+            .collect()
+    }
+
+    /// How many rows the settings section offers the cursor: the visible
+    /// directives, plus the trailing "add setting" row when there is anything
+    /// left to add.
+    pub(crate) fn setting_row_count(&self, idx: usize) -> usize {
+        let rows = self.report_setting_rows(idx).len();
+        rows + usize::from(!self.missing_report_settings(idx).is_empty())
+    }
+
+    /// Whether the cursor is on the trailing "add setting" row rather than on a
+    /// directive.
+    fn on_add_setting_row(&self, idx: usize, sel: usize) -> bool {
+        sel >= self.report_setting_rows(idx).len()
+    }
+
+    /// Handle a key while the node editor's cursor is in the settings section.
+    /// Returns `true` when the key was consumed.
+    ///
+    /// Moving down off the last row (or up off the first flow row, handled by
+    /// the caller) crosses between the two sections, so the whole pane still
+    /// feels like one list to arrow through even though the two halves are
+    /// indexed separately.
+    fn on_key_report_settings(&mut self, key: KeyEvent, idx: usize, sel: usize) -> bool {
+        let last = self.setting_row_count(idx).saturating_sub(1);
+        let sel = sel.min(last);
+        self.reports[idx].node_setting = Some(sel);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reports[idx].node_setting = Some(sel.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if sel >= last {
+                    // Off the bottom of the settings and into the flow.
+                    self.reports[idx].node_setting = None;
+                    self.reports[idx].node_selected = 0;
+                } else {
+                    self.reports[idx].node_setting = Some(sel + 1);
+                }
+            }
+            KeyCode::Home => self.reports[idx].node_setting = Some(0),
+            KeyCode::End => {
+                // End belongs to the flow (the outline is the long list), so it
+                // leaves the settings entirely.
+                self.reports[idx].node_setting = None;
+                let rows = self.report_node_rows(idx).map(|r| r.len()).unwrap_or(1);
+                self.reports[idx].node_selected = rows.saturating_sub(1);
+            }
+            KeyCode::Enter => self.configure_selected_setting(idx, sel),
+            KeyCode::Char('e') => self.edit_selected_setting_raw(idx, sel),
+            KeyCode::Delete | KeyCode::Backspace => self.clear_selected_setting(idx, sel),
+            KeyCode::Char('a') | KeyCode::Insert => self.open_add_setting_menu(idx),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Enter on a settings row: open the editor that suits the directive — a
+    /// picker for the ones with a closed set of answers, a file browser for the
+    /// two that name paths, a text prompt for the rest.
+    fn configure_selected_setting(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            self.open_add_setting_menu(idx);
+            return;
+        }
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        let (key, kind, occurrence) = (row.key, row.kind, row.occurrence);
+        match kind {
+            // The collection picker already exists (`b`), lists exactly the
+            // right things and writes the reference in the right form, so Enter
+            // here is that same picker rather than a second one beside it.
+            //
+            // Only for the *primary* collection, though: it rebinds the report,
+            // and a helper also needs its `AS alias`, which the picker has no
+            // way to ask for. Helper rows get the raw text prompt, seeded with
+            // the whole `path AS alias` line.
+            HeaderKind::Collection if occurrence == 0 => self.open_report_bind(),
+            HeaderKind::Collection => self.open_setting_text_prompt(idx, sel),
+            HeaderKind::Environment | HeaderKind::Format => {
+                self.open_setting_value_menu(idx, key, occurrence, kind)
+            }
+            HeaderKind::Folder | HeaderKind::File => self.open_setting_path_browser(idx, key, kind),
+            HeaderKind::Text => self.open_setting_text_prompt(idx, sel),
+        }
+    }
+
+    /// `e` on a settings row: edit the directive's stored value as raw text,
+    /// whatever its kind. The escape hatch that matches the outline's own `e`,
+    /// and the only way to type a value the pickers can't offer — a collection
+    /// that isn't open, an environment that only exists on another machine.
+    fn edit_selected_setting_raw(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            self.open_add_setting_menu(idx);
+            return;
+        }
+        self.open_setting_text_prompt(idx, sel);
+    }
+
+    /// Seed and open the text prompt for the settings row at `sel`.
+    fn open_setting_text_prompt(&mut self, idx: usize, sel: usize) {
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        // The placeholder is a "not filled in yet" marker, not a value anyone
+        // meant to edit, so the prompt opens empty rather than with a `?` to
+        // delete first.
+        let seed = if row.unset() {
+            String::new()
+        } else {
+            row.value.clone()
+        };
+        let key = row.key;
+        let occurrence = row.occurrence;
+        let report_id = self.reports[idx].report.id;
+        self.overlay = Some(Overlay::Prompt {
+            kind: PromptKind::ReportHeaderValue {
+                report_id,
+                key,
+                occurrence,
+            },
+            editor: Editor::new(&seed, false),
+            title: key.to_uppercase(),
+            mask: false,
+            reset_to: None,
+            secret_intact: false,
+            secret_checkbox: None,
+        });
+    }
+
+    /// Delete on a settings row: remove the directive. An always-shown one
+    /// (`collection:`, `output:`) stays on screen as its unset prompt; the rest
+    /// go back to the add menu.
+    fn clear_selected_setting(&mut self, idx: usize, sel: usize) {
+        if self.on_add_setting_row(idx, sel) {
+            return;
+        }
+        let rows = self.report_setting_rows(idx);
+        let Some(row) = rows.get(sel) else { return };
+        let (key, occurrence) = (row.key, row.occurrence);
+        self.apply_report_setting(idx, key, occurrence, None);
+        // Removing an optional directive shortens the list under the cursor.
+        let last = self.setting_row_count(idx).saturating_sub(1);
+        self.reports[idx].node_setting = Some(sel.min(last));
+    }
+
+    /// Write (or, with `None`, remove) a header directive on the report at
+    /// `idx`, re-serializing through the same undoable path every structural
+    /// node edit uses — so Ctrl+Z takes a settings change back too.
+    pub(crate) fn apply_report_setting(
+        &mut self,
+        idx: usize,
+        key: &str,
+        occurrence: usize,
+        value: Option<&str>,
+    ) {
+        {
+            let rt = &mut self.reports[idx];
+            let Ok(mut flow) = rt.report.flow() else {
+                return;
+            };
+            if !crate::report::edit::set_header_nth(&mut flow, key, occurrence, value) {
+                return;
+            }
+            let text = flow.to_text();
+            rt.set_text_undoable(text);
+        }
+        self.revalidate_report(idx);
+        self.save_state();
+    }
+}
+
+/// The settings menu overlay ([`Overlay::ReportSettingMenu`]) — one list, two
+/// jobs, because they are the same interaction: choose one of a short list of
+/// names and something happens to the header.
+pub(crate) struct SettingMenu {
+    pub(crate) step: SettingMenuStep,
+    /// What the rows say — the *whole* list, never narrowed in place, so
+    /// backspacing over the filter brings the hidden rows straight back.
+    pub(crate) options: Vec<String>,
+    /// What has been typed to narrow the list. Empty means "show everything".
+    pub(crate) filter: String,
+    /// The cursor, as an index into the **visible** (filtered) rows — see
+    /// [`SettingMenu::visible`]. Keeping it in filtered space is what makes
+    /// "type two letters, press Enter" work without any bookkeeping.
+    pub(crate) selected: usize,
+    /// The report being edited (by id so a tab reorder can't misroute it).
+    pub(crate) report_id: u64,
+}
+
+/// Which job a [`SettingMenu`] is doing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SettingMenuStep {
+    /// Adding one of the not-yet-present optional directives; the options are
+    /// directive keys.
+    AddSetting,
+    /// Choosing the value of `key`; the options are the values themselves.
+    PickValue {
+        key: &'static str,
+        /// Which occurrence of `key` the pick writes to — see
+        /// [`SettingRow::occurrence`].
+        occurrence: usize,
+    },
+    /// Choosing the value of a report `PARAM` from the run settings view; the
+    /// options are the parameter's `CHOICE(…)` list or the loaded environment
+    /// names. Unlike the two above this doesn't touch the source: a parameter's
+    /// value belongs to the run, not to the report.
+    PickParam { name: String },
+}
+
+impl SettingMenu {
+    /// The rows the filter leaves standing, in declaration order. A
+    /// case-insensitive substring match: the lists these menus show are names
+    /// (environments, formats, directives), and people recall a fragment of a
+    /// name far more reliably than its first letters.
+    pub(crate) fn visible(&self) -> Vec<&String> {
+        if self.filter.is_empty() {
+            return self.options.iter().collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.options
+            .iter()
+            .filter(|o| o.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// The row the cursor is on, or `None` when the filter matches nothing.
+    pub(crate) fn choice(&self) -> Option<String> {
+        self.visible().get(self.selected).map(|o| (*o).clone())
+    }
+
+    /// Keep the cursor on a row that exists after the filter changed. It goes
+    /// to the top rather than trying to follow the previously selected row:
+    /// the point of typing is to bring the wanted row *to* the top.
+    fn clamp_selection(&mut self) {
+        self.selected = 0;
+    }
+
+    /// The overlay title for the current job.
+    pub(crate) fn title(&self, s: &Strings) -> String {
+        match &self.step {
+            SettingMenuStep::AddSetting => s.report_add_setting.to_string(),
+            SettingMenuStep::PickValue { key, .. } => key.to_uppercase(),
+            SettingMenuStep::PickParam { name } => name.clone(),
+        }
+    }
+}
+
+impl TuiApp {
+    /// `a` on the settings section: offer the optional directives this report
+    /// doesn't have yet. A no-op with a status when they are all present —
+    /// better than an empty menu that looks broken.
+    fn open_add_setting_menu(&mut self, idx: usize) {
+        let s = Strings::for_language(&self.language);
+        let missing = self.missing_report_settings(idx);
+        // A helper collection is always offerable — `collection:` repeats, so
+        // unlike the one-shot directives it is never "already set".
+        let mut options: Vec<String> = missing.iter().map(|k| k.to_uppercase()).collect();
+        options.push(s.report_add_helper_collection.to_string());
+        // A second label class is offered the same way: `labels:` repeats, so
+        // once one is set the one-shot "add setting" entry is gone and there
+        // would otherwise be no way to declare the other half of the
+        // vocabulary without editing the source.
+        if self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.flow().ok())
+            .is_some_and(|f| !f.header.labels().is_empty())
+        {
+            options.push(s.report_add_label_class.to_string());
+        }
+        self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+            step: SettingMenuStep::AddSetting,
+            options,
+            filter: String::new(),
+            selected: 0,
+            report_id: self.reports[idx].report.id,
+        })));
+    }
+
+    /// Add another `# collection:` line — an aliased helper collection, whose
+    /// requests the report can then call as `alias/request`.
+    ///
+    /// Seeded with the placeholder so the row appears immediately, then its
+    /// text prompt is opened on the new row: a helper needs both a path and an
+    /// `AS alias`, and typing the line is the only editor that can express
+    /// both. Validation says so plainly if the alias is left off.
+    fn add_helper_collection(&mut self, idx: usize) {
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let occurrence = flow.header.get_all("collection").len().max(1);
+        self.apply_report_setting(idx, "collection", occurrence, Some(HEADER_PLACEHOLDER));
+        let rows = self.report_setting_rows(idx);
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| r.key == "collection" && r.occurrence == occurrence)
+        {
+            self.reports[idx].node_setting = Some(pos);
+            self.open_setting_text_prompt(idx, pos);
+        }
+    }
+
+    /// Add another `# labels:` line — one more class of the answers the report
+    /// scores.
+    ///
+    /// Seeded and opened for typing exactly like a helper collection: a class
+    /// is a name and a list of spellings on one line (`Pass = pass, ok, real`),
+    /// which only the text prompt can express.
+    fn add_label_class(&mut self, idx: usize) {
+        let Ok(flow) = self.reports[idx].report.flow() else {
+            return;
+        };
+        let occurrence = flow.header.labels().len();
+        self.apply_report_setting(idx, "labels", occurrence, Some(HEADER_PLACEHOLDER));
+        let rows = self.report_setting_rows(idx);
+        if let Some(pos) = rows
+            .iter()
+            .position(|r| r.key == "labels" && r.occurrence == occurrence)
+        {
+            self.reports[idx].node_setting = Some(pos);
+            self.open_setting_text_prompt(idx, pos);
+        }
+    }
+
+    /// Enter on a directive whose answers are a closed list: the output formats
+    /// PaperTrail can write, or the environments actually loaded.
+    fn open_setting_value_menu(
+        &mut self,
+        idx: usize,
+        key: &'static str,
+        occurrence: usize,
+        kind: HeaderKind,
+    ) {
+        let options: Vec<String> = match kind {
+            HeaderKind::Format => crate::report::writer::OUTPUT_EXTENSIONS
+                .iter()
+                .map(|e| e.to_string())
+                .collect(),
+            _ => self.global_envs.iter().map(|e| e.name.clone()).collect(),
+        };
+        if options.is_empty() {
+            // Only reachable for environments: there is nothing to choose from
+            // until one is loaded. `e` still types a name by hand, which is the
+            // right answer for an environment that lives on another machine.
+            self.status = Some(Status::ReportSettingNoChoices);
+            return;
+        }
+        let current = self
+            .report_setting_rows(idx)
+            .into_iter()
+            .find(|r| r.key == key)
+            .map(|r| r.value)
+            .unwrap_or_default();
+        let selected = options.iter().position(|o| *o == current).unwrap_or(0);
+        self.overlay = Some(Overlay::ReportSettingMenu(Box::new(SettingMenu {
+            step: SettingMenuStep::PickValue { key, occurrence },
+            options,
+            filter: String::new(),
+            selected,
+            report_id: self.reports[idx].report.id,
+        })));
+    }
+
+    /// Enter on `root:` or `baseline:`: browse for the folder / file, rather
+    /// than making the user type a path they can't check.
+    fn open_setting_path_browser(&mut self, idx: usize, key: &'static str, kind: HeaderKind) {
+        self.pending_header_path = Some((self.reports[idx].report.id, key));
+        // Seed the browser at the report's own folder: a report's root and its
+        // baseline almost always live beside it.
+        if let Some(dir) = self.active_report_base_dir() {
+            self.last_browse_dir = Some(dir);
+        }
+        self.open_browser(match kind {
+            HeaderKind::Folder => FileAction::PickReportHeaderFolder,
+            _ => FileAction::PickReportHeaderFile,
+        });
+    }
+
+    /// Store a browsed path (or a typed one) into the parked header directive,
+    /// relative to the report when that is shorter — a report and the files it
+    /// names usually travel together, so an absolute path would break the
+    /// moment the pair moved. Mirrors the GUI's `pick_header_file`.
+    /// A `PARAM … FILE`/`FOLDER` pick came back: store it as the parameter's
+    /// value for the next run. Relative to the report's own folder when it
+    /// lives beneath it, matching what `# root:` does — a report and the files
+    /// it feeds on usually travel together.
+    pub(crate) fn commit_report_param_path(&mut self, path: &str) {
+        let Some((report_id, name)) = self.pending_param_path.take() else {
+            return;
+        };
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let value = self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.path.as_deref())
+            .and_then(|p| p.parent())
+            .and_then(|base| std::path::Path::new(path).strip_prefix(base).ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        self.set_report_param(report_id, &name, value);
+    }
+
+    pub(crate) fn commit_report_header_path(&mut self, path: &str) {
+        let Some((report_id, key)) = self.pending_header_path.take() else {
+            return;
+        };
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return;
+        };
+        let value = self
+            .reports
+            .get(idx)
+            .and_then(|rt| rt.report.path.as_deref())
+            .and_then(|p| p.parent())
+            .and_then(|base| std::path::Path::new(path).strip_prefix(base).ok())
+            .map(|rel| rel.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string());
+        self.apply_report_setting(idx, key, 0, Some(&value));
+    }
+
+    /// Key handling for [`Overlay::ReportSettingMenu`]. ↑/↓ (and `j`/`k`,
+    /// Home/End) move; Enter applies; anything else cancels — the same shape as
+    /// every other list overlay here.
+    pub(crate) fn report_setting_menu_key_handler(
+        &mut self,
+        key: KeyEvent,
+        mut menu: Box<SettingMenu>,
+    ) {
+        let last = menu.visible().len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Down => {
+                menu.selected = (menu.selected + 1).min(last);
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Home => {
+                menu.selected = 0;
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::End => {
+                menu.selected = last;
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            // Typing narrows the list. These menus can be as long as the set of
+            // loaded environments, where scrolling to the one you already know
+            // the name of is the slowest possible way to pick it. This is why
+            // `j`/`k` no longer move the cursor here — a letter is a letter.
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                menu.filter.push(c);
+                menu.clamp_selection();
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Backspace => {
+                // Backspace on an empty filter closes the menu, so the key that
+                // undoes typing keeps undoing right out of the overlay.
+                if menu.filter.pop().is_some() {
+                    menu.clamp_selection();
+                    self.overlay = Some(Overlay::ReportSettingMenu(menu));
+                }
+            }
+            // Enter on a filter that matches nothing keeps the menu up: closing
+            // it would look like a pick was made.
+            KeyCode::Enter if menu.choice().is_none() => {
+                self.overlay = Some(Overlay::ReportSettingMenu(menu));
+            }
+            KeyCode::Enter => self.apply_setting_menu(*menu),
+            // Esc / anything else: cancel (the overlay was already taken).
+            _ => {}
+        }
+    }
+
+    fn apply_setting_menu(&mut self, menu: SettingMenu) {
+        let Some(idx) = self.report_index_by_id(menu.report_id) else {
+            return;
+        };
+        // Nothing matches the filter: there is no choice to apply, and closing
+        // the menu on Enter would look like a silent pick.
+        let Some(choice) = menu.choice() else {
+            return;
+        };
+        match &menu.step {
+            SettingMenuStep::AddSetting => {
+                // Seeded with the placeholder so the row appears at once; an
+                // empty value would be read as "remove this directive" and the
+                // menu would appear to do nothing.
+                let s = Strings::for_language(&self.language);
+                if choice == s.report_add_helper_collection {
+                    self.add_helper_collection(idx);
+                    return;
+                }
+                if choice == s.report_add_label_class {
+                    self.add_label_class(idx);
+                    return;
+                }
+                let key = choice.to_ascii_lowercase();
+                let Some(spec) = header_specs().into_iter().find(|s| s.key == key) else {
+                    return;
+                };
+                self.apply_report_setting(idx, spec.key, 0, Some(HEADER_PLACEHOLDER));
+                // Put the cursor on the row that just appeared and open its
+                // editor, so adding a setting and filling it in is one gesture.
+                let rows = self.report_setting_rows(idx);
+                if let Some(pos) = rows.iter().position(|r| r.key == spec.key) {
+                    self.reports[idx].node_setting = Some(pos);
+                    self.configure_selected_setting(idx, pos);
+                }
+            }
+            SettingMenuStep::PickValue { key, occurrence } => {
+                self.apply_report_setting(idx, key, *occurrence, Some(&choice))
+            }
+            SettingMenuStep::PickParam { name } => {
+                let (id, name) = (menu.report_id, name.clone());
+                self.set_report_param(id, &name, choice);
+            }
+        }
     }
 }

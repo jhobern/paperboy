@@ -12,24 +12,23 @@ use ratatui_explorer::{
 };
 
 use crate::collection::Collection;
-use crate::environment::{PendingEnvSecrets, spawn_resolution_many};
 use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, METHODS};
 use crate::i18n::{Language, Status, Strings};
-use crate::persistence::{
-    self, PendingWorkspaceReload, PersistedEnv, PersistedReport, PersistedState, PersistedTab,
-};
+use crate::persistence::{self, PendingWorkspaceReload, PersistedReport, PersistedState};
 use crate::request::{self, AppVars, build_request_json};
 
 use super::app::*;
 use super::editor::*;
-use super::git_save::{GitSaveStage, GitSaveTarget};
+use super::git_save::GitSaveStage;
 use super::new_request::*;
 use super::remote::*;
 use super::reports::ReportPane;
 use super::reports::{ReportView, grid_col_at_x, result_column_widths};
 use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
-use tui_panel_select::clipboard::copy_to_clipboard;
+use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
+use crate::save_flow::SaveTargetKind;
+use crate::tui::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
@@ -113,6 +112,21 @@ impl TuiApp {
             self.on_mouse_raw_text_editor(ev);
             return;
         }
+        // A right-click on an environment — either a Workspace tree's
+        // environment file, or a row of the Environments panel — makes it the
+        // active one. A terminal has nowhere sensible to hang a context menu,
+        // so the one useful entry the GUI's menu offers is bound directly to
+        // the gesture instead.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Right))
+            && self.overlay.is_none()
+            && (self.right_click_revert_workspace_row(point)
+                || self.right_click_activate_env(point))
+        {
+            return;
+        }
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.mouse_drag_moved = false;
+        }
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && !ev.modifiers.contains(KeyModifiers::ALT)
         {
@@ -148,6 +162,14 @@ impl TuiApp {
                 } else {
                     None
                 };
+                // Clicking a panel selects it, like clicking any other pane —
+                // this is how the Main and Response panels are reachable with
+                // the mouse at all. (They begin a text selection too; that used
+                // to be *all* they did, so they were the only panes you had to
+                // reach with the keyboard.)
+                if let Some(pane) = pane {
+                    self.focus = pane;
+                }
                 if ev.modifiers.contains(KeyModifiers::ALT) {
                     // Alt+Click *adds* a region: finalize whichever panel
                     // currently holds the live one (keeping it, and any
@@ -176,6 +198,7 @@ impl TuiApp {
                     return;
                 }
                 self.drag_selection_to((ev.column, ev.row));
+                self.mouse_drag_moved = true;
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.scrollbar_drag.take().is_some() {
@@ -183,7 +206,9 @@ impl TuiApp {
                 }
                 self.main_panel.end_drag();
                 self.resp_panel.end_drag();
-                self.copy_selection_to_clipboard();
+                if self.mouse_drag_moved {
+                    self.copy_selection_only();
+                }
             }
             _ => {}
         }
@@ -202,7 +227,9 @@ impl TuiApp {
         let row_activation = match target {
             MouseHitTarget::SelectListRow(_)
             | MouseHitTarget::SelectGlobalEnvRow(_)
-            | MouseHitTarget::ReportNodeRow(_) => self.mouse_row_activation(target),
+            | MouseHitTarget::ReportNodeRow(_)
+            | MouseHitTarget::ReportSettingRow(_)
+            | MouseHitTarget::ReportParamRow(_) => self.mouse_row_activation(target),
             _ => {
                 self.last_mouse_row = None;
                 false
@@ -249,11 +276,49 @@ impl TuiApp {
                 self.primary_send();
                 true
             }
-            MouseHitTarget::ReportResultsCell => self.on_mouse_results_cell_click(point.x, point.y),
+            MouseHitTarget::ReportResultsCell => {
+                // Clicking the grid also *selects* the report body, the way
+                // clicking any other panel selects it. Without this an
+                // embedded report's grid moved its own cell cursor while focus
+                // stayed on the workspace tree beside it, so the next keypress
+                // went somewhere the user wasn't looking. The cell click is
+                // still allowed to decline the event (a click on the pinned
+                // header row), which falls through to text selection.
+                self.focus = Pane::Main;
+                self.on_mouse_results_cell_click(point.x, point.y)
+            }
+            MouseHitTarget::ReportParamRow(row) => {
+                self.focus = Pane::Main;
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.param_selected = row;
+                    }
+                    if row_activation {
+                        self.configure_selected_param();
+                    } else {
+                        keep_mouse_hits = true;
+                    }
+                }
+                true
+            }
+            MouseHitTarget::ReportSettingRow(row) => {
+                if let Some(idx) = self.active_report_index() {
+                    if let Some(rt) = self.reports.get_mut(idx) {
+                        rt.node_setting = Some(row);
+                    }
+                    if row_activation {
+                        self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
+                    } else {
+                        keep_mouse_hits = true;
+                    }
+                }
+                true
+            }
             MouseHitTarget::ReportNodeRow(row) => {
                 if let Some(idx) = self.active_report_index() {
                     if let Some(rt) = self.reports.get_mut(idx) {
                         rt.node_selected = row;
+                        rt.node_setting = None;
                     }
                     if row_activation {
                         self.on_key_report_nodes(Self::mouse_key(KeyCode::Enter), idx);
@@ -388,7 +453,7 @@ impl TuiApp {
                 }
             }
             MouseScrollTarget::GlobalEnv => {
-                let len = self.global_envs.len();
+                let len = self.env_rows().len();
                 if len > 0 {
                     let next = (self.global_env_idx as i32 + dir).clamp(0, len as i32 - 1) as usize;
                     self.select_row_in_pane(Pane::GlobalEnv, next);
@@ -461,6 +526,7 @@ impl TuiApp {
         match self.overlay.as_mut() {
             Some(Overlay::FileMenu(sel))
             | Some(Overlay::FileLoadMenu(sel))
+            | Some(Overlay::FileImportMenu(sel))
             | Some(Overlay::FileSaveMenu(sel))
             | Some(Overlay::FileLoadSource(_, sel))
             | Some(Overlay::FileSaveDest(_, sel))
@@ -480,6 +546,7 @@ impl TuiApp {
             Some(Overlay::ReportColumns(picker)) => picker.selected = row,
             Some(Overlay::ReportBind(picker)) => picker.selected = row,
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
+            Some(Overlay::ReportSettingMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
             Some(Overlay::ReportNodeEnvs(form)) => form.selected = row,
             Some(Overlay::ReportNodeFiles(form)) => form.selected = row,
@@ -526,7 +593,9 @@ impl TuiApp {
     }
 
     fn click_browser_row(&mut self, row: usize) {
-        let Some(Overlay::Browser(action, mut ex)) = self.overlay.take() else {
+        let Some((action, mut ex)) =
+            take_overlay!(self, Overlay::Browser(action, ex) => (action, ex))
+        else {
             return;
         };
         let len = ex.files().len();
@@ -544,7 +613,7 @@ impl TuiApp {
     }
 
     fn click_workspace_picker_row(&mut self, row: usize) {
-        let Some(Overlay::WorkspacePicker(mut picker)) = self.overlay.take() else {
+        let Some(mut picker) = take_overlay!(self, Overlay::WorkspacePicker(p) => p) else {
             return;
         };
         let activate = picker.selected == row;
@@ -660,35 +729,37 @@ impl TuiApp {
 
     fn click_remote_wizard_row(&mut self, row: usize) {
         let mut activate = false;
+        let lang = self.language.clone();
         if let Some(Overlay::RemoteGit(w)) = self.overlay.as_mut() {
             let recent_len = w.recent.len();
-            match &mut w.stage {
-                RemoteStage::Connect { field, recent_sel } => {
+            match w.stage() {
+                RemoteStage::Connect => {
                     if row == 0 || row == 1 {
-                        *field = row as u8;
-                        *recent_sel = None;
+                        w.field = row as u8;
+                        w.recent_sel = None;
                     } else if row >= 10 {
                         let idx = row - 10;
                         if idx < recent_len {
-                            *recent_sel = Some(idx);
+                            w.recent_sel = Some(idx);
                             activate = true;
                         }
                     }
                 }
-                RemoteStage::PickRef { refs, sel, .. } => {
-                    if row < refs.len() {
-                        *sel = row;
+                RemoteStage::PickRef => {
+                    let s = Strings::for_language(&lang);
+                    if row < w.flow.ref_choices(&s).len() {
+                        w.sel = row;
                         activate = true;
                     }
                 }
-                RemoteStage::PickFile { files, sel, .. } => {
-                    if row < files.len() {
-                        *sel = row;
+                RemoteStage::PickFile => {
+                    if row < w.flow.pickable_files().len() {
+                        w.sel = row;
                         activate = true;
                     }
                 }
-                RemoteStage::PickWorkspaceFilter { sel } => {
-                    *sel = row.min(WorkspaceGitFilter::ALL.len().saturating_sub(1));
+                RemoteStage::PickWorkspaceFilter => {
+                    w.sel = row.min(WorkspaceGitFilter::ALL.len().saturating_sub(1));
                     activate = true;
                 }
                 _ => {}
@@ -702,30 +773,29 @@ impl TuiApp {
     fn click_git_save_wizard_row(&mut self, row: usize) {
         let mut activate = false;
         if let Some(Overlay::GitSave(w)) = self.overlay.as_mut() {
-            match &mut w.stage {
-                GitSaveStage::Connect { field } => {
-                    *field = row.min(2) as u8;
+            match w.stage() {
+                GitSaveStage::Connect => {
+                    w.field = row.min(2) as u8;
                 }
-                GitSaveStage::ChoosePaths { field } => {
-                    *field = row.min(2) as u8;
+                GitSaveStage::ChoosePaths => {
+                    w.field = row.min(2) as u8;
                     if row == 1 {
-                        w.include_env = !w.include_env;
+                        w.flow.include_env = !w.flow.include_env;
                     }
                 }
-                GitSaveStage::ChooseTarget { sel, refs } => {
+                GitSaveStage::ChooseTarget => {
                     if row == 0 {
-                        w.target_kind = if w.target_kind == GitSaveTarget::Branch {
-                            GitSaveTarget::Tag
+                        w.flow.target_kind = if w.flow.target_kind == SaveTargetKind::Branch {
+                            SaveTargetKind::Tag
                         } else {
-                            GitSaveTarget::Branch
+                            SaveTargetKind::Branch
                         };
                     } else if row == 1 {
-                        *sel = None;
+                        w.sel = None;
                     } else if row >= 10 {
                         let idx = row - 10;
-                        let branch_len = refs.as_ref().map(|r| r.branches.len()).unwrap_or(0);
-                        if idx < branch_len {
-                            *sel = Some(idx);
+                        if idx < w.flow.refs().branches.len() {
+                            w.sel = Some(idx);
                             activate = true;
                         }
                     }
@@ -871,6 +941,12 @@ impl TuiApp {
                     self.clear_report_selections();
                 }
                 if let Some(pane) = pane {
+                    // Clicking a report panel selects the report body, exactly
+                    // as clicking the Main or Response panel does in the normal
+                    // view. For a report embedded in a workspace this is the
+                    // difference between the keyboard following the click and
+                    // it staying on the tree.
+                    self.focus = Pane::Main;
                     let area = self.report_pane_area(pane);
                     if let Some(panel) = self.report_panel_mut(pane) {
                         panel.begin(area, (ev.column, ev.row));
@@ -883,13 +959,16 @@ impl TuiApp {
                     return;
                 }
                 self.drag_report_selection_to((ev.column, ev.row));
+                self.mouse_drag_moved = true;
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.report_scrollbar_drag.take().is_some() {
                     return;
                 }
                 self.end_report_drags();
-                self.copy_report_selection_to_clipboard();
+                if self.mouse_drag_moved {
+                    self.copy_report_selection_only();
+                }
             }
             _ => {}
         }
@@ -946,13 +1025,15 @@ impl TuiApp {
         // Reuse the same column-width computation as the renderer so the click
         // lands on the right column.
         let x_off = (col as usize).saturating_sub(area.x as usize);
-        let widths = result_column_widths(result, &header);
+        let widths =
+            result_column_widths(result, &header, &self.reports[idx].visible_result_rows());
         let n_cols = widths.len();
         if n_cols == 0 {
             return false;
         }
         let show_icons = self.reports[idx].run_progress.is_some();
-        let clicked_col = grid_col_at_x(&widths, x_off, show_icons).min(n_cols - 1);
+        let col_offset = self.reports[idx].results_col_offset;
+        let clicked_col = grid_col_at_x(&widths, x_off, show_icons, col_offset).min(n_cols - 1);
         let new_cell = (data_row, clicked_col);
         let prev_cell = self.reports[idx].cell_cursor;
         if prev_cell == Some(new_cell) {
@@ -1068,23 +1149,14 @@ impl TuiApp {
     /// falling back — with nothing selected — to the whole text of whichever
     /// panel the current view primarily shows (results grid in the results
     /// view, else the flow source). Bound to `y` and the mouse-release handler,
-    /// mirroring [`copy_selection_to_clipboard`].
+    /// mirroring [`Self::copy_selection_to_clipboard`].
     pub(crate) fn copy_report_selection_to_clipboard(&mut self) {
+        if self.copy_report_selection_only() {
+            return;
+        }
         let Some(idx) = self.active_report_index() else {
             return;
         };
-        let parts: Vec<String> = {
-            let rt = &self.reports[idx];
-            let mut parts = rt.source_panel.selected_parts(None);
-            parts.extend(rt.validation_panel.selected_parts(None));
-            parts.extend(rt.results_panel.selected_parts(None));
-            parts
-        };
-        if !parts.is_empty() {
-            copy_to_clipboard(&parts.join("\n\n"));
-            self.status = Some(Status::Copied);
-            return;
-        }
         let rt = &self.reports[idx];
         let whole = match rt.view {
             crate::tui::reports::ReportView::Results => rt.results_panel.whole_text(),
@@ -1098,6 +1170,28 @@ impl TuiApp {
             copy_to_clipboard(text);
             self.status = Some(Status::Copied);
         }
+    }
+
+    /// The report-view counterpart of [`Self::copy_selection_only`]: copy only
+    /// genuinely selected regions, with no whole-panel fallback, so that
+    /// releasing a click that selected nothing leaves the clipboard alone.
+    pub(crate) fn copy_report_selection_only(&mut self) -> bool {
+        let Some(idx) = self.active_report_index() else {
+            return false;
+        };
+        let parts: Vec<String> = {
+            let rt = &self.reports[idx];
+            let mut parts = rt.source_panel.selected_parts(None);
+            parts.extend(rt.validation_panel.selected_parts(None));
+            parts.extend(rt.results_panel.selected_parts(None));
+            parts
+        };
+        if parts.is_empty() {
+            return false;
+        }
+        copy_to_clipboard(&parts.join("\n\n"));
+        self.status = Some(Status::Copied);
+        true
     }
 
     /// The Main/Response text panel for `pane` (immutable), or `None` for a
@@ -1323,34 +1417,59 @@ impl TuiApp {
         scratch.selected_parts(None)
     }
 
-    /// Copy every active text selection region to the clipboard via OSC 52
-    /// (see `concatenated_selection_text`). Shared by the mouse-release
-    /// handler (drag-to-select) and the `y` keyboard shortcut, the latter
-    /// existing because OSC 52 write-back isn't picked up by every terminal
-    /// emulator / multiplexer config, so users need an explicit, repeatable
-    /// way to retry the copy without having to redo every drag.
+    /// Copy every active text selection region to the clipboard (see
+    /// `concatenated_selection_text`). Bound to the `y` shortcut, which exists
+    /// because a copy can silently fail depending on the terminal emulator /
+    /// multiplexer, so users need an explicit, repeatable way to retry without
+    /// having to redo every drag.
     ///
     /// With nothing selected, `y` falls back to copying the *whole* content
     /// of whichever of the Main (Request JSON) / Response panels currently
     /// has focus — so the whole request/response can be grabbed without
-    /// first having to drag-select every line of a possibly huge body.
+    /// first having to drag-select every line of a possibly huge body. The
+    /// mouse-release path deliberately does *not* do this; see
+    /// [`Self::copy_selection_only`].
     pub(crate) fn copy_selection_to_clipboard(&mut self) {
-        if let Some(text) = self.concatenated_selection_text() {
-            copy_to_clipboard(&text);
-            self.status = Some(Status::Copied);
-        } else if let Some(text) = self.whole_panel_text(self.focus) {
+        if self.copy_selection_only() {
+            return;
+        }
+        if let Some(text) = self.whole_panel_text(self.focus) {
             copy_to_clipboard(&text);
             self.status = Some(Status::Copied);
         }
     }
 
+    /// Copy only what is genuinely selected, reporting whether anything was.
+    ///
+    /// This is the mouse-release path, which deliberately has *no* whole-panel
+    /// fallback: a release that follows no drag is how a panel is focused, and
+    /// filling the clipboard with the entire panel because of it would quietly
+    /// throw away whatever the user had copied earlier. The caller gates this
+    /// on `mouse_drag_moved` as well, because `begin` always leaves a
+    /// degenerate one-character region behind that would otherwise count as a
+    /// selection.
+    pub(crate) fn copy_selection_only(&mut self) -> bool {
+        if let Some(text) = self.concatenated_selection_text() {
+            copy_to_clipboard(&text);
+            self.status = Some(Status::Copied);
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn on_key_overlay(&mut self, key: KeyEvent) {
+        // Unlike the polls, this genuinely wants whatever is open: the match
+        // below is exhaustive and every arm either puts an overlay back or
+        // deliberately closes one. Taking unconditionally is only safe *because*
+        // of that — see `take_overlay!` before copying this shape anywhere that
+        // handles a single kind of overlay.
         let Some(overlay) = self.overlay.take() else {
             return;
         };
         match overlay {
             Overlay::Help(tab) => self.help_key_handler(key, tab),
             Overlay::RemoteGit(w) => self.on_key_remote(w, key),
+            Overlay::PostmanImport(w) => self.on_key_postman(w, key),
             Overlay::GitSave(w) => self.on_key_git_save(w, key),
             Overlay::EnvPopup(popup) => self.on_key_env_popup(popup, key),
             Overlay::EnvLinkPicker(picker) => self.on_key_env_link_picker(picker, key),
@@ -1379,6 +1498,7 @@ impl TuiApp {
                 sel,
             } => self.workspace_storage_choice_key_handler(key, repo, name, origin, sel),
             Overlay::FileMenu(sel) => self.file_menu_key_handler(key, sel),
+            Overlay::FileImportMenu(sel) => self.file_import_menu_key_handler(key, sel),
             Overlay::FileLoadMenu(sel) => self.file_load_menu_key_handler(key, sel),
             Overlay::FileSaveMenu(sel) => self.file_save_menu_key_handler(key, sel),
             Overlay::FileLoadSource(kind, sel) => self.file_load_source_key_handler(key, kind, sel),
@@ -1417,6 +1537,7 @@ impl TuiApp {
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
+            Overlay::ReportSettingMenu(menu) => self.report_setting_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
             Overlay::ReportNodeEnvs(form) => self.report_node_envs_key_handler(key, form),
             Overlay::ReportNodeFiles(form) => self.report_node_files_key_handler(key, form),
@@ -1448,15 +1569,56 @@ impl TuiApp {
             self.on_key_report_body(key);
             return;
         }
+        // Running the report you can see should not depend on which pane the
+        // cursor happens to be in. With a report in the right pane, the tree's
+        // selection *is* that report -- so the two run keys act on it from the
+        // tree as well, saving a Tab in and a Tab back out for the one thing
+        // anybody does with a report. Only these two: every other report key
+        // (`c`, `b`, `v`, …) already means something to the tree, and quietly
+        // changing what a letter does depending on the right pane's contents is
+        // how a key map becomes unlearnable. `r` and `d` are unbound here, and
+        // F5's "send the selection" reads the same way when the selection is a
+        // report.
+        if self.active_report_index().is_some()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(
+                key.code,
+                KeyCode::Char('r') | KeyCode::Char('d') | KeyCode::F(5)
+            )
+        {
+            match key.code {
+                KeyCode::Char('d') => self.open_report_dry_run(),
+                _ => self.run_active_report(),
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Type-to-filter for the Global Environments panel, opened with `/`.
+        // It has to swallow keys as a mode rather than filtering on any
+        // keypress the way the file browser does: this panel binds bare letters
+        // to actions (`a` activate, `x` delete, `u` undo, `q` quit), so typing
+        // a name here without a mode would fire half of them. Handled before
+        // the main match for the same reason.
+        if self.env_filter_typing && self.on_key_env_filter(key, ctrl, alt) {
+            return;
+        }
         match key.code {
             // Esc dismisses every active mouse text selection first (the
             // active one and any additional Alt+Click+Drag regions), so
             // nothing lingers highlighted; only takes effect when there is
             // at least one, so it doesn't shadow any other key's behaviour.
             KeyCode::Esc if self.has_any_selection() => self.clear_selections(),
+            // Esc on the Environments panel clears an applied filter. Enter
+            // leaves the filter box with the filter still on (so the narrowed
+            // list can be navigated), and without this there'd be no way back
+            // to the full list short of backspacing the query out.
+            KeyCode::Esc if self.focus == Pane::GlobalEnv && !self.env_query.is_empty() => {
+                self.env_query.clear();
+                self.clamp_env_selection();
+            }
             // `y` (vim-style "yank") copies to the clipboard on demand — an
             // explicit fallback for terminals where the automatic
             // copy-on-mouse-release OSC 52 write isn't picked up (e.g. no
@@ -1514,6 +1676,17 @@ impl TuiApp {
             // deleted environment (mirroring how `x` deletes one there).
             KeyCode::Char('u') if self.focus == Pane::GlobalEnv => self.restore_deleted_env(),
             KeyCode::Char('u') => self.reopen_closed_tab(),
+            // `s` would be mnemonic for "source" but is already the global
+            // Settings menu. `o` is deliberately scoped to the Environments
+            // panel and cycles the row origin filter without stealing a common
+            // app-wide shortcut.
+            KeyCode::Char('o') if self.focus == Pane::GlobalEnv => {
+                if self.has_workspace_env_source() {
+                    self.env_source = self.env_source.next();
+                    self.clamp_env_selection();
+                    self.save_state();
+                }
+            }
             // Ctrl+Shift+Left/Right reorders the active tab (index 0, the
             // built-in Request tab, never moves).
             KeyCode::Left if ctrl && shift => self.move_active_tab(false),
@@ -1531,6 +1704,14 @@ impl TuiApp {
                 self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // `/` starts filtering the Global Environments panel by name. It
+            // also focuses the panel, so it works as "find me an environment"
+            // from wherever you are rather than only once the panel is focused
+            // — with hundreds of environments that is the whole point of it.
+            KeyCode::Char('/') => {
+                self.focus = Pane::GlobalEnv;
+                self.env_filter_typing = true;
+            }
             // Shift+R opens a brand-new PaperTrail report tab (report tabs live
             // after the collection tabs in the same strip). In a Workspace tab
             // it instead opens the new-report folder browser, seeded to the
@@ -1591,8 +1772,8 @@ impl TuiApp {
             // Environment; elsewhere it renames the active tab. The panel arm
             // is listed first so it wins when that panel is focused (otherwise
             // the tab-rename shortcut would shadow it).
-            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                if let Some(env_id) = self.global_envs.get(self.global_env_idx).map(|e| e.id) {
+            KeyCode::F(2) if self.focus == Pane::GlobalEnv && !self.env_rows().is_empty() => {
+                if let Some(env_id) = self.selected_env_id() {
                     self.open_prompt_rename_env(env_id);
                 }
             }
@@ -1602,15 +1783,19 @@ impl TuiApp {
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
             // Guarded by the confirm-on-delete-env preference; when it's off,
-            // delete straight away (still undoable with `u`).
-            KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.global_envs.is_empty() => {
-                if self.confirm_on_delete_env {
-                    self.overlay = Some(Overlay::Confirm {
-                        action: ConfirmAction::DeleteEnv(self.global_env_idx),
-                        sel: 1,
-                    });
-                } else {
-                    self.delete_global_env(self.global_env_idx);
+            // delete straight away (still undoable with `u`). A workspace file
+            // that isn't loaded has nothing to delete — the panel lists it, but
+            // `x` is not a way to delete files off disk.
+            KeyCode::Char('x') if self.focus == Pane::GlobalEnv && !self.env_rows().is_empty() => {
+                if let Some(idx) = self.selected_env_index() {
+                    if self.confirm_on_delete_env {
+                        self.overlay = Some(Overlay::Confirm {
+                            action: ConfirmAction::DeleteEnv(idx),
+                            sel: 1,
+                        });
+                    } else {
+                        self.delete_global_env(idx);
+                    }
                 }
             }
             KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
@@ -1622,8 +1807,24 @@ impl TuiApp {
             KeyCode::Char('c') if self.focus == Pane::List => self.start_workspace_transfer(false),
             // 'a' toggles activation of the selected Global Environment (at
             // most one may be active — activating one deactivates any other).
+            // On an unopened workspace file it loads the file first: activating
+            // it is exactly what you'd want next, and it's what Enter would
+            // have had to do anyway.
             KeyCode::Char('a') if self.focus == Pane::GlobalEnv => {
-                self.toggle_activate_env(self.global_env_idx);
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                if let Some(idx) = self.selected_env_index() {
+                    self.toggle_activate_env(idx);
+                }
+            }
+            // 'a' on a Workspace tree's environment file makes it the active
+            // environment — the terminal's answer to the GUI's right-click →
+            // "Set as active environment". It loads the file first if it isn't
+            // open yet, so activating one is a single keystroke from the tree
+            // rather than "Enter here, then find it again in the panel".
+            KeyCode::Char('a') if self.focus == Pane::List => {
+                self.activate_selected_workspace_env();
             }
             // 'p' in the Requests list links/unlinks a Global Environment to
             // the active collection.
@@ -1847,9 +2048,8 @@ impl TuiApp {
     /// Global Environments list, clamped the same way as the collections list.
     pub(crate) fn scroll_env_h(&mut self, delta: i32) {
         let len = self
-            .global_envs
-            .get(self.global_env_idx)
-            .map(|e| e.name.chars().count())
+            .selected_env_row()
+            .map(|r| r.name.chars().count())
             .unwrap_or(0);
         self.global_env_hscroll = clamp_hscroll(
             self.global_env_hscroll,
@@ -1857,6 +2057,83 @@ impl TuiApp {
             len,
             self.global_env_scroll_w.get(),
         );
+    }
+
+    /// Keys for the Global Environments panel's `/` filter, while it is
+    /// capturing. Returns `true` when the key was consumed.
+    ///
+    /// Printable characters extend the query and Backspace trims it, both
+    /// re-clamping the selection since the row the cursor was on may no longer
+    /// be there. Enter keeps the filter but hands the keyboard back to the
+    /// list, so the narrowed list can be navigated and acted on; Esc clears the
+    /// filter outright (the way out of a filter you no longer want). Up/Down
+    /// move the selection without leaving the filter, so a name can be typed
+    /// and a match picked in one go. Everything else falls through to the
+    /// panel's normal keys.
+    fn on_key_env_filter(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        match key.code {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                self.env_query.push(c);
+                self.clamp_env_selection();
+            }
+            KeyCode::Backspace => {
+                self.env_query.pop();
+                self.clamp_env_selection();
+            }
+            KeyCode::Esc => {
+                self.env_query.clear();
+                self.env_filter_typing = false;
+                self.clamp_env_selection();
+            }
+            KeyCode::Enter => self.env_filter_typing = false,
+            KeyCode::Up | KeyCode::Down => {
+                let len = self.env_rows().len();
+                if len > 0 {
+                    // Wrap the way the panel's own j/k navigation does.
+                    let cur = self.global_env_idx.min(len - 1) as i32;
+                    let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                    let next = (cur + delta).rem_euclid(len as i32) as usize;
+                    self.select_row_in_pane(Pane::GlobalEnv, next);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keep the Environments panel selection inside the (possibly just
+    /// narrowed) row list, and reset the name's horizontal scroll since the
+    /// selection is now on a different name.
+    fn clamp_env_selection(&mut self) {
+        self.global_env_idx = self
+            .global_env_idx
+            .min(self.env_rows().len().saturating_sub(1));
+        self.global_env_hscroll = 0;
+    }
+
+    /// Load the environment file the Environments panel selection is on, for a
+    /// workspace row that hasn't been opened yet. Leaves the selection on the
+    /// environment it became, so the action that triggered the load (Enter,
+    /// `a`) can go straight on to act on it. A no-op on an already-loaded row.
+    pub(crate) fn load_selected_env_row(&mut self) {
+        let Some(path) = self
+            .selected_env_row()
+            .and_then(|r| r.file().map(PathBuf::from))
+        else {
+            return;
+        };
+        let Some(p) = path.to_str() else {
+            return;
+        };
+        self.do_file_action(FileAction::LoadEnv, p);
+        if let Some(id) = self
+            .global_envs
+            .iter()
+            .find(|e| e.path.as_deref() == Some(path.as_path()))
+            .map(|e| e.id)
+        {
+            self.select_env_row_by_id(id);
+        }
     }
 
     pub(crate) fn panes(&self) -> Vec<Pane> {
@@ -2325,6 +2602,162 @@ impl TuiApp {
         }
     }
 
+    /// Right-click on a row: if it names an environment — a Workspace tree's
+    /// environment file, or a row of the Environments panel — select it and
+    /// make it active. Returns whether the click was consumed, so any other
+    /// right-click keeps its existing behaviour.
+    /// A right-click on an *edited* workspace tree row offers to throw its
+    /// in-memory changes away and go back to what is on disk — a request row
+    /// reverts that request, a collection file row reverts the whole file.
+    ///
+    /// The GUI hangs this on a context menu; a terminal has nowhere to put one,
+    /// so the gesture triggers the action directly. It is safe to do that here
+    /// because both paths raise the same confirmation dialog `Ctrl+R` does, so
+    /// a stray right-click can't lose an edit.
+    ///
+    /// Returns `false` for a clean row, leaving the click to whatever else
+    /// wants it.
+    fn right_click_revert_workspace_row(&mut self, point: Position) -> bool {
+        let Some(MouseHitTarget::SelectListRow(row)) = self.mouse_hit_at(point) else {
+            return false;
+        };
+        let ci = self.active_tab;
+        let Some(col) = self.collections.get(ci) else {
+            return false;
+        };
+        if !col.is_workspace() {
+            return false;
+        }
+        match col.ws_rows().into_iter().nth(row) {
+            // Only the loaded collection's requests can be reverted one at a
+            // time: another file's edits are parked as a whole, with no on-disk
+            // entry to put back in place of just one of them. Its file row
+            // (below) reverts the lot.
+            Some(crate::collection::WsRow::Request {
+                collection,
+                idx,
+                loaded: true,
+                ..
+            }) if col.path.as_deref() == Some(collection.as_path())
+                // `modified`, not "edited": a request that was *added* in this
+                // session has no saved version to go back to, so reverting it
+                // would have nothing to do. The file row still offers to drop
+                // it along with the rest of the file's edits.
+                && col.entries.get(idx).is_some_and(|e| e.modified) =>
+            {
+                self.select_row_in_pane(Pane::List, row);
+                self.collections[ci].selected_entry = idx;
+                self.begin_revert_request();
+                true
+            }
+            Some(crate::collection::WsRow::Collection { path, .. })
+                if col.workspace_file_edited(&path) =>
+            {
+                self.select_row_in_pane(Pane::List, row);
+                self.overlay = Some(Overlay::Confirm {
+                    action: ConfirmAction::RevertWorkspaceFile(ci, path),
+                    sel: 1,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn right_click_activate_env(&mut self, point: Position) -> bool {
+        match self.mouse_hit_at(point) {
+            Some(MouseHitTarget::SelectListRow(row)) => {
+                let ci = self.active_tab;
+                let Some(col) = self.collections.get(ci) else {
+                    return false;
+                };
+                if !col.is_workspace()
+                    || !matches!(
+                        col.ws_rows().into_iter().nth(row),
+                        Some(crate::collection::WsRow::Environment { .. })
+                    )
+                {
+                    return false;
+                }
+                self.select_row_in_pane(Pane::List, row);
+                self.activate_selected_workspace_env();
+                true
+            }
+            // In the panel the row may be a workspace file that isn't open yet;
+            // `a`'s handler already loads one before activating, so reuse it
+            // rather than repeating that logic here.
+            Some(MouseHitTarget::SelectGlobalEnvRow(row)) => {
+                self.select_row_in_pane(Pane::GlobalEnv, row);
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                let Some(idx) = self.selected_env_index() else {
+                    return true;
+                };
+                // "Make this active", not "toggle": right-clicking the active
+                // environment shouldn't turn substitution off.
+                if self.active_env_id != self.global_envs.get(idx).map(|e| e.id) {
+                    self.toggle_activate_env(idx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Make the Workspace tree's selected environment file the active
+    /// environment, loading it if it isn't open yet.
+    ///
+    /// Unlike [`Self::open_workspace_environment`] this doesn't open the
+    /// variables popup: the point of the gesture is to switch environment and
+    /// carry on with the request you were looking at, so nothing takes over the
+    /// screen. Nothing happens on any other kind of row, which keeps `a` from
+    /// doing something surprising elsewhere in the tree.
+    fn activate_selected_workspace_env(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        let Some(crate::collection::WsRow::Environment { path, .. }) = col
+            .is_workspace()
+            .then(|| col.ws_rows().into_iter().nth(col.list_cursor))
+            .flatten()
+        else {
+            return;
+        };
+        // Reuse an already-open copy rather than loading the file twice, which
+        // would leave two rows for one file in the Environments panel.
+        let existing = self
+            .global_envs
+            .iter()
+            .position(|e| e.path.as_deref() == Some(path.as_path()));
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                if let Some(p) = path.to_str() {
+                    self.do_file_action(FileAction::LoadEnv, p);
+                }
+                // A prompt (name collision, say) means the load hasn't happened
+                // yet; activating would act on the wrong environment.
+                if self.overlay.is_some() {
+                    return;
+                }
+                match self
+                    .global_envs
+                    .iter()
+                    .position(|e| e.path.as_deref() == Some(path.as_path()))
+                {
+                    Some(i) => i,
+                    None => return,
+                }
+            }
+        };
+        // `toggle_activate_env` would *deactivate* one that's already active,
+        // which isn't what "make this the active environment" asks for.
+        if self.active_env_id != Some(self.global_envs[idx].id) {
+            self.toggle_activate_env(idx);
+        }
+        self.select_env_row_by_id(self.global_envs[idx].id);
+    }
+
     /// Toggle the Workspace tree's extension filter (`Ctrl+F`): on shows only
     /// the workspace's own file types (`.hurl/.json/.vars/.trail`); off shows
     /// every file. Persisted via `workspace_filter_hurl_json` (shared with the
@@ -2511,7 +2944,7 @@ impl TuiApp {
                 self.select_row_in_pane(Pane::List, step(cur, len, delta));
             }
             Pane::GlobalEnv => {
-                let len = self.global_envs.len();
+                let len = self.env_rows().len();
                 self.select_row_in_pane(Pane::GlobalEnv, step(self.global_env_idx, len, delta));
             }
             Pane::Main => {
@@ -2558,10 +2991,11 @@ impl TuiApp {
                 self.clear_selections();
             }
             Pane::GlobalEnv => {
-                if self.global_envs.is_empty() {
+                let len = self.env_rows().len();
+                if len == 0 {
                     return;
                 }
-                self.global_env_idx = absolute_index.min(self.global_envs.len() - 1);
+                self.global_env_idx = absolute_index.min(len - 1);
                 self.focus = Pane::GlobalEnv;
                 self.global_env_hscroll = 0;
             }
@@ -2623,8 +3057,14 @@ impl TuiApp {
                 // showing that environment's variables (mirrors the old
                 // inline panel's Enter-to-edit-secret behaviour, but scoped
                 // to the popup rather than the collection-embedded panel).
-                if let Some(env) = self.global_envs.get(self.global_env_idx) {
-                    self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env.id)));
+                // A workspace file that isn't open yet is loaded first — the
+                // panel lists the whole workspace, so Enter is how you open
+                // one of them without going back to the tree.
+                if self.selected_env_id().is_none() {
+                    self.load_selected_env_row();
+                }
+                if let Some(id) = self.selected_env_id() {
+                    self.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(id)));
                 }
             }
             Pane::Main => {
@@ -2916,76 +3356,26 @@ impl TuiApp {
 
     /// Overwrite the current tabs / language / base URL from persisted state.
     /// `collections[0]` always remains the built-in Request tab.
-    pub(crate) fn apply_persisted(&mut self, state: PersistedState) {
-        self.language = state.language;
-        if !state.base_url.trim().is_empty() {
-            self.vars.base_url = state.base_url;
-        }
-        // Restore the global environment list first, gathering every
-        // environment's pending secrets into one batch so restoring several
-        // 1Password-backed environments only prompts for authorization once
-        // in total, not once per environment.
-        let mut pending_groups = Vec::new();
-        let mut global_envs = Vec::with_capacity(state.global_envs.len());
-        for pe in &state.global_envs {
-            let (env, pending) = pe.restore();
-            if !pending.is_empty() {
-                pending_groups.push(PendingEnvSecrets {
-                    env_id: env.id,
-                    pending,
-                });
-            }
-            global_envs.push(env);
-        }
-        self.active_env_id = state
-            .active_global_env
-            .and_then(|idx| global_envs.get(idx))
-            .map(|e| e.id);
-        self.global_envs = global_envs;
-        if !pending_groups.is_empty() {
-            self.pending_env.push(spawn_resolution_many(pending_groups));
-        }
-        if !state.tabs.is_empty() {
-            // Track tabs whose Workspace root vanished entirely since the
-            // last session (see `PersistedTab::into_collection`): a plain
-            // status message for ones with nothing to redownload (a local
-            // folder that was moved/deleted), or queued up for a
-            // redownload-confirm prompt (see `open_next_pending_workspace_reload`)
-            // for ones that are known to have come from git.
-            let mut missing_workspace_name = None;
-            let mut pending_reloads = std::collections::VecDeque::new();
-            let collections = state
-                .tabs
-                .into_iter()
-                .enumerate()
-                .map(|(i, tab)| {
-                    let had_root = tab.workspace_root.is_some();
-                    let name = tab.name.clone();
-                    let linked_env_id = tab
-                        .linked_env_index
-                        .and_then(|idx| self.global_envs.get(idx))
-                        .map(|e| e.id);
-                    let (col, pending_reload) = tab.into_collection(linked_env_id);
-                    if had_root && col.workspace_root.is_none() {
-                        match pending_reload {
-                            Some(reload) => pending_reloads.push_back((i, reload)),
-                            None => missing_workspace_name = Some(name),
-                        }
-                    }
-                    col
-                })
-                .collect();
-            self.collections = collections;
-            if let Some(name) = missing_workspace_name {
-                self.status = Some(Status::WorkspaceFolderMissing(name));
-            }
-            self.pending_workspace_reloads = pending_reloads;
-            self.open_next_pending_workspace_reload();
-        }
-        // Restore report tabs after the collections, then clamp the active tab
-        // against the *unified* tab count (collections + standalone reports).
-        self.reports = state
-            .reports
+    /// Restore from persisted state.
+    ///
+    /// Everything both front-ends share is restored by
+    /// [`Session::apply_persisted`]; what is left here is the terminal UI's own
+    /// view of reports, which it holds as richer
+    /// [`ReportTab`](crate::tui::reports::ReportTab)s than the plain
+    /// `PersistedReport`s the session carries.
+    pub(crate) fn apply_persisted(&mut self, mut state: PersistedState) {
+        // Taken before the session sees it: the session keeps `PersistedReport`s,
+        // but the terminal UI needs to build `ReportTab`s from the same rows, and
+        // cloning a whole report's source text twice for that is wasteful.
+        let persisted_reports = std::mem::take(&mut state.reports);
+        // The session clamps the active tab against *its* tab count, which knows
+        // nothing about the report tabs built below; re-clamp once they exist.
+        let wanted_tab = state.active_tab;
+
+        self.session.apply_persisted(state);
+        self.open_next_pending_workspace_reload();
+
+        self.reports = persisted_reports
             .into_iter()
             .map(|pr| {
                 // Re-link a workspace report to its root if the folder still
@@ -3032,7 +3422,7 @@ impl TuiApp {
                 self.focus_workspace_tree_on_report(ci, &path);
             }
         }
-        self.active_tab = state.active_tab.min(self.tab_count().saturating_sub(1));
+        self.active_tab = wanted_tab.min(self.tab_count().saturating_sub(1));
         // A workspace collection resumes focused on its tree (`Pane::List`, the
         // default), and so does a workspace report shown in the right pane — the
         // single tree keeps driving navigation. Nothing extra to set here (the
@@ -3041,44 +3431,21 @@ impl TuiApp {
         for i in 0..self.reports.len() {
             self.revalidate_report(i);
         }
-        self.last_browse_dir = state
-            .last_browse_dir
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        self.last_env_dir = state
-            .last_env_dir
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        self.confirm_on_exit = state.confirm_on_exit;
-        self.confirm_on_clear = state.confirm_on_clear;
-        self.confirm_on_delete_env = state.confirm_on_delete_env;
-        self.always_save_when_prompted = state.always_save_when_prompted;
-        self.list_width = state.list_width;
-        self.response_pct = state.response_pct;
-        self.recent_git_urls = state.recent_git_urls;
-        self.default_request_view = state.default_request_view;
-        self.run_all_batch_mode = state.run_all_batch_mode;
-        self.custom_themes = state.custom_themes;
-        self.active_theme = state.active_theme;
-        self.gui_layout = state.gui;
     }
 
     /// Snapshot the current state for saving (environments are saved in source
     /// form only, so resolved secrets are never written to disk).
+    /// Snapshot for saving.
+    ///
+    /// Everything the two front-ends share is produced by
+    /// [`Session::to_persisted`] — there is one writer of that schema, so a
+    /// setting added to `Session` is persisted by both without a second edit
+    /// here. Only `reports` is overridden, because the terminal UI holds richer
+    /// [`ReportTab`](crate::tui::reports::ReportTab)s than the plain
+    /// `PersistedReport`s the session carries, and decides which of them are
+    /// worth writing out.
     pub(crate) fn to_persisted(&self) -> PersistedState {
         PersistedState {
-            language: self.language.clone(),
-            base_url: self.vars.base_url.clone(),
-            tabs: self
-                .collections
-                .iter()
-                .map(|c| {
-                    let linked_env_index = c
-                        .linked_env_id
-                        .and_then(|id| self.global_envs.iter().position(|e| e.id == id));
-                    PersistedTab::from_collection(c, linked_env_index)
-                })
-                .collect(),
             // Report tabs are persisted as source-text snapshots (see
             // `PersistedReport`) so an unsaved scratch report survives a restart.
             // Standalone reports and the *shown* embedded report of each
@@ -3105,38 +3472,18 @@ impl TuiApp {
                     pr
                 })
                 .collect(),
-            active_tab: self.active_tab,
-            last_browse_dir: self
-                .last_browse_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            last_env_dir: self
-                .last_env_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            confirm_on_exit: self.confirm_on_exit,
-            confirm_on_clear: self.confirm_on_clear,
-            confirm_on_delete_env: self.confirm_on_delete_env,
-            always_save_when_prompted: self.always_save_when_prompted,
-            list_width: self.list_width,
-            response_pct: self.response_pct,
-            recent_git_urls: self.recent_git_urls.clone(),
-            default_request_view: self.default_request_view,
-            run_all_batch_mode: self.run_all_batch_mode,
-            custom_themes: self.custom_themes.clone(),
-            active_theme: self.active_theme.clone(),
-            global_envs: self
-                .global_envs
-                .iter()
-                .map(PersistedEnv::from_environment)
-                .collect(),
-            gui: self.gui_layout,
-            active_global_env: self
-                .active_env_id
-                .and_then(|id| self.global_envs.iter().position(|e| e.id == id)),
+            ..self.session.to_persisted()
         }
     }
 
+    /// Persist the current state.
+    ///
+    /// Note for anyone reaching for [`Session::save`] instead: it exists, and
+    /// `Deref` makes `self.save()` compile, but it would write the session's own
+    /// `PersistedReport`s rather than the terminal UI's `ReportTab`s — silently
+    /// dropping unsaved report edits. Always go through this one. The
+    /// `save_state` name is kept distinct from `save` so the two can't be
+    /// confused at a call site.
     pub(crate) fn save_state(&self) {
         persistence::save_state(&self.to_persisted());
     }
@@ -3174,12 +3521,6 @@ impl TuiApp {
                 self.clear_all();
                 self.status = Some(Status::Cleared);
             }
-            // Confirmed a change-overwrite of the ORIGINAL file: write there.
-            ConfirmAction::Save(save) => {
-                if let Some(path) = self.original_save_path(save) {
-                    self.do_file_action(save, &path);
-                }
-            }
             // Confirmed a "Save As" over an existing file.
             ConfirmAction::Overwrite(save) => {
                 if let Some(path) = self.pending_save_path.take() {
@@ -3191,6 +3532,19 @@ impl TuiApp {
                 Some(method) => self.status = Some(Status::RequestReverted(method)),
                 None => self.status = Some(Status::NothingToRevert),
             },
+            ConfirmAction::RevertWorkspaceFile(ci, path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                match self.collections[ci].revert_workspace_file(&path) {
+                    Ok(()) => {
+                        self.status = Some(Status::FileReverted(name));
+                        self.save_state();
+                    }
+                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                }
+            }
             ConfirmAction::RevertEnv(env_id) => match self.revert_env_to_saved(env_id) {
                 Some(name) => self.status = Some(Status::EnvReverted(name)),
                 None => self.status = Some(Status::NothingToRevert),
@@ -3262,8 +3616,13 @@ impl TuiApp {
     }
 
     /// "Save Collection" / "Save Environment": write to the original file when
-    /// one exists (silently if unchanged, else after a change confirmation);
-    /// otherwise fall back to "Save As".
+    /// one exists, otherwise fall back to "Save As".
+    ///
+    /// No confirmation, even with unsaved changes: "Save" *means* write my
+    /// changes back to the file they came from, so asking again was asking the
+    /// user to confirm the thing they had just asked for. "Save As" still
+    /// confirms before overwriting a *different* file, which is a genuine
+    /// surprise — that one is about the file you didn't choose to change.
     pub(crate) fn begin_save(&mut self, action: FileAction) {
         if action == FileAction::SaveEnv && self.current_env_id().is_none() {
             self.status = Some(Status::NotEnvironment);
@@ -3274,31 +3633,7 @@ impl TuiApp {
             return;
         }
         match self.original_save_path(action) {
-            Some(path) => {
-                let changes = match action {
-                    FileAction::SaveEnv => self
-                        .current_env_id()
-                        .map(|id| self.changed_env_count(id))
-                        .unwrap_or(0),
-                    // A report's "changes" is just its dirty flag (its source is
-                    // a single text buffer, not a set of per-request markers).
-                    FileAction::SaveReport => self
-                        .active_report_index()
-                        .filter(|&i| self.reports[i].report.dirty)
-                        .map(|_| 1)
-                        .unwrap_or(0),
-                    _ => self.changed_request_count(self.active_tab),
-                };
-                if changes == 0 {
-                    // Nothing changed — saving to the original is a no-op; just do it.
-                    self.do_file_action(action, &path);
-                } else {
-                    self.overlay = Some(Overlay::Confirm {
-                        action: ConfirmAction::Save(action),
-                        sel: 1,
-                    });
-                }
-            }
+            Some(path) => self.do_file_action(action, &path),
             None => self.begin_save_as(action),
         }
     }
@@ -3432,6 +3767,25 @@ impl TuiApp {
         self.browser_name = Editor::new(&format!("{stem}.{}", OUTPUT_EXTENSIONS[next]), false);
     }
 
+    /// Save into the folder the picker is showing, under the name already in
+    /// its inline field — what Space (and Enter on a file row) does in a
+    /// "save to folder" picker.
+    ///
+    /// A blank name leaves the picker open: there is nothing to save under it,
+    /// and closing on a name the user never typed would write a file called
+    /// nothing anywhere they happened to be standing.
+    fn browser_commit_current_folder(&mut self, action: FileAction, ex: &FileExplorer) {
+        let name = self.browser_name.text().trim().to_string();
+        if name.is_empty() {
+            self.browser_name_focused = true;
+            self.overlay = Some(Overlay::Browser(action, Box::new(ex.clone())));
+            return;
+        }
+        let dir = ex.cwd().clone();
+        self.last_browse_dir = Some(dir.clone());
+        self.browser_commit_save(action, dir, name);
+    }
+
     pub(crate) fn browser_commit_save(
         &mut self,
         action: FileAction,
@@ -3448,6 +3802,7 @@ impl TuiApp {
                 }
                 self.finish_workspace_save(name);
             }
+            FileAction::PostmanDestChooseFolder => self.finish_postman_dest(dir, name),
             FileAction::SaveCollectionChooseFolder => {
                 let mut file = std::path::PathBuf::from(&name);
                 if file.extension().is_none() {
@@ -3874,8 +4229,24 @@ impl TuiApp {
         }
     }
 
+    /// The Import submenu: `0` opens a file the user exported from Postman,
+    /// `1` connects to their Postman account.
+    pub(crate) fn activate_file_import_item(&mut self, sel: usize) {
+        if sel == 0 {
+            self.open_browser(FileAction::ImportPostmanFile);
+        } else {
+            self.open_postman_wizard();
+        }
+    }
+
     /// Second step of Load: `sel` is `0` for a local file, `1` for git.
     pub(crate) fn activate_file_load_source(&mut self, kind: FileKind, sel: usize) {
+        // Workspace has a third source (see `file_load_source_items`); it is
+        // handled first so the local/git pairing below stays a simple boolean.
+        if kind == FileKind::Workspace && sel == 2 {
+            self.open_postman_wizard();
+            return;
+        }
         let local = sel == 0;
         match (kind, local) {
             (FileKind::Collection, true) => self.open_browser(FileAction::OpenCollection),
@@ -3955,6 +4326,7 @@ impl TuiApp {
         let s = Strings::for_language(&self.language);
         let label = match action {
             FileAction::OpenCollection => s.open_collection,
+            FileAction::ImportPostmanFile => s.postman_export_open_title,
             FileAction::LoadEnv => s.load_environment,
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
@@ -3966,13 +4338,29 @@ impl TuiApp {
             FileAction::SaveReportChooseFolder => s.save_report_folder,
             FileAction::NewReportChooseFolder => s.new_report_folder,
             FileAction::PickReportNodeFolder => s.report_node_folder_pick,
+            FileAction::PickReportHeaderFolder => s.report_header_root_pick,
+            FileAction::PickReportHeaderFile => s.report_header_baseline_pick,
+            FileAction::PickReportParamFolder | FileAction::PickReportParamFile => {
+                s.param_pick_path
+            }
+            FileAction::PostmanDestChooseFolder => s.postman_dest_folder,
             _ => s.browser_select_file,
         }
         .trim_end_matches('…');
         let hint_body = match action {
             FileAction::OpenWorkspace => s.browser_hint_workspace,
-            FileAction::PickReportNodeFolder => s.browser_hint_workspace,
-            FileAction::SaveWorkspaceChooseFolder => s.browser_hint_workspace_save,
+            // Shares the Workspace picker's shape (Space confirms the current
+            // directory) but not its meaning — this folder becomes a loop's
+            // source, not a Workspace root.
+            FileAction::PickReportNodeFolder => s.browser_hint_node_folder,
+            // `root:` names a folder (Space confirms the current one);
+            // `baseline:` names a file, so it uses the ordinary file hint.
+            FileAction::PickReportHeaderFolder | FileAction::PickReportParamFolder => {
+                s.browser_hint_header_folder
+            }
+            FileAction::SaveWorkspaceChooseFolder | FileAction::PostmanDestChooseFolder => {
+                s.browser_hint_workspace_save
+            }
             FileAction::MoveWorkspaceItemChooseFolder => s.browser_hint_workspace_move,
             FileAction::SaveCollectionChooseFolder
             | FileAction::SaveReportCsvChooseFolder
@@ -3985,6 +4373,7 @@ impl TuiApp {
             _ => s.browser_hint,
         };
         let hint = format!("{label}  ·  {hint_body}");
+        self.browser_hint_line = hint.clone();
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -4038,6 +4427,13 @@ impl TuiApp {
                         .new_report_seed_dir
                         .as_ref()
                         .or(self.last_browse_dir.as_ref()),
+                    // Reopen where the wizard's current destination lives, so
+                    // browsing starts from the suggestion rather than wherever
+                    // the user last opened a file.
+                    FileAction::PostmanDestChooseFolder => self
+                        .postman_dest_seed_dir
+                        .as_ref()
+                        .or(self.last_browse_dir.as_ref()),
                     _ => self.last_browse_dir.as_ref(),
                 };
                 if let Some(dir) = reopen
@@ -4048,6 +4444,7 @@ impl TuiApp {
                 // The seed dir is one-shot — clear it so a later browser opened
                 // for a different action doesn't inherit it.
                 self.new_report_seed_dir = None;
+                self.postman_dest_seed_dir = None;
                 // Remember where the browser actually started so `^r` can jump
                 // back here after the user navigates away.
                 self.browser_origin_dir = Some(ex.cwd().clone());
@@ -4071,6 +4468,11 @@ impl TuiApp {
                         // A brand-new report always starts from a fresh default
                         // name (never the active report's file name).
                         FileAction::NewReportChooseFolder => "report.trail".to_string(),
+                        FileAction::PostmanDestChooseFolder => self
+                            .parked_postman
+                            .as_ref()
+                            .map(|w| w.dest_folder_name())
+                            .unwrap_or_default(),
                         _ => self.default_save_collection_filename(),
                     };
                     self.browser_name = Editor::new(&default, false);
@@ -4436,24 +4838,47 @@ impl TuiApp {
                 self.overlay = Some(Overlay::FileMenu(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::FileMenu((sel + 1).min(1)));
+                self.overlay = Some(Overlay::FileMenu((sel + 1).min(2)));
             }
             KeyCode::Enter | KeyCode::Right => {
-                self.overlay = Some(if sel == 0 {
-                    Overlay::FileLoadMenu(0)
-                } else {
-                    Overlay::FileSaveMenu(0)
+                self.overlay = Some(match sel {
+                    0 => Overlay::FileLoadMenu(0),
+                    1 => Overlay::FileSaveMenu(0),
+                    _ => Overlay::FileImportMenu(0),
                 });
             }
             KeyCode::Char(c) => {
                 let s = Strings::for_language(&self.language);
                 match mnemonic_index(&file_menu_items(&s), c) {
                     Some(0) => self.overlay = Some(Overlay::FileLoadMenu(0)),
-                    Some(_) => self.overlay = Some(Overlay::FileSaveMenu(0)),
+                    Some(1) => self.overlay = Some(Overlay::FileSaveMenu(0)),
+                    Some(_) => self.overlay = Some(Overlay::FileImportMenu(0)),
                     None => self.overlay = Some(Overlay::FileMenu(sel)),
                 }
             }
             _ => self.overlay = Some(Overlay::FileMenu(sel)),
+        }
+    }
+
+    fn file_import_menu_key_handler(&mut self, key: KeyEvent, sel: usize) {
+        let s = Strings::for_language(&self.language);
+        let items = file_import_items(&s);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                self.overlay = Some(Overlay::FileMenu(2))
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Some(Overlay::FileImportMenu(sel.saturating_sub(1)));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay = Some(Overlay::FileImportMenu((sel + 1).min(items.len() - 1)));
+            }
+            KeyCode::Enter | KeyCode::Right => self.activate_file_import_item(sel),
+            KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                Some(i) => self.activate_file_import_item(i),
+                None => self.overlay = Some(Overlay::FileImportMenu(sel)),
+            },
+            _ => self.overlay = Some(Overlay::FileImportMenu(sel)),
         }
     }
 
@@ -4511,7 +4936,7 @@ impl TuiApp {
 
     fn file_load_source_key_handler(&mut self, key: KeyEvent, kind: FileKind, sel: usize) {
         let s = Strings::for_language(&self.language);
-        let items = file_load_source_items(&s);
+        let items = file_load_source_items(kind, &s);
         match key.code {
             // Left/Esc steps back to the kind list with this kind lit.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
@@ -5010,7 +5435,14 @@ impl TuiApp {
         }
         let _ = ex.set_filter_map(move |file| {
             if file.is_dir && file.name == "../" {
-                return Some(file);
+                // The way out is narrowed by the query like everything else,
+                // but matched on what it is *shown* as: its path is the parent
+                // directory, whose real name has nothing to do with the ".."
+                // being typed at. Hiding it strands nobody — Left still
+                // ascends, Backspace trims the query and Esc clears it — and
+                // leaving it pinned to the top of a filtered list made it the
+                // one row that never answered the question you asked.
+                return (query.is_empty() || "../".contains(&query)).then_some(file);
             }
             if !file.is_dir && filter_on && !browser_keep_file(action, &file) {
                 return None;
@@ -5028,6 +5460,20 @@ impl TuiApp {
             }
             Some(file)
         });
+    }
+
+    /// Drop any type-to-filter query after the browser has changed directory.
+    ///
+    /// A query is typed to find something *here*; it almost never matches
+    /// anything inside the folder it just found, so carrying it across a
+    /// descent made the new directory look empty (only `../` survives the
+    /// filter) with no visible cause. Navigation is the whole point of a folder
+    /// picker, so the query is scoped to one directory and cleared on arrival.
+    fn browser_clear_query_on_move(&mut self, action: FileAction, ex: &mut FileExplorer) {
+        if !self.browser_query.is_empty() {
+            self.browser_query.clear();
+            self.apply_browser_filter(action, ex);
+        }
     }
 
     fn browser_key_handler(
@@ -5068,17 +5514,28 @@ impl TuiApp {
             self.overlay = Some(Overlay::Browser(action, ex));
             return;
         }
-        // Type-to-filter for the load pickers: printable keys narrow the file
-        // list by name (case-insensitive substring) on top of the extension
-        // filter, so a crowded folder can be sifted by just typing. Handled
-        // before the generic key match below so letters that double as vim
-        // motions here (h/j/k/l/q) filter instead of navigating. Backspace
-        // trims the query; the first Esc clears it (a second Esc, with an empty
-        // query, then cancels via the generic handler).
-        if browser_filters_by_ext(action) && !save_folder {
+        // Type-to-filter, in every browser: printable keys narrow the list by
+        // name (case-insensitive substring) on top of any extension filter, so
+        // a crowded folder can be sifted by just typing. Handled before the
+        // generic key match below so letters that double as vim motions here
+        // (h/j/k/l/q) filter instead of navigating. Backspace trims the query;
+        // the first Esc clears it (a second Esc, with an empty query, then
+        // cancels via the generic handler).
+        //
+        // Two carve-outs, both about a key that already means something here:
+        //  * a "save to folder" picker has an inline filename editor, so typing
+        //    only filters while the *list* has focus — Tab moves to the field,
+        //    where the same keys type a name;
+        //  * a folder picker takes `Space` as "choose this directory", so a
+        //    space never enters the query there (see
+        //    [`browser_confirms_on_space`]).
+        if !save_folder || !self.browser_name_focused {
             match key.code {
                 KeyCode::Char(c)
-                    if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+                    if !ctrl
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && !c.is_control()
+                        && !(c == ' ' && browser_confirms_on_space(action)) =>
                 {
                     self.browser_query.push(c);
                     self.apply_browser_filter(action, &mut ex);
@@ -5144,14 +5601,37 @@ impl TuiApp {
                 // unchanged, rather than discarding it.
                 if let Some(form) = self.parked_wizard.take() {
                     self.overlay = Some(Overlay::NewRequest(form));
+                } else if let Some(w) = self.parked_postman.take() {
+                    // Cancelling the pick keeps the destination the wizard
+                    // already had, rather than clearing it.
+                    self.overlay = Some(Overlay::PostmanImport(w));
                 } else if action == FileAction::SaveWorkspaceChooseFolder {
                     self.cancel_workspace_save();
+                } else if matches!(
+                    action,
+                    FileAction::PickReportHeaderFolder | FileAction::PickReportHeaderFile
+                ) {
+                    // Abandon the pick; the directive keeps its current value.
+                    self.pending_header_path = None;
+                } else if matches!(
+                    action,
+                    FileAction::PickReportParamFolder | FileAction::PickReportParamFile
+                ) {
+                    // Abandon the pick; the parameter keeps its current value.
+                    self.pending_param_path = None;
                 } else if action == FileAction::PickReportNodeFolder {
                     // Abandon the folder pick; the node keeps its current dir.
                     self.pending_node_folder = None;
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                // A query can now match nothing at all — `../` no longer
+                // survives every filter — and `current()` indexes the list, so
+                // there is nothing here to open.
+                if ex.files().is_empty() {
+                    self.overlay = Some(Overlay::Browser(action, ex));
+                    return;
+                }
                 let on_parent_row = ex.cwd().parent() == Some(ex.current().path.as_path());
                 if ex.current().is_dir && on_parent_row {
                     // The "../" row goes UP, which isn't a descent. Enter
@@ -5162,12 +5642,14 @@ impl TuiApp {
                     // Enter) to ascend.
                     if key.code == KeyCode::Enter && !self.browser_confined_at_root(action, &ex) {
                         self.browser_ascend(&mut ex);
+                        self.browser_clear_query_on_move(action, &mut ex);
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else if ex.current().is_dir {
                     // Descend into the directory (handled by the explorer).
                     let target = ex.current().path.clone();
                     let _ = ex.handle(&Event::Key(key));
+                    self.browser_clear_query_on_move(action, &mut ex);
                     // If this descent retraces the upward trail, re-select
                     // the next folder down it so a run of Rights unwinds a
                     // run of Lefts exactly. Stepping into any other folder
@@ -5185,24 +5667,23 @@ impl TuiApp {
                         None => self.browser_forward_path = None,
                     }
                     self.overlay = Some(Overlay::Browser(action, ex));
+                } else if save_folder {
+                    // A file row in a "save to folder" picker: the file itself
+                    // can't be the answer (the answer is a folder plus a name),
+                    // and Enter here used to do nothing at all. It now means
+                    // what Space means -- save into the folder being shown,
+                    // under the name in the field -- because a dead key on the
+                    // row the user is looking at teaches them the picker is
+                    // stuck. Enter on a *folder* row still descends: that is
+                    // how you get anywhere.
+                    self.browser_commit_current_folder(action, &ex);
                 } else if matches!(
                     action,
-                    FileAction::OpenWorkspace
-                        | FileAction::SaveWorkspaceChooseFolder
-                        | FileAction::SaveCollectionChooseFolder
-                        | FileAction::MoveWorkspaceItemChooseFolder
-                        | FileAction::NewReportChooseFolder
+                    FileAction::OpenWorkspace | FileAction::MoveWorkspaceItemChooseFolder
                 ) {
-                    // A Workspace root/destination (or a collection save
-                    // destination) must be a folder, not a file — Enter on a
-                    // file here is a no-op. For the "save to folder" pickers,
-                    // Tab to the filename field at the bottom and press Enter
-                    // there to save into the current folder; `Space` picks the
-                    // current folder as a Workspace root (OpenWorkspace).
-                    // `NewReportChooseFolder` shows the workspace's own files
-                    // for context but only folders are selectable, so Enter on
-                    // one of those files is likewise inert (the browser stays
-                    // open).
+                    // A Workspace root/move destination must be a folder, not a
+                    // file, and `Space` is how the current one is confirmed —
+                    // so Enter on a file here is a no-op.
                     self.overlay = Some(Overlay::Browser(action, ex));
                 } else {
                     // A file is selected — remember its folder so the browser
@@ -5216,6 +5697,12 @@ impl TuiApp {
                     self.do_file_action(action, &path);
                     self.save_state();
                 }
+            }
+            // Space saves into the folder on screen, under the name already in
+            // the inline field — the decision the picker was opened to confirm.
+            // Tab is still there for renaming it first.
+            KeyCode::Char(' ') if save_folder => {
+                self.browser_commit_current_folder(action, &ex);
             }
             KeyCode::Char(' ') if action == FileAction::OpenWorkspace => {
                 // Confirm the CURRENT WORKING DIRECTORY (not necessarily
@@ -5234,6 +5721,20 @@ impl TuiApp {
                 self.overlay = None;
                 self.finish_workspace_item_move(dir);
             }
+            KeyCode::Char(' ') if action == FileAction::PickReportHeaderFolder => {
+                // Confirm the current directory as the report's `# root:`.
+                let dir = ex.cwd().clone();
+                self.last_browse_dir = Some(dir.clone());
+                self.commit_report_header_path(&dir.to_string_lossy());
+                self.save_state();
+            }
+            KeyCode::Char(' ') if action == FileAction::PickReportParamFolder => {
+                // Confirm the current directory as the parameter's value.
+                let dir = ex.cwd().clone();
+                self.last_browse_dir = Some(dir.clone());
+                self.commit_report_param_path(&dir.to_string_lossy());
+                self.save_state();
+            }
             KeyCode::Char(' ') if action == FileAction::PickReportNodeFolder => {
                 // Confirm the current directory as the loop's source folder,
                 // writing it into the parked `FOR … IN FILES/FOLDERS` node.
@@ -5249,6 +5750,7 @@ impl TuiApp {
                     && origin.is_dir()
                 {
                     let _ = ex.set_cwd(&origin);
+                    self.browser_clear_query_on_move(action, &mut ex);
                 }
                 self.browser_forward_path = None;
                 self.overlay = Some(Overlay::Browser(action, ex));
@@ -5262,12 +5764,18 @@ impl TuiApp {
                 // inside the workspace, so there's nowhere higher to go.
                 if !self.browser_confined_at_root(action, &ex) {
                     self.browser_ascend(&mut ex);
+                    self.browser_clear_query_on_move(action, &mut ex);
                 }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
             _ => {
-                // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …).
-                let _ = ex.handle(&Event::Key(key));
+                // Navigation (j/k, Home/End, Ctrl+h toggle hidden, …). Skipped
+                // on an empty list: the explorer's own handlers index it
+                // unguarded (`% files.len()`, `files.len() - 1`), so a Down on
+                // a filter that matched nothing would panic.
+                if !ex.files().is_empty() {
+                    let _ = ex.handle(&Event::Key(key));
+                }
                 self.overlay = Some(Overlay::Browser(action, ex));
             }
         }
@@ -6065,6 +6573,28 @@ fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
     Some(ancestor.join(first))
 }
 
+/// Whether `Space` confirms the current directory for this action, rather than
+/// being an ordinary character. The folder pickers have no filename to type, so
+/// they took `Space` as "choose this folder"; type-to-filter must therefore
+/// leave it alone in exactly these three, and only these three.
+fn browser_confirms_on_space(action: FileAction) -> bool {
+    // A "save to folder" picker confirms on Space too, with the name already
+    // sitting in its inline field. That field is seeded with the name the
+    // caller wanted in the first place, so the common case -- "yes, here,
+    // called that" -- was three keystrokes (Tab, Enter, and the Tab back if
+    // you'd changed your mind) for a decision the user had already made.
+    action.is_save_to_folder() || {
+        matches!(
+            action,
+            FileAction::OpenWorkspace
+                | FileAction::MoveWorkspaceItemChooseFolder
+                | FileAction::PickReportNodeFolder
+                | FileAction::PickReportHeaderFolder
+                | FileAction::PickReportParamFolder
+        )
+    }
+}
+
 /// Whether the local load browser filters by extension for this action. The
 /// three "open an existing X" pickers hide files that can't be that X; the
 /// save-to-folder and folder-pick actions don't (they list everything). See
@@ -6072,7 +6602,10 @@ fn child_towards(ancestor: &Path, descendant: &Path) -> Option<PathBuf> {
 fn browser_filters_by_ext(action: FileAction) -> bool {
     matches!(
         action,
-        FileAction::OpenCollection | FileAction::LoadEnv | FileAction::OpenReport
+        FileAction::OpenCollection
+            | FileAction::ImportPostmanFile
+            | FileAction::LoadEnv
+            | FileAction::OpenReport
     )
 }
 
@@ -6094,8 +6627,17 @@ fn browser_keep_file(action: FileAction, file: &ExplorerFile) -> bool {
         FileAction::OpenCollection => {
             matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
         }
+        // Postman writes both kinds of export as `.json`; which one this is is
+        // read off the content once it is chosen.
+        FileAction::ImportPostmanFile => {
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("json"))
+        }
         FileAction::LoadEnv => {
-            matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars") || e.eq_ignore_ascii_case("env"))
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars")
+                || e.eq_ignore_ascii_case("env")
+                // Postman exports an environment as JSON; the content check on
+                // load rejects a `.json` that turns out to be something else.
+                || e.eq_ignore_ascii_case("json"))
                 || name.eq_ignore_ascii_case(".env")
                 || name.to_ascii_lowercase().starts_with(".env.")
         }

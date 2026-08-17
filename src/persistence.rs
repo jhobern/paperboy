@@ -7,12 +7,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::collection::Collection;
+use crate::env_panel::EnvSource;
 use crate::environment::{Environment, PendingSecret, parse_vars_pending};
 use crate::git_remote::GitOrigin;
 use crate::hurl::HurlEntry;
 use crate::i18n::Language;
+use crate::remote_flow::WorkspaceGitOrigin;
 use crate::request::RequestView;
-use crate::tui::remote::WorkspaceGitOrigin;
 
 // ── Session state persistence ───────────────────────────────────────────────
 
@@ -386,6 +387,18 @@ fn default_true() -> bool {
     true
 }
 
+/// One report's remembered parameter values (see
+/// [`PersistedState::report_params`]).
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub struct PersistedReportParams {
+    /// [`crate::report::Report::param_key`] — path, git origin, or name.
+    pub key: String,
+    /// `NAME = value`, keyed by the parameter's raw name so relabelling a
+    /// parameter never orphans what was chosen for it. A pair sorted by name,
+    /// again so the file doesn't churn.
+    pub values: Vec<(String, String)>,
+}
+
 impl PersistedReport {
     /// Snapshot a report's persistable parts.
     pub fn from_report(r: &crate::report::Report) -> Self {
@@ -464,6 +477,12 @@ pub struct GuiLayout {
     /// Width of the report editor's block palette column.
     #[serde(default)]
     pub report_palette_width: Option<f32>,
+    /// Height of the results view's summary block (metrics, filters, matrices).
+    #[serde(default)]
+    pub report_summary_height: Option<f32>,
+    /// Height of the row drill-down panel under the results grid.
+    #[serde(default)]
+    pub report_detail_height: Option<f32>,
     /// Which centre-column view was open.
     #[serde(default)]
     pub view: GuiView,
@@ -501,6 +520,10 @@ pub struct PersistedState {
     /// picker can reopen there independently of other file loads.
     #[serde(default)]
     pub last_env_dir: Option<String>,
+    /// Last folder a Postman import was written into, so the next import
+    /// suggests the same place and downloaded workspaces stay together.
+    #[serde(default)]
+    pub last_import_dir: Option<String>,
     /// Ask for confirmation before quitting the app.
     #[serde(default = "yes")]
     pub confirm_on_exit: bool,
@@ -526,6 +549,24 @@ pub struct PersistedState {
     /// first, offered as a pickable list in the "Load from Git" wizard.
     #[serde(default)]
     pub recent_git_urls: Vec<String>,
+    /// Provider *references* the Postman API key has been read from, most
+    /// recent first — `{{ op://… }}`, `{{ ssm:/… }}`, `{{ env:… }}`. Never a
+    /// pasted key: a reference is an address, which is safe to keep, where the
+    /// key itself is the credential and is never written to disk.
+    #[serde(default)]
+    pub recent_key_refs: Vec<String>,
+    /// The parameter values each report was last run with, most recently used
+    /// first. Keyed by the report's file path (or git origin, or name) rather
+    /// than its process-unique id, so reopening tomorrow offers back what you
+    /// chose today.
+    ///
+    /// A list rather than a map so `state.json` is written in a stable order:
+    /// a serialized `HashMap` reshuffles between runs and turns every save
+    /// into a diff. The report file itself is never touched — the default in
+    /// the `.trail` is what the report *says*, this is only what this user
+    /// last *did*.
+    #[serde(default)]
+    pub report_params: Vec<PersistedReportParams>,
     /// Which of JSON / Hurl text the Main (Request) panel shows by default for
     /// every request (Settings → Preferences → Default Request View).
     #[serde(default)]
@@ -550,6 +591,10 @@ pub struct PersistedState {
     /// Environment, if any.
     #[serde(default)]
     pub active_global_env: Option<usize>,
+    /// Which source(s) the Environments panel lists. Shared by both front-ends
+    /// because they share the same row model and saved state file.
+    #[serde(default)]
+    pub env_source: EnvSource,
     /// GUI-only window/panel geometry and last-open view (see [`GuiLayout`]).
     /// Ignored by the terminal UI, which round-trips it untouched so using one
     /// front-end never discards the other's layout.
@@ -579,6 +624,7 @@ impl Default for PersistedState {
             active_tab: 0,
             last_browse_dir: None,
             last_env_dir: None,
+            last_import_dir: None,
             confirm_on_exit: true,
             confirm_on_clear: true,
             confirm_on_delete_env: true,
@@ -586,12 +632,15 @@ impl Default for PersistedState {
             list_width: default_list_width(),
             response_pct: default_response_pct(),
             recent_git_urls: Vec::new(),
+            recent_key_refs: Vec::new(),
+            report_params: Vec::new(),
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
             custom_themes: Vec::new(),
             active_theme: None,
             global_envs: Vec::new(),
             active_global_env: None,
+            env_source: EnvSource::Both,
             gui: GuiLayout::default(),
         }
     }

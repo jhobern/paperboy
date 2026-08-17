@@ -17,9 +17,13 @@ const COMPACT_TAIL: usize = 4;
 const COMPACT_ELLIPSIS: &str = "...";
 
 /// Produce a "compact overview" of a response body by shortening long
-/// double-quoted string *literals* to a `"head...tail"` form — e.g.
+/// double-quoted string *values* to a `"head...tail"` form — e.g.
 /// `"anehusenhugroegureol…"` becomes `"aneh...ureol"` — while leaving structure,
-/// numbers and short strings (JSON keys, enums, …) untouched. Used by the
+/// numbers, short strings (enums, …) and object *keys* untouched.
+///
+/// Keys are never shortened however long they are: a compacted value is still
+/// recognisable from the key that names it, but a compacted *key* leaves a body
+/// that can't be read at all, which defeats the point of an overview. Used by the
 /// Response viewer's "compact view" toggle so a body full of long opaque values
 /// (tokens, base64, hashes) can be skimmed at a glance.
 ///
@@ -51,6 +55,11 @@ pub(crate) fn compact_long_strings_mapped(text: &str) -> (String, Vec<Vec<usize>
     // A literal is only worth compacting when the ellipsis actually saves room.
     let threshold = COMPACT_HEAD + COMPACT_TAIL + COMPACT_ELLIPSIS.chars().count();
     let ellipsis_len = COMPACT_ELLIPSIS.chars().count();
+    // Indexed rather than iterated: deciding whether a literal is a key needs
+    // to look past its closing quote (and any spaces) for a `:`, which is more
+    // lookahead than a `Peekable` gives.
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
     let mut out = String::with_capacity(text.len());
     let mut maps: Vec<Vec<usize>> = Vec::new();
     // `cur` is the current line's compacted-col -> full-col map; `full_col` is
@@ -58,8 +67,9 @@ pub(crate) fn compact_long_strings_mapped(text: &str) -> (String, Vec<Vec<usize>
     // line. `push` a mapping entry for every compacted char we emit.
     let mut cur: Vec<usize> = Vec::new();
     let mut full_col: usize = 0;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         if c == '\n' {
             // Newlines separate logical lines and aren't part of a line's
             // selectable content: close the current line, recording the
@@ -84,13 +94,16 @@ pub(crate) fn compact_long_strings_mapped(text: &str) -> (String, Vec<Vec<usize>
         let content_start = full_col;
         let mut content: Vec<char> = Vec::new();
         let mut closed = false;
-        while let Some(nc) = chars.next() {
+        while i < chars.len() {
+            let nc = chars[i];
+            i += 1;
             if nc == '\\' {
                 // A backslash escapes the next char; keep both verbatim so the
                 // escape stays intact (and a `\"` doesn't close the literal).
                 content.push('\\');
-                if let Some(esc) = chars.next() {
-                    content.push(esc);
+                if i < chars.len() {
+                    content.push(chars[i]);
+                    i += 1;
                 }
                 continue;
             }
@@ -100,7 +113,7 @@ pub(crate) fn compact_long_strings_mapped(text: &str) -> (String, Vec<Vec<usize>
             }
             content.push(nc);
         }
-        if content.len() > threshold {
+        if content.len() > threshold && !(closed && is_object_key(&chars, i)) {
             for k in 0..COMPACT_HEAD {
                 cur.push(content_start + k);
             }
@@ -134,9 +147,74 @@ pub(crate) fn compact_long_strings_mapped(text: &str) -> (String, Vec<Vec<usize>
     (out, maps)
 }
 
+/// Whether the literal that ends at `after` (the index just past its closing
+/// quote) is an object *key* — i.e. the next non-blank character is a `:`.
+///
+/// Only spaces and tabs are skipped, not newlines: a key and its colon are
+/// always on one line in every serialiser worth worrying about, whereas a lone
+/// `:` starting the next line is far more likely to be ordinary text in a
+/// multi-line body than a delayed key separator.
+fn is_object_key(chars: &[char], after: usize) -> bool {
+    chars[after..].iter().find(|c| **c != ' ' && **c != '\t') == Some(&':')
+}
+
+/// The command that hands `path` to whatever the desktop thinks should open it.
+///
+/// Split out from [`open_in_desktop`] so the choice can be tested without
+/// actually launching a browser: the test asserts the platform's opener and
+/// that the path is passed as one argument (never interpolated into a shell
+/// string, which would break on a space and would be an injection hole for a
+/// filename the user didn't type).
+fn desktop_open_command(path: &Path) -> (&'static str, Vec<String>) {
+    let arg = path.to_string_lossy().into_owned();
+    if cfg!(target_os = "macos") {
+        ("open", vec![arg])
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin, not a program, and its first quoted
+        // argument is taken as the *window title* — hence the empty one.
+        ("cmd", vec!["/C".into(), "start".into(), String::new(), arg])
+    } else {
+        ("xdg-open", vec![arg])
+    }
+}
+
+/// Open `path` in the desktop's default application for it (a browser for an
+/// exported HTML report, a spreadsheet for an `.xlsx`, …).
+///
+/// Detached deliberately: the opener usually returns immediately, but some
+/// (`xdg-open` delegating to a not-yet-running browser) linger for the life of
+/// the app they start, and waiting for that would freeze the UI until the user
+/// closed their browser. Stdio is silenced for the same reason a TUI can't
+/// afford stray output on its screen.
+pub(crate) fn open_in_desktop(path: impl AsRef<Path>) -> Result<(), String> {
+    let path = path.as_ref();
+    let (program, args) = desktop_open_command(path);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{program}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compact_long_strings;
+    use super::{compact_long_strings, desktop_open_command};
+
+    /// A path with a space in it must survive as a single argument — the whole
+    /// point of not building a shell string.
+    #[test]
+    fn the_desktop_opener_passes_the_path_as_one_argument() {
+        let (program, args) =
+            desktop_open_command(std::path::Path::new("/tmp/a report/out file.html"));
+        assert!(!program.is_empty(), "every platform has an opener to name");
+        assert!(
+            args.iter().any(|a| a == "/tmp/a report/out file.html"),
+            "the path is one whole argument, not split or quoted: {args:?}"
+        );
+    }
 
     #[test]
     fn long_values_are_shortened_but_keys_and_short_values_are_not() {
@@ -223,5 +301,79 @@ mod tests {
             assert!(line_map.windows(2).all(|w| w[0] <= w[1]));
             assert_eq!(*line_map.last().unwrap(), full_lines[i].chars().count());
         }
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{compact_long_strings, compact_long_strings_mapped};
+
+    /// However long a key is, it stays whole: the compact view is for skimming,
+    /// and a body of `"aten...tion": "aneh...rucg"` rows can't be skimmed.
+    #[test]
+    fn a_long_key_is_never_shortened_however_long_its_value_is() {
+        let src =
+            "{\n  \"authenticationChallengeIdentifier\": \"anehusenhugroegureolegkregulregu\"\n}";
+        let out = compact_long_strings(src);
+        assert!(
+            out.contains("\"authenticationChallengeIdentifier\""),
+            "the key survives intact: {out}"
+        );
+        assert!(
+            out.contains("\"aneh...regu\""),
+            "but its value doesn't: {out}"
+        );
+    }
+
+    /// A key is recognised by the `:` that follows it, whatever the serialiser
+    /// put between the two — and a value that merely *contains* a colon is not
+    /// a key.
+    #[test]
+    fn spacing_before_the_colon_does_not_hide_a_key() {
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        for gap in ["", " ", "   ", "\t"] {
+            let src = format!("{{\"{long}\"{gap}: 1}}");
+            assert!(
+                compact_long_strings(&src).contains(long),
+                "a key followed by {gap:?} then `:` is still a key"
+            );
+        }
+        // A colon on the *next* line isn't a key separator in any format we
+        // render; treating it as one would leave long values uncompacted.
+        let src = format!("[\n  \"{long}\"\n  : 1\n]");
+        assert!(compact_long_strings(&src).contains("\"abcd...wxyz\""));
+    }
+
+    /// Nothing about the value side changes: a long array element, or a value
+    /// with a colon in it, still compacts.
+    #[test]
+    fn values_still_compact_including_ones_containing_a_colon() {
+        let src = "[\"https://example.com/a/very/long/path\"]";
+        assert_eq!(compact_long_strings(src), "[\"http...path\"]");
+    }
+
+    /// The column map is what makes "copy the untruncated value" work, so an
+    /// uncompacted key must map straight through — one entry per character,
+    /// each mapping to itself — or a selection over a key would copy the wrong
+    /// span of the full text.
+    #[test]
+    fn an_uncompacted_key_maps_one_to_one_onto_the_full_text() {
+        let src = "{\"authenticationChallengeIdentifier\": \"anehusenhugroegureolegkregulregu\"}";
+        let (out, maps) = compact_long_strings_mapped(src);
+        assert_eq!(maps.len(), 1, "one line in, one line out");
+        let line = &maps[0];
+        assert_eq!(
+            line.len(),
+            out.chars().count() + 1,
+            "one entry per compacted column, plus the past-the-end sentinel"
+        );
+        // Everything up to and including the key's closing quote is unchanged,
+        // so those columns are identity.
+        let key_end = out.find(':').unwrap();
+        assert!(line[..=key_end].iter().enumerate().all(|(i, m)| *m == i));
+        assert!(
+            line.windows(2).all(|w| w[0] <= w[1]),
+            "and the map is still monotonic across the compacted value"
+        );
     }
 }

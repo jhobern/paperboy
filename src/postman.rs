@@ -18,6 +18,14 @@ use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl};
 #[serde(default)]
 struct Collection {
     item: Vec<Item>,
+    /// Collection-level variables. Postman resolves `{{name}}` against these
+    /// when nothing in the environment defines it, so they are part of what
+    /// makes an exported collection runnable — see
+    /// [`postman_collection_variables`].
+    variable: Vec<Param>,
+    /// The collection's default auth, inherited by every request that doesn't
+    /// set its own.
+    auth: Option<Auth>,
 }
 
 /// A folder (nested `item`s) or a leaf holding a `request`.
@@ -27,6 +35,10 @@ struct Item {
     name: String,
     item: Option<Vec<Item>>,
     request: Option<Request>,
+    /// A folder's default auth, overriding the collection's for everything
+    /// beneath it. Only meaningful on folders; a leaf's auth lives on its
+    /// `request`.
+    auth: Option<Auth>,
     /// Pre-request / test scripts. Only `test` scripts are mined for
     /// `pm.<store>.set(...)` capture calls (see [`captures_from_events`]).
     event: Vec<Event>,
@@ -76,15 +88,17 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     })
 }
 
-/// Only `basic` (→ `basic_auth`) and `bearer` (→ a `Bearer` header) are mapped;
-/// credentials live in `key/value` lists keyed by `username`/`password`/`token`.
-#[derive(Deserialize, Default)]
+/// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header) and `apikey` (→ a
+/// header or a query parameter) are mapped; credentials live in `key/value`
+/// lists keyed by `username`/`password`/`token`/`key`/`value`/`in`.
+#[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Auth {
     #[serde(rename = "type")]
     kind: String,
     basic: Vec<Param>,
     bearer: Vec<Param>,
+    apikey: Vec<Param>,
 }
 
 impl Auth {
@@ -93,6 +107,21 @@ impl Auth {
             .find(|p| p.key == name)
             .map(|p| p.value.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether this block turns auth *off* rather than describing some. Postman
+    /// writes `{"type": "noauth"}` on a request that opts out of the auth it
+    /// would otherwise inherit, so it has to beat the parent rather than being
+    /// skipped as "nothing useful here".
+    fn is_noauth(&self) -> bool {
+        self.kind == "noauth"
+    }
+
+    /// Whether this block explicitly defers to the parent. Postman usually
+    /// signals inheritance by omitting `auth` entirely, but the newer exports
+    /// write it out as a type of its own.
+    fn inherits(&self) -> bool {
+        self.kind == "inherit" || self.kind.is_empty()
     }
 }
 
@@ -114,7 +143,7 @@ struct Body {
 /// fills in *absent* fields, not `null` ones, so the string fields use
 /// [`de_str`] to coerce `null` to an empty string; otherwise a single `null`
 /// would fail the whole collection import.
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Param {
     #[serde(deserialize_with = "de_str")]
@@ -163,9 +192,16 @@ impl Param {
                 value: self.src.clone(),
                 kind: FormFieldKind::File,
                 content_type: self.content_type.clone(),
-                base64_prefix: None,
-                enabled: true,
+                // A file part Postman never had a file for (`src` empty — the
+                // user picked the field but not the file, which their export
+                // preserves) serializes to `key: file,;`, which is not valid
+                // Hurl: the file would be written and then refuse to load,
+                // taking the whole collection with it. Kept as a *disabled*
+                // row, which round-trips as a comment — the field is still
+                // there to be filled in, and the file still parses.
+                enabled: !self.src.trim().is_empty(),
                 desc: self.description.clone(),
+                base64_prefix: None,
             }
         } else {
             FormField {
@@ -181,12 +217,119 @@ impl Param {
     }
 }
 
+/// Unwrap the `{"<key>": {…}}` envelope Postman puts around a collection or an
+/// environment when it comes from the Postman API or an "Export all data"
+/// account backup (each `Collections/*.json` there is `{"collection": {"info":
+/// …, "item": …}}` and each `Environments/*.json` is `{"environment": {"name":
+/// …, "values": …}}`), as opposed to the bare documents a single "Export
+/// collection"/"Export environment" produces. `marker` is the field the inner
+/// document must carry for the value to be treated as an envelope, so a
+/// same-named field that happens to hold something else isn't mistaken for one.
+/// Anything else is returned untouched.
+fn unwrap_envelope(v: Value, key: &str, marker: &str) -> Value {
+    match v {
+        Value::Object(mut m) => match m.remove(key) {
+            Some(inner @ Value::Object(_)) if inner.get(marker).is_some() => inner,
+            // Not an envelope: put back what we took so the value is unchanged.
+            other => {
+                if let Some(other) = other {
+                    m.insert(key.to_string(), other);
+                }
+                Value::Object(m)
+            }
+        },
+        other => other,
+    }
+}
+
 /// `true` when `content` looks like a Postman collection export (an `info`
-/// block and an `item` array), as opposed to Hurl text.
+/// block and an `item` array), as opposed to Hurl text. Both the bare and the
+/// `{"collection": …}` enveloped shapes are recognized.
 pub fn looks_like_postman(content: &str) -> bool {
     serde_json::from_str::<Value>(content)
+        .map(|v| unwrap_envelope(v, "collection", "item"))
         .map(|v| v.get("info").is_some() && v.get("item").is_some())
         .unwrap_or(false)
+}
+
+/// Which of the two things Postman exports a file holds.
+///
+/// A user who picks "import an exported file" has one file and no idea which
+/// of PaperBoy's two shelves it belongs on — Postman writes collections and
+/// environments to the same `.json` extension. Deciding that from the content
+/// is the importer's job, not theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Collection,
+    Environment,
+}
+
+/// What kind of Postman export `content` is, or `None` if it is not one.
+///
+/// Collections are tested first: a document carrying both shapes is a
+/// collection with variables, not an environment.
+pub fn export_kind(content: &str) -> Option<ExportKind> {
+    if looks_like_postman(content) {
+        Some(ExportKind::Collection)
+    } else if postman_env_values(content).is_some() {
+        Some(ExportKind::Environment)
+    } else {
+        None
+    }
+}
+
+/// A Postman environment export: a flat list of variables. Postman has no
+/// notion of PaperBoy's provider references, so every value imports as a
+/// literal — but a value that *is* written as `{{ op://… }}` / `{{ ssm:… }}`
+/// still classifies as a secret reference once it reaches
+/// [`crate::environment::parse_vars_pending`], exactly as in a `.vars` file.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PostmanEnv {
+    values: Vec<EnvValue>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct EnvValue {
+    #[serde(deserialize_with = "de_str")]
+    key: String,
+    #[serde(deserialize_with = "de_str")]
+    value: String,
+    /// Absent (or `null`) means enabled — Postman only writes this out when a
+    /// variable has been ticked off, so defaulting it to `false` (as
+    /// `#[serde(default)]` would) would silently drop every variable.
+    enabled: Option<bool>,
+}
+
+/// The `KEY`/value pairs of a Postman environment export, or `None` if
+/// `content` isn't one. Both the bare `{"name": …, "values": […]}` shape and
+/// the `{"environment": …}` envelope used by an account backup are accepted.
+///
+/// Variables Postman has disabled are dropped: they are the ones it would not
+/// send, and a `.vars` environment has no "present but off" state to map them
+/// onto. Keyless entries are dropped too, and a value carrying a newline is
+/// flattened to a space — a `.vars` file is line-based, so keeping the break
+/// would split one variable into two on the next save/reload.
+pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
+    let v = serde_json::from_str::<Value>(content).ok()?;
+    let v = unwrap_envelope(v, "environment", "values");
+    // A collection also has no `values`, but check `item` too so a document
+    // carrying both is never imported as an environment.
+    if !v.get("values").is_some_and(Value::is_array) || v.get("item").is_some() {
+        return None;
+    }
+    let env = serde_json::from_value::<PostmanEnv>(v).ok()?;
+    Some(
+        env.values
+            .into_iter()
+            .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
+            .map(|v| {
+                let value = v.value.replace(['\n', '\r'], " ");
+                (v.key.trim().to_string(), value.trim().to_string())
+            })
+            .collect(),
+    )
 }
 
 /// Parse a collection file's `content`: a Postman JSON export is imported,
@@ -199,17 +342,65 @@ pub fn parse_collection(content: &str) -> Vec<HurlEntry> {
     }
 }
 
+/// Something a conversion could not carry across, recorded rather than
+/// silently dropped so a migration off Postman knows what still needs doing by
+/// hand. See [`convert_postman`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversionNote {
+    /// The request (folder-prefixed) or `""` for the collection as a whole.
+    pub item: String,
+    pub detail: String,
+}
+
+/// Everything a Postman collection turns into: the requests, the
+/// collection-level variables (which have nowhere to live in a `.hurl` file
+/// and belong in a `.vars` alongside it), and what was lost on the way.
+#[derive(Debug, Default)]
+pub struct ConvertedCollection {
+    pub entries: Vec<HurlEntry>,
+    pub variables: Vec<(String, String)>,
+    pub notes: Vec<ConversionNote>,
+}
+
 /// Convert a Postman collection JSON into `HurlEntry` values. Folders are
 /// preserved by prefixing each request's title with its `/`-joined folder path
 /// (e.g. "Auth/Tokens/Refresh") — the same convention plain Hurl collections
 /// use (see [`crate::tree`]). Returns an empty vec if the JSON isn't a
 /// recognizable collection.
 pub fn import_postman(content: &str) -> Vec<HurlEntry> {
-    let Ok(root) = serde_json::from_str::<Collection>(content) else {
-        return Vec::new();
+    convert_postman(content).entries
+}
+
+/// The full conversion, including the collection variables and the fidelity
+/// notes [`import_postman`] throws away.
+///
+/// Auth is resolved here rather than per request, because Postman's is
+/// inherited: a request with no `auth` block uses its folder's, a folder with
+/// none uses the collection's, and `"type": "noauth"` at any level means "no
+/// auth", not "ask my parent".
+pub fn convert_postman(content: &str) -> ConvertedCollection {
+    let Ok(root) = serde_json::from_str::<Value>(content)
+        .map(|v| unwrap_envelope(v, "collection", "item"))
+        .and_then(serde_json::from_value::<Collection>)
+    else {
+        return ConvertedCollection::default();
     };
-    let mut out = Vec::new();
-    walk_items(&root.item, &mut Vec::new(), &mut out);
+    let mut out = ConvertedCollection {
+        variables: root
+            .variable
+            .iter()
+            .filter(|v| !v.disabled && !v.key.trim().is_empty())
+            .map(|v| {
+                (
+                    v.key.trim().to_string(),
+                    v.value.replace(['\n', '\r'], " ").trim().to_string(),
+                )
+            })
+            .collect(),
+        ..ConvertedCollection::default()
+    };
+    let inherited = root.auth.as_ref().filter(|a| !a.inherits());
+    walk_items(&root.item, &mut Vec::new(), inherited, &mut out);
     out
 }
 
@@ -217,11 +408,20 @@ pub fn import_postman(content: &str) -> Vec<HurlEntry> {
 /// nested `item` array) and building up `path` as the folder breadcrumb so
 /// each request's title can be prefixed with it. Folders take precedence when
 /// a node unusually carries both `item` and `request`.
-fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) {
+///
+/// `inherited` is the nearest enclosing auth, already resolved — `None` once
+/// some level has said `noauth`.
+fn walk_items(
+    items: &[Item],
+    path: &mut Vec<String>,
+    inherited: Option<&Auth>,
+    out: &mut ConvertedCollection,
+) {
     for it in items {
         if let Some(sub) = &it.item {
+            let here = resolve_auth(it.auth.as_ref(), inherited);
             path.push(it.name.clone());
-            walk_items(sub, path, out);
+            walk_items(sub, path, here, out);
             path.pop();
         } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
@@ -229,17 +429,157 @@ fn walk_items(items: &[Item], path: &mut Vec<String>, out: &mut Vec<HurlEntry>) 
             } else {
                 format!("{}/{}", path.join("/"), it.name)
             };
-            out.push(map_request(&title, req, &it.event));
+            let auth = resolve_auth(req.auth.as_ref(), inherited);
+            let mut entry = map_request(&title, req, &it.event, auth);
+            note_losses(&title, req, &it.event, auth, &entry, out);
+            for name in rename_dynamic_variables(&mut entry) {
+                out.notes.push(ConversionNote {
+                    item: title.clone(),
+                    detail: format!(
+                        "Postman generated `{{{{${name}}}}}` for you; Hurl has no equivalent, so it \
+                         became the variable `{{{{{name}}}}}`, which has to be supplied"
+                    ),
+                });
+            }
+            out.entries.push(entry);
         }
     }
 }
 
-fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
-    let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
+/// Postman's *dynamic variables* — `{{$guid}}`, `{{$randomInt}}`,
+/// `{{$timestamp}}` — are values it generates at send time. Hurl has no such
+/// thing, and worse, a `$` is not legal in a Hurl template name: one
+/// `{{$guid}}` anywhere in a collection made the whole converted file fail to
+/// parse ("parsing template variable"), so every request in it was lost, not
+/// just the one that used it.
+///
+/// Each is rewritten to an ordinary variable of the same name without the `$`
+/// (`{{$guid}}` → `{{guid}}`), which parses, runs as soon as the value is
+/// supplied, and stays readable as the thing it was. Dotted forms
+/// (`{{$processEnv.HOME}}`) fold their dots into underscores for the same
+/// reason. Returns the names rewritten, so each can be noted.
+fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
+    static DYNAMIC_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\{\{\s*\$([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}").unwrap());
 
-    // Auth → basic_auth, or a `Bearer` Authorization header for bearer tokens.
+    let mut found: Vec<String> = Vec::new();
+    let mut fix = |text: &mut String| {
+        if !text.contains("{{") {
+            return;
+        }
+        let replaced = DYNAMIC_RE.replace_all(text, |caps: &regex::Captures| {
+            let name = caps[1].replace('.', "_");
+            if !found.contains(&name) {
+                found.push(name.clone());
+            }
+            format!("{{{{{name}}}}}")
+        });
+        if let std::borrow::Cow::Owned(new) = replaced {
+            *text = new;
+        }
+    };
+
+    fix(&mut entry.url);
+    for row in entry
+        .headers
+        .iter_mut()
+        .chain(entry.queries.iter_mut())
+        .chain(entry.cookies.iter_mut())
+    {
+        fix(&mut row.value);
+    }
+    for f in &mut entry.form_fields {
+        fix(&mut f.value);
+    }
+    if let Some(body) = entry.body.as_mut() {
+        fix(body);
+    }
+    if let Some((user, pass)) = entry.basic_auth.as_mut() {
+        fix(user);
+        fix(pass);
+    }
+    found
+}
+
+/// Which auth applies at this level: its own if it declares any, otherwise
+/// whatever it inherits — and nothing at all if it opts out.
+fn resolve_auth<'a>(own: Option<&'a Auth>, inherited: Option<&'a Auth>) -> Option<&'a Auth> {
+    match own {
+        Some(a) if a.is_noauth() => None,
+        Some(a) if !a.inherits() => Some(a),
+        _ => inherited,
+    }
+}
+
+/// Record what this request couldn't bring with it. Deliberately conservative:
+/// a note is only written where something in the export is genuinely not in the
+/// output, so the report stays worth reading.
+fn note_losses(
+    title: &str,
+    req: &Request,
+    events: &[Event],
+    auth: Option<&Auth>,
+    entry: &HurlEntry,
+    out: &mut ConvertedCollection,
+) {
+    let mut note = |detail: String| {
+        out.notes.push(ConversionNote {
+            item: title.to_string(),
+            detail,
+        })
+    };
+
+    if let Some(auth) = auth
+        && !matches!(auth.kind.as_str(), "basic" | "bearer" | "apikey")
+    {
+        note(format!(
+            "auth type `{}` has no Hurl equivalent and was dropped",
+            auth.kind
+        ));
+    }
+    if let Some(auth) = auth
+        && auth.kind == "apikey"
+        && !matches!(Auth::field(&auth.apikey, "in").as_str(), "" | "header")
+    {
+        note("API-key auth is sent in the query string; it was added as a query parameter".into());
+    }
+    if let Some(b) = &req.body
+        && !matches!(b.mode.as_str(), "" | "raw" | "urlencoded" | "formdata")
+    {
+        note(format!("body mode `{}` was dropped", b.mode));
+    }
+    for f in &entry.form_fields {
+        if f.kind == FormFieldKind::File && !f.enabled {
+            note(format!(
+                "the file part `{}` had no file chosen in Postman, so it is switched off until one is",
+                f.key
+            ));
+        }
+    }
+    if events
+        .iter()
+        .any(|e| e.listen == "prerequest" && !e.script.exec.is_empty())
+    {
+        note("a pre-request script was dropped — Hurl has no equivalent".into());
+    }
+    let has_tests = events
+        .iter()
+        .any(|e| e.listen == "test" && !e.script.exec.is_empty());
+    if has_tests && entry.captures.is_empty() {
+        note("a test script was dropped — nothing in it reduced to a [Captures] entry".into());
+    } else if has_tests {
+        note("a test script was read for [Captures] only; its assertions were dropped".into());
+    }
+}
+
+fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>) -> HurlEntry {
+    let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
+    let mut queries: Vec<KvRow> = Vec::new();
+
+    // Auth → basic_auth, or a header/query parameter. `auth` is already
+    // resolved against the enclosing folder and collection by `walk_items`.
     let mut basic_auth = None;
-    if let Some(auth) = &req.auth {
+    if let Some(auth) = auth {
         match auth.kind.as_str() {
             "basic" => {
                 let u = Auth::field(&auth.basic, "username");
@@ -252,6 +592,21 @@ fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
                 let t = Auth::field(&auth.bearer, "token");
                 if !t.is_empty() {
                     headers.push(KvRow::new("Authorization", format!("Bearer {t}")));
+                }
+            }
+            // An API key is a header or a query parameter with a configurable
+            // name — both of which Hurl expresses directly, so this is the one
+            // remaining common Postman auth type that maps without loss.
+            "apikey" => {
+                let key = Auth::field(&auth.apikey, "key");
+                let value = Auth::field(&auth.apikey, "value");
+                if !key.is_empty() {
+                    let row = KvRow::new(key, value);
+                    if Auth::field(&auth.apikey, "in") == "query" {
+                        queries.push(row);
+                    } else {
+                        headers.push(row);
+                    }
                 }
             }
             _ => {}
@@ -276,6 +631,7 @@ fn map_request(name: &str, req: &Request, events: &[Event]) -> HurlEntry {
     let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
+    entry.queries.extend(queries);
     // Captured variables from the request's `test` script (#24). A request that
     // gets captures serializes with a `HTTP *` line automatically; one with none
     // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
@@ -522,6 +878,38 @@ mod tests {
         assert!(!looks_like_postman("GET http://x/y\nHTTP 200\n"));
     }
 
+    /// Postman's account backup ("Export all data") and its API wrap each
+    /// collection in a `{"collection": …}` envelope instead of exporting the
+    /// bare `{"info": …, "item": …}` shape, so both must import.
+    #[test]
+    fn enveloped_collection_export_is_detected_and_imported() {
+        let json = r#"{ "collection": {
+          "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [
+            { "name": "login", "request": { "method": "POST", "url": "{{url}}/login" } }
+          ]
+        }}"#;
+        assert!(looks_like_postman(json));
+        let e = import_postman(json);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].title, "login");
+        assert_eq!(e[0].method, "POST");
+        assert_eq!(e[0].url, "{{url}}/login");
+    }
+
+    /// A `collection` key that isn't the envelope (no `item` inside) must not
+    /// swallow the real document.
+    #[test]
+    fn collection_key_that_is_not_an_envelope_is_left_alone() {
+        let json = r#"{
+          "collection": "some-id",
+          "info": { "name": "demo" },
+          "item": [ { "name": "ping", "request": { "method": "GET", "url": "http://x/y" } } ]
+        }"#;
+        assert!(looks_like_postman(json));
+        assert_eq!(import_postman(json).len(), 1);
+    }
+
     #[test]
     fn form_field_with_explicit_null_value_still_imports() {
         // Postman routinely emits `"value": null` (and null `src`) for blank
@@ -661,5 +1049,258 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+
+    /// A collection whose auth lives at the top, is overridden by one folder,
+    /// switched off by one request, and left to inherit everywhere else.
+    fn nested() -> &'static str {
+        r#"{
+          "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{TOKEN}}" }] },
+          "variable": [
+            { "key": "base", "value": "https://api.example.com" },
+            { "key": "off", "value": "x", "disabled": true },
+            { "key": "", "value": "nameless" }
+          ],
+          "item": [
+            { "name": "inherits", "request": { "method": "GET", "url": "{{base}}/a" } },
+            { "name": "opts out", "request": {
+                "method": "GET", "url": "{{base}}/b", "auth": { "type": "noauth" } } },
+            { "name": "folder",
+              "auth": { "type": "basic", "basic": [
+                { "key": "username", "value": "u" }, { "key": "password", "value": "p" } ] },
+              "item": [
+                { "name": "deep", "request": { "method": "GET", "url": "{{base}}/c" } },
+                { "name": "own", "request": { "method": "GET", "url": "{{base}}/d",
+                    "auth": { "type": "apikey", "apikey": [
+                      { "key": "key", "value": "X-Key" },
+                      { "key": "value", "value": "{{KEY}}" } ] } } }
+              ] }
+          ]
+        }"#
+    }
+
+    fn header(e: &HurlEntry, name: &str) -> Option<String> {
+        e.headers
+            .iter()
+            .find(|h| h.key.eq_ignore_ascii_case(name))
+            .map(|h| h.value.clone())
+    }
+
+    /// Postman applies the collection's auth to every request that doesn't
+    /// declare its own, so a collection that authenticates once at the top must
+    /// not import as sixty unauthenticated requests.
+    #[test]
+    fn a_request_without_auth_inherits_the_collections() {
+        let c = convert_postman(nested());
+        let e = &c.entries[0];
+        assert_eq!(e.title, "inherits");
+        assert_eq!(
+            header(e, "Authorization").as_deref(),
+            Some("Bearer {{TOKEN}}")
+        );
+    }
+
+    /// `noauth` is Postman's way of saying "not even the inherited one", so it
+    /// has to beat the parent rather than being ignored as an empty block.
+    #[test]
+    fn a_request_can_opt_out_of_the_inherited_auth() {
+        let c = convert_postman(nested());
+        let e = &c.entries[1];
+        assert_eq!(e.title, "opts out");
+        assert_eq!(header(e, "Authorization"), None);
+        assert_eq!(e.basic_auth, None);
+    }
+
+    /// A folder's auth replaces the collection's for everything beneath it,
+    /// however deep.
+    #[test]
+    fn a_folder_overrides_the_collection_for_everything_inside_it() {
+        let c = convert_postman(nested());
+        let e = c.entries.iter().find(|e| e.title == "folder/deep").unwrap();
+        assert_eq!(e.basic_auth, Some(("u".to_string(), "p".to_string())));
+        assert_eq!(
+            header(e, "Authorization"),
+            None,
+            "the collection's bearer token doesn't leak past the folder"
+        );
+    }
+
+    /// The request is the innermost level, so its own auth wins over the
+    /// folder's as well as the collection's.
+    #[test]
+    fn a_requests_own_auth_beats_the_folder_it_is_in() {
+        let c = convert_postman(nested());
+        let e = c.entries.iter().find(|e| e.title == "folder/own").unwrap();
+        assert_eq!(header(e, "X-Key").as_deref(), Some("{{KEY}}"));
+        assert_eq!(e.basic_auth, None, "the folder's basic auth was replaced");
+    }
+
+    /// An API key can be sent in the query string instead of a header, which
+    /// Hurl expresses directly — so it maps rather than being dropped.
+    #[test]
+    fn an_api_key_in_the_query_string_becomes_a_query_parameter() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "q", "request": { "method": "GET", "url": "https://x/y",
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "api_key" },
+              { "key": "value", "value": "abc" },
+              { "key": "in", "value": "query" } ] } } } ]
+        }"#;
+        let c = convert_postman(json);
+        let e = &c.entries[0];
+        assert!(
+            e.queries
+                .iter()
+                .any(|q| q.key == "api_key" && q.value == "abc"),
+            "the key rides in the query string: {:?}",
+            e.queries
+        );
+        assert_eq!(header(e, "api_key"), None, "and not in a header as well");
+    }
+
+    /// Collection variables are what make `{{base}}` resolve, so they have to
+    /// come across — into a `.vars` file, since a `.hurl` has nowhere to put
+    /// them. Disabled and nameless ones are dropped, as in an environment.
+    #[test]
+    fn collection_variables_are_extracted_for_a_vars_file() {
+        let vars = convert_postman(nested()).variables;
+        assert_eq!(
+            vars,
+            vec![("base".to_string(), "https://api.example.com".to_string())]
+        );
+    }
+
+    /// Anything genuinely lost is recorded, so a migration knows what is left
+    /// to do by hand instead of finding out at runtime.
+    #[test]
+    fn what_could_not_be_converted_is_reported() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [
+            { "name": "oauth", "request": { "method": "GET", "url": "https://x",
+                "auth": { "type": "oauth2" } } },
+            { "name": "gql", "request": { "method": "POST", "url": "https://x",
+                "body": { "mode": "graphql" } } },
+            { "name": "scripted", "request": { "method": "GET", "url": "https://x" },
+              "event": [ { "listen": "prerequest",
+                           "script": { "exec": ["pm.environment.set('t', Date.now())"] } } ] }
+          ]
+        }"#;
+        let notes = convert_postman(json).notes;
+        let for_item = |name: &str| {
+            notes
+                .iter()
+                .filter(|n| n.item == name)
+                .map(|n| n.detail.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            for_item("oauth")[0].contains("oauth2"),
+            "the auth type that was lost is named: {notes:?}"
+        );
+        assert!(for_item("gql")[0].contains("graphql"));
+        assert!(for_item("scripted")[0].contains("pre-request"));
+    }
+
+    /// The bug this whole guard exists for: one Postman dynamic variable
+    /// anywhere in a collection produced a `.hurl` that would not parse
+    /// ("parsing template variable"), so *every* request in the file was lost
+    /// — silently, because the file itself looked fine on disk.
+    #[test]
+    fn a_generated_variable_is_renamed_so_the_file_still_parses() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/{{$guid}}",
+            "header": [ { "key": "X-Run", "value": "{{$timestamp}}" } ],
+            "body": { "mode": "raw", "raw": "{\"id\": \"{{$processEnv.HOME}}\"}" } } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        assert!(!hurl.contains("{{$"), "a `$` is not a legal name: {hurl}");
+        assert!(hurl.contains("{{guid}}"), "{hurl}");
+        assert!(hurl.contains("{{timestamp}}"), "{hurl}");
+        assert!(hurl.contains("{{processEnv_HOME}}"), "{hurl}");
+        assert_eq!(
+            crate::hurl::parse_hurl(&hurl).len(),
+            1,
+            "the converted file must read back: {:?}",
+            crate::hurl::parse_hurl_error(&hurl)
+        );
+        // Each rename is reported: the value Postman used to make up now has
+        // to come from somewhere.
+        assert_eq!(converted.notes.len(), 3);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("{{guid}}"))
+        );
+    }
+
+    /// Postman keeps a file part that never had a file chosen. It serialized to
+    /// `key: file,;`, which is not valid Hurl — and again took the whole
+    /// collection down with it.
+    #[test]
+    fn a_file_part_with_no_file_is_switched_off_rather_than_written_broken() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "upload", "request": { "method": "POST", "url": "https://x",
+            "body": { "mode": "formdata", "formdata": [
+              { "key": "document_id", "value": "1", "type": "text" },
+              { "key": "front_side_file", "type": "file", "src": "" }
+            ] } } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        // The row survives as a comment (which parses); what must not appear
+        // is a live `file,;` line, which does not.
+        assert!(
+            !hurl
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("file,;")),
+            "{hurl}"
+        );
+        assert_eq!(
+            crate::hurl::parse_hurl(&hurl).len(),
+            1,
+            "the converted file must read back: {:?}",
+            crate::hurl::parse_hurl_error(&hurl)
+        );
+        // The field is still there, switched off, so it can be filled in.
+        let back = &crate::hurl::parse_hurl(&hurl)[0];
+        let part = back
+            .form_fields
+            .iter()
+            .find(|f| f.key == "front_side_file")
+            .expect("the part survives as a disabled row");
+        assert!(!part.enabled);
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("front_side_file")),
+            "the switched-off part is reported: {:?}",
+            converted.notes
+        );
+    }
+
+    /// A collection that converts cleanly must produce an empty report, so an
+    /// empty report means something.
+    #[test]
+    fn a_clean_collection_reports_nothing() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "ok", "request": { "method": "GET", "url": "https://x",
+            "header": [ { "key": "Accept", "value": "application/json" } ] } } ]
+        }"#;
+        assert_eq!(convert_postman(json).notes, vec![]);
     }
 }

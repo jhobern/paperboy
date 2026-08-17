@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::flow::Header;
+use super::flow::{Header, ImageSpec};
 
 /// The reserved column name that carries the ENVS comparison target (the
 /// environment name for the row). Excluded from the row *key* (it is the
@@ -54,6 +54,16 @@ pub struct ReportResult {
     pub rows: Vec<ReportRow>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
+    /// Row indices whose result hasn't streamed in yet — the skeleton slots a
+    /// live run has not reached.
+    ///
+    /// A skeleton row is produced by a *dry* pass, so its intrinsics are
+    /// placeholders (`Time` is 0, `status` is 0). Left in, they drag a live
+    /// `STATISTICS(MEAN)` down towards zero and the reader watches a statistic
+    /// that is simply wrong slowly become right, which is worse than showing
+    /// nothing. Set by whichever front-end is streaming the run and cleared as
+    /// each row lands; always empty for a finished run.
+    pub pending: std::collections::HashSet<usize>,
     /// The table-wide marker rendered for a cell that resolved to nothing (the
     /// effective `PRELUDE_NO_MATCH_MARKER`, empty by default). Applied once, at
     /// render time, by [`OutputColumn::value`].
@@ -66,6 +76,187 @@ pub struct ReportResult {
     /// columns at render time (a `columns:` directive's own `STATISTICS(…)`
     /// takes precedence for a column that carries both). Empty by default.
     pub column_stats: std::collections::HashMap<String, Vec<StatKind>>,
+    /// `IMAGE[(…)]` render hints requested per output-column *header* by a
+    /// `REPORT … AS <header> IMAGE(…)` statement or a `WITH` field, merged into
+    /// the resolved columns the same way `column_stats` is (a `columns:`
+    /// directive's own inline `IMAGE(…)` wins). Empty by default.
+    pub column_images: std::collections::HashMap<String, ImageSpec>,
+    /// `TRUTH "…"` templates requested per output-column *header*, merged into
+    /// the resolved columns exactly as `column_images` is. Empty by default.
+    pub column_truths: std::collections::HashMap<String, String>,
+    /// Output-column headers flagged `DETAIL`, merged into the resolved columns
+    /// exactly as `column_truths` is. Empty by default.
+    pub column_details: std::collections::HashSet<String>,
+    /// Produced column keys whose value is an *elapsed time* — every column
+    /// sourced from the `Time`/`TimeSetup`/`TimeWait`/`TimeDownload` intrinsics,
+    /// including a `[Reports]` or `WITH` field that aliases one under a name of
+    /// its own (`"Response Time": Time`).
+    ///
+    /// Comparison excludes these from the diff. It can't do that on the column
+    /// *name* alone, the way it does for the intrinsics under their own names:
+    /// the name of an aliased column is the user's, and carries no hint of what
+    /// it holds. Left uncaught, a renamed time made every row of a comparison
+    /// report read as changed, because a time never repeats.
+    pub timing_columns: std::collections::HashSet<String>,
+    /// Resolved picture bytes for `IMAGE` columns, keyed by `(row index within
+    /// [`rows`](Self::rows), output-column header)`.
+    ///
+    /// Filled during the **run**, not the write: [`super::writer::ReportWriter`]
+    /// is a pure `(&ReportResult, &Header) -> Vec<u8>` function with no IO, and
+    /// keeping it that way is what makes every writer trivially testable. The
+    /// run already has the network, the `# root:` base directory and the
+    /// `PARALLEL` workers, so resolution belongs there.
+    pub images: std::collections::HashMap<(usize, String), ImageData>,
+    /// How each ground-truthed cell scored, keyed like [`images`](Self::images)
+    /// by `(row index, output-column header)`. Filled during the run's finalize
+    /// phase for every column carrying a `TRUTH "…"` clause; empty otherwise, so
+    /// a report that declares no ground truth is unchanged in every writer.
+    pub verdicts: std::collections::HashMap<(usize, String), Verdict>,
+    /// The ground-truth value each verdict was reached against — the `TRUTH`
+    /// template with this row's variables substituted in. Kept beside the
+    /// verdict so a summary (accuracy, confusion matrix) never has to
+    /// re-interpolate, and so the reader can be shown what was expected.
+    pub truths: std::collections::HashMap<(usize, String), String>,
+    /// The baseline row each compared row was scored against, kept alive past
+    /// the comparison collapse and keyed by the *collapsed* row index.
+    ///
+    /// A comparison folds the baseline row into its candidate and drops it, so
+    /// by the time truths are scored the baseline's own answers are gone —
+    /// which is exactly what a [`Trend`] needs ("was it right *before*?"). The
+    /// whole row is kept rather than the truth columns alone because the
+    /// collapse runs before the columns are resolved and so cannot know which
+    /// cells will matter. Only populated when the report declares a truth
+    /// ([`track_baseline`](Self::track_baseline)), so a report without one
+    /// carries no extra rows and is unchanged.
+    pub baseline_rows: std::collections::HashMap<usize, ReportRow>,
+    /// Whether the comparison should record
+    /// [`baseline_rows`](Self::baseline_rows). Set by the run's finalize phase
+    /// before the collapse, because only it can see both the flow's truths and
+    /// the rows.
+    pub track_baseline: bool,
+    /// How each ground-truthed cell moved relative to the baseline, keyed like
+    /// [`verdicts`](Self::verdicts). Only present for a report that has both a
+    /// truth and a comparison, and only for cells scored on *both* sides.
+    pub trends: std::collections::HashMap<(usize, String), Trend>,
+}
+
+/// How one ground-truthed cell moved between the baseline and the candidate —
+/// the second-order verdict that makes a comparison readable: *a change towards
+/// the truth is good, a change away from it is bad*.
+///
+/// Additive to [`Verdict`] and to the comparison's own `Result`, never a
+/// replacement: a row is routinely `Result: changed` *and* `Trend: fixed`, which
+/// is the useful reading rather than a contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trend {
+    /// Right before, right now.
+    Unchanged,
+    /// Wrong before, right now.
+    Fixed,
+    /// Right before, wrong now — the one every reader is looking for.
+    Regressed,
+    /// Wrong before, wrong now. Failing, but not *new*: CI cares about the
+    /// difference, and so does anyone deciding whether to ship — which is why
+    /// it stays a distinct variant even though it *shows* as `unchanged` (see
+    /// [`Trend::as_str`]).
+    StillWrong,
+}
+
+impl Trend {
+    /// The reserved `Trend` column's cell text, English and lower-case like
+    /// every other reserved value for the same reason: report data, not chrome.
+    ///
+    /// `StillWrong` reads as `unchanged` because that is what the column is
+    /// answering — *did this row move?* — and the answer for a row that was
+    /// wrong before and is wrong now is no. Whether it is right or wrong is the
+    /// `Correct` column's question, and it is sat right beside it, so the pair
+    /// still says everything: `unchanged` + `incorrect` is the still-failing
+    /// row. The distinction survives where it matters — the variant is kept, so
+    /// the cell is still tinted red and JUnit can still tell a known failure
+    /// from a passing row.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trend::Unchanged | Trend::StillWrong => "unchanged",
+            Trend::Fixed => "fixed",
+            Trend::Regressed => "regressed",
+        }
+    }
+
+    /// The second-order verdict for a cell scored on both sides.
+    ///
+    /// `None` when either side is [`Verdict::Untested`]: with no ground truth
+    /// for the row there is no "towards" or "away from" to report, and guessing
+    /// one would put a colour on the rows nobody has checked.
+    pub fn of(baseline: Verdict, candidate: Verdict) -> Option<Trend> {
+        match (baseline, candidate) {
+            (Verdict::Untested, _) | (_, Verdict::Untested) => None,
+            (Verdict::Correct, Verdict::Correct) => Some(Trend::Unchanged),
+            (Verdict::Incorrect, Verdict::Correct) => Some(Trend::Fixed),
+            (Verdict::Correct, Verdict::Incorrect) => Some(Trend::Regressed),
+            (Verdict::Incorrect, Verdict::Incorrect) => Some(Trend::StillWrong),
+        }
+    }
+
+    /// How bad this trend is, for the row roll-up. The roll-up favours the bad
+    /// news: a row with one regressed column and one fixed column is
+    /// `regressed`, because a mixed row needs a human and the column exists to
+    /// be sorted and filtered by.
+    fn severity(self) -> u8 {
+        match self {
+            Trend::Unchanged => 0,
+            Trend::Fixed => 1,
+            Trend::StillWrong => 2,
+            Trend::Regressed => 3,
+        }
+    }
+
+    /// The row roll-up over every scored column's trend.
+    pub fn rollup(trends: impl IntoIterator<Item = Trend>) -> Option<Trend> {
+        trends.into_iter().max_by_key(|t| t.severity())
+    }
+}
+
+/// How one ground-truthed cell scored.
+///
+/// Deliberately three-valued. A row whose ground truth is missing or blank is
+/// `Untested`, not a pass: scoring an unlabelled row as correct would inflate
+/// every accuracy figure by exactly the rows nobody has checked, which is the
+/// one number a reader must be able to trust.
+///
+/// A verdict never fails a run. Ground truth is *data* about the answer, not an
+/// assertion about it — `[Asserts]` is where a run says something went wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Correct,
+    Incorrect,
+    Untested,
+}
+
+impl Verdict {
+    /// The reserved `Correct` column's cell text. English, like the other
+    /// reserved column values (`Result`, `TARGET`): these are report *data*,
+    /// read by scripts and diffed between runs, not UI chrome.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Correct => "correct",
+            Verdict::Incorrect => "incorrect",
+            Verdict::Untested => "untested",
+        }
+    }
+}
+
+/// One resolved picture: the raw encoded bytes plus the format sniffed from
+/// them. Kept as encoded bytes (rather than decoded pixels) because both
+/// writers embed the original file — xlsx stores it in `xl/media/`, HTML
+/// base64-encodes it into a `data:` URI — so decoding would only lose fidelity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    /// The MIME type sniffed from the leading magic bytes (`image/jpeg`, …).
+    pub mime: String,
+    /// Natural pixel size, used to scale proportionally when the `IMAGE` clause
+    /// fixes only one dimension.
+    pub natural: (u32, u32),
 }
 
 impl ReportResult {
@@ -91,6 +282,9 @@ impl ReportResult {
                     header: k.clone(),
                     sources: vec![k.clone()],
                     stats: Vec::new(),
+                    image: None,
+                    truth: None,
+                    detail: false,
                 })
                 .collect(),
         };
@@ -103,6 +297,48 @@ impl ReportResult {
                 {
                     col.stats = stats.clone();
                 }
+                // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
+                // statically: the comparison produces one `baseline.<alias>.f`
+                // per alias that emits `f`, and the aliases are only known once
+                // the run has produced rows. It is recorded as `baseline.*.f`
+                // and matched here by prefix and suffix.
+                if col.stats.is_empty()
+                    && let Some(rest) = col.header.strip_prefix("baseline.")
+                    && let Some((_, field)) = rest.rsplit_once('.')
+                    && let Some(stats) = self.column_stats.get(&format!("baseline.*.{field}"))
+                {
+                    col.stats = stats.clone();
+                }
+            }
+        }
+        // Likewise for `IMAGE(…)` hints, and on the same precedence rule: an
+        // inline hint in the `columns:` directive is the more specific
+        // statement of intent, so it is never overridden.
+        if !self.column_images.is_empty() {
+            for col in &mut columns {
+                if col.image.is_none()
+                    && let Some(img) = self.column_images.get(&col.header)
+                {
+                    col.image = Some(*img);
+                }
+            }
+        }
+        // And for `TRUTH "…"`, on the same precedence rule.
+        if !self.column_truths.is_empty() {
+            for col in &mut columns {
+                if col.truth.is_none()
+                    && let Some(t) = self.column_truths.get(&col.header)
+                {
+                    col.truth = Some(t.clone());
+                }
+            }
+        }
+        // `DETAIL` is a flag rather than a value, so "the directive already said
+        // so" is the whole precedence rule: a `columns:` spec can add the flag,
+        // never take it away.
+        if !self.column_details.is_empty() {
+            for col in &mut columns {
+                col.detail = col.detail || self.column_details.contains(&col.header);
             }
         }
         columns
@@ -114,6 +350,50 @@ impl ReportResult {
     /// per distinct value carrying its count. The leading (first-column) cell of
     /// each row holds the row's label unless the first column itself carries the
     /// statistic's value. Returns an empty vec when no column requested stats.
+    /// The complete footer of the table: the `STATISTICS` rows followed by the
+    /// ground-truth metric rows.
+    ///
+    /// This is what a *flat* renderer wants — CSV, JSON and the two live grids
+    /// have one table and nowhere else to put a figure. Formats with a header
+    /// block (HTML, xlsx) draw the metrics as cards or on their own sheet
+    /// instead and use [`Self::summary_rows`] for the footer, so the same
+    /// number is never printed twice in one document.
+    pub fn footer_rows(&self, columns: &[OutputColumn], header: &Header) -> Vec<SummaryRow> {
+        let mut rows = self.summary_rows(columns);
+        if let Some(metrics) = self.metrics(columns, header) {
+            rows.extend(metrics.summary_rows(columns));
+        }
+        rows
+    }
+
+    /// The ground-truth metrics of this run, or `None` when it has no `TRUTH`
+    /// column. The label vocabulary comes from the report's `# labels:`
+    /// directives, which is why this needs the header.
+    pub fn metrics(
+        &self,
+        columns: &[OutputColumn],
+        header: &Header,
+    ) -> Option<super::metrics::Metrics> {
+        let labels = super::labels::LabelMap::parse(&header.labels());
+        super::metrics::Metrics::compute(self, columns, &labels)
+    }
+
+    /// Row `r`'s rolled-up trend, read from the scored cells rather than from
+    /// the `Trend` column's text.
+    ///
+    /// The text can't be parsed back to a variant any more —
+    /// [`Trend::as_str`] shows both `Unchanged` and `StillWrong` as
+    /// `unchanged` — and it was never the better source anyway: this is the
+    /// same roll-up the column itself was written from, favouring the bad news.
+    pub fn row_trend(&self, r: usize) -> Option<Trend> {
+        Trend::rollup(
+            self.trends
+                .iter()
+                .filter(|((row, _), _)| *row == r)
+                .map(|(_, t)| *t),
+        )
+    }
+
     pub fn summary_rows(&self, columns: &[OutputColumn]) -> Vec<SummaryRow> {
         if columns.iter().all(|c| c.stats.is_empty()) {
             return Vec::new();
@@ -123,7 +403,9 @@ impl ReportResult {
         let column_values = |col: &OutputColumn| -> Vec<String> {
             self.rows
                 .iter()
-                .map(|row| col.value(row, &self.no_match_marker))
+                .enumerate()
+                .filter(|(i, _)| !self.pending.contains(i))
+                .map(|(_, row)| col.value(row, &self.no_match_marker))
                 .filter(|v| !v.trim().is_empty() && *v != self.no_match_marker)
                 .collect()
         };
@@ -146,7 +428,7 @@ impl ReportResult {
                 if let Some(text) = compute_stat(stat, &values) {
                     cells[ci] = Some(StatValue {
                         text,
-                        stat,
+                        stat: Some(stat),
                         numeric,
                         match_value: None,
                     });
@@ -168,7 +450,7 @@ impl ReportResult {
                 let mut cells = vec![None; columns.len()];
                 cells[ci] = Some(StatValue {
                     text: count.to_string(),
-                    stat: StatKind::Distribution,
+                    stat: Some(StatKind::Distribution),
                     numeric: true,
                     match_value: Some(value.clone()),
                 });
@@ -289,7 +571,10 @@ impl StatKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatValue {
     pub text: String,
-    pub stat: StatKind,
+    /// The statistic behind the value, or `None` for a footer figure that no
+    /// spreadsheet formula could recompute (a ground-truth metric), which is
+    /// therefore written as plain text.
+    pub stat: Option<StatKind>,
     pub numeric: bool,
     pub match_value: Option<String>,
 }
@@ -444,6 +729,23 @@ pub struct OutputColumn {
     pub sources: Vec<String>,
     /// Summary statistics to append after the data rows (empty = none).
     pub stats: Vec<StatKind>,
+    /// An `IMAGE[(…)]` render hint: writers that can show pictures draw this
+    /// column's cell *value* as one. The value itself is untouched, so a writer
+    /// that can't (CSV, JSON) simply writes the text. `None` = an ordinary text
+    /// column.
+    pub image: Option<ImageSpec>,
+    /// A `TRUTH "<template>"` clause: the column declares what the *correct*
+    /// value was, so a run can report whether the system under test was right
+    /// rather than merely whether it changed. The template is interpolated per
+    /// row after the run (see [`crate::report::flow::ReportFlow::column_truths`]);
+    /// the verdicts land in [`ReportResult::verdicts`]. `None` = a column with
+    /// no expected answer, which is every column in an ordinary report.
+    pub truth: Option<String>,
+    /// A `DETAIL` flag: the column belongs in its row's drill-down rather than
+    /// in the table. Placement only — the column is still exported, compared and
+    /// snapshotted like any other, which is what lets a format with no
+    /// drill-down (CSV, JSON) ignore the flag without losing data.
+    pub detail: bool,
 }
 
 impl OutputColumn {
@@ -489,9 +791,16 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
             if part.is_empty() {
                 return None;
             }
-            // Peel off an optional trailing `STATISTICS(…)` clause first, then
-            // the optional ` AS <name>` rename, leaving just the sources.
-            let (part, stats) = split_statistics(part);
+            // Peel off the optional trailing `STATISTICS(…)` and `IMAGE(…)`
+            // clauses first (in either written order), then the optional
+            // ` AS <name>` rename, leaving just the sources.
+            let (part, clauses) = split_column_clauses(part);
+            let ColumnClauses {
+                stats,
+                image,
+                truth,
+                detail,
+            } = clauses;
             let (sources_part, header) = split_as(part);
             let sources: Vec<String> = sources_part
                 .split('|')
@@ -506,9 +815,275 @@ pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
                 header,
                 sources,
                 stats,
+                image,
+                truth,
+                detail,
             })
         })
         .collect()
+}
+
+/// The optional trailing clauses a column spec may carry, in any order:
+/// `STATISTICS(…)`, `IMAGE[(…)]` and `TRUTH "<template>"`.
+///
+/// A struct rather than a tuple because there are now three of them and the
+/// same set attaches at four different places (a `columns:` spec, a `WITH`
+/// field, `REPORT … AS`, `REPORT "…" AS`) — a positional triple read the same
+/// way in four files is a bug waiting for the fourth clause.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ColumnClauses {
+    pub stats: Vec<StatKind>,
+    pub image: Option<ImageSpec>,
+    pub truth: Option<String>,
+    pub detail: bool,
+}
+
+/// Peel every optional trailing clause -- `STATISTICS(…)`, `IMAGE[(…)]` and
+/// `TRUTH "…"` -- off a column-spec, in whichever order they were written.
+///
+/// They are peeled in a loop rather than in a fixed sequence because no order
+/// is more natural than another, and a report that stops working because two
+/// independent clauses were typed the "wrong" way round is exactly the kind of
+/// arbitrary rule this language avoids.
+pub(crate) fn split_column_clauses(part: &str) -> (&str, ColumnClauses) {
+    let mut rest = part;
+    let mut out = ColumnClauses::default();
+    loop {
+        // Each peeler returns only the text *before* the clause it found, so
+        // they have to be applied right-to-left or an outer one would throw an
+        // inner one away. The longest remainder is the clause that starts
+        // latest, and so is the one to take this time round.
+        let (sr, s) = split_statistics(rest);
+        let (ir, im) = split_image(rest);
+        let (tr, tv) = split_truth(rest);
+        let (dr, dv) = split_detail(rest);
+        let cands = [
+            (!s.is_empty(), sr.len()),
+            (im.is_some(), ir.len()),
+            (tv.is_some(), tr.len()),
+            (dv, dr.len()),
+        ];
+        let latest = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, (found, _))| *found)
+            .max_by_key(|(_, (_, len))| *len)
+            .map(|(i, _)| i);
+        match latest {
+            Some(0) => {
+                out.stats = s;
+                rest = sr;
+            }
+            Some(1) => {
+                out.image = im;
+                rest = ir;
+            }
+            Some(2) => {
+                out.truth = tv;
+                rest = tr;
+            }
+            Some(3) => {
+                out.detail = true;
+                rest = dr;
+            }
+            _ => return (rest, out),
+        }
+    }
+}
+
+/// Peel a trailing bare `DETAIL` flag (case-insensitive, whole-word, outside
+/// quotes) off a column-spec, returning `(remainder, found)`.
+///
+/// Whole-word and outside quotes for the same reasons as its siblings: a column
+/// genuinely called `Detail` or `DETAILS`, or a template that contains the word,
+/// must not lose text to the flag.
+pub(crate) fn split_detail(part: &str) -> (&str, bool) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b'd' || c == b'D')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 6)
+                .is_some_and(|w| w.eq_ignore_ascii_case("detail"))
+            && part
+                .as_bytes()
+                .get(i + 6)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            // The flag takes no argument, so anything after it belongs to
+            // another clause -- and a bare word after it means this `DETAIL`
+            // was part of the column source, not a clause on it.
+            && part[i + 6..].trim_start().is_empty()
+        {
+            return (part[..i].trim_end(), true);
+        }
+        i += 1;
+    }
+    (part, false)
+}
+
+/// Peel a trailing `TRUTH "<template>"` clause (case-insensitive, whole-word,
+/// outside quotes) off a column-spec, returning `(remainder, template)`.
+///
+/// The argument is required and must be quoted: a ground truth is a *value*,
+/// and an unquoted one would be indistinguishable from the column name or
+/// keyword beside it (`TRUTH pass` vs `TRUTH PASS`). A `TRUTH` with nothing
+/// parseable after it is left in the text, where it becomes a visible part of
+/// the column source rather than a silently ignored clause.
+pub(crate) fn split_truth(part: &str) -> (&str, Option<String>) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b't' || c == b'T')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 5)
+                .is_some_and(|w| w.eq_ignore_ascii_case("truth"))
+            // Whole word: a column called `TRUTHY` is not a clause.
+            && part
+                .as_bytes()
+                .get(i + 5)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            && let Some(template) = quoted_arg(part[i + 5..].trim_start())
+        {
+            return (part[..i].trim_end(), Some(template));
+        }
+        i += 1;
+    }
+    (part, None)
+}
+
+/// Read a `"…"` string literal at the start of `text`, honouring the `\"`
+/// escape the serializer writes, and return its *content*. `None` when the text
+/// does not start with a quote or the quote is never closed.
+fn quoted_arg(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in chars {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+/// Peel a trailing `IMAGE` / `IMAGE(opt, …)` clause (case-insensitive,
+/// whole-word, outside quotes) off a column-spec, returning
+/// `(remainder, spec)`. Unrecognised options inside the parentheses are
+/// dropped, exactly as unknown statistic keywords are: a typo narrows what the
+/// clause does, it never fails the whole report.
+pub(crate) fn split_image(part: &str) -> (&str, Option<ImageSpec>) {
+    let bytes = part.as_bytes();
+    let mut in_quote = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && (c == b'i' || c == b'I')
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && part
+                .get(i..i + 5)
+                .is_some_and(|w| w.eq_ignore_ascii_case("image"))
+            // Whole word: `IMAGES` or `IMAGE_URL` is a column name, not a clause.
+            && part
+                .as_bytes()
+                .get(i + 5)
+                .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        {
+            let after = part[i + 5..].trim_start();
+            if let Some(inner) = after.strip_prefix('(') {
+                if let Some(close) = inner.find(')') {
+                    return (
+                        part[..i].trim_end(),
+                        Some(parse_image_opts(&inner[..close])),
+                    );
+                }
+                // An unclosed `(` isn't a clause; leave the text alone.
+            } else {
+                // The bare keyword, with defaults.
+                return (part[..i].trim_end(), Some(ImageSpec::default()));
+            }
+        }
+        i += 1;
+    }
+    (part, None)
+}
+
+/// Parse the inside of an `IMAGE(…)` clause: `HEIGHT n`, `WIDTH n`, `FIT`,
+/// comma-separated and case-insensitive.
+fn parse_image_opts(inner: &str) -> ImageSpec {
+    let mut spec = ImageSpec::default();
+    for opt in inner.split(',') {
+        let opt = opt.trim();
+        if opt.eq_ignore_ascii_case("fit") {
+            spec.fit = true;
+            continue;
+        }
+        let mut parts = opt.split_whitespace();
+        let (Some(key), Some(val)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(n) = val.parse::<u32>() else { continue };
+        if n == 0 {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("height") {
+            spec.height = Some(n);
+        } else if key.eq_ignore_ascii_case("width") {
+            spec.width = Some(n);
+        }
+    }
+    spec
 }
 
 /// Peel a trailing `STATISTICS(stat, …)` clause (case-insensitive, whole-word,
@@ -521,6 +1096,13 @@ pub(crate) fn split_statistics(part: &str) -> (&str, Vec<StatKind>) {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
+        // A `\"` inside a string is part of it, not the end of it; without
+        // this the quote tracking desyncs and a clause after a template
+        // containing an escaped quote is silently swallowed as literal text.
+        if in_quote && c == b'\\' {
+            i += 2;
+            continue;
+        }
         if c == b'"' {
             in_quote = !in_quote;
             i += 1;
@@ -627,6 +1209,47 @@ fn unquote(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The flag takes no argument, so it can only be recognised as the last
+    /// thing on the line -- otherwise a column source that merely ends in the
+    /// word, or mentions it inside quotes, would lose text.
+    #[test]
+    fn split_detail_only_takes_a_trailing_bare_keyword() {
+        assert_eq!(
+            split_detail("jsonpath \"$.a\" DETAIL"),
+            ("jsonpath \"$.a\"", true)
+        );
+        assert_eq!(
+            split_detail("jsonpath \"$.a\" detail  "),
+            ("jsonpath \"$.a\"", true)
+        );
+        // Not a clause: something follows it, it is inside quotes, or it is
+        // glued to a longer word.
+        for src in [
+            "jsonpath \"$.a\" DETAIL EXTRA",
+            "jsonpath \"$.DETAIL\"",
+            "jsonpath \"$.a\" DETAILS",
+        ] {
+            assert_eq!(split_detail(src), (src, false), "{src}");
+        }
+    }
+
+    /// A `columns:` header can only *add* the flag: the two spellings are
+    /// independent, and letting the header silently un-detail a column would
+    /// make the source line a lie.
+    #[test]
+    fn column_detail_from_the_flow_survives_a_columns_header() {
+        let mut res = ReportResult::default();
+        res.column_details.insert("Payload".into());
+        let header = Header {
+            lines: vec![crate::report::flow::HeaderLine::Directive {
+                key: "columns".to_string(),
+                value: "Payload, Name DETAIL".to_string(),
+            }],
+        };
+        let cols = res.resolved_columns(&header);
+        assert!(cols.iter().all(|c| c.detail), "both are detail columns");
+    }
+
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
             cells: cells
@@ -696,6 +1319,9 @@ mod tests {
             header: "Status".into(),
             sources: vec!["a.status".into(), "b.status".into()],
             stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
         };
         let r = row(&[("a.status", ""), ("b.status", "ok")], &[], None);
         assert_eq!(col.value(&r, "-"), "ok");
@@ -707,6 +1333,9 @@ mod tests {
             header: "Name".into(),
             sources: vec!["FILE".into()],
             stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
         };
         let r = row(&[], &[("FILE", "a.jpg")], None);
         assert_eq!(col.value(&r, "∅"), "a.jpg");
@@ -720,6 +1349,9 @@ mod tests {
             header: "Env".into(),
             sources: vec![TARGET_COLUMN.to_string()],
             stats: Vec::new(),
+            image: None,
+            truth: None,
+            detail: false,
         };
         let r = row(&[], &[], Some("staging-au"));
         assert_eq!(col.value(&r, "-"), "staging-au");
@@ -740,6 +1372,159 @@ mod tests {
         assert_eq!(cols[0].header, "Pretty time");
         assert_eq!(cols[0].sources, vec!["proc.Time"]);
         assert_eq!(cols[0].stats, vec![StatKind::Mean]);
+    }
+
+    #[test]
+    fn parse_columns_reads_image_clause_in_either_order() {
+        use crate::report::flow::ImageSpec;
+        // The `columns:` directive is a second, independent spelling of the same
+        // clauses, so it has to accept everything the flow parser does.
+        let cols = parse_columns(
+            "face.Frame AS Face IMAGE, Doc IMAGE(HEIGHT 110), Sig IMAGE(WIDTH 200, HEIGHT 100), Thumb IMAGE(FIT), Time STATISTICS(MEAN) IMAGE(HEIGHT 20), Other IMAGE(HEIGHT 20) STATISTICS(MEAN)",
+        );
+        assert_eq!(cols[0].header, "Face");
+        assert_eq!(cols[0].sources, vec!["face.Frame"]);
+        assert_eq!(cols[0].image, Some(ImageSpec::default()));
+        assert_eq!(
+            cols[1].image,
+            Some(ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            cols[2].image,
+            Some(ImageSpec {
+                width: Some(200),
+                height: Some(100),
+                fit: false
+            })
+        );
+        assert_eq!(
+            cols[3].image,
+            Some(ImageSpec {
+                fit: true,
+                ..Default::default()
+            })
+        );
+        for c in &cols[4..6] {
+            assert_eq!(c.stats, vec![StatKind::Mean], "{}", c.header);
+            assert_eq!(
+                c.image,
+                Some(ImageSpec {
+                    height: Some(20),
+                    ..Default::default()
+                }),
+                "{}",
+                c.header
+            );
+        }
+    }
+
+    /// A column with no `IMAGE` clause must stay a plain text column — the
+    /// clause is opt-in per column, never inherited from a neighbour.
+    #[test]
+    fn parse_columns_leaves_other_columns_without_an_image() {
+        let cols = parse_columns("Face IMAGE, Time");
+        assert!(cols[0].image.is_some());
+        assert_eq!(cols[1].image, None);
+    }
+
+    /// The flow's `IMAGE` clauses reach the resolved columns, but an inline
+    /// `columns:` entry for the same header wins — the same precedence the
+    /// `STATISTICS` clause already has.
+    #[test]
+    fn resolved_columns_merge_flow_images_and_inline_wins() {
+        use crate::report::flow::ImageSpec;
+        let mut res = ReportResult::default();
+        res.rows = vec![row(&[("Face", "a.png"), ("Doc", "b.png")], &[], None)];
+        res.column_order = vec!["Face".to_string(), "Doc".to_string()];
+        res.column_images.insert(
+            "Face".to_string(),
+            ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            },
+        );
+        res.column_images.insert(
+            "Doc".to_string(),
+            ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            },
+        );
+        let header = Header {
+            lines: vec![crate::report::flow::HeaderLine::Directive {
+                key: "columns".to_string(),
+                value: "Face, Doc IMAGE(HEIGHT 40)".to_string(),
+            }],
+        };
+        let cols = res.resolved_columns(&header);
+        assert_eq!(
+            cols[0].image,
+            Some(ImageSpec {
+                height: Some(110),
+                ..Default::default()
+            }),
+            "a column with no inline clause takes the flow's"
+        );
+        assert_eq!(
+            cols[1].image,
+            Some(ImageSpec {
+                height: Some(40),
+                ..Default::default()
+            }),
+            "an inline IMAGE(…) overrides the flow's"
+        );
+    }
+
+    #[test]
+    fn image_spec_scales_proportionally_from_one_dimension() {
+        use crate::report::flow::{DEFAULT_IMAGE_HEIGHT, ImageSpec};
+        let natural = (400, 200);
+        // Height only: width follows the aspect ratio, and vice versa.
+        assert_eq!(
+            ImageSpec {
+                height: Some(100),
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            Some((200.0, 100.0))
+        );
+        assert_eq!(
+            ImageSpec {
+                width: Some(100),
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            Some((100.0, 50.0))
+        );
+        // Both given: the aspect ratio is deliberately not preserved — the
+        // report asked for an exact box.
+        assert_eq!(
+            ImageSpec {
+                width: Some(100),
+                height: Some(100),
+                fit: false
+            }
+            .scaled_size(natural),
+            Some((100.0, 100.0))
+        );
+        // Neither: the default height, scaled proportionally.
+        let h = DEFAULT_IMAGE_HEIGHT as f64;
+        assert_eq!(
+            ImageSpec::default().scaled_size(natural),
+            Some((h * 2.0, h))
+        );
+        // FIT hands sizing to the writer, so there is no box to compute.
+        assert_eq!(
+            ImageSpec {
+                fit: true,
+                ..Default::default()
+            }
+            .scaled_size(natural),
+            None
+        );
     }
 
     #[test]
@@ -766,6 +1551,54 @@ mod tests {
         assert_eq!(get("Max").as_deref(), Some("300"));
         // Population std dev of {100,200,300} = ~81.6497.
         assert!(get("Std dev").unwrap().starts_with("81.6"));
+    }
+
+    /// A live run's statistics measure only the rows that have actually come
+    /// back: the skeleton fills the rest with dry placeholders (`Time` 0), and
+    /// averaging those in makes the figure wrong in a way that slowly corrects
+    /// itself — which is worse than showing nothing.
+    /// `BASELINE(…) SHOW(Time STATISTICS(MEAN))` summarises the copied baseline
+    /// column, whose real name (`baseline.<alias>.Time`) only exists once the
+    /// run has produced rows — so it is matched by suffix.
+    #[test]
+    fn baseline_show_statistics_reach_the_column_they_name() {
+        let mut res = ReportResult::default();
+        res.note_column("proc.Time");
+        res.note_column("baseline.proc.Time");
+        res.column_stats
+            .insert("baseline.*.Time".to_string(), vec![StatKind::Mean]);
+        let cols = res.resolved_columns(&Header::default());
+        let baseline_col = cols
+            .iter()
+            .find(|c| c.header == "baseline.proc.Time")
+            .expect("the copied baseline column");
+        assert_eq!(baseline_col.stats, vec![StatKind::Mean]);
+        // The candidate's own column is untouched: the clause named the
+        // baseline's.
+        let own = cols.iter().find(|c| c.header == "proc.Time").unwrap();
+        assert!(own.stats.is_empty());
+    }
+
+    #[test]
+    fn statistics_skip_rows_still_waiting_on_their_result() {
+        let mut res = ReportResult::default();
+        res.rows = vec![
+            row(&[("Time", "100")], &[], None),
+            row(&[("Time", "200")], &[], None),
+            row(&[("Time", "0")], &[], None),
+            row(&[("Time", "0")], &[], None),
+        ];
+        res.pending = [2, 3].into_iter().collect();
+        let cols = parse_columns("Time STATISTICS(MEAN, COUNT)");
+        let summary = res.summary_rows(&cols);
+        let get = |label: &str| {
+            summary
+                .iter()
+                .find(|r| r.label == label)
+                .map(|r| r.text_cell(0))
+        };
+        assert_eq!(get("Count").as_deref(), Some("2"), "only the finished rows");
+        assert_eq!(get("Mean").as_deref(), Some("150"));
     }
 
     #[test]

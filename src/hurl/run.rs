@@ -55,6 +55,25 @@ pub struct EntryOutcome {
     /// milliseconds (excludes assert/capture processing). Reports surface this
     /// as the per-request "Time" column.
     pub duration_ms: u64,
+    /// The `duration_ms` breakdown, from libcurl's own timers, so a report can
+    /// separate what the *server* did from what the local machine and network
+    /// spent getting to it. Each is summed over the entry's calls (a redirect
+    /// chain contributes every hop), so the three always add up to
+    /// `duration_ms`.
+    ///
+    /// Connection setup: DNS resolution, TCP connect and the TLS handshake —
+    /// everything before the request could start being sent. PaperBoy builds a
+    /// fresh client per request, so every request pays this in full; under a
+    /// heavily parallel run it is also the part that suffers most from local
+    /// CPU and uplink contention, which is precisely why it is worth seeing
+    /// apart from the rest.
+    pub setup_ms: u64,
+    /// Time in flight: from the request starting to go out to the first byte of
+    /// the response arriving. The closest thing to "what the server took",
+    /// and the figure to watch when a parallel run makes `Time` climb.
+    pub wait_ms: u64,
+    /// Time spent receiving the response body, after its first byte.
+    pub download_ms: u64,
     /// `true` when the runner reported no errors for this entry (status
     /// expectation, asserts and transport all satisfied).
     pub ok: bool,
@@ -332,6 +351,25 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
         e.errors.first().map(|er| render_error(er, lines))
     };
 
+    // Split the transfer time into connection setup / in-flight / download,
+    // summed across calls so a redirect chain accounts for every hop. libcurl
+    // reports its timers as offsets from the start of each transfer:
+    // `pre_transfer` is "connected, TLS done, about to send", `start_transfer`
+    // is "first response byte in". Saturating throughout: the timers are
+    // independent samples and a stalled transfer can report them out of order,
+    // which must never underflow into an absurd duration.
+    let (setup_ms, wait_ms, download_ms) = e.calls.iter().fold((0, 0, 0), |(s, w, d), c| {
+        let t = &c.timings;
+        let pre = t.pre_transfer;
+        let start = t.start_transfer.max(pre);
+        let total = t.total.max(start);
+        (
+            s + pre.as_millis() as u64,
+            w + (start - pre).as_millis() as u64,
+            d + (total - start).as_millis() as u64,
+        )
+    });
+
     (
         EntryOutcome {
             method,
@@ -344,6 +382,9 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
             asserts,
             captures,
             duration_ms: e.transfer_duration.as_millis() as u64,
+            setup_ms,
+            wait_ms,
+            download_ms,
             ok: e.errors.is_empty(),
             error: entry_error.clone(),
         },
@@ -397,6 +438,45 @@ fn reason(status: u16) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Removes a path when it goes out of scope, so a failing assertion can't
+    /// leave scratch files behind. The plain `remove_*` call these tests used to
+    /// end with is skipped when the test panics — which for the one case that
+    /// has to write into the *current* directory meant litter in the working
+    /// tree, not just in `/tmp`.
+    struct TempPath(std::path::PathBuf);
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            if self.0.is_dir() {
+                std::fs::remove_dir_all(&self.0).ok();
+            } else {
+                std::fs::remove_file(&self.0).ok();
+            }
+        }
+    }
+
+    impl std::ops::Deref for TempPath {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl TempPath {
+        /// The path itself. Inherent rather than left to `Deref`, because
+        /// `Path::as_path` doesn't exist and the call would otherwise resolve
+        /// through a different (unstable) trait entirely.
+        fn as_path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    /// A uniquely-named scratch path under `dir` (not created on disk), cleaned
+    /// up whether the test passes or panics.
+    fn temp_path(dir: &std::path::Path, prefix: &str) -> TempPath {
+        TempPath(dir.join(format!("{prefix}_{}", uuid::Uuid::new_v4())))
+    }
+
     /// Spawn a one-shot HTTP/1.1 server on an ephemeral port that answers the
     /// first connection with `status`/`reason` and a tiny JSON body, then
     /// closes. Returns the bound port. Used to exercise the status-assertion
@@ -421,6 +501,24 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Feature: the transfer time is reported both whole and broken into its
+    /// connection-setup / in-flight / download parts, and the parts add up.
+    #[test]
+    fn timing_breakdown_partitions_the_total() {
+        let port = one_shot_server(200, "OK");
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let e = out.entries.first().expect("one entry");
+        // Millisecond truncation of each part can lose up to 1ms apiece, so the
+        // sum can trail the total slightly; it must never exceed it.
+        let parts = e.setup_ms + e.wait_ms + e.download_ms;
+        assert!(
+            parts <= e.duration_ms && e.duration_ms - parts <= 3,
+            "parts {parts} should account for total {}",
+            e.duration_ms
+        );
     }
 
     /// Feature: the implicit `HTTP <code>` status line surfaces in the mapped
@@ -545,8 +643,8 @@ mod tests {
     /// file access", regardless of where the `.hurl` file actually lived.
     #[test]
     fn relative_form_file_path_is_authorized_against_the_collection_directory() {
-        let dir = std::env::temp_dir().join(format!("paperboy_run_test_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_path(&std::env::temp_dir(), "paperboy_run_test");
+        std::fs::create_dir_all(&*dir).unwrap();
         std::fs::write(dir.join("avatar.png"), b"fake-png").unwrap();
 
         // The URL is unroutable (TEST-NET-1, RFC 5737) with a tiny implicit
@@ -565,8 +663,6 @@ mod tests {
             !msg.to_ascii_lowercase().contains("unauthorized"),
             "a form file relative to the collection directory must be authorized, got: {msg}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Without a `file_root`, the runner falls back to the process's current
@@ -575,9 +671,13 @@ mod tests {
     #[test]
     fn missing_file_root_falls_back_to_the_process_current_directory() {
         let cwd = std::env::current_dir().unwrap();
-        let unique = format!("paperboy_run_test_cwd_{}.bin", uuid::Uuid::new_v4());
-        let file_path = cwd.join(&unique);
-        std::fs::write(&file_path, b"fake").unwrap();
+        let file_path = temp_path(&cwd, "paperboy_run_test_cwd");
+        let unique = file_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&*file_path, b"fake").unwrap();
 
         let content = format!("POST http://192.0.2.1/upload\n[Multipart]\nf: file,{unique};\n");
         let out = run_hurl(&content, &HashMap::new(), None);
@@ -591,22 +691,16 @@ mod tests {
             !msg.to_ascii_lowercase().contains("unauthorized"),
             "a file in the process's current directory must be authorized when no file_root is given, got: {msg}"
         );
-
-        std::fs::remove_file(&file_path).ok();
     }
 
     /// A form file path that resolves outside the given `file_root` must
     /// still be rejected — the fix must not disable the sandbox entirely.
     #[test]
     fn form_file_path_outside_the_file_root_is_still_rejected() {
-        let root =
-            std::env::temp_dir().join(format!("paperboy_run_test_root_{}", uuid::Uuid::new_v4()));
-        let outside = std::env::temp_dir().join(format!(
-            "paperboy_run_test_outside_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        let root = temp_path(&std::env::temp_dir(), "paperboy_run_test_root");
+        let outside = temp_path(&std::env::temp_dir(), "paperboy_run_test_outside");
+        std::fs::create_dir_all(&*root).unwrap();
+        std::fs::create_dir_all(&*outside).unwrap();
         std::fs::write(outside.join("secret.bin"), b"fake").unwrap();
 
         let content = "POST http://192.0.2.1/upload\n[Multipart]\nf: file,../secret.bin;\n";
@@ -623,9 +717,6 @@ mod tests {
             msg.to_ascii_lowercase().contains("unauthorized"),
             "a file outside file_root must still be rejected, got: {msg}"
         );
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&outside).ok();
     }
 
     /// End-to-end proof that staging fixes the exact scenario the previous
@@ -637,14 +728,10 @@ mod tests {
         use crate::hurl::entry::{FormField, FormFieldKind, HurlEntry};
         use crate::hurl::stage_out_of_scope_form_files;
 
-        let root =
-            std::env::temp_dir().join(format!("paperboy_stage_run_root_{}", uuid::Uuid::new_v4()));
-        let outside = std::env::temp_dir().join(format!(
-            "paperboy_stage_run_outside_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        let root = temp_path(&std::env::temp_dir(), "paperboy_stage_run_root");
+        let outside = temp_path(&std::env::temp_dir(), "paperboy_stage_run_outside");
+        std::fs::create_dir_all(&*root).unwrap();
+        std::fs::create_dir_all(&*outside).unwrap();
         let outside_file = outside.join("secret.bin");
         std::fs::write(&outside_file, b"fake").unwrap();
 
@@ -680,8 +767,6 @@ mod tests {
             "the staged file must be authorized against the staging directory, got: {msg}"
         );
 
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&outside).ok();
         std::fs::remove_dir_all(&staged_dir).ok();
     }
 }

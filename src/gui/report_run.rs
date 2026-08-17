@@ -66,6 +66,76 @@ pub struct RunProgress {
     pub total: usize,
 }
 
+/// What identifies a report's run across the editor being closed and reopened.
+///
+/// A report opened from a Workspace tree is loaded afresh from disk each time,
+/// so its [`Report::id`](crate::report::Report::id) is a *different* number on
+/// the way back in — the file path is the only thing that survives. A session
+/// report keeps its id (it is cloned out of the session), and may have no path
+/// at all if it has never been saved.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum RunKey {
+    Path(std::path::PathBuf),
+    Id(u64),
+}
+
+impl RunKey {
+    pub fn of(report: &crate::report::Report) -> Self {
+        match &report.path {
+            Some(p) => RunKey::Path(p.clone()),
+            None => RunKey::Id(report.id),
+        }
+    }
+}
+
+/// A report's run, parked while its editor isn't on screen.
+///
+/// The editor is a *view*: it is dropped and rebuilt whenever the user clicks a
+/// tab or opens another file. A run must not be, because dropping its
+/// [`RunHandle`] cancels the worker — so navigating away used to kill a report
+/// mid-flight and throw away the rows it had already collected. The run lives on
+/// the app instead, and the editor borrows it while it is open.
+#[derive(Default)]
+pub struct ParkedRun {
+    pub result: Option<ReportResult>,
+    pub progress: Option<RunProgress>,
+    pub run: Option<RunHandle>,
+    pub results_exported: bool,
+    pub last_export: Option<String>,
+    /// The answers typed into the run settings. They travel with the run
+    /// because they are what produced it -- and because retyping them after a
+    /// trip to another tab would be a poor reward for having answered once.
+    pub params: crate::report::params::ParamValues,
+}
+
+impl ParkedRun {
+    /// Whether this is worth keeping: a live run, or results someone might come
+    /// back to.
+    pub fn is_worth_keeping(&self) -> bool {
+        self.run.is_some() || self.result.is_some()
+    }
+
+    /// Drain any buffered updates so a run that nobody is looking at still makes
+    /// progress into its grid. Returns whether it is still live.
+    pub fn pump(&mut self) -> bool {
+        let Some(handle) = self.run.as_mut() else {
+            return false;
+        };
+        if matches!(
+            drain(handle, &mut self.result, &mut self.progress),
+            Drained::Disconnected
+        ) {
+            self.run = None;
+            return false;
+        }
+        if handle.finished() {
+            self.run = None;
+            return false;
+        }
+        true
+    }
+}
+
 /// A handle on an in-flight run: the cancel flag (flip it to wind the run down)
 /// and the receiver its updates stream over.
 pub struct RunHandle {
@@ -82,6 +152,13 @@ impl RunHandle {
     /// still finishes, but no new ones start). The partial grid is retained.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The shared cancel flag, so a test can watch it after the handle itself
+    /// has been dropped (which is exactly what stopping a run does).
+    #[cfg(test)]
+    pub(crate) fn cancel_flag_for_test(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
     }
 
     /// Whether this run has been cancelled.
@@ -102,6 +179,19 @@ impl Drop for RunHandle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// A handle wired to a caller-driven sender, so a test can push updates through
+/// the real [`drain`]/[`apply`] fold without spawning a worker.
+#[cfg(test)]
+pub(crate) fn test_handle() -> (RunHandle, std::sync::mpsc::Sender<RunUpdate>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = RunHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+        finished: false,
+    };
+    (handle, tx)
 }
 
 /// Wraps a real [`EntryRunner`] with a cancel flag so a running report can be
@@ -136,11 +226,15 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         let ReportRunInputs {
             flow,
             entries,
+            helpers,
             base_vars,
             named_envs,
             root,
             file_root,
+            language,
+            params,
         } = inputs;
+        let strings = crate::i18n::Strings::for_language(&language);
 
         // 1. Skeleton: expand with no HTTP to get the full canonical row set up
         //    front. Its rows map 1:1 (by `path`) to the live rows the sink will
@@ -148,10 +242,13 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         let skeleton = {
             let dry_ctx = RunContext {
                 entries: &entries,
+                helpers: &helpers,
                 base_vars: base_vars.clone(),
                 named_envs: named_envs.clone(),
                 root: root.clone(),
                 runner: &DryRunner,
+                strings: &strings,
+                params: params.clone(),
                 sink: None,
             };
             run_flow_raw(&flow, &dry_ctx)
@@ -179,10 +276,13 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
         };
         let ctx = RunContext {
             entries: &entries,
+            helpers: &helpers,
             base_vars,
             named_envs,
             root,
             runner: &runner,
+            strings: &strings,
+            params: params.clone(),
             sink: Some(&sink),
         };
         let mut result = run_flow_raw(&flow, &ctx);
@@ -255,7 +355,10 @@ fn apply(
             if cancelled {
                 return None;
             }
+            let mut skeleton = skeleton;
             let total = skeleton.rows.len();
+            // Outstanding until each row streams in — see `ReportResult::pending`.
+            skeleton.pending = (0..total).collect();
             let index = skeleton
                 .rows
                 .iter()
@@ -294,6 +397,7 @@ fn apply(
                 && ri < res.rows.len()
             {
                 res.rows[ri] = *row;
+                res.pending.remove(&ri);
                 if prog.states[ri] != RowState::Finished {
                     prog.states[ri] = RowState::Finished;
                     prog.done += 1;
@@ -326,19 +430,6 @@ fn apply(
 mod tests {
     use super::*;
     use crate::report::model::{ReportResult, ReportRow};
-    use std::sync::mpsc::Sender;
-
-    /// A handle wired to a caller-driven sender, so a test can push updates
-    /// through the real [`drain`]/[`apply`] fold without spawning a worker.
-    fn test_handle() -> (RunHandle, Sender<RunUpdate>) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = RunHandle {
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx,
-            finished: false,
-        };
-        (handle, tx)
-    }
 
     fn row(path: Vec<(usize, usize)>, status: &str) -> ReportRow {
         let mut r = ReportRow::default();

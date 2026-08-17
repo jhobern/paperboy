@@ -425,7 +425,38 @@ fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
 /// Synchronous (blocks on the CLIs) — used by the headless CLI runner. The
 /// GUIs use [`parse_vars_pending`] + [`spawn_resolution`] to avoid freezing.
 pub fn parse_vars(name: String, content: &str) -> Environment {
-    parse_vars_with(name, content, &CliResolver)
+    parse_vars_with(name, content, &default_resolver())
+}
+
+/// Resolve one value that may be a `{{ … }}` provider reference — an API key, a
+/// token, anything held somewhere other than in the clear — to its literal.
+///
+/// A value with no reference in it is returned as-is (trimmed), so a caller can
+/// pass whatever the user typed without deciding first what kind of thing it is.
+/// `None` means the reference was recognised but the provider would not answer:
+/// a wrong path, or a CLI that is missing or not signed in.
+///
+/// The reference goes through the same parser a `.vars` file does, so it
+/// behaves identically here and there — the same syntax, the same providers,
+/// and (like everything resolved this way) never written to disk.
+///
+/// **Blocking**: it shells out to `op`/`aws`, which can take seconds and may
+/// prompt for a fingerprint. Never call it on a thread that is drawing.
+pub fn resolve_reference(raw: &str) -> Option<String> {
+    resolve_reference_with(raw, &default_resolver())
+}
+
+/// [`resolve_reference`] against a caller-supplied resolver, for tests.
+pub fn resolve_reference_with(raw: &str, resolver: &dyn SecretResolver) -> Option<String> {
+    let raw = raw.trim();
+    if !raw.contains("{{") {
+        return (!raw.is_empty()).then(|| raw.to_string());
+    }
+    let env = parse_vars_with("secret".to_string(), &format!("VALUE={raw}"), resolver);
+    match env.vars.first() {
+        Some(v) if v.resolved && !v.value.trim().is_empty() => Some(v.value.clone()),
+        _ => None,
+    }
 }
 
 /// Parse a `.vars` file using a caller-supplied `resolver`, resolving every
@@ -484,16 +515,21 @@ pub fn parse_vars_pending(name: String, content: &str) -> (Environment, Vec<Pend
     let mut vars = Vec::new();
     let mut pending = Vec::new();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, raw)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        let raw = raw.trim().to_string();
+    // A Postman environment export (`.json`) is imported into the same model:
+    // its variables are just `KEY`/value pairs, so they go through the identical
+    // classification as `.vars` lines and behave the same from here on.
+    let pairs: Vec<(String, String)> = match crate::postman::postman_env_values(content) {
+        Some(pairs) => pairs,
+        None => content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, raw)| (key.trim().to_string(), raw.trim().to_string()))
+            .collect(),
+    };
+
+    for (key, raw) in pairs {
         let index = vars.len();
         vars.push(parse_var_pending(key, raw, index, &mut pending));
     }
@@ -740,10 +776,27 @@ pub fn spawn_resolution(env_id: u64, pending: Vec<PendingSecret>) -> Receiver<En
     rx
 }
 
+/// The resolver the synchronous entry points use.
+///
+/// Under test this is [`NoopResolver`], for the same reason the background
+/// resolvers swap themselves out: a test that reached the real `op` would put a
+/// fingerprint prompt on the developer's screen and resolve against whatever
+/// happens to be in *their* 1Password — which is neither reproducible nor
+/// something a test suite is entitled to do.
+#[cfg(not(test))]
+fn default_resolver() -> CliResolver {
+    CliResolver
+}
+
+#[cfg(test)]
+fn default_resolver() -> NoopResolver {
+    NoopResolver
+}
+
 /// A resolver that never resolves anything, used under `cfg(test)` so the test
 /// suite never invokes the real `op`/`aws` CLIs.
 #[cfg(test)]
-struct NoopResolver;
+pub struct NoopResolver;
 
 #[cfg(test)]
 impl SecretResolver for NoopResolver {
@@ -760,10 +813,14 @@ fn extract_template(s: &str) -> Option<&str> {
     Some(s.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim())
 }
 
-/// Heuristic check that `content` is a `.vars` environment file: at least one
-/// non-comment `KEY=value` line whose key has no whitespace. This distinguishes
-/// it from a Hurl collection (whose lines are `METHOD url` / `Header: value`).
+/// Heuristic check that `content` is an environment file: a Postman
+/// environment export (`.json`), or a `.vars` file — at least one non-comment
+/// `KEY=value` line whose key has no whitespace. This distinguishes it from a
+/// Hurl collection (whose lines are `METHOD url` / `Header: value`).
 pub fn looks_like_env(content: &str) -> bool {
+    if crate::postman::postman_env_values(content).is_some() {
+        return true;
+    }
     content.lines().any(|line| {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -816,6 +873,41 @@ mod tests {
         fn resolve_ssm(&self, name: &str) -> Option<String> {
             (name == "/demo/api/password").then(|| "ssm-secret-xyz".to_string())
         }
+    }
+
+    /// A one-off secret — an API key typed into a wizard — resolves through the
+    /// same syntax and the same providers a `.vars` file does.
+    #[test]
+    fn a_single_value_resolves_the_same_way_a_vars_line_does() {
+        assert_eq!(
+            resolve_reference_with("{{ op://Engineering/demo-api/token }}", &MockResolver),
+            Some("op-secret-123".to_string())
+        );
+        assert_eq!(
+            resolve_reference_with("{{ ssm:/demo/api/password }}", &MockResolver),
+            Some("ssm-secret-xyz".to_string())
+        );
+    }
+
+    /// Anything that isn't a reference is already the value: a caller can hand
+    /// over whatever was typed without deciding first what kind of thing it is.
+    #[test]
+    fn a_plain_value_passes_straight_through() {
+        assert_eq!(
+            resolve_reference_with("  PMAK-abcdef  ", &MockResolver),
+            Some("PMAK-abcdef".to_string())
+        );
+        assert_eq!(resolve_reference_with("   ", &MockResolver), None);
+    }
+
+    /// A reference the provider won't answer is not a key: reporting it as one
+    /// would send the literal `{{ … }}` text to the server as a credential.
+    #[test]
+    fn an_unresolvable_reference_is_not_mistaken_for_a_value() {
+        assert_eq!(
+            resolve_reference_with("{{ op://Nope/nothing/here }}", &MockResolver),
+            None
+        );
     }
 
     fn one(content: &str) -> EnvVar {
@@ -1180,5 +1272,57 @@ mod tests {
         assert!(!looks_like_env("\n\n# just a comment\n"));
         // A URL query string ("KEY=val" but the key has spaces) is not a var line.
         assert!(!looks_like_env("GET http://x?a=b"));
+    }
+
+    /// A Postman environment export is an environment file too, in both the
+    /// bare shape and the `{"environment": …}` envelope an account backup uses.
+    #[test]
+    fn postman_environment_exports_are_loaded_as_environments() {
+        let bare = r#"{
+          "id": "abc", "name": "Staging",
+          "values": [
+            { "key": "url", "value": "https://staging.example", "enabled": true },
+            { "key": "token", "value": "t0k", "type": "secret" },
+            { "key": "old", "value": "gone", "enabled": false }
+          ]
+        }"#;
+        let enveloped = format!("{{ \"environment\": {} }}", bare);
+
+        for content in [bare, enveloped.as_str()] {
+            assert!(looks_like_env(content));
+            let (env, pending) = parse_vars_pending("Staging".into(), content);
+            assert!(pending.is_empty(), "plain literals need no resolution");
+            assert_eq!(
+                env.vars.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
+                vec!["url", "token"],
+                "a variable Postman disabled is not imported"
+            );
+            assert_eq!(env.vars[0].value, "https://staging.example");
+            assert!(env.vars[0].resolved);
+            // `raw` is what a later "Save Environment" writes out as `.vars`.
+            assert_eq!(env.to_vars_text(), "url=https://staging.example\ntoken=t0k");
+        }
+    }
+
+    /// A Postman value written as a provider reference is classified like the
+    /// same token in a `.vars` file, rather than being taken literally.
+    #[test]
+    fn postman_environment_value_can_be_a_provider_reference() {
+        let content = r#"{ "name": "e", "values": [
+            { "key": "TOKEN", "value": "{{ op://V/i/f }}" }
+        ]}"#;
+        let (env, pending) = parse_vars_pending("e".into(), content);
+        assert_eq!(env.vars[0].source, ValueSource::OnePassword);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// A Postman *collection* must not be mistaken for an environment.
+    #[test]
+    fn postman_collection_is_not_an_environment() {
+        let json = r#"{ "collection": {
+          "info": { "name": "demo" },
+          "item": [ { "name": "a", "request": { "method": "GET", "url": "http://x" } } ]
+        }}"#;
+        assert!(!looks_like_env(json));
     }
 }

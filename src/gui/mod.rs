@@ -9,11 +9,14 @@
 //! natively by egui rather than the hand-written plumbing the terminal UI needs.
 
 mod app;
+#[cfg(test)]
+mod dialog_style;
 mod editor;
 mod environments;
 mod filepick;
 mod icons;
 mod menu;
+mod postman;
 mod remote;
 mod report_editor;
 mod report_run;
