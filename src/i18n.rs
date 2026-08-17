@@ -983,7 +983,7 @@ strings! {
     gui_report_path => "Path:", "Chemin\u{a0}:", "Sti:";
     // PaperTrail block editor (report_editor.rs).
     gui_report_run_settings => "Run settings", "Réglages d'exécution", "Kørselsindstillinger";
-    gui_report_run_settings_tooltip => "The values this report asks for before it runs.", "Les valeurs que ce rapport demande avant de s'exécuter.", "De værdier denne rapport beder om, før den kører.";
+    gui_report_run_settings_shortcut => "Click, or press p, to change them.", "Cliquez, ou appuyez sur p, pour les modifier.", "Klik, eller tryk p, for at ændre dem.";
     gui_report_view_blocks => "Blocks", "Blocs", "Blokke";
     gui_report_view_source => "Source", "Source", "Kilde";
     gui_report_add_block => "Add block", "Ajouter un bloc", "Tilføj blok";
@@ -1304,8 +1304,11 @@ strings! {
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
     param_view_lead => "Set the values this run will use.", "Définissez les valeurs utilisées par cette exécution.", "Angiv de værdier, denne kørsel skal bruge.";
     param_view_hint => "Enter set  r run  d preview  Esc cancel", "Entrée définir  r exécuter  d aperçu  Échap annuler", "Enter angiv  r kør  d forhåndsvis  Esc annullér";
-    param_summary_prefix => "Values", "Valeurs", "Værdier";
+    param_summary_prefix => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";
     param_summary_hint => "p to change", "p pour modifier", "p for at ændre";
+    param_changed_since_run => "changed since this run", "modifié depuis cette exécution", "ændret siden denne kørsel";
+    param_previewed_with => "Previewed with", "Aperçu avec", "Forhåndsvist med";
+    param_result_ran_with => "The table below was run with {}.", "Le tableau ci-dessous a été exécuté avec {}.", "Tabellen nedenfor blev kørt med {}.";
     param_value_unset => "(not set)", "(non renseigné)", "(ikke angivet)";
     param_open_hint => "p run settings", "p paramètres d'exécution", "p kørselsindstillinger";
     param_required => "'{}' has no value and no default — set it before running (--param {}=…).", "« {} » n'a ni valeur ni valeur par défaut — renseignez-le avant d'exécuter (--param {}=…).", "'{}' har hverken en værdi eller en standardværdi — angiv den før kørslen (--param {}=…).";

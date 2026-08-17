@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A report's run settings are easier to find, and easier to trust.** The
+  values a report will run with used to be a dim, truncated label sitting beside
+  a separate *Run settings* button, and a line you can read but not act on reads
+  as a status message rather than a question. The summary is now the control
+  itself: click it (or press `p`, in both front-ends) to change the values.
+  Anything unanswered is painted in the colour the app uses for "not settled
+  yet" — or the error colour where it would actually stop the run — so an
+  unanswered report looks unanswered. Both front-ends now call the thing by the
+  same name, *Run settings*, and a table or preview left on screen after its
+  answers have changed says *changed since this run* rather than being described
+  by values it wasn't produced with. The terminal UI's binding panel is also
+  sized to what it holds, so a long base directory can no longer wrap and push
+  the run-settings line out of sight.
 - **Importing from Postman is where people look for it.** It used to be a leaf
   three levels down — *Open ▸ Workspace ▸ From Postman…* — which asks a
   newcomer to decide that what they want is a "workspace" before they can find

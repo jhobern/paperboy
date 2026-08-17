@@ -22948,6 +22948,63 @@ fn a_report_that_asks_for_values_is_asked_on_the_way_to_a_run() {
     assert!(rows[0].problem.is_some(), "an unanswered TICKET is flagged");
 }
 
+/// The values a run will use are named on screen under the same words as the
+/// box that changes them, and the line says which key opens it — the box is
+/// asked for once per session, so without this the answers are invisible.
+#[test]
+fn the_binding_panel_names_the_run_settings_and_how_to_open_them() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = report_app();
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = squashed(&buffer_text(term.backend().buffer()));
+
+    assert!(
+        text.contains(&format!("{}:", s.param_summary_prefix)),
+        "the summary is labelled with the same words as the box it opens: {text}"
+    );
+    assert!(
+        text.contains("REGION=au"),
+        "an answered value is shown: {text}"
+    );
+    assert!(
+        text.contains(&format!("TICKET={}", s.param_value_unset)),
+        "and an unanswered one is called out: {text}"
+    );
+    assert!(
+        text.contains(s.param_summary_hint),
+        "the line says what to press: {text}"
+    );
+}
+
+/// A table produced with one set of answers, still on screen after the answers
+/// have moved on, is the one case where the summary line isn't describing what
+/// is being looked at — so it says so.
+#[test]
+fn the_summary_says_when_the_answers_moved_on_since_the_table() {
+    let mut app = report_app();
+    assert!(
+        !app.report_params_changed_since_result(0),
+        "a report that has never been run has not changed"
+    );
+
+    app.record_result_params(0);
+    app.reports[0].result = Some(crate::report::model::ReportResult::default());
+    assert!(
+        !app.report_params_changed_since_result(0),
+        "nothing has been touched since"
+    );
+
+    let id = app.reports[0].report.id;
+    app.set_report_param(id, "REGION", "eu".to_string());
+    assert!(
+        app.report_params_changed_since_result(0),
+        "changing an answer leaves the table on screen out of date"
+    );
+}
+
 /// A report that asks for nothing is unaffected: it opens on its source and `p`
 /// says so rather than showing an empty form.
 #[test]
@@ -23406,7 +23463,7 @@ fn the_questions_are_drawn_over_the_report_not_instead_of_it() {
         "and the report it is asking about is still on screen: {screen}"
     );
     assert!(
-        screen.contains("Values"),
+        squashed(&screen).contains("REGION=au"),
         "with the chosen values named under it: {screen}"
     );
 }

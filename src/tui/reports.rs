@@ -221,6 +221,10 @@ pub(crate) struct ReportTab {
     pub(crate) params_answered: Option<String>,
     /// The selected row in the run settings view.
     pub(crate) param_selected: usize,
+    /// What the result (or preview) on screen was actually run with. Kept so
+    /// the summary line can say when the answers have moved on since — a table
+    /// described by values it wasn't produced with is worse than no summary.
+    pub(crate) result_params: Vec<(String, String)>,
     /// The last run's output, if the report has been run this session. Rendered
     /// as a grid in [`ReportView::Results`] and the source of an `Export CSV`.
     pub(crate) result: Option<ReportResult>,
@@ -429,6 +433,7 @@ impl ReportTab {
             node_setting: None,
             node_undo: Vec::new(),
             param_values: Default::default(),
+            result_params: Vec::new(),
             params_seeded: false,
             params_open: false,
             params_answered: None,
@@ -1258,6 +1263,7 @@ impl TuiApp {
             return None;
         }
         self.remember_active_report_params(idx);
+        self.record_result_params(idx);
         match self.build_report_run_inputs(idx) {
             Ok(inputs) => Some((report_id, inputs)),
             Err(reason) => {
@@ -1265,6 +1271,37 @@ impl TuiApp {
                 None
             }
         }
+    }
+
+    /// Note what the run about to start is answering, so the summary line can
+    /// say later when the answers have moved on since the table was produced.
+    pub(crate) fn record_result_params(&mut self, idx: usize) {
+        let now: Vec<(String, String)> = self
+            .report_param_rows(idx)
+            .into_iter()
+            .map(|r| (r.name, r.value))
+            .collect();
+        if let Some(rt) = self.reports.get_mut(idx) {
+            rt.result_params = now;
+        }
+    }
+
+    /// Whether the answers have changed since the result on screen was made.
+    /// False with nothing to compare against: a report that has never been run
+    /// is not "changed".
+    pub(crate) fn report_params_changed_since_result(&self, idx: usize) -> bool {
+        let Some(rt) = self.reports.get(idx) else {
+            return false;
+        };
+        if rt.result_params.is_empty() || (rt.result.is_none() && rt.dry_run.is_none()) {
+            return false;
+        }
+        let now: Vec<(String, String)> = self
+            .report_param_rows(idx)
+            .into_iter()
+            .map(|r| (r.name, r.value))
+            .collect();
+        now != rt.result_params
     }
 
     /// Spawn the worker thread for a prepared run. The run streams back over a
@@ -1722,22 +1759,37 @@ impl TuiApp {
         self.reports[idx].params_open = false;
     }
 
-    /// The chosen values in one line — `REGION=au · TICKET=FR-12` — for the
-    /// binding panel, so what the next run will use is on screen without
-    /// opening anything.
-    pub(crate) fn report_param_summary(&self, idx: usize, s: &Strings) -> String {
-        self.report_param_rows(idx)
-            .iter()
-            .map(|r| {
-                let v = if r.value.is_empty() {
-                    s.param_value_unset
-                } else {
-                    r.value.as_str()
-                };
-                format!("{}={}", r.name, v)
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
+    /// The chosen values as coloured spans — for the binding panel, so what the
+    /// next run will use is on screen without opening anything — `REGION=au · TICKET=(not set)`.
+    /// A value with no answer is painted like something still to be
+    /// done rather than like the rest of the line, because a line where
+    /// everything is the same colour reads as a status message and this one is
+    /// a question.
+    pub(crate) fn report_param_spans<'a>(
+        &self,
+        idx: usize,
+        s: &'a Strings,
+        th: &Theme,
+    ) -> Vec<Span<'a>> {
+        let mut spans = Vec::new();
+        for (i, r) in self.report_param_rows(idx).iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", Style::default().fg(th.dim)));
+            }
+            spans.push(Span::styled(
+                format!("{}=", r.name),
+                Style::default().fg(th.dim),
+            ));
+            let (text, color) = if r.problem.is_some() {
+                (s.param_value_unset.to_string(), th.err)
+            } else if r.value.is_empty() {
+                (s.param_value_unset.to_string(), th.pending)
+            } else {
+                (r.value.clone(), th.text)
+            };
+            spans.push(Span::styled(text, Style::default().fg(color)));
+        }
+        spans
     }
 
     /// Fill in a report's parameter values from what it was last run with,
@@ -2151,6 +2203,7 @@ impl TuiApp {
             return;
         }
         self.seed_report_params(idx);
+        self.record_result_params(idx);
         match self.dry_run_report_flow(idx) {
             Ok(result) => {
                 // The flow header is needed to resolve `# columns:` for the
@@ -3875,7 +3928,7 @@ pub(crate) fn draw_report_content(
     // when the user has flipped to it; otherwise the source + binding +
     // validation stack (binding and validation moved to the bottom for stable
     // layout when scrolling past different reports in a workspace).
-    let bind_h = binding_height(app, idx);
+    let bind_h = binding_height(app, idx, area.width, s, th);
     if app.reports[idx].view == ReportView::Results {
         let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(bind_h)]).split(area);
         draw_report_results(f, rows[0], app, idx, s, th);
@@ -5011,18 +5064,29 @@ pub(crate) fn report_base_dir(report: &Report) -> (std::path::PathBuf, bool) {
 
 /// The binding panel's height: its two standing lines plus, for a report that
 /// declares `PARAM`s, a third naming the values the next run will use.
-fn binding_height(app: &TuiApp, idx: usize) -> u16 {
-    if app.report_has_params(idx) { 5 } else { 4 }
+/// How tall the binding panel has to be to show everything it holds. Measured
+/// against the width it will actually get, because a long base directory wraps
+/// on a narrow terminal and a fixed height would silently clip whatever is
+/// last — which is how the run-settings line disappeared exactly when the
+/// window was too small to spare it.
+fn binding_height(app: &TuiApp, idx: usize, width: u16, s: &Strings, th: &Theme) -> u16 {
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let rows: usize = binding_lines(app, idx, s, th)
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|sp| sp.content.chars().count()).sum();
+            w.div_ceil(inner).max(1)
+        })
+        .sum();
+    // Capped so a pathological path can't take over the pane; the panel is the
+    // supporting cast, not the thing being read.
+    (rows as u16 + 2).clamp(4, 8)
 }
 
-fn draw_report_binding(
-    f: &mut Frame,
-    area: Rect,
-    app: &TuiApp,
-    idx: usize,
-    s: &Strings,
-    th: &Theme,
-) {
+/// The binding panel's contents: what the report is bound to, where its
+/// relative paths resolve, and (when it asks for any) the values the next run
+/// will use. Built apart from the drawing so the panel can be sized to them.
+fn binding_lines<'a>(app: &'a TuiApp, idx: usize, s: &'a Strings, th: &Theme) -> Vec<Line<'a>> {
     let rt = &app.reports[idx];
     let binding = match app.resolve_bound_collection(&rt.report) {
         Some(ci) => {
@@ -5095,17 +5159,42 @@ fn draw_report_binding(
     // session, so without this the chosen values would be invisible after the
     // box closes.
     if app.report_has_params(idx) {
-        lines.push(Line::from(vec![
-            Span::styled(s.param_summary_prefix, Style::default().fg(th.dim)),
-            Span::raw(" "),
+        let mut spans = vec![
             Span::styled(
-                app.report_param_summary(idx, s),
-                Style::default().fg(th.text),
+                format!("{}:", s.param_summary_prefix),
+                Style::default().fg(th.dim),
             ),
-            Span::styled("  ", Style::default().fg(th.dim)),
-            Span::styled(s.param_summary_hint, Style::default().fg(th.dim)),
-        ]));
+            Span::raw(" "),
+        ];
+        spans.extend(app.report_param_spans(idx, s, th));
+        // A table on screen that was produced with different answers is the one
+        // case where this line isn't describing what is being looked at.
+        if app.report_params_changed_since_result(idx) {
+            spans.push(Span::styled(
+                format!(" · {}", s.param_changed_since_run),
+                Style::default().fg(th.accent),
+            ));
+        }
+        spans.push(Span::styled("  ", Style::default().fg(th.dim)));
+        spans.push(Span::styled(
+            s.param_summary_hint,
+            Style::default().fg(th.accent),
+        ));
+        lines.push(Line::from(spans));
     }
+    lines
+}
+
+fn draw_report_binding(
+    f: &mut Frame,
+    area: Rect,
+    app: &TuiApp,
+    idx: usize,
+    s: &Strings,
+    th: &Theme,
+) {
+    let rt = &app.reports[idx];
+    let lines = binding_lines(app, idx, s, th);
     let title = if app.running_reports.contains_key(&rt.report.id) {
         format!(
             "{} — {}",

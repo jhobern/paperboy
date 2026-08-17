@@ -186,6 +186,12 @@ pub struct ReportEditor {
     /// The open run-settings dialog, and what pressing its primary button will
     /// do. `None` when it isn't showing.
     params_modal: Option<RunIntent>,
+    /// What the result on screen was actually run with, in the order the
+    /// report declares. Kept beside the result rather than in it, because the
+    /// question it answers — "what did *this* table come from?" — is only ever
+    /// asked while looking at the table, and because the answers can be
+    /// changed afterwards without rerunning.
+    result_params: Vec<(String, String)>,
     /// A toolbar button pressed this frame, run *after* the body has been drawn
     /// (see [`ToolbarAct`]).
     pending_toolbar: Option<ToolbarAct>,
@@ -277,6 +283,7 @@ impl ReportEditor {
             inspector: None,
             dry_run: None,
             param_values: Default::default(),
+            result_params: Vec::new(),
             params_seeded: false,
             params_sig: String::new(),
             params_confirmed: false,
@@ -537,6 +544,21 @@ impl ReportEditor {
         !self.is_running() && !self.params_confirmed && self.has_params()
     }
 
+    /// Whether the answers now differ from the ones the result on screen was
+    /// produced with. False when there is nothing to compare against — a
+    /// report that has never been run is not "changed".
+    pub(super) fn params_changed_since_result(&self, s: &Strings) -> bool {
+        if self.result_params.is_empty() || (self.result.is_none() && self.dry_run.is_none()) {
+            return false;
+        }
+        let now: Vec<(String, String)> = self
+            .param_rows(s)
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        now != self.result_params
+    }
+
     /// Open the run-settings dialog, seeded with what the last run used.
     pub(super) fn open_param_modal(&mut self, app: &GuiApp, intent: RunIntent) {
         self.seed_params(&app.session);
@@ -596,6 +618,10 @@ impl ReportEditor {
         {
             app.session.save();
         }
+        self.result_params = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
@@ -664,8 +690,12 @@ impl ReportEditor {
         // The preview answers the same questions the real run will, so it has
         // to be given the same values -- a dry run against unset parameters
         // would describe a flow nobody is going to run.
-        let chosen: crate::report::params::ParamValues = self
-            .param_rows(&app.strings)
+        let rows = self.param_rows(&app.strings);
+        let chosen: crate::report::params::ParamValues = rows
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        self.result_params = rows
             .iter()
             .map(|r| (r.name.clone(), r.value.clone()))
             .collect();
@@ -1956,30 +1986,16 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if dry.clicked() {
                     ed.pending_toolbar = Some(ToolbarAct::DryRun);
                 }
-                // The way back to the questions, and — beside it — the answers
-                // themselves. A report that asks for something should never
-                // leave you guessing what it is about to run with, and the
-                // dialog is only shown unprompted once.
+                // The answers themselves, and the way back to the questions —
+                // one thing, not two. They used to be a button beside a dim
+                // label, which split reading from acting: the part you could
+                // read looked like a status message, and the part you could
+                // click said "Run settings" without saying what the settings
+                // were. Now the line *is* the button.
                 if ed.has_params() {
-                    if ui
-                        .button(format!(
-                            "{} {}",
-                            super::icons::ENV,
-                            app.strings.gui_report_run_settings
-                        ))
-                        .on_hover_text(app.strings.gui_report_run_settings_tooltip)
-                        .clicked()
-                    {
+                    if param_chip(ui, &ed, app, &th).clicked() {
                         ed.pending_toolbar = Some(ToolbarAct::RunSettings);
                     }
-                    // Body size, not `small`: this is the line that says what
-                    // the next run will use, so it is read rather than
-                    // glanced at, and it was set finer than the source it
-                    // describes. Truncated (the toolbar is a row, not a
-                    // paragraph) with the whole of it on hover.
-                    let summary = ed.param_summary(&app.strings);
-                    ui.add(egui::Label::new(RichText::new(&summary).color(th.dim)).truncate())
-                        .on_hover_text(&summary);
                 }
             }
             // What you can do with a *result*, shown only where there is one to
@@ -2053,6 +2069,18 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         EditorView::Source => source_view(&mut ed, app, ui),
         EditorView::Blocks => blocks_view(&mut ed, app, ui),
         EditorView::Results => results_view(&mut ed, app, ui),
+    }
+
+    // `p` opens the run settings, as it does in the terminal UI — but not while
+    // a text field has focus (it is a perfectly good letter) and not while the
+    // dialog it would open is already up.
+    let typing = ui.memory(|m| m.focused().is_some());
+    if !typing
+        && ed.has_params()
+        && ed.params_modal.is_none()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P))
+    {
+        ed.pending_toolbar = Some(ToolbarAct::RunSettings);
     }
 
     // The run settings dialog: the report's own questions, asked on the way to
@@ -2614,6 +2642,101 @@ fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
 /// who does go on to read the source. Drawn as tinted, rounded cards in the
 /// Blocks view's own idiom, in the `subst` hue every other `{{substitution}}`
 /// carries — which is exactly what a parameter is.
+/// The toolbar's run-settings chip: what the next run will use, as one
+/// clickable line.
+///
+/// Every part of it is readable *and* clickable, which is the whole point — the
+/// values used to be a dim label sitting beside a button, and a line you can
+/// read but not act on reads as a status message rather than a question. A
+/// value that has no answer is painted in the colour the app uses for "not
+/// settled yet" (or the error colour where it would actually stop the run), so
+/// an unanswered report looks unanswered instead of merely informative.
+fn param_chip(
+    ui: &mut egui::Ui,
+    ed: &ReportEditor,
+    app: &GuiApp,
+    th: &super::theme::GuiTheme,
+) -> egui::Response {
+    use egui::text::{LayoutJob, TextFormat};
+
+    let s = &app.strings;
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let fmt = |color: egui::Color32| TextFormat {
+        font_id: font.clone(),
+        color,
+        ..Default::default()
+    };
+    let mut job = LayoutJob::default();
+    // One row, however long the answers are: the toolbar is a row, not a
+    // paragraph, and the whole of it is on hover.
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job.wrap.max_width = (ui.available_width() - 24.0).max(120.0);
+    job.append(
+        &format!("{} {}: ", super::icons::ENV, s.gui_report_run_settings),
+        0.0,
+        fmt(th.text),
+    );
+    for (i, row) in ed.param_rows(s).iter().enumerate() {
+        if i > 0 {
+            job.append(" · ", 0.0, fmt(th.dim));
+        }
+        job.append(&format!("{}=", row.name), 0.0, fmt(th.dim));
+        let (text, color) = if row.problem.is_some() {
+            (s.param_value_unset, th.err)
+        } else if row.value.is_empty() {
+            (s.param_value_unset, th.pending)
+        } else {
+            (row.value.as_str(), th.text)
+        };
+        job.append(text, 0.0, fmt(color));
+    }
+    // A result on screen that was produced with different answers is the one
+    // case where the chip is not describing what the reader is looking at.
+    // Saying so here beats a strip above the table, which would cost a row of
+    // the table every run, changed or not.
+    let stale = ed.params_changed_since_result(s);
+    if stale {
+        job.append(
+            &format!(" · {}", s.param_changed_since_run),
+            0.0,
+            fmt(th.accent),
+        );
+    }
+    let mut hover = format!(
+        "{}\n{}",
+        ed.param_summary(s),
+        s.gui_report_run_settings_shortcut
+    );
+    if stale {
+        hover = format!(
+            "{}\n{}",
+            s.param_result_ran_with
+                .replace("{}", &summarize(&ed.result_params, s)),
+            hover
+        );
+    }
+    ui.add(egui::Button::new(job)).on_hover_text(hover)
+}
+
+/// `NAME=value · NAME=value`, with an empty value written as the same
+/// "(not set)" the form shows.
+fn summarize(values: &[(String, String)], s: &Strings) -> String {
+    values
+        .iter()
+        .map(|(name, value)| {
+            let shown = if value.is_empty() {
+                s.param_value_unset
+            } else {
+                value.as_str()
+            };
+            format!("{name}={shown}")
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 #[cfg(test)]
 pub(crate) fn arm_params_for_audit(ed: &mut ReportEditor) {
     ed.params_modal = Some(RunIntent::Run);
@@ -3054,6 +3177,18 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         let mut keep = true;
         ui.horizontal(|ui| {
             ui.colored_label(th.pending, app.strings.report_dry_run_preview_notice);
+            // A preview is read as "this is what would happen", so the answers
+            // it assumed belong beside it rather than only in the toolbar.
+            if !ed.result_params.is_empty() {
+                ui.colored_label(
+                    th.dim,
+                    format!(
+                        "{} {}",
+                        app.strings.param_previewed_with,
+                        summarize(&ed.result_params, &app.strings)
+                    ),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button(format!(
@@ -9720,6 +9855,97 @@ mod tests {
             .map(|sp| sp.key)
             .collect();
         assert_eq!(paths, ["root", "baseline"]);
+    }
+
+    /// A report that asks for values names them in the toolbar, in the same
+    /// words as the box that changes them, with anything unanswered called out
+    /// — the box is asked for once per session, so otherwise the answers are
+    /// invisible while the report is being read.
+    #[test]
+    fn the_run_settings_chip_shows_the_values_it_will_run_with() {
+        const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM TEXT TICKET LABEL \"Ticket number\"
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+        let mut app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        app.open_report_editor(
+            ReportOrigin::Workspace,
+            crate::report::Report::from_text("Face", TRAIL),
+        );
+        let ed = app.report_editor.take().unwrap();
+        let s = Strings::for_language(&Language::English);
+        let th = app.theme;
+
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            param_chip(ui, &ed, &app, &th);
+        });
+        let painted: String = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.contains(s.gui_report_run_settings),
+            "the chip is labelled with the words of the box it opens: {painted:?}"
+        );
+        assert!(
+            painted.contains("REGION=au"),
+            "an answered value is shown: {painted:?}"
+        );
+        assert!(
+            painted.contains(&format!("TICKET={}", s.param_value_unset)),
+            "and an unanswered one is called out: {painted:?}"
+        );
+    }
+
+    /// A result still on screen after its answers have changed is the one case
+    /// where the chip is not describing what is being looked at, so it says so
+    /// — and a report that has never been run has not "changed".
+    #[test]
+    fn the_chip_says_when_the_answers_moved_on_since_the_result() {
+        const TRAIL: &str = "\
+# name: Face
+# collection: c.hurl
+PARAM CHOICE(\"au\", \"eu\") REGION = \"au\"
+REPORT REQUEST x
+";
+        let mut app = crate::gui::app::GuiApp::for_test(crate::session::Session::default());
+        app.open_report_editor(
+            ReportOrigin::Workspace,
+            crate::report::Report::from_text("Face", TRAIL),
+        );
+        let ed = app.report_editor.as_mut().unwrap();
+        let s = Strings::for_language(&Language::English);
+
+        assert!(
+            !ed.params_changed_since_result(&s),
+            "nothing has been run, so nothing has moved on"
+        );
+
+        ed.result_params = ed
+            .param_rows(&s)
+            .iter()
+            .map(|r| (r.name.clone(), r.value.clone()))
+            .collect();
+        ed.result = Some(crate::report::model::ReportResult::default());
+        assert!(
+            !ed.params_changed_since_result(&s),
+            "the table on screen was made with exactly these answers"
+        );
+
+        ed.param_values
+            .insert("REGION".to_string(), "eu".to_string());
+        assert!(
+            ed.params_changed_since_result(&s),
+            "changing an answer leaves the table on screen out of date"
+        );
     }
 
     /// The button that adds a report setting says what it adds. A bare `+`
