@@ -3825,6 +3825,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let items = file_load_items(s);
             draw_menu_popup(f, s.file_load_menu, &items, *sel, th, Some(app));
         }
+        Overlay::FileImportMenu(sel) => {
+            let items = file_import_items(s);
+            draw_menu_popup(f, s.file_import_menu, &items, *sel, th, Some(app));
+        }
         Overlay::FileSaveMenu(sel) => {
             let items = app.file_save_items();
             let labels: Vec<&str> = items.iter().map(|it| it.label(s)).collect();

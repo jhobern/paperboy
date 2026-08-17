@@ -252,6 +252,32 @@ pub fn looks_like_postman(content: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Which of the two things Postman exports a file holds.
+///
+/// A user who picks "import an exported file" has one file and no idea which
+/// of PaperBoy's two shelves it belongs on — Postman writes collections and
+/// environments to the same `.json` extension. Deciding that from the content
+/// is the importer's job, not theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    Collection,
+    Environment,
+}
+
+/// What kind of Postman export `content` is, or `None` if it is not one.
+///
+/// Collections are tested first: a document carrying both shapes is a
+/// collection with variables, not an environment.
+pub fn export_kind(content: &str) -> Option<ExportKind> {
+    if looks_like_postman(content) {
+        Some(ExportKind::Collection)
+    } else if postman_env_values(content).is_some() {
+        Some(ExportKind::Environment)
+    } else {
+        None
+    }
+}
+
 /// A Postman environment export: a flat list of variables. Postman has no
 /// notion of PaperBoy's provider references, so every value imports as a
 /// literal — but a value that *is* written as `{{ op://… }}` / `{{ ssm:… }}`

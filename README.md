@@ -229,10 +229,13 @@ What changes is how you interact with it:
 - **Selection, scrolling and the clipboard** use the platform's native
   handling; **collection tabs switch by clicking**; folders collapse/expand by
   clicking their header.
-- **The File menu is grouped by verb** (New / Open / Save / Import-Export)
-  rather than one flat list. There is no separate "Import Postman": **Open ▸
-  Collection** takes a Hurl `.hurl` file or a Postman `.json` export and works
-  out which it is. Every file dialog reopens in the folder you last used it in.
+- **The File menu is grouped by verb** (New / Import / Open / Save) rather than
+  one flat list. **File ▸ Import from Postman** has the two routes across:
+  *From an exported file (.json)…*, which needs nothing but the file and works
+  out by itself whether it holds a collection or an environment, and *From my
+  Postman account…*, which connects with an API key and brings whole workspaces
+  over. (**Open ▸ Collection** takes a Postman export too — it is the same
+  load.) Every file dialog reopens in the folder you last used it in.
 - **Workspaces can be grown from inside the app.** The workspace panel's **New**
   menu adds a collection, report or environment at the top of the tree, and
   right-clicking any row offers the same three inside *that* folder. Files (and
@@ -600,8 +603,15 @@ up-to-date list. Highlights:
 Bring a whole Postman workspace across at once, rather than exporting each
 collection by hand.
 
-**In the app**, it's **File ▸ Load ▸ Workspace ▸ From Postman…** in the terminal
-UI, and **Open from Git ▸ From Postman…** in the GUI. Give it your API key and
+If all you have is a file you already exported from Postman, none of this is
+needed: **File ▸ Import from Postman ▸ From an exported file (.json)…** opens it
+straight away — collection or environment, whichever it turns out to be — with
+no API key and no account.
+
+**In the app**, it's **File ▸ Import ▸ Postman account…** in the terminal UI and
+**File ▸ Import from Postman ▸ From my Postman account…** in the GUI — or, if
+you are already thinking in workspaces, **File ▸ Load ▸ Workspace ▸ From a
+Postman account…** (**Open ▸ Workspace ▸ …** in the GUI). Give it your API key and
 it lists the workspaces the key can see; pick one, choose what to bring across
 and where to put it, and the imported folder opens as a workspace.
 

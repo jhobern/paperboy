@@ -99,6 +99,11 @@ pub enum OpenKind {
     /// Open a folder as a Workspace (a filesystem tree of collections /
     /// environments / reports), rather than a single file.
     Workspace,
+    /// A `.json` file exported from Postman. The same load as a collection or
+    /// an environment — which of the two it is is read off the file — but
+    /// asked for in the user's own terms: they have an export, not a
+    /// "collection in Postman's JSON dialect".
+    PostmanExport,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

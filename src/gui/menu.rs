@@ -226,11 +226,16 @@ fn top_menu<R>(
 /// a dozen sibling entries where "open" and "save" items were interleaved.
 ///
 /// The File menu, shaped the way the terminal's is: **what** first, **where**
-/// second. "Open ▸ Workspace ▸ From Postman…" says what a Postman import
+/// second. "Open ▸ Workspace ▸ From a Postman account…" says what that import
 /// produces, where a bare "From Postman…" sitting among the open commands left
 /// the user to guess; and the same submenu is where "Local folder…" and "From
 /// Git…" live, so the sources for a thing are listed together instead of being
 /// spread over three top-level entries.
+///
+/// Import is the exception, and sits at the top level: it is the word someone
+/// arriving from Postman scans for, and reaching it by way of "Open ▸
+/// Workspace" asks them to know what PaperBoy will make of their export before
+/// they have made it.
 fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
     let (title, mnemonic) = (app.strings.gui_menu_file, app.strings.gui_menu_file_key);
     top_menu(app, ui, title, mnemonic, |app, ui| {
@@ -246,6 +251,34 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         // Submenus close only themselves, leaving the File menu hanging open
         // over the app; every leaf sets this so the whole menu goes with it.
         let mut close_menu = false;
+
+        // Import is its own top-level entry rather than a leaf three levels
+        // down under Open ▸ Workspace: "import" is the word someone arriving
+        // from Postman looks for, and they will not find it by first deciding
+        // that what they want is a workspace. Its two routes are named after
+        // what the user has — a file they exported, or an account to connect
+        // to — because that, not the transport, is what they can answer.
+        ui.menu_button(app.strings.gui_menu_import, |ui| {
+            if ui
+                .button(app.strings.gui_menu_import_file)
+                .on_hover_text(app.strings.help_menu_import_file)
+                .clicked()
+            {
+                open_via_picker(app, OpenKind::PostmanExport);
+                close_menu = true;
+                ui.close();
+            }
+            if ui
+                .button(app.strings.gui_menu_import_account)
+                .on_hover_text(app.strings.help_menu_import_account)
+                .clicked()
+            {
+                app.postman.open();
+                close_menu = true;
+                ui.close();
+            }
+        });
+        ui.separator();
         ui.menu_button(app.strings.gui_menu_open, |ui| {
             ui.menu_button(app.strings.file_kind_collection, |ui| {
                 if ui.button(app.strings.gui_menu_from_file).clicked() {
@@ -999,6 +1032,7 @@ fn open_title(app: &GuiApp, kind: OpenKind) -> &'static str {
         OpenKind::Environment => app.strings.gui_open_environment_title,
         OpenKind::Workspace => app.strings.gui_open_workspace_title,
         OpenKind::Report => app.strings.gui_open_report_title,
+        OpenKind::PostmanExport => app.strings.postman_export_open_title,
     }
 }
 
@@ -1042,6 +1076,12 @@ pub fn open_via_picker(app: &mut GuiApp, kind: OpenKind) {
         OpenKind::Report => super::filepick::PickKind::File {
             filters: filters(&[
                 (app.strings.gui_filter_reports, &["trail"]),
+                (app.strings.gui_filter_all, &["*"]),
+            ]),
+        },
+        OpenKind::PostmanExport => super::filepick::PickKind::File {
+            filters: filters(&[
+                (app.strings.gui_filter_postman_export, &["json"]),
                 (app.strings.gui_filter_all, &["*"]),
             ]),
         },
@@ -1216,6 +1256,18 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
         app.focus = super::Focus::Main;
         return Ok(());
     }
+    // An export is sorted by what it holds, not by what the user said it was:
+    // Postman writes collections and environments to the same `.json`, and
+    // making the user know which they picked is exactly the knowledge they
+    // came here without.
+    let kind = match kind {
+        OpenKind::PostmanExport => match crate::postman::export_kind(&content) {
+            Some(crate::postman::ExportKind::Collection) => OpenKind::Collection,
+            Some(crate::postman::ExportKind::Environment) => OpenKind::Environment,
+            None => return Err(app.strings.gui_not_postman_export.to_string()),
+        },
+        other => other,
+    };
     let ok = match kind {
         OpenKind::Collection => {
             app.session
@@ -1225,7 +1277,7 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
             .session
             .load_environment_text(name, &content, Some(path.to_path_buf()), None)
             .is_some(),
-        OpenKind::Workspace | OpenKind::Report => unreachable!(),
+        OpenKind::Workspace | OpenKind::Report | OpenKind::PostmanExport => unreachable!(),
     };
     if ok {
         Ok(())
@@ -1799,6 +1851,50 @@ mod tests {
 
     fn app() -> GuiApp {
         GuiApp::for_test(Session::default())
+    }
+
+    /// The desktop import route asks for "a file you exported from Postman"
+    /// and works out for itself which of PaperBoy's two shelves it belongs on —
+    /// Postman gives collections and environments the same `.json` extension,
+    /// and knowing which is which is exactly what a newcomer has not learned
+    /// yet.
+    #[test]
+    fn an_exported_postman_file_opens_as_whichever_kind_it_turns_out_to_be() {
+        let dir = std::env::temp_dir().join(format!("pb_gui_import_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collection = dir.join("api.json");
+        std::fs::write(
+            &collection,
+            r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+        )
+        .unwrap();
+        let environment = dir.join("staging.json");
+        std::fs::write(
+            &environment,
+            r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+        )
+        .unwrap();
+        let other = dir.join("notes.json");
+        std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
+
+        let mut app = app();
+        let tabs = app.session.collections.len();
+        let envs = app.session.global_envs.len();
+
+        assert!(apply_open(&mut app, OpenKind::PostmanExport, &collection).is_ok());
+        assert_eq!(app.session.collections.len(), tabs + 1);
+        assert_eq!(app.session.global_envs.len(), envs);
+
+        assert!(apply_open(&mut app, OpenKind::PostmanExport, &environment).is_ok());
+        assert_eq!(app.session.global_envs.len(), envs + 1);
+        assert_eq!(app.session.collections.len(), tabs + 1);
+
+        // And a `.json` that is neither says so in those terms, rather than
+        // "could not parse that file".
+        let err = apply_open(&mut app, OpenKind::PostmanExport, &other).unwrap_err();
+        assert_eq!(err, app.strings.gui_not_postman_export);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An export is remembered so the toolbar can offer to open it: the file an

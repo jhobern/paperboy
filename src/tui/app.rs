@@ -34,6 +34,10 @@ pub(crate) enum FileAction {
     SaveRequest,
     LoadRequest,
     OpenCollection,
+    /// A `.json` file exported from Postman, opened without the user having to
+    /// say first whether it holds a collection or an environment — the file
+    /// itself says which, and Postman gives both the same extension.
+    ImportPostmanFile,
     SaveCollection,
     LoadEnv,
     SaveEnv,
@@ -450,9 +454,10 @@ macro_rules! take_overlay {
 pub(crate) use take_overlay;
 
 pub(crate) enum Overlay {
-    /// Top-level File menu: just "(L)oad" / "(S)ave", each opening its own
-    /// grouped submenu (see `FileLoadMenu`/`FileSaveMenu`) — replaces the old
-    /// flat 12-item list that had grown hard to scan.
+    /// Top-level File menu: "(L)oad" / "(S)ave" / "(I)mport", each opening its
+    /// own grouped submenu (see `FileLoadMenu` / `FileSaveMenu` /
+    /// `FileImportMenu`) — replaces the old flat 12-item list that had grown
+    /// hard to scan.
     FileMenu(usize),
     /// The "Load" submenu of the File menu: just the *kinds* (Request /
     /// Collection / Environment / Workspace). Picking a kind that can come
@@ -460,6 +465,9 @@ pub(crate) enum Overlay {
     /// git; Request (local-only) goes straight to its path prompt. Esc/q
     /// returns to `FileMenu(0)`.
     FileLoadMenu(usize),
+    /// The "Import" submenu of the File menu: an exported Postman file, or a
+    /// Postman account to connect to. Esc/q returns to `FileMenu(2)`.
+    FileImportMenu(usize),
     /// The "Save" submenu of the File menu: just the *kinds* (Request /
     /// Collection / Environment / Workspace / Response). Picking a kind with
     /// more than one destination opens `FileSaveDest`; Request/Response go
@@ -875,9 +883,23 @@ pub(crate) struct MouseHit {
 /// concatenates them in reading order (see
 /// `input::concatenated_selection_text`, which iterates the two panels in
 /// this order directly).
-/// The 2 top-level File menu items: "(L)oad" and "(S)ave".
-pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 2] {
-    [s.file_menu_item_load, s.file_menu_item_save]
+/// The 3 top-level File menu items: "(L)oad", "(S)ave" and "(I)mport".
+///
+/// Import is here rather than buried under Load ▸ Workspace ▸ From Postman
+/// because it is what someone arriving from Postman comes looking for, and
+/// they will not find it by first deciding that what they want is a workspace.
+pub(crate) fn file_menu_items(s: &Strings) -> [&'static str; 3] {
+    [
+        s.file_menu_item_load,
+        s.file_menu_item_save,
+        s.file_menu_item_import,
+    ]
+}
+
+/// The "Import" submenu: the two ways a Postman user's work can arrive, named
+/// after what *they* have — a file they exported, or an account to connect to.
+pub(crate) fn file_import_items(s: &Strings) -> [&'static str; 2] {
+    [s.file_import_item_file, s.file_import_item_account]
 }
 
 /// The kinds of thing the File menu can load or save. Chosen in the first
@@ -2190,6 +2212,23 @@ impl TuiApp {
                     let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
+                Err(e) => self.status = Some(Status::Error(e.to_string())),
+            },
+            // Sorted by what the export holds rather than by what the user
+            // said it was: knowing whether a `.json` is a collection or an
+            // environment is precisely the knowledge they arrived without.
+            FileAction::ImportPostmanFile => match std::fs::read_to_string(path) {
+                Ok(content) => match crate::postman::export_kind(&content) {
+                    Some(crate::postman::ExportKind::Collection) => {
+                        let name = collection_name_from_path(path, "collection");
+                        self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    }
+                    Some(crate::postman::ExportKind::Environment) => {
+                        let name = env_name_from_path(path, "environment");
+                        self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    }
+                    None => self.status = Some(Status::NotCollection),
+                },
                 Err(e) => self.status = Some(Status::Error(e.to_string())),
             },
             FileAction::SaveCollection => {

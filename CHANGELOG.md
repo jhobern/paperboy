@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Importing from Postman is where people look for it.** It used to be a leaf
+  three levels down — *Open ▸ Workspace ▸ From Postman…* — which asks a
+  newcomer to decide that what they want is a "workspace" before they can find
+  the word "import" at all. **Import from Postman** is now its own top-level
+  File entry in both front-ends, and it offers the two routes by what the user
+  actually has: *From an exported file (.json)…*, which needs no API key and
+  works out by itself whether the file holds a collection or an environment,
+  and *From my Postman account…*, which connects and brings whole workspaces
+  over. The old deep entry stays where it was, renamed *From a Postman
+  account…* so it can't be confused with the file route, and an empty request
+  list now offers the import directly — that is the screen where "where are my
+  requests?" is being asked.
+
 - **The Postman importer says what it wants of you.** The first thing the
   importer asks is where your API key comes from, and it defaults to reading it
   from 1Password rather than having you paste one — deliberately, because a

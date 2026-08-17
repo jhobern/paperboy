@@ -224,6 +224,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.gui_delete,
         s.gui_edited_request,
     );
+    let (lbl_import, lbl_import_file, lbl_import_account, tip_import_file, tip_import_account) = (
+        s.gui_import_postman_button,
+        s.gui_menu_import_file,
+        s.gui_menu_import_account,
+        s.help_menu_import_file,
+        s.help_menu_import_account,
+    );
 
     // Header: collection name (truncates) + Run All / Add (always visible).
     let name = app.session.collections[ci].name.clone();
@@ -267,6 +274,29 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             if entries.is_empty() {
                 ui.add_space(8.0);
                 ui.colored_label(theme.dim, lbl_no_requests);
+                // The other way a first collection arrives. Someone coming from
+                // Postman meets this panel before they meet the File menu, and
+                // an empty list is exactly the moment "where are my requests?"
+                // is being asked.
+                ui.add_space(6.0);
+                ui.menu_button(lbl_import, |ui| {
+                    if ui
+                        .button(lbl_import_file)
+                        .on_hover_text(tip_import_file)
+                        .clicked()
+                    {
+                        super::menu::open_via_picker(app, super::app::OpenKind::PostmanExport);
+                        ui.close();
+                    }
+                    if ui
+                        .button(lbl_import_account)
+                        .on_hover_text(tip_import_account)
+                        .clicked()
+                    {
+                        app.postman.open();
+                        ui.close();
+                    }
+                });
                 return;
             }
             let tree = build_tree(entries);

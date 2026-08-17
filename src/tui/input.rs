@@ -526,6 +526,7 @@ impl TuiApp {
         match self.overlay.as_mut() {
             Some(Overlay::FileMenu(sel))
             | Some(Overlay::FileLoadMenu(sel))
+            | Some(Overlay::FileImportMenu(sel))
             | Some(Overlay::FileSaveMenu(sel))
             | Some(Overlay::FileLoadSource(_, sel))
             | Some(Overlay::FileSaveDest(_, sel))
@@ -1497,6 +1498,7 @@ impl TuiApp {
                 sel,
             } => self.workspace_storage_choice_key_handler(key, repo, name, origin, sel),
             Overlay::FileMenu(sel) => self.file_menu_key_handler(key, sel),
+            Overlay::FileImportMenu(sel) => self.file_import_menu_key_handler(key, sel),
             Overlay::FileLoadMenu(sel) => self.file_load_menu_key_handler(key, sel),
             Overlay::FileSaveMenu(sel) => self.file_save_menu_key_handler(key, sel),
             Overlay::FileLoadSource(kind, sel) => self.file_load_source_key_handler(key, kind, sel),
@@ -4227,6 +4229,16 @@ impl TuiApp {
         }
     }
 
+    /// The Import submenu: `0` opens a file the user exported from Postman,
+    /// `1` connects to their Postman account.
+    pub(crate) fn activate_file_import_item(&mut self, sel: usize) {
+        if sel == 0 {
+            self.open_browser(FileAction::ImportPostmanFile);
+        } else {
+            self.open_postman_wizard();
+        }
+    }
+
     /// Second step of Load: `sel` is `0` for a local file, `1` for git.
     pub(crate) fn activate_file_load_source(&mut self, kind: FileKind, sel: usize) {
         // Workspace has a third source (see `file_load_source_items`); it is
@@ -4314,6 +4326,7 @@ impl TuiApp {
         let s = Strings::for_language(&self.language);
         let label = match action {
             FileAction::OpenCollection => s.open_collection,
+            FileAction::ImportPostmanFile => s.postman_export_open_title,
             FileAction::LoadEnv => s.load_environment,
             FileAction::OpenWorkspace => s.open_workspace,
             FileAction::SaveWorkspaceChooseFolder => s.save_workspace,
@@ -4825,24 +4838,47 @@ impl TuiApp {
                 self.overlay = Some(Overlay::FileMenu(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::FileMenu((sel + 1).min(1)));
+                self.overlay = Some(Overlay::FileMenu((sel + 1).min(2)));
             }
             KeyCode::Enter | KeyCode::Right => {
-                self.overlay = Some(if sel == 0 {
-                    Overlay::FileLoadMenu(0)
-                } else {
-                    Overlay::FileSaveMenu(0)
+                self.overlay = Some(match sel {
+                    0 => Overlay::FileLoadMenu(0),
+                    1 => Overlay::FileSaveMenu(0),
+                    _ => Overlay::FileImportMenu(0),
                 });
             }
             KeyCode::Char(c) => {
                 let s = Strings::for_language(&self.language);
                 match mnemonic_index(&file_menu_items(&s), c) {
                     Some(0) => self.overlay = Some(Overlay::FileLoadMenu(0)),
-                    Some(_) => self.overlay = Some(Overlay::FileSaveMenu(0)),
+                    Some(1) => self.overlay = Some(Overlay::FileSaveMenu(0)),
+                    Some(_) => self.overlay = Some(Overlay::FileImportMenu(0)),
                     None => self.overlay = Some(Overlay::FileMenu(sel)),
                 }
             }
             _ => self.overlay = Some(Overlay::FileMenu(sel)),
+        }
+    }
+
+    fn file_import_menu_key_handler(&mut self, key: KeyEvent, sel: usize) {
+        let s = Strings::for_language(&self.language);
+        let items = file_import_items(&s);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => {
+                self.overlay = Some(Overlay::FileMenu(2))
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Some(Overlay::FileImportMenu(sel.saturating_sub(1)));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay = Some(Overlay::FileImportMenu((sel + 1).min(items.len() - 1)));
+            }
+            KeyCode::Enter | KeyCode::Right => self.activate_file_import_item(sel),
+            KeyCode::Char(c) => match mnemonic_index(&items, c) {
+                Some(i) => self.activate_file_import_item(i),
+                None => self.overlay = Some(Overlay::FileImportMenu(sel)),
+            },
+            _ => self.overlay = Some(Overlay::FileImportMenu(sel)),
         }
     }
 
@@ -6566,7 +6602,10 @@ fn browser_confirms_on_space(action: FileAction) -> bool {
 fn browser_filters_by_ext(action: FileAction) -> bool {
     matches!(
         action,
-        FileAction::OpenCollection | FileAction::LoadEnv | FileAction::OpenReport
+        FileAction::OpenCollection
+            | FileAction::ImportPostmanFile
+            | FileAction::LoadEnv
+            | FileAction::OpenReport
     )
 }
 
@@ -6587,6 +6626,11 @@ fn browser_keep_file(action: FileAction, file: &ExplorerFile) -> bool {
     match action {
         FileAction::OpenCollection => {
             matches!(ext, Some(e) if e.eq_ignore_ascii_case("hurl") || e.eq_ignore_ascii_case("json"))
+        }
+        // Postman writes both kinds of export as `.json`; which one this is is
+        // read off the content once it is chosen.
+        FileAction::ImportPostmanFile => {
+            matches!(ext, Some(e) if e.eq_ignore_ascii_case("json"))
         }
         FileAction::LoadEnv => {
             matches!(ext, Some(e) if e.eq_ignore_ascii_case("vars")

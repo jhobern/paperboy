@@ -3032,6 +3032,7 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             .iter()
             .map(|it| it.label(&s))
             .collect::<Vec<_>>(),
+            file_import_items(&s).to_vec(),
             file_load_source_items(FileKind::Collection, &s),
             file_load_source_items(FileKind::Workspace, &s),
             file_save_dest_items(FileKind::Collection, &s),
@@ -3056,6 +3057,103 @@ fn file_menu_mnemonics_are_unique_within_each_popup_and_avoid_nav_keys() {
             }
         }
     }
+}
+
+/// Import is a top-level File entry, not a leaf under Load ▸ Workspace ▸ …:
+/// "import" is what someone arriving from Postman looks for, and they will not
+/// find it by first deciding that what they want is a workspace.
+#[test]
+fn the_file_menu_offers_importing_from_postman_at_the_top_level() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(2))));
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::FileImportMenu(0))),
+        "Enter on Import opens the two ways in"
+    );
+
+    // The file a user already exported: a browser, no API key, no account.
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(&app.overlay, Some(Overlay::Browser(action, _)) if *action == FileAction::ImportPostmanFile),
+        "the first route browses for an export: {:?}",
+        app.overlay.is_some()
+    );
+
+    // The second connects to Postman itself.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "the second route opens the account importer"
+    );
+
+    // Esc walks back up rather than closing the whole menu.
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('f'));
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Left);
+    assert!(matches!(app.overlay, Some(Overlay::FileMenu(2))));
+}
+
+/// Postman writes collections and environments to the same `.json` extension,
+/// and a user with one export in their Downloads folder has no reason to know
+/// which of PaperBoy's two shelves it belongs on. The import reads that off
+/// the file.
+#[test]
+fn a_postman_export_lands_on_the_right_shelf_whichever_kind_it_is() {
+    let dir = temp_dir("pb_import_export");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let collection = dir.join("api.json");
+    std::fs::write(
+        &collection,
+        r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+    )
+    .unwrap();
+    let environment = dir.join("staging.json");
+    std::fs::write(
+        &environment,
+        r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+    )
+    .unwrap();
+
+    let mut app = TuiApp::default();
+    let tabs = app.collections.len();
+    let envs = app.global_envs.len();
+    app.do_file_action(FileAction::ImportPostmanFile, collection.to_str().unwrap());
+    assert_eq!(
+        app.collections.len(),
+        tabs + 1,
+        "the collection opened as a tab"
+    );
+    assert_eq!(app.global_envs.len(), envs, "and not as an environment");
+
+    app.do_file_action(FileAction::ImportPostmanFile, environment.to_str().unwrap());
+    assert_eq!(
+        app.global_envs.len(),
+        envs + 1,
+        "the environment export opened as an environment"
+    );
+    assert_eq!(app.collections.len(), tabs + 1, "and not as a tab");
+
+    // Anything else says so rather than opening an empty something.
+    let other = dir.join("notes.json");
+    std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
+    app.do_file_action(FileAction::ImportPostmanFile, other.to_str().unwrap());
+    assert!(matches!(app.status, Some(Status::NotCollection)));
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
