@@ -26315,7 +26315,8 @@ fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields()
     }
 
     // The keys are on the frame, and the whole dialog is four rows of content
-    // inside its border rather than the dozen the stacked hints took.
+    // plus the line explaining the chosen key source, rather than the dozen the
+    // stacked hints took.
     let hint_row = text
         .lines()
         .position(|l| l.contains(s.postman_connect_hint))
@@ -26324,7 +26325,62 @@ fn the_connect_form_puts_its_keys_on_the_border_and_its_examples_in_the_fields()
         .lines()
         .position(|l| l.contains(s.postman_key_source_label))
         .unwrap();
-    assert_eq!(hint_row - first, 4, "four field rows, then the border");
+    let help_rows = text
+        .lines()
+        .skip(first + 2)
+        .take_while(|l| !l.contains(s.postman_workspace_label))
+        .count();
+    assert!(
+        help_rows <= 2,
+        "the source help is a line or two, not a page"
+    );
+    assert_eq!(
+        hint_row - first,
+        4 + help_rows,
+        "four field rows and the source help, then the border"
+    );
+
+    // And the explanation belongs to the source that is showing.
+    assert!(
+        squashed(&text).contains(s.postman_key_help_op),
+        "the chosen source went unexplained: {text}"
+    );
+}
+
+/// Text as the panel would read aloud, with the line breaks the terminal put in
+/// taken back out, so a test can look for a sentence that wrapped.
+fn squashed(text: &str) -> String {
+    text.replace('\u{2502}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Each key source asks something different of the user: an item in a password
+/// manager, a parameter in AWS, the name of an environment variable, or the key
+/// itself. The picker only names them, so the form has to say what the chosen
+/// one means — including that two of them need a command-line tool.
+#[test]
+fn the_key_field_explains_whichever_source_is_chosen() {
+    use crate::postman_flow::KeySource;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let s = Strings::for_language(&Language::English);
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+    for (src, help) in [
+        (KeySource::OnePassword, s.postman_key_help_op),
+        (KeySource::Ssm, s.postman_key_help_ssm),
+        (KeySource::Env, s.postman_key_help_env),
+        (KeySource::Paste, s.postman_key_help_paste),
+    ] {
+        postman_wizard(&mut app).key_source = src;
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text = squashed(&buffer_text(term.backend().buffer()));
+        assert!(text.contains(help), "{src:?} went unexplained: {text}");
+    }
 }
 
 /// The value column must not move when the key source changes. The key row's

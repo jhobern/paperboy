@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The Postman importer says what it wants of you.** The first thing the
+  importer asks is where your API key comes from, and it defaults to reading it
+  from 1Password rather than having you paste one — deliberately, because a
+  pasted key is a live credential while a reference is only its address. But it
+  never said so: the field showed `Private/Postman/credential`, which reads like
+  a value you should already have, and nothing mentioned that the key is fetched
+  fresh on every run, that nothing is stored, or that 1Password's `op` command
+  has to be installed. Each source now carries a line of plain English saying
+  exactly that, and the examples are written as shapes (`vault/item/field`) so
+  they cannot be mistaken for answers. The workspace field says "leave blank to
+  choose from a list" rather than "blank: choose from a list", and the Hurl
+  conversion note no longer names a file the user has not seen yet.
+
 - **The desktop dialogs all look like the same program.** A pass over every
   window and dialog found four things drifting: the Postman and Git wizards
   painted every field label in the accent blue while the rest of the app uses

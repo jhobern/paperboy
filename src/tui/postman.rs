@@ -308,6 +308,17 @@ fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
     }
 }
 
+/// What picking this source commits the user to: where the key is read from,
+/// when, and what has to be installed for that to work.
+fn key_field_help(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_help_paste,
+        KeySource::OnePassword => s.postman_key_help_op,
+        KeySource::Ssm => s.postman_key_help_ssm,
+        KeySource::Env => s.postman_key_help_env,
+    }
+}
+
 fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     // Laid out like the request wizard: a label column on the left, the value
     // beside it, and the keys on the border. Four short rows say as much as
@@ -341,8 +352,18 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let recent = w.recent_entries();
     let recent_rows = recent.len().min(5) as u16;
 
+    // A line under the key field saying what picking this source commits the
+    // user to. The picker names four sources but says nothing about what each
+    // one needs of them, which is the whole question for someone who has never
+    // referenced a secret by address before.
+    let help = key_field_help(w.key_source, s);
     let width = 66.min(f.area().width);
-    let area = centered_rect(width, fields.len() as u16 + recent_rows + 2, f.area());
+    let help_rows = wrapped_height(help, width.saturating_sub(2));
+    let area = centered_rect(
+        width,
+        fields.len() as u16 + recent_rows + help_rows + 2,
+        f.area(),
+    );
     f.render_widget(Clear, area);
     let hint = if recent_rows > 0 {
         format!(
@@ -359,12 +380,13 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let all_rows = Layout::vertical([
         Constraint::Length(1),           // key source
         Constraint::Length(1),           // key
+        Constraint::Length(help_rows),   // what that source means
         Constraint::Length(recent_rows), // remembered references
         Constraint::Length(1),           // workspace
         Constraint::Length(1),           // host
     ])
     .split(inner);
-    let rows = [all_rows[0], all_rows[1], all_rows[3], all_rows[4]];
+    let rows = [all_rows[0], all_rows[1], all_rows[4], all_rows[5]];
     for (row, (label, placeholder, idx)) in rows.iter().zip(fields.iter()) {
         let cols =
             Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(*row);
@@ -400,6 +422,11 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         render_line_field_hinted(f, cols[1], ed, w.field == *idx, mask, placeholder, th);
     }
 
+    f.render_widget(
+        Paragraph::new(Span::styled(help, Style::default().fg(th.dim))).wrap(Wrap { trim: true }),
+        all_rows[2],
+    );
+
     if recent_rows > 0 {
         let items: Vec<ListItem> = recent
             .iter()
@@ -420,7 +447,7 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
                 ))
             })
             .collect();
-        f.render_widget(List::new(items), all_rows[2]);
+        f.render_widget(List::new(items), all_rows[3]);
     }
 }
 

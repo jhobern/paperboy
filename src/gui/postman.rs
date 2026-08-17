@@ -225,6 +225,15 @@ impl PostmanUi {
         }
     }
 
+    /// Put the connect step on a given key source, so a test can paint the
+    /// explanation that source is supposed to carry.
+    #[cfg(test)]
+    pub(crate) fn seed_key_source_for_audit(&mut self, src: KeySource) {
+        if let Some(w) = &mut self.flow {
+            w.key_source = src;
+        }
+    }
+
     /// Bring a backgrounded import back on screen.
     pub fn reveal(&mut self) {
         if let Some(w) = &mut self.flow {
@@ -498,6 +507,20 @@ fn draw_connect(
             });
             ui.end_row();
 
+            // Under the field, in the field's own column: what choosing this
+            // source actually means. The picker names four sources but says
+            // nothing about what each one needs of the user, which is the whole
+            // question for someone who has never referenced a secret by
+            // address before.
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(key_field_help(w.key_source, s)).color(colors.dim),
+                )
+                .wrap(),
+            );
+            ui.end_row();
+
             ui.colored_label(colors.dim, s.postman_workspace_label);
             ui.add_enabled(
                 !busy,
@@ -561,6 +584,17 @@ fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
         KeySource::OnePassword => s.postman_key_hint_op,
         KeySource::Ssm => s.postman_key_hint_ssm,
         KeySource::Env => s.postman_key_hint_env,
+    }
+}
+
+/// What picking this source commits the user to: where the key is read from,
+/// when, and what has to be installed for that to work.
+fn key_field_help(src: KeySource, s: &Strings) -> &'static str {
+    match src {
+        KeySource::Paste => s.postman_key_help_paste,
+        KeySource::OnePassword => s.postman_key_help_op,
+        KeySource::Ssm => s.postman_key_help_ssm,
+        KeySource::Env => s.postman_key_help_env,
     }
 }
 
@@ -878,6 +912,65 @@ mod tests {
         let (src, entry) = KeySource::detect(&w.flow.key);
         assert_eq!(src, KeySource::Ssm);
         assert_eq!(entry, "/prod/postman/api-key");
+    }
+
+    /// Choosing where the key comes from is the first thing the importer asks
+    /// and the least obvious: three of the four sources want the *address* of a
+    /// key rather than a key, and one of them needs a command-line tool
+    /// installed. The form has to say which, for whichever source is showing.
+    #[test]
+    fn the_connect_form_explains_the_key_source_that_is_showing() {
+        use eframe::egui;
+
+        fn painted(app: &mut GuiApp) -> String {
+            fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let ctx = egui::Context::default();
+            app.theme.apply(&ctx);
+            let mut last = Vec::new();
+            for _ in 0..3 {
+                let out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let ctx = ui.ctx().clone();
+                        super::show(app, &ctx);
+                    },
+                );
+                last.clear();
+                out.shapes.iter().for_each(|sh| walk(&sh.shape, &mut last));
+            }
+            // Wrapping is egui's business, so compare on the words.
+            last.join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let s = s();
+        for (src, help) in [
+            (KeySource::OnePassword, s.postman_key_help_op),
+            (KeySource::Ssm, s.postman_key_help_ssm),
+            (KeySource::Env, s.postman_key_help_env),
+            (KeySource::Paste, s.postman_key_help_paste),
+        ] {
+            let mut app = GuiApp::for_test(Session::default());
+            app.postman.open();
+            app.postman.seed_step_for_audit(Step::Connect);
+            app.postman.seed_key_source_for_audit(src);
+            let text = painted(&mut app);
+            assert!(text.contains(help), "{src:?} went unexplained: {text}");
+        }
     }
 
     fn a_plan() -> ImportPlan {
