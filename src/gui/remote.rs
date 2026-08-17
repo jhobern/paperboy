@@ -581,8 +581,9 @@ enum UiAction {
 #[derive(Clone, Copy)]
 struct UiColors {
     dim: egui::Color32,
-    accent: egui::Color32,
     err: egui::Color32,
+    text: egui::Color32,
+    ok: egui::Color32,
 }
 
 impl RemoteUi {
@@ -644,8 +645,9 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
 
     let colors = UiColors {
         dim: app.theme.dim,
-        accent: app.theme.accent,
         err: app.theme.err,
+        text: app.theme.text,
+        ok: app.theme.ok,
     };
     let title = flow.title(&app.strings);
     let mut action = UiAction::None;
@@ -825,7 +827,7 @@ fn url_field(
     s: &Strings,
 ) {
     ui.horizontal(|ui| {
-        ui.colored_label(colors.accent, s.gui_git_repo_url);
+        ui.colored_label(colors.dim, s.gui_git_repo_url);
         if !recent.is_empty() {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.menu_button(s.gui_git_recent, |ui| {
@@ -965,11 +967,15 @@ fn draw_load_workspace_storage(
 ) -> UiAction {
     let mut action = UiAction::None;
 
-    ui.colored_label(colors.accent, s.gui_git_ws_storage_title);
+    ui.label(
+        egui::RichText::new(s.gui_git_ws_storage_title)
+            .strong()
+            .color(colors.text),
+    );
     ui.add_space(4.0);
     ui.colored_label(colors.dim, s.git_workspace_storage_q);
     ui.add_space(6.0);
-    ui.colored_label(colors.accent, s.gui_git_ws_folder_name);
+    ui.colored_label(colors.dim, s.gui_git_ws_folder_name);
     ui.add_enabled(
         !busy,
         egui::TextEdit::singleline(&mut load.ws_name).desired_width(f32::INFINITY),
@@ -1006,7 +1012,7 @@ fn draw_load_connect(
 
     url_field(ui, &mut load.flow.url, recent, busy, colors, s);
     ui.add_space(4.0);
-    ui.colored_label(colors.accent, s.gui_git_token);
+    ui.colored_label(colors.dim, s.gui_git_token);
     ui.add_enabled(
         !busy,
         egui::TextEdit::singleline(&mut load.flow.token)
@@ -1215,7 +1221,7 @@ fn draw_save(
         SaveStep::Connect => {
             url_field(ui, &mut flow.url, recent, busy, colors, s);
             ui.add_space(4.0);
-            ui.colored_label(colors.accent, s.gui_git_token);
+            ui.colored_label(colors.dim, s.gui_git_token);
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut flow.token)
@@ -1242,7 +1248,7 @@ fn draw_save(
             });
         }
         SaveStep::ChoosePaths => {
-            ui.colored_label(colors.accent, s.gui_git_path);
+            ui.colored_label(colors.dim, s.gui_git_path);
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut flow.path).desired_width(f32::INFINITY),
@@ -1255,7 +1261,7 @@ fn draw_save(
                 );
                 if flow.include_env {
                     ui.add_space(4.0);
-                    ui.colored_label(colors.accent, s.git_save_env_path_label);
+                    ui.colored_label(colors.dim, s.git_save_env_path_label);
                     ui.add_enabled(
                         !busy,
                         egui::TextEdit::singleline(&mut flow.env_path).desired_width(f32::INFINITY),
@@ -1295,7 +1301,7 @@ fn draw_save(
             });
             ui.add_space(4.0);
             ui.colored_label(
-                colors.accent,
+                colors.dim,
                 if flow.target_kind == SaveTargetKind::Branch {
                     s.gui_git_branch
                 } else {
@@ -1346,7 +1352,7 @@ fn draw_save(
             });
         }
         SaveStep::CommitMessage => {
-            ui.colored_label(colors.accent, s.gui_git_commit_message);
+            ui.colored_label(colors.dim, s.gui_git_commit_message);
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut flow.message).desired_width(f32::INFINITY),
@@ -1371,7 +1377,7 @@ fn draw_save(
             });
         }
         SaveStep::Done => {
-            ui.colored_label(colors.accent, s.gui_git_saved);
+            ui.colored_label(colors.ok, s.gui_git_saved);
             ui.add_space(8.0);
             if ui.button(s.gui_close).clicked() {
                 action = UiAction::Cancel;

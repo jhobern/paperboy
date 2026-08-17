@@ -113,7 +113,7 @@ strings! {
     confirm_clear_q => "Close all collections? This removes all tabs and requests.", "Fermer toutes les collections\u{a0}? Cela supprime tous les onglets et requêtes.", "Luk alle samlinger? Dette fjerner alle faner og anmodninger.";
     confirm_overwrite_q => "\"{f}\" already exists. Overwrite it?", "«\u{a0}{f}\u{a0}» existe déjà. L'écraser\u{a0}?", "«{f}» findes allerede. Overskriv den?";
     confirm_revert_request_q => "Revert \"{r}\" to its last saved version? In-memory edits will be discarded.", "Rétablir «\u{a0}{r}\u{a0}» à sa dernière version enregistrée\u{a0}? Les modifications en mémoire seront perdues.", "Gendan «{r}» til sidst gemte version? Ændringer i hukommelsen går tabt.";
-    confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every in-memory edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications en mémoire seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ændringer i hukommelsen går tabt.";
+    confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every unsaved edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications non enregistrées seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ikke-gemte ændringer går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
     confirm_yes => "Yes", "Oui", "Ja";
@@ -989,7 +989,8 @@ strings! {
     node_form_response => "Response", "Réponse", "Svar";
     node_form_response_default => "Default", "Défaut", "Standard";
     node_form_alias => "Column name (AS)", "Nom de colonne (AS)", "Kolonnenavn (AS)";
-    node_form_show => "Show fields (all ticked = show all)", "Afficher les champs (tous cochés = tout afficher)", "Vis felter (alle markeret = vis alle)";
+    node_form_show => "Show fields", "Afficher les champs", "Vis felter";
+    node_form_show_hint => "Ticking every field is the same as showing them all", "Cocher tous les champs revient à tous les afficher", "At markere alle felter svarer til at vise dem alle";
     node_envs_environments => "Environments", "Environnements", "Miljøer";
     node_envs_baseline_show => "SHOW — baseline fields to carry onto every comparison row", "SHOW — champs de référence à reporter sur chaque ligne de comparaison", "SHOW — referencefelter der føres over på hver sammenligningsrække";
     node_envs_baseline_show_hint => "Ticked fields appear beside each comparison as baseline.<field>. Tick nothing for no SHOW clause.", "Les champs cochés apparaissent à côté de chaque comparaison sous la forme baseline.<champ>. Ne rien cocher = aucune clause SHOW.", "Afkrydsede felter vises ved siden af hver sammenligning som baseline.<felt>. Kryds intet af for ingen SHOW-klausul.";
@@ -1280,6 +1281,7 @@ strings! {
     diag_env_ref_default_not_loaded => "ENVS names '{}', which currently means '{}' — an environment that isn't loaded.", "ENVS désigne « {} », qui signifie actuellement « {} » — un environnement qui n'est pas chargé.", "ENVS navngiver '{}', som i øjeblikket betyder '{}' — et miljø, der ikke er indlæst.";
     param_pick_path => "Pick a value for this parameter…", "Choisissez une valeur pour ce paramètre…", "Vælg en værdi til denne parameter…";
     param_row_required => "needs a value", "doit être renseigné", "kræver en værdi";
+    param_blocked_hint => "Fill in the values marked above before running.", "Renseignez les valeurs signalées ci-dessus avant de lancer.", "Udfyld de markerede værdier ovenfor, før du kører.";
     param_run_settings_first => "This report asks for some values — check them, then run again to start.", "Ce rapport demande des valeurs : vérifiez-les, puis relancez pour démarrer.", "Denne rapport beder om nogle værdier — tjek dem, og kør igen for at starte.";
     param_none_declared => "This report doesn't ask for anything before it runs.", "Ce rapport ne demande rien avant de s'exécuter.", "Denne rapport beder ikke om noget, før den kører.";
     param_view_title => "Run settings", "Paramètres d'exécution", "Kørselsindstillinger";

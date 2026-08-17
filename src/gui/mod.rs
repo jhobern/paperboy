@@ -9,6 +9,8 @@
 //! natively by egui rather than the hand-written plumbing the terminal UI needs.
 
 mod app;
+#[cfg(test)]
+mod dialog_style;
 mod editor;
 mod environments;
 mod filepick;

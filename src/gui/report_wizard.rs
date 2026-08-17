@@ -1127,6 +1127,7 @@ fn request_ui(
     if f.report && !f.fields.is_empty() {
         ui.add_space(6.0);
         ui.label(RichText::new(s.node_form_show).color(th.dim));
+        ui.label(RichText::new(s.node_form_show_hint).color(th.dim));
         egui::ScrollArea::vertical()
             .id_salt("pt_req_fields")
             .max_height(160.0)

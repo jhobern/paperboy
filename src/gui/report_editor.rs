@@ -2070,7 +2070,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let mut open = true;
         let esc = ui.ctx().input(|i| i.key_pressed(egui::Key::Escape));
         let ins = ed.inspector.as_ref().unwrap();
-        egui::Window::new(RichText::new(&ins.title).strong().color(th.text))
+        // Titled like every other window in the app: a plain `RichText` here
+        // is body-sized, which left the one floating window with a title
+        // smaller than the dialogs beside it.
+        egui::Window::new(RichText::new(&ins.title).heading().color(th.text))
             .id(egui::Id::new("pt_cell_inspector"))
             .collapsible(false)
             .resizable(true)
@@ -2611,6 +2614,11 @@ fn snap_end_line(text: &str, at: usize) -> Option<(String, usize)> {
 /// who does go on to read the source. Drawn as tinted, rounded cards in the
 /// Blocks view's own idiom, in the `subst` hue every other `{{substitution}}`
 /// carries — which is exactly what a parameter is.
+#[cfg(test)]
+pub(crate) fn arm_params_for_audit(ed: &mut ReportEditor) {
+    ed.params_modal = Some(RunIntent::Run);
+}
+
 fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context) {
     let Some(intent) = ed.params_modal else {
         return;
@@ -2639,7 +2647,10 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
         ui.set_min_width(FORM_MAX_WIDTH);
         ui.set_max_width(FORM_MAX_WIDTH);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(s.param_view_title).strong().color(th.text));
+            // Sized like the title bar of every framed dialog in the app: a
+            // modal draws its own title, and a body-sized one reads as a
+            // stray line rather than as the name of the window.
+            ui.heading(RichText::new(s.param_view_title).color(th.text));
             // A modal has no title bar to hang a close button off, so it gets
             // its own: every dialog in the app can be left by the corner as
             // well as by Escape.
@@ -2715,8 +2726,10 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
             if ui.button(s.gui_cancel).clicked() {
                 leave = Some(None);
             }
+            // Not the per-card message repeated: beside the disabled buttons
+            // the useful thing to say is what to do about it.
             if !ready {
-                ui.colored_label(th.err, s.param_row_required);
+                ui.colored_label(th.err, s.param_blocked_hint);
             }
         });
     });
@@ -2813,11 +2826,10 @@ fn param_card(
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&row.prompt).strong().color(th.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(th.dim, RichText::new(row.kind.keyword()).small());
+                    ui.colored_label(th.dim, row.kind.keyword());
                     ui.label(
                         RichText::new(&row.name)
                             .monospace()
-                            .small()
                             .color(mix(th.dim, th.subst, 0.5)),
                     );
                 });
@@ -6583,8 +6595,12 @@ fn settings_panel(
     settings_frame(th).show(ui, |ui| {
         // A heading, because the frame alone only said "these are grouped", not
         // what the group *is*. The same words the TUI's panel uses.
-        ui.heading(RichText::new(s.report_settings_heading).color(th.dim))
-            .on_hover_text(s.report_settings_help);
+        ui.label(
+            RichText::new(s.report_settings_heading)
+                .strong()
+                .color(th.text),
+        )
+        .on_hover_text(s.report_settings_help);
         // One setting per line, each starting at the same left edge as `BEGIN`
         // below. Laying them out in a row instead left them ragged — a combo
         // chip and a text chip are different widths and sit differently in a

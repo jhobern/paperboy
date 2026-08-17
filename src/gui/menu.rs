@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use eframe::egui::{self, RichText};
+use eframe::egui;
 
 use crate::i18n::{Language, Strings};
 use crate::request::RequestView;
@@ -473,11 +473,7 @@ fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             }
         });
         ui.separator();
-        ui.label(
-            RichText::new(app.strings.gui_preferences)
-                .small()
-                .color(app.theme.dim),
-        );
+        ui.colored_label(app.theme.dim, app.strings.gui_preferences);
         if ui
             .checkbox(
                 &mut app.session.confirm_on_exit,
@@ -610,7 +606,7 @@ fn revert_to_saved_dialog(
     );
     let mut decided = false;
     let dismissed = modal(ctx, title, |ui| {
-        ui.label(question);
+        ui.colored_label(app.theme.text, question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button(go).clicked() {
@@ -661,9 +657,10 @@ fn export_results_dialog(app: &mut GuiApp, ctx: &egui::Context, mut path: String
         app.strings.gui_report_export_format,
     );
     let mut act = ExportChoice::Keep;
+    let theme_dim = app.theme.dim;
     let answered = modal(ctx, title, |ui| {
         ui.horizontal(|ui| {
-            ui.label(lbl_format);
+            ui.colored_label(theme_dim, lbl_format);
             let current = std::path::Path::new(&path)
                 .extension()
                 .and_then(|e| e.to_str())
@@ -790,7 +787,7 @@ fn unsaved_quit_dialog(app: &mut GuiApp, ctx: &egui::Context, count: usize, tabs
     let mut decided = false;
     let mut save_then_quit = false;
     let decided = modal(ctx, title, |ui| {
-        ui.label(question);
+        ui.colored_label(app.theme.text, question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             // Offered first: it is the only answer that keeps the work, so it
@@ -852,7 +849,7 @@ fn unsaved_close_tab_dialog(
     );
     let mut decided = false;
     let dismissed = modal(ctx, title, |ui| {
-        ui.label(question);
+        ui.colored_label(app.theme.text, question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button(close).clicked() {
@@ -892,7 +889,7 @@ fn close_git_workspace_dialog(
     );
     let mut decided = false;
     let dismissed = modal(ctx, title, |ui| {
-        ui.label(question);
+        ui.colored_label(app.theme.text, question);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button(keep).clicked() {
@@ -948,9 +945,9 @@ fn workspace_reload_dialog(
     );
     let mut answer: Option<bool> = None;
     let dismissed = modal(ctx, title, |ui| {
-        ui.label(question);
+        ui.colored_label(app.theme.text, question);
         ui.add_space(4.0);
-        ui.label(hint);
+        ui.colored_label(app.theme.dim, hint);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button(yes).clicked() {
@@ -1705,9 +1702,10 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
     let lbl_name = app.strings.gui_name;
     let lbl_apply = app.strings.gui_apply;
     let lbl_cancel = app.strings.gui_cancel;
+    let dim = app.theme.dim;
     let frame = modal(ctx, title, |ui| {
         ui.horizontal(|ui| {
-            ui.label(lbl_name);
+            ui.colored_label(dim, lbl_name);
             ui.text_edit_singleline(&mut state.spec.name);
         });
         ui.separator();
@@ -1717,7 +1715,7 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
             .show(ui, |ui| {
                 for i in 0..THEME_COLOR_COUNT {
                     let label = color_label(&strings, i);
-                    ui.label(label);
+                    ui.colored_label(dim, label);
                     let mut rgb = state.spec.color(i);
                     if ui.color_edit_button_srgb(&mut rgb).changed() {
                         state.spec.set_color(i, rgb);

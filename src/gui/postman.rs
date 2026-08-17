@@ -78,6 +78,19 @@ impl Wizard {
     /// the rest of the app stays usable through. The earlier steps are busy
     /// only in bursts, and going modeless under the user mid-burst would move
     /// the ground while they read.
+    #[cfg(test)]
+    fn seed_for_audit(&mut self, step: Step) {
+        self.flow.key = "PMAK-x".into();
+        self.flow.dest = "/tmp/pb/import".into();
+        self.flow.seed_chosen(crate::postman_api::WorkspaceSummary {
+            id: "ws-a".into(),
+            name: "Alpha".into(),
+            kind: crate::postman_api::WorkspaceKind::Team,
+        });
+        self.flow.seed_step(step);
+        self.remember_step();
+    }
+
     fn working(&self) -> bool {
         matches!(self.flow.step(), Step::Downloading)
     }
@@ -205,6 +218,13 @@ impl PostmanUi {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_step_for_audit(&mut self, step: Step) {
+        if let Some(w) = &mut self.flow {
+            w.seed_for_audit(step);
+        }
+    }
+
     /// Bring a backgrounded import back on screen.
     pub fn reveal(&mut self) {
         if let Some(w) = &mut self.flow {
@@ -241,8 +261,12 @@ enum UiAction {
 #[derive(Clone, Copy)]
 struct UiColors {
     dim: egui::Color32,
+    /// Reserved for what the import is *doing* — the paced waits. Field labels
+    /// are dim, as they are everywhere else in the app.
     accent: egui::Color32,
     err: egui::Color32,
+    text: egui::Color32,
+    ok: egui::Color32,
 }
 
 /// Render the Postman dialog (if any) and drive its worker. Call once per frame.
@@ -273,6 +297,8 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         dim: app.theme.dim,
         accent: app.theme.accent,
         err: app.theme.err,
+        text: app.theme.text,
+        ok: app.theme.ok,
     };
     let mut action = UiAction::None;
     let import_base = app
@@ -417,7 +443,7 @@ fn draw_connect(
         // value column stays where it is as the source changes.
         .min_col_width(LABEL_WIDTH)
         .show(ui, |ui| {
-            ui.colored_label(colors.accent, s.postman_key_source_label);
+            ui.colored_label(colors.dim, s.postman_key_source_label);
             egui::ComboBox::from_id_salt("pb_postman_key_source")
                 .width(200.0)
                 .selected_text(key_source_label(w.key_source, s))
@@ -433,7 +459,7 @@ fn draw_connect(
                 });
             ui.end_row();
 
-            ui.colored_label(colors.accent, key_field_label(w.key_source, s));
+            ui.colored_label(colors.dim, key_field_label(w.key_source, s));
             // The references this key has been read from before, offered beside
             // the field: finding the 1Password item path is the tedious half of
             // setting an import up, and it is the same path every time. Only
@@ -472,7 +498,7 @@ fn draw_connect(
             });
             ui.end_row();
 
-            ui.colored_label(colors.accent, s.postman_workspace_label);
+            ui.colored_label(colors.dim, s.postman_workspace_label);
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut w.flow.workspace_ref)
@@ -481,7 +507,7 @@ fn draw_connect(
             );
             ui.end_row();
 
-            ui.colored_label(colors.accent, s.postman_base_url_label);
+            ui.colored_label(colors.dim, s.postman_base_url_label);
             ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut w.flow.base_url)
@@ -547,7 +573,11 @@ fn draw_pick_workspace(
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
 
-    ui.colored_label(colors.accent, s.postman_pick_workspace);
+    ui.label(
+        egui::RichText::new(s.postman_pick_workspace)
+            .strong()
+            .color(colors.text),
+    );
     ui.add_enabled(
         !busy,
         egui::TextEdit::singleline(&mut w.flow.filter)
@@ -613,7 +643,7 @@ fn draw_options(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     );
     ui.add_space(8.0);
 
-    ui.colored_label(colors.accent, s.postman_format_label);
+    ui.colored_label(colors.dim, s.postman_format_label);
     ui.radio_value(&mut w.flow.format, ImportFormat::Raw, s.postman_format_raw);
     ui.radio_value(
         &mut w.flow.format,
@@ -625,7 +655,7 @@ fn draw_options(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     }
     ui.add_space(8.0);
 
-    ui.colored_label(colors.accent, s.postman_dest_label);
+    ui.colored_label(colors.dim, s.postman_dest_label);
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
@@ -686,7 +716,11 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         return action;
     };
 
-    ui.colored_label(colors.accent, s.postman_confirm_title);
+    ui.label(
+        egui::RichText::new(s.postman_confirm_title)
+            .strong()
+            .color(colors.text),
+    );
     ui.add_space(4.0);
     ui.label(format!(
         "{} {} · {} {}",
@@ -777,14 +811,15 @@ fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Str
 /// screen and no way out.
 fn draw_done(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
     let mut action = UiAction::None;
-    ui.colored_label(colors.accent, s.postman_done_title);
+    ui.colored_label(colors.ok, s.postman_done_title);
     ui.label(w.flow.dest_path().to_string_lossy().into_owned());
     let failures = w.flow.failures().len();
     if failures > 0 {
         ui.colored_label(colors.err, format!("{failures} {}", s.postman_skipped));
     }
     ui.add_space(8.0);
-    if ui.button(s.gui_cancel).clicked() {
+    // Nothing is left to call off here, so the way out is Close, not Cancel.
+    if ui.button(s.gui_close).clicked() {
         action = UiAction::Cancel;
     }
     action

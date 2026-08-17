@@ -12,6 +12,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The desktop dialogs all look like the same program.** A pass over every
+  window and dialog found four things drifting: the Postman and Git wizards
+  painted every field label in the accent blue while the rest of the app uses
+  dim grey and saves accent for status; the run-settings modal drew its own
+  title at body size, next to dialogs whose titles are a size larger; the
+  parameter cards annotated themselves at a size no other text in the app uses;
+  and the confirmation dialogs left their question uncoloured, so the sentence
+  the dialog exists to ask was fainter than the buttons under it. All four now
+  follow the same rules, the finished-import dialog leaves by *Close* rather
+  than *Cancel*, and a test paints every dialog and fails if any of them
+  reaches for a third text size.
+
 - **A Postman import no longer stops the desktop app.** Bulk imports are paced
   around Postman's rate limit and can run for many minutes, and the dialog held
   the whole app while they did — nothing to answer, and nothing else possible.
