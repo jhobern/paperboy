@@ -36,6 +36,7 @@ struct Collection {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Item {
+    #[serde(deserialize_with = "de_str")]
     name: String,
     item: Option<Vec<Item>>,
     request: Option<Request>,
@@ -80,6 +81,7 @@ impl Profile {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Event {
+    #[serde(deserialize_with = "de_str")]
     listen: String,
     script: Script,
 }
@@ -92,7 +94,7 @@ struct Script {
 
 #[derive(Deserialize)]
 struct Request {
-    #[serde(default = "get_method")]
+    #[serde(default = "get_method", deserialize_with = "de_method")]
     method: String,
     #[serde(default, deserialize_with = "de_url")]
     url: Url,
@@ -123,6 +125,14 @@ fn de_description<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 
 fn get_method() -> String {
     "GET".to_string()
+}
+
+/// Like [`de_str`], but a method that reads as blank (a `null`, or a structure
+/// we can't stringify) falls back to the same `GET` an absent one does rather
+/// than producing a request with no verb.
+fn de_method<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let m = de_str(d)?;
+    Ok(if m.trim().is_empty() { get_method() } else { m })
 }
 
 /// A Postman URL: the text as typed, plus the *path variables* declared for it.
@@ -181,7 +191,7 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
 #[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Auth {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "de_str")]
     kind: String,
     basic: Vec<Param>,
     bearer: Vec<Param>,
@@ -218,7 +228,9 @@ impl Auth {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Body {
+    #[serde(deserialize_with = "de_str")]
     mode: String,
+    #[serde(deserialize_with = "de_str")]
     raw: String,
     urlencoded: Vec<Param>,
     formdata: Vec<Param>,
@@ -276,10 +288,22 @@ struct Param {
     description: String,
 }
 
-/// Deserialize a string field tolerantly: an explicit JSON `null` (which
-/// `#[serde(default)]` does *not* handle) becomes an empty string.
+/// Deserialize a string field tolerantly. Postman's schema is only loosely
+/// enforced by its own exporter, so a field documented as a string turns up as
+/// anything: an explicit JSON `null` (which `#[serde(default)]` does *not*
+/// handle), a number or bool from a hand-edited collection, or a nested
+/// structure — real exports carry `{"key": "tokenRequestParams", "value": []}`
+/// inside an oauth2 block. Because serde aborts the *whole* document on the
+/// first type error, and [`convert_postman`] answers a failed parse with an
+/// empty collection, being strict here silently emptied entire workspaces. So
+/// scalars stringify and structures become empty rather than fatal.
 fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null | Value::Array(_) | Value::Object(_) => String::new(),
+    })
 }
 
 impl Param {
@@ -492,11 +516,24 @@ pub fn import_postman(content: &str) -> Vec<HurlEntry> {
 /// none uses the collection's, and `"type": "noauth"` at any level means "no
 /// auth", not "ask my parent".
 pub fn convert_postman(content: &str) -> ConvertedCollection {
-    let Ok(root) = serde_json::from_str::<Value>(content)
+    // A file that doesn't deserialize produces *no* requests, which looks
+    // exactly like an empty collection — a shape of Postman JSON we mishandle
+    // is therefore invisible unless it says so. Record it as a note so the
+    // failure is reported rather than mistaken for "this collection is empty".
+    let root = match serde_json::from_str::<Value>(content)
         .map(|v| unwrap_envelope(v, "collection", "item"))
         .and_then(serde_json::from_value::<Collection>)
-    else {
-        return ConvertedCollection::default();
+    {
+        Ok(root) => root,
+        Err(e) => {
+            return ConvertedCollection {
+                notes: vec![ConversionNote {
+                    item: String::new(),
+                    detail: format!("collection could not be read: {e}"),
+                }],
+                ..ConvertedCollection::default()
+            };
+        }
     };
     let mut out = ConvertedCollection {
         variables: root
@@ -2705,5 +2742,101 @@ mod inheritance_tests {
             "header": [ { "key": "Accept", "value": "application/json" } ] } } ]
         }"#;
         assert_eq!(convert_postman(json).notes, vec![]);
+    }
+}
+
+#[cfg(test)]
+mod field_tolerance_tests {
+    use super::*;
+
+    /// A collection whose oauth2 block carries the request-parameter lists
+    /// Postman writes out as *arrays* — `{"key": "tokenRequestParams",
+    /// "value": []}`. Real exports (the IDKit workspaces) all have these.
+    fn collection_with(param: &str) -> String {
+        format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "auth": {{ "type": "oauth2", "oauth2": [
+                {{ "key": "accessTokenUrl", "value": "https://id.example.com/token" }},
+                {{ "key": "grant_type", "value": "client_credentials" }},
+                {{ "key": "clientId", "value": "abc" }},
+                {{ "key": "clientSecret", "value": "shh" }},
+                {param}
+              ] }},
+              "item": [
+                {{ "name": "Ping", "request": {{ "method": "GET", "url": "https://x/ping" }} }}
+              ]
+            }}"#
+        )
+    }
+
+    /// The regression: a non-string `value` anywhere aborted the *whole*
+    /// document, and a failed parse imports as an empty collection — so one
+    /// unexpected field silently emptied entire workspaces rather than
+    /// degrading the one row it appeared on.
+    #[test]
+    fn array_valued_auth_param_does_not_empty_the_collection() {
+        for value in [r#"[]"#, r#"[{"key": "a", "value": "b"}]"#, r#"{"a": 1}"#] {
+            let json = collection_with(&format!(
+                r#"{{ "key": "tokenRequestParams", "value": {value}, "type": "any" }}"#
+            ));
+            let out = convert_postman(&json);
+            assert!(
+                out.entries.iter().any(|e| e.title == "Ping"),
+                "value {value} emptied the collection"
+            );
+            assert!(
+                out.notes
+                    .iter()
+                    .all(|n| !n.detail.contains("could not be read")),
+                "value {value} failed to parse"
+            );
+        }
+    }
+
+    /// Numbers and bools stringify rather than failing — hand-edited and
+    /// third-party-generated collections write both.
+    #[test]
+    fn scalar_valued_fields_stringify() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [ { "name": "Ping", "request": {
+            "method": "GET", "url": "https://x/ping",
+            "header": [ { "key": "X-Retry", "value": 3 },
+                        { "key": "X-Debug", "value": true } ] } } ]
+        }"#;
+        let entries = import_postman(json);
+        let headers = &entries[0].headers;
+        assert_eq!(
+            headers.iter().find(|h| h.key == "X-Retry").unwrap().value,
+            "3"
+        );
+        assert_eq!(
+            headers.iter().find(|h| h.key == "X-Debug").unwrap().value,
+            "true"
+        );
+    }
+
+    /// A `null` method is still a `GET`, like an absent one.
+    #[test]
+    fn null_method_falls_back_to_get() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [ { "name": "Ping", "request": { "method": null, "url": "https://x/ping" } } ]
+        }"#;
+        assert_eq!(import_postman(json)[0].method, "GET");
+    }
+
+    /// When a collection genuinely can't be read, say so — an empty result on
+    /// its own is indistinguishable from an empty collection.
+    #[test]
+    fn unreadable_collection_is_reported_rather_than_silently_empty() {
+        let json = r#"{ "info": { "schema": "https://schema.getpostman.com/..v2.1.0" },
+                        "item": "not a list" }"#;
+        let out = convert_postman(json);
+        assert!(out.entries.is_empty());
+        assert_eq!(out.notes.len(), 1);
+        assert!(out.notes[0].item.is_empty());
+        assert!(out.notes[0].detail.contains("could not be read"));
     }
 }

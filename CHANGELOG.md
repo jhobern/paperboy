@@ -139,6 +139,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A collection with an unexpected field imports again instead of arriving
+  empty.** Postman's export format is only loosely enforced by Postman itself,
+  and a field documented as a string turns up as anything — every one of the
+  real IDKit workspace exports carries `{"key": "tokenRequestParams",
+  "value": []}` inside its oauth2 block. The importer read those fields
+  strictly, and serde abandons the *whole* document on the first type error, so
+  a single unexpected array in one auth block emptied a workspace of all its
+  requests. Worse, an unreadable collection and an empty one looked identical:
+  the failure was reported as "no requests". String fields now coerce — numbers
+  and bools stringify, and a structure or `null` reads as blank — so a shape we
+  don't understand costs one value rather than the collection, and a collection
+  that genuinely cannot be read now says so as a conversion note.
 - **An imported request keeps its path variables.** Postman writes a URL
   placeholder twice — as `/:batch_id` in the URL text, and again in a list of
   declared variables holding the value to put there. The importer read only the
