@@ -125,6 +125,7 @@ struct Auth {
     bearer: Vec<Param>,
     apikey: Vec<Param>,
     oauth2: Vec<Param>,
+    awsv4: Vec<Param>,
 }
 
 impl Auth {
@@ -893,6 +894,15 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
     found
 }
 
+/// `value` unless it is blank, in which case `fallback`.
+fn non_empty(value: String, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
 /// Which auth applies at this level: its own if it declares any, otherwise
 /// whatever it inherits — and nothing at all if it opts out.
 fn resolve_auth<'a>(own: Option<&'a Auth>, inherited: Option<&'a Auth>) -> Option<&'a Auth> {
@@ -922,12 +932,25 @@ fn note_losses(
     };
 
     if let Some(auth) = auth
-        && !matches!(auth.kind.as_str(), "basic" | "bearer" | "apikey" | "oauth2")
+        && !matches!(
+            auth.kind.as_str(),
+            "basic" | "bearer" | "apikey" | "oauth2" | "awsv4"
+        )
     {
         note(format!(
             "auth type `{}` has no Hurl equivalent and was dropped",
             auth.kind
         ));
+    }
+    if let Some(auth) = auth
+        && auth.kind == "awsv4"
+        && Auth::field(&auth.awsv4, "accessKey").trim().is_empty()
+    {
+        note(
+            "AWS auth carried no keys — real exports keep them in variables or outside the file \
+             — so the request signs with `{{aws_access_key_id}}` and `{{aws_secret_access_key}}`"
+                .into(),
+        );
     }
     if let Some(auth) = auth
         && auth.kind == "apikey"
@@ -967,6 +990,7 @@ fn note_losses(
 fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>) -> HurlEntry {
     let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
     let mut queries: Vec<KvRow> = Vec::new();
+    let mut options: Vec<KvRow> = Vec::new();
 
     // Auth → basic_auth, or a header/query parameter. `auth` is already
     // resolved against the enclosing folder and collection by `walk_items`.
@@ -1001,6 +1025,43 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
                     }
                 }
             }
+            // AWS Signature v4 is a signing algorithm, not a header PaperBoy
+            // could write out: the signature covers the method, path, headers
+            // and body, so it can only be computed at send time. curl does it,
+            // Hurl exposes it as the `aws-sigv4` option, and the credentials
+            // ride in `user` — so this maps exactly, which is worth doing for
+            // an auth type that otherwise loses every request under it.
+            "awsv4" => {
+                let f = |name: &str| Auth::field(&auth.awsv4, name);
+                // `aws:amz` is the provider pair every AWS endpoint uses.
+                // Region and service are appended only when the export names
+                // them, because curl infers both from the hostname and a blank
+                // guess would be worse than no guess.
+                let mut provider = "aws:amz".to_string();
+                let (region, service) = (f("region"), f("service"));
+                if !region.trim().is_empty() || !service.trim().is_empty() {
+                    provider.push(':');
+                    provider.push_str(region.trim());
+                    if !service.trim().is_empty() {
+                        provider.push(':');
+                        provider.push_str(service.trim());
+                    }
+                }
+                options.push(KvRow::new("aws-sigv4", provider));
+
+                // Postman usually stores these as collection variables rather
+                // than in the auth block, and real exports leave the block
+                // empty altogether — so fall back to named variables the user
+                // can fill in rather than signing with nothing.
+                let key = non_empty(f("accessKey"), "{{aws_access_key_id}}");
+                let secret = non_empty(f("secretKey"), "{{aws_secret_access_key}}");
+                options.push(KvRow::new("user", format!("{key}:{secret}")));
+
+                let session = f("sessionToken");
+                if !session.trim().is_empty() {
+                    headers.push(KvRow::new("x-amz-security-token", session));
+                }
+            }
             _ => {}
         }
     }
@@ -1024,6 +1085,7 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
     entry.queries.extend(queries);
+    entry.options.extend(options);
     // Captured variables from the request's `test` script (#24). A request that
     // gets captures serializes with a `HTTP *` line automatically; one with none
     // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
@@ -1441,6 +1503,96 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod awsv4_tests {
+    use super::*;
+
+    fn one(auth: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [ {{ "name": "r", "request": {{ "method": "GET",
+                "url": "https://api.example.com/v1/x", "auth": {auth} }} }} ]
+            }}"#
+        ))
+    }
+
+    fn option(e: &HurlEntry, name: &str) -> Option<String> {
+        e.options
+            .iter()
+            .find(|o| o.key == name)
+            .map(|o| o.value.clone())
+    }
+
+    /// A v4 signature covers the method, path, headers and body, so it can only
+    /// be computed at send time — which is precisely what Hurl's `aws-sigv4`
+    /// option asks curl to do. Every request under this auth used to import
+    /// unsigned, with a note saying so.
+    #[test]
+    fn awsv4_auth_becomes_the_aws_sigv4_option() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                 { "key": "accessKey", "value": "AKIA1" },
+                 { "key": "secretKey", "value": "s3cret" },
+                 { "key": "region", "value": "eu-west-1" },
+                 { "key": "service", "value": "execute-api" } ] }"#);
+        let e = &c.entries[0];
+        assert_eq!(
+            option(e, "aws-sigv4").as_deref(),
+            Some("aws:amz:eu-west-1:execute-api")
+        );
+        assert_eq!(option(e, "user").as_deref(), Some("AKIA1:s3cret"));
+    }
+
+    /// curl works the region and service out from the hostname, so naming them
+    /// blank would be worse than not naming them.
+    #[test]
+    fn an_unnamed_region_is_left_for_curl_to_infer() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                        { "key": "accessKey", "value": "AKIA1" },
+                        { "key": "secretKey", "value": "s3cret" } ] }"#);
+        assert_eq!(
+            option(&c.entries[0], "aws-sigv4").as_deref(),
+            Some("aws:amz")
+        );
+    }
+
+    /// Both AWS-signed collections in the exports on hand are exactly this:
+    /// a bare `{"type": "awsv4"}`, with the keys kept somewhere else entirely.
+    #[test]
+    fn a_bare_aws_auth_block_signs_with_named_variables_and_says_so() {
+        let c = one(r#"{ "type": "awsv4" }"#);
+        assert_eq!(
+            option(&c.entries[0], "user").as_deref(),
+            Some("{{aws_access_key_id}}:{{aws_secret_access_key}}")
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("aws_access_key_id")),
+            "the user is told where to put the keys: {:?}",
+            c.notes
+        );
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("was dropped")),
+            "and it is no longer reported as a lost auth type"
+        );
+    }
+
+    /// Temporary credentials need the session token alongside the signature.
+    #[test]
+    fn a_session_token_rides_in_its_own_header() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                        { "key": "accessKey", "value": "A" },
+                        { "key": "secretKey", "value": "B" },
+                        { "key": "sessionToken", "value": "tok" } ] }"#);
+        assert!(c.entries[0].headers.contains(&KvRow::toggled(
+            "x-amz-security-token",
+            "tok",
+            true
+        )));
     }
 }
 

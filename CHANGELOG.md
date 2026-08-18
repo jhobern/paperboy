@@ -12,6 +12,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **AWS-signed Postman requests import signed.** An AWS Signature v4 covers
+  the method, path, headers and body, so it can only be computed at send time —
+  there is no header PaperBoy could write into the file. That made it the one
+  auth type where every request underneath it silently lost its credentials.
+  Hurl exposes the signing curl already does, so `awsv4` auth now imports as an
+  `aws-sigv4` request option with the keys in `user`. The region and service are
+  named only when the export names them, since curl works both out from the
+  hostname and a blank guess would be worse than none. A session token becomes
+  the `x-amz-security-token` header. Both AWS collections in the exports on hand
+  store nothing in the auth block at all — Postman keeps the keys elsewhere — so
+  a bare block signs with `{{aws_access_key_id}}` and `{{aws_secret_access_key}}`
+  and the report says where to put them.
+
 - **A Postman collection that authenticates with OAuth 2 arrives able to
   authenticate.** Postman fetches the token itself, behind the scenes, and
   never writes it into the export — so a collection whose folder said
