@@ -10,6 +10,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.4.0] - unreleased
 
+### Added
+
+- **A Postman collection that authenticates with OAuth 2 arrives able to
+  authenticate.** Postman fetches the token itself, behind the scenes, and
+  never writes it into the export — so a collection whose folder said
+  "client credentials, here is the token endpoint" imported as a pile of
+  requests with no credentials on them at all, and the configuration that
+  would have explained why was silently dropped. PaperBoy doesn't need any
+  hidden machinery for this: a token request is just a request, and
+  `[Captures]` hands its answer to the ones that follow. Importing an OAuth 2
+  collection now generates exactly that — a `POST` to the token endpoint
+  asserting `HTTP 200` and capturing `access_token`, placed in the folder that
+  declared the auth and ahead of the first request that needs it, with
+  `Authorization: Bearer {{access_token}}` added to the requests that inherit
+  it. Identical configurations on six folders share one token rather than
+  fetching six. Postman's choices are honoured: client credentials go in the
+  Basic header or the form body as configured, and a token can be added as a
+  query parameter instead. Only the grants that are genuinely just an HTTP
+  POST are generated — `authorization_code` and the rest need a browser, a
+  redirect and a human, so they are reported instead of half-built. A request
+  that sets its own `Authorization` keeps it: real exports routinely have a
+  hand-written token request sitting inside the folder that configures OAuth 2,
+  which would otherwise end up asking for a token using a token it doesn't have
+  yet. Where Postman stored no client credentials (it keeps them outside the
+  export, which is most of them) the request refers to `{{oauth_client_id}}`
+  and `{{oauth_client_secret}}`, and the conversion report says so.
+
 ### Fixed
 
 - **An imported request keeps its path variables.** Postman writes a URL

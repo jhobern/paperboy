@@ -112,9 +112,10 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
     })
 }
 
-/// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header) and `apikey` (→ a
-/// header or a query parameter) are mapped; credentials live in `key/value`
-/// lists keyed by `username`/`password`/`token`/`key`/`value`/`in`.
+/// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header), `apikey` (→ a
+/// header or a query parameter) and `oauth2` (→ a generated token request, see
+/// [`apply_oauth2`]) are mapped; credentials live in `key/value` lists keyed by
+/// `username`/`password`/`token`/`key`/`value`/`in`.
 #[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Auth {
@@ -123,6 +124,7 @@ struct Auth {
     basic: Vec<Param>,
     bearer: Vec<Param>,
     apikey: Vec<Param>,
+    oauth2: Vec<Param>,
 }
 
 impl Auth {
@@ -424,7 +426,15 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
         ..ConvertedCollection::default()
     };
     let inherited = root.auth.as_ref().filter(|a| !a.inherits());
-    walk_items(&root.item, &mut Vec::new(), inherited, &mut out);
+    let mut tokens = OAuthTokens::default();
+    walk_items(
+        &root.item,
+        &mut Vec::new(),
+        inherited,
+        &[],
+        &mut tokens,
+        &mut out,
+    );
     out
 }
 
@@ -434,18 +444,29 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
 /// a node unusually carries both `item` and `request`.
 ///
 /// `inherited` is the nearest enclosing auth, already resolved — `None` once
-/// some level has said `noauth`.
+/// some level has said `noauth`. `auth_path` is the folder breadcrumb of the
+/// level that *declared* it, which is where a generated OAuth 2 token request
+/// belongs: naming it after the first request that happens to use it would
+/// bury a collection-wide token three folders deep.
 fn walk_items(
     items: &[Item],
     path: &mut Vec<String>,
     inherited: Option<&Auth>,
+    auth_path: &[String],
+    tokens: &mut OAuthTokens,
     out: &mut ConvertedCollection,
 ) {
     for it in items {
         if let Some(sub) = &it.item {
             let here = resolve_auth(it.auth.as_ref(), inherited);
+            let declares_own = it.auth.as_ref().is_some_and(|a| !a.inherits());
             path.push(it.name.clone());
-            walk_items(sub, path, here, out);
+            let here_path = if declares_own {
+                path.clone()
+            } else {
+                auth_path.to_vec()
+            };
+            walk_items(sub, path, here, &here_path, tokens, out);
             path.pop();
         } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
@@ -454,8 +475,13 @@ fn walk_items(
                 format!("{}/{}", path.join("/"), it.name)
             };
             let auth = resolve_auth(req.auth.as_ref(), inherited);
+            // A request declaring its own auth owns it, so its own folder is
+            // where a token request for it belongs.
+            let declares_own = req.auth.as_ref().is_some_and(|a| !a.inherits());
+            let token_path: &[String] = if declares_own { path } else { auth_path };
             let mut entry = map_request(&title, req, &it.event, auth);
             apply_path_variables(&title, &req.url, &mut entry, out);
+            apply_oauth2(&title, token_path, auth, &mut entry, tokens, out);
             note_losses(&title, req, &it.event, auth, &entry, out);
             for name in rename_dynamic_variables(&mut entry) {
                 out.notes.push(ConversionNote {
@@ -469,6 +495,274 @@ fn walk_items(
             out.entries.push(entry);
         }
     }
+}
+
+/// Postman's OAuth 2 configuration, flattened out of its `key`/`value` list.
+///
+/// Postman fetches the token itself, behind the scenes, and never writes it to
+/// the export — so an OAuth 2 collection used to import as a pile of requests
+/// with no credentials on them at all. Hurl has no such machinery, but it
+/// doesn't need any: a token request is just a request, and `[Captures]` feeds
+/// its answer to the ones that follow. That is exactly the shape a hand-written
+/// Hurl collection uses, so this generates it.
+struct OAuth2 {
+    access_token_url: String,
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
+    username: String,
+    password: String,
+    scope: String,
+    /// `header` (HTTP Basic, Postman's default) or `body` (credentials as form
+    /// fields) — how the token endpoint expects the client to identify itself.
+    client_authentication: String,
+    /// Text placed before the token, e.g. `"Bearer "`. Postman stores the
+    /// trailing space; exports that omit it fall back to `tokenType`.
+    header_prefix: String,
+    /// `header` (the default) or `queryParams`.
+    add_token_to: String,
+}
+
+impl OAuth2 {
+    fn read(auth: &Auth) -> Self {
+        let f = |name: &str| Auth::field(&auth.oauth2, name);
+        let prefix = match (f("headerPrefix"), f("tokenType")) {
+            (p, _) if !p.trim().is_empty() => p,
+            (_, t) if !t.trim().is_empty() => format!("{} ", t.trim()),
+            _ => "Bearer ".to_string(),
+        };
+        OAuth2 {
+            access_token_url: f("accessTokenUrl"),
+            grant_type: f("grant_type"),
+            client_id: f("clientId"),
+            client_secret: f("clientSecret"),
+            username: f("username"),
+            password: f("password"),
+            scope: f("scope"),
+            client_authentication: f("client_authentication"),
+            header_prefix: prefix,
+            add_token_to: f("addTokenTo"),
+        }
+    }
+
+    /// What makes two OAuth 2 blocks the same token. Folders repeat the whole
+    /// configuration rather than referring to a shared one, so without this a
+    /// collection with the same credentials on six folders would fetch six
+    /// identical tokens.
+    fn identity(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.access_token_url,
+            self.grant_type,
+            self.client_id,
+            self.scope,
+            self.client_authentication
+        )
+    }
+}
+
+/// Tokens generated so far: identity → the variable its value is captured into.
+/// Threaded through the walk so the token request is emitted once, immediately
+/// before the first request that needs it — which is also the order "Run All"
+/// needs, since a collection is a script that runs top to bottom.
+#[derive(Default)]
+struct OAuthTokens {
+    issued: Vec<(String, String)>,
+}
+
+impl OAuthTokens {
+    fn var_for(&self, identity: &str) -> Option<&str> {
+        self.issued
+            .iter()
+            .find(|(id, _)| id == identity)
+            .map(|(_, var)| var.as_str())
+    }
+
+    /// A fresh capture name. The first token is plain `access_token` — the name
+    /// the endpoint's own JSON uses and the one anybody reading the collection
+    /// will expect; later ones are numbered rather than named after the folder,
+    /// because a folder can be renamed and the variable would then lie.
+    fn next_var(&self) -> String {
+        match self.issued.len() {
+            0 => "access_token".to_string(),
+            n => format!("access_token_{}", n + 1),
+        }
+    }
+}
+
+/// Turn a Postman OAuth 2 block into a real request: a token request generated
+/// once, plus the `Authorization` header (or query parameter) on every request
+/// that inherits it.
+///
+/// Only the grants that are *just an HTTP POST* are generated —
+/// `client_credentials` and `password`. `authorization_code`, `implicit` and
+/// PKCE need a browser, a redirect and a human, none of which a file of
+/// requests can carry, so they are reported rather than half-built.
+fn apply_oauth2(
+    title: &str,
+    path: &[String],
+    auth: Option<&Auth>,
+    entry: &mut HurlEntry,
+    tokens: &mut OAuthTokens,
+    out: &mut ConvertedCollection,
+) {
+    let Some(auth) = auth.filter(|a| a.kind == "oauth2") else {
+        return;
+    };
+    let cfg = OAuth2::read(auth);
+    let mut note = |detail: String| {
+        out.notes.push(ConversionNote {
+            item: title.to_string(),
+            detail,
+        })
+    };
+
+    // A request that spells its own credentials out keeps them. Real exports do
+    // this constantly — a hand-written token request sitting inside a folder
+    // that also has OAuth 2 configured on it, so it ends up asking for a token
+    // using a token it doesn't have yet. Appending ours as well would leave two
+    // `Authorization` headers on the wire and let the collection's own,
+    // deliberate choice lose to a generated one.
+    let already_authorized = if cfg.add_token_to == "queryParams" {
+        entry.queries.iter().any(|q| q.key == "access_token")
+    } else {
+        entry
+            .headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case("authorization"))
+    };
+    if already_authorized {
+        note(
+            "this request sets its own Authorization, so the folder's OAuth 2 token was not \
+             added on top of it"
+                .into(),
+        );
+        return;
+    }
+
+    // A folder may override only the presentation (`headerPrefix`) and leave
+    // the token configuration to its parent. There is nothing to fetch, so
+    // reuse whatever the enclosing level already issued.
+    let var = if cfg.access_token_url.trim().is_empty() {
+        match tokens.issued.last() {
+            Some((_, var)) => var.clone(),
+            None => {
+                note(
+                    "OAuth 2 auth with no token URL — Postman was holding a token it fetched \
+                     elsewhere, which an export can't carry, so this request has no credentials"
+                        .into(),
+                );
+                return;
+            }
+        }
+    } else if !matches!(cfg.grant_type.as_str(), "client_credentials" | "password") {
+        note(format!(
+            "the OAuth 2 `{}` grant needs a browser redirect, which a file of requests can't \
+             perform — fetch a token by hand and put it in a variable",
+            cfg.grant_type
+        ));
+        return;
+    } else {
+        let identity = cfg.identity();
+        match tokens.var_for(&identity) {
+            Some(var) => var.to_string(),
+            None => {
+                let var = tokens.next_var();
+                let (token_entry, missing) = token_request(&cfg, &var, path);
+                if missing {
+                    note(
+                        "Postman keeps OAuth 2 client credentials outside the export, so the \
+                         generated token request refers to `{{oauth_client_id}}` and \
+                         `{{oauth_client_secret}}` — fill them in alongside the collection"
+                            .into(),
+                    );
+                }
+                out.entries.push(token_entry);
+                tokens.issued.push((identity, var.clone()));
+                var
+            }
+        }
+    };
+
+    if cfg.add_token_to == "queryParams" {
+        entry
+            .queries
+            .push(KvRow::new("access_token", format!("{{{{{var}}}}}")));
+    } else {
+        entry.headers.push(KvRow::new(
+            "Authorization",
+            format!("{}{{{{{var}}}}}", cfg.header_prefix),
+        ));
+    }
+}
+
+/// Build the token request itself. Returns it plus whether the credentials had
+/// to be stubbed out as variables because the export didn't carry them.
+fn token_request(cfg: &OAuth2, var: &str, path: &[String]) -> (HurlEntry, bool) {
+    let missing = cfg.client_id.trim().is_empty() && cfg.client_secret.trim().is_empty();
+    let (id, secret) = if missing {
+        (
+            "{{oauth_client_id}}".to_string(),
+            "{{oauth_client_secret}}".to_string(),
+        )
+    } else {
+        (cfg.client_id.clone(), cfg.client_secret.clone())
+    };
+
+    let mut form: Vec<FormField> = Vec::new();
+    let mut text = |key: &str, value: String| {
+        form.push(FormField {
+            key: key.to_string(),
+            value,
+            kind: FormFieldKind::Text,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+            desc: String::new(),
+        })
+    };
+    text("grant_type", cfg.grant_type.clone());
+    if !cfg.scope.trim().is_empty() {
+        text("scope", cfg.scope.clone());
+    }
+    if cfg.grant_type == "password" {
+        text("username", cfg.username.clone());
+        text("password", cfg.password.clone());
+    }
+    // Postman's default is HTTP Basic ("header"); "body" sends the credentials
+    // as ordinary form fields instead. Both are in the spec and endpoints
+    // differ on which they accept, so the export's choice is honoured.
+    let basic_auth = if cfg.client_authentication == "body" {
+        text("client_id", id);
+        text("client_secret", secret);
+        None
+    } else {
+        Some((id, secret))
+    };
+
+    // The name is prefixed with the folder that declared the auth so it nests
+    // beside the requests that use it, and reads as the first step of that
+    // folder rather than a stray request at the top of the collection.
+    let title = if path.is_empty() {
+        "Get access token".to_string()
+    } else {
+        format!("{}/Get access token", path.join("/"))
+    };
+
+    let entry = HurlEntry {
+        title,
+        method: "POST".to_string(),
+        url: cfg.access_token_url.clone(),
+        form_fields: form,
+        basic_auth,
+        // Asserted, not merely hoped for: without it a failed token request
+        // captures nothing and every request after it fails for a reason that
+        // has scrolled off the screen.
+        expected_status: Some(200),
+        captures: vec![(var.to_string(), "jsonpath \"$.access_token\"".to_string())],
+        ..Default::default()
+    };
+    (entry, missing)
 }
 
 /// Rewrite Postman's `/:name` path placeholders to `{{name}}`, and carry the
@@ -628,7 +922,7 @@ fn note_losses(
     };
 
     if let Some(auth) = auth
-        && !matches!(auth.kind.as_str(), "basic" | "bearer" | "apikey")
+        && !matches!(auth.kind.as_str(), "basic" | "bearer" | "apikey" | "oauth2")
     {
         note(format!(
             "auth type `{}` has no Hurl equivalent and was dropped",
@@ -1151,6 +1445,309 @@ mod tests {
 }
 
 #[cfg(test)]
+mod oauth2_tests {
+    use super::*;
+
+    /// A folder that authenticates with client credentials, holding two
+    /// requests — the real shape from the IDKit exports.
+    fn folder_oauth2(extra: &str) -> String {
+        format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [
+                {{ "name": "Tenant API",
+                   "auth": {{ "type": "oauth2", "oauth2": [
+                     {{ "key": "accessTokenUrl", "value": "https://id.example.com/v1/token" }},
+                     {{ "key": "grant_type", "value": "client_credentials" }},
+                     {{ "key": "clientId", "value": "abc" }},
+                     {{ "key": "clientSecret", "value": "shh" }},
+                     {{ "key": "scope", "value": "read write" }},
+                     {{ "key": "tokenType", "value": "Bearer" }}
+                     {extra}
+                   ] }},
+                   "item": [
+                     {{ "name": "list", "request": {{ "method": "GET", "url": "https://h/a" }} }},
+                     {{ "name": "get", "request": {{ "method": "GET", "url": "https://h/b" }} }}
+                   ] }}
+              ]
+            }}"#
+        )
+    }
+
+    fn header(e: &HurlEntry, name: &str) -> Option<String> {
+        e.headers
+            .iter()
+            .find(|h| h.key.eq_ignore_ascii_case(name))
+            .map(|h| h.value.clone())
+    }
+
+    fn field(e: &HurlEntry, key: &str) -> Option<String> {
+        e.form_fields
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| f.value.clone())
+    }
+
+    /// The point of the feature: Postman fetches the token itself and never
+    /// writes it to the export, so these requests used to import with no
+    /// credentials at all. Hurl doesn't need the machinery — a token request is
+    /// just a request.
+    #[test]
+    fn a_folders_client_credentials_auth_becomes_a_token_request() {
+        let c = convert_postman(&folder_oauth2(""));
+        let titles: Vec<&str> = c.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Tenant API/Get access token",
+                "Tenant API/list",
+                "Tenant API/get"
+            ],
+            "the token request is generated once, in the folder that declared \
+             the auth, ahead of the requests that need it"
+        );
+
+        let token = &c.entries[0];
+        assert_eq!(token.method, "POST");
+        assert_eq!(token.url, "https://id.example.com/v1/token");
+        assert_eq!(
+            field(token, "grant_type").as_deref(),
+            Some("client_credentials")
+        );
+        assert_eq!(field(token, "scope").as_deref(), Some("read write"));
+        assert_eq!(
+            token.basic_auth,
+            Some(("abc".to_string(), "shh".to_string())),
+            "Postman's default client authentication is HTTP Basic"
+        );
+        assert_eq!(
+            token.captures,
+            vec![(
+                "access_token".to_string(),
+                "jsonpath \"$.access_token\"".to_string()
+            )]
+        );
+        assert_eq!(
+            token.expected_status,
+            Some(200),
+            "without this a failed token request captures nothing and every \
+             request after it fails for a reason that has scrolled away"
+        );
+
+        for e in &c.entries[1..] {
+            assert_eq!(
+                header(e, "Authorization").as_deref(),
+                Some("Bearer {{access_token}}"),
+                "{} must actually use the token",
+                e.title
+            );
+        }
+    }
+
+    /// Folders repeat the whole configuration rather than pointing at a shared
+    /// one, so the same credentials on six folders must not fetch six tokens.
+    #[test]
+    fn one_token_request_is_generated_per_distinct_configuration() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [
+                { "name": "A", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "same" } ] },
+                  "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x" } } ] },
+                { "name": "B", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "same" } ] },
+                  "item": [ { "name": "y", "request": { "method": "GET", "url": "https://h/y" } } ] },
+                { "name": "C", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "other" } ] },
+                  "item": [ { "name": "z", "request": { "method": "GET", "url": "https://h/z" } } ] }
+              ]
+            }"#,
+        );
+        let tokens: Vec<&str> = c
+            .entries
+            .iter()
+            .filter(|e| e.title.ends_with("Get access token"))
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec!["A/Get access token", "C/Get access token"],
+            "identical configurations share a token; a different client gets its own"
+        );
+        let used = |title: &str| {
+            c.entries
+                .iter()
+                .find(|e| e.title == title)
+                .and_then(|e| header(e, "Authorization"))
+        };
+        assert_eq!(used("A/x"), used("B/y"), "B reuses A's token");
+        assert_eq!(used("C/z").as_deref(), Some("Bearer {{access_token_2}}"));
+    }
+
+    /// `client_authentication: body` puts the credentials in the form instead
+    /// of the Basic header; endpoints differ on which they accept.
+    #[test]
+    fn body_client_authentication_sends_the_credentials_as_form_fields() {
+        let c = convert_postman(&folder_oauth2(
+            r#", { "key": "client_authentication", "value": "body" }"#,
+        ));
+        let token = &c.entries[0];
+        assert_eq!(token.basic_auth, None);
+        assert_eq!(field(token, "client_id").as_deref(), Some("abc"));
+        assert_eq!(field(token, "client_secret").as_deref(), Some("shh"));
+    }
+
+    /// Postman can be told to put the token in the query string instead.
+    #[test]
+    fn add_token_to_query_params_uses_a_query_parameter() {
+        let c = convert_postman(&folder_oauth2(
+            r#", { "key": "addTokenTo", "value": "queryParams" }"#,
+        ));
+        let list = c
+            .entries
+            .iter()
+            .find(|e| e.title == "Tenant API/list")
+            .unwrap();
+        assert_eq!(header(list, "Authorization"), None);
+        assert!(
+            list.queries
+                .contains(&KvRow::toggled("access_token", "{{access_token}}", true))
+        );
+    }
+
+    /// A browser redirect is not something a file of requests can perform, so
+    /// this is reported rather than half-built.
+    #[test]
+    fn the_authorization_code_grant_is_reported_not_invented() {
+        let c =
+            convert_postman(&folder_oauth2("").replace("client_credentials", "authorization_code"));
+        assert!(
+            c.entries
+                .iter()
+                .all(|e| !e.title.ends_with("Get access token")),
+            "nothing is generated for a flow that needs a human"
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("authorization_code")),
+            "but the user is told why: {:?}",
+            c.notes
+        );
+    }
+
+    /// Postman keeps client credentials outside the export, which is most of
+    /// the real exports. The request still has to be generated -- with the
+    /// secrets as variables, where PaperBoy keeps secrets anyway.
+    #[test]
+    fn missing_credentials_become_variables_and_a_note() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x",
+                "auth": { "type": "oauth2", "oauth2": [
+                  { "key": "accessTokenUrl", "value": "https://id/t" },
+                  { "key": "grant_type", "value": "client_credentials" },
+                  { "key": "clientId", "value": "" },
+                  { "key": "clientSecret", "value": "" } ] } } } ]
+            }"#,
+        );
+        assert_eq!(
+            c.entries[0].basic_auth,
+            Some((
+                "{{oauth_client_id}}".to_string(),
+                "{{oauth_client_secret}}".to_string()
+            ))
+        );
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("oauth_client_id")),
+            "and it says so rather than leaving a silently unusable request"
+        );
+    }
+
+    /// A folder can override only the presentation and leave the token
+    /// configuration to its parent; there is nothing to fetch.
+    #[test]
+    fn an_override_with_no_token_url_reuses_the_inherited_token() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "auth": { "type": "oauth2", "oauth2": [
+                { "key": "accessTokenUrl", "value": "https://id/t" },
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "clientId", "value": "abc" } ] },
+              "item": [
+                { "name": "plain", "request": { "method": "GET", "url": "https://h/a" } },
+                { "name": "F", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "headerPrefix", "value": "Token " } ] },
+                  "item": [ { "name": "y", "request": { "method": "GET", "url": "https://h/y" } } ] }
+              ]
+            }"#,
+        );
+        assert_eq!(
+            c.entries
+                .iter()
+                .filter(|e| e.title.ends_with("Get access token"))
+                .count(),
+            1,
+            "the override has no token URL of its own to fetch from"
+        );
+        let y = c.entries.iter().find(|e| e.title == "F/y").unwrap();
+        assert_eq!(
+            header(y, "Authorization").as_deref(),
+            Some("Token {{access_token}}"),
+            "but its prefix override is honoured"
+        );
+    }
+
+    /// A collection-wide token belongs at the top, not wherever the first
+    /// request that uses it happens to live.
+    #[test]
+    fn a_collection_wide_token_is_not_buried_in_a_folder() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "auth": { "type": "oauth2", "oauth2": [
+                { "key": "accessTokenUrl", "value": "https://id/t" },
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "clientId", "value": "abc" } ] },
+              "item": [ { "name": "Deep", "item": [ { "name": "Deeper", "item": [
+                { "name": "x", "request": { "method": "GET", "url": "https://h/x" } } ] } ] } ]
+            }"#,
+        );
+        assert_eq!(c.entries[0].title, "Get access token");
+    }
+
+    /// The `password` grant is also just a POST, so it is generated too.
+    #[test]
+    fn the_password_grant_is_generated_like_client_credentials() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x",
+                "auth": { "type": "oauth2", "oauth2": [
+                  { "key": "accessTokenUrl", "value": "https://id/t" },
+                  { "key": "grant_type", "value": "password" },
+                  { "key": "clientId", "value": "abc" },
+                  { "key": "username", "value": "u" },
+                  { "key": "password", "value": "p" } ] } } } ]
+            }"#,
+        );
+        let token = &c.entries[0];
+        assert_eq!(field(token, "grant_type").as_deref(), Some("password"));
+        assert_eq!(field(token, "username").as_deref(), Some("u"));
+        assert_eq!(field(token, "password").as_deref(), Some("p"));
+    }
+}
+
+#[cfg(test)]
 mod path_variable_tests {
     use super::*;
 
@@ -1375,8 +1972,8 @@ mod inheritance_tests {
         let json = r#"{
           "info": { "name": "d", "schema": "x" },
           "item": [
-            { "name": "oauth", "request": { "method": "GET", "url": "https://x",
-                "auth": { "type": "oauth2" } } },
+            { "name": "oauth1", "request": { "method": "GET", "url": "https://x",
+                "auth": { "type": "oauth1" } } },
             { "name": "gql", "request": { "method": "POST", "url": "https://x",
                 "body": { "mode": "graphql" } } },
             { "name": "scripted", "request": { "method": "GET", "url": "https://x" },
@@ -1393,7 +1990,7 @@ mod inheritance_tests {
                 .collect::<Vec<_>>()
         };
         assert!(
-            for_item("oauth")[0].contains("oauth2"),
+            for_item("oauth1")[0].contains("oauth1"),
             "the auth type that was lost is named: {notes:?}"
         );
         assert!(for_item("gql")[0].contains("graphql"));
