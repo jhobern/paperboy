@@ -155,6 +155,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A run's result no longer belongs to whichever collection is open.** In a
+  Workspace tab a request kept its pass/fail tick and its response only while
+  the file it lives in stayed loaded: opening another folder re-read that file
+  from disk, and a freshly parsed request has never been run, so both the
+  marker and the response were gone on the way back — at the exact moment
+  someone goes to compare one request's answer with another's. Results are now
+  parked per file, like unsaved edits already were, and handed back when the
+  file returns; the tree draws the marker for requests whose collection isn't
+  loaded too, since being run is a fact about the request, not about which file
+  the tab happens to hold. Results are matched by *what* the request is as well
+  as where it sits, so a file changed outside PaperBoy can't hand a stale
+  response to whatever now occupies that position, and they stay in memory —
+  a response is a point-in-time answer from a server and has no business
+  surviving a restart. Both front-ends show it.
+
+- **A request row is clickable all the way across.** A row in the request tree
+  is a method badge, a name and a couple of markers, but only the name was a
+  widget — clicking `GET`, or the gap after the name, did nothing, so picking a
+  request meant aiming at its text. The whole line is one target now, and
+  hovering it says so. (The terminal UI hit-tests by which line a click landed
+  on, so its rows have always worked this way.)
+
 - **A collection with an unexpected field imports again instead of arriving
   empty.** Postman's export format is only loosely enforced by Postman itself,
   and a field documented as a string turns up as anything — every one of the

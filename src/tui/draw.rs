@@ -175,14 +175,32 @@ enum LeftRow {
         depth: usize,
     },
     /// A request of an expanded but *not-loaded* workspace collection: its name
-    /// and method are cached, but there is no entry to draw run status or edit
-    /// markers from, so it renders dim apart from the method badge. Opening it
-    /// (Enter/Right) loads its collection.
+    /// and method are cached, so it renders dim apart from the method badge and
+    /// its run status. Opening it (Enter/Right) loads its collection.
     WsRequestName {
         name: String,
         method: String,
         depth: usize,
+        /// How this request last fared. A run's result outlives the file being
+        /// loaded (see [`crate::collection::RunRecord`]), so a request that was
+        /// run and then switched away from still shows its tick here — it was
+        /// run this session, and which file the tab happens to hold now has
+        /// nothing to do with that.
+        run: RunStatus,
     },
+}
+
+/// The pass/fail marker for a request row: a tick, a cross, a dotted marker
+/// while a run is in progress, or a blank the width of one so names stay in
+/// their column. Shared by loaded and not-loaded rows, which show the same
+/// thing for the same reason.
+fn run_marker_span(run: RunStatus, th: &crate::tui::theme::Theme) -> Span<'static> {
+    match run {
+        RunStatus::Passed => Span::styled("\u{2713} ", Style::default().fg(th.ok)),
+        RunStatus::Failed => Span::styled("\u{2717} ", Style::default().fg(th.err)),
+        RunStatus::Running => Span::styled("\u{2026} ", Style::default().fg(th.pending)),
+        RunStatus::NotRun => Span::raw("  "),
+    }
 }
 
 impl LeftRow {
@@ -241,15 +259,17 @@ impl LeftRow {
                         ..
                     } => LeftRow::Entry { idx, depth },
                     WsRow::Request {
+                        collection,
+                        idx,
                         name,
                         method,
                         depth,
                         loaded: false,
-                        ..
                     } => LeftRow::WsRequestName {
                         name,
                         method,
                         depth,
+                        run: col.workspace_run_status(&collection, idx),
                     },
                 })
                 .collect()
@@ -2067,12 +2087,13 @@ pub(crate) fn draw_collection_left(
             // dim — the loaded collection is the one in focus — but the method
             // is coloured like everywhere else: which row is the POST is the
             // question the badge answers, and it is worth answering before the
-            // file has been opened. The two-space pad and the run-status gap
-            // line the name up under the loaded rows' names.
+            // file has been opened. The two-space pad lines the name up under
+            // the loaded rows' names.
             LeftRow::WsRequestName {
                 name,
                 method,
                 depth,
+                run,
             } => {
                 let indent = "  ".repeat(*depth);
                 ListItem::new(Line::from(vec![
@@ -2083,7 +2104,7 @@ pub(crate) fn draw_collection_left(
                             .fg(method_color(method))
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  "),
+                    run_marker_span(*run, th),
                     Span::styled(name.clone(), Style::default().fg(th.dim)),
                 ]))
             }
@@ -2117,14 +2138,7 @@ pub(crate) fn draw_collection_left(
                 // Pass/fail from the most recent "Run All" (Alt+F5); a
                 // dotted marker while a run is still in progress; blank
                 // until a batch run has actually covered this entry.
-                spans.push(match e.last_run {
-                    RunStatus::Passed => Span::styled("\u{2713} ", Style::default().fg(th.ok)),
-                    RunStatus::Failed => Span::styled("\u{2717} ", Style::default().fg(th.err)),
-                    RunStatus::Running => {
-                        Span::styled("\u{2026} ", Style::default().fg(th.pending))
-                    }
-                    RunStatus::NotRun => Span::raw("  "),
-                });
+                spans.push(run_marker_span(e.last_run, th));
                 // Show the request's name when it has one; otherwise fall back
                 // to the URL. A title encodes a folder path (`Auth/Login`), and
                 // those folders are already rows in the tree, so only the leaf

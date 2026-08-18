@@ -1423,6 +1423,90 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A run's result belonged to whichever file the tab happened to have
+    /// loaded: switching to another collection and back re-read the file from
+    /// disk, and a freshly parsed request has never been run. The tick and the
+    /// response both vanished — at the exact moment someone goes to compare
+    /// one request's answer with another's.
+    #[test]
+    fn run_results_and_responses_survive_switching_collections() {
+        let dir = tmp("runs");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+        let health = dir.join("health.hurl");
+        let users = dir.join("api/users.hurl");
+
+        assert!(s.load_workspace_file(ci, health.clone()));
+        s.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+        s.collections[ci].entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            body: "{\"ok\":true}".into(),
+            ..Default::default()
+        });
+
+        // Look at another collection: the result still belongs to the request
+        // that earned it, so the tree can still mark its row.
+        assert!(s.load_workspace_file(ci, users.clone()));
+        assert_eq!(
+            s.collections[ci].workspace_run_status(&health, 0),
+            crate::hurl::RunStatus::Passed,
+            "a request run this session keeps its marker once the tab moves on"
+        );
+        assert_eq!(
+            s.collections[ci].workspace_run_status(&users, 0),
+            crate::hurl::RunStatus::NotRun
+        );
+
+        // ...and coming back brings the response with it.
+        assert!(s.load_workspace_file(ci, health));
+        assert_eq!(
+            s.collections[ci].entries[0].last_run,
+            crate::hurl::RunStatus::Passed
+        );
+        assert_eq!(
+            s.collections[ci].entries[0]
+                .last_response
+                .as_ref()
+                .map(|r| r.status),
+            Some(200),
+            "the response is there to read again, not just the tick"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The results are matched to requests by what they are, not only by where
+    /// they sit: a file edited outside PaperBoy between the run and the reopen
+    /// must not hand a stale response to whatever request now occupies that
+    /// position.
+    #[test]
+    fn a_changed_file_does_not_inherit_the_previous_requests_result() {
+        let dir = tmp("runs_changed");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+        let health = dir.join("health.hurl");
+
+        assert!(s.load_workspace_file(ci, health.clone()));
+        s.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+        s.collections[ci].entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            ..Default::default()
+        });
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+
+        // Somebody else rewrote the file while we were away.
+        std::fs::write(&health, "DELETE https://example.com/health\n").unwrap();
+        assert!(s.load_workspace_file(ci, health));
+        assert_eq!(
+            s.collections[ci].entries[0].last_run,
+            crate::hurl::RunStatus::NotRun,
+            "a different request, so no marker"
+        );
+        assert!(s.collections[ci].entries[0].last_response.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saving_a_collection_clears_its_edit_markers_and_parked_edits() {
         let dir = tmp("saved");

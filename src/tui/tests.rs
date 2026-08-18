@@ -16219,6 +16219,71 @@ fn a_request_carries_its_method_even_when_its_collection_is_not_loaded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A run's tick belongs to the request that earned it, not to whichever file
+/// the tab currently holds. Running a request, opening another collection in
+/// the same Workspace tab and looking back at the first must still show what
+/// happened — the terminal UI draws the marker on cached rows for exactly the
+/// same reason the GUI does.
+#[test]
+fn a_run_marker_stays_on_a_request_whose_collection_is_no_longer_loaded() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = workspace_temp_dir_two_collections("ws_run_marker");
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    let one = dir.join("one.hurl");
+
+    app.collections[ci]
+        .load_workspace_file(one.clone())
+        .unwrap();
+    app.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+    app.collections[ci].entries[1].last_run = crate::hurl::RunStatus::Failed;
+
+    // Move the tab to the other collection, leaving one.hurl listed from cache.
+    app.collections[ci]
+        .load_workspace_file(dir.join("two.hurl"))
+        .unwrap();
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    assert_eq!(
+        app.collections[ci].workspace_run_status(&one, 0),
+        crate::hurl::RunStatus::Passed
+    );
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<Vec<_>>()
+        .chunks(100)
+        .map(|row| row.concat())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let login = screen
+        .lines()
+        .find(|l| l.contains("Login"))
+        .expect("the not-loaded collection's Login row is drawn");
+    assert!(
+        login.contains('\u{2713}'),
+        "the passing run keeps its tick: {login:?}"
+    );
+    let logout = screen
+        .lines()
+        .find(|l| l.contains("Logout"))
+        .expect("the Logout row is drawn");
+    assert!(
+        logout.contains('\u{2717}'),
+        "and a failing one keeps its cross: {logout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A collection expanded but never loaded this session lists its request names
 /// straight from disk once `rebuild_expanded_titles` populates the cache — the
 /// path used by persistence restore.

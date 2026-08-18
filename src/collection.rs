@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::git_remote::GitOrigin;
-use crate::hurl::{HurlEntry, collection_to_hurl};
+use crate::hurl::{HurlEntry, RunStatus, collection_to_hurl};
 use crate::tree::{self, Row};
 
 /// The cached headline of one request in a collection that isn't loaded: its
@@ -31,6 +31,37 @@ pub struct WsTitle {
     /// be one row, not an `https:` folder holding an `x` folder.
     pub url: String,
     pub method: String,
+}
+
+/// What a run left behind on one request: its pass/fail marker and the
+/// response it came back with.
+///
+/// A Workspace tab holds one file's requests at a time, and a file with no
+/// unsaved edits is re-read from disk when it is opened again — so a run's
+/// result lived exactly as long as the tab stayed on that collection. Running
+/// a request, looking at another folder and coming back lost both the tick and
+/// the response, which is precisely the moment someone wants to compare them.
+/// Results are parked here instead, per file, and handed back when the file
+/// returns; the tree also reads them so a file that isn't loaded still shows
+/// what happened to its requests this session.
+///
+/// Runtime-only, like [`Collection::workspace_pending`]: a response is a
+/// point-in-time answer from a server, not a fact about the collection, and
+/// has no business surviving a restart (or being written to disk, where the
+/// headers it carries would outlive the session that earned them).
+#[derive(Debug, Clone, Default)]
+pub struct RunRecord {
+    /// Identifies the request the result belongs to, so a file edited outside
+    /// PaperBoy between the run and the reopen can't hand a stale response to
+    /// whatever request now sits at that position.
+    key: String,
+    last_run: RunStatus,
+    last_response: Option<crate::http::ApiResponse>,
+}
+
+/// How a request is recognised across a reload: what it is and where it goes.
+fn run_key(entry: &HurlEntry) -> String {
+    format!("{}\u{1}{}\u{1}{}", entry.title, entry.method, entry.url)
 }
 
 fn ws_request_title(entry: &HurlEntry) -> WsTitle {
@@ -366,6 +397,11 @@ pub struct Collection {
     /// Runtime-only. A workspace tab's entries are never a trusted snapshot
     /// across a restart (see [`crate::persistence`]), so neither are these.
     pub workspace_pending: HashMap<PathBuf, Vec<HurlEntry>>,
+
+    /// Run results for this Workspace tab's files, keyed by file and indexed
+    /// the way [`Self::workspace_titles`] is — see [`RunRecord`] for why they
+    /// outlive the file being loaded, and why they are runtime-only.
+    pub workspace_runs: HashMap<PathBuf, Vec<RunRecord>>,
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -415,6 +451,7 @@ impl Collection {
             workspace_titles: HashMap::new(),
             workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
+            workspace_runs: HashMap::new(),
         };
         c.sync_folder_to_selected();
         c
@@ -750,8 +787,10 @@ impl Collection {
         };
         self.workspace_pending.remove(&path);
         self.park_pending_edits();
+        self.park_run_results();
         self.snapshot_loaded_titles();
         self.entries = entries;
+        self.restore_run_results(&path);
         self.selected_entry = 0;
         self.path = Some(path);
         self.invalidate_request_json();
@@ -772,6 +811,89 @@ impl Collection {
         if let Some(path) = self.path.clone() {
             self.workspace_pending.insert(path, self.entries.clone());
         }
+    }
+
+    /// Park the loaded file's run results so they survive a switch to another
+    /// file in the same Workspace tab (see [`RunRecord`]).
+    ///
+    /// Unlike [`Self::park_pending_edits`] this runs whether or not the file
+    /// has been edited: an unedited file is re-read from disk when it comes
+    /// back, and a fresh parse has never been run.
+    fn park_run_results(&mut self) {
+        if self.workspace_root.is_none() {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let records: Vec<RunRecord> = self
+            .entries
+            .iter()
+            .map(|e| RunRecord {
+                key: run_key(e),
+                last_run: e.last_run,
+                last_response: e.last_response.clone(),
+            })
+            .collect();
+        // Nothing has been run: don't hold a row of empty records that would
+        // only have to be checked later.
+        if records
+            .iter()
+            .all(|r| r.last_run == RunStatus::NotRun && r.last_response.is_none())
+        {
+            self.workspace_runs.remove(&path);
+        } else {
+            self.workspace_runs.insert(path, records);
+        }
+    }
+
+    /// Put previously parked run results back onto the entries just loaded
+    /// from `path`, by position and only where the request still matches (see
+    /// [`RunRecord::key`]). An entry that already carries a result keeps it:
+    /// entries handed back from `workspace_pending` were never re-read, so
+    /// theirs is the live one.
+    fn restore_run_results(&mut self, path: &Path) {
+        let Some(records) = self.workspace_runs.get(path) else {
+            return;
+        };
+        for (entry, record) in self.entries.iter_mut().zip(records.iter()) {
+            if entry.last_run != RunStatus::NotRun || entry.last_response.is_some() {
+                continue;
+            }
+            if run_key(entry) == record.key {
+                entry.last_run = record.last_run;
+                entry.last_response = record.last_response.clone();
+            }
+        }
+    }
+
+    /// The run marker to show for request `idx` of the workspace file at
+    /// `path`, whether or not that file is the one this tab has loaded.
+    ///
+    /// The tree used to draw markers for the loaded collection only, on the
+    /// grounds that nothing else could have been run — which stopped being
+    /// true the moment results outlived the file being loaded.
+    pub fn workspace_run_status(&self, path: &Path, idx: usize) -> RunStatus {
+        if self.path.as_deref() == Some(path) {
+            return self
+                .entries
+                .get(idx)
+                .map(|e| e.last_run)
+                .unwrap_or(RunStatus::NotRun);
+        }
+        // A file with parked *edits* keeps its entries whole, results included;
+        // only a file that will be re-read needs the parked records.
+        if let Some(parked) = self.workspace_pending.get(path) {
+            return parked
+                .get(idx)
+                .map(|e| e.last_run)
+                .unwrap_or(RunStatus::NotRun);
+        }
+        self.workspace_runs
+            .get(path)
+            .and_then(|r| r.get(idx))
+            .map(|r| r.last_run)
+            .unwrap_or(RunStatus::NotRun)
     }
 
     /// `true` when this collection holds requests that have been added or
@@ -893,7 +1015,12 @@ impl Collection {
         self.workspace_pending.remove(path);
         if self.path.as_deref() == Some(path) {
             let sel = self.selected_entry;
+            // Reverting throws away *edits*, not the record of what happened
+            // when these requests were last run — so the results are parked
+            // across the reload like they are across a file switch.
+            self.park_run_results();
             self.entries = entries;
+            self.restore_run_results(path);
             self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
             self.invalidate_request_json();
             self.sync_folder_to_selected();
