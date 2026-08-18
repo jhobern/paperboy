@@ -759,6 +759,12 @@ impl GuiApp {
     /// there is no dismiss button — there is nothing to dismiss, only something
     /// to fix. Colouring the tokens red in the editor (see `editor.rs`) says
     /// *where*; this says *that*, for the tokens scrolled out of view.
+    ///
+    /// The headline and the names, and nothing else. A line of advice under
+    /// them ("add them to an environment, or check the spelling") only told
+    /// someone looking at a list of their own variable names what they already
+    /// knew, in small dim type, and pushed the request itself further down the
+    /// screen every time it appeared.
     fn undefined_vars_banner(&mut self, ui: &mut egui::Ui) {
         let ci = self.active_ci();
         let Some(col) = self.session.collections.get(ci) else {
@@ -776,7 +782,6 @@ impl GuiApp {
             s.gui_undefined_banner_many
                 .replace("{n}", &missing.len().to_string())
         };
-        let hint = s.gui_undefined_banner_hint;
         let th = self.theme;
         // Drawn inline at the top of the centre panel rather than in a
         // `Panel::top`: a panel would reserve a fixed strip and clip the list
@@ -796,7 +801,6 @@ impl GuiApp {
                             .monospace(),
                     );
                 });
-                ui.label(egui::RichText::new(hint).color(th.dim).small());
             });
         ui.add_space(4.0);
     }

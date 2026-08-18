@@ -389,7 +389,6 @@ strings! {
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
     gui_undefined_banner_many => "{n} variables in this request are undefined", "{n} variables de cette requête ne sont pas définies", "{n} variabler i denne anmodning er udefinerede";
-    gui_undefined_banner_hint => "Nothing defines them — add them to an environment, or check the spelling.", "Rien ne les définit — ajoutez-les à un environnement ou vérifiez l'orthographe.", "Intet definerer dem — tilføj dem til et miljø, eller kontrollér stavemåden.";
     subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
     json_invalid => "⚠ Invalid JSON — fix before running", "⚠ JSON invalide — corrigez avant d'exécuter", "⚠ Ugyldig JSON — ret før kørsel";
     foot_focus => "focus", "focus", "fokus";
