@@ -10,6 +10,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.4.0] - unreleased
 
+### Changed
+
+- **Fields read as content, not as a grid of boxes.** Every editable value in
+  the GUI was drawn as a sunken, outlined text box, so a panel of headers or
+  environment variables was mostly chrome with the content — the part anyone is
+  actually there to read — a minor detail inside it. Fields now carry a faint
+  wash instead of a border, in the manner of the report editor's chips, and
+  grow their outline only when the pointer arrives or they take focus. The
+  affordance is deferred, not removed. Buttons, checkboxes and combo boxes keep
+  their outlines: an outline is how a *control* says it is a control, and the
+  flattening is scoped to the fields rather than applied to the whole style.
+
+- **A value too long for its field is no longer hidden in it.** Bearer tokens,
+  URLs with a query string and a couple of `{{ variables }}` in them, form
+  paths, assertions — the longest strings in the app all lived in one-line
+  fields that showed a dozen characters and scrolled the rest out of sight, so
+  reading a value meant dragging through it. Values, descriptions, URLs,
+  assertions, form fields and environment values now wrap onto as many lines as
+  they need and the row grows to fit, which is what the terminal UI has always
+  done (it edits the Hurl source directly, wrapped). Enter still cannot break a
+  value across lines: these are single-line values that wrap for reading, and a
+  header with a newline in it would not survive being written out as Hurl.
+
 ### Added
 
 - **A Postman collection can be read before it is imported.** A workspace list

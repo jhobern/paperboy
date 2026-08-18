@@ -141,11 +141,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // of a few hundred environments is unusable without it, and an empty box is
     // one line of panel for a permanently useful control.
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut app.env_query)
-                .hint_text(app.strings.gui_env_filter_hint)
-                .desired_width(f32::INFINITY),
-        );
+        super::widgets::flat_fields(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.env_query)
+                    .hint_text(app.strings.gui_env_filter_hint)
+                    .desired_width(f32::INFINITY),
+            )
+        });
     });
     if has_workspace(app) {
         ui.horizontal_wrapped(|ui| {
@@ -468,13 +470,16 @@ fn var_editor(
                     match source_label(source) {
                         None => {
                             // Literal: editable value.
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut vars[i].value)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text(s.gui_hint_value),
-                                )
-                                .changed()
+                            // Environment values are tokens and URLs — the
+                            // longest strings in the app — so they wrap.
+                            if super::widgets::wrapping_field(
+                                ui,
+                                ui.available_width(),
+                                &mut vars[i].value,
+                                s.gui_hint_value,
+                                theme.text,
+                            )
+                            .changed()
                             {
                                 vars[i].raw = vars[i].value.clone();
                                 vars[i].modified = true;

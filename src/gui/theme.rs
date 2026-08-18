@@ -73,9 +73,23 @@ impl GuiTheme {
         mix(self.panel, self.text, 0.06)
     }
 
-    /// A slightly-recessed surface colour (text-edit backgrounds).
+    /// A slightly-recessed surface colour (scroll bars, code blocks).
     pub fn sunken(&self) -> Color32 {
         mix(self.bg, Color32::BLACK, 0.10)
+    }
+
+    /// The wash behind an editable field.
+    ///
+    /// Deliberately far closer to the panel than [`Self::sunken`]: a screen of
+    /// requests is mostly fields, and drawing each as a sunken, outlined box
+    /// turned every panel into a grid of boxes with the content — the part
+    /// anyone is actually reading — a minor detail inside them. This is a
+    /// tint, in the manner of the report editor's chips: enough to say "this
+    /// is a thing you can type in" without a border, which is then brought in
+    /// only when the pointer or the keyboard arrives (see
+    /// `widgets::flat_fields`).
+    pub fn field(&self) -> Color32 {
+        mix(self.panel, self.text, 0.05)
     }
 
     /// Install this theme as egui's active visual style.
@@ -86,6 +100,10 @@ impl GuiTheme {
         visuals.panel_fill = self.panel;
         visuals.faint_bg_color = self.raised();
         visuals.extreme_bg_color = self.sunken();
+        // Text fields get their own, much lighter wash: `extreme_bg_color`
+        // still dresses the scroll bars and code blocks, which do want to look
+        // recessed.
+        visuals.text_edit_bg_color = Some(self.field());
         visuals.hyperlink_color = self.accent;
         // Use the theme's own selection colours (matching the terminal UI's
         // selected-row look) rather than deriving them from the accent.

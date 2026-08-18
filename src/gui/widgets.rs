@@ -31,6 +31,32 @@ pub fn split_key_width(ui: &egui::Ui, reserved: f32) -> f32 {
     (usable * 0.40).clamp(90.0_f32.min(max_key), max_key)
 }
 
+/// Draw `content`'s text fields flat: no outline until the pointer or the
+/// keyboard arrives.
+///
+/// egui frames a `TextEdit` with `widgets.inactive.bg_stroke` when it is idle,
+/// `widgets.hovered.bg_stroke` under the pointer and `selection.stroke` while
+/// focused. That inactive hairline is shared with buttons, combo boxes and
+/// checkboxes — which *should* keep their outline, since an outline is how a
+/// control says it is a control — so it is dropped here, scoped to the fields,
+/// rather than globally.
+///
+/// The affordance is not lost, only deferred: the field keeps its wash (see
+/// [`GuiTheme::field`]), grows a border under the pointer, and is outlined in
+/// the selection colour while it has focus. This is the report editor's chip
+/// treatment applied to editable text — read as content, behave as a control.
+///
+/// Scoped through [`egui::Ui::scope`] because `visuals_mut` edits the `Ui`'s
+/// own style: without it the change would leak into every later widget in the
+/// same `Ui`, taking the checkbox column of a key/value grid with it.
+pub fn flat_fields<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+        content(ui)
+    })
+    .inner
+}
+
 /// A key/value row's **key** text field, forced to exactly `key_w` wide.
 ///
 /// A bare `TextEdit::singleline` clamps its `desired_width` to the cell's
@@ -47,12 +73,68 @@ pub fn sized_key(
     color: Color32,
 ) -> egui::Response {
     let h = ui.spacing().interact_size.y;
-    ui.add_sized(
-        [key_w, h],
-        egui::TextEdit::singleline(text)
-            .hint_text(hint)
-            .text_color(color),
-    )
+    flat_fields(ui, |ui| {
+        ui.add_sized(
+            [key_w, h],
+            egui::TextEdit::singleline(text)
+                .hint_text(hint)
+                .text_color(color),
+        )
+    })
+}
+
+/// A value field that shows **all** of its text, wrapping onto as many lines
+/// as it needs instead of scrolling the overflow out of sight.
+///
+/// A single-line field is a viewport onto its value: a bearer token, a long
+/// URL or a JSON fragment is a few visible characters and a promise that the
+/// rest is in there somewhere, which has to be scrubbed through to read. Since
+/// these fields hold the *content* of a request — the thing the screen exists
+/// to show — they wrap and the row grows, exactly as the terminal UI does
+/// (which edits the Hurl source directly and has always wrapped).
+///
+/// It is a multiline `TextEdit` for the wrapping, but not a multiline *field*:
+/// `return_key(None)` means Enter never inserts a newline, so a header value
+/// cannot be broken across lines by a stray keystroke into something that
+/// would not survive being written out as Hurl.
+pub fn wrapping_field(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+) -> egui::Response {
+    wrapping_field_font(ui, width, text, hint, color, egui::TextStyle::Body)
+}
+
+/// [`wrapping_field`] in a chosen text style — the URL is monospaced, so that
+/// the punctuation a URL is mostly made of lines up.
+pub fn wrapping_field_font(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+    font: egui::TextStyle,
+) -> egui::Response {
+    flat_fields(ui, |ui| {
+        // Allocated at the width the caller worked out, with the height left
+        // to the content — `add_sized` would pin the height and undo the
+        // growth this exists for.
+        ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
+            ui.set_width(width);
+            ui.add(
+                egui::TextEdit::multiline(text)
+                    .hint_text(hint)
+                    .text_color(color)
+                    .desired_width(width)
+                    .desired_rows(1)
+                    .return_key(None)
+                    .font(font),
+            )
+        })
+        .inner
+    })
 }
 
 /// A selectable label whose footprint never changes between the
@@ -347,7 +429,9 @@ pub fn kv_editor(
                 if k.changed() {
                     changed = true;
                 }
-                let v = sized_key(ui, val_w, &mut rows[i].value, val_hint, row_color);
+                // The value is the one cell whose content is the request
+                // itself, so it is the one that wraps rather than truncates.
+                let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
                 if v.changed() {
                     changed = true;
                 }
@@ -367,11 +451,12 @@ pub fn kv_editor(
                         // later, not part of the request, so it is always dim —
                         // even on an enabled row it shouldn't compete with the
                         // value beside it.
-                        let d = ui.add(
-                            egui::TextEdit::singleline(&mut rows[i].desc)
-                                .hint_text(s.gui_hint_description)
-                                .text_color(theme.dim)
-                                .desired_width(f32::INFINITY),
+                        let d = wrapping_field(
+                            ui,
+                            ui.available_width(),
+                            &mut rows[i].desc,
+                            s.gui_hint_description,
+                            theme.dim,
                         );
                         if d.changed() {
                             changed = true;
@@ -434,10 +519,12 @@ pub fn pair_editor(
                     {
                         remove = Some(i);
                     }
-                    let v = ui.add(
-                        egui::TextEdit::singleline(&mut rows[i].1)
-                            .hint_text(val_hint)
-                            .desired_width(f32::INFINITY),
+                    let v = wrapping_field(
+                        ui,
+                        ui.available_width(),
+                        &mut rows[i].1,
+                        val_hint,
+                        theme.text,
                     );
                     if v.changed() {
                         changed = true;
@@ -523,6 +610,86 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             });
         }
+    }
+
+    /// The flattening is scoped. A checkbox or a button in the same row still
+    /// gets its outline — an outline is how a *control* says it is a control;
+    /// the fields give theirs up because they are mostly content.
+    #[test]
+    fn flattening_a_field_does_not_flatten_the_controls_beside_it() {
+        let ctx = egui::Context::default();
+        // The app's own theme, not egui's defaults: the outline this is about
+        // is one PaperBoy puts there.
+        GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+        let mut inside = egui::Stroke::new(9.0, Color32::RED);
+        let mut after = egui::Stroke::new(9.0, Color32::RED);
+        ctx.run_ui(a_frame(), |ui| {
+            let before = ui.visuals().widgets.inactive.bg_stroke;
+            assert!(before.width > 0.0, "the app's controls are outlined");
+            flat_fields(ui, |ui| {
+                inside = ui.visuals().widgets.inactive.bg_stroke;
+            });
+            after = ui.visuals().widgets.inactive.bg_stroke;
+        });
+        assert_eq!(inside, egui::Stroke::NONE, "no box around an idle field");
+        assert!(
+            after.width > 0.0,
+            "and everything after it is left alone, got {after:?}"
+        );
+    }
+
+    /// A field whose value doesn't fit used to hide the rest behind a
+    /// scrolling viewport. It now wraps, so the row grows and the whole value
+    /// is on screen — the point of the panel.
+    #[test]
+    fn a_long_value_wraps_instead_of_scrolling_out_of_sight() {
+        let ctx = egui::Context::default();
+        let measure = |text: &str| -> f32 {
+            let mut value = text.to_string();
+            let mut height = 0.0;
+            // Twice: egui settles galley sizes on the second pass.
+            for _ in 0..2 {
+                ctx.run_ui(a_frame(), |ui| {
+                    height = wrapping_field(ui, 200.0, &mut value, "", Color32::WHITE)
+                        .rect
+                        .height();
+                });
+            }
+            height
+        };
+
+        let short = measure("small");
+        let long = measure(
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.a-very-long-token-that-will-not-fit              in-two-hundred-points-of-width-no-matter-how-small-the-font-is",
+        );
+        assert!(
+            long > short * 2.0,
+            "a value too long for the field must wrap onto more lines: {short} then {long}"
+        );
+    }
+
+    /// The wrapping is for reading, not for multi-line values: a header broken
+    /// across lines would not survive being written out as Hurl.
+    #[test]
+    fn enter_cannot_break_a_value_across_lines() {
+        let ctx = egui::Context::default();
+        let mut value = "text/plain".to_string();
+        let mut input = a_frame();
+        // Click into the field, then press Enter.
+        click_at(&mut input, egui::pos2(60.0, 12.0));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        for _ in 0..2 {
+            ctx.run_ui(input.clone(), |ui| {
+                wrapping_field(ui, 200.0, &mut value, "", Color32::WHITE);
+            });
+        }
+        assert_eq!(value, "text/plain", "Enter must not insert a newline");
     }
 
     /// A dialog covers the app with a sheet that eats clicks: the menu bar and

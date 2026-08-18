@@ -436,11 +436,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let url_hint = app.strings.gui_hint_url;
         ui.horizontal(|ui| {
             ui.label(RichText::new(name_label).color(theme.dim));
-            let name = ui.add(
-                egui::TextEdit::singleline(&mut entry.title)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(name_label),
-            );
+            let name = widgets::flat_fields(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.title)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(name_label),
+                )
+            });
             if name.changed() {
                 changed = true;
             }
@@ -451,11 +453,17 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 changed = true;
             }
             let send_w = 92.0;
-            let url = ui.add_sized(
-                [ui.available_width() - send_w, 24.0],
-                egui::TextEdit::singleline(&mut entry.url)
-                    .hint_text(url_hint)
-                    .font(egui::TextStyle::Monospace),
+            // Wrapped, not scrolled: a URL with a path, a query string and a
+            // couple of `{{ variables }}` in it is the single longest thing on
+            // this screen, and reading it a dozen characters at a time through
+            // a one-line viewport was the worst case of the problem.
+            let url = widgets::wrapping_field_font(
+                ui,
+                (ui.available_width() - send_w).max(80.0),
+                &mut entry.url,
+                url_hint,
+                theme.text,
+                egui::TextStyle::Monospace,
             );
             if url.changed() {
                 changed = true;
@@ -883,11 +891,13 @@ fn assert_editor(
             {
                 remove = Some(i);
             }
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut asserts[i])
-                    .desired_width(f32::INFINITY)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text(s.gui_hint_assert),
+            let r = widgets::wrapping_field_font(
+                ui,
+                ui.available_width(),
+                &mut asserts[i],
+                s.gui_hint_assert,
+                theme.text,
+                egui::TextStyle::Monospace,
             );
             if r.changed() {
                 changed = true;
@@ -995,14 +1005,16 @@ fn form_editor(
                         // See `super::filepick`.
                         *browse = Some(i);
                     }
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut fields[i].value)
-                                .desired_width(f32::INFINITY)
-                                .text_color(row_color)
-                                .hint_text(hint),
-                        )
-                        .changed()
+                    // A form value is often a path or a long token, so it
+                    // wraps rather than hiding its tail.
+                    if super::widgets::wrapping_field(
+                        ui,
+                        ui.available_width(),
+                        &mut fields[i].value,
+                        hint,
+                        row_color,
+                    )
+                    .changed()
                     {
                         changed = true;
                     }
@@ -1013,9 +1025,10 @@ fn form_editor(
                     ui.label(RichText::new(s.gui_base64_prefix).color(theme.dim).small());
                     ui.label(""); // kind column
                     let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut prefix).desired_width(f32::INFINITY))
-                        .changed()
+                    if super::widgets::flat_fields(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut prefix).desired_width(f32::INFINITY))
+                    })
+                    .changed()
                     {
                         fields[i].base64_prefix = if prefix.is_empty() {
                             None
