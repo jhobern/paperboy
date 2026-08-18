@@ -20,8 +20,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   is taller than a field, so the note settled a couple of pixels low and every
   row sagged towards its right-hand edge. The ✕ is now a column of its own,
   reserving exactly the width it takes, so the headers stay over the fields
-  they name whether the table is empty or full. The same alignment fix applies
-  to the form-data and environment-variable tables.
+  they name whether the table is empty or full, and it no longer hangs below
+  the row it ends. The rows themselves are laid out top-aligned instead of on a
+  grid: a grid centres each cell against a row height it only discovers as the
+  cells are added, so every cell sat a fraction of a pixel lower than the one
+  before it — invisible in the arithmetic, a whole pixel on screen, and the
+  reason the table looked as though it sloped downhill. The same fix applies to
+  the header, query, cookie, option, form-data and environment-variable
+  tables.
 
 - **The "send this row" column header is a tick again.** It was a bare
   `\u{2713}`, which none of the bundled fonts have a glyph for, so it rendered

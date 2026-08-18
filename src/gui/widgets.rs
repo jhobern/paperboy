@@ -57,14 +57,57 @@ pub fn flat_fields<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> 
     .inner
 }
 
+/// One row of a key/value table: its cells side by side, **top**-aligned.
+///
+/// Not an [`egui::Grid`], which is what this used to be. A grid aligns a cell's
+/// contents to the vertical *centre* of its row — and a row's height is only
+/// known as its cells are added, so each cell was centred against the tallest
+/// of the cells before it and every one sat a fraction lower than the last.
+/// A fifth of a pixel is nothing in the model and a whole pixel on screen once
+/// a row lands on a fractional y, so a table of them visibly sagged to the
+/// right. Every column's width is worked out up front here anyway (see
+/// [`kv_widths`]), which was most of what the grid was for.
+pub fn table_row<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        content(ui)
+    })
+    .inner
+}
+
+/// The rows of a key/value table, spaced as the grid used to space them.
+pub fn table_rows<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        content(ui)
+    })
+    .inner
+}
+
+/// Draw a control at the height of the fields around it, by taking its own
+/// vertical padding away. A button is otherwise taller than the row it sits in.
+pub fn flat_buttons<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.y = 0.0;
+        content(ui)
+    })
+    .inner
+}
+
 /// A key/value row's **key** text field, forced to exactly `key_w` wide.
 ///
-/// A bare `TextEdit::singleline` clamps its `desired_width` to the cell's
-/// `available_width`, which stays tiny for a non-last grid column (the last,
-/// filling column grabs the row's free width first). So `desired_width(key_w)`
-/// alone renders as a ~24px sliver. [`egui::Ui::add_sized`] instead *allocates*
-/// a `key_w`-wide rect up front and fits the field to it, so the key honours
-/// the [`split_key_width`] split regardless of the grid's column feedback.
+/// The same field as [`wrapping_field`], at a width of its own. It used to be
+/// a `TextEdit::singleline` sized with `add_sized` — which laid out a *tenth of
+/// a pixel* differently from the wrapping value beside it. That is invisible in
+/// the model and a whole pixel on screen whenever the row lands on a fractional
+/// y, so the key sat one pixel above the value and the description, and a table
+/// of them read as sagging to the right. Two cells that have to line up are
+/// better built the same way than adjusted until they agree.
+///
+/// (The reason neither uses a bare `TextEdit` is width: it clamps
+/// `desired_width` to the cell's `available_width`, which stays tiny for a
+/// non-last grid column, so the field would render as a ~24px sliver instead of
+/// honouring the [`split_key_width`] split.)
 pub fn sized_key(
     ui: &mut egui::Ui,
     key_w: f32,
@@ -72,15 +115,7 @@ pub fn sized_key(
     hint: &str,
     color: Color32,
 ) -> egui::Response {
-    let h = ui.spacing().interact_size.y;
-    flat_fields(ui, |ui| {
-        ui.add_sized(
-            [key_w, h],
-            egui::TextEdit::singleline(text)
-                .hint_text(hint)
-                .text_color(color),
-        )
-    })
+    wrapping_field(ui, key_w, text, hint, color)
 }
 
 /// A value field that shows **all** of its text, wrapping onto as many lines
@@ -107,6 +142,10 @@ pub fn wrapping_field(
     wrapping_field_font(ui, width, text, hint, color, egui::TextStyle::Body)
 }
 
+/// A `TextEdit`'s horizontal margin: the field the user sees is this wider than
+/// the `desired_width` it is asked for.
+const TEXT_EDIT_MARGIN: f32 = 8.0;
+
 /// [`wrapping_field`] in a chosen text style — the URL is monospaced, so that
 /// the punctuation a URL is mostly made of lines up.
 pub fn wrapping_field_font(
@@ -122,7 +161,6 @@ pub fn wrapping_field_font(
     // pixels more than the column reserved, so a filled table laid its columns
     // out slightly wider than an empty one and the headers stopped lining up
     // with the fields beneath them.
-    const TEXT_EDIT_MARGIN: f32 = 8.0;
     let text_w = (width - TEXT_EDIT_MARGIN).max(16.0);
     flat_fields(ui, |ui| {
         // Allocated at the width the caller worked out, with the height left
@@ -366,8 +404,20 @@ fn sized_header(ui: &mut egui::Ui, theme: &GuiTheme, text: &str, w: f32) {
 /// row height for it left the filled table a few pixels wider than the header
 /// that has to line up with it. Sizing the button to this reserves exactly
 /// what it takes.
-fn remove_width(ui: &egui::Ui) -> f32 {
+pub fn remove_width(ui: &egui::Ui) -> f32 {
     ui.spacing().interact_size.y + 2.0 * ui.spacing().button_padding.x
+}
+
+/// The width a text button will claim, so a row can reserve it before the
+/// button is added (the value field to its left has to be sized first).
+pub fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+        .size()
+        .x;
+    w + 2.0 * ui.spacing().button_padding.x
 }
 
 /// The four column widths of a [`kv_editor`] row: tick, key, value, note.
@@ -414,86 +464,84 @@ pub fn kv_editor(
     // same line, and the ✕ still sits immediately right of the note.
     let (check_w, key_w, val_w, desc_w) = kv_widths(ui);
     let row_h = ui.spacing().interact_size.y;
-    egui::Grid::new(id)
-        .num_columns(5)
-        .spacing([8.0, 4.0])
-        // Unstriped: every cell in the row is a filled field now, so the row
-        // already reads as a row. Alternating the *background* behind fields
-        // that have a background of their own gave each row two competing
-        // shades and made the fields look like they were floating on top of
-        // the table rather than being it.
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            // Column titles, as in the terminal UI: without them a bare grid of
+    ui.push_id(id, |ui| {
+        table_rows(ui, |ui| {
+            // Column titles, as in the terminal UI: without them a bare table of
             // text boxes gives no clue that the tick is "send this row" rather
             // than "select".
-            // The Phosphor tick, not a bare `\u{2713}`: egui's bundled fonts
-            // have no glyph for it, so the literal rendered as a tofu box.
-            sized_header(ui, theme, super::icons::PASS, check_w);
-            sized_header(ui, theme, key_label, key_w);
-            sized_header(ui, theme, val_label, val_w);
-            sized_header(ui, theme, s.hdr_description, desc_w);
-            // The ✕ column has no title — the button says what it does.
-            ui.allocate_space(egui::vec2(remove_width(ui), 1.0));
-            ui.end_row();
+            table_row(ui, |ui| {
+                // The Phosphor tick, not a bare `\u{2713}`: egui's bundled fonts
+                // have no glyph for it, so the literal rendered as a tofu box.
+                sized_header(ui, theme, super::icons::PASS, check_w);
+                sized_header(ui, theme, key_label, key_w);
+                sized_header(ui, theme, val_label, val_w);
+                sized_header(ui, theme, s.hdr_description, desc_w);
+                // The ✕ column has no title — the button says what it does.
+                ui.allocate_space(egui::vec2(remove_width(ui), 1.0));
+            });
             for i in 0..rows.len() {
-                if ui
-                    .add_sized(
-                        [check_w, row_h],
-                        egui::Checkbox::without_text(&mut rows[i].enabled),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
-                // A disabled row (checkbox unticked) isn't sent, so grey its
-                // key/value out to read as inactive — matching the terminal UI.
-                let row_color = if rows[i].enabled {
-                    theme.text
-                } else {
-                    theme.dim
-                };
-                let k = sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color);
-                if k.changed() {
-                    changed = true;
-                }
-                // The value is the one cell whose content is the request
-                // itself, so it is the one that wraps rather than truncates.
-                let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
-                if v.changed() {
-                    changed = true;
-                }
-                // The description is a note for whoever reads the file later,
-                // not part of the request, so it is always dim — even on an
-                // enabled row it shouldn't compete with the value beside it.
-                let d = wrapping_field(
-                    ui,
-                    desc_w,
-                    &mut rows[i].desc,
-                    s.gui_hint_description,
-                    theme.dim,
-                );
-                if d.changed() {
-                    changed = true;
-                }
-                // Sized, not free-growing: the header row has to reserve
-                // exactly what this column claims (see `kv_widths`), or an
-                // empty table and a filled one lay their columns out
-                // differently and everything shifts when the first row lands.
-                let x_w = remove_width(ui);
-                if ui
-                    .add_sized(
-                        [x_w, row_h],
-                        egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
-                    )
-                    .on_hover_text(s.gui_remove)
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
-                ui.end_row();
+                table_row(ui, |ui| {
+                    if ui
+                        .add_sized(
+                            [check_w, row_h],
+                            egui::Checkbox::without_text(&mut rows[i].enabled),
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    // A disabled row (checkbox unticked) isn't sent, so grey its
+                    // key/value out to read as inactive — matching the terminal UI.
+                    let row_color = if rows[i].enabled {
+                        theme.text
+                    } else {
+                        theme.dim
+                    };
+                    let k = sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color);
+                    if k.changed() {
+                        changed = true;
+                    }
+                    // The value is the one cell whose content is the request
+                    // itself, so it is the one that wraps rather than truncates.
+                    let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
+                    if v.changed() {
+                        changed = true;
+                    }
+                    // The description is a note for whoever reads the file later,
+                    // not part of the request, so it is always dim — even on an
+                    // enabled row it shouldn't compete with the value beside it.
+                    let d = wrapping_field(
+                        ui,
+                        desc_w,
+                        &mut rows[i].desc,
+                        s.gui_hint_description,
+                        theme.dim,
+                    );
+                    if d.changed() {
+                        changed = true;
+                    }
+                    // Sized, not free-growing: the header row has to reserve
+                    // exactly what this column claims (see `kv_widths`), or an
+                    // empty table and a filled one lay their columns out
+                    // differently and everything shifts when the first row lands.
+                    // Padded to the height of the fields rather than its own: a
+                    // button's vertical padding makes it taller than the row it
+                    // belongs to, so it hung two pixels below the fields and drew
+                    // the eye down at the end of every row.
+                    let x_w = remove_width(ui);
+                    let hit = flat_buttons(ui, |ui| {
+                        ui.add_sized(
+                            [x_w, row_h],
+                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                        )
+                    });
+                    if hit.on_hover_text(s.gui_remove).clicked() {
+                        remove = Some(i);
+                    }
+                });
             }
         });
+    });
     if let Some(i) = remove {
         rows.remove(i);
         changed = true;
@@ -524,46 +572,40 @@ pub fn pair_editor(
     // shares the value cell (right-aligned) rather than being its own column,
     // and the key takes ~40% of the free width so it grows too.
     let key_w = split_key_width(ui, 42.0);
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        // See `kv_editor`: the filled fields are the row.
-        .min_col_width(0.0)
-        .show(ui, |ui| {
+    let x_w = remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    ui.push_id(id, |ui| {
+        table_rows(ui, |ui| {
             // See `kv_editor`: titled columns, minus the enabled tick this
-            // table doesn't have.
-            column_header(ui, theme, key_label);
-            column_header(ui, theme, val_label);
-            ui.end_row();
+            // table doesn't have, and top-aligned rows so they don't sag.
+            table_row(ui, |ui| {
+                sized_header(ui, theme, key_label, key_w);
+                column_header(ui, theme, val_label);
+            });
             for i in 0..rows.len() {
-                let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, theme.text);
-                if k.changed() {
-                    changed = true;
-                }
-                // `Align::Min` so the value lines up with the key beside it
-                // rather than being centred against the taller ✕ — see
-                // `kv_editor`.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if ui
-                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                        .clicked()
-                    {
-                        remove = Some(i);
+                table_row(ui, |ui| {
+                    let k = sized_key(ui, key_w, &mut rows[i].0, key_hint, theme.text);
+                    if k.changed() {
+                        changed = true;
                     }
-                    let v = wrapping_field(
-                        ui,
-                        ui.available_width(),
-                        &mut rows[i].1,
-                        val_hint,
-                        theme.text,
-                    );
+                    let val_w = (ui.available_width() - x_w - 8.0).max(40.0);
+                    let v = wrapping_field(ui, val_w, &mut rows[i].1, val_hint, theme.text);
                     if v.changed() {
                         changed = true;
                     }
+                    let hit = flat_buttons(ui, |ui| {
+                        ui.add_sized(
+                            [x_w, row_h],
+                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                        )
+                    });
+                    if hit.clicked() {
+                        remove = Some(i);
+                    }
                 });
-                ui.end_row();
             }
         });
+    });
     if let Some(i) = remove {
         rows.remove(i);
         changed = true;
@@ -918,9 +960,13 @@ mod tests {
                         .min_col_width(0.0)
                         .show(ui, |ui| {
                             ui.checkbox(&mut true, "");
+                            // The *field*, not the text inside it: a
+                            // `TextEdit`'s response rect is its text area, and
+                            // the frame the user sees is that plus the margin.
                             rendered = sized_key(ui, key_w, &mut text, "", Color32::PLACEHOLDER)
                                 .rect
-                                .width();
+                                .width()
+                                + TEXT_EDIT_MARGIN;
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1029,15 +1075,67 @@ mod tests {
         });
         assert_eq!(rects.len(), 6, "three fields per row, got {rects:?}");
         for row in rects.chunks(3) {
-            let top = row[0].top();
+            let first = row[0];
             for (i, r) in row.iter().enumerate() {
+                // Exactly, not nearly: a fifth of a pixel is invisible in the
+                // model and a whole pixel on screen once the row lands on a
+                // fractional y, which is what made the table look as though it
+                // sloped. Any tolerance here is a tolerance for the bug.
                 assert!(
-                    (r.top() - top).abs() < 0.5,
-                    "field {i} sits at {} but the row starts at {top}",
-                    r.top()
+                    (r.top() - first.top()).abs() < 0.01,
+                    "field {i} sits at {} but the row starts at {}",
+                    r.top(),
+                    first.top()
+                );
+                assert!(
+                    (r.height() - first.height()).abs() < 0.01,
+                    "field {i} is {} tall, the row is {}",
+                    r.height(),
+                    first.height()
                 );
             }
         }
+    }
+
+    /// The remove ✕ has to be the height of the fields it sits between. A
+    /// button's own vertical padding makes it taller, so it hung below the row
+    /// and drew the eye downwards at the end of every line — the sag again,
+    /// this time at the right-hand edge.
+    #[test]
+    fn the_remove_button_does_not_hang_below_the_row() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let mut rows = vec![KvRow::new("Accept", "application/json")];
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let mut button_fill = Color32::TRANSPARENT;
+        let mut fields = Vec::new();
+        let mut buttons = Vec::new();
+        let full = ctx.run_ui(a_frame(), |ui| {
+            button_fill = ui.visuals().widgets.inactive.weak_bg_fill;
+            kv_editor(
+                ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+            );
+        });
+        for cs in &full.shapes {
+            rects_filled(&cs.shape, theme.field(), &mut fields);
+            rects_filled(&cs.shape, button_fill, &mut buttons);
+        }
+        let field = *fields.first().expect("a field was painted");
+        // The ✕ is the rightmost control on the row; the "+ Add" button below
+        // it starts at the left edge.
+        let x = buttons
+            .iter()
+            .filter(|b| b.top() < field.bottom())
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .copied()
+            .expect("the remove button was painted");
+        assert!(
+            x.height() <= field.height() + 0.01,
+            "the ✕ is {} tall next to a {} field",
+            x.height(),
+            field.height()
+        );
     }
 
     /// Striping a table whose every cell is a filled field gives each row two

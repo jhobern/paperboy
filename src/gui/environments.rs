@@ -438,13 +438,15 @@ fn var_editor(
     // Give the key ~40% of the free width so it grows with the panel instead of
     // staying a fixed sliver next to the filling value (see `split_key_width`).
     let key_w = super::widgets::split_key_width(ui, 42.0);
-    egui::Grid::new("env_vars")
-        .num_columns(2)
-        .spacing([8.0, 4.0])
-        // Unstriped — see `widgets::kv_editor`.
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            for i in 0..vars.len() {
+    let x_w = super::widgets::remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    super::widgets::table_rows(ui, |ui| {
+        for i in 0..vars.len() {
+            // Top-aligned, explicit columns rather than a grid: a grid centres
+            // each cell against a row height it only learns as cells are added,
+            // so every cell sat a fraction lower than the one before it and the
+            // table looked as though it sloped (see `widgets::table_row`).
+            super::widgets::table_row(ui, |ui| {
                 let source = vars[i].source;
                 if super::widgets::sized_key(
                     ui,
@@ -457,61 +459,61 @@ fn var_editor(
                 {
                     changed = true;
                 }
-                // The value cell is the grid's last column so it stretches to
-                // fill the panel; the remove ✕ is right-aligned inside it (see
-                // the note in `widgets::kv_editor`).
-                // `Align::Min` so the value lines up with its key rather than
-                // sinking below it — see `widgets::kv_editor`.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if ui
-                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
-                    match source_label(source) {
-                        None => {
-                            // Literal: editable value.
-                            // Environment values are tokens and URLs — the
-                            // longest strings in the app — so they wrap.
-                            if super::widgets::wrapping_field(
-                                ui,
-                                ui.available_width(),
-                                &mut vars[i].value,
-                                s.gui_hint_value,
-                                theme.text,
-                            )
-                            .changed()
-                            {
-                                vars[i].raw = vars[i].value.clone();
-                                vars[i].modified = true;
-                                changed = true;
-                            }
-                        }
-                        Some(provider) => {
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(format!("{{{{ {provider} }}}}"))
-                                            .color(theme.subst),
-                                    );
-                                    if vars[i].loading {
-                                        ui.spinner();
-                                        ui.colored_label(theme.pending, s.gui_resolving);
-                                    } else if vars[i].resolved {
-                                        ui.colored_label(theme.dim, "••••••");
-                                    } else {
-                                        ui.colored_label(theme.err, s.gui_unresolved);
-                                    }
-                                },
-                            );
+                // The value takes what the remove ✕ leaves.
+                let val_w = (ui.available_width() - x_w - 8.0).max(40.0);
+                match source_label(source) {
+                    None => {
+                        // Literal: editable value.
+                        // Environment values are tokens and URLs — the
+                        // longest strings in the app — so they wrap.
+                        if super::widgets::wrapping_field(
+                            ui,
+                            val_w,
+                            &mut vars[i].value,
+                            s.gui_hint_value,
+                            theme.text,
+                        )
+                        .changed()
+                        {
+                            vars[i].raw = vars[i].value.clone();
+                            vars[i].modified = true;
+                            changed = true;
                         }
                     }
-                });
-                ui.end_row();
-            }
-        });
+                    Some(provider) => {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(val_w, row_h),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(format!("{{{{ {provider} }}}}"))
+                                        .color(theme.subst),
+                                );
+                                if vars[i].loading {
+                                    ui.spinner();
+                                    ui.colored_label(theme.pending, s.gui_resolving);
+                                } else if vars[i].resolved {
+                                    ui.colored_label(theme.dim, "••••••");
+                                } else {
+                                    ui.colored_label(theme.err, s.gui_unresolved);
+                                }
+                            },
+                        );
+                    }
+                }
+                if super::widgets::flat_buttons(ui, |ui| {
+                    ui.add_sized(
+                        [x_w, row_h],
+                        egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                    )
+                })
+                .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+        }
+    });
     if let Some(i) = remove {
         vars.remove(i);
         changed = true;

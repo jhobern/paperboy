@@ -925,20 +925,20 @@ fn form_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
-    // A grid (not a per-row `ui.horizontal`) keeps every column vertically
-    // aligned across rows: the kind ComboBox is taller than the text cells, so
-    // laying each row out independently let the dropdowns and values drift down
-    // the further right they sat. The grid pins them to shared column edges and
-    // gives the key ~40% of the free width (the value fills the rest as the
-    // last column — see `widgets::split_key_width`).
+    // Explicit column widths (not a `ui.horizontal` that lets each cell take
+    // what it likes) keep every column aligned across rows: the kind ComboBox
+    // is taller than the text cells, so laying each row out freely let the
+    // dropdowns and values drift down the further right they sat. The key gets
+    // ~40% of the free width — see `widgets::split_key_width`.
     let key_w = super::widgets::split_key_width(ui, 160.0);
-    egui::Grid::new("form_fields")
-        .num_columns(4)
-        .spacing([8.0, 4.0])
-        // Unstriped — see `widgets::kv_editor`.
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            for i in 0..fields.len() {
+    let kind_w = 80.0;
+    let check_w = ui.spacing().interact_size.y + 4.0;
+    let x_w = super::widgets::remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    let browse_w = super::widgets::button_width(ui, s.gui_browse);
+    super::widgets::table_rows(ui, |ui| {
+        for i in 0..fields.len() {
+            super::widgets::table_row(ui, |ui| {
                 if ui.checkbox(&mut fields[i].enabled, "").changed() {
                     changed = true;
                 }
@@ -968,7 +968,7 @@ fn form_editor(
                         FormFieldKind::File => s.gui_kind_file,
                         FormFieldKind::Base64File => s.gui_kind_base64,
                     })
-                    .width(80.0)
+                    .width(kind_w)
                     .show_ui(ui, |ui| {
                         for (k, label) in [
                             (FormFieldKind::Text, s.gui_kind_text),
@@ -982,57 +982,66 @@ fn form_editor(
                         }
                     });
                 fields[i].kind = kind;
+                let is_file = matches!(kind, FormFieldKind::File | FormFieldKind::Base64File);
                 let hint = match kind {
                     FormFieldKind::Text => s.gui_hint_value,
                     _ => s.gui_hint_file_path,
                 };
-                // Value fills the last column; the remove ✕ is tucked to its
-                // right (see the note in `widgets::kv_editor`).
-                // `Align::Min`: the ✕ and Browse buttons are taller than the
-                // value field, and centring against them dropped the value
-                // below the key and kind picker to its left (see
-                // `widgets::kv_editor`).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    if ui
-                        .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                        .clicked()
-                    {
-                        remove = Some(i);
-                    }
+                // The value fills what the ✕ (and, for a path, Browse) leave.
+                let mut spare = ui.available_width() - x_w - 8.0;
+                if is_file {
+                    spare -= browse_w + 8.0;
+                }
+                // A form value is often a path or a long token, so it
+                // wraps rather than hiding its tail.
+                if super::widgets::wrapping_field(
+                    ui,
+                    spare.max(40.0),
+                    &mut fields[i].value,
+                    hint,
+                    row_color,
+                )
+                .changed()
+                {
+                    changed = true;
+                }
+                super::widgets::flat_buttons(ui, |ui| {
                     // File/Base64 values are paths — offer a native file picker
                     // (the terminal UI has its in-app browser for the same).
-                    if matches!(kind, FormFieldKind::File | FormFieldKind::Base64File)
-                        && ui.button(s.gui_browse).clicked()
+                    if is_file
+                        && ui
+                            .add_sized([browse_w, row_h], egui::Button::new(s.gui_browse))
+                            .clicked()
                     {
                         // Recorded rather than opened: the picker needs `app`,
                         // which the section body has already borrowed mutably.
                         // See `super::filepick`.
                         *browse = Some(i);
                     }
-                    // A form value is often a path or a long token, so it
-                    // wraps rather than hiding its tail.
-                    if super::widgets::wrapping_field(
-                        ui,
-                        ui.available_width(),
-                        &mut fields[i].value,
-                        hint,
-                        row_color,
-                    )
-                    .changed()
+                    if ui
+                        .add_sized(
+                            [x_w, row_h],
+                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                        )
+                        .clicked()
                     {
-                        changed = true;
+                        remove = Some(i);
                     }
                 });
-                ui.end_row();
-                if fields[i].kind == FormFieldKind::Base64File {
-                    ui.label(""); // checkbox column
-                    ui.label(RichText::new(s.gui_base64_prefix).color(theme.dim).small());
-                    ui.label(""); // kind column
+            });
+            if fields[i].kind == FormFieldKind::Base64File {
+                super::widgets::table_row(ui, |ui| {
+                    ui.add_space(check_w);
+                    ui.add_sized(
+                        [key_w, row_h],
+                        egui::Label::new(
+                            RichText::new(s.gui_base64_prefix).color(theme.dim).small(),
+                        ),
+                    );
+                    ui.add_space(kind_w);
                     let mut prefix = fields[i].base64_prefix.clone().unwrap_or_default();
-                    if super::widgets::flat_fields(ui, |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut prefix).desired_width(f32::INFINITY))
-                    })
-                    .changed()
+                    let w = (ui.available_width() - x_w - 8.0).max(40.0);
+                    if super::widgets::wrapping_field(ui, w, &mut prefix, "", theme.text).changed()
                     {
                         fields[i].base64_prefix = if prefix.is_empty() {
                             None
@@ -1041,10 +1050,10 @@ fn form_editor(
                         };
                         changed = true;
                     }
-                    ui.end_row();
-                }
+                });
             }
-        });
+        }
+    });
     if let Some(i) = remove {
         fields.remove(i);
         changed = true;
