@@ -201,6 +201,30 @@ struct Body {
     raw: String,
     urlencoded: Vec<Param>,
     formdata: Vec<Param>,
+    /// `{"src": "/path/to/file"}` — the whole request body read from a file.
+    file: FileBody,
+    graphql: GraphQl,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct FileBody {
+    #[serde(deserialize_with = "de_str")]
+    src: String,
+}
+
+/// Postman's GraphQL body is the query and its variables kept apart. On the
+/// wire GraphQL is an ordinary JSON POST, so this is a presentation split
+/// rather than a protocol one — which is why it can be imported rather than
+/// merely reported.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GraphQl {
+    #[serde(deserialize_with = "de_str")]
+    query: String,
+    /// Held as a *string* of JSON, not as JSON.
+    #[serde(deserialize_with = "de_str")]
+    variables: String,
 }
 
 /// A `{key, value, …}` entry shared by headers, auth and body params; the extra
@@ -1026,10 +1050,29 @@ fn note_losses(
             },
             req.method
         ));
-    } else if let Some(b) = &req.body
-        && !matches!(b.mode.as_str(), "" | "raw" | "urlencoded" | "formdata")
-    {
-        note(format!("body mode `{}` was dropped", b.mode));
+    } else if let Some(b) = &req.body {
+        match b.mode.as_str() {
+            "" | "raw" | "urlencoded" | "formdata" => {}
+            // Hurl can send a whole body from a file, but PaperBoy's own
+            // request model has no place to keep one — a `file,path;` body
+            // serialises correctly and then reads back as nothing, so importing
+            // it would produce a request that quietly loses its body the first
+            // time the collection is reopened. Better to say so.
+            "file" if b.file.src.trim().is_empty() => note(
+                "the body is a file, and Postman never had one chosen — attach it here instead"
+                    .into(),
+            ),
+            "file" => note(format!(
+                "the body was the file `{}`; attach it here instead, as PaperBoy sends file \
+                 bodies as form or multipart parts rather than as the whole body",
+                b.file.src.trim()
+            )),
+            "graphql" if b.graphql.query.trim().is_empty() => {
+                note("the GraphQL body held no query, so there was nothing to send".into())
+            }
+            "graphql" => {}
+            mode => note(format!("body mode `{mode}` was dropped")),
+        }
     }
     for f in &entry.form_fields {
         if f.kind == FormFieldKind::File && !f.enabled {
@@ -1157,6 +1200,27 @@ fn map_request(
                 form_fields = b.urlencoded.iter().filter_map(Param::form_field).collect()
             }
             "formdata" => form_fields = b.formdata.iter().filter_map(Param::form_field).collect(),
+            // GraphQL over HTTP is a JSON POST of `{query, variables}`; the two
+            // halves are only kept apart for editing.
+            "graphql" if !b.graphql.query.trim().is_empty() => {
+                let mut doc = serde_json::Map::new();
+                doc.insert("query".into(), Value::String(b.graphql.query.clone()));
+                // Variables arrive as a string of JSON. Parsed, they nest as an
+                // object the way the server expects; unparseable, they are left
+                // out rather than sent as a quoted blob the server would reject.
+                if let Ok(vars) = serde_json::from_str::<Value>(&b.graphql.variables)
+                    && !vars.is_null()
+                {
+                    doc.insert("variables".into(), vars);
+                }
+                body = serde_json::to_string_pretty(&Value::Object(doc)).unwrap_or_default();
+                if !headers
+                    .iter()
+                    .any(|h| h.key.eq_ignore_ascii_case("content-type"))
+                {
+                    headers.push(KvRow::new("Content-Type", "application/json"));
+                }
+            }
             _ => {}
         }
     }
@@ -1600,6 +1664,92 @@ mod tests {
         assert_eq!(
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod body_mode_tests {
+    use super::*;
+
+    fn post(body: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {{ "name": "r", "request": {{ "method": "POST",
+                   "url": "https://h/x", "body": {body} }} }} ] }}"#
+        ))
+    }
+
+    /// GraphQL over HTTP is an ordinary JSON POST; Postman only keeps the query
+    /// and its variables apart so they can be edited separately. That made this
+    /// a presentation difference the importer was treating as a protocol one.
+    #[test]
+    fn a_graphql_body_becomes_the_json_post_it_actually_is() {
+        let c = post(
+            r#"{ "mode": "graphql", "graphql": {
+                 "query": "query Q($id: ID){ thing(id: $id) }",
+                 "variables": "{ \"id\": \"7\" }" } }"#,
+        );
+        let e = &c.entries[0];
+        let sent: serde_json::Value = serde_json::from_str(e.body.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["query"], "query Q($id: ID){ thing(id: $id) }");
+        assert_eq!(
+            sent["variables"]["id"], "7",
+            "the variables nest as an object, not as the string Postman stores"
+        );
+        assert!(
+            e.headers
+                .iter()
+                .any(|h| h.key.eq_ignore_ascii_case("content-type")
+                    && h.value.contains("application/json"))
+        );
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("graphql")),
+            "and nothing was lost to report: {:?}",
+            c.notes
+        );
+    }
+
+    /// Half-written variables are left out rather than sent as a quoted blob
+    /// the server would reject.
+    #[test]
+    fn unparseable_graphql_variables_are_left_out() {
+        let c = post(
+            r#"{ "mode": "graphql", "graphql": { "query": "{ ping }",
+                 "variables": "{ not json" } }"#,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(c.entries[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["query"], "{ ping }");
+        assert!(sent.get("variables").is_none());
+    }
+
+    /// A `file,path;` body serialises as valid Hurl and then reads back as
+    /// nothing, because PaperBoy's request model has nowhere to keep one. An
+    /// import that vanished on the next reload would be worse than a note.
+    #[test]
+    fn a_file_body_is_reported_rather_than_imported_and_lost() {
+        let c = post(r#"{ "mode": "file", "file": { "src": "./payload.bin" } }"#);
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("./payload.bin")),
+            "the path is named so it can be attached by hand: {:?}",
+            c.notes
+        );
+    }
+
+    /// Both file bodies in the exports on hand are `{"src": ""}` — the mode was
+    /// chosen and a file never was.
+    #[test]
+    fn a_file_body_with_no_file_is_reported_not_invented() {
+        let c = post(r#"{ "mode": "file", "file": { "src": "" } }"#);
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("never had one chosen")),
+            "{:?}",
+            c.notes
         );
     }
 }
@@ -2352,7 +2502,10 @@ mod inheritance_tests {
             for_item("oauth1")[0].contains("oauth1"),
             "the auth type that was lost is named: {notes:?}"
         );
-        assert!(for_item("gql")[0].contains("graphql"));
+        assert!(
+            for_item("gql")[0].contains("GraphQL"),
+            "an empty GraphQL body has nothing to send, and says so"
+        );
         assert!(for_item("scripted")[0].contains("pre-request"));
     }
 

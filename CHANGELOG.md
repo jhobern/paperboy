@@ -12,6 +12,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A GraphQL request imports as a GraphQL request.** Postman keeps the query
+  and its variables in separate boxes, which made the importer treat GraphQL as
+  a protocol it didn't speak and drop the body entirely. On the wire GraphQL is
+  an ordinary JSON `POST` of `{"query": …, "variables": …}`, so that is what it
+  now becomes, with the variables nested as an object rather than the string
+  Postman stores them as. Variables that are half-written and don't parse are
+  left out instead of being sent as a quoted blob the server would reject.
+
+- **A request whose body is a file says so.** Hurl can send a file as a whole
+  request body, but PaperBoy has nowhere to keep one — such a body writes out
+  correctly and then reads back as nothing, so importing it would produce a
+  request that quietly loses its body the first time the collection is
+  reopened. The conversion report now names the file Postman had (or says none
+  was ever chosen, which is both of the ones in the exports on hand) so it can
+  be attached as a form or multipart part instead.
+
 - **Postman's send-time switches are honoured.** Postman strips the body from
   a `GET` unless the request explicitly turns body pruning off, so a `GET`
   stored with a body is the remains of an edit rather than a request that sends
