@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **An imported request keeps its path variables.** Postman writes a URL
+  placeholder twice — as `/:batch_id` in the URL text, and again in a list of
+  declared variables holding the value to put there. The importer read only the
+  text, so fifty requests in one real export arrived asking the server for a
+  batch literally named `:batch_id`, and the mistake was invisible until the
+  404 came back. Declared placeholders now import as ordinary `{{batch_id}}`
+  variables, keeping the request parameterised instead of baking one value in,
+  and the value Postman would have substituted is carried into the collection's
+  variables. Only whole path segments are rewritten and only for names the
+  export declares, so a port (`host:8080`), a scheme and a colon in a query
+  value are left alone. Path variables belong to a request but a `.vars` file
+  holds one value per name, so when two requests declare the same name
+  differently the first is kept and the clash is reported rather than guessed.
+
 - **A variable nothing defines no longer looks perfectly fine.** A typo'd
   `{{ tokn }}`, or a collection run before its environment was activated, was
   the only broken thing on screen with no mark on it: the editor coloured every

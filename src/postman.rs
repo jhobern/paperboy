@@ -63,7 +63,7 @@ struct Request {
     #[serde(default = "get_method")]
     method: String,
     #[serde(default, deserialize_with = "de_url")]
-    url: String,
+    url: Url,
     #[serde(default)]
     header: Vec<Param>,
     auth: Option<Auth>,
@@ -74,17 +74,41 @@ fn get_method() -> String {
     "GET".to_string()
 }
 
+/// A Postman URL: the text as typed, plus the *path variables* declared for it.
+///
+/// Postman writes a path placeholder twice — once in `raw` as `/:batch_id`, and
+/// once in `variable` as a key/value pair holding the value to substitute. Only
+/// reading `raw` imported the colon form literally, so the request went out
+/// asking for a batch actually named ":batch_id".
+#[derive(Default)]
+struct Url {
+    raw: String,
+    /// Declared path variables, in declaration order. Empty for the bare-string
+    /// form of a URL, which has nowhere to put them.
+    variables: Vec<Param>,
+}
+
 /// A Postman URL is a bare string or an object with a `raw` field; anything
 /// else imports as an empty URL rather than failing the whole collection.
-fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
     Ok(match Value::deserialize(d)? {
-        Value::String(s) => s,
-        Value::Object(m) => m
-            .get("raw")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
+        Value::String(s) => Url {
+            raw: s,
+            variables: Vec::new(),
+        },
+        Value::Object(m) => Url {
+            raw: m
+                .get("raw")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            variables: m
+                .get("variable")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
+                .unwrap_or_default(),
+        },
+        _ => Url::default(),
     })
 }
 
@@ -431,6 +455,7 @@ fn walk_items(
             };
             let auth = resolve_auth(req.auth.as_ref(), inherited);
             let mut entry = map_request(&title, req, &it.event, auth);
+            apply_path_variables(&title, &req.url, &mut entry, out);
             note_losses(&title, req, &it.event, auth, &entry, out);
             for name in rename_dynamic_variables(&mut entry) {
                 out.notes.push(ConversionNote {
@@ -442,6 +467,79 @@ fn walk_items(
                 });
             }
             out.entries.push(entry);
+        }
+    }
+}
+
+/// Rewrite Postman's `/:name` path placeholders to `{{name}}`, and carry the
+/// values it declared for them into the collection's variables.
+///
+/// Postman substitutes a path variable from `url.variable` at send time, so
+/// importing `raw` alone produced a URL that asks the server for a resource
+/// literally named ":batch_id". Hurl's equivalent is an ordinary `{{name}}`,
+/// which keeps the request parameterised rather than baking one value in.
+///
+/// Only whole segments are rewritten, and only for names the export actually
+/// declares: `:` is legal in a URL (`http://host:8080`, a `mailto:`), and
+/// Postman itself only substitutes what is in the `variable` list.
+///
+/// A declared value is seeded into the collection's variables so the request
+/// works as imported. The first value for a name wins — path variables are
+/// per-request, so several requests can declare the same name with different
+/// values, and there is exactly one `.vars` file for them to land in. A
+/// conflict is reported rather than silently resolved, since guessing which
+/// batch id was meant is not something an importer can do.
+fn apply_path_variables(
+    title: &str,
+    url: &Url,
+    entry: &mut HurlEntry,
+    out: &mut ConvertedCollection,
+) {
+    let declared: Vec<&Param> = url
+        .variables
+        .iter()
+        .filter(|v| !v.disabled && !v.key.trim().is_empty())
+        .collect();
+    if declared.is_empty() {
+        return;
+    }
+
+    // Rewrite the path only. The query string can contain a bare `:` in a
+    // value, and Postman never substitutes path variables there.
+    let (path, query) = match entry.url.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (entry.url.clone(), None),
+    };
+    let rewritten: Vec<String> = path
+        .split('/')
+        .map(|seg| match seg.strip_prefix(':') {
+            Some(name) if declared.iter().any(|v| v.key.trim() == name) => {
+                format!("{{{{{name}}}}}")
+            }
+            _ => seg.to_string(),
+        })
+        .collect();
+    entry.url = match query {
+        Some(q) => format!("{}?{}", rewritten.join("/"), q),
+        None => rewritten.join("/"),
+    };
+
+    for var in declared {
+        let key = var.key.trim().to_string();
+        let value = var.value.replace(['\n', '\r'], " ").trim().to_string();
+        match out.variables.iter().find(|(k, _)| *k == key) {
+            Some((_, existing)) if *existing != value && !value.is_empty() => {
+                out.notes.push(ConversionNote {
+                    item: title.to_string(),
+                    detail: format!(
+                        "the path variable `{key}` is declared here as `{value}` but is already \
+                         `{existing}` — a `.vars` file holds one value per name, so the first was \
+                         kept"
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => out.variables.push((key, value)),
         }
     }
 }
@@ -628,7 +726,7 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
         }
     }
 
-    let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
+    let mut entry = HurlEntry::from_fields(name, &req.method, &req.url.raw, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
     entry.queries.extend(queries);
@@ -1049,6 +1147,99 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_variable_tests {
+    use super::*;
+
+    fn one(url: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [ {{ "name": "r", "request": {{ "method": "GET", "url": {url} }} }} ]
+            }}"#
+        ))
+    }
+
+    /// The bug: importing `raw` alone asked the server for a batch literally
+    /// named ":batch_id".
+    #[test]
+    fn a_declared_path_variable_becomes_a_hurl_variable() {
+        let c = one(r#"{ "raw": "{{base}}/v1/batches/:batch_id/add",
+                 "variable": [{ "key": "batch_id", "value": "se-28529731" }] }"#);
+        assert_eq!(c.entries[0].url, "{{base}}/v1/batches/{{batch_id}}/add");
+        assert!(
+            c.variables
+                .contains(&("batch_id".into(), "se-28529731".into())),
+            "and the value Postman would have substituted comes with it"
+        );
+    }
+
+    /// A colon is legal in a URL, and Postman only substitutes what it declares.
+    #[test]
+    fn an_undeclared_colon_segment_is_left_alone() {
+        let c = one(r#"{ "raw": "http://localhost:8080/v1/:not_declared" }"#);
+        assert_eq!(c.entries[0].url, "http://localhost:8080/v1/:not_declared");
+        assert!(c.variables.is_empty());
+    }
+
+    /// Only whole segments — a port is not a path variable even when a
+    /// same-named variable happens to be declared.
+    #[test]
+    fn a_port_is_never_mistaken_for_a_path_variable() {
+        let c = one(r#"{ "raw": "http://host:8080/x/:id",
+                 "variable": [{ "key": "id", "value": "7" }] }"#);
+        assert_eq!(c.entries[0].url, "http://host:8080/x/{{id}}");
+    }
+
+    /// Rewriting the query string too would corrupt values that legitimately
+    /// contain a colon.
+    #[test]
+    fn the_query_string_is_not_rewritten() {
+        let c = one(r#"{ "raw": "https://h/x/:id?at=12:30&who=:id",
+                 "variable": [{ "key": "id", "value": "7" }] }"#);
+        assert_eq!(
+            c.entries[0].url, "https://h/x/{{id}}?at=12:30&who=:id",
+            "the path placeholder is rewritten; the colons after the `?` are not"
+        );
+    }
+
+    /// Path variables are per-request but a `.vars` file has one value per
+    /// name, so a clash has to be reported rather than quietly picked.
+    #[test]
+    fn two_requests_declaring_the_same_name_differently_are_reported() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [
+                { "name": "a", "request": { "method": "GET", "url": {
+                    "raw": "https://h/:id", "variable": [{ "key": "id", "value": "1" }] } } },
+                { "name": "b", "request": { "method": "GET", "url": {
+                    "raw": "https://h/:id", "variable": [{ "key": "id", "value": "2" }] } } }
+              ]
+            }"#,
+        );
+        assert_eq!(c.variables, vec![("id".to_string(), "1".to_string())]);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.item == "b" && n.detail.contains("id")),
+            "the discarded second value is named, not swallowed: {:?}",
+            c.notes
+        );
+    }
+
+    /// ShipEngine's exports declare the name but leave the value blank. The
+    /// request must still be parameterised — and the empty variable is exactly
+    /// what the undefined-variable warning is for.
+    #[test]
+    fn a_declared_variable_with_no_value_still_parameterises_the_url() {
+        let c = one(r#"{ "raw": "{{baseUrl}}/v1/batches/:batch_id",
+                 "variable": [{ "key": "batch_id", "value": "", "description": "Batch ID" }] }"#);
+        assert_eq!(c.entries[0].url, "{{baseUrl}}/v1/batches/{{batch_id}}");
+        assert_eq!(c.variables, vec![("batch_id".to_string(), String::new())]);
     }
 }
 
