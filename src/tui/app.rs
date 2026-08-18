@@ -1638,6 +1638,15 @@ impl TuiApp {
         // answer than running and saying why it failed. The editor already
         // paints them red; this is the same finding said out loud, for a user
         // who pressed F5 without looking at the body.
+        // A raw body plus form fields is refused rather than reported: Hurl
+        // would send the body and silently drop every field, so the request
+        // "succeeds" having sent the wrong thing (see
+        // `HurlEntry::body_form_conflict`).
+        let conflicts = request::body_form_conflicts(&self.collections[col_idx]);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return;
+        }
         let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
         self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);
@@ -1685,6 +1694,12 @@ impl TuiApp {
         }
         // Reported, not blocking — see `run_entry`. Checked across every entry
         // rather than only the selected one, to match the guard above it.
+        // Refused, not reported — see the single-request run.
+        let conflicts = request::body_form_conflicts_all(col);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return;
+        }
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);

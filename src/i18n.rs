@@ -788,8 +788,13 @@ strings! {
     gui_code_repr_hurl => "Hurl", "Hurl", "Hurl";
     gui_code_parse_error => "Invalid request text — edits not applied.", "Texte de requête invalide — modifications non appliquées.", "Ugyldig anmodningstekst — ændringer ikke anvendt.";
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
-    gui_form_fields => "Form / multipart fields", "Champs de formulaire / multipart", "Formular-/multipart-felter";
-    gui_form_mutually_exclusive => "This request uses form fields (below). A raw body and form fields are mutually exclusive.", "Cette requête utilise des champs de formulaire (ci-dessous). Un corps brut et des champs de formulaire sont mutuellement exclusifs.", "Denne anmodning bruger formularfelter (nedenfor). En rå brødtekst og formularfelter udelukker hinanden.";
+    body_form_conflict_status => "✖ Not sent — a raw body and form fields can't both be sent:", "✖ Non envoyé — un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble :", "✖ Ikke sendt — en rå brødtekst og formularfelter kan ikke sendes sammen:";
+    body_form_conflict_hint => "✖ A raw body and form fields can't both be sent — remove one", "✖ Un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble — supprimez-en un", "✖ En rå brødtekst og formularfelter kan ikke sendes sammen — fjern det ene";
+    gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
+    gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
+    gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
+    gui_body_mode_raw => "Raw body", "Corps brut", "Rå brødtekst";
+    gui_body_mode_form => "Form fields", "Champs de formulaire", "Formularfelter";
     gui_raw_body_hint => "Raw request body (JSON, text, …)", "Corps brut de la requête (JSON, texte, …)", "Rå anmodningstekst (JSON, tekst, …)";
     gui_basic_auth => "Basic authentication", "Authentification basique", "Basisgodkendelse";
     gui_username => "Username", "Nom d'utilisateur", "Brugernavn";
@@ -1457,6 +1462,11 @@ pub enum Status {
     /// the resulting failure arrives as an unexplained 401 several steps later,
     /// so the cause is named at the moment it is introduced.
     UndefinedVars(Vec<String>),
+    /// The run was refused because these requests carry both a raw body and
+    /// form fields, which Hurl sends as neither (the body silently replaces the
+    /// form). Blocking rather than advisory: the request would otherwise appear
+    /// to succeed.
+    BodyFormConflict(Vec<String>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -1702,6 +1712,9 @@ impl Status {
             }
             Status::UndefinedVars(keys) => {
                 format!("{} {}", s.env_undefined_vars, keys.join(", "))
+            }
+            Status::BodyFormConflict(names) => {
+                format!("{} {}", s.body_form_conflict_status, names.join(", "))
             }
             Status::EnvVarReloading(key) => format!("{} {key}…", s.env_reloading_var),
             Status::EnvActivated(name) => format!("{} {name}", s.env_activated),

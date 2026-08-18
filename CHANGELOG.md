@@ -12,6 +12,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **A raw body and form fields are now an error, not a note.** Hurl builds both
+  onto the same libcurl handle: the form is written first, then the body
+  overwrites it, and the `Content-Type` is still taken from the form — so the
+  request is sent with none of its form fields and a body labelled as a form,
+  and comes back with a perfectly good response to something nobody asked for.
+  A body of one stray space was enough to do it. Both front-ends now refuse to
+  send such a request and say which one it is, the GUI's Body section names the
+  problem and offers to remove the body, and the terminal UI's request panel
+  says so before Send is ever pressed.
+
+- **The GUI's Body section shows the raw body or the form fields, not both.**
+  They are mutually exclusive on the wire, so a request that posts a form now
+  gets the whole panel for its fields instead of half of it, and the choice is
+  a control rather than a sentence explaining that you shouldn't fill both in.
+  Which one is showing is remembered per request, and starts on whichever the
+  request already carries.
+
 - **A row of fields now reads as one row.** With every cell carrying a wash of
   its own, striping the table behind them gave each row two competing
   backgrounds and made the fields look like they were floating on the table

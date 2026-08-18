@@ -805,6 +805,42 @@ impl GuiApp {
         ui.add_space(4.0);
     }
 
+    /// Names the selected request when it carries both a raw body and form
+    /// fields, which Hurl cannot send together.
+    ///
+    /// Beside the undefined-variables banner and for the same reason: the
+    /// Body section says it in place and offers the fix, but a user who is
+    /// looking at Headers (or at nothing in particular) would otherwise press
+    /// Send, watch a 200 come back, and never learn that none of their form
+    /// fields left the machine. Recomputed each frame, like the banner above
+    /// it, so it appears and disappears with the request itself.
+    fn body_form_conflict_banner(&mut self, ui: &mut egui::Ui) {
+        let ci = self.active_ci();
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        if crate::request::body_form_conflicts(col).is_empty() {
+            return;
+        }
+        let th = self.theme;
+        let s = &self.strings;
+        egui::Frame::new()
+            .fill(th.panel)
+            .stroke(egui::Stroke::new(1.0, th.err))
+            .inner_margin(6.0)
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(s.gui_body_conflict_headline)
+                        .color(th.err)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(s.gui_body_conflict_detail).color(th.text));
+            });
+        ui.add_space(4.0);
+    }
+
     pub fn panel_frame<R>(
         &mut self,
         ui: &mut egui::Ui,
@@ -1200,6 +1236,7 @@ impl GuiApp {
                 return;
             }
             self.undefined_vars_banner(ui);
+            self.body_form_conflict_banner(ui);
             let avail = ui.available_height();
             let resp_h = self.session.gui.response_height.unwrap_or_else(|| {
                 (avail * self.session.response_pct as f32 / 100.0)

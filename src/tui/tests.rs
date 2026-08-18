@@ -11834,9 +11834,15 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
 
 // ── Body / Form-Multipart conflict ──────────────────────────────────────
 
+/// A body plus form fields is refused before anything is sent. It used to be
+/// caught deep in the runner and reported as a raw English string in the
+/// response pane; it is now a status of its own, in the user's language, that
+/// names the request — and the request panel says so before Send is ever
+/// pressed (see `sending is refused` below).
 #[test]
-fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_error() {
+fn sending_a_request_with_both_body_and_form_fields_is_refused_and_names_the_request() {
     let mut entry = HurlEntry {
+        title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://127.0.0.1:1/x".to_string(),
         body: Some("{\"a\":1}".to_string()),
@@ -11860,15 +11866,56 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
 
     app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
 
+    match &app.status {
+        Some(crate::i18n::Status::BodyFormConflict(names)) => {
+            assert_eq!(names, &vec!["Token".to_string()])
+        }
+        other => panic!("expected the run to be refused, got {other:?}"),
+    }
     let r = app.response.lock().unwrap();
     assert!(
         !r.loading,
         "must not be left stuck loading on a request that can never be built"
     );
+}
+
+/// …and it is visible without pressing Send at all: the whole trap is that the
+/// combination looks fine right up until something silently fails to arrive.
+#[test]
+fn the_request_panel_warns_about_a_body_and_form_fields_before_anything_is_sent() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut entry = HurlEntry {
+        title: "Token".to_string(),
+        method: "POST".to_string(),
+        url: "http://example.com/token".to_string(),
+        body: Some(" ".to_string()),
+        ..Default::default()
+    };
+    entry.form_fields.push(crate::hurl::FormField {
+        key: "grant_type".to_string(),
+        value: "client_credentials".to_string(),
+        enabled: true,
+        ..Default::default()
+    });
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+    app.active_tab = 1;
+    app.focus = Pane::Main;
+
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    let s = Strings::for_language(&Language::English);
+    // Compared on a distinctive fragment: the panel is narrower than the whole
+    // sentence, so the line is cut off on screen.
+    let fragment = &s.body_form_conflict_hint[..40.min(s.body_form_conflict_hint.len())];
     assert!(
-        r.error.contains("Body") && r.error.contains("Form"),
-        "the error should explain the conflict clearly: {}",
-        r.error
+        text.contains(fragment),
+        "the panel warns about the conflict, got:\n{text}"
     );
 }
 

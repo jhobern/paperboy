@@ -683,6 +683,36 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 }
 
+/// The in-editor error for a request that carries both a raw body and form
+/// fields. Returns whether the user asked to drop the body.
+///
+/// Deliberately an error rather than the advisory note this used to be: the
+/// request still *sends*, and sends wrongly, so a line of quiet text at the top
+/// of a section it may not even be looking at is not enough. The action is here
+/// because the usual cause is a body that is a single stray space — invisible,
+/// and not something anyone would think to go and delete.
+fn conflict_notice(ui: &mut egui::Ui, theme: &super::theme::GuiTheme, st: &Strings) -> bool {
+    let mut clear = false;
+    egui::Frame::new()
+        .fill(theme.panel)
+        .stroke(egui::Stroke::new(1.0, theme.err))
+        .inner_margin(6.0)
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(st.gui_body_conflict_headline)
+                    .color(theme.err)
+                    .strong(),
+            );
+            ui.label(RichText::new(st.gui_body_conflict_detail).color(theme.text));
+            if ui.button(st.gui_body_conflict_clear).clicked() {
+                clear = true;
+            }
+        });
+    clear
+}
+
 /// Human-readable heading for a section, used above each block in the "All"
 /// combined view. Reads the same i18n tab labels as the section tab bar.
 fn section_title(section: EditorSection, s: &Strings) -> &'static str {
@@ -748,27 +778,63 @@ fn draw_section(
             }
         }
         EditorSection::Body => {
-            if !entry.form_fields.is_empty() {
-                ui.colored_label(theme.pending, st.gui_form_mutually_exclusive);
+            // A raw body and form fields are mutually exclusive on the wire
+            // (see `HurlEntry::body_form_conflict`), so the section shows one
+            // or the other rather than stacking both: a request that posts a
+            // form gets the whole panel for its fields instead of half of it,
+            // and the choice being a control makes the exclusivity something
+            // the user can see rather than something they read about.
+            //
+            // Which one is showing is remembered per request (keyed by what
+            // names it) rather than being global, so switching between a JSON
+            // request and a form one doesn't keep flipping the panel; the
+            // default follows whatever the request already carries.
+            let id = egui::Id::new((
+                "body_mode",
+                entry.title.as_str(),
+                entry.method.as_str(),
+                entry.url.as_str(),
+            ));
+            let default_form = !entry.form_fields.is_empty();
+            let mut form_mode =
+                ui.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || default_form));
+            ui.horizontal(|ui| {
+                if super::widgets::selectable(ui, !form_mode, st.gui_body_mode_raw).clicked() {
+                    form_mode = false;
+                }
+                if super::widgets::selectable(ui, form_mode, st.gui_body_mode_form).clicked() {
+                    form_mode = true;
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(id, form_mode));
+            // Shown in both modes, and regardless of which one the offending
+            // content is in: the whole point is that the half you can't see is
+            // the half that breaks the request.
+            if entry.body_form_conflict() {
+                let cleared = conflict_notice(ui, theme, st);
+                if cleared {
+                    entry.body = None;
+                    changed = true;
+                }
+                ui.add_space(4.0);
             }
-            let mut body = entry.body.take().unwrap_or_default();
-            let resp = ui.add(
-                egui::TextEdit::multiline(&mut body)
-                    .code_editor()
-                    .desired_rows(10)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(st.gui_raw_body_hint),
-            );
-            if resp.changed() {
-                changed = true;
-            }
-            entry.body = if body.is_empty() { None } else { Some(body) };
-
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label(RichText::new(st.gui_form_fields).color(theme.dim));
-            if form_editor(ui, theme, st, &mut entry.form_fields, browse) {
-                changed = true;
+            if form_mode {
+                if form_editor(ui, theme, st, &mut entry.form_fields, browse) {
+                    changed = true;
+                }
+            } else {
+                let mut body = entry.body.take().unwrap_or_default();
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut body)
+                        .code_editor()
+                        .desired_rows(10)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(st.gui_raw_body_hint),
+                );
+                if resp.changed() {
+                    changed = true;
+                }
+                entry.body = if body.is_empty() { None } else { Some(body) };
             }
         }
         EditorSection::Auth => {
@@ -1090,6 +1156,113 @@ mod tests {
     /// must lay out *exactly* the buffer's characters — a length change would
     /// desync the cursor. This asserts the produced job text is identical to
     /// the input, `{{ VAR }}` tokens included (i.e. never substituted).
+    /// Every string a frame painted, so a section can be checked for by what
+    /// the user reads rather than by poking at internal state.
+    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Draw the Body section for `entry` and report what it painted.
+    fn draw_body_section(entry: &mut HurlEntry) -> Vec<String> {
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let st = Strings::for_language(&Language::English);
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut browse = None;
+        let mut out = Vec::new();
+        // Twice: the first pass is what sizes the fields.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |ui| {
+                draw_section(EditorSection::Body, ui, &th, &st, entry, &mut browse);
+            });
+            out = painted(&full.shapes);
+        }
+        out
+    }
+
+    /// A raw body and form fields are mutually exclusive on the wire, so the
+    /// section shows one or the other — and opens on whichever the request
+    /// already uses, rather than always giving half the panel to an empty body
+    /// box.
+    #[test]
+    fn the_body_section_opens_on_the_form_when_the_request_posts_one() {
+        let mut entry = HurlEntry {
+            form_fields: vec![crate::hurl::FormField {
+                key: "grant_type".into(),
+                value: "client_credentials".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shown = draw_body_section(&mut entry);
+        assert!(
+            shown.iter().any(|t| t == "grant_type"),
+            "the form field is shown: {shown:?}"
+        );
+        let st = Strings::for_language(&Language::English);
+        assert!(
+            !shown.iter().any(|t| t == st.gui_raw_body_hint),
+            "the empty body box is not taking up the panel: {shown:?}"
+        );
+    }
+
+    /// …and on the body when there are no fields, so a JSON request is not
+    /// made to hunt for its own editor.
+    #[test]
+    fn the_body_section_opens_on_the_body_when_there_are_no_form_fields() {
+        let mut entry = HurlEntry::default();
+        let shown = draw_body_section(&mut entry);
+        let st = Strings::for_language(&Language::English);
+        assert!(
+            shown.iter().any(|t| t == st.gui_raw_body_hint),
+            "the raw body editor is shown: {shown:?}"
+        );
+    }
+
+    /// The half that is hidden is exactly the half that breaks the request, so
+    /// carrying both has to be said out loud whichever one is on screen.
+    #[test]
+    fn carrying_both_a_body_and_form_fields_is_reported_in_the_section() {
+        let mut entry = HurlEntry {
+            body: Some(" ".into()),
+            form_fields: vec![crate::hurl::FormField {
+                key: "grant_type".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shown = draw_body_section(&mut entry);
+        let st = Strings::for_language(&Language::English);
+        assert!(
+            shown.iter().any(|t| t == st.gui_body_conflict_headline),
+            "the conflict is named: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|t| t == st.gui_body_conflict_clear),
+            "and the fix is offered: {shown:?}"
+        );
+    }
+
     #[test]
     fn editable_highlighter_preserves_the_buffer_text_verbatim() {
         let th = GuiTheme::from_spec(&Session::default().active_theme_spec());

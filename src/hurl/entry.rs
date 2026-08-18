@@ -481,6 +481,27 @@ impl HurlEntry {
         }
     }
 
+    /// Whether this request carries both a raw body and enabled form fields.
+    ///
+    /// Hurl builds both onto the same libcurl handle — the form is written with
+    /// `post_fields_copy`, then the body overwrites it with a second
+    /// `post_fields_copy` (a `[Multipart]` `httppost` is likewise overridden) —
+    /// so the form silently never reaches the wire. Worse, Hurl picks the
+    /// implicit `Content-Type` from the *form*, so the body goes out labelled
+    /// `application/x-www-form-urlencoded` (or `multipart/form-data`) whatever
+    /// it actually is. The request "succeeds" and the server is simply sent the
+    /// wrong thing, which is the hardest kind of failure to trace back — so a
+    /// front-end must treat this as an error rather than a hint.
+    ///
+    /// Any body at all counts, including one that is nothing but a stray space:
+    /// libcurl checks the bytes, not whether they mean anything, so a
+    /// whitespace body loses the form just as thoroughly as a real one. Only
+    /// *enabled* fields count, since a disabled row is a comment and never
+    /// reaches the wire (see the serializer).
+    pub fn body_form_conflict(&self) -> bool {
+        self.body.is_some() && self.form_fields.iter().any(|f| f.enabled)
+    }
+
     /// The key of the first enabled `[Form]`/`[Multipart]` file field with an
     /// empty path, if any. Such a field serializes to an invalid `file,;` line
     /// that PaperBoy's own parser rejects, so an entry carrying one can't be
@@ -776,6 +797,40 @@ mod tests {
                 .iter()
                 .any(|r| r.key.eq_ignore_ascii_case("content-length"))
         );
+    }
+
+    /// libcurl checks the body's *bytes*, not whether they mean anything, so a
+    /// body of one stray space replaces the form just as completely as a real
+    /// one — which is exactly how someone loses a form without touching it.
+    #[test]
+    fn even_a_whitespace_body_conflicts_with_form_fields() {
+        let mut e = HurlEntry {
+            form_fields: vec![FormField {
+                key: "grant_type".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!e.body_form_conflict(), "form fields alone are fine");
+        e.body = Some(" ".into());
+        assert!(e.body_form_conflict(), "a space is still a body");
+    }
+
+    /// A disabled row is written out as a comment and never reaches the wire,
+    /// so it can't be the thing a body is competing with.
+    #[test]
+    fn a_disabled_form_field_does_not_conflict_with_a_body() {
+        let e = HurlEntry {
+            body: Some("{}".into()),
+            form_fields: vec![FormField {
+                key: "grant_type".into(),
+                enabled: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!e.body_form_conflict());
     }
 
     #[test]

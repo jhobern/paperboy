@@ -3195,6 +3195,12 @@ pub(crate) fn draw_collection_main(
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
     let expected_status = entry.expected_status;
+    // A raw body plus form fields can't both be sent (see
+    // `HurlEntry::body_form_conflict`), and the run refuses it. Said here too,
+    // beside the request rather than only when Send is pressed: the whole
+    // problem is that the combination looks fine until something silently
+    // doesn't arrive.
+    let body_form_conflict = entry.body_form_conflict();
     // The Hurl view always renders (it's actual Hurl syntax, not JSON, so the
     // "invalid JSON" check below is meaningless for it and skipped entirely).
     let (buf, valid) = if hurl_view {
@@ -3277,6 +3283,12 @@ pub(crate) fn draw_collection_main(
     // buffer actually had (and its geometry would be one row short).
     if buf.ends_with('\n') {
         body_lines.push(Line::from(""));
+    }
+    if body_form_conflict {
+        top_lines.push(Line::styled(
+            s.body_form_conflict_hint.to_string(),
+            Style::default().fg(th.err),
+        ));
     }
     top_lines.push(if valid {
         Line::styled(

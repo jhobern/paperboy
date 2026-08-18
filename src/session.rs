@@ -789,6 +789,15 @@ impl Session {
         // Undefined variables are reported but never block: sending a literal
         // `{{ tokn }}` is valid Hurl, and refusing to run would be a worse
         // answer than running and saying why it failed.
+        // A raw body plus form fields is refused rather than reported: Hurl
+        // would send the body and silently drop every field, so the request
+        // "succeeds" having sent the wrong thing (see
+        // `HurlEntry::body_form_conflict`).
+        let conflicts = request::body_form_conflicts(&self.collections[ci]);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return Vec::new();
+        }
         let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
         self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.begin_request();
@@ -817,6 +826,12 @@ impl Session {
         if !blocking.is_empty() {
             self.status = Some(Status::WaitingSecrets(blocking.clone()));
             return blocking;
+        }
+        // Refused, not reported — see the single-request run.
+        let conflicts = request::body_form_conflicts_all(col);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return Vec::new();
         }
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
@@ -1421,6 +1436,43 @@ mod workspace_tests {
         assert!(s.collections[ci].entries[0].modified);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hurl builds a form and a body onto the same curl handle, so the body
+    /// wins and the form is never sent — and the request comes back 200 having
+    /// posted the wrong thing. Refusing is the only answer that tells anyone.
+    #[test]
+    fn a_request_with_both_a_body_and_form_fields_is_refused_rather_than_sent() {
+        let mut s = Session::default();
+        s.collections[0].entries = vec![crate::hurl::HurlEntry {
+            title: "Token".into(),
+            method: "POST".into(),
+            url: "https://example.com/token".into(),
+            // A single space: the shape of the accident this guards against.
+            body: Some(" ".into()),
+            form_fields: vec![crate::hurl::FormField {
+                key: "grant_type".into(),
+                value: "client_credentials".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        s.collections[0].selected_entry = 0;
+
+        s.run_entry(0);
+
+        match &s.status {
+            Some(crate::i18n::Status::BodyFormConflict(names)) => {
+                assert_eq!(names, &vec!["Token".to_string()], "it says which request");
+            }
+            other => panic!("expected the run to be refused, got {other:?}"),
+        }
+        assert_eq!(
+            s.collections[0].entries[0].last_run,
+            RunStatus::NotRun,
+            "nothing was sent"
+        );
     }
 
     /// A run's result belonged to whichever file the tab happened to have

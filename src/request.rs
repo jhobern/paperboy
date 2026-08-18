@@ -665,13 +665,17 @@ pub fn run_resolved_entry(
     out
 }
 
-/// Human-readable error for the one Hurl request shape that can never be
-/// built: a `[Form]`/`[Multipart]` section together with a raw `[Body]`.
-/// Hurl's own parser rejects this (a body ends the entry, so a following
-/// `[Form]`/`[Multipart]` header is a syntax error) but with a cryptic
-/// message; detecting it ourselves lets us surface something the user can
-/// act on directly on the status bar.
-const BODY_FORM_CONFLICT_ERROR: &str = "Can't send: a request can't have both a Body and Form/Multipart fields (Hurl doesn't support combining them) — remove one.";
+/// Human-readable error for the one request shape that must never be sent: a
+/// `[Form]`/`[Multipart]` section together with a raw body.
+///
+/// Hurl builds both onto the same libcurl handle, so the body overwrites the
+/// form and the fields never leave the machine — while the `Content-Type` is
+/// still chosen from the form, so the body goes out mislabelled. Nothing
+/// errors: the request returns a perfectly good response to something the user
+/// never asked for. Both front-ends refuse such a request before it gets here
+/// (see [`body_form_conflicts`]); this is the backstop for every other caller,
+/// and for a `.hurl` edited by hand.
+const BODY_FORM_CONFLICT_ERROR: &str = "Can't send: a request can't have both a Body and Form/Multipart fields (Hurl sends the body and silently drops the fields) — remove one.";
 
 /// Run the collection's selected entry on a background thread via the Hurl
 /// runner, mapping the result (status, body, headers, `[Asserts]`, error) into
@@ -688,7 +692,7 @@ pub fn run_collection(
     state: Arc<Mutex<ApiResponse>>,
 ) -> Option<Receiver<CaptureUpdate>> {
     let base = col.entries.get(col.selected_entry)?;
-    if base.body.is_some() && !base.form_fields.is_empty() {
+    if base.body_form_conflict() {
         let mut r = state.lock().unwrap();
         r.loading = false;
         r.error = BODY_FORM_CONFLICT_ERROR.to_string();
@@ -784,11 +788,7 @@ pub fn run_all_entries(
     if col.entries.is_empty() {
         return None;
     }
-    if let Some(bad) = col
-        .entries
-        .iter()
-        .find(|e| e.body.is_some() && !e.form_fields.is_empty())
-    {
+    if let Some(bad) = col.entries.iter().find(|e| e.body_form_conflict()) {
         let mut r = state.lock().unwrap();
         r.loading = false;
         r.error = format!("{} ({})", BODY_FORM_CONFLICT_ERROR, bad.title);
@@ -1079,6 +1079,42 @@ pub fn undefined_request_keys_all(col: &Collection, env: Option<&Environment>) -
     out.sort();
     out.dedup();
     out
+}
+
+/// The name of the selected request if it carries both a raw body and enabled
+/// form fields, which Hurl cannot send together — see
+/// [`HurlEntry::body_form_conflict`](crate::hurl::HurlEntry::body_form_conflict).
+///
+/// Unlike [`undefined_request_keys`] this *does* block the run. An undefined
+/// variable is sent literally and fails visibly; this one succeeds while
+/// quietly dropping every form field, so the only way for a user to find out is
+/// to notice that the server behaved as though the fields were never there.
+pub fn body_form_conflicts(col: &Collection) -> Vec<String> {
+    col.entries
+        .get(col.selected_entry)
+        .filter(|e| e.body_form_conflict())
+        .map(|e| vec![request_label(e)])
+        .unwrap_or_default()
+}
+
+/// [`body_form_conflicts`] across every entry — used by "Run All".
+pub fn body_form_conflicts_all(col: &Collection) -> Vec<String> {
+    col.entries
+        .iter()
+        .filter(|e| e.body_form_conflict())
+        .map(request_label)
+        .collect()
+}
+
+/// How a request is named in a message about it: its title, or its method and
+/// URL when it hasn't been given one (an untitled request is still worth
+/// pointing at).
+fn request_label(e: &crate::hurl::HurlEntry) -> String {
+    if e.title.trim().is_empty() {
+        format!("{} {}", e.method, e.url)
+    } else {
+        e.title.clone()
+    }
 }
 
 /// Drain background secret-resolution results, applying each to the matching
@@ -1660,6 +1696,7 @@ mod tests {
             form_fields: vec![FormField {
                 key: "f".into(),
                 value: "v".into(),
+                enabled: true,
                 ..Default::default()
             }],
             ..Default::default()
