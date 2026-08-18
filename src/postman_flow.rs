@@ -14,6 +14,7 @@
 //! channel while the user reads the estimate, and downloads on the same
 //! importer once they say go.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -170,6 +171,100 @@ impl Progress {
     }
 }
 
+/// One line of a collection preview: a folder, or a request under it.
+///
+/// Built from the conversion the import itself would do, so what the preview
+/// lists is exactly what the `.hurl` file would end up holding — a preview
+/// assembled straight from the Postman JSON would be a second, subtly
+/// different reading of it, and the one thing this screen must not do is
+/// promise something the import then doesn't deliver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreviewRow {
+    /// How deep in the folder tree, for indenting.
+    pub(crate) depth: usize,
+    pub(crate) label: String,
+    /// `None` for a folder; the HTTP method for a request.
+    pub(crate) method: Option<String>,
+}
+
+/// A fetched collection, ready to show: what is in it, and what wouldn't
+/// survive the import.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Preview {
+    pub(crate) uid: String,
+    pub(crate) name: String,
+    pub(crate) rows: Vec<PreviewRow>,
+    pub(crate) requests: usize,
+    /// The fidelity notes the conversion produced, as `"item: detail"` lines.
+    /// Worth showing *before* the import rather than in a file afterwards:
+    /// "this collection is 90 requests of which 12 use a feature Hurl has no
+    /// equivalent for" is exactly the sort of thing that decides whether this
+    /// is the workspace someone wanted.
+    pub(crate) notes: Vec<String>,
+}
+
+impl Preview {
+    /// Convert a fetched collection into its preview.
+    fn build(uid: String, name: String, body: &str) -> Self {
+        let converted = crate::postman::convert_postman(body);
+        let requests = converted.entries.len();
+        Self {
+            uid,
+            name,
+            rows: preview_rows(&converted.entries),
+            requests,
+            notes: converted
+                .notes
+                .iter()
+                .map(|n| {
+                    if n.item.is_empty() {
+                        n.detail.clone()
+                    } else {
+                        format!("{}: {}", n.item, n.detail)
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Turn the flat, folder-prefixed titles the conversion produces
+/// (`"Auth/Tokens/Refresh"`) back into an indented tree.
+///
+/// The entries are already in document order, so a folder is opened when it
+/// first appears and stays open until a title stops sharing it — no sorting,
+/// and the order on screen is the order the collection runs in.
+fn preview_rows(entries: &[crate::hurl::HurlEntry]) -> Vec<PreviewRow> {
+    let mut rows: Vec<PreviewRow> = Vec::new();
+    let mut open: Vec<&str> = Vec::new();
+    for entry in entries {
+        let mut parts: Vec<&str> = entry.title.split('/').collect();
+        // An untitled request still has to appear: it is a request the import
+        // would land, and a preview that quietly dropped it would be lying.
+        let name = parts.pop().unwrap_or_default();
+        let shared = open
+            .iter()
+            .zip(parts.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        open.truncate(shared);
+        for folder in &parts[shared..] {
+            rows.push(PreviewRow {
+                depth: open.len(),
+                label: (*folder).to_string(),
+                method: None,
+            });
+            open.push(folder);
+        }
+        rows.push(PreviewRow {
+            depth: open.len(),
+            label: name.to_string(),
+            method: Some(entry.method.clone()),
+        });
+    }
+    rows
+}
+
 /// What the front-end must act on. Everything else the flow handles itself.
 #[derive(Debug)]
 pub(crate) enum PostmanEvent {
@@ -221,6 +316,29 @@ pub(crate) struct PostmanFlow {
     /// Items that could not be fetched, accumulated as they are reported so the
     /// running import can show them rather than only the final summary.
     failures: Vec<(String, String)>,
+
+    // -- Preview -----------------------------------------------------------
+    /// Which of the plan's collections the confirmation step is pointing at.
+    /// Only the terminal UI moves it; the GUI previews whichever row was
+    /// clicked, and sets this so the two agree about what is open.
+    pub(crate) preview_sel: usize,
+    /// The collection currently being read, if any.
+    preview: Option<Preview>,
+    /// Previews already fetched, keyed by the id they were fetched with.
+    ///
+    /// Reopening one must be free: each fetch is a real API call on the same
+    /// tight bucket the import itself needs, and a user comparing two
+    /// collections would otherwise pay again every time they looked back.
+    preview_cache: HashMap<String, Preview>,
+    preview_rx: Option<Receiver<Result<Box<Preview>, String>>>,
+    /// The id being fetched, so the row can show a spinner and a second click
+    /// can't queue a second call.
+    preview_pending: Option<String>,
+    /// A failed preview. Deliberately *not* a [`Step::Failed`]: the preview is
+    /// an aside, and a workspace that is fine to import should not be thrown
+    /// out of its confirmation screen because an optional extra call was
+    /// rate-limited.
+    preview_error: Option<String>,
 
     // -- Worker -----------------------------------------------------------
     rx: Option<Receiver<Msg>>,
@@ -451,6 +569,12 @@ impl PostmanFlow {
             plan: None,
             progress: Progress::default(),
             failures: Vec::new(),
+            preview_sel: 0,
+            preview: None,
+            preview_cache: HashMap::new(),
+            preview_rx: None,
+            preview_pending: None,
+            preview_error: None,
             rx: None,
             progress_rx: None,
             go: None,
@@ -592,6 +716,141 @@ impl PostmanFlow {
 
     pub(crate) fn failures(&self) -> &[(String, String)] {
         &self.failures
+    }
+
+    // -- Preview -----------------------------------------------------------
+
+    /// The open preview, if one has been fetched.
+    pub(crate) fn preview(&self) -> Option<&Preview> {
+        self.preview.as_ref()
+    }
+
+    /// Whether a preview fetch is in flight, and for which collection id.
+    pub(crate) fn preview_pending(&self) -> Option<&str> {
+        self.preview_pending.as_deref()
+    }
+
+    pub(crate) fn preview_error(&self) -> Option<&str> {
+        self.preview_error.as_deref()
+    }
+
+    /// Whether `item` has already been read, so a front-end can offer
+    /// "Preview" and "Preview (cached)" differently — the first costs an API
+    /// call and the second doesn't, and that is worth knowing before clicking
+    /// on a rate-limited account.
+    pub(crate) fn preview_is_cached(&self, id: &str) -> bool {
+        self.preview_cache.contains_key(id)
+    }
+
+    /// The plan's collections, which is what there is to preview. Environments
+    /// are a list of names and values whose whole content is already implied
+    /// by the plan; a collection is the thing nobody can guess the inside of.
+    pub(crate) fn previewable(&self) -> &[crate::postman_api::ItemSummary] {
+        self.plan.as_ref().map_or(&[], |p| p.collections.as_slice())
+    }
+
+    /// Move the confirmation step's highlight, saturating at the ends.
+    pub(crate) fn move_preview_sel(&mut self, delta: isize) {
+        let len = self.previewable().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.preview_sel as isize + delta).clamp(0, len as isize - 1);
+        self.preview_sel = next as usize;
+    }
+
+    /// Read the collection at `index` of the plan: from the cache if it has
+    /// been read before, otherwise by fetching it.
+    ///
+    /// One API call, made on its own thread rather than through the parked
+    /// importer — the importer is waiting on the go-ahead and cannot be asked
+    /// to run an errand without giving up its place. That means this call is
+    /// not paced with the download's, which is why it is only ever made when
+    /// the user asks for it by name, once per collection.
+    pub(crate) fn preview_collection(&mut self, index: usize, s: &Strings) {
+        // One at a time: a second fetch would race the first into the cache
+        // and spend a call to show the same screen.
+        if self.preview_pending.is_some() {
+            return;
+        }
+        let Some((id, name)) = self
+            .previewable()
+            .get(index)
+            .map(|item| (item.fetch_id().to_string(), item.name.clone()))
+        else {
+            return;
+        };
+        self.preview_sel = index;
+        self.preview_error = None;
+        if let Some(cached) = self.preview_cache.get(&id) {
+            self.preview = Some(cached.clone());
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let raw = self.key.trim().to_string();
+        let base = self.base_url_opt();
+        let cache = Arc::clone(&self.resolved_key);
+        let bad_ref = s.postman_err_key_ref;
+        let pending = id.clone();
+        thread::spawn(move || {
+            let key = match resolve_key(&raw, &cache) {
+                Some(k) => k,
+                None => {
+                    let _ = tx.send(Err(bad_ref.to_string()));
+                    return;
+                }
+            };
+            let client = PostmanClient::new(key, base);
+            let msg = match client.get_collection(&id) {
+                Ok((body, _rate)) => Ok(Box::new(Preview::build(id, name, &body))),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(msg);
+        });
+        self.preview_rx = Some(rx);
+        self.preview_pending = Some(pending);
+    }
+
+    /// Preview whichever collection the highlight is on.
+    pub(crate) fn preview_selected(&mut self, s: &Strings) {
+        self.preview_collection(self.preview_sel, s);
+    }
+
+    /// Close the open preview, keeping it cached. Returns whether there was
+    /// one, so a front-end can let Esc close the preview before it means
+    /// "cancel the import".
+    pub(crate) fn close_preview(&mut self) -> bool {
+        self.preview_error = None;
+        self.preview.take().is_some()
+    }
+
+    /// Fold in a finished preview fetch.
+    fn drain_preview(&mut self) {
+        let Some(rx) = self.preview_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(preview)) => {
+                self.preview_cache
+                    .insert(preview.uid.clone(), (*preview).clone());
+                self.preview = Some(*preview);
+                self.preview_rx = None;
+                self.preview_pending = None;
+            }
+            Ok(Err(e)) => {
+                self.preview_error = Some(e);
+                self.preview_rx = None;
+                self.preview_pending = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            // The thread died without answering; nothing to report but the
+            // spinner must stop.
+            Err(TryRecvError::Disconnected) => {
+                self.preview_rx = None;
+                self.preview_pending = None;
+            }
+        }
     }
 
     pub(crate) fn workspaces(&self) -> &[WorkspaceSummary] {
@@ -780,6 +1039,9 @@ impl PostmanFlow {
         self.rx = Some(rx);
         self.progress_rx = Some(progress_rx);
         self.go = Some(go_tx);
+        // A fresh plan is coming, so anything left pointing into the old one
+        // would point at the wrong collection.
+        self.reset_preview();
         self.set_busy(Phase::Planning);
         self.step = Step::Confirm;
         true
@@ -822,7 +1084,19 @@ impl PostmanFlow {
     pub(crate) fn to_pick_workspace(&mut self) {
         self.chosen = None;
         self.plan = None;
+        self.reset_preview();
         self.step = Step::PickWorkspace;
+    }
+
+    /// Forget which collection was being looked at, but *not* what was read:
+    /// the cache is keyed by collection id, so a user who backs out to compare
+    /// two workspaces and returns doesn't buy the same pages twice.
+    fn reset_preview(&mut self) {
+        self.preview = None;
+        self.preview_rx = None;
+        self.preview_pending = None;
+        self.preview_error = None;
+        self.preview_sel = 0;
     }
 
     /// Return to the first step to fix the key or the URL, discarding the
@@ -835,6 +1109,7 @@ impl PostmanFlow {
         self.workspaces.clear();
         self.chosen = None;
         self.plan = None;
+        self.reset_preview();
         self.selected = 0;
         self.filter.clear();
         self.step = Step::Connect;
@@ -886,6 +1161,7 @@ impl PostmanFlow {
     /// UI) or each frame (the GUI).
     pub(crate) fn poll(&mut self, s: &Strings) -> Option<PostmanEvent> {
         self.drain_progress();
+        self.drain_preview();
 
         let result = self.rx.as_ref().map(Receiver::try_recv)?;
         match result {
@@ -1030,6 +1306,12 @@ impl PostmanFlow {
 
     pub(crate) fn seed_plan(&mut self, plan: ImportPlan) {
         self.plan = Some(plan);
+    }
+
+    /// Put a preview in the cache as though it had been fetched, so a
+    /// front-end's tests can open one without a Postman API behind them.
+    pub(crate) fn seed_preview_cache(&mut self, preview: Preview) {
+        self.preview_cache.insert(preview.uid.clone(), preview);
     }
 }
 
@@ -1679,6 +1961,187 @@ mod tests {
         assert_eq!(human_duration(Duration::from_millis(200), &s), "1 seconds");
         assert_eq!(human_duration(Duration::from_secs(45), &s), "45 seconds");
         assert_eq!(human_duration(Duration::from_secs(61), &s), "2 minutes");
+    }
+
+    fn item(name: &str) -> ItemSummary {
+        ItemSummary {
+            uid: format!("uid-{name}"),
+            id: format!("id-{name}"),
+            name: name.to_string(),
+        }
+    }
+
+    fn plan_of(collections: Vec<ItemSummary>) -> ImportPlan {
+        ImportPlan {
+            workspace_id: "ws".into(),
+            workspace_name: "Workspace".into(),
+            collections,
+            environments: Vec::new(),
+            remaining_month: None,
+        }
+    }
+
+    /// The whole point of reading a collection before importing it is seeing
+    /// its shape, so the flat, folder-prefixed titles the conversion produces
+    /// have to come back apart into folders.
+    #[test]
+    fn a_preview_rebuilds_the_folder_tree_from_prefixed_titles() {
+        let entry = |title: &str, method: &str| crate::hurl::HurlEntry {
+            title: title.to_string(),
+            method: method.to_string(),
+            ..Default::default()
+        };
+        let rows = preview_rows(&[
+            entry("Health", "GET"),
+            entry("Auth/Login", "POST"),
+            entry("Auth/Tokens/Refresh", "POST"),
+            entry("Auth/Logout", "POST"),
+            entry("Users/List", "GET"),
+        ]);
+        let shape: Vec<(usize, &str, Option<&str>)> = rows
+            .iter()
+            .map(|r| (r.depth, r.label.as_str(), r.method.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, "Health", Some("GET")),
+                (0, "Auth", None),
+                (1, "Login", Some("POST")),
+                (1, "Tokens", None),
+                (2, "Refresh", Some("POST")),
+                // Back up a level: the folder is not opened a second time.
+                (1, "Logout", Some("POST")),
+                (0, "Users", None),
+                (1, "List", Some("GET")),
+            ]
+        );
+    }
+
+    /// Built from the conversion the import itself would run, so what the
+    /// preview promises is what the `.hurl` file would hold — including the
+    /// warning that something in it will not survive.
+    #[test]
+    fn a_preview_counts_requests_and_repeats_what_would_not_convert() {
+        let json = r#"{
+            "info": {"name": "Sample", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [
+                {"name": "Ping", "request": {"method": "GET", "url": "https://example.net/ping"}},
+                {"name": "Folder", "item": [
+                    {"name": "Made up", "request": {"method": "GET", "url": "https://example.net/{{$guid}}"}}
+                ]}
+            ]
+        }"#;
+        let preview = Preview::build("uid-1".into(), "Sample".into(), json);
+        assert_eq!(preview.requests, 2);
+        assert_eq!(preview.uid, "uid-1");
+        assert!(
+            preview
+                .rows
+                .iter()
+                .any(|r| r.label == "Folder" && r.method.is_none()),
+            "the folder must be a folder, not a request: {:?}",
+            preview.rows
+        );
+        assert!(
+            preview.notes.iter().any(|n| n.contains("Made up")),
+            "the dynamic variable must be reported against its request: {:?}",
+            preview.notes
+        );
+    }
+
+    /// Each preview is a real API call on the same tight bucket the import
+    /// needs, so looking at one twice must not pay for it twice.
+    #[test]
+    fn a_collection_already_read_reopens_without_another_call() {
+        let s = s();
+        let mut flow = PostmanFlow::new();
+        flow.key = "PMAK-stub".into();
+        flow.seed_plan(plan_of(vec![item("a"), item("b")]));
+        flow.seed_preview_cache(Preview {
+            uid: "uid-a".into(),
+            name: "a".into(),
+            rows: Vec::new(),
+            requests: 3,
+            notes: Vec::new(),
+        });
+
+        assert!(flow.preview_is_cached("uid-a"));
+        flow.preview_collection(0, &s);
+        assert_eq!(flow.preview().map(|p| p.requests), Some(3));
+        assert!(
+            flow.preview_pending().is_none(),
+            "nothing may be fetched for a collection already read"
+        );
+    }
+
+    /// Closing keeps what was read: a user comparing two collections should
+    /// not buy the first one again on the way back to it.
+    #[test]
+    fn closing_a_preview_keeps_it_cached() {
+        let s = s();
+        let mut flow = PostmanFlow::new();
+        flow.seed_plan(plan_of(vec![item("a")]));
+        flow.seed_preview_cache(Preview {
+            uid: "uid-a".into(),
+            name: "a".into(),
+            requests: 1,
+            ..Preview::default()
+        });
+        flow.preview_collection(0, &s);
+
+        assert!(flow.close_preview(), "there was one open");
+        assert!(!flow.close_preview(), "and now there is not");
+        assert!(flow.preview().is_none());
+        assert!(flow.preview_is_cached("uid-a"), "still remembered");
+    }
+
+    /// A fresh plan points at different collections, so an open preview from
+    /// the last one would be answering a question nobody asked any more.
+    #[test]
+    fn replanning_forgets_the_open_preview_but_not_what_was_read() {
+        let s = s();
+        let mut flow = PostmanFlow::new();
+        flow.seed_plan(plan_of(vec![item("a")]));
+        flow.seed_preview_cache(Preview {
+            uid: "uid-a".into(),
+            name: "a".into(),
+            ..Preview::default()
+        });
+        flow.preview_collection(0, &s);
+        assert!(flow.preview().is_some());
+
+        flow.to_pick_workspace();
+        assert!(flow.preview().is_none(), "the open one is put away");
+        assert_eq!(flow.preview_sel, 0);
+        assert!(flow.preview_is_cached("uid-a"), "but not re-fetched later");
+    }
+
+    /// The highlight is driven by arrow keys, which must stop at the ends
+    /// rather than wrapping into an index the plan has nothing at.
+    #[test]
+    fn the_preview_highlight_stops_at_the_ends() {
+        let mut flow = PostmanFlow::new();
+        flow.seed_plan(plan_of(vec![item("a"), item("b"), item("c")]));
+
+        flow.move_preview_sel(-1);
+        assert_eq!(flow.preview_sel, 0);
+        flow.move_preview_sel(2);
+        assert_eq!(flow.preview_sel, 2);
+        flow.move_preview_sel(5);
+        assert_eq!(flow.preview_sel, 2);
+    }
+
+    /// With no plan there is nothing to point at; moving must not panic.
+    #[test]
+    fn the_preview_highlight_copes_with_nothing_to_show() {
+        let mut flow = PostmanFlow::new();
+        assert!(flow.previewable().is_empty());
+        flow.move_preview_sel(1);
+        assert_eq!(flow.preview_sel, 0);
+        flow.preview_collection(0, &s());
+        assert!(flow.preview().is_none());
+        assert!(flow.preview_pending().is_none());
     }
 }
 

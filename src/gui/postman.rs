@@ -14,7 +14,8 @@ use eframe::egui;
 
 use crate::i18n::{Status, Strings};
 use crate::postman_flow::{
-    KeySource, PostmanEvent, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
+    KeySource, PostmanEvent, PostmanFlow, Preview, Step, default_dest_name, human_duration,
+    item_kind_label,
 };
 use crate::postman_import::{ImportFormat, ImportSummary, WaitReason};
 
@@ -285,6 +286,10 @@ enum UiAction {
     BrowseDest,
     BackToConnect,
     BackToWorkspaces,
+    /// Read the plan's nth collection, so the user can see what is inside a
+    /// workspace before spending the rest of their API budget on it.
+    Preview(usize),
+    ClosePreview,
 }
 
 #[derive(Clone, Copy)]
@@ -384,6 +389,12 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         }
         UiAction::Confirm => {
             w.flow.confirm();
+        }
+        UiAction::Preview(i) => {
+            w.flow.preview_collection(i, &app.strings);
+        }
+        UiAction::ClosePreview => {
+            w.flow.close_preview();
         }
         UiAction::BrowseDest => {
             let seed = std::path::PathBuf::from(w.flow.dest.trim());
@@ -750,6 +761,16 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         ui.colored_label(colors.err, s.postman_budget_warning);
     }
 
+    // What is actually in there. The plan can only count collections, and a
+    // count is no help deciding whether this is the workspace someone meant —
+    // so each one can be opened and read before anything bulk is fetched.
+    // Backing out here is still free: nothing but this has been downloaded.
+    if !w.flow.previewable().is_empty() {
+        ui.add_space(8.0);
+        ui.colored_label(colors.dim, s.postman_preview_cost);
+        draw_preview_list(ui, w, colors, s, &mut action);
+    }
+
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button(s.postman_start).clicked() {
@@ -760,6 +781,118 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         }
     });
     action
+}
+
+/// The plan's collections, each openable, with whichever one is open shown
+/// underneath. Kept in the dialog rather than a window of its own: the
+/// question it answers ("is this the workspace I wanted?") is the question the
+/// confirmation step is already asking.
+fn draw_preview_list(
+    ui: &mut egui::Ui,
+    w: &Wizard,
+    colors: UiColors,
+    s: &Strings,
+    action: &mut UiAction,
+) {
+    let pending = w.flow.preview_pending().map(str::to_string);
+    let open = w.flow.preview().map(|p| p.uid.clone());
+    let items: Vec<(String, String, bool)> = w
+        .flow
+        .previewable()
+        .iter()
+        .map(|i| {
+            let id = i.fetch_id().to_string();
+            let cached = w.flow.preview_is_cached(&id);
+            (id, i.name.clone(), cached)
+        })
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .id_salt("postman_preview_list")
+        .show(ui, |ui| {
+            for (index, (id, name, cached)) in items.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let busy = pending.as_deref() == Some(id.as_str());
+                    let is_open = open.as_deref() == Some(id.as_str());
+                    if busy {
+                        ui.spinner();
+                    }
+                    let label = if *cached {
+                        s.postman_preview_cached
+                    } else {
+                        s.postman_preview_action
+                    };
+                    // Only one fetch runs at a time, so the rest go quiet
+                    // rather than queueing calls the user can't see.
+                    let can = pending.is_none();
+                    if is_open {
+                        if ui.button(s.gui_close).clicked() {
+                            *action = UiAction::ClosePreview;
+                        }
+                    } else if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                        *action = UiAction::Preview(index);
+                    }
+                    ui.colored_label(colors.text, name);
+                });
+                if open.as_deref() == Some(id.as_str())
+                    && let Some(preview) = w.flow.preview()
+                {
+                    draw_preview_body(ui, preview, colors, s);
+                }
+            }
+        });
+
+    if let Some(err) = w.flow.preview_error() {
+        ui.colored_label(colors.err, err);
+    }
+    if w.flow.preview_pending().is_some() {
+        ui.colored_label(colors.accent, s.postman_preview_busy);
+    }
+}
+
+/// One opened collection: its requests in their folders, then what would not
+/// survive the conversion.
+fn draw_preview_body(ui: &mut egui::Ui, preview: &Preview, colors: UiColors, s: &Strings) {
+    ui.indent("postman_preview_body", |ui| {
+        if preview.rows.is_empty() {
+            ui.colored_label(colors.dim, s.postman_preview_empty);
+            return;
+        }
+        ui.colored_label(
+            colors.dim,
+            format!("{} {}", preview.requests, s.postman_preview_requests),
+        );
+        for row in &preview.rows {
+            ui.horizontal(|ui| {
+                // Indent by depth: the folders are the whole point of reading
+                // this, and a flat list would be the very complaint the
+                // workspace tree was reshaped to answer.
+                ui.add_space(row.depth as f32 * 12.0);
+                let label = if row.label.trim().is_empty() {
+                    s.postman_preview_untitled
+                } else {
+                    row.label.as_str()
+                };
+                match &row.method {
+                    Some(method) => {
+                        ui.colored_label(colors.accent, method);
+                        ui.colored_label(colors.text, label);
+                    }
+                    None => {
+                        ui.colored_label(colors.dim, format!("{label}/"));
+                    }
+                }
+            });
+        }
+        if !preview.notes.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(colors.err, s.postman_preview_notes);
+            for note in &preview.notes {
+                ui.colored_label(colors.dim, note);
+            }
+        }
+    });
 }
 
 fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
@@ -1181,6 +1314,111 @@ mod tests {
         let mut w = wizard();
         w.flow.seed_step(Step::Downloading);
         assert!(w.working());
+    }
+
+    /// A plan can only count collections, and a count does not answer "is this
+    /// the workspace I meant?". Opening one lists what the import would land,
+    /// folders and all, before any of it is fetched.
+    #[test]
+    fn the_confirmation_step_can_read_a_collection_before_importing_it() {
+        use crate::postman_api::ItemSummary;
+        use crate::postman_flow::PreviewRow;
+        use eframe::egui;
+
+        fn painted(app: &mut GuiApp) -> String {
+            fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let ctx = egui::Context::default();
+            app.theme.apply(&ctx);
+            let mut last = Vec::new();
+            for _ in 0..3 {
+                let out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let ctx = ui.ctx().clone();
+                        super::show(app, &ctx);
+                    },
+                );
+                last.clear();
+                out.shapes.iter().for_each(|sh| walk(&sh.shape, &mut last));
+            }
+            last.join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        let mut app = GuiApp::for_test(Session::default());
+        app.postman.open();
+        app.postman.seed_step_for_audit(Step::Confirm);
+        let flow = &mut app.postman.flow.as_mut().unwrap().flow;
+        flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: vec![ItemSummary {
+                uid: "uid-a".to_string(),
+                id: "id-a".to_string(),
+                name: "Billing".to_string(),
+            }],
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        // Cached, so the test needs no Postman API behind it.
+        flow.seed_preview_cache(Preview {
+            uid: "uid-a".to_string(),
+            name: "Billing".to_string(),
+            rows: vec![
+                PreviewRow {
+                    depth: 0,
+                    label: "Invoices".to_string(),
+                    method: None,
+                },
+                PreviewRow {
+                    depth: 1,
+                    label: "Create invoice".to_string(),
+                    method: Some("POST".to_string()),
+                },
+            ],
+            requests: 1,
+            notes: vec!["Create invoice: uses a Postman sandbox script".to_string()],
+        });
+
+        // The collection is offered, but nothing of its content is shown until
+        // it is asked for — that is the API call this screen exists to avoid
+        // spending by accident.
+        let before = painted(&mut app);
+        assert!(before.contains("Billing"), "the collection is listed");
+        assert!(
+            !before.contains("Create invoice"),
+            "nothing is read until asked for, got {before:?}"
+        );
+
+        let s = s();
+        app.postman
+            .flow
+            .as_mut()
+            .unwrap()
+            .flow
+            .preview_collection(0, &s);
+        let after = painted(&mut app);
+        assert!(after.contains("Invoices"), "the folder must show");
+        assert!(after.contains("Create invoice"), "and the request under it");
+        assert!(after.contains("POST"), "with its method");
+        assert!(
+            after.contains("sandbox script"),
+            "and what would not convert, which is worth knowing beforehand"
+        );
     }
 
     /// The point of hiding it: the status bar keeps saying how far along the

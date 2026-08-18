@@ -12,6 +12,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A Postman collection can be read before it is imported.** A workspace list
+  is a list of names, and a name is no help deciding whether this is the
+  workspace you meant — the previous screen could only say "23 collections, 500
+  environments, about eleven minutes". The confirmation step now lists the
+  workspace's collections and opens any of them: the requests, in their
+  folders, exactly as the import would land them, plus anything in that
+  collection that would not convert cleanly. It is built by running the real
+  conversion over the fetched collection, so it cannot promise something the
+  import then doesn't deliver.
+
+  It reads collections rather than whole workspaces on purpose. Postman has no
+  "list the requests in a workspace" endpoint — the only way to know what is in
+  one is to fetch every collection in it, one call each, on the same rate limit
+  the import itself has to live inside. Fetching all of them to answer a
+  question about one would spend the budget the screen exists to protect. So a
+  collection is fetched only when asked for by name, one at a time, and each is
+  remembered once read: opening it again, or coming back to it after looking at
+  another workspace, costs nothing. `p` in the terminal UI, a button per row in
+  the GUI.
+
 - **A request keeps the prose that explains it.** Postman lets each request
   carry a description, and 88 requests in the exports on hand use it — often as
   the only statement anywhere of what the request is for or what it needs. The

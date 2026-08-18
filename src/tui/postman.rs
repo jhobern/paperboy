@@ -9,7 +9,7 @@ use super::listscroll::ListScroll;
 use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
@@ -76,6 +76,10 @@ pub(crate) struct PostmanWizard {
     /// Where the workspace list is scrolled to, carried between frames (see
     /// [`ListScroll`]).
     pub(crate) list_scroll: ListScroll,
+    /// How far down an open collection preview has been scrolled. Lives here
+    /// rather than in the flow because it is a property of this screen, not of
+    /// what was fetched — the GUI scrolls the same preview with its own.
+    pub(crate) preview_scroll: usize,
     /// Key *references* used before, most recent first, straight from the
     /// session. Filtered to the chosen source before being shown, so switching
     /// to SSM doesn't offer 1Password paths.
@@ -107,6 +111,7 @@ impl PostmanWizard {
             option_row: 0,
             before_error: Step::Connect,
             list_scroll: ListScroll::default(),
+            preview_scroll: 0,
             recent,
             recent_sel: None,
             done: None,
@@ -574,6 +579,12 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let Some(plan) = w.flow.plan() else {
         return;
     };
+    // An open preview takes the screen: it is a list to read, and reading it
+    // beside the summary would leave neither enough room to be useful.
+    if let Some(preview) = w.flow.preview() {
+        draw_preview(f, w, preview, s, th, title);
+        return;
+    }
     let width = 78.min(f.area().width);
     let note_h = wrapped_height(s.postman_rate_limit_note, width.saturating_sub(2));
     let warn_h = if plan.strains_monthly_budget() {
@@ -583,15 +594,27 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     };
     // Sized to its content — no trailing empty rows, which on a four-line
     // screen read as "something failed to draw".
-    let area = centered_rect(width, note_h + warn_h + 5, f.area());
+    // The collections, so the workspace can be read into before any of it is
+    // downloaded. Bounded so a 60-collection workspace still leaves the
+    // summary and the estimate on screen.
+    let list_h = match w.flow.previewable().len() {
+        0 => 0,
+        n => (n as u16).min(8) + 2, // + the cost note and a blank line
+    };
+    let area = centered_rect(width, note_h + warn_h + list_h + 5, f.area());
     f.render_widget(Clear, area);
     // The hint is on the border like everywhere else, but in the accent rather
     // than dim: nothing on this screen is waiting for anything else, and a dim
     // line here was read as a status message, leaving people parked wondering
     // why nothing was downloading.
+    let hint = if w.flow.previewable().is_empty() {
+        s.postman_confirm_hint
+    } else {
+        s.postman_preview_hint
+    };
     let block = panel_hinted_styled(
         title.to_string(),
-        s.postman_confirm_hint,
+        hint,
         Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         th,
     );
@@ -603,6 +626,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         Constraint::Length(note_h), // rate limit note
         Constraint::Length(1),      // estimate
         Constraint::Length(warn_h), // budget warning
+        Constraint::Length(list_h), // collections to preview
     ])
     .split(inner);
 
@@ -649,6 +673,122 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             rows[4],
         );
     }
+    if list_h > 0 {
+        draw_preview_list(f, w, s, th, rows[5]);
+    }
+}
+
+/// The plan's collections, highlighted one at a time, with a line saying what
+/// opening one costs. Nothing is fetched until asked for by name.
+fn draw_preview_list(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, area: Rect) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    let status = match (w.flow.preview_pending(), w.flow.preview_error()) {
+        (Some(_), _) => Line::styled(s.postman_preview_busy, Style::default().fg(th.accent)),
+        (None, Some(err)) => Line::styled(err.to_string(), Style::default().fg(th.err)),
+        (None, None) => Line::styled(s.postman_preview_cost, Style::default().fg(th.dim)),
+    };
+    f.render_widget(Paragraph::new(status), rows[0]);
+
+    let height = rows[1].height as usize;
+    let items = w.flow.previewable();
+    // Keep the highlight on screen without a scrollbar's worth of machinery:
+    // the window simply follows the selection.
+    let first = w.flow.preview_sel.saturating_sub(height.saturating_sub(1));
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, item)| {
+            let selected = i == w.flow.preview_sel;
+            let mark = if selected { "> " } else { "  " };
+            let seen = if w.flow.preview_is_cached(item.fetch_id()) {
+                " ·"
+            } else {
+                ""
+            };
+            let style = if selected {
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.text)
+            };
+            Line::styled(format!("{mark}{}{seen}", item.name), style)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), rows[1]);
+}
+
+/// One collection, read out: its requests in their folders, then whatever the
+/// conversion would not manage exactly.
+fn draw_preview(
+    f: &mut Frame,
+    w: &PostmanWizard,
+    preview: &crate::postman_flow::Preview,
+    s: &Strings,
+    th: &Theme,
+    title: &str,
+) {
+    let width = 78.min(f.area().width);
+    let height = (f.area().height * 4 / 5).max(6.min(f.area().height));
+    let area = centered_rect(width, height, f.area());
+    f.render_widget(Clear, area);
+    let block = panel_hinted_styled(
+        format!("{title} \u{2014} {}", preview.name),
+        s.postman_preview_close_hint,
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        th,
+    );
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                "{} \u{b7} {} {}",
+                s.postman_preview_title, preview.requests, s.postman_preview_requests
+            ),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        )),
+        rows[0],
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    if preview.rows.is_empty() {
+        lines.push(Line::styled(
+            s.postman_preview_empty,
+            Style::default().fg(th.dim),
+        ));
+    }
+    for row in &preview.rows {
+        let indent = " ".repeat(row.depth * 2);
+        let label = if row.label.trim().is_empty() {
+            s.postman_preview_untitled
+        } else {
+            row.label.as_str()
+        };
+        lines.push(match &row.method {
+            Some(method) => Line::from(vec![
+                Span::styled(format!("{indent}{method} "), Style::default().fg(th.accent)),
+                Span::styled(label.to_string(), Style::default().fg(th.text)),
+            ]),
+            None => Line::styled(format!("{indent}{label}/"), Style::default().fg(th.dim)),
+        });
+    }
+    if !preview.notes.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            s.postman_preview_notes,
+            Style::default().fg(th.err),
+        ));
+        for note in &preview.notes {
+            lines.push(Line::styled(note.clone(), Style::default().fg(th.dim)));
+        }
+    }
+    // Clamped so scrolling past the end can't leave an empty panel.
+    let max = lines.len().saturating_sub(rows[1].height as usize);
+    let scroll = w.preview_scroll.min(max);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), rows[1]);
 }
 
 fn draw_downloading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {

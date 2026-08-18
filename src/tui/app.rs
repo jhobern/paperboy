@@ -3888,16 +3888,57 @@ impl TuiApp {
                     _ => {}
                 }
             }
-            PostmanStage::Confirm => match key.code {
-                KeyCode::Esc => {
-                    w.flow.cancel();
+            PostmanStage::Confirm => {
+                // An open preview owns the keys: it is a list being read, and
+                // the screen underneath is only waiting.
+                if w.flow.preview().is_some() {
+                    match key.code {
+                        // Enter closes rather than imports. Starting a long
+                        // download from a screen that is showing something
+                        // else — and not the estimate — is not a thing to do
+                        // on one keystroke.
+                        KeyCode::Esc | KeyCode::Enter => {
+                            w.flow.close_preview();
+                            w.preview_scroll = 0;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            w.preview_scroll = w.preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            w.preview_scroll = w.preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            w.preview_scroll = w.preview_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp => {
+                            w.preview_scroll = w.preview_scroll.saturating_sub(10);
+                        }
+                        KeyCode::Home => w.preview_scroll = 0,
+                        _ => {}
+                    }
+                    self.overlay = Some(Overlay::PostmanImport(w));
                     return;
                 }
-                KeyCode::Enter => {
-                    w.flow.confirm();
+                match key.code {
+                    KeyCode::Esc => {
+                        w.flow.cancel();
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        w.flow.confirm();
+                    }
+                    KeyCode::Down => w.flow.move_preview_sel(1),
+                    KeyCode::Up => w.flow.move_preview_sel(-1),
+                    // Reading one collection costs a single API call, so it is
+                    // asked for explicitly rather than happening on arrival.
+                    KeyCode::Char('p') => {
+                        w.preview_scroll = 0;
+                        let strings = Strings::for_language(&self.language);
+                        w.flow.preview_selected(&strings);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             PostmanStage::Downloading => {
                 if key.code == KeyCode::Esc {
                     w.flow.cancel();

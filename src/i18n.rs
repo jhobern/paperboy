@@ -1223,6 +1223,17 @@ strings! {
     postman_confirm_title => "Ready to import", "Prêt à importer", "Klar til at importere";
     postman_error_hint => "Esc back", "Échap retour", "Esc tilbage";
     postman_confirm_hint => "Enter import · Esc back", "Entrée importer · Échap retour", "Enter importér · Esc tilbage";
+    postman_preview_action => "Preview", "Aperçu", "Forhåndsvis";
+    postman_preview_cached => "Preview (already read)", "Aperçu (déjà lu)", "Forhåndsvis (allerede læst)";
+    postman_preview_title => "What this collection holds", "Contenu de cette collection", "Hvad denne samling indeholder";
+    postman_preview_busy => "Reading the collection…", "Lecture de la collection…", "Læser samlingen…";
+    postman_preview_cost => "Reading one costs a single API call; each is remembered once read.", "En lire une coûte un seul appel d'API ; chacune est mémorisée une fois lue.", "At læse én koster ét enkelt API-kald; hver huskes, når den er læst.";
+    postman_preview_empty => "This collection has no requests.", "Cette collection ne contient aucune requête.", "Denne samling har ingen forespørgsler.";
+    postman_preview_requests => "requests", "requêtes", "forespørgsler";
+    postman_preview_notes => "Would not convert exactly:", "Ne se convertirait pas exactement :", "Ville ikke blive konverteret nøjagtigt:";
+    postman_preview_hint => "↑↓ choose · p preview · Enter import · Esc back", "↑↓ choisir · p aperçu · Entrée importer · Échap retour", "↑↓ vælg · p forhåndsvis · Enter importér · Esc tilbage";
+    postman_preview_close_hint => "↑↓ scroll · Esc close", "↑↓ défiler · Échap fermer", "↑↓ rul · Esc luk";
+    postman_preview_untitled => "(untitled)", "(sans titre)", "(uden titel)";
     postman_rate_limit_note => "Paced to stay inside Postman’s rate limit.", "Rythme adapté à la limite de débit de Postman.", "Tempo tilpasset Postmans hastighedsgrænse.";
     postman_background => "Importing from Postman", "Import depuis Postman", "Importerer fra Postman";
     postman_background_button => "Continue in the background", "Continuer en arrière-plan", "Fortsæt i baggrunden";

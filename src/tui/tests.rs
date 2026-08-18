@@ -26207,6 +26207,95 @@ fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
 }
 
+/// A workspace is a list of collection names until something opens one, and a
+/// name is no help deciding whether this is the workspace you meant. `p` reads
+/// one — and Esc puts it away again rather than cancelling the whole import,
+/// which is what Esc means on the screen underneath.
+#[test]
+fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
+    use crate::postman_api::ItemSummary;
+    use crate::postman_flow::{Preview, PreviewRow};
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Confirm);
+        w.flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: vec![
+                ItemSummary {
+                    uid: "uid-a".to_string(),
+                    id: "id-a".to_string(),
+                    name: "Billing".to_string(),
+                },
+                ItemSummary {
+                    uid: "uid-b".to_string(),
+                    id: "id-b".to_string(),
+                    name: "Shipping".to_string(),
+                },
+            ],
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        // Cached, so the keystroke does not want a Postman API behind it.
+        w.flow.seed_preview_cache(Preview {
+            uid: "uid-b".to_string(),
+            name: "Shipping".to_string(),
+            rows: vec![PreviewRow {
+                depth: 0,
+                label: "Rates".to_string(),
+                method: Some("GET".to_string()),
+            }],
+            requests: 1,
+            notes: Vec::new(),
+        });
+    }
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        postman_wizard(&mut app)
+            .flow
+            .preview()
+            .map(|p| p.name.clone()),
+        Some("Shipping".to_string()),
+        "the highlighted collection must be the one opened"
+    );
+
+    // The panel really draws what it fetched, folders and all.
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(painted.contains("Rates"), "the request must be listed");
+        assert!(painted.contains("GET"), "with its method");
+    }
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        postman_wizard(&mut app).flow.preview().is_none(),
+        "Esc closes the preview"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "and leaves the import alone"
+    );
+    // Only now does Esc mean "give up on the import".
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none());
+}
+
 #[test]
 fn every_step_of_the_postman_wizard_renders() {
     use ratatui::{Terminal, backend::TestBackend};
