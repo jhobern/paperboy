@@ -1827,21 +1827,7 @@ fn file_stem(path: &str) -> String {
 
 /// The i18n label for the `i`th editable theme colour (mirrors the terminal
 /// UI's `theme_editor::color_label`, reading the same `Strings` fields).
-fn color_label(s: &Strings, i: usize) -> &'static str {
-    match i {
-        0 => s.theme_c_bg,
-        1 => s.theme_c_panel,
-        2 => s.theme_c_text,
-        3 => s.theme_c_dim,
-        4 => s.theme_c_accent,
-        5 => s.theme_c_ok,
-        6 => s.theme_c_err,
-        7 => s.theme_c_subst,
-        8 => s.theme_c_pending,
-        9 => s.theme_c_select_bg,
-        _ => s.theme_c_select_fg,
-    }
-}
+use crate::theme::color_label;
 
 #[cfg(test)]
 mod tests {

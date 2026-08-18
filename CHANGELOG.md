@@ -12,6 +12,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Themes name their own surfaces, and four new ones are offered.** Every
+  panel, field, button and border used to be mixed out of one `panel` colour
+  with such small factors that the field wash and the button wash landed two
+  RGB points apart — so a dark theme was a flat sheet with slightly different
+  sheets drawn on it, which is exactly how it looked. A theme now names its
+  field, raised and recessed surfaces and its border colour outright, the
+  ground sits further from the panels above it, and borders no longer borrow
+  the colour used for dim *text*. Graphite is retuned on the new roles, and
+  there are four more themes to choose from: **Midnight** (deep blue),
+  **Evergreen** (slate green), **Espresso** (warm brown) and **Daylight** —
+  the first light theme, with the GUI now taking its light/dark furniture from
+  the theme's own ground. The three language presets are retuned too, without
+  the school-bus yellow selection. Custom themes saved before this change keep
+  exactly the colours they had: the four new ones are optional when loading and
+  fall back to the shades the app used to derive.
+
 - **A raw body and form fields are now an error, not a note.** Hurl builds both
   onto the same libcurl handle: the form is written first, then the body
   overwrites it, and the `Content-Type` is still taken from the form — so the

@@ -295,7 +295,10 @@ impl LeftRow {
 }
 
 pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> {
-    let border = if focused { th.accent } else { th.dim };
+    // An unfocused border is structure, not text: `line` rather than `dim` so a
+    // theme can quieten its panel edges without also dimming the words it uses
+    // `dim` for (see `theme::Theme::line`).
+    let border = if focused { th.accent } else { th.line };
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -2275,7 +2278,10 @@ pub(crate) fn draw_collection_left(
             run_hint.push_str(&workspace_hint);
         }
     }
-    let border = if focused { th.accent } else { th.dim };
+    // An unfocused border is structure, not text: `line` rather than `dim` so a
+    // theme can quieten its panel edges without also dimming the words it uses
+    // `dim` for (see `theme::Theme::line`).
+    let border = if focused { th.accent } else { th.line };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))

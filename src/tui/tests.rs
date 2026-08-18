@@ -17605,16 +17605,28 @@ fn the_theme_list_starts_with_automatic_then_the_built_in_presets() {
     let s = crate::i18n::Strings::for_language(&app.language);
     let entries = app.theme_picker_entries(&s);
     assert_eq!(entries[0], s.theme_auto, "row 0 follows the language");
+    // Listed from the shared table rather than spelled out, so adding a preset
+    // is one edit rather than two.
+    let presets: Vec<String> = super::theme::builtin_presets()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(&entries[1..], &presets[..]);
     assert_eq!(
-        &entries[1..],
-        &[
-            super::theme::PRESET_DEFAULT.to_string(),
-            super::theme::PRESET_ENGLISH.to_string(),
-            super::theme::PRESET_FRENCH.to_string(),
-            super::theme::PRESET_DANISH.to_string(),
-        ],
-        "the neutral default leads, then one preset per bundled language"
+        entries[1],
+        super::theme::PRESET_DEFAULT,
+        "the neutral default leads"
     );
+    for lang in [
+        super::theme::PRESET_ENGLISH,
+        super::theme::PRESET_FRENCH,
+        super::theme::PRESET_DANISH,
+    ] {
+        assert!(
+            presets.iter().any(|p| p == lang),
+            "the language presets are still offered: {lang}"
+        );
+    }
 }
 
 #[test]
@@ -17627,21 +17639,22 @@ fn selecting_a_preset_in_the_picker_activates_it() {
     );
 
     open_theme_editor(&mut app); // opens on the active theme (Graphite, row 1)
-    // Graphite(1) -> Britannia(2) -> Parisian Purple(3) -> Dannebrog(4).
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
+    // Down once per preset after the first, to land on the last one whatever
+    // the list holds.
+    let presets = super::theme::builtin_presets();
+    for _ in 1..presets.len() {
+        press(&mut app, KeyCode::Down);
+    }
     assert_eq!(
         app.active_theme.as_deref(),
-        Some(super::theme::PRESET_DANISH),
+        Some(presets.last().unwrap().name.as_str()),
         "hovering a preset activates it live"
     );
 
     // Walking all the way back up to row 0 clears the manual choice.
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
+    for _ in 0..presets.len() {
+        press(&mut app, KeyCode::Up);
+    }
     assert_eq!(
         app.active_theme, None,
         "row 0 goes back to following the language"
@@ -17713,12 +17726,13 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
     for c in "Nordic".chars() {
         press(&mut app, KeyCode::Char(c));
     }
-    // Move focus into the base list and pick Dannebrog (Graphite, Britannia,
-    // Parisian, Dannebrog -> down three times from the first entry).
-    press(&mut app, KeyCode::Down); // Name -> Base (Graphite)
-    press(&mut app, KeyCode::Down); // -> Britannia
-    press(&mut app, KeyCode::Down); // -> Parisian Purple
-    press(&mut app, KeyCode::Down); // -> Dannebrog
+    // Move focus into the base list and walk to the last preset (the first
+    // Down moves Name -> Base, then one per preset after the first).
+    let presets = super::theme::builtin_presets();
+    press(&mut app, KeyCode::Down);
+    for _ in 1..presets.len() {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Enter);
 
     let created = app
@@ -17726,10 +17740,10 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
         .iter()
         .find(|t| t.name == "Nordic")
         .expect("theme created");
-    let dannebrog = super::theme::preset_for_language(&Language::Danish);
+    let base = presets.last().unwrap();
     assert_eq!(
         created.color(0),
-        dannebrog.color(0),
+        base.color(0),
         "the new theme copies the chosen base's colours"
     );
 }
@@ -18015,8 +18029,8 @@ fn ctrl_d_deletes_a_custom_theme_but_never_a_preset() {
     );
     assert_eq!(
         app.all_themes().len(),
-        4,
-        "the built-in presets remain (Graphite plus one per language)"
+        super::theme::builtin_presets().len(),
+        "every built-in preset remains"
     );
 }
 

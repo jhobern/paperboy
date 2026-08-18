@@ -80,6 +80,10 @@ strings! {
     theme_c_pending => "Pending", "En attente", "Afventer";
     theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
     theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
+    theme_c_field => "Field background", "Fond des champs", "Feltbaggrund";
+    theme_c_raised => "Raised surface", "Surface en relief", "Hævet overflade";
+    theme_c_sunken => "Recessed surface", "Surface en creux", "Sænket overflade";
+    theme_c_line => "Borders and separators", "Bordures et séparateurs", "Kanter og adskillere";
     theme_saved => "Theme saved:", "Thème enregistré\u{a0}:", "Tema gemt:";
     theme_deleted => "Theme deleted:", "Thème supprimé\u{a0}:", "Tema slettet:";
     theme_name_required => "Give the theme a name before saving", "Donnez un nom au thème avant d'enregistrer", "Giv temaet et navn før du gemmer";
