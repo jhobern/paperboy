@@ -12,6 +12,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **A row of fields now reads as one row.** With every cell carrying a wash of
+  its own, striping the table behind them gave each row two competing
+  backgrounds and made the fields look like they were floating on the table
+  rather than being it, so the stripes are gone. The fields in a row also line
+  up: the remove ✕ used to share a cell with the note beside it, and a button
+  is taller than a field, so the note settled a couple of pixels low and every
+  row sagged towards its right-hand edge. The ✕ is now a column of its own,
+  reserving exactly the width it takes, so the headers stay over the fields
+  they name whether the table is empty or full. The same alignment fix applies
+  to the form-data and environment-variable tables.
+
+- **The "send this row" column header is a tick again.** It was a bare
+  `\u{2713}`, which none of the bundled fonts have a glyph for, so it rendered
+  as an empty tofu box — it now uses the same Phosphor tick every other mark in
+  the GUI does.
+
 - **Fields read as content, not as a grid of boxes.** Every editable value in
   the GUI was drawn as a sunken, outlined text box, so a panel of headers or
   environment variables was mostly chrome with the content — the part anyone is

@@ -935,7 +935,7 @@ fn form_editor(
     egui::Grid::new("form_fields")
         .num_columns(4)
         .spacing([8.0, 4.0])
-        .striped(true)
+        // Unstriped — see `widgets::kv_editor`.
         .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..fields.len() {
@@ -988,7 +988,11 @@ fn form_editor(
                 };
                 // Value fills the last column; the remove ✕ is tucked to its
                 // right (see the note in `widgets::kv_editor`).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // `Align::Min`: the ✕ and Browse buttons are taller than the
+                // value field, and centring against them dropped the value
+                // below the key and kind picker to its left (see
+                // `widgets::kv_editor`).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui
                         .button(RichText::new(super::icons::CLOSE).color(theme.err))
                         .clicked()

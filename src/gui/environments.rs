@@ -441,7 +441,7 @@ fn var_editor(
     egui::Grid::new("env_vars")
         .num_columns(2)
         .spacing([8.0, 4.0])
-        .striped(true)
+        // Unstriped — see `widgets::kv_editor`.
         .min_col_width(0.0)
         .show(ui, |ui| {
             for i in 0..vars.len() {
@@ -460,7 +460,9 @@ fn var_editor(
                 // The value cell is the grid's last column so it stretches to
                 // fill the panel; the remove ✕ is right-aligned inside it (see
                 // the note in `widgets::kv_editor`).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // `Align::Min` so the value lines up with its key rather than
+                // sinking below it — see `widgets::kv_editor`.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     if ui
                         .button(RichText::new(super::icons::CLOSE).color(theme.err))
                         .clicked()
