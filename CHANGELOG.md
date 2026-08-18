@@ -12,6 +12,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Postman's send-time switches are honoured.** Postman strips the body from
+  a `GET` unless the request explicitly turns body pruning off, so a `GET`
+  stored with a body is the remains of an edit rather than a request that sends
+  one — importing it anyway changed what the collection did, and some servers
+  reject a `GET` with a body outright. The setting is now read, and inherited
+  from the folder and collection the way Postman inherits it, so the 318
+  requests in one real export that deliberately keep their bodies still do.
+  Where a body is left out the conversion report says so, since the text is
+  plainly visible in the export. `strictSSL: false` — Postman being told not to
+  verify the certificate — becomes Hurl's `insecure` option, without which the
+  request imports and then simply fails against the box it was written for.
+
+- **A switched-off query parameter survives the import.** Postman leaves
+  disabled parameters out of the URL text and records them separately, so
+  reading the text alone threw them away entirely. They are part of the
+  request — the optional filter someone turns on now and again — and PaperBoy
+  has a switched-off row for exactly that, so they now import switched off
+  instead of disappearing.
+
 - **AWS-signed Postman requests import signed.** An AWS Signature v4 covers
   the method, path, headers and body, so it can only be computed at send time —
   there is no header PaperBoy could write into the file. That made it the one

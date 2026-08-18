@@ -26,6 +26,8 @@ struct Collection {
     /// The collection's default auth, inherited by every request that doesn't
     /// set its own.
     auth: Option<Auth>,
+    #[serde(rename = "protocolProfileBehavior")]
+    protocol_profile_behavior: Option<Profile>,
 }
 
 /// A folder (nested `item`s) or a leaf holding a `request`.
@@ -42,6 +44,34 @@ struct Item {
     /// Pre-request / test scripts. Only `test` scripts are mined for
     /// `pm.<store>.set(...)` capture calls (see [`captures_from_events`]).
     event: Vec<Event>,
+    #[serde(rename = "protocolProfileBehavior")]
+    protocol_profile_behavior: Option<Profile>,
+}
+
+/// Postman's per-request send-time switches. Set at collection, folder or
+/// request level, each inherited by everything below it until overridden.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+struct Profile {
+    /// Send a body even on a method that normally has none. Postman *strips*
+    /// the body from a GET unless this is set, so a request stored with both a
+    /// GET and a body is not a request with a body — it's a leftover.
+    #[serde(rename = "disableBodyPruning")]
+    disable_body_pruning: Option<bool>,
+    /// `false` means "don't verify the certificate" — Hurl's `insecure`.
+    #[serde(rename = "strictSSL")]
+    strict_ssl: Option<bool>,
+}
+
+impl Profile {
+    /// This level's settings over the inherited ones, field by field: Postman
+    /// overrides individually rather than replacing the whole block.
+    fn over(self, parent: Profile) -> Profile {
+        Profile {
+            disable_body_pruning: self.disable_body_pruning.or(parent.disable_body_pruning),
+            strict_ssl: self.strict_ssl.or(parent.strict_ssl),
+        }
+    }
 }
 
 /// A Postman `event` — a `prerequest` or `test` script attached to an item.
@@ -86,6 +116,11 @@ struct Url {
     /// Declared path variables, in declaration order. Empty for the bare-string
     /// form of a URL, which has nowhere to put them.
     variables: Vec<Param>,
+    /// The query parameters as Postman lists them. Only the *disabled* ones
+    /// matter here — enabled ones are already in `raw` and get parsed out of
+    /// it, but a switched-off parameter is left out of `raw` entirely, so it
+    /// used to disappear rather than import switched off.
+    queries: Vec<Param>,
 }
 
 /// A Postman URL is a bare string or an object with a `raw` field; anything
@@ -95,6 +130,7 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
         Value::String(s) => Url {
             raw: s,
             variables: Vec::new(),
+            queries: Vec::new(),
         },
         Value::Object(m) => Url {
             raw: m
@@ -104,6 +140,11 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
                 .to_string(),
             variables: m
                 .get("variable")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
+                .unwrap_or_default(),
+            queries: m
+                .get("query")
                 .cloned()
                 .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
                 .unwrap_or_default(),
@@ -433,6 +474,7 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
         &mut Vec::new(),
         inherited,
         &[],
+        root.protocol_profile_behavior.unwrap_or_default(),
         &mut tokens,
         &mut out,
     );
@@ -454,6 +496,7 @@ fn walk_items(
     path: &mut Vec<String>,
     inherited: Option<&Auth>,
     auth_path: &[String],
+    profile: Profile,
     tokens: &mut OAuthTokens,
     out: &mut ConvertedCollection,
 ) {
@@ -467,7 +510,11 @@ fn walk_items(
             } else {
                 auth_path.to_vec()
             };
-            walk_items(sub, path, here, &here_path, tokens, out);
+            let here_profile = it
+                .protocol_profile_behavior
+                .unwrap_or_default()
+                .over(profile);
+            walk_items(sub, path, here, &here_path, here_profile, tokens, out);
             path.pop();
         } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
@@ -480,10 +527,14 @@ fn walk_items(
             // where a token request for it belongs.
             let declares_own = req.auth.as_ref().is_some_and(|a| !a.inherits());
             let token_path: &[String] = if declares_own { path } else { auth_path };
-            let mut entry = map_request(&title, req, &it.event, auth);
+            let profile = it
+                .protocol_profile_behavior
+                .unwrap_or_default()
+                .over(profile);
+            let mut entry = map_request(&title, req, &it.event, auth, profile);
             apply_path_variables(&title, &req.url, &mut entry, out);
             apply_oauth2(&title, token_path, auth, &mut entry, tokens, out);
-            note_losses(&title, req, &it.event, auth, &entry, out);
+            note_losses(&title, req, &it.event, auth, profile, &entry, out);
             for name in rename_dynamic_variables(&mut entry) {
                 out.notes.push(ConversionNote {
                     item: title.clone(),
@@ -921,6 +972,7 @@ fn note_losses(
     req: &Request,
     events: &[Event],
     auth: Option<&Auth>,
+    profile: Profile,
     entry: &HurlEntry,
     out: &mut ConvertedCollection,
 ) {
@@ -958,7 +1010,23 @@ fn note_losses(
     {
         note("API-key auth is sent in the query string; it was added as a query parameter".into());
     }
+    let pruned =
+        matches!(req.method.as_str(), "GET" | "HEAD") && profile.disable_body_pruning != Some(true);
     if let Some(b) = &req.body
+        && pruned
+        && !(b.raw.is_empty() && b.mode.is_empty())
+    {
+        note(format!(
+            "the stored {} body was left out, because Postman would not have sent it on a {} \
+             either — nothing turned its body pruning off",
+            if b.mode.is_empty() {
+                "request"
+            } else {
+                &b.mode
+            },
+            req.method
+        ));
+    } else if let Some(b) = &req.body
         && !matches!(b.mode.as_str(), "" | "raw" | "urlencoded" | "formdata")
     {
         note(format!("body mode `{}` was dropped", b.mode));
@@ -987,7 +1055,13 @@ fn note_losses(
     }
 }
 
-fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>) -> HurlEntry {
+fn map_request(
+    name: &str,
+    req: &Request,
+    events: &[Event],
+    auth: Option<&Auth>,
+    profile: Profile,
+) -> HurlEntry {
     let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
     let mut queries: Vec<KvRow> = Vec::new();
     let mut options: Vec<KvRow> = Vec::new();
@@ -1070,7 +1144,13 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
     // form fields (file-type form-data fields become `File` fields).
     let mut form_fields = Vec::new();
     let mut body = String::new();
-    if let Some(b) = &req.body {
+    // Postman strips the body from a body-less method unless `disableBodyPruning`
+    // says otherwise, so a GET stored with a body is not a GET that sends one —
+    // it's the remains of an edit. Importing it anyway would change what the
+    // collection does, and some servers reject a GET with a body outright.
+    let pruned =
+        matches!(req.method.as_str(), "GET" | "HEAD") && profile.disable_body_pruning != Some(true);
+    if let Some(b) = &req.body.as_ref().filter(|_| !pruned) {
         match b.mode.as_str() {
             "raw" => body = b.raw.clone(),
             "urlencoded" => {
@@ -1084,8 +1164,26 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
     let mut entry = HurlEntry::from_fields(name, &req.method, &req.url.raw, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
+    // A parameter Postman has switched off is left out of the URL text, so
+    // reading the text alone threw it away. It is part of the request as
+    // documentation — the optional filter someone turns on now and again — and
+    // PaperBoy has a switched-off row for exactly this.
+    entry.queries.extend(
+        req.url
+            .queries
+            .iter()
+            .filter(|q| q.disabled)
+            .filter_map(Param::enabled_kve),
+    );
     entry.queries.extend(queries);
     entry.options.extend(options);
+    // `strictSSL: false` is Postman being told not to verify the certificate,
+    // which is Hurl's `insecure` — a real behavioural setting that would
+    // otherwise import as a request that simply fails against the staging box
+    // it was written for.
+    if profile.strict_ssl == Some(false) {
+        entry.options.push(KvRow::new("insecure", "true"));
+    }
     // Captured variables from the request's `test` script (#24). A request that
     // gets captures serializes with a `HTTP *` line automatically; one with none
     // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
@@ -1474,7 +1572,7 @@ mod tests {
           "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
           "item": [
             { "name": "search", "request": {
-                "method": "GET",
+                "method": "POST",
                 "url": {
                   "raw": "{{url}}/search?q=cats",
                   "host": ["{{url}}"],
@@ -1503,6 +1601,115 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_behavior_tests {
+    use super::*;
+
+    fn convert(item: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {item} ] }}"#
+        ))
+    }
+
+    /// Postman strips the body from a GET unless told not to, so a GET stored
+    /// with a body is the remains of an edit, not a request that sends one.
+    #[test]
+    fn a_get_body_postman_would_not_have_sent_is_left_out() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "GET", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{\"stale\":true}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("body pruning")),
+            "and it says why, since the text is visibly in the export: {:?}",
+            c.notes
+        );
+    }
+
+    /// ...but 318 requests in the exports on hand explicitly turn pruning off,
+    /// and those really do send a body on a GET.
+    #[test]
+    fn disable_body_pruning_keeps_the_body() {
+        let c = convert(
+            r#"{ "name": "r", "protocolProfileBehavior": { "disableBodyPruning": true },
+                 "request": { "method": "GET", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// A POST body is never pruned, whatever the setting says.
+    #[test]
+    fn a_post_body_is_untouched() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "POST", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// The setting is inherited, and Postman overrides field by field rather
+    /// than replacing the whole block.
+    #[test]
+    fn a_folder_can_turn_pruning_off_for_everything_inside_it() {
+        let c = convert(
+            r#"{ "name": "F", "protocolProfileBehavior": { "disableBodyPruning": true },
+                 "item": [ { "name": "r", "request": { "method": "GET", "url": "https://h/x",
+                   "body": { "mode": "raw", "raw": "{}" } } } ] }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// `strictSSL: false` is a real behavioural setting; without it the request
+    /// imports and then simply fails against the box it was written for.
+    #[test]
+    fn strict_ssl_off_becomes_the_insecure_option() {
+        let c = convert(
+            r#"{ "name": "r", "protocolProfileBehavior": { "strictSSL": false },
+                 "request": { "method": "GET", "url": "https://h/x" } }"#,
+        );
+        assert!(
+            c.entries[0]
+                .options
+                .contains(&KvRow::toggled("insecure", "true", true))
+        );
+    }
+
+    /// The default must stay strict — silently disabling certificate checks
+    /// would be the worst possible thing to get wrong here.
+    #[test]
+    fn certificate_checking_stays_on_by_default() {
+        let c = convert(r#"{ "name": "r", "request": { "method": "GET", "url": "https://h/x" } }"#);
+        assert!(c.entries[0].options.is_empty());
+    }
+
+    /// A switched-off parameter is left out of the URL text, so reading the
+    /// text alone lost it. It is documentation — the optional filter someone
+    /// turns on now and again — and there is a switched-off row for it.
+    #[test]
+    fn a_disabled_query_parameter_imports_switched_off() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "GET", "url": {
+                 "raw": "https://h/x?page=2",
+                 "query": [ { "key": "page", "value": "2" },
+                            { "key": "verbose", "value": "true", "disabled": true } ] } } }"#,
+        );
+        let q = &c.entries[0].queries;
+        assert!(
+            q.contains(&KvRow::toggled("verbose", "true", false)),
+            "the disabled parameter is kept, switched off: {q:?}"
+        );
+        assert_eq!(
+            q.iter().filter(|r| r.key == "page").count(),
+            0,
+            "and the enabled one is not duplicated — it is already in the URL text"
+        );
+        assert_eq!(c.entries[0].url, "https://h/x?page=2");
     }
 }
 
