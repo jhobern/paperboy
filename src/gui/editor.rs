@@ -31,6 +31,7 @@ struct SubstSeen {
     literal: bool,
     pending: bool,
     failed: bool,
+    undefined: bool,
     shadowed: bool,
 }
 
@@ -41,11 +42,12 @@ impl SubstSeen {
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
+            SubstKind::Undefined => self.undefined = true,
         }
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed
+        self.loaded || self.literal || self.pending || self.failed || self.undefined
     }
 }
 
@@ -57,6 +59,7 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
         SubstKind::Loaded => th.ok,
         SubstKind::Pending => th.pending,
         SubstKind::Failed => th.err,
+        SubstKind::Undefined => th.err,
     }
 }
 
@@ -72,6 +75,7 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.literal, s.subst_hint_literal, th.subst),
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
+            (seen.undefined, s.subst_hint_undefined, th.err),
         ] {
             if present {
                 ui.colored_label(color, format!("\u{25cf} {word}"));
@@ -123,7 +127,13 @@ fn highlight_code_editable(
                 }
                 job.append(token, 0.0, fmt(subst_color(info.kind, th)));
             }
-            None => job.append(token, 0.0, fmt(th.text)),
+            // Nothing defines this one. It used to fall through as ordinary
+            // body text, which made the only variable the user *can't* fix by
+            // waiting the only one that looked perfectly fine.
+            None => {
+                seen.mark(SubstKind::Undefined);
+                job.append(token, 0.0, fmt(subst_color(SubstKind::Undefined, th)));
+            }
         }
         rest = &rest[end..];
     }
@@ -153,11 +163,14 @@ fn substitution_statuses(
         };
         let close = open + 2 + close_rel;
         let inner = rest[open + 2..close].trim();
-        if let Some(info) = vars.get(inner) {
-            seen.mark(info.kind);
-            if shadowed.contains(inner) {
-                seen.shadowed = true;
+        match vars.get(inner) {
+            Some(info) => {
+                seen.mark(info.kind);
+                if shadowed.contains(inner) {
+                    seen.shadowed = true;
+                }
             }
+            None => seen.mark(SubstKind::Undefined),
         }
         rest = &rest[close + 2..];
     }

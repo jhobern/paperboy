@@ -1964,13 +1964,19 @@ impl TuiApp {
                         path,
                         expanded: false,
                         ..
+                    })
+                    | Some(crate::collection::WsRow::RequestFolder {
+                        path,
+                        expanded: false,
+                        ..
                     }) => {
                         self.collections[ci].workspace_expanded.insert(path);
                         self.workspace_select_highlighted(ci);
                         self.save_state();
                     }
                     // Already expanded: do nothing (use Left to collapse).
-                    Some(crate::collection::WsRow::Folder { expanded: true, .. }) => {}
+                    Some(crate::collection::WsRow::Folder { expanded: true, .. })
+                    | Some(crate::collection::WsRow::RequestFolder { expanded: true, .. }) => {}
                     // A collection row: (re)focus that collection. If it is
                     // collapsed this also expands it; if it was opened earlier
                     // but a *different* collection is now the loaded one, this
@@ -2453,7 +2459,8 @@ impl TuiApp {
         // Selection already follows the highlight (see `workspace_select_highlighted`),
         // so the right pane matches the highlighted row before Enter is pressed.
         match row {
-            crate::collection::WsRow::Folder { path, expanded, .. } => {
+            crate::collection::WsRow::Folder { path, expanded, .. }
+            | crate::collection::WsRow::RequestFolder { path, expanded, .. } => {
                 // Toggle: Enter on an expanded folder collapses it; on a
                 // collapsed folder expands it — consistent with typical file
                 // tree UX.
@@ -2552,6 +2559,11 @@ impl TuiApp {
                     path.parent().map(|p| p.to_path_buf())
                 }
                 crate::collection::WsRow::Request { collection, .. } => {
+                    collection.parent().map(|p| p.to_path_buf())
+                }
+                // A virtual folder has no directory of its own, so a new report
+                // goes beside the collection file holding it.
+                crate::collection::WsRow::RequestFolder { collection, .. } => {
                     collection.parent().map(|p| p.to_path_buf())
                 }
             })
@@ -2832,19 +2844,18 @@ impl TuiApp {
 
         // Helper to get the display-depth of any WsRow.
         fn row_depth(r: &crate::collection::WsRow) -> usize {
-            match r {
-                crate::collection::WsRow::Folder { depth, .. } => *depth,
-                crate::collection::WsRow::Collection { depth, .. } => *depth,
-                crate::collection::WsRow::Report { depth, .. } => *depth,
-                crate::collection::WsRow::Environment { depth, .. } => *depth,
-                crate::collection::WsRow::Request { depth, .. } => *depth,
-            }
+            r.depth()
         }
 
         // An expanded folder or collection collapses in place; the path is the
-        // key removed from `workspace_expanded` in both cases.
+        // key removed from `workspace_expanded` in all three cases.
         let expanded_path = match row {
             crate::collection::WsRow::Folder {
+                path,
+                expanded: true,
+                ..
+            }
+            | crate::collection::WsRow::RequestFolder {
                 path,
                 expanded: true,
                 ..

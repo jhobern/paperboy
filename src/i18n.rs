@@ -385,6 +385,11 @@ strings! {
     subst_hint_literal => "literal", "littéral", "literal";
     subst_hint_loading => "loading", "en cours", "indlæser";
     subst_hint_missing => "missing", "manquant", "mangler";
+    subst_hint_undefined => "undefined", "non défini", "udefineret";
+    env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
+    gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
+    gui_undefined_banner_many => "{n} variables in this request are undefined", "{n} variables de cette requête ne sont pas définies", "{n} variabler i denne anmodning er udefinerede";
+    gui_undefined_banner_hint => "Nothing defines them — add them to an environment, or check the spelling.", "Rien ne les définit — ajoutez-les à un environnement ou vérifiez l'orthographe.", "Intet definerer dem — tilføj dem til et miljø, eller kontrollér stavemåden.";
     subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
     json_invalid => "⚠ Invalid JSON — fix before running", "⚠ JSON invalide — corrigez avant d'exécuter", "⚠ Ugyldig JSON — ret før kørsel";
     foot_focus => "focus", "focus", "fokus";
@@ -854,6 +859,10 @@ strings! {
     gui_linked_tooltip => "Pin to the active collection (overrides Active)", "Épingler à la collection active (remplace Actif)", "Fastgør til den aktive samling (tilsidesætter Aktiv)";
     gui_delete => "Delete", "Supprimer", "Slet";
     gui_save_ellipsis => "Save…", "Enregistrer…", "Gem…";
+    gui_env_menu_activate => "Activate", "Activer", "Aktivér";
+    gui_env_menu_deactivate => "Deactivate", "Désactiver", "Deaktivér";
+    gui_env_menu_link => "Link to this collection", "Lier à cette collection", "Tilknyt denne samling";
+    gui_env_menu_unlink => "Unlink from this collection", "Délier de cette collection", "Fjern tilknytning til denne samling";
     gui_add_variable => "+ Add variable", "+ Ajouter une variable", "+ Tilføj variabel";
     gui_resolving => "resolving…", "résolution…", "løser…";
     gui_unresolved => "unresolved", "non résolu", "uløst";
@@ -1433,6 +1442,11 @@ pub enum Status {
     GitSaved,
     /// Secrets the request is waiting on (their variable names).
     WaitingSecrets(Vec<String>),
+    /// The request was sent with variables nothing defines (their names). Not a
+    /// refusal to send — Hurl will happily put `{{ tokn }}` on the wire — but
+    /// the resulting failure arrives as an unexplained 401 several steps later,
+    /// so the cause is named at the moment it is introduced.
+    UndefinedVars(Vec<String>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -1675,6 +1689,9 @@ impl Status {
             Status::GitSaved => s.git_save_success.to_string(),
             Status::WaitingSecrets(keys) => {
                 format!("{} {}", s.env_waiting_secrets, keys.join(", "))
+            }
+            Status::UndefinedVars(keys) => {
+                format!("{} {}", s.env_undefined_vars, keys.join(", "))
             }
             Status::EnvVarReloading(key) => format!("{} {key}…", s.env_reloading_var),
             Status::EnvActivated(name) => format!("{} {name}", s.env_activated),

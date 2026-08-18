@@ -786,7 +786,11 @@ impl Session {
             self.status = Some(Status::WaitingSecrets(blocking.clone()));
             return blocking;
         }
-        self.status = None;
+        // Undefined variables are reported but never block: sending a literal
+        // `{{ tokn }}` is valid Hurl, and refusing to run would be a worse
+        // answer than running and saying why it failed.
+        let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.begin_request();
         let selected = self.collections[ci].selected_entry;
         if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
@@ -814,7 +818,8 @@ impl Session {
             self.status = Some(Status::WaitingSecrets(blocking.clone()));
             return blocking;
         }
-        self.status = None;
+        let undefined = request::undefined_request_keys_all(col, env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;

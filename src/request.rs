@@ -73,6 +73,18 @@ pub enum SubstKind {
     /// Failed to resolve, or a capture not yet initialised from a response
     /// (kept as `{{ VAR }}`, red).
     Failed,
+    /// Referenced by the request but defined nowhere at all — no environment
+    /// variable, no `[Captures]` name, no captured value (kept as `{{ VAR }}`,
+    /// red).
+    ///
+    /// Kept apart from [`SubstKind::Failed`] because the two ask for different
+    /// things: a failed variable exists and can be retried, while an undefined
+    /// one is usually a typo or a missing environment and has to be *added*.
+    /// Before this existed an undefined placeholder matched nothing in the
+    /// substitution map and was drawn as ordinary body text, so the one kind of
+    /// broken variable the user could do nothing about was also the only one
+    /// that looked completely fine.
+    Undefined,
 }
 
 /// How one referenced variable should be rendered when substituted.
@@ -1012,6 +1024,63 @@ pub fn pending_request_keys_all(col: &Collection, env: Option<&Environment>) -> 
     blocking
 }
 
+/// Every variable name the collection can supply a value for, whether or not it
+/// has one yet: the environment's variables, every `[Captures]` name any request
+/// defines, and anything already captured this session.
+///
+/// A `[Captures]` name counts as defined even before it holds a value, because
+/// a collection that logs in and then uses `{{ token }}` is correct — the value
+/// arrives mid-run. Treating those as undefined would put a warning on every
+/// well-formed collection, which is the fastest way to teach someone to ignore
+/// warnings.
+fn defined_keys(col: &Collection, env: Option<&Environment>) -> std::collections::HashSet<String> {
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(env) = env {
+        defined.extend(env.vars.iter().map(|v| v.key.clone()));
+    }
+    for entry in &col.entries {
+        defined.extend(entry.captures.iter().map(|(name, _)| name.clone()));
+    }
+    defined.extend(col.captures.keys().cloned());
+    defined
+}
+
+/// Variables the selected request references that nothing defines — the typo'd
+/// `{{ tokn }}`, or the whole environment nobody remembered to activate.
+///
+/// Unlike [`pending_request_keys`] this does **not** block the run: sending a
+/// literal `{{ tokn }}` is legal (Hurl will do it), and a front-end may have
+/// good reason to. It is reported instead, loudly, because the failure it
+/// causes otherwise surfaces as an unexplained 401 several steps later.
+/// Sorted for stable display.
+pub fn undefined_request_keys(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let Some(entry) = col.entries.get(col.selected_entry) else {
+        return Vec::new();
+    };
+    let defined = defined_keys(col, env);
+    let mut out: Vec<String> = entry_referenced_keys(entry)
+        .into_iter()
+        .filter(|k| !defined.contains(k))
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`undefined_request_keys`] across every entry in the collection — used by
+/// "Run All", which sends all of them.
+pub fn undefined_request_keys_all(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let defined = defined_keys(col, env);
+    let mut out: Vec<String> = col
+        .entries
+        .iter()
+        .flat_map(entry_referenced_keys)
+        .filter(|k| !defined.contains(k))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Drain background secret-resolution results, applying each to the matching
 /// Global Environment and invalidating every collection's cached preview (any
 /// of them might reference it, linked or active-global). Disconnected
@@ -1330,6 +1399,121 @@ mod tests {
             pending_request_keys_all(&col, Some(&env)),
             vec!["API_TOKEN".to_string()],
             "Run All must check every entry, not just the selected one"
+        );
+    }
+
+    // ── Undefined variables ───────────────────────────────────────────────
+
+    fn plain_var(key: &str, value: &str) -> EnvVar {
+        EnvVar {
+            key: key.into(),
+            value: value.into(),
+            source: ValueSource::Literal,
+            resolved: true,
+            loading: false,
+            original_value: value.into(),
+            modified: false,
+            user_added: false,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_variable_no_one_defines_is_reported() {
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ BASE_URL }}/{{ tokn }}".into(),
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+        let env = env_with(vec![plain_var("BASE_URL", "http://x")]);
+
+        assert_eq!(
+            undefined_request_keys(&col, Some(&env)),
+            vec!["tokn".to_string()],
+            "the typo is named; the variable that exists is not"
+        );
+    }
+
+    #[test]
+    fn a_capture_name_counts_as_defined_before_it_has_a_value() {
+        // The "log in, then use {{ token }}" shape: the value only exists
+        // mid-run, but the collection is correct and must not be flagged.
+        let login = HurlEntry {
+            method: "POST".into(),
+            url: "http://x/login".into(),
+            captures: vec![("token".into(), "jsonpath \"$.token\"".into())],
+            ..Default::default()
+        };
+        let use_it = HurlEntry {
+            method: "GET".into(),
+            url: "http://x/me?t={{ token }}".into(),
+            ..Default::default()
+        };
+        let mut col = Collection::new("c".into(), vec![login, use_it]);
+        col.selected_entry = 1;
+
+        assert!(
+            undefined_request_keys(&col, None).is_empty(),
+            "a captured name is defined even before the capture has run"
+        );
+    }
+
+    #[test]
+    fn a_pending_secret_is_defined_not_undefined() {
+        // It has a source and is on its way — that's WaitingSecrets' job to
+        // report, and double-reporting it would be noise.
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ API_TOKEN }}".into(),
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+        let env = env_with(vec![secret_var("API_TOKEN", false, true)]);
+
+        assert!(undefined_request_keys(&col, Some(&env)).is_empty());
+    }
+
+    #[test]
+    fn with_no_environment_active_every_referenced_variable_is_undefined() {
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ BASE_URL }}/x".into(),
+            headers: vec![KvRow::toggled(
+                "Authorization",
+                "Bearer {{ API_KEY }}",
+                true,
+            )],
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+
+        assert_eq!(
+            undefined_request_keys(&col, None),
+            vec!["API_KEY".to_string(), "BASE_URL".to_string()],
+            "sorted, and headers are scanned as well as the URL"
+        );
+    }
+
+    #[test]
+    fn undefined_request_keys_all_checks_every_entry_and_dedupes() {
+        let first = HurlEntry {
+            method: "GET".into(),
+            url: "{{ nope }}/a".into(),
+            ..Default::default()
+        };
+        let second = HurlEntry {
+            method: "GET".into(),
+            url: "{{ nope }}/b".into(),
+            ..Default::default()
+        };
+        let mut col = Collection::new("c".into(), vec![first, second]);
+        col.selected_entry = 0;
+
+        assert_eq!(
+            undefined_request_keys_all(&col, None),
+            vec!["nope".to_string()],
+            "reported once, not once per entry that uses it"
         );
     }
 

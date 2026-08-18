@@ -108,6 +108,18 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_save_ellipsis,
         )
     };
+    // The header right-click menu's labels, which say what the click will *do*
+    // rather than what the row currently *is* (the body's buttons are toggles
+    // showing state, so "Active" reads correctly there and wouldn't here).
+    let (lbl_activate, lbl_deactivate, lbl_link, lbl_unlink) = {
+        let s = &app.strings;
+        (
+            s.gui_env_menu_activate,
+            s.gui_env_menu_deactivate,
+            s.gui_env_menu_link,
+            s.gui_env_menu_unlink,
+        )
+    };
 
     super::widgets::panel_header(ui, &theme, lbl_environments, |ui| {
         if ui.button(lbl_load).on_hover_text(tip_load).clicked() {
@@ -332,6 +344,43 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if reveal {
                     header.scroll_to_me(Some(egui::Align::Center));
                 }
+                // The row's buttons live *inside* the collapsing body, so
+                // switching environments used to mean expanding a row, clicking
+                // Active, and collapsing it again — three gestures for the one
+                // thing this panel is most often opened to do. The header
+                // answers directly: double-click activates, right-click offers
+                // the same actions the body does without opening it.
+                if header.double_clicked() {
+                    activate = Some(id);
+                }
+                header.context_menu(|ui| {
+                    let toggle = if is_active {
+                        lbl_deactivate
+                    } else {
+                        lbl_activate
+                    };
+                    if ui.button(toggle).clicked() {
+                        activate = Some(id);
+                        ui.close();
+                    }
+                    let link_lbl = if is_linked { lbl_unlink } else { lbl_link };
+                    if ui.button(link_lbl).on_hover_text(tip_linked).clicked() {
+                        link = Some(id);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button(lbl_save).clicked() {
+                        save = Some(id);
+                        ui.close();
+                    }
+                    if ui
+                        .button(RichText::new(lbl_delete).color(theme.err))
+                        .clicked()
+                    {
+                        delete = Some(id);
+                        ui.close();
+                    }
+                });
             }
         });
 
@@ -732,5 +781,168 @@ mod tests {
             painted.iter().any(|t| t == super::super::icons::CARET_DOWN),
             "an opened row should show the expanded caret: {painted:?}"
         );
+    }
+
+    /// The position of the first painted text shape containing `needle`, so a
+    /// test can click the row the user would click.
+    fn text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::epaint::Shape, needle: &str, out: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::epaint::Shape::Text(t) if out.is_none() => {
+                    if t.galley.text().contains(needle) {
+                        *out = Some(t.pos + t.galley.size() / 2.0);
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, needle, &mut out);
+        }
+        out
+    }
+
+    /// Drive the panel across several frames on one `Context`, so pointer state
+    /// (and any menu it opens) survives from frame to frame the way it does in
+    /// a running app. Returns the text painted by the final frame.
+    fn drive(
+        app: &mut GuiApp,
+        frames: &[Vec<egui::Event>],
+    ) -> (Vec<String>, Vec<egui::epaint::ClippedShape>) {
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        let mut painted = Vec::new();
+        let mut time = 0.0;
+        for events in frames {
+            let mut input = egui::RawInput::default();
+            input.time = Some(time);
+            time += 0.05;
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(320.0, 600.0),
+            ));
+            input.events = events.clone();
+            let out = ctx.run_ui(input, |panel| super::ui(app, panel));
+            painted = painted_text(&out.shapes);
+            shapes = out.shapes;
+        }
+        (painted, shapes)
+    }
+
+    fn click_at(pos: egui::Pos2, button: egui::PointerButton, count: usize) -> Vec<egui::Event> {
+        let mut ev = vec![egui::Event::PointerMoved(pos)];
+        for _ in 0..count {
+            ev.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Default::default(),
+            });
+            ev.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Default::default(),
+            });
+        }
+        ev
+    }
+
+    /// Switching environments is the thing this panel is most often opened to
+    /// do, and its buttons live inside the collapsing body — so doing it used
+    /// to mean expanding a row, clicking Active, and collapsing it again. The
+    /// header answers the gesture directly.
+    #[test]
+    fn double_clicking_a_row_activates_that_environment() {
+        let (mut app, dir) = app_with_workspace("dblclick");
+        app.session
+            .load_environment_text("hand-made".into(), "A=1\n", None, None);
+        assert_eq!(
+            app.session.active_env_id, None,
+            "nothing active to begin with"
+        );
+
+        let (_, shapes) = drive(&mut app, &[vec![]]);
+        let pos = text_pos(&shapes, "hand-made").expect("the row is painted");
+        drive(
+            &mut app,
+            &[vec![], click_at(pos, egui::PointerButton::Primary, 2)],
+        );
+
+        let id = app
+            .session
+            .global_envs
+            .iter()
+            .find(|e| e.name == "hand-made")
+            .map(|e| e.id);
+        assert_eq!(
+            app.session.active_env_id, id,
+            "the row the user double-clicked is the one that became active"
+        );
+
+        // And again turns it back off: the underlying action is a toggle, so
+        // the gesture must not activate-only and leave no way back.
+        drive(
+            &mut app,
+            &[vec![], click_at(pos, egui::PointerButton::Primary, 2)],
+        );
+        assert_eq!(app.session.active_env_id, None, "double-click toggles");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The right-click menu offers the row's actions without expanding it, and
+    /// names them by what the click will *do* — an active row offers to
+    /// deactivate, not to "Active".
+    #[test]
+    fn right_clicking_a_row_offers_its_actions_and_names_them_by_effect() {
+        let (mut app, dir) = app_with_workspace("ctxmenu");
+        app.session
+            .load_environment_text("hand-made".into(), "A=1\n", None, None);
+
+        let (_, shapes) = drive(&mut app, &[vec![]]);
+        let pos = text_pos(&shapes, "hand-made").expect("the row is painted");
+
+        let (painted, _) = drive(
+            &mut app,
+            &[
+                vec![],
+                click_at(pos, egui::PointerButton::Secondary, 1),
+                vec![],
+            ],
+        );
+        for label in ["Activate", "Link to this collection", "Save…", "Delete"] {
+            assert!(
+                painted.iter().any(|t| t == label),
+                "the menu should offer {label:?}, painted: {painted:?}"
+            );
+        }
+        assert!(
+            !painted.iter().any(|t| t == "Deactivate"),
+            "an inactive row offers to activate, not to deactivate: {painted:?}"
+        );
+
+        // Make it active, and the same menu inverts.
+        let id = app
+            .session
+            .global_envs
+            .iter()
+            .find(|e| e.name == "hand-made")
+            .map(|e| e.id);
+        app.session.set_active_env(id);
+        let (painted, _) = drive(
+            &mut app,
+            &[
+                vec![],
+                click_at(pos, egui::PointerButton::Secondary, 1),
+                vec![],
+            ],
+        );
+        assert!(
+            painted.iter().any(|t| t == "Deactivate"),
+            "an active row offers the way back: {painted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

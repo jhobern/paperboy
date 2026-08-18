@@ -676,6 +676,34 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
+                    // A virtual folder inside a collection file. It looks and
+                    // toggles like a filesystem folder, but deliberately has
+                    // neither the New/right-click menu nor drag-and-drop: those
+                    // act on real files, and this row has none — the requests
+                    // under it live inside their collection.
+                    WsRow::RequestFolder {
+                        path,
+                        name,
+                        depth,
+                        expanded,
+                        ..
+                    } => {
+                        let chev = if *expanded {
+                            super::icons::CARET_DOWN
+                        } else {
+                            super::icons::CARET_RIGHT
+                        };
+                        let text = RichText::new(format!("{chev} {} {name}", super::icons::FOLDER))
+                            .color(theme.text);
+                        let resp = ui
+                            .push_id(("ws_req_folder", path), |ui| {
+                                ws_row(ui, *depth, false, text)
+                            })
+                            .inner;
+                        if resp.clicked() {
+                            actions.push(WsAction::ToggleFolder(path.clone()));
+                        }
+                    }
                     WsRow::Request {
                         collection,
                         idx,

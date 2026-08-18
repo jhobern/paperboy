@@ -12,6 +12,47 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A variable nothing defines no longer looks perfectly fine.** A typo'd
+  `{{ tokn }}`, or a collection run before its environment was activated, was
+  the only broken thing on screen with no mark on it: the editor coloured every
+  *known* variable by its status — green for loaded, cyan for literal, orange
+  for loading, red for failed — and painted unknown ones in plain body text,
+  identical to the characters around them. The request then ran, and the
+  mistake surfaced minutes later as an unexplained 401 from a server that had
+  been sent the literal text `{{ tokn }}`. Undefined variables are now red in
+  both front-ends and listed in the substitution legend, and the GUI names them
+  in a band above the request editor so the ones scrolled out of view still
+  count. Names a request *captures* from an earlier response are treated as
+  defined even before they hold a value, since "log in, then use `{{ token }}`"
+  is correct and warning about it would only teach you to ignore the warning.
+  The run is reported, not blocked — sending a literal `{{ tokn }}` is valid
+  Hurl, and refusing to send is a worse answer than sending and saying why it
+  failed.
+
+- **Switching environments takes one gesture.** The buttons that activate, link,
+  save and delete an environment live inside the row's collapsing body, so
+  changing which environment is active meant expanding a row, clicking *Active*,
+  and folding it back up — three gestures for the thing the panel is most often
+  opened to do, repeated every time you moved between staging and production.
+  The row header now answers directly: double-click it to activate (and again to
+  deactivate), or right-click it for the same actions the body offers without
+  opening it at all. The menu names them by what the click will do, so an active
+  environment offers *Deactivate* rather than a button labelled *Active* that you
+  have to reason about.
+
+- **An imported collection keeps its folders in the workspace tree.** Postman
+  exports nest their requests in folders, and importing one names each request
+  after the path it came from — `Auth/Login`, `Auth/Tokens/Refresh`. The
+  workspace tree then threw all of that away and listed only the last segment,
+  so a hundred requests from twenty folders arrived as one flat run of names
+  with several rows called `Login` and no way to tell them apart. Those titles
+  now nest: each segment is a folder row that opens and closes like any other,
+  starting closed, with the folders holding the request you have selected opened
+  for you so it is never hidden. The requests list inside a single collection
+  already read `/` this way — it is the workspace tree that was ignoring it.
+  Both front-ends, and a collection you have only expanded (never opened) nests
+  too.
+
 - **A finished Postman import says what it did.** The dialog used to simply
   vanish on success: a tab quietly switched, the request panel still showed
   whatever was open before, and nothing said what had landed or where. It now

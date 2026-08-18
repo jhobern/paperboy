@@ -750,6 +750,57 @@ impl GuiApp {
 
     /// Wrap a panel body in a titled, focus-aware frame and register a click on
     /// it as focusing that panel.
+    /// A red band above the request editor naming every `{{ VAR }}` the selected
+    /// request references that nothing defines.
+    ///
+    /// Derived state, recomputed each frame rather than stored: it is the exact
+    /// answer for the request that is on screen *now*, so it appears the moment
+    /// the typo is made and vanishes the moment it is fixed. That is also why
+    /// there is no dismiss button — there is nothing to dismiss, only something
+    /// to fix. Colouring the tokens red in the editor (see `editor.rs`) says
+    /// *where*; this says *that*, for the tokens scrolled out of view.
+    fn undefined_vars_banner(&mut self, ui: &mut egui::Ui) {
+        let ci = self.active_ci();
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        let env = self.session.effective_env(ci);
+        let missing = crate::request::undefined_request_keys(col, env.as_ref());
+        if missing.is_empty() {
+            return;
+        }
+        let s = &self.strings;
+        let headline = if missing.len() == 1 {
+            s.gui_undefined_banner_one.to_string()
+        } else {
+            s.gui_undefined_banner_many
+                .replace("{n}", &missing.len().to_string())
+        };
+        let hint = s.gui_undefined_banner_hint;
+        let th = self.theme;
+        // Drawn inline at the top of the centre panel rather than in a
+        // `Panel::top`: a panel would reserve a fixed strip and clip the list
+        // of names, and this band's height depends on how many names there are.
+        egui::Frame::new()
+            .fill(th.panel)
+            .stroke(egui::Stroke::new(1.0, th.err))
+            .inner_margin(6.0)
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(egui::RichText::new(headline).color(th.err).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(missing.join(", "))
+                            .color(th.err)
+                            .monospace(),
+                    );
+                });
+                ui.label(egui::RichText::new(hint).color(th.dim).small());
+            });
+        ui.add_space(4.0);
+    }
+
     pub fn panel_frame<R>(
         &mut self,
         ui: &mut egui::Ui,
@@ -1144,6 +1195,7 @@ impl GuiApp {
                 self.panel_frame(ui, Focus::Main, |app, ui| reports::ui(app, ui));
                 return;
             }
+            self.undefined_vars_banner(ui);
             let avail = ui.available_height();
             let resp_h = self.session.gui.response_height.unwrap_or_else(|| {
                 (avail * self.session.response_pct as f32 / 100.0)
@@ -1465,6 +1517,68 @@ mod tests {
         let out = ctx.run_ui(close_request(), |ui| app.intercept_close(ui.ctx()));
         assert!(!cancelled(&out), "a confirmed quit must not be intercepted");
         assert!(app.dialog.is_none(), "and must not ask a second time");
+    }
+
+    /// Does any text painted this frame contain `needle`? Shapes nest (a
+    /// `Frame` emits a `Shape::Vec`), so this has to recurse rather than scan
+    /// the top level.
+    fn painted(out: &egui::FullOutput, needle: &str) -> bool {
+        fn walk(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.text().contains(needle),
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                _ => false,
+            }
+        }
+        out.shapes.iter().any(|c| walk(&c.shape, needle))
+    }
+
+    /// Paint the banner once with a real screen rect — without one, egui has no
+    /// room to lay anything out and paints nothing at all.
+    fn banner_frame(app: &mut GuiApp) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(640.0, 480.0),
+        ));
+        ctx.run_ui(input, |ui| app.undefined_vars_banner(ui))
+    }
+
+    fn app_referencing(url: &str) -> GuiApp {
+        let mut e = crate::hurl::HurlEntry::default();
+        e.title = "req".into();
+        e.method = "GET".into();
+        e.url = url.into();
+        let mut session = Session::default();
+        session.collections.clear();
+        session
+            .collections
+            .push(crate::collection::Collection::new("c".to_string(), vec![e]));
+        GuiApp::for_test(session)
+    }
+
+    /// The whole point of feature: a variable nothing defines used to be
+    /// invisible — it rendered as ordinary body text and the run just 401'd.
+    #[test]
+    fn undefined_variables_are_named_in_a_banner() {
+        let mut app = app_referencing("https://x/{{ tokn }}");
+        let out = banner_frame(&mut app);
+        assert!(
+            painted(&out, "tokn"),
+            "the offending variable must be named, not just counted"
+        );
+    }
+
+    /// ...and it must be silent otherwise, or it becomes wallpaper.
+    #[test]
+    fn a_request_with_no_variables_gets_no_banner() {
+        let mut app = app_referencing("https://x/plain");
+        let out = banner_frame(&mut app);
+        assert!(
+            !painted(&out, "undefined"),
+            "nothing is wrong, so nothing should be said"
+        );
     }
 
     /// Nothing unsaved, nothing to say — the window closes without a word.

@@ -219,6 +219,21 @@ impl LeftRow {
                     }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
                     WsRow::Environment { name, depth, .. } => LeftRow::Environment { name, depth },
+                    // A virtual folder inside a collection renders exactly like
+                    // a filesystem one: it behaves like one in the tree (same
+                    // chevron, same expand/collapse keys, same indentation), and
+                    // giving it a second look would suggest a distinction the
+                    // user can't act on.
+                    WsRow::RequestFolder {
+                        name,
+                        depth,
+                        expanded,
+                        ..
+                    } => LeftRow::WsFolder {
+                        name,
+                        depth,
+                        expanded,
+                    },
                     WsRow::Request {
                         idx,
                         depth,
@@ -2789,6 +2804,7 @@ fn subst_color(kind: crate::request::SubstKind, th: &Theme) -> Color {
         SubstKind::Loaded => th.ok,       // green
         SubstKind::Pending => th.pending, // orange
         SubstKind::Failed => th.err,      // red
+        SubstKind::Undefined => th.err,   // red
     }
 }
 
@@ -2801,6 +2817,8 @@ struct SubstSeen {
     literal: bool,
     pending: bool,
     failed: bool,
+    /// At least one referenced `{{ VAR }}` is defined nowhere at all.
+    undefined: bool,
     /// At least one rendered substitution's Global Environment value is
     /// being shadowed by the collection's linked Environment.
     shadowed: bool,
@@ -2814,11 +2832,12 @@ impl SubstSeen {
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
+            SubstKind::Undefined => self.undefined = true,
         }
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed
+        self.loaded || self.literal || self.pending || self.failed || self.undefined
     }
 }
 
@@ -2826,7 +2845,8 @@ impl SubstSeen {
 /// *known* `{{ VAR }}` by its resolution status: a resolved value is substituted
 /// (green = loaded from a source, cyan = literal); an unavailable one keeps the
 /// `{{ VAR }}` placeholder (orange = loading, red = failed / not initialised).
-/// Unknown placeholders are kept in the default colour. Marks `seen` with the
+/// A placeholder nothing defines keeps its braces too and is painted red.
+/// Marks `seen` with the
 /// status of every known variable that was rendered. `shadowed`, when given,
 /// flags variable names whose value from the active Global Environment is
 /// being overridden by the collection's linked Environment (see
@@ -2890,10 +2910,17 @@ fn highlight_spans(
                     }
                 }
             }
+            // Defined nowhere: kept as `{{ VAR }}` and painted as the error it
+            // is. Drawing these in the default colour made an undefined
+            // variable the one broken thing on screen that looked fine.
             None => {
+                seen.mark(crate::request::SubstKind::Undefined);
                 let piece = rest[open..end].to_string();
                 cur_len += piece.chars().count();
-                spans.push(Span::styled(piece, Style::default().fg(th.text)));
+                spans.push(Span::styled(
+                    piece,
+                    Style::default().fg(subst_color(crate::request::SubstKind::Undefined, th)),
+                ));
             }
         }
         rest = &rest[end..];
@@ -3251,6 +3278,7 @@ pub(crate) fn draw_collection_main(
             (seen.literal, s.subst_hint_literal, th.subst),
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
+            (seen.undefined, s.subst_hint_undefined, th.err),
         ];
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (present, word, color) in segments {
