@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A request keeps the prose that explains it.** Postman lets each request
+  carry a description, and 88 requests in the exports on hand use it — often as
+  the only statement anywhere of what the request is for or what it needs. The
+  importer dropped all of it. Descriptions now import as comments in the
+  request's header region, where Hurl keeps them and PaperBoy already
+  round-trips them. They deliberately don't join the title: the title is the
+  request's *name* and is what every list in the app shows, so a paragraph
+  there would be unreadable.
+
 - **A GraphQL request imports as a GraphQL request.** Postman keeps the query
   and its variables in separate boxes, which made the importer treat GraphQL as
   a protocol it didn't speak and drop the body entirely. On the wire GraphQL is

@@ -12,7 +12,9 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl};
+use crate::hurl::{
+    CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl,
+};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -98,6 +100,25 @@ struct Request {
     header: Vec<Param>,
     auth: Option<Auth>,
     body: Option<Body>,
+    /// Prose documenting the request. A bare string, or `{"content": …}` with
+    /// a media type beside it.
+    #[serde(default, deserialize_with = "de_description")]
+    description: String,
+}
+
+/// A Postman description is a string or a `{"content": …, "type": …}` object;
+/// anything else (including an explicit `null`) reads as no description rather
+/// than failing the collection.
+fn de_description<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Object(m) => m
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    })
 }
 
 fn get_method() -> String {
@@ -1240,6 +1261,24 @@ fn map_request(
             .filter_map(Param::enabled_kve),
     );
     entry.queries.extend(queries);
+    // Postman's prose about the request. Kept as comments in the header
+    // region rather than folded into the title: the title is the request's
+    // *name* and is what every list in the app shows, so a paragraph in it
+    // would be unreadable — but dropping it loses the only explanation of what
+    // half these requests are for. `EntryComment` already round-trips.
+    entry.comments.extend(
+        req.description
+            .replace("\r\n", "\n")
+            .lines()
+            .map(|line| EntryComment {
+                anchor: CommentAnchor::Headers,
+                text: if line.trim().is_empty() {
+                    "#".to_string()
+                } else {
+                    format!("# {}", line.trim_end())
+                },
+            }),
+    );
     entry.options.extend(options);
     // `strictSSL: false` is Postman being told not to verify the certificate,
     // which is Hurl's `insecure` — a real behavioural setting that would
@@ -1665,6 +1704,70 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+
+    fn one(request: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {{ "name": "r", "request": {request} }} ] }}"#
+        ))
+    }
+
+    fn comments(e: &HurlEntry) -> Vec<&str> {
+        e.comments.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// 88 requests in the exports on hand carry prose, and it was the only
+    /// explanation of what half of them are for.
+    #[test]
+    fn a_request_description_is_kept_as_comments() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x",
+                 "description": "Returns the current user.\n\nRequires the `read` scope." }"#);
+        assert_eq!(
+            comments(&c.entries[0]),
+            vec![
+                "# Returns the current user.",
+                "#",
+                "# Requires the `read` scope."
+            ]
+        );
+    }
+
+    /// The title is the request's *name* and is what every list in the app
+    /// shows, so a paragraph must not end up in it.
+    #[test]
+    fn the_description_never_becomes_part_of_the_name() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x", "description": "long prose" }"#);
+        assert_eq!(c.entries[0].title, "r");
+    }
+
+    /// Postman writes the newer descriptions as an object with a media type.
+    #[test]
+    fn an_object_description_is_read_too() {
+        let c = one(r##"{ "method": "GET", "url": "https://h/x",
+                 "description": { "content": "Heading", "type": "text/markdown" } }"##);
+        assert_eq!(comments(&c.entries[0]), vec!["# Heading"]);
+    }
+
+    /// A description that isn't there mustn't leave an empty comment behind.
+    #[test]
+    fn no_description_adds_nothing() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x" }"#);
+        assert!(c.entries[0].comments.is_empty());
+    }
+
+    /// Postman writes an explicit `null` for fields it leaves blank, which must
+    /// not fail the whole import.
+    #[test]
+    fn a_null_description_is_survivable() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x", "description": null }"#);
+        assert_eq!(c.entries.len(), 1);
+        assert!(c.entries[0].comments.is_empty());
     }
 }
 
