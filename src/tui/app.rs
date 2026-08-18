@@ -1633,7 +1633,13 @@ impl TuiApp {
             self.status = Some(Status::WaitingSecrets(blocking));
             return;
         }
-        self.status = None;
+        // Undefined variables are reported but never block: sending a literal
+        // `{{ tokn }}` is valid Hurl, and refusing to run would be a worse
+        // answer than running and saying why it failed. The editor already
+        // paints them red; this is the same finding said out loud, for a user
+        // who pressed F5 without looking at the body.
+        let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1677,7 +1683,10 @@ impl TuiApp {
             self.status = Some(Status::WaitingSecrets(blocking));
             return;
         }
-        self.status = None;
+        // Reported, not blocking — see `run_entry`. Checked across every entry
+        // rather than only the selected one, to match the guard above it.
+        let undefined = request::undefined_request_keys_all(col, env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1698,8 +1707,10 @@ impl TuiApp {
             // Streaming Run All doesn't carry Hurl's automatic cookie jar
             // between requests — warn about it in the status bar (batch mode
             // is unaffected). Overwritten by the pass/fail summary once the
-            // run finishes.
-            if !self.run_all_batch_mode {
+            // run finishes. Never overwrites an undefined-variable report,
+            // though: that one names a request that is about to fail, where
+            // this is a note about how the run is chained.
+            if !self.run_all_batch_mode && self.status.is_none() {
                 self.status = Some(Status::RunAllStreamingCookies);
             }
             self.pending_batch_runs.push(rx);

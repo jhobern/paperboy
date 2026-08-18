@@ -118,10 +118,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   identical to the characters around them. The request then ran, and the
   mistake surfaced minutes later as an unexplained 401 from a server that had
   been sent the literal text `{{ tokn }}`. Undefined variables are now red in
-  both front-ends and listed in the substitution legend, and the GUI names them
-  in a band above the request editor so the ones scrolled out of view still
-  count. Names a request *captures* from an earlier response are treated as
-  defined even before they hold a value, since "log in, then use `{{ token }}`"
+  both front-ends and listed in the substitution legend, the GUI names them in
+  a band above the request editor so the ones scrolled out of view still count,
+  and the terminal UI names them in the status line when a request is sent (it
+  runs requests through its own path, which had been left out). Names a
+  request *captures* from an earlier response are treated as defined even
+  before they hold a value, since "log in, then use `{{ token }}`"
   is correct and warning about it would only teach you to ignore the warning.
   The run is reported, not blocked — sending a literal `{{ tokn }}` is valid
   Hurl, and refusing to send is a worse answer than sending and saying why it

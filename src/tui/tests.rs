@@ -16699,6 +16699,98 @@ fn run_all_entries_blocks_when_any_entry_references_a_still_pending_secret() {
     assert!(!app.response.lock().unwrap().loading);
 }
 
+/// The TUI runs requests through its own `run_entry`, not the shared
+/// `session::run_entry`, so the undefined-variable report had to be wired into
+/// both — the editor painting `{{ VAR }}` red is no help to someone who hits
+/// F5 without reading the body.
+#[test]
+fn run_entry_reports_undefined_variables_without_blocking() {
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ MISSING }}".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+
+    app.run_entry(1);
+
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        "the unknown variable must be named, got {:?}",
+        app.status
+    );
+    // Reported, not blocked: a literal `{{ MISSING }}` is valid Hurl to send.
+    assert!(
+        app.response.lock().unwrap().loading,
+        "the request must still have been sent"
+    );
+}
+
+/// The streaming Run All cookie warning used to be written unconditionally,
+/// which would have buried the undefined-variable report a line after it was
+/// made. The one that names a request about to fail wins.
+#[test]
+fn run_all_streaming_cookie_note_does_not_hide_undefined_variables() {
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ MISSING }}".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    app.run_all_batch_mode = false;
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+
+    app.run_all_entries(1);
+
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        "undefined variables must outrank the cookie note, got {:?}",
+        app.status
+    );
+}
+
+/// With every variable accounted for, nothing is said — the status line is not
+/// somewhere to leave a permanent notice.
+#[test]
+fn run_entry_says_nothing_when_every_variable_is_defined() {
+    use crate::environment::{EnvVar, Environment, ValueSource};
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ HOST }}".into(),
+        ..Default::default()
+    };
+    let mut col = Collection::new("t".to_string(), vec![entry]);
+    let env = Environment {
+        id: 0,
+        name: "e".into(),
+        vars: vec![EnvVar {
+            key: "HOST".into(),
+            value: "example.net".into(),
+            source: ValueSource::Literal,
+            resolved: true,
+            loading: false,
+            original_value: "example.net".into(),
+            modified: false,
+            user_added: false,
+            raw: String::new(),
+        }],
+        path: None,
+        git_origin: None,
+    };
+
+    let mut app = TuiApp::default();
+    let env_id = add_global_env(&mut app, env);
+    col.linked_env_id = Some(env_id);
+    app.collections.push(col);
+
+    app.run_entry(1);
+
+    assert!(app.status.is_none(), "got {:?}", app.status);
+}
+
 #[test]
 fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
     let e1 = HurlEntry {
