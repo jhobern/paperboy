@@ -475,11 +475,11 @@ fn draw_connect(
             ui.colored_label(colors.dim, s.postman_key_source_label);
             egui::ComboBox::from_id_salt("pb_postman_key_source")
                 .width(200.0)
-                .selected_text(key_source_label(w.key_source, s))
+                .selected_text(w.key_source.source_label(s))
                 .show_ui(ui, |ui| {
                     for src in KeySource::ALL {
                         if ui
-                            .selectable_label(src == w.key_source, key_source_label(src, s))
+                            .selectable_label(src == w.key_source, src.source_label(s))
                             .clicked()
                         {
                             w.key_source = src;
@@ -488,7 +488,7 @@ fn draw_connect(
                 });
             ui.end_row();
 
-            ui.colored_label(colors.dim, key_field_label(w.key_source, s));
+            ui.colored_label(colors.dim, w.key_source.field_label(s));
             // The references this key has been read from before, offered beside
             // the field: finding the 1Password item path is the tedious half of
             // setting an import up, and it is the same path every time. Only
@@ -509,7 +509,7 @@ fn draw_connect(
                     !busy,
                     egui::TextEdit::singleline(&mut w.key_entry)
                         .password(w.key_source.is_secret())
-                        .hint_text(key_field_hint(w.key_source, s))
+                        .hint_text(w.key_source.field_hint(s))
                         .desired_width(if known.is_empty() { 340.0 } else { 250.0 }),
                 );
                 if !known.is_empty() {
@@ -534,10 +534,8 @@ fn draw_connect(
             // address before.
             ui.label("");
             ui.add(
-                egui::Label::new(
-                    egui::RichText::new(key_field_help(w.key_source, s)).color(colors.dim),
-                )
-                .wrap(),
+                egui::Label::new(egui::RichText::new(w.key_source.field_help(s)).color(colors.dim))
+                    .wrap(),
             );
             ui.end_row();
 
@@ -574,48 +572,6 @@ fn draw_connect(
         }
     });
     action
-}
-
-/// The name of a key source as the picker shows it.
-fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_source_paste,
-        KeySource::OnePassword => s.postman_key_source_op,
-        KeySource::Ssm => s.postman_key_source_ssm,
-        KeySource::Env => s.postman_key_source_env,
-    }
-}
-
-/// What the key field is asking for, and an example of it — both follow the
-/// chosen source, because "API key" is the wrong prompt when the field wants
-/// the name of a 1Password item.
-fn key_field_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_label,
-        KeySource::OnePassword => s.postman_key_label_op,
-        KeySource::Ssm => s.postman_key_label_ssm,
-        KeySource::Env => s.postman_key_label_env,
-    }
-}
-
-fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_hint,
-        KeySource::OnePassword => s.postman_key_hint_op,
-        KeySource::Ssm => s.postman_key_hint_ssm,
-        KeySource::Env => s.postman_key_hint_env,
-    }
-}
-
-/// What picking this source commits the user to: where the key is read from,
-/// when, and what has to be installed for that to work.
-fn key_field_help(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_help_paste,
-        KeySource::OnePassword => s.postman_key_help_op,
-        KeySource::Ssm => s.postman_key_help_ssm,
-        KeySource::Env => s.postman_key_help_env,
-    }
 }
 
 fn draw_pick_workspace(

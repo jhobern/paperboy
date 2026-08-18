@@ -688,6 +688,15 @@ fn press(app: &mut TuiApp, code: KeyCode) {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+/// Type `text` into the app one character at a time, exactly as a user would.
+/// The tests care about the keystrokes (a field's own key handling runs per
+/// character), so this drives [`press`] rather than setting a buffer directly.
+fn type_str(app: &mut TuiApp, text: &str) {
+    for ch in text.chars() {
+        press(app, KeyCode::Char(ch));
+    }
+}
+
 fn add_global_env(app: &mut TuiApp, env: crate::environment::Environment) -> u64 {
     let id = env.id;
     app.global_envs.push(env);
@@ -937,16 +946,12 @@ fn creating_a_request_adds_it_to_the_request_tab() {
     press(&mut app, KeyCode::Char('n')); // open New Request form
     assert!(app.overlay.is_some());
 
-    for ch in "demo".chars() {
-        press(&mut app, KeyCode::Char(ch)); // Name field
-    }
+    type_str(&mut app, "demo"); // Name field
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Right); // GET -> POST
     press(&mut app, KeyCode::Tab); // -> URL
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     // Ctrl+Enter submits.
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
@@ -968,9 +973,7 @@ fn new_request_can_target_another_collection() {
     press(&mut app, KeyCode::Right); // target 0 (Request) -> 1 (api)
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     assert!(
@@ -996,18 +999,12 @@ fn creating_a_request_with_a_header_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Enter); // -> Header(0, Key)
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
-    for ch in "abc".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -1025,9 +1022,7 @@ fn empty_header_rows_are_not_added() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -1333,9 +1328,7 @@ fn arrow_keys_move_between_columns_in_a_header_row() {
 fn left_right_move_the_cursor_before_crossing_cells() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "ab".chars() {
-        press(&mut app, KeyCode::Char(ch)); // Key = "ab", cursor at end
-    }
+    type_str(&mut app, "ab"); // Key = "ab", cursor at end
     // At the end of the text, Right crosses to the next cell.
     press(&mut app, KeyCode::Right);
     assert_eq!(
@@ -1377,9 +1370,7 @@ fn focused_cell_col(app: &TuiApp) -> usize {
 fn ctrl_left_right_jump_to_start_and_end_of_cell() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // focus Header(0, Key)
-    for ch in "hello".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "hello");
     assert_eq!(focused_cell_col(&app), 5, "cursor at end after typing");
 
     // Ctrl+Left jumps to the start of the field without leaving the cell.
@@ -1630,13 +1621,9 @@ fn up_down_in_the_body_move_the_cursor_then_leave_at_the_edges() {
     }
     assert_eq!(new_focus(&app), NewField::Body);
 
-    for ch in "line1".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "line1");
     press(&mut app, KeyCode::Enter); // newline (Body is multi-line)
-    for ch in "line2".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "line2");
 
     // The cursor is on the second line: Up moves it up, staying in the Body.
     press(&mut app, KeyCode::Up);
@@ -1684,9 +1671,7 @@ fn key_cell_shows_a_prepopulated_dropdown() {
 fn dropdown_filters_as_you_type_and_enter_fills_the_key() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "content".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "content");
     let sugs = form_ref(&app)
         .key_dropdown()
         .expect("matches for 'content'")
@@ -1755,9 +1740,7 @@ fn esc_dismisses_dropdown_before_cancelling_the_form() {
 fn typing_no_match_hides_the_dropdown() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "zzz".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "zzz");
     assert!(
         form_ref(&app).key_dropdown().is_none(),
         "no header contains 'zzz'"
@@ -1860,9 +1843,7 @@ fn a_disabled_header_row_renders_its_key_dimmed() {
 
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // focus Header(0, Key)
-    for ch in "Zydeco".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "Zydeco");
     // Move focus off the key so it renders via the non-focused (coloured)
     // path rather than as the live editor.
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
@@ -1943,18 +1924,12 @@ fn disabled_header_is_not_sent() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Enter); // -> Header(0, Key)
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     press(&mut app, KeyCode::Tab); // -> Value
-    for ch in "abc".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc");
     // Disable the row via Ctrl+E (focus stays on the Value cell).
     app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     assert_eq!(
@@ -5377,9 +5352,7 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
-    for ch in "feature-x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "feature-x");
     press(&mut app, KeyCode::Enter);
 
     match &app.overlay {
@@ -6246,13 +6219,9 @@ fn env_var_form_key_then_value_adds_the_variable() {
     let env_id = add_empty_global_env(&mut app, "e");
     app.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env_id)));
     press(&mut app, KeyCode::Char('n')); // open the form (Key cell focused)
-    for ch in "API_TOKEN".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "API_TOKEN");
     press(&mut app, KeyCode::Tab); // Key -> Value
-    for ch in "abc123".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc123");
     press(&mut app, KeyCode::Enter); // commit
 
     assert!(
@@ -9785,9 +9754,7 @@ fn ctrl_r_on_an_unchanged_environment_keeps_the_popup_open() {
 fn tab_completes_the_hurl_ghost_in_a_save_prompt() {
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveCollection, "Save", "");
-    for ch in "myfile".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "myfile");
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "myfile.hurl"),
@@ -9805,9 +9772,7 @@ fn tab_completes_the_hurl_ghost_in_a_save_prompt() {
 fn right_arrow_completes_the_vars_ghost_at_the_end() {
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveEnv, "Save", "");
-    for ch in "staging".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "staging");
     press(&mut app, KeyCode::Right); // cursor at end -> completes ".vars"
     match &app.overlay {
         Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "staging.vars"),
@@ -9824,9 +9789,7 @@ fn save_prompt_renders_the_dimmed_extension_ghost() {
 
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveCollection, "Save", "");
-    for ch in "myfile".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "myfile");
     let mut term = Terminal::new(TestBackend::new(72, 6)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
@@ -10837,9 +10800,7 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10848,9 +10809,7 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "jsonpath \"$.ok\" == \"yes\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.ok\" == \"yes\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -10944,9 +10903,7 @@ fn a_typed_status_assert_becomes_the_expected_status() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10955,9 +10912,7 @@ fn a_typed_status_assert_becomes_the_expected_status() {
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "status == 201".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "status == 201");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
     let e = &app.collections[0].entries;
     assert_eq!(e.len(), 1);
@@ -10972,9 +10927,7 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10984,13 +10937,9 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Tab); // -> AddCapture (captures start empty)
     press(&mut app, KeyCode::Enter); // -> Capture(0, Name), a fresh row is added
-    for ch in "token".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "token");
     press(&mut app, KeyCode::Tab); // -> Capture(0, Expr)
-    for ch in "jsonpath \"$.token\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.token\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11062,9 +11011,7 @@ fn creating_a_request_with_a_cookie_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Enter); // -> Cookie(0, Key)
@@ -11072,13 +11019,9 @@ fn creating_a_request_with_a_cookie_via_the_table() {
         new_focus(&app),
         NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key)
     );
-    for ch in "session".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "session");
     press(&mut app, KeyCode::Tab); // -> Cookie(0, Value)
-    for ch in "abc123".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc123");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11096,9 +11039,7 @@ fn creating_a_request_with_an_option_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery, empty
@@ -11108,13 +11049,9 @@ fn creating_a_request_with_an_option_via_the_table() {
         new_focus(&app),
         NewField::Kvd(KvdKind::Options, 0, HdrCol::Key)
     );
-    for ch in "retry".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "retry");
     press(&mut app, KeyCode::Tab); // -> Options(0, Value)
-    for ch in "3".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "3");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11175,9 +11112,7 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -11185,14 +11120,10 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
-    for ch in "username".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "username");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind), defaults to Text
     press(&mut app, KeyCode::Tab); // -> FormField(0, Value)
-    for ch in "bob".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "bob");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11211,18 +11142,14 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
-    for ch in "avatar".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Kind));
 
@@ -11255,15 +11182,11 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     // longer captures them), so Right moves on to Value, then Ctype.
     press(&mut app, KeyCode::Right);
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
-    for ch in "avatar.png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar.png");
     press(&mut app, KeyCode::Right);
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11452,18 +11375,14 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
-    for ch in "avatar".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind)
     press(&mut app, KeyCode::Enter); // reveal the dropdown
     press(&mut app, KeyCode::Down); // flip Text -> File
@@ -11471,18 +11390,14 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Right); // -> FormField(0, Ctype)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
     press(&mut app, KeyCode::Esc); // dismiss the auto-opened dropdown so typing isn't intercepted
-    for ch in "text/csv".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "text/csv");
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
     press(&mut app, KeyCode::Right); // -> Prefix (inert on a File row)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Prefix));
     press(&mut app, KeyCode::Right); // -> Desc, independent from Ctype
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Desc));
-    for ch in "a note".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "a note");
 
     let row = &form_ref(&app).form_fields[0];
     assert_eq!(row.ctype.text(), "text/csv");
@@ -11625,9 +11540,7 @@ fn content_type_dropdown_auto_option_respects_the_filter() {
     let mut app = TuiApp::default();
     open_form_on_file_ctype(&mut app);
     let first_mime = content_type_options()[0];
-    for ch in first_mime.chars() {
-        press(&mut app, KeyCode::Char(ch)); // manually typed override
-    }
+    type_str(&mut app, first_mime); // manually typed override
     assert_eq!(form_ref(&app).form_fields[0].ctype.text(), first_mime);
     assert!(
         !form_ref(&app).ctype_filtered_options().is_empty()
@@ -11667,9 +11580,7 @@ fn typing_auto_keeps_the_auto_option_visible_and_typing_something_else_hides_it(
     open_form_on_file_ctype(&mut app);
     let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
 
-    for ch in "Auto".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "Auto");
     assert!(
         form_ref(&app).ctype_auto_visible(&s),
         "typing \"Auto\" itself must still match the Auto entry's own label"
@@ -11678,9 +11589,7 @@ fn typing_auto_keeps_the_auto_option_visible_and_typing_something_else_hides_it(
     for _ in "Auto".chars() {
         press(&mut app, KeyCode::Backspace);
     }
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     assert!(
         !form_ref(&app).ctype_auto_visible(&s),
         "typing an unrelated mime must hide the Auto entry"
@@ -11710,9 +11619,7 @@ fn a_populated_content_type_cell_hides_its_dropdown_until_enter_reveals_it() {
     open_form_on_file_ctype(&mut app); // -> Ctype, empty, dropdown auto-open
     assert!(form_ref(&app).ctype_dropdown_open());
     press(&mut app, KeyCode::Esc); // dismiss the dropdown so typing isn't intercepted
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     assert_eq!(form_ref(&app).form_fields[0].ctype.text(), "image/png");
 
     // Leaving and returning to the now-populated Ctype cell must not
@@ -11760,9 +11667,7 @@ fn typing_in_the_content_type_cell_filters_the_dropdown_like_the_key_dropdown_do
         "an empty query shows every option, same as filter_headers"
     );
 
-    for ch in "png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "png");
     assert!(
         form_ref(&app).ctype_dropdown_open(),
         "typing keeps (re-opens) the dropdown, like the Key dropdown"
@@ -11786,9 +11691,7 @@ fn typing_in_the_content_type_cell_filters_the_dropdown_like_the_key_dropdown_do
 
     // Typing something matching nothing empties the list (mirrors
     // `typing_no_match_hides_the_dropdown` for the Key dropdown).
-    for ch in "zzz".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "zzz");
     assert!(
         form_ref(&app).ctype_filtered_options().is_empty(),
         "no mime type contains \"pngzzz\""
@@ -11915,9 +11818,7 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
         a.last_browse_dir = Some(dir.clone());
     });
     open_form_on_file_value(&mut app);
-    for ch in "old-value.png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "old-value.png");
     app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(matches!(app.overlay, Some(Overlay::Browser(..))));
 
@@ -12056,9 +11957,7 @@ fn editing_on_a_section_tab_is_reflected_when_switching_back_to_all() {
 
     press(&mut app, KeyCode::PageDown); // -> Headers tab
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     assert_eq!(form_ref(&app).headers[0].key.text(), "X-Test");
 
     press(&mut app, KeyCode::PageUp); // back -> All tab
@@ -12293,9 +12192,7 @@ fn brackets_cycle_wizard_section_tabs_on_non_text_fields() {
 fn brackets_are_typed_into_wizard_text_fields() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // -> Header(0, Key), a text field
-    for ch in "a[0]".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "a[0]");
     assert_eq!(
         form_ref(&app).view_tab,
         WizardTab::All,
@@ -21218,9 +21115,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
@@ -21231,13 +21126,9 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddCapture
     press(&mut app, KeyCode::Tab); // -> AddReport
     press(&mut app, KeyCode::Enter); // -> Report(0, Name)
-    for ch in "status".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "status");
     press(&mut app, KeyCode::Tab); // -> Report(0, Expr)
-    for ch in "jsonpath \"$.status\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.status\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -24870,9 +24761,7 @@ fn shift_n_in_a_workspace_names_a_new_file_and_its_extension_picks_the_kind() {
 
     // `.trail` asks for a report, not a collection — one prompt covers all
     // three kinds because the extension chooses between them.
-    for ch in "monthly.trail".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "monthly.trail");
     press(&mut app, KeyCode::Enter);
 
     let made = root.join("apis/monthly.trail");
@@ -24900,9 +24789,7 @@ fn a_new_workspace_file_with_no_extension_is_a_collection_like_the_ghost_suggest
     cursor_on_ws_row(&mut app, &root.join("apis"));
 
     press(&mut app, KeyCode::Char('N'));
-    for ch in "orders".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "orders");
     press(&mut app, KeyCode::Enter);
 
     assert!(

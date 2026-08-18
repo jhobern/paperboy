@@ -34,6 +34,7 @@ use crate::report::flow::{
     ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
 };
 use crate::report::model::StatKind;
+use crate::shared_utils::truncate_to_width;
 
 // The pure structural-editing core (flatten/insert/remove/move/replace/parse
 // of the flow AST, plus the node-kind palette templates) lives in the
@@ -3655,16 +3656,6 @@ fn render_setting_row(
         Span::styled(head.to_string(), Style::default().fg(key_colour)),
         Span::styled(tail.to_string(), Style::default().fg(value_colour)),
     ])
-}
-
-/// Cut `text` to `width` display columns, marking the cut with an ellipsis.
-fn truncate_to_width(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn render_node_row(

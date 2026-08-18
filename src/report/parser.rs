@@ -1607,11 +1607,45 @@ mod tests {
         }
     }
 
+    /// The sources the grammar must reject. Grouped into one table: each was a
+    /// test whose whole body was the same "this does not parse" assertion, and
+    /// the edges of the grammar are far easier to read against each other than
+    /// scattered down the file one `#[test]` at a time.
     #[test]
-    fn empty_show_selector_is_a_parse_error() {
-        assert!(parse_flow("REPORT REQUEST process SHOW()\n").is_err());
+    fn malformed_sources_are_parse_errors() {
+        for (why, src) in [
+            ("SHOW with no fields", "REPORT REQUEST process SHOW()\n"),
+            ("HIDE with no fields", "REPORT REQUEST process HIDE()\n"),
+            ("FOR without its END", "FOR X IN FILES \"d\"\n  REQUEST r\n"),
+            ("END without a FOR", "REQUEST r\nEND\n"),
+            (
+                "the reserved JOIN source",
+                "FOR X IN JOIN ON \"k\" (a, b)\n  REQUEST r\nEND\n",
+            ),
+            (
+                "an unterminated string",
+                "FOR X IN FILES \"oops\n  REQUEST r\nEND\n",
+            ),
+            (
+                "PARALLEL with zero workers",
+                "PARALLEL(0) FOR FILE IN FILES \"docs\"\n  REQUEST r\nEND\n",
+            ),
+            (
+                "PARALLEL with a non-numeric degree",
+                "PARALLEL(lots) FOR FILE IN FILES \"docs\"\n  REQUEST r\nEND\n",
+            ),
+            (
+                "PARALLEL on something that isn't a FOR",
+                "PARALLEL REQUEST r\n",
+            ),
+            (
+                "SHOW after COMPARISON",
+                "FOR T IN ENVS BASELINE(\"p\"), COMPARISON(\"s\") SHOW(Time)\n    REQUEST r\nEND\n",
+            ),
+        ] {
+            assert!(parse_flow(src).is_err(), "{why} must not parse: {src:?}");
+        }
     }
-
     #[test]
     fn quoted_request_name_with_spaces() {
         let flow = parse_flow("REQUEST \"My Request\"\n").unwrap();
@@ -1646,26 +1680,6 @@ mod tests {
             "# collection: c.hurl\nREPORT REQUEST proc AS \"Overall Result\" SHOW(status)\n",
         );
         assert_round_trips("# collection: c.hurl\nREPORT \"{{v}}\" AS \"Overall Result\"\n");
-    }
-
-    #[test]
-    fn unbalanced_for_is_an_error() {
-        assert!(parse_flow("FOR X IN FILES \"d\"\n  REQUEST r\n").is_err());
-    }
-
-    #[test]
-    fn stray_end_is_an_error() {
-        assert!(parse_flow("REQUEST r\nEND\n").is_err());
-    }
-
-    #[test]
-    fn reserved_join_is_rejected() {
-        assert!(parse_flow("FOR X IN JOIN ON \"k\" (a, b)\n  REQUEST r\nEND\n").is_err());
-    }
-
-    #[test]
-    fn unterminated_string_errors() {
-        assert!(parse_flow("FOR X IN FILES \"oops\n  REQUEST r\nEND\n").is_err());
     }
 
     #[test]
@@ -1742,23 +1756,6 @@ mod tests {
     }
 
     #[test]
-    fn parallel_zero_workers_is_an_error() {
-        assert!(parse_flow("PARALLEL(0) FOR FILE IN FILES \"docs\"\n  REQUEST r\nEND\n").is_err());
-    }
-
-    #[test]
-    fn parallel_non_numeric_degree_is_an_error() {
-        assert!(
-            parse_flow("PARALLEL(lots) FOR FILE IN FILES \"docs\"\n  REQUEST r\nEND\n").is_err()
-        );
-    }
-
-    #[test]
-    fn parallel_without_for_is_an_error() {
-        assert!(parse_flow("PARALLEL REQUEST r\n").is_err());
-    }
-
-    #[test]
     fn opens_block_recognises_every_end_terminated_opener() {
         // FOR loops, with and without a PARALLEL[(n)] marker, and indented.
         assert!(opens_block("FOR F IN FILES \"docs\""));
@@ -1817,11 +1814,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_hide_selector_is_a_parse_error() {
-        assert!(parse_flow("REPORT REQUEST process HIDE()\n").is_err());
-    }
-
-    #[test]
     fn hide_with_block_round_trips() {
         // HIDE + WITH block: the WITH block opener must still be recognised.
         assert_round_trips(
@@ -1871,18 +1863,6 @@ mod tests {
         // Multiple SHOW fields also round-trip.
         assert_round_trips(
             "FOR TARGET IN ENVS BASELINE(\"p\") SHOW(Time, HttpStatus), COMPARISON(\"s\")\n    REQUEST r\nEND\n",
-        );
-    }
-
-    #[test]
-    fn show_on_comparison_is_a_parse_error() {
-        // SHOW after COMPARISON must be rejected.
-        assert!(
-            parse_flow(
-                "FOR T IN ENVS BASELINE(\"p\"), COMPARISON(\"s\") SHOW(Time)\n    REQUEST r\nEND\n"
-            )
-            .is_err(),
-            "SHOW after COMPARISON should not parse"
         );
     }
 

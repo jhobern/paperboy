@@ -30,7 +30,9 @@
 
 use super::flow::{Header, ImageSpec};
 use super::model::{ImageData, OutputColumn, ReportResult};
-use super::writer::{ReportWriter, Tint, measured_column_widths, run_cell_tint};
+use super::writer::{
+    ImageColumnWidth, ReportWriter, Tint, image_column_px, measured_column_widths, run_cell_tint,
+};
 
 /// Writes a report as a printable PDF: a landscape A4 table, the header row
 /// repeated on every page, cells tinted like the other visual exports, and an
@@ -262,21 +264,10 @@ fn column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f64> {
 /// resolve, gets a modest fixed width — never the width of the path text
 /// underneath, which is the same rule the HTML and xlsx exports follow.
 fn image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<f64> {
-    let spec = column.image?;
-    let widest = result
-        .images
-        .iter()
-        .filter(|((_, header), _)| header == &column.header)
-        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
-        .fold(0.0_f64, f64::max);
-    if widest > 0.0 {
-        return Some(widest / PX_PER_PT + 2.0 * CELL_PAD);
-    }
-    result
-        .images
-        .keys()
-        .any(|(_, header)| header == &column.header)
-        .then_some(FIT_IMAGE_MAX_H)
+    Some(match image_column_px(column, result)? {
+        ImageColumnWidth::Widest(px) => px / PX_PER_PT + 2.0 * CELL_PAD,
+        ImageColumnWidth::Fit => FIT_IMAGE_MAX_H,
+    })
 }
 
 /// Squeeze a table onto the page by taking from the widest columns first.

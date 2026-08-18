@@ -22,6 +22,7 @@ use crate::git_remote::{self, GitOrigin, RefKind};
 use crate::i18n::{Status, Strings};
 use crate::remote_flow::{
     FlowEvent, RefChoice, RemoteFlow, RemoteKind, Step, WorkspaceGitFilter, WorkspaceGitOrigin,
+    workspace_name_from_url,
 };
 
 use crate::environment::Environment;
@@ -284,7 +285,8 @@ impl LoadFlow {
             self.local_error = Some(app.strings.gui_git_err_browse_again.to_string());
             return false;
         };
-        let name = nonblank(&self.ws_name).unwrap_or_else(|| file_stem_from_url(&self.flow.url));
+        let name =
+            nonblank(&self.ws_name).unwrap_or_else(|| workspace_name_from_url(&self.flow.url));
         remember_git_url(&mut app.session, &self.flow.url);
         app.session
             .open_workspace_from_git(root, name, self.ws_origin.take());
@@ -1570,23 +1572,6 @@ fn name_from_repo_path(path: &str) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
         .to_string()
-}
-
-/// A tab name for a Workspace loaded from `url`: the repository's own name
-/// (`…/team/api-tests.git` → `api-tests`). The folder it was downloaded into is
-/// a meaningless temp path, so the URL is the only human-readable source.
-fn file_stem_from_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    let last = trimmed
-        .rsplit(['/', ':'])
-        .find(|seg| !seg.is_empty())
-        .unwrap_or(trimmed);
-    let stem = last.strip_suffix(".git").unwrap_or(last).trim();
-    if stem.is_empty() {
-        "workspace".to_string()
-    } else {
-        stem.to_string()
-    }
 }
 
 /// Open a `.trail` fetched from git as a report tab, keeping its provenance so

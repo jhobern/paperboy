@@ -1560,53 +1560,34 @@ mod tests {
         assert!(warns.is_empty(), "unbound flow shouldn't warn: {warns:?}");
     }
 
+    /// The header-directive diagnostics, grouped: each line is one "this source
+    /// does / does not raise that message" case, which is all these families
+    /// ever were. Grouped rather than one test apiece so the cases can be read
+    /// against each other; a failure names the source and the message it wanted.
     #[test]
-    fn missing_collection_is_an_error() {
+    fn collection_and_output_header_diagnostics() {
+        let t = titles();
+        // No collection at all, and a directive present but empty, are the same
+        // error: nothing to resolve request names against.
         assert!(has_err(
             "REQUEST Oauth\n",
             None,
             None,
             "No collection chosen"
         ));
-    }
+        let empty_directive = "# collection:\nREQUEST Oauth\n";
+        assert!(has_err(empty_directive, None, None, "No collection chosen"));
 
-    #[test]
-    fn empty_collection_directive_is_an_error() {
-        assert!(has_err(
-            "# collection:\nREQUEST Oauth\n",
-            None,
-            None,
-            "No collection chosen"
-        ));
+        let docx = "# collection: ./c.hurl\n# output: docx\nREQUEST Oauth\n";
+        assert!(has_err(docx, Some(&t), None, "unsupported output format"));
+        let csv = "# collection: ./c.hurl\n# output: csv\nREQUEST Oauth\n";
+        assert!(!has_err(csv, Some(&t), None, "unsupported"));
     }
-
     #[test]
     fn valid_header_with_bound_collection_has_no_errors() {
         let t = titles();
         let errs = errors("# collection: ./c.hurl\nREQUEST Oauth\n", Some(&t), None);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-    }
-
-    #[test]
-    fn unsupported_output_format_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\n# output: docx\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "unsupported output format"
-        ));
-    }
-
-    #[test]
-    fn csv_output_is_accepted() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# output: csv\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "unsupported"
-        ));
     }
 
     #[test]
@@ -1667,54 +1648,31 @@ mod tests {
         );
     }
 
+    /// The `# environment:` directive's diagnostics, grouped.
     #[test]
-    fn environment_header_naming_an_unloaded_env_is_an_error() {
+    fn environment_header_diagnostics() {
         let t = titles();
-        let envs = ["au".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            Some(&envs),
-            "environment 'staging' is not loaded"
-        ));
-    }
+        let named_staging = "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n";
+        let only_au = ["au".to_string()];
+        let au_and_staging = ["au".to_string(), "staging".to_string()];
 
-    #[test]
-    fn environment_header_naming_a_loaded_env_is_accepted() {
-        let t = titles();
-        let envs = ["au".to_string(), "staging".to_string()];
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            Some(&envs),
-            "is not loaded"
-        ));
-    }
+        let unloaded = "environment 'staging' is not loaded";
+        assert!(has_err(named_staging, Some(&t), Some(&only_au), unloaded));
+        let loaded = Some(&au_and_staging[..]);
+        assert!(!has_err(named_staging, Some(&t), loaded, "is not loaded"));
 
-    #[test]
-    fn empty_environment_header_is_an_error() {
-        let t = titles();
+        let empty = "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n";
         assert!(has_err(
-            "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n",
+            empty,
             Some(&t),
             None,
             "environment setting is empty"
         ));
-    }
 
-    #[test]
-    fn environment_header_is_not_checked_until_envs_are_known() {
         // With no loaded-env context, a named environment can't be verified —
         // it must not spuriously error (mirrors how ENVS names are skipped).
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "is not loaded"
-        ));
+        assert!(!has_err(named_staging, Some(&t), None, "is not loaded"));
     }
-
     #[test]
     fn unbound_collection_warns_but_does_not_error_on_names() {
         let diags = diags_for("# collection: ./c.hurl\nREQUEST Whatever\n", None, None);
@@ -1726,75 +1684,55 @@ mod tests {
         assert!(!diags.iter().any(|d| d.message.contains("not found")));
     }
 
+    /// How a `REQUEST` name is matched against the bound collection's titles.
     #[test]
-    fn request_name_resolves_by_exact_full_title() {
+    fn request_name_resolution_diagnostics() {
         let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nREQUEST upload/process_file\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
+        let full = "# collection: ./c.hurl\nREQUEST upload/process_file\n";
+        assert!(!has_err(full, Some(&t), None, "not found"));
 
-    #[test]
-    fn request_name_resolves_by_unique_leaf() {
-        let t = titles();
         // "process_file" is the leaf of "upload/process_file".
-        assert!(!has_err(
-            "# collection: ./c.hurl\nREPORT REQUEST process_file\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
+        let leaf = "# collection: ./c.hurl\nREPORT REQUEST process_file\n";
+        assert!(!has_err(leaf, Some(&t), None, "not found"));
 
+        let unknown = "# collection: ./c.hurl\nREQUEST nope\n";
+        assert!(has_err(unknown, Some(&t), None, "not found"));
+
+        // A leaf shared by two requests can't be resolved.
+        let dups = vec!["a/dup".to_string(), "b/dup".to_string()];
+        let ambiguous = "# collection: ./c.hurl\nREQUEST dup\n";
+        assert!(has_err(ambiguous, Some(&dups), None, "ambiguous"));
+    }
+    /// The `ENVS` loop-source diagnostics: role clauses and unloaded names.
     #[test]
-    fn unknown_request_name_is_an_error() {
+    fn envs_clause_diagnostics() {
         let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nREQUEST nope\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
-
-    #[test]
-    fn ambiguous_leaf_is_an_error() {
-        let t = vec!["a/dup".to_string(), "b/dup".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\nREQUEST dup\n",
-            Some(&t),
-            None,
-            "ambiguous"
-        ));
-    }
-
-    #[test]
-    fn envs_plain_empty_is_an_error() {
         // An ENVS clause with no names can't be produced by the parser directly,
         // so drive check_env_clause via a role clause missing comparisons.
-        let t = titles();
+        let no_comparison =
+            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"prod\")\n  REQUEST Oauth\nEND\n";
         assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"prod\")\n  REQUEST Oauth\nEND\n",
+            no_comparison,
             Some(&t),
             None,
             "at least one COMPARISON"
         ));
-    }
 
-    #[test]
-    fn envs_multiple_baseline_is_an_error() {
-        let t = titles();
+        let two_baselines = "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"a\", \"b\"), COMPARISON(\"c\")\n  REQUEST Oauth\nEND\n";
         assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"a\", \"b\"), COMPARISON(\"c\")\n  REQUEST Oauth\nEND\n",
+            two_baselines,
             Some(&t),
             None,
             "at most one BASELINE"
         ));
-    }
 
+        let named = "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n";
+        let only_prod = vec!["prod-au".to_string()];
+        let both = vec!["prod-au".to_string(), "staging-au".to_string()];
+        let missing = "'staging-au' is not loaded";
+        assert!(has_err(named, Some(&t), Some(&only_prod), missing));
+        assert!(!has_err(named, Some(&t), Some(&both), "not loaded"));
+    }
     #[test]
     fn baseline_directive_with_envs_comparison_warns_it_is_ignored() {
         // Both a `# baseline:` snapshot diff and a live ENVS comparison target
@@ -1984,118 +1922,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// How many names a loop pattern binds versus how wide its source is, and
+    /// whether the list it names was ever declared.
     #[test]
-    fn envs_unloaded_environment_is_an_error() {
+    fn loop_arity_and_list_reference_diagnostics() {
         let t = titles();
-        let envs = vec!["prod-au".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            Some(&envs),
-            "'staging-au' is not loaded"
-        ));
-    }
+        let c = "# collection: ./c.hurl\n";
+        let check = |src: String, needle: &str| has_err(&src, Some(&t), None, needle);
 
-    #[test]
-    fn envs_all_loaded_has_no_env_error() {
-        let t = titles();
-        let envs = vec!["prod-au".to_string(), "staging-au".to_string()];
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            Some(&envs),
-            "not loaded"
-        ));
-    }
+        let two_from_one = format!("{c}FOR (A, B) IN FILES \"d\"\n  REQUEST Oauth\nEND\n");
+        assert!(check(two_from_one, "binds 2 name"));
+        let zip = format!("{c}FOR (A, B) IN ZIP(FILES \"x\", FILES \"y\")\n  REQUEST Oauth\nEND\n");
+        assert!(!check(zip, "binds"));
 
-    #[test]
-    fn arity_mismatch_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR (A, B) IN FILES \"d\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds 2 name"
-        ));
-    }
+        let concat_ok = format!(
+            "{c}FOR F IN CONCAT(FILES \"x\", FILES \"y\", FOLDERS \"z\")\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(!check(concat_ok, "arity"));
+        let concat_bad = format!(
+            "{c}FOR F IN CONCAT(FILES \"x\", ZIP(FILES \"a\", FILES \"b\"))\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(check(concat_bad, "inconsistent arity"));
 
-    #[test]
-    fn arity_match_on_zip_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR (A, B) IN ZIP(FILES \"x\", FILES \"y\")\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds"
-        ));
-    }
+        let ragged =
+            format!("{c}LIST L = [(\"a\", \"b\"), \"c\"]\nFOR (X, Y) IN L\n  REQUEST Oauth\nEND\n");
+        assert!(check(ragged, "inconsistent arity"));
+        // A rest pattern absorbs whatever extra positions a row carries.
+        let rest = format!(
+            "{c}LIST L = [(\"a\", \"b\", \"c\")]\nFOR (X, ...) IN L\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(!check(rest, "binds"));
 
-    #[test]
-    fn concat_of_same_arity_sources_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", FILES \"y\", FOLDERS \"z\")\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "arity"
-        ));
+        let undeclared = format!("{c}FOR X IN MISSING\n  REQUEST Oauth\nEND\n");
+        assert!(check(undeclared, "unknown list"));
+        let declared = format!("{c}LIST DOCS = FILES \"d\"\nFOR X IN DOCS\n  REQUEST Oauth\nEND\n");
+        assert!(!check(declared, "unknown list"));
     }
-
-    #[test]
-    fn concat_of_mismatched_arity_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", ZIP(FILES \"a\", FILES \"b\"))\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "inconsistent arity"
-        ));
-    }
-
-    #[test]
-    fn inconsistent_list_literal_arity_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nLIST L = [(\"a\", \"b\"), \"c\"]\nFOR (X, Y) IN L\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "inconsistent arity"
-        ));
-    }
-
-    #[test]
-    fn rest_pattern_absorbs_extra_positions() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nLIST L = [(\"a\", \"b\", \"c\")]\nFOR (X, ...) IN L\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds",
-        ));
-    }
-
-    #[test]
-    fn unknown_list_reference_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR X IN MISSING\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "unknown list"
-        ));
-    }
-
-    #[test]
-    fn declared_list_reference_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nLIST DOCS = FILES \"d\"\nFOR X IN DOCS\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "unknown list"
-        ));
-    }
-
     #[test]
     fn show_and_hide_overlap_is_an_error() {
         // A field in both SHOW and HIDE is contradictory → validation error.

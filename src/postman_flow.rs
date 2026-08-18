@@ -292,6 +292,49 @@ impl KeySource {
         matches!(self, KeySource::Paste)
     }
 
+    /// The name of this key source as the selector/picker shows it.
+    pub(crate) fn source_label(self, s: &Strings) -> &'static str {
+        match self {
+            KeySource::Paste => s.postman_key_source_paste,
+            KeySource::OnePassword => s.postman_key_source_op,
+            KeySource::Ssm => s.postman_key_source_ssm,
+            KeySource::Env => s.postman_key_source_env,
+        }
+    }
+
+    /// What the key field is asking for, and how to find it — both follow the
+    /// chosen source, because "Postman API key" is the wrong prompt when the
+    /// field wants the name of a 1Password item.
+    pub(crate) fn field_label(self, s: &Strings) -> &'static str {
+        match self {
+            KeySource::Paste => s.postman_key_label,
+            KeySource::OnePassword => s.postman_key_label_op,
+            KeySource::Ssm => s.postman_key_label_ssm,
+            KeySource::Env => s.postman_key_label_env,
+        }
+    }
+
+    /// The dim in-field example for this source.
+    pub(crate) fn field_hint(self, s: &Strings) -> &'static str {
+        match self {
+            KeySource::Paste => s.postman_key_hint,
+            KeySource::OnePassword => s.postman_key_hint_op,
+            KeySource::Ssm => s.postman_key_hint_ssm,
+            KeySource::Env => s.postman_key_hint_env,
+        }
+    }
+
+    /// What picking this source commits the user to: where the key is read
+    /// from, when, and what has to be installed for that to work.
+    pub(crate) fn field_help(self, s: &Strings) -> &'static str {
+        match self {
+            KeySource::Paste => s.postman_key_help_paste,
+            KeySource::OnePassword => s.postman_key_help_op,
+            KeySource::Ssm => s.postman_key_help_ssm,
+            KeySource::Env => s.postman_key_help_env,
+        }
+    }
+
     /// Wrap what the user typed into the reference the resolver understands.
     ///
     /// Tolerant of a user who already knows the syntax: an entry that is
@@ -431,11 +474,6 @@ impl PostmanFlow {
 
     pub(crate) fn step(&self) -> &Step {
         &self.step
-    }
-
-    #[cfg(test)]
-    pub(crate) fn busy(&self) -> Option<Phase> {
-        self.busy
     }
 
     fn set_busy(&mut self, phase: Phase) {

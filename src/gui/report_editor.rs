@@ -4610,16 +4610,10 @@ fn flatten_cell(value: &str) -> String {
 }
 
 /// Per-cell display cap so one wide cell can't push the grid off-screen; the
-/// full value is available on hover. Mirrors the TUI's `MAX_COL_WIDTH`.
+/// full value is available on hover. Shares the TUI grid's truncation helper so
+/// the two front-ends cut and mark a wide cell identically.
 fn truncate_cell(value: &str) -> String {
-    const MAX: usize = 48;
-    if value.chars().count() > MAX {
-        let mut s: String = value.chars().take(MAX - 1).collect();
-        s.push('…');
-        s
-    } else {
-        value.to_string()
-    }
+    crate::shared_utils::truncate_to_width(value, 48)
 }
 
 /// Open the native save picker for exporting the active report's results,

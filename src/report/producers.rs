@@ -392,6 +392,15 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The file names of `paths`, in order — what every listing test asserts
+    /// on, rather than the absolute temp paths the producers return.
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "paperboy_prod_{tag}_{}",
@@ -421,10 +430,7 @@ mod tests {
             fs::write(d.join(n), "x").unwrap();
         }
         let files = list_files(&d, Some("*.jpg")).unwrap();
-        let names: Vec<String> = files
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names = names(&files);
         assert_eq!(names, vec!["a.jpg", "b.jpg"]);
         fs::remove_dir_all(&d).ok();
     }
@@ -531,10 +537,7 @@ mod tests {
         fs::create_dir_all(d.join("case_a/inner")).unwrap();
         fs::create_dir_all(d.join("case_b")).unwrap();
         let got = list_folders(&d, None).unwrap();
-        let names: Vec<String> = got
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names = names(&got);
         assert_eq!(names, vec!["case_a", "case_b"]);
         fs::remove_dir_all(&d).ok();
     }
@@ -546,10 +549,7 @@ mod tests {
         fs::create_dir_all(d.join("case_b")).unwrap();
         fs::create_dir_all(d.join("scratch")).unwrap();
         let got = list_folders(&d, Some("case_*")).unwrap();
-        let names: Vec<String> = got
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names = names(&got);
         assert_eq!(names, vec!["case_a", "case_b"]);
         fs::remove_dir_all(&d).ok();
     }
@@ -567,10 +567,7 @@ mod tests {
         // whatever depth they happen to sit. The order is by full path (so the
         // run is reproducible), not by folder name.
         let cases = list_folders(&d, Some("**/case_*")).unwrap();
-        let names: Vec<String> = cases
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names = names(&cases);
         assert_eq!(names, vec!["case_1", "case_2"]);
         fs::remove_dir_all(&d).ok();
     }
@@ -583,10 +580,7 @@ mod tests {
         std::os::unix::fs::symlink(&d, d.join("loop")).unwrap();
         let got = list_folders(&d, Some("**")).unwrap();
         // Terminates, and the symlink is not itself listed as a folder.
-        let names: Vec<String> = got
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
+        let names = names(&got);
         assert_eq!(names, vec!["case_1"]);
         fs::remove_dir_all(&d).ok();
     }

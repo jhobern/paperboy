@@ -281,48 +281,6 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
     lines
 }
 
-/// The name of a key source as the selector shows it.
-pub(crate) fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_source_paste,
-        KeySource::OnePassword => s.postman_key_source_op,
-        KeySource::Ssm => s.postman_key_source_ssm,
-        KeySource::Env => s.postman_key_source_env,
-    }
-}
-
-/// What the key field is asking for, and how to find it — both follow the
-/// chosen source, because "Postman API key" is the wrong prompt when the field
-/// wants the name of a 1Password item.
-fn key_field_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_label,
-        KeySource::OnePassword => s.postman_key_label_op,
-        KeySource::Ssm => s.postman_key_label_ssm,
-        KeySource::Env => s.postman_key_label_env,
-    }
-}
-
-fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_hint,
-        KeySource::OnePassword => s.postman_key_hint_op,
-        KeySource::Ssm => s.postman_key_hint_ssm,
-        KeySource::Env => s.postman_key_hint_env,
-    }
-}
-
-/// What picking this source commits the user to: where the key is read from,
-/// when, and what has to be installed for that to work.
-fn key_field_help(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_help_paste,
-        KeySource::OnePassword => s.postman_key_help_op,
-        KeySource::Ssm => s.postman_key_help_ssm,
-        KeySource::Env => s.postman_key_help_env,
-    }
-}
-
 fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
     // Laid out like the request wizard: a label column on the left, the value
     // beside it, and the keys on the border. Four short rows say as much as
@@ -331,11 +289,7 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     // is about to be typed.
     let fields: [(&str, &str, u8); 4] = [
         (s.postman_key_source_label, "", 0),
-        (
-            key_field_label(w.key_source, s),
-            key_field_hint(w.key_source, s),
-            1,
-        ),
+        (w.key_source.field_label(s), w.key_source.field_hint(s), 1),
         (s.postman_workspace_label, s.postman_workspace_hint, 2),
         (s.postman_base_url_label, s.postman_base_url_hint, 3),
     ];
@@ -347,7 +301,7 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         fields
             .iter()
             .map(|(l, _, _)| *l)
-            .chain(KeySource::ALL.iter().map(|src| key_field_label(*src, s))),
+            .chain(KeySource::ALL.iter().map(|src| src.field_label(s))),
     );
 
     // The references this key has been read from before, offered under the key
@@ -360,7 +314,7 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     // user to. The picker names four sources but says nothing about what each
     // one needs of them, which is the whole question for someone who has never
     // referenced a secret by address before.
-    let help = key_field_help(w.key_source, s);
+    let help = w.key_source.field_help(s);
     let width = 66.min(f.area().width);
     let help_rows = wrapped_height(help, width.saturating_sub(2));
     let area = centered_rect(
@@ -408,7 +362,7 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             };
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    format!("\u{2039} {} \u{203a}", key_source_label(w.key_source, s)),
+                    format!("\u{2039} {} \u{203a}", w.key_source.source_label(s)),
                     style,
                 )),
                 cols[1],

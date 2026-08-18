@@ -16,6 +16,7 @@ use super::compare::{
 };
 use super::flow::Header;
 use super::model::{OutputColumn, ReportResult, Trend, Verdict};
+use crate::shared_utils::sanitize_file_stem;
 
 /// Serializes a run result to a concrete output format (bytes, so a binary
 /// format like `.xlsx` fits the same interface). Fallible because a binary
@@ -91,28 +92,6 @@ fn tokened_output_path(report: &crate::report::Report, ext: &str) -> Option<std:
     match report.path.as_ref().and_then(|p| p.parent()) {
         Some(d) => Some(d.join(file)),
         None => Some(std::path::PathBuf::from(file)),
-    }
-}
-
-/// Turn a display name into a safe single-segment file stem (replacing path
-/// separators and other awkward characters with `_`), so a scratch report's
-/// name can't escape the current directory when exported.
-fn sanitize_file_stem(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "report".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -1473,9 +1452,27 @@ fn xlsx_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<f6
     widths
 }
 
-/// The width to give `column` if it shows pictures, in Excel characters;
-/// `None` for an ordinary column.
-fn xlsx_image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<f64> {
+/// What sizing a picture column asks for, in the pictures' own pixels.
+pub(super) enum ImageColumnWidth {
+    /// The widest picture the column actually has to show.
+    Widest(f64),
+    /// The column has pictures but no fixed box to size to — either a `FIT`
+    /// column, or one whose pictures all failed to resolve. Every export gives
+    /// these a modest fixed width rather than sizing to the text behind them.
+    Fit,
+}
+
+/// How wide `column`'s pictures are, or `None` for an ordinary column.
+///
+/// Shared by all three tabular exports: a picture column is sized to its
+/// pictures, never to the path or URL they were resolved from, because that
+/// text is only a fallback for a picture that couldn't be fetched — sizing to
+/// it buys a column of thumbnails the width of a file path, while sizing below
+/// the picture clips it. Each export converts the result into its own units.
+pub(super) fn image_column_px(
+    column: &OutputColumn,
+    result: &ReportResult,
+) -> Option<ImageColumnWidth> {
     let spec = column.image?;
     let widest = result
         .images
@@ -1484,17 +1481,22 @@ fn xlsx_image_column_width(column: &OutputColumn, result: &ReportResult) -> Opti
         .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
         .fold(0.0_f64, f64::max);
     if widest > 0.0 {
-        return Some(clamp_xlsx_width(px_to_char_width(widest)));
+        return Some(ImageColumnWidth::Widest(widest));
     }
-    // A `FIT` column has no fixed box, and a column whose pictures all failed
-    // to fetch has nothing to size to -- but neither wants to be as wide as the
-    // path behind them, which in a real run is a hundred characters of
-    // directory nobody reads.
     result
         .images
         .keys()
         .any(|(_, header)| header == &column.header)
-        .then_some(XLSX_FIT_IMAGE_WIDTH)
+        .then_some(ImageColumnWidth::Fit)
+}
+
+/// The width to give `column` if it shows pictures, in Excel characters;
+/// `None` for an ordinary column.
+fn xlsx_image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<f64> {
+    Some(match image_column_px(column, result)? {
+        ImageColumnWidth::Widest(px) => clamp_xlsx_width(px_to_char_width(px)),
+        ImageColumnWidth::Fit => XLSX_FIT_IMAGE_WIDTH,
+    })
 }
 
 /// How wide a `FIT` picture column is made, in Excel characters. `FIT` sizes
@@ -1594,27 +1596,14 @@ fn html_column_widths(columns: &[OutputColumn], result: &ReportResult) -> Vec<us
 /// The width to give `column` if it shows pictures, in `ch`; `None` for an
 /// ordinary column.
 fn image_column_width(column: &OutputColumn, result: &ReportResult) -> Option<usize> {
-    let spec = column.image?;
-    let widest = result
-        .images
-        .iter()
-        .filter(|((_, header), _)| header == &column.header)
-        .filter_map(|(_, img)| spec.scaled_size(img.natural).map(|(w, _)| w))
-        .fold(0.0_f64, f64::max);
-    if widest <= 0.0 {
-        // Either a `FIT` column (no fixed box) or one whose pictures all failed
-        // to resolve; both want a modest column rather than one sized to text
-        // that is never drawn.
-        return result
-            .images
-            .keys()
-            .any(|(_, header)| header == &column.header)
-            .then_some(HTML_FIT_IMAGE_WIDTH);
-    }
-    // A little more than the picture: the cell has padding, and a column cut to
-    // the pixel puts a scrollbar's worth of nothing between neighbours.
-    let ch = (widest / HTML_PX_PER_CH).ceil() as usize + 2;
-    Some(ch.clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH))
+    Some(match image_column_px(column, result)? {
+        // A little more than the picture: the cell has padding, and a column
+        // cut to the pixel puts a scrollbar's worth of nothing between
+        // neighbours.
+        ImageColumnWidth::Widest(px) => ((px / HTML_PX_PER_CH).ceil() as usize + 2)
+            .clamp(HTML_MIN_COL_WIDTH, HTML_MAX_COL_WIDTH),
+        ImageColumnWidth::Fit => HTML_FIT_IMAGE_WIDTH,
+    })
 }
 
 /// Bring the total width down towards [`HTML_TOTAL_WIDTH_BUDGET`] by taking it

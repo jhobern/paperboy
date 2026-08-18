@@ -11,6 +11,41 @@ pub(crate) fn stem(path: impl AsRef<Path>, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// Turn a display name into a safe single-segment file stem (path separators and
+/// other awkward characters → `_`), so a scratch report's name can't escape the
+/// target directory when it is exported. Shared by the report writers and the
+/// headless report CLI so an exported file lands in the same place either way.
+pub(crate) fn sanitize_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "report".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Cut `text` to `width` display columns, marking the cut with an ellipsis.
+/// Counts `char`s rather than bytes so it can't split a multi-byte sequence.
+/// Shared by both front-ends' result grids, which cap cell width identically.
+pub(crate) fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// How many leading / trailing characters a compacted string literal keeps.
 const COMPACT_HEAD: usize = 4;
 const COMPACT_TAIL: usize = 4;
