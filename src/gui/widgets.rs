@@ -199,6 +199,23 @@ pub fn selectable<'a>(
     ui.add(egui::Button::selectable(selected, atoms).frame_when_inactive(true))
 }
 
+/// [`selectable`] for a row of a list or tree: no frame unless it is the
+/// selected one.
+///
+/// A segmented control (section tabs, the Raw body / Form fields switch) wants
+/// every option framed, because the frames are what make it read as one control
+/// with several settings. A list is the opposite: framing every row paints a
+/// grey chip behind every name, and a list of chips reads as a list of disabled
+/// things — which is exactly how the request tree looked once the theme gave
+/// the raised surface a colour of its own to be seen in.
+pub fn selectable_row<'a>(
+    ui: &mut egui::Ui,
+    selected: bool,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    ui.add(egui::Button::selectable(selected, atoms))
+}
+
 /// A panel header: a bold, **truncating** title on the left and right-aligned
 /// action buttons that stay fully visible.
 ///
@@ -1054,6 +1071,55 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Every row of a list framed is a list that reads as disabled — the
+    /// complaint that started this: the request tree looked "greyed out,
+    /// almost like they are disabled" once the theme gave `raised` a colour
+    /// distinct enough from the panel to be seen. A segmented control still
+    /// wants its frames, so the two must part company.
+    #[test]
+    fn an_unselected_row_paints_no_chip_but_an_unselected_tab_does() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let chips = |body: &dyn Fn(&mut egui::Ui)| {
+            let mut out = Vec::new();
+            for _ in 0..2 {
+                let full = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(400.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| body(ui),
+                );
+                out.clear();
+                for cs in &full.shapes {
+                    rects_filled(&cs.shape, theme.raised(), &mut out);
+                }
+            }
+            out.len()
+        };
+
+        assert_eq!(
+            chips(&|ui| {
+                selectable_row(ui, false, "GET /one");
+                selectable_row(ui, false, "GET /two");
+            }),
+            0,
+            "an unselected list row is content, not a chip"
+        );
+        assert_eq!(
+            chips(&|ui| {
+                selectable(ui, false, "Params");
+                selectable(ui, false, "Headers");
+            }),
+            2,
+            "a segmented control keeps every option framed"
+        );
     }
 
     /// A row's fields must sit on one line. The description shares its cell

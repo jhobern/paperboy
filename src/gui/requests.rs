@@ -179,10 +179,15 @@ fn render_node(
         let row = clickable_row(ui, ("req_row", i), |ui| {
             ui.horizontal(|ui| {
                 super::widgets::method_badge(ui, theme, &entry.method);
+                // A request that isn't selected is still a request: `dim` is
+                // the colour this app uses for things that don't apply
+                // (disabled rows, hints), and spending it on every name in the
+                // tree made the whole list look switched off. The selected one
+                // leads with weight instead.
                 let text = if is_sel {
                     RichText::new(&label).strong().color(theme.text)
                 } else {
-                    RichText::new(&label).color(theme.dim)
+                    RichText::new(&label).color(theme.text)
                 };
                 // Reserve the run marker on the right, then let the name fill
                 // (and truncate within) the remaining space, so a long name
@@ -195,7 +200,7 @@ fn render_node(
                     }
                     edited_marker(ui, entry, theme, lbl_edited);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        super::widgets::selectable(ui, is_sel, text)
+                        super::widgets::selectable_row(ui, is_sel, text)
                     })
                     .inner
                 })
@@ -781,7 +786,9 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 let text = if is_sel {
                                     RichText::new(name).strong().color(theme.text)
                                 } else {
-                                    RichText::new(name).color(theme.dim)
+                                    // See the collection tree: an unselected
+                                    // request is not a disabled one.
+                                    RichText::new(name).color(theme.text)
                                 };
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -798,7 +805,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                         }
                                         ui.with_layout(
                                             egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| super::widgets::selectable(ui, is_sel, text),
+                                            |ui| super::widgets::selectable_row(ui, is_sel, text),
                                         )
                                         .inner
                                     },
@@ -1674,6 +1681,65 @@ pub(crate) mod tests {
             walk(&cs.shape, &mut out);
         }
         out
+    }
+
+    /// The colour a name is painted in, by name.
+    fn text_color(shapes: &[egui::epaint::ClippedShape], needle: &str) -> egui::Color32 {
+        fn walk(shape: &egui::epaint::Shape, needle: &str, out: &mut Option<egui::Color32>) {
+            match shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    *out = t
+                        .override_text_color
+                        .or_else(|| t.galley.job.sections.first().map(|s| s.format.color));
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, needle, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for cs in shapes {
+            walk(&cs.shape, needle, &mut out);
+        }
+        out.expect("the name is drawn")
+    }
+
+    /// `dim` is this app's colour for what doesn't apply — hints, disabled
+    /// rows, empty states. Spending it on every request that merely isn't the
+    /// selected one made the tree look switched off.
+    #[test]
+    fn an_unselected_request_is_not_painted_in_the_disabled_colour() {
+        redirect_saved_state();
+        let dir = ws_tmp("dimrow");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        expand_all(&mut session.collections[ci], &dir);
+        assert!(session.load_workspace_file(ci, dir.join("api/v1/one.hurl")));
+        session.collections[ci].selected_entry = 0;
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let dim = app.theme.dim;
+        let text = app.theme.text;
+
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| crate::gui::requests::ui(&mut app, ui),
+        );
+
+        let got = text_color(&out.shapes, "example.com/a2");
+        assert_ne!(got, dim, "an unselected request is not disabled");
+        assert_eq!(got, text, "it is ordinary content");
     }
 
     /// A row is a method badge, a name and some markers, but only the name used

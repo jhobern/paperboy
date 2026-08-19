@@ -60,7 +60,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             for (i, report) in app.session.reports.iter().enumerate() {
                 let label = RichText::new(format!("{} {}", super::icons::REPORT, report.name))
                     .color(theme.text);
-                if super::widgets::selectable(ui, false, label).clicked() {
+                if super::widgets::selectable_row(ui, false, label).clicked() {
                     open = Some(i);
                 }
                 if let Some(path) = &report.path {

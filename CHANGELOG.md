@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- Request names in the collection and workspace trees no longer read as
+  disabled. Every row was framed like a button and its name painted in the
+  colour reserved for things that don't apply, which — once themes gave the
+  raised surface a colour of its own — turned the tree into a column of grey
+  chips. A row that isn't selected is now plain text with no frame; the
+  hover wash and the selection fill are the only backgrounds. Segmented
+  controls (section tabs, the body-mode switch) keep their frames. The
+  report and git-ref lists were framed the same way and are fixed with it.
+
 - **Themes name their own surfaces, and four new ones are offered.** Every
   panel, field, button and border used to be mixed out of one `panel` colour
   with such small factors that the field wash and the button wash landed two

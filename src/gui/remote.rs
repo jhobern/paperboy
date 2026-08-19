@@ -1083,7 +1083,7 @@ fn draw_load_pick_ref(
                         RefKind::Branch => load.selected_branch == idx,
                         RefKind::Tag => load.selected_tag == idx,
                     };
-                    if super::widgets::selectable(ui, selected, name.as_str()).clicked() {
+                    if super::widgets::selectable_row(ui, selected, name.as_str()).clicked() {
                         match load.ref_kind {
                             RefKind::Branch => load.selected_branch = idx,
                             RefKind::Tag => load.selected_tag = idx,
@@ -1152,7 +1152,7 @@ fn draw_load_pick_file(
                 .show(ui, |ui| {
                     for path in visible.iter() {
                         let selected = load.selected_path.as_deref() == Some(path.as_str());
-                        if super::widgets::selectable(ui, selected, path.as_str()).clicked() {
+                        if super::widgets::selectable_row(ui, selected, path.as_str()).clicked() {
                             load.selected_path = Some(path.clone());
                         }
                     }
