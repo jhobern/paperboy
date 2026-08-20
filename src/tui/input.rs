@@ -1675,6 +1675,13 @@ impl TuiApp {
             // `u` in the Global Environments panel reopens the most recently
             // deleted environment (mirroring how `x` deletes one there).
             KeyCode::Char('u') if self.focus == Pane::GlobalEnv => self.restore_deleted_env(),
+            // `g` for "go to the active one". Scoped to the panel, like `o` and
+            // `u` beside it, rather than taking an app-wide letter. A no-op
+            // when nothing is active — the panel only advertises the key when
+            // there is somewhere for it to go.
+            KeyCode::Char('g') if self.focus == Pane::GlobalEnv => {
+                self.jump_to_active_env();
+            }
             KeyCode::Char('u') => self.reopen_closed_tab(),
             // `s` would be mnemonic for "source" but is already the global
             // Settings menu. `o` is deliberately scoped to the Environments
@@ -2115,6 +2122,48 @@ impl TuiApp {
             .global_env_idx
             .min(self.env_rows().len().saturating_sub(1));
         self.global_env_hscroll = 0;
+    }
+
+    /// Put the Environments panel selection on the *active* environment.
+    ///
+    /// In a workspace of several hundred environments the active one is almost
+    /// never on screen, and it is the row people most often want back — to read
+    /// it, edit it, or deactivate it. Scrolling to it is hopeless, and
+    /// filtering to it means already knowing its name, which is exactly what
+    /// has been lost.
+    ///
+    /// The filters are widened as far as the row needs; see
+    /// [`crate::env_panel::reveal_plan`], which the GUI's button follows too so
+    /// the two panels behave the same.
+    pub(crate) fn jump_to_active_env(&mut self) -> bool {
+        let Some(id) = self.active_env_id else {
+            return false;
+        };
+        let files = self.workspace_env_files();
+        let Some(plan) = crate::env_panel::reveal_plan(
+            &self.global_envs,
+            &files,
+            &self.env_query,
+            self.effective_env_source(),
+            id,
+        ) else {
+            return false;
+        };
+        if plan.clear_filter {
+            self.env_query.clear();
+        }
+        if plan.widen_source {
+            self.env_source = crate::env_panel::EnvSource::Both;
+        }
+        let Some(i) = self.env_rows().iter().position(|r| r.env_id() == Some(id)) else {
+            return false;
+        };
+        self.select_row_in_pane(Pane::GlobalEnv, i);
+        self.global_env_hscroll = 0;
+        if plan.clear_filter || plan.widen_source {
+            self.save_state();
+        }
+        true
     }
 
     /// Load the environment file the Environments panel selection is on, for a
@@ -5808,6 +5857,52 @@ impl TuiApp {
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
+        // The extract-to-parameter prompt is a modal over the wizard, not
+        // another dropdown: while it is open every key belongs to it, so the
+        // name being typed can contain anything a variable name can without
+        // colliding with the form's own shortcuts.
+        if form.extract.is_some() {
+            match key.code {
+                KeyCode::Esc => form.extract = None,
+                KeyCode::Enter => {
+                    form.apply_extract();
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    if let Some(p) = form.extract.as_mut() {
+                        p.name.insert(c);
+                    }
+                    form.recheck_extract();
+                }
+                KeyCode::Backspace => {
+                    if let Some(p) = form.extract.as_mut() {
+                        p.name.backspace();
+                    }
+                    form.recheck_extract();
+                }
+                KeyCode::Left => {
+                    if let Some(p) = form.extract.as_mut() {
+                        p.name.left();
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(p) = form.extract.as_mut() {
+                        p.name.right();
+                    }
+                }
+                _ => {}
+            }
+            self.overlay = Some(Overlay::NewRequest(form));
+            return;
+        }
+        // Ctrl+P extracts the focused cell's selection — or the whole cell when
+        // nothing is selected — into a request parameter. Silently does nothing
+        // when there is no text to extract, rather than opening a prompt that
+        // could only be cancelled.
+        if ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+            form.begin_extract();
+            self.overlay = Some(Overlay::NewRequest(form));
+            return;
+        }
         let prev_focus = form.focus;
         // Remember the last table cell (Headers/Cookies/Queries/Options row or
         // Form-field cell) the user was on, so leaving the multiline Body
@@ -6446,6 +6541,17 @@ impl TuiApp {
                         }
                     } else if let Some(ed) = form.active_editor() {
                         let single = !ed.multiline;
+                        // Shift+←/→ selects, in the free-text fields only: the
+                        // URL and the Body are where *part* of the value varies
+                        // and so where "extract to parameter" needs to be told
+                        // which part. A table cell holds one value, so there is
+                        // nothing to narrow and its own ←/→ keep stepping
+                        // between cells at the edges.
+                        if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                            ed.set_selecting(shift);
+                        } else {
+                            ed.clear_selection();
+                        }
                         match key.code {
                             KeyCode::Enter if single => {}
                             KeyCode::Enter => ed.newline(),

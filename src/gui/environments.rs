@@ -22,7 +22,7 @@ fn source_label(source: ValueSource) -> Option<&'static str> {
 
 fn env_source_label(s: &Strings, source: crate::env_panel::EnvSource) -> &'static str {
     match source {
-        crate::env_panel::EnvSource::Both => s.gui_env_source_both,
+        crate::env_panel::EnvSource::Both => s.gui_env_source_all,
         crate::env_panel::EnvSource::Global => s.gui_env_source_global,
         crate::env_panel::EnvSource::Workspace => s.gui_env_source_workspace,
     }
@@ -77,6 +77,30 @@ fn env_rows_from(app: &GuiApp, files: &[std::path::PathBuf]) -> Vec<crate::env_p
     )
 }
 
+/// Reveal the active environment: widen whichever filters are hiding it (see
+/// [`crate::env_panel::reveal_plan`], which the terminal UI's `g` key follows
+/// too), then ask the list to expand and scroll to its row.
+pub(super) fn goto_active(app: &mut GuiApp, id: u64) {
+    let files = workspace_files(app);
+    let Some(plan) = crate::env_panel::reveal_plan(
+        &app.session.global_envs,
+        &files,
+        &app.env_query,
+        effective_source(app),
+        id,
+    ) else {
+        return;
+    };
+    if plan.clear_filter {
+        app.env_query.clear();
+    }
+    if plan.widen_source {
+        app.session.env_source = crate::env_panel::EnvSource::Both;
+        app.session.save();
+    }
+    app.reveal_env = Some(id);
+}
+
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let theme = app.theme;
     let ci = app.active_ci();
@@ -122,6 +146,19 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
 
     super::widgets::panel_header(ui, &theme, lbl_environments, |ui| {
+        // "Take me back to the active one." A workspace of a few hundred
+        // environments buries it, and the row people most often want is the one
+        // currently in effect. Shown only when something is active, so the
+        // button never sits there with nowhere to go.
+        if let Some(id) = app.session.active_env_id {
+            if ui
+                .button(super::icons::GOTO_ACTIVE)
+                .on_hover_text(app.strings.gui_env_goto_active_tooltip)
+                .clicked()
+            {
+                goto_active(app, id);
+            }
+        }
         if ui.button(lbl_load).on_hover_text(tip_load).clicked() {
             super::menu::open_via_picker(app, OpenKind::Environment);
         }
@@ -195,6 +232,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // width wider than the panel (see the note in `requests.rs` — an
             // over-wide panel leaves an unpainted strip while being dragged).
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            // Same rhythm as the request and workspace trees: this is a list of
+            // rows too, and it sat beneath them looking twice as airy.
+            super::widgets::tree_rhythm(ui);
             if rows.is_empty() {
                 ui.add_space(6.0);
                 // "Nothing loaded" and "the filter hid everything" are
@@ -670,6 +710,51 @@ mod tests {
                 .any(|t| t.contains(app.strings.gui_env_filter_no_matches)),
             "and an empty result says so rather than looking like an empty panel: {painted:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complaint: with several hundred environments the active one is
+    /// impossible to find again. The button widens whatever is hiding it and
+    /// asks the list to reveal it — the same rule the terminal UI's `g` follows.
+    #[test]
+    fn the_goto_active_button_reveals_the_active_environment() {
+        let (mut app, dir) = app_with_workspace("gotoactive");
+        app.session
+            .load_environment_text("hand-made".into(), "A=1\n", None, None);
+        let id = app.session.global_envs.last().unwrap().id;
+        app.session.active_env_id = Some(id);
+
+        // Hidden twice over: by the text filter and by a workspace-only source.
+        app.env_query = "PROD".into();
+        app.session.env_source = crate::env_panel::EnvSource::Workspace;
+        assert!(
+            env_rows(&app).iter().all(|r| r.env_id() != Some(id)),
+            "the precondition is that it is hidden"
+        );
+
+        goto_active(&mut app, id);
+
+        assert!(app.env_query.is_empty(), "the text filter is cleared");
+        assert_eq!(app.session.env_source, crate::env_panel::EnvSource::Both);
+        assert_eq!(app.reveal_env, Some(id), "and the list is asked to show it");
+        assert!(env_rows(&app).iter().any(|r| r.env_id() == Some(id)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing is disturbed when the active environment is already on show.
+    #[test]
+    fn the_goto_active_button_leaves_a_visible_row_alone() {
+        let (mut app, dir) = app_with_workspace("gotovisible");
+        app.session
+            .load_environment_text("hand-made".into(), "A=1\n", None, None);
+        let id = app.session.global_envs.last().unwrap().id;
+        app.session.active_env_id = Some(id);
+        app.env_query = "hand".into();
+
+        goto_active(&mut app, id);
+
+        assert_eq!(app.env_query, "hand", "the user's filter is theirs to keep");
+        assert_eq!(app.reveal_env, Some(id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

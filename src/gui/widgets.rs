@@ -118,6 +118,78 @@ pub fn sized_key(
     wrapping_field(ui, key_w, text, hint, color)
 }
 
+/// The width the [`suggesting_key`] caret button takes out of the key column.
+fn suggest_width(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
+/// A key field with a caret beside it offering the well-known names for the
+/// section — HTTP header names, for instance.
+///
+/// Deliberately a *visible* button rather than a popup that appears as you
+/// type. The terminal UI's Key column offers the same list, and the complaint
+/// was that the GUI simply didn't have it; an autocomplete that only shows
+/// itself once you have already started typing the name would leave someone who
+/// doesn't know the name is on offer exactly where they were.
+///
+/// It is also not a `ComboBox`, because these lists are shortcuts rather than
+/// vocabularies: any header name is legal, and a picker that made the two dozen
+/// common ones easy at the cost of making the rest impossible would be a poor
+/// trade. The field stays free text; the caret is a way to fill it in.
+///
+/// The list narrows to what has been typed so far, so the caret stays useful
+/// after a few characters instead of making the user scroll past everything.
+pub fn suggesting_key(
+    ui: &mut egui::Ui,
+    key_w: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+    options: &[&'static str],
+    empty_label: &str,
+) -> egui::Response {
+    let caret_w = suggest_width(ui);
+    let mut resp = wrapping_field(ui, (key_w - caret_w - 4.0).max(40.0), text, hint, color);
+    let row_h = ui.spacing().interact_size.y;
+    let mut picked: Option<&'static str> = None;
+    flat_buttons(ui, |ui| {
+        let button = ui.add_sized(
+            [caret_w, row_h],
+            egui::Button::new(RichText::new(super::icons::CARET_DOWN).small()),
+        );
+        egui::Popup::menu(&button).show(|ui| {
+            // Narrowed to what has been typed, the same way the terminal UI's
+            // Key column narrows its list.
+            let typed = text.trim().to_ascii_lowercase();
+            let mut any = false;
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for opt in options {
+                        if !typed.is_empty() && !opt.to_ascii_lowercase().contains(&typed) {
+                            continue;
+                        }
+                        any = true;
+                        if ui.button(*opt).clicked() {
+                            picked = Some(opt);
+                            ui.close();
+                        }
+                    }
+                });
+            if !any {
+                // "Nothing matches what you typed" is not the same as "there is
+                // nothing here", and a silently empty menu reads as broken.
+                ui.label(empty_label);
+            }
+        });
+    });
+    if let Some(name) = picked {
+        *text = name.to_string();
+        resp.mark_changed();
+    }
+    resp
+}
+
 /// A value field that shows **all** of its text, wrapping onto as many lines
 /// as it needs instead of scrolling the overflow out of sight.
 ///
@@ -146,6 +218,16 @@ pub fn wrapping_field(
 /// the `desired_width` it is asked for.
 const TEXT_EDIT_MARGIN: f32 = 8.0;
 
+/// How many lines a wrapping field grows to before it starts scrolling instead.
+///
+/// Wrapping exists so a token or a URL can be *read* rather than scrubbed
+/// through — but an environment variable holding a JWT is a hundred lines of
+/// base64, and a field that tall swallows the panel it lives in, pushing every
+/// other variable off the screen. Past this many lines the field stops growing
+/// and scrolls within itself: the whole value is still there to scroll or
+/// select through, and the rows around it stay where they are.
+const FIELD_MAX_LINES: f32 = 6.0;
+
 /// [`wrapping_field`] in a chosen text style — the URL is monospaced, so that
 /// the punctuation a URL is mostly made of lines up.
 pub fn wrapping_field_font(
@@ -162,21 +244,53 @@ pub fn wrapping_field_font(
     // out slightly wider than an empty one and the headers stopped lining up
     // with the fields beneath them.
     let text_w = (width - TEXT_EDIT_MARGIN).max(16.0);
+    // How tall this value wants to be, measured the way the `TextEdit` will lay
+    // it out (same font, same wrap width), and the tallest it is allowed to get
+    // (see `FIELD_MAX_LINES`). Measuring up front matters: a field that simply
+    // *asked* for the maximum would make its row that tall whatever it holds,
+    // which in a horizontal row (the method picker, the URL, Send) pushed the
+    // URL onto a line of its own.
+    let font_id = font.resolve(ui.style());
+    let max_h = ui.ctx().fonts_mut(|f| f.row_height(&font_id)) * FIELD_MAX_LINES + TEXT_EDIT_MARGIN;
+    let wanted_h = ui
+        .ctx()
+        .fonts_mut(|f| f.layout(text.clone(), font_id, color, text_w).size().y)
+        + TEXT_EDIT_MARGIN;
+    let field = |ui: &mut egui::Ui, text: &mut String| {
+        ui.add(
+            egui::TextEdit::multiline(text)
+                .hint_text(hint)
+                .text_color(color)
+                .desired_width(text_w)
+                .desired_rows(1)
+                .return_key(None)
+                .font(font.clone()),
+        )
+    };
     flat_fields(ui, |ui| {
-        // Allocated at the width the caller worked out, with the height left
-        // to the content — `add_sized` would pin the height and undo the
-        // growth this exists for.
-        ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
+        // A value that fits is drawn exactly as it always was: no viewport, no
+        // reserved height, so the fields that hold one line — which is nearly
+        // all of them — lay out to the pixel as before.
+        if wanted_h <= max_h {
+            // Allocated at the width the caller worked out, with the height
+            // left to the content — `add_sized` would pin the height and undo
+            // the growth this exists for.
+            return ui
+                .allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
+                    ui.set_width(width);
+                    field(ui, text)
+                })
+                .inner;
+        }
+        // Only an over-long value gets the capped, scrolling viewport.
+        ui.allocate_ui(egui::vec2(width, max_h), |ui| {
             ui.set_width(width);
-            ui.add(
-                egui::TextEdit::multiline(text)
-                    .hint_text(hint)
-                    .text_color(color)
-                    .desired_width(text_w)
-                    .desired_rows(1)
-                    .return_key(None)
-                    .font(font),
-            )
+            ui.set_height(max_h);
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| field(ui, text))
+                .inner
         })
         .inner
     })
@@ -208,12 +322,46 @@ pub fn selectable<'a>(
 /// grey chip behind every name, and a list of chips reads as a list of disabled
 /// things — which is exactly how the request tree looked once the theme gave
 /// the raised surface a colour of its own to be seen in.
+///
+/// The border is drawn *inside* the row rather than around it, so no row ever
+/// changes size. `Button::selectable` drops the frame entirely while the row
+/// is neither selected nor hovered, and egui compensates a frame's stroke
+/// inside the frame's own margin (`inner_margin = button_padding -
+/// stroke.width`, with the stroke drawn back around it) — so a frameless row
+/// comes out `2 * stroke.width` narrower and shorter than the same row
+/// selected, and picking a request grew its name and nudged the rows after it.
+/// Reserving the frame in every state instead would fix the movement by
+/// padding *every* row out to the selected one's size, which just spaces the
+/// whole list out; the button therefore keeps the compact, frameless geometry
+/// (its own stroke is suppressed so the framed states can't claim the extra
+/// pixels either) and the border is painted over the edge of the row we
+/// already have.
 pub fn selectable_row<'a>(
     ui: &mut egui::Ui,
     selected: bool,
     atoms: impl egui::IntoAtoms<'a>,
 ) -> egui::Response {
-    ui.add(egui::Button::selectable(selected, atoms))
+    // The state is read the way `Button` itself reads it (last frame's response
+    // for the id this widget is about to take), so hover still lights the row
+    // up rather than being flattened along with the resting state.
+    let state = ui
+        .ctx()
+        .read_response(ui.next_auto_id())
+        .map(|r| r.widget_state())
+        .unwrap_or_default();
+    // Exactly when egui would have framed the row: hovered/held, or selected.
+    let framed = selected || state != egui::widget_style::WidgetState::Inactive;
+    let visuals = *ui.visuals().widgets.state(state);
+    let response = ui.add(egui::Button::selectable(selected, atoms).stroke(egui::Stroke::NONE));
+    if framed && visuals.bg_stroke.width > 0.0 {
+        ui.painter().rect_stroke(
+            response.rect,
+            visuals.corner_radius,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
 }
 
 /// A panel header: a bold, **truncating** title on the left and right-aligned
@@ -244,6 +392,36 @@ pub fn panel_header(
             });
         });
     });
+}
+
+/// Vertical gap between two tree rows, in pixels.
+///
+/// The app-wide `item_spacing` (see `theme.rs`) is the gap between *controls*,
+/// and a tree is not a stack of controls: a row is one line of a list, and the
+/// air meant to keep two buttons apart reads as a list that has been spaced
+/// out. Rows are separated by their own, tighter rhythm so a folder of
+/// requests can be scanned as one block — and so more of it fits on screen,
+/// which is most of the point of a tree.
+pub const TREE_ROW_SPACING: f32 = 3.0;
+
+/// Padding above and below a tree row's label, in pixels.
+///
+/// Same argument as [`TREE_ROW_SPACING`], applied to the row itself: the
+/// app-wide `button_padding` is what makes a *button* comfortable to hit, and
+/// a row of a list doesn't need that much air around its one line of text.
+/// Left at 2px rather than nothing so the selection border doesn't sit on the
+/// letters, and egui's `interact_size` still keeps the row a sane click
+/// target.
+pub const TREE_ROW_PADDING: f32 = 2.0;
+
+/// Put a `Ui` on the trees' denser rhythm: every list of rows in the app (the
+/// request tree, the workspace tree, the environment list) is spaced the same
+/// way, so the panels read as one thing rather than three lists that happen to
+/// sit above each other.
+pub fn tree_rhythm(ui: &mut egui::Ui) {
+    let spacing = ui.spacing_mut();
+    spacing.item_spacing.y = TREE_ROW_SPACING;
+    spacing.button_padding.y = TREE_ROW_PADDING;
 }
 
 /// A collapsible tree row whose header **truncates** to the available width and
@@ -303,8 +481,11 @@ pub fn tree_header_marked<R>(
     let open = state.is_open();
 
     // The band has to be painted *under* the row's contents, so reserve a slot
-    // in the paint order now and fill it once the row's rect is known.
-    let band = highlight.map(|_| ui.painter().add(egui::Shape::Noop));
+    // in the paint order now and fill it once the row's rect is known. The
+    // hover wash shares the slot: a tree row is a click target, and without it
+    // the environment list was the one tree in the app that gave no sign the
+    // pointer was over a row at all.
+    let band = ui.painter().add(egui::Shape::Noop);
 
     let header = ui
         .horizontal(|ui| {
@@ -329,13 +510,22 @@ pub fn tree_header_marked<R>(
         .response
         .interact(egui::Sense::click());
 
-    if let (Some(band), Some(color)) = (band, highlight) {
-        let rect = header.rect.expand2(egui::vec2(0.0, 2.0));
-        let mut shapes = vec![egui::Shape::rect_filled(
+    let rect = header.rect.expand2(egui::vec2(0.0, 2.0));
+    let mut shapes = Vec::new();
+    if header.hovered() {
+        let visuals = ui.visuals().widgets.hovered;
+        shapes.push(egui::Shape::rect_filled(
+            rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+        ));
+    }
+    if let Some(color) = highlight {
+        shapes.push(egui::Shape::rect_filled(
             rect,
             3.0,
             color.gamma_multiply(0.22),
-        )];
+        ));
         // A solid bar on the leading edge, so the row still reads as marked on
         // a theme whose background leaves the translucent band very faint.
         shapes.push(egui::Shape::rect_filled(
@@ -343,9 +533,10 @@ pub fn tree_header_marked<R>(
             1.0,
             color,
         ));
+    }
+    if !shapes.is_empty() {
         ui.painter().set(band, egui::Shape::Vec(shapes));
     }
-
     if header.clicked() {
         state.toggle(ui);
     }
@@ -460,6 +651,12 @@ fn kv_widths(ui: &egui::Ui) -> (f32, f32, f32, f32) {
 
 /// An editable table of [`KvRow`]s (headers, query params, cookies, options).
 /// Returns true if anything changed. Adds a trailing "add row" button.
+///
+/// `extract_row` receives the index of a row whose value was right-clicked and
+/// sent to "Extract to parameter…". The table only reports it: which request
+/// field that row *is* is the caller's business, and the entry it belongs to is
+/// borrowed here, so the write-back happens back where the section was drawn.
+#[allow(clippy::too_many_arguments)]
 pub fn kv_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,
@@ -470,6 +667,9 @@ pub fn kv_editor(
     val_hint: &str,
     key_label: &str,
     val_label: &str,
+    extract_label: &str,
+    extract_row: &mut Option<usize>,
+    key_options: &[&'static str],
 ) -> bool {
     let mut changed = false;
     let mut remove: Option<usize> = None;
@@ -514,7 +714,22 @@ pub fn kv_editor(
                     } else {
                         theme.dim
                     };
-                    let k = sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color);
+                    // Sections with a well-known vocabulary (header and cookie
+                    // names) get the caret; a query parameter's name is the
+                    // API's business and there is nothing to suggest.
+                    let k = if key_options.is_empty() {
+                        sized_key(ui, key_w, &mut rows[i].key, key_hint, row_color)
+                    } else {
+                        suggesting_key(
+                            ui,
+                            key_w,
+                            &mut rows[i].key,
+                            key_hint,
+                            row_color,
+                            key_options,
+                            s.gui_suggest_no_matches,
+                        )
+                    };
                     if k.changed() {
                         changed = true;
                     }
@@ -523,6 +738,14 @@ pub fn kv_editor(
                     let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
                     if v.changed() {
                         changed = true;
+                    }
+                    if !rows[i].value.trim().is_empty() {
+                        v.context_menu(|ui| {
+                            if ui.button(extract_label).clicked() {
+                                *extract_row = Some(i);
+                                ui.close();
+                            }
+                        });
                     }
                     // The description is a note for whoever reads the file later,
                     // not part of the request, so it is always dim — even on an
@@ -702,6 +925,52 @@ mod tests {
         }
     }
 
+    /// A modal dialog owns the keyboard as well as the pointer: the dimmed
+    /// sheet already swallowed clicks, but Tab used to walk straight out of the
+    /// dialog and into the panels behind it. Naming the dialog's layer as
+    /// egui's modal layer is what confines focus to it.
+    fn top_modal_layer_after(modeless: bool) -> Option<egui::LayerId> {
+        let ctx = egui::Context::default();
+        // Two passes: the layer is registered by the pass that draws the
+        // window, and egui only reports it from the pass after that.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(a_frame(), |ui| {
+                let ctx = ui.ctx().clone();
+                // Something focusable behind the dialog, which is what Tab used
+                // to escape into.
+                let mut behind = String::new();
+                ui.add(egui::TextEdit::singleline(&mut behind));
+                if modeless {
+                    dialog_modeless(&ctx, "Dlg", None, |ui| ui.button("ok"));
+                } else {
+                    dialog(&ctx, "Dlg", None, |ui| ui.button("ok"));
+                }
+            });
+        }
+        ctx.memory(|m| m.top_modal_layer())
+    }
+
+    #[test]
+    fn a_modal_dialog_confines_keyboard_focus_to_its_own_layer() {
+        let layer = top_modal_layer_after(false);
+        // The id is egui's own (a `Window` derives it from the title), so the
+        // assertion is on what matters: a modal layer exists, and it is the
+        // foreground one the dialog was put in rather than the panels below.
+        assert_eq!(
+            layer.map(|l| l.order),
+            Some(egui::Order::Foreground),
+            "the dialog's own layer is the modal one, so Tab can't leave it"
+        );
+        assert_ne!(layer, Some(egui::LayerId::background()));
+    }
+
+    /// The modeless shell is the opposite case by design: it reports progress
+    /// beside work the user is still doing, so it must not capture the keyboard.
+    #[test]
+    fn a_modeless_dialog_leaves_the_keyboard_alone() {
+        assert_eq!(top_modal_layer_after(true), None);
+    }
+
     /// The flattening is scoped. A checkbox or a button in the same row still
     /// gets its outline — an outline is how a *control* says it is a control;
     /// the fields give theirs up because they are mostly content.
@@ -713,7 +982,7 @@ mod tests {
         GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
         let mut inside = egui::Stroke::new(9.0, Color32::RED);
         let mut after = egui::Stroke::new(9.0, Color32::RED);
-        ctx.run_ui(a_frame(), |ui| {
+        let _ = ctx.run_ui(a_frame(), |ui| {
             let before = ui.visuals().widgets.inactive.bg_stroke;
             assert!(before.width > 0.0, "the app's controls are outlined");
             flat_fields(ui, |ui| {
@@ -739,7 +1008,7 @@ mod tests {
             let mut height = 0.0;
             // Twice: egui settles galley sizes on the second pass.
             for _ in 0..2 {
-                ctx.run_ui(a_frame(), |ui| {
+                let _ = ctx.run_ui(a_frame(), |ui| {
                     height = wrapping_field(ui, 200.0, &mut value, "", Color32::WHITE)
                         .rect
                         .height();
@@ -775,7 +1044,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         });
         for _ in 0..2 {
-            ctx.run_ui(input.clone(), |ui| {
+            let _ = ctx.run_ui(input.clone(), |ui| {
                 wrapping_field(ui, 200.0, &mut value, "", Color32::WHITE);
             });
         }
@@ -1025,13 +1294,109 @@ mod tests {
                 |ui| {
                     let before = ui.min_rect().width();
                     kv_editor(
-                        ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                        ui,
+                        &theme,
+                        &s,
+                        "kv",
+                        &mut rows,
+                        "name",
+                        "value",
+                        "Header",
+                        "Value",
+                        "Extract",
+                        &mut None,
+                        &[],
                     );
                     w = ui.min_rect().width() - before;
                 },
             );
         }
         w
+    }
+
+    /// Render a `kv_editor` and report every piece of text it painted.
+    fn kv_texts(rows: &mut Vec<KvRow>, key_options: &[&'static str]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            out.clear();
+            let full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(900.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    kv_editor(
+                        ui,
+                        &theme,
+                        &s,
+                        "kv",
+                        rows,
+                        "name",
+                        "value",
+                        "Header",
+                        "Value",
+                        "Extract",
+                        &mut None,
+                        key_options,
+                    );
+                },
+            );
+            for cs in &full.shapes {
+                collect_text(&cs.shape, &mut out);
+            }
+        }
+        out
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_text(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The complaint: the terminal UI offers the common header names in its Key
+    /// column and the GUI simply didn't. The caret is the affordance, so it has
+    /// to be *there* — and only where there is a vocabulary to offer, since a
+    /// query parameter's name is the API's business.
+    #[test]
+    fn a_key_column_with_a_vocabulary_gets_a_caret_and_one_without_does_not() {
+        let mut rows = vec![KvRow::new("Accept", "application/json")];
+        let with = kv_texts(&mut rows, crate::http::COMMON_HEADERS);
+        assert!(
+            with.iter().any(|t| t == super::super::icons::CARET_DOWN),
+            "the headers table offers the list: {with:?}"
+        );
+
+        let mut rows = vec![KvRow::new("page", "2")];
+        let without = kv_texts(&mut rows, &[]);
+        assert!(
+            !without.iter().any(|t| t == super::super::icons::CARET_DOWN),
+            "a query parameter has nothing to suggest: {without:?}"
+        );
+    }
+
+    /// Picking a name fills the cell, and the list is the same one the terminal
+    /// UI narrows — both front-ends read `crate::http`.
+    #[test]
+    fn the_key_vocabulary_is_the_one_both_front_ends_share() {
+        assert!(crate::http::COMMON_HEADERS.contains(&"Content-Type"));
+        assert_eq!(
+            crate::http::filter_headers("auth"),
+            vec!["Authorization"],
+            "the caret narrows to what has been typed"
+        );
     }
 
     /// Collect every rectangle painted in a given fill, recursing into the
@@ -1071,6 +1436,112 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Selecting a row must not resize it: `Button::selectable` drops its frame
+    /// while inactive, and the stroke width the frame folds into its margin
+    /// went with it, so picking a request in the workspace tree grew that row
+    /// and shuffled the rows after it down the panel. The fix must not be paid
+    /// for by padding every row out to the framed size either — a list of
+    /// requests spaced out by the border it isn't showing is its own bug — so
+    /// the frameless size is the one every state has to match.
+    #[test]
+    fn selecting_a_row_leaves_it_exactly_where_it_was() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        // A pointer parked off the rows: hover survives from frame to frame,
+        // so every run has to say where the pointer is, not just the hover one.
+        let away = egui::pos2(390.0, 190.0);
+        let rows = |pointer: egui::Pos2, body: &mut dyn FnMut(&mut egui::Ui, usize)| {
+            // Twice: the first pass has no stored response to read a state
+            // from, so the steady state is the second one.
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                let full = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(400.0, 200.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        for i in 0..3 {
+                            body(ui, i);
+                        }
+                    },
+                );
+                shapes = full.shapes;
+            }
+            shapes
+        };
+        let with = |selected: bool, pointer: egui::Pos2| {
+            let mut rects = Vec::new();
+            let shapes = rows(pointer, &mut |ui, i| {
+                let r = selectable_row(ui, selected && i == 1, "GET /one").rect;
+                if i == 0 {
+                    rects.clear();
+                }
+                rects.push(r);
+            });
+            (rects, shapes)
+        };
+
+        let (quiet, _) = with(false, away);
+        let (picked, picked_shapes) = with(true, away);
+        assert_eq!(
+            quiet, picked,
+            "selecting the middle row moved it or its neighbours"
+        );
+        let (hovered, _) = with(false, quiet[0].center());
+        assert_eq!(quiet, hovered, "hovering a row moved it or its neighbours");
+
+        // The bare, unframed button is the size a row has always been.
+        let mut bare = Vec::new();
+        rows(away, &mut |ui, i| {
+            let r = ui
+                .add(egui::Button::selectable(false, "GET /one").frame_when_inactive(false))
+                .rect;
+            if i == 0 {
+                bare.clear();
+            }
+            bare.push(r);
+        });
+        assert_eq!(
+            bare, quiet,
+            "rows grew to make room for a border they aren't drawing"
+        );
+
+        // The border still has to be *there*: it is drawn inside the selected
+        // row's own rect rather than around it.
+        let mut border = None;
+        for cs in &picked_shapes {
+            stroked_rects(&cs.shape, &mut |rect, width| {
+                if width > 0.0 && rect == picked[1] {
+                    border = Some(width);
+                }
+            });
+        }
+        assert!(
+            border.is_some(),
+            "the selected row lost its border: {picked_shapes:?}"
+        );
+    }
+
+    /// Walk a shape tree, reporting every rectangle drawn with a visible
+    /// stroke (rect, stroke width).
+    fn stroked_rects(shape: &egui::Shape, out: &mut dyn FnMut(egui::Rect, f32)) {
+        match shape {
+            egui::Shape::Rect(r) if r.stroke.width > 0.0 => out(r.rect, r.stroke.width),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    stroked_rects(s, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Every row of a list framed is a list that reads as disabled — the
@@ -1136,7 +1607,18 @@ mod tests {
         ];
         let rects = field_rects(&theme, |ui| {
             kv_editor(
-                ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                ui,
+                &theme,
+                &s,
+                "kv",
+                &mut rows,
+                "name",
+                "value",
+                "Header",
+                "Value",
+                "Extract",
+                &mut None,
+                &[],
             );
         });
         assert_eq!(rects.len(), 6, "three fields per row, got {rects:?}");
@@ -1180,7 +1662,18 @@ mod tests {
         let full = ctx.run_ui(a_frame(), |ui| {
             button_fill = ui.visuals().widgets.inactive.weak_bg_fill;
             kv_editor(
-                ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                ui,
+                &theme,
+                &s,
+                "kv",
+                &mut rows,
+                "name",
+                "value",
+                "Header",
+                "Value",
+                "Extract",
+                &mut None,
+                &[],
             );
         });
         for cs in &full.shapes {
@@ -1219,7 +1712,18 @@ mod tests {
         let full = ctx.run_ui(a_frame(), |ui| {
             stripe = ui.visuals().faint_bg_color;
             kv_editor(
-                ui, &theme, &s, "kv", &mut rows, "name", "value", "Header", "Value",
+                ui,
+                &theme,
+                &s,
+                "kv",
+                &mut rows,
+                "name",
+                "value",
+                "Header",
+                "Value",
+                "Extract",
+                &mut None,
+                &[],
             );
         });
         for cs in &full.shapes {
@@ -1327,6 +1831,148 @@ mod tests {
             "asking to reveal it should open it with no click involved"
         );
     }
+
+    /// A tree row is a click target, and the environment list — built from
+    /// these headers — was the one list in the app that gave no sign the
+    /// pointer was over a row.
+    #[test]
+    fn a_tree_row_lights_up_under_the_pointer() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let wash = ctx
+            .style_of(egui::Theme::Dark)
+            .visuals
+            .widgets
+            .hovered
+            .weak_bg_fill;
+        let washes = |pointer: egui::Pos2| {
+            let mut out = Vec::new();
+            for _ in 0..2 {
+                let full = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(300.0, 200.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        tree_header(ui, "hover-row", false, RichText::new("dev"), |_ui| {});
+                    },
+                );
+                out.clear();
+                for cs in &full.shapes {
+                    rects_filled(&cs.shape, wash, &mut out);
+                }
+            }
+            out.len()
+        };
+
+        assert_eq!(
+            washes(egui::pos2(280.0, 190.0)),
+            0,
+            "a row at rest is plain"
+        );
+        assert_eq!(
+            washes(egui::pos2(40.0, 8.0)),
+            1,
+            "the row under the pointer should say so"
+        );
+    }
+
+    /// A field that *asks* for its maximum height makes its row that tall
+    /// whatever it holds — which is what pushed the URL off the line it shares
+    /// with the method picker and the Send button. A value that fits has to
+    /// take exactly the room it needs.
+    #[test]
+    fn a_short_value_does_not_reserve_the_room_a_long_one_would() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let row_height = |value: Option<&str>| {
+            let mut text = value.unwrap_or_default().to_string();
+            let mut out = 0.0;
+            // Galley sizes settle from the previous pass.
+            for _ in 0..3 {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(400.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        // The URL row: a picker, the field, and a button.
+                        ui.horizontal(|ui| {
+                            let _ = ui.button("POST");
+                            if value.is_some() {
+                                wrapping_field(ui, 200.0, &mut text, "", Color32::WHITE);
+                            }
+                            let _ = ui.button("Send");
+                            out = ui.min_rect().height();
+                        });
+                    },
+                );
+            }
+            out
+        };
+
+        // The row the controls alone make, against the row they make with a
+        // one-line URL between them.
+        let controls = row_height(None);
+        let with_url = row_height(Some("{{url}}/create_session"));
+        assert!(
+            with_url <= controls + 2.0,
+            "a one-line URL made its row {with_url}px tall, next to {controls}px of controls"
+        );
+    }
+
+    /// A JWT in an environment variable is a hundred wrapped lines, and a
+    /// field that tall pushed every other variable out of the panel. Past a
+    /// few lines the field scrolls within itself instead of growing.
+    #[test]
+    fn a_very_long_value_stops_growing_and_scrolls_instead() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        theme.apply(&ctx);
+        let height = |value: &str| {
+            let mut text = value.to_string();
+            let mut out = 0.0;
+            // Galley sizes settle from the previous pass.
+            for _ in 0..3 {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(300.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.scope(|ui| {
+                            wrapping_field(ui, 120.0, &mut text, "", Color32::WHITE);
+                            out = ui.min_rect().height();
+                        });
+                    },
+                );
+            }
+            out
+        };
+
+        let one_line = height("short");
+        let jwt = height(&"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.".repeat(40));
+        assert!(
+            jwt > one_line,
+            "a value that needs two lines still gets them"
+        );
+        assert!(
+            jwt <= one_line * (FIELD_MAX_LINES + 1.0),
+            "a huge value took the whole panel ({jwt}px for a {one_line}px row)"
+        );
+    }
 }
 
 /// What a [`dialog`] frame produced, and whether the user asked to close it.
@@ -1419,14 +2065,24 @@ fn dialog_with<R>(
     if let Some(size) = default_size {
         window = window.default_size(size);
     }
-    let inner = window
-        .show(ctx, |ui| {
-            if let Some(w) = min_width {
-                ui.set_min_width(w);
-            }
-            add(ui)
-        })
-        .and_then(|r| r.inner);
+    let shown = window.show(ctx, |ui| {
+        if let Some(w) = min_width {
+            ui.set_min_width(w);
+        }
+        add(ui)
+    });
+    // The sheet stops the *pointer*, but keyboard focus is a separate,
+    // context-wide list: Tab out of the last field of a dialog and egui happily
+    // walked on into the panels behind it, typing into a request the dialog was
+    // asking about. Naming the dialog's layer as the modal one confines Tab and
+    // the arrow keys to it, which is the behaviour every other desktop dialog
+    // has. Registered after the window is shown because it is the window that
+    // owns the layer; egui applies it from the next frame, as it does for its
+    // own `Modal`.
+    if modal && let Some(r) = &shown {
+        ctx.memory_mut(|m| m.set_modal_layer(r.response.layer_id));
+    }
+    let inner = shown.and_then(|r| r.inner);
     // Escape is read from the raw input rather than consumed: a dialog is the
     // top-most thing on screen, so nothing underneath it should be acting on
     // the same press anyway.

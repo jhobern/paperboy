@@ -12,9 +12,9 @@ use nom::{
 };
 
 use crate::report::flow::{
-    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, ParallelSpec, ParamDecl,
-    ParamKind, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef,
-    ShowField, WithItem,
+    Binder, Element, EnvClause, FlowNode, Header, HeaderLine, ImageSpec, OverrideTarget,
+    ParallelSpec, ParamDecl, ParamKind, Pattern, Producer, ReportFlow, ReportStmt, ResponseFmt,
+    RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
 use crate::report::model::{ColumnClauses, StatKind};
 
@@ -345,9 +345,10 @@ fn param_kind(i: &str) -> IResult<&str, ParamKind> {
 }
 
 fn request(i: &str) -> IResult<&str, FlowNode> {
-    map(preceded(kw("REQUEST"), str_or_word), |name| {
-        FlowNode::Request { name }
-    })(i)
+    let (i, _) = kw("REQUEST")(i)?;
+    let (i, name) = str_or_word(i)?;
+    let (i, using) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
+    Ok((i, FlowNode::Request { name, using }))
 }
 
 /// `[PARALLEL[(n)]] FOR <pattern> IN (ENVS <clause> | <producer>) … END`.
@@ -427,7 +428,15 @@ fn report(i: &str) -> IResult<&str, FlowNode> {
 fn report_request(i: &str) -> IResult<&str, ReportStmt> {
     let (i, _) = kw("REQUEST")(i)?;
     let (i, name) = str_or_word(i)?;
+    // `USING(…)` is accepted on either side of `AS`. It is written both ways in
+    // the wild — the clause belongs to the *send* and the alias to the
+    // *column*, so neither order is obviously the wrong one to reach for — and
+    // rejecting one of them turns a reading of the line into a syntax error.
+    // The serialiser still emits one order, so a file normalises on save.
+    let (i, using_first) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
     let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
+    let (i, using_last) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
+    let using: Vec<UsingItem> = using_first.into_iter().chain(using_last).collect();
     let (i, response_fmt) = opt(preceded(kw("RESPONSE"), resp_fmt))(i)?;
     let (i, show) = map(opt(show_clause), Option::unwrap_or_default)(i)?;
     let (i, hide) = map(opt(hide_clause), Option::unwrap_or_default)(i)?;
@@ -437,6 +446,7 @@ fn report_request(i: &str) -> IResult<&str, ReportStmt> {
         ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -652,6 +662,35 @@ fn show_field(i: &str) -> IResult<&str, ShowField> {
             stats: stats.unwrap_or_default(),
         },
     ))
+}
+
+/// `USING(FILE, multipart.file = "{{DOC}}", …)` — the required-parameter /
+/// call-site-override clause shared by `REQUEST` and `REPORT REQUEST`.
+///
+/// Parenthesised and comma-separated like `SHOW(…)`/`HIDE(…)` rather than
+/// introducing a second block form: the common case is one identifier
+/// (`USING(FILE)`) and it should cost one glance, not three lines.
+fn using_clause(i: &str) -> IResult<&str, Vec<UsingItem>> {
+    preceded(kw("USING"), paren_list1(using_item))(i)
+}
+
+/// One `USING(…)` item: a bare parameter name, or `<target> = "<value>"`.
+///
+/// The two forms are told apart by the `=`, which leaves room for the override
+/// syntax to grow without ever making `USING(FILE)` ambiguous.
+fn using_item(i: &str) -> IResult<&str, UsingItem> {
+    let (rest, path) = word(i)?;
+    match opt(preceded(sym('='), string_lit))(rest)? {
+        (rest, Some(value)) => {
+            let target = OverrideTarget::parse(path).ok_or_else(|| perr(i))?;
+            Ok((rest, UsingItem::Override { target, value }))
+        }
+        // A required parameter is a plain variable name; a dotted path here is
+        // an override someone forgot to give a value, and saying so as a parse
+        // error beats silently requiring a parameter called `multipart.file`.
+        (rest, None) if is_ident(path) => Ok((rest, UsingItem::Require(path.to_string()))),
+        _ => Err(perr(i)),
+    }
 }
 
 /// `HIDE(a, b, …)` — at least one field (empty is a parse error).
@@ -1064,6 +1103,122 @@ fn with_block_head(i: &str) -> IResult<&str, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- USING(…) ----------------------------------------------------------
+
+    /// The common form: one identifier stating which parameter the request must
+    /// declare. It binds nothing (the value already flows through scope) — it
+    /// exists so a flow copied onto an unparameterised collection fails loudly
+    /// instead of silently sending the request's own hardcoded value.
+    #[test]
+    fn a_using_clause_records_required_parameters() {
+        let flow =
+            parse_flow("# collection: c\n\nREQUEST upload USING(FILE, PAGE)\n").expect("parses");
+
+        let FlowNode::Request { using, .. } = &flow.nodes[0] else {
+            panic!("expected a request, got {:?}", flow.nodes[0]);
+        };
+        assert_eq!(
+            using,
+            &vec![
+                UsingItem::Require("FILE".into()),
+                UsingItem::Require("PAGE".into())
+            ]
+        );
+    }
+
+    /// The published examples write `USING(…)` before `AS`, the grammar table
+    /// writes it after. Both are read; the serialiser picks one.
+    #[test]
+    fn using_is_accepted_on_either_side_of_the_alias() {
+        let after = "# collection: c\n\nREPORT REQUEST upload AS up USING(FILE)\n";
+        let before = "# collection: c\n\nREPORT REQUEST upload USING(FILE) AS up\n";
+        let stmt = |src: &str| {
+            let flow = parse_flow(src).expect("parses");
+            match flow.nodes.first().expect("one statement") {
+                FlowNode::Report(ReportStmt::Request { alias, using, .. }) => {
+                    (alias.clone(), using.clone())
+                }
+                other => panic!("expected a report request, got {other:?}"),
+            }
+        };
+        assert_eq!(stmt(after), stmt(before));
+        let (alias, using) = stmt(before);
+        assert_eq!(alias.as_deref(), Some("up"));
+        assert_eq!(using, vec![UsingItem::Require("FILE".into())]);
+    }
+
+    /// The override form is told apart by the `=`, so the two can be mixed in
+    /// one clause without ambiguity.
+    #[test]
+    fn a_using_clause_mixes_requirements_and_overrides() {
+        let src = "# collection: c\n\nREPORT REQUEST upload AS up USING(FILE, multipart.file = \"{{DOC}}\") SHOW(HttpStatus)\n";
+        let flow = parse_flow(src).expect("parses");
+
+        let FlowNode::Report(ReportStmt::Request { using, .. }) = &flow.nodes[0] else {
+            panic!("expected a report request, got {:?}", flow.nodes[0]);
+        };
+        assert_eq!(
+            using,
+            &vec![
+                UsingItem::Require("FILE".into()),
+                UsingItem::Override {
+                    target: OverrideTarget::Multipart("file".into()),
+                    value: "{{DOC}}".into(),
+                },
+            ]
+        );
+        assert_eq!(flow.to_text(), src, "round-trips byte for byte");
+    }
+
+    /// Every addressable part of a request round-trips through its written
+    /// form, so a target can't parse as one thing and serialize as another.
+    #[test]
+    fn every_override_target_round_trips() {
+        for path in [
+            "url",
+            "body",
+            "header.X-Trace",
+            "query.page",
+            "form.name",
+            "multipart.file",
+            "cookie.session",
+            "option.retry",
+            "basic_auth.user",
+            "basic_auth.pass",
+        ] {
+            let target = OverrideTarget::parse(path).expect(path);
+            assert_eq!(target.text(), path);
+        }
+    }
+
+    /// An unknown section, or a section given the wrong shape, is a parse error
+    /// rather than a silently-ignored clause.
+    #[test]
+    fn a_malformed_override_target_is_rejected() {
+        for path in ["nope.x", "url.x", "body.x", "header.", "basic_auth.admin"] {
+            assert!(OverrideTarget::parse(path).is_none(), "{path}");
+        }
+        assert!(
+            parse_flow("# collection: c\n\nREQUEST a USING(nope.x = \"1\")\n").is_err(),
+            "an unknown target must not parse",
+        );
+    }
+
+    /// A dotted path with no value is an override someone forgot to finish, not
+    /// a request for a parameter named `multipart.file`.
+    #[test]
+    fn a_dotted_requirement_without_a_value_is_rejected() {
+        assert!(parse_flow("# collection: c\n\nREQUEST a USING(multipart.file)\n").is_err());
+    }
+
+    /// A request with no clause serializes without one — the clause is optional
+    /// and existing flows are untouched.
+    #[test]
+    fn a_request_without_a_using_clause_is_unchanged() {
+        let src = "# collection: c\n\nREQUEST upload\n";
+        assert_eq!(parse_flow(src).expect("parses").to_text(), src);
+    }
 
     /// The bug that motivated `FlowNode::Comment`: a block commented out in the
     /// body used to vanish, because `trivia` threw comments away and the
@@ -1652,7 +1807,8 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
-                name: "My Request".into()
+                name: "My Request".into(),
+                using: Vec::new(),
             }
         );
     }
@@ -1663,7 +1819,8 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
-                name: "auth/Oauth".into()
+                name: "auth/Oauth".into(),
+                using: Vec::new(),
             }
         );
     }

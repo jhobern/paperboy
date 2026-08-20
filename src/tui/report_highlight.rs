@@ -78,6 +78,7 @@ const KEYWORDS: &[&str] = &[
     "PRETTY",
     "SHOW",
     "HIDE",
+    "USING",
     "JOIN",
     "ON",
     // The per-column clauses. They read as part of the column they follow (the
@@ -132,6 +133,10 @@ fn keyword_color(upper: &str, th: &Theme) -> Color {
         "REPORT" => th.subst,
         "SHOW" => th.ok,
         "HIDE" => th.dim,
+        // The clause states a *requirement* the request has to meet, so it
+        // takes the substitution hue its GUI chip carries rather than reading
+        // as one more structural keyword.
+        "USING" => th.subst,
         "AS" | "BASELINE" | "COMPARISON" => th.pending,
         "PARALLEL" => th.err,
         // The column clauses take the substitution hue their GUI chips carry,
@@ -528,7 +533,7 @@ mod tests {
     #[test]
     fn keyword_colour_follows_category() {
         let th = th();
-        let line = "SHOW HIDE AS RESPONSE WITH PARALLEL";
+        let line = "SHOW HIDE AS RESPONSE WITH PARALLEL USING";
         let spans = highlight_line(line, &ctx(), &th);
         let fg = |kw: &str| spans.iter().find(|s| s.content == kw).unwrap().style.fg;
         assert_eq!(fg("SHOW"), Some(th.ok));
@@ -540,6 +545,9 @@ mod tests {
         // apart from the blue loop keywords.
         assert_eq!(fg("WITH"), Some(th.accent));
         assert_eq!(fg("PARALLEL"), Some(th.err));
+        // USING binds the call site to the request's own parameters, so it
+        // shares REPORT's substitution colour rather than the structural accent.
+        assert_eq!(fg("USING"), Some(th.subst));
     }
 
     #[test]

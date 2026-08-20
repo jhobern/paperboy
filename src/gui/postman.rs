@@ -290,6 +290,11 @@ enum UiAction {
     /// workspace before spending the rest of their API budget on it.
     Preview(usize),
     ClosePreview,
+    /// Expand the nth visible workspace in the picker, listing the collections
+    /// in it. An index rather than an id so this stays a `Copy` action like
+    /// every other one here; the id is looked up when it is acted on.
+    PeekWorkspace(usize),
+    ClosePeek,
 }
 
 #[derive(Clone, Copy)]
@@ -395,6 +400,15 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         }
         UiAction::ClosePreview => {
             w.flow.close_preview();
+        }
+        UiAction::PeekWorkspace(i) => {
+            let id = w.flow.visible_workspaces().get(i).map(|ws| ws.id.clone());
+            if let Some(id) = id {
+                w.flow.open_workspace_peek(&id, &app.strings);
+            }
+        }
+        UiAction::ClosePeek => {
+            w.flow.close_workspace_peek();
         }
         UiAction::BrowseDest => {
             let seed = std::path::PathBuf::from(w.flow.dest.trim());
@@ -607,31 +621,94 @@ fn draw_pick_workspace(
     );
     ui.add_space(4.0);
 
-    let names: Vec<String> = w
+    // Each row is a tree node, not a bare name: a workspace *contains*
+    // collections, and which ones it contains is the question the reader is
+    // actually answering here. It used to be answerable only two steps later,
+    // once a workspace had been committed to and planned — so choosing between
+    // "IDV Platform" and "IDV Platform (old)" meant importing one to find out.
+    let rows: Vec<(String, String)> = w
         .flow
         .visible_workspaces()
         .iter()
-        .map(|ws| ws.name.clone())
+        .map(|ws| (ws.id.clone(), ws.name.clone()))
+        .collect();
+    if !rows.is_empty() {
+        ui.colored_label(colors.dim, s.postman_ws_peek_cost);
+    }
+    let open = w.flow.peek_open().map(str::to_string);
+    let pending = w.flow.peek_pending().map(str::to_string);
+    let listed: Vec<Option<Vec<String>>> = rows
+        .iter()
+        .map(|(id, _)| w.flow.workspace_peek(id).map(<[String]>::to_vec))
         .collect();
     let mut selected = w.flow.selected;
     egui::ScrollArea::vertical()
         .max_height(260.0)
         .show(ui, |ui| {
-            for (i, name) in names.iter().enumerate() {
-                if ui.selectable_label(selected == i, name).clicked() {
+            super::widgets::tree_rhythm(ui);
+            for (i, (id, name)) in rows.iter().enumerate() {
+                let expanded = open.as_deref() == Some(id.as_str());
+                let busy = pending.as_deref() == Some(id.as_str());
+                let chev = if expanded {
+                    super::icons::CARET_DOWN
+                } else {
+                    super::icons::CARET_RIGHT
+                };
+                let row = ui.horizontal(|ui| {
+                    let label = format!("{chev} {} {name}", super::icons::FOLDER);
+                    let hit = ui.selectable_label(selected == i, label);
+                    // The spinner sits *after* the row so it can't shift the
+                    // name sideways when it appears and vanishes.
+                    if busy {
+                        ui.spinner();
+                    }
+                    hit
+                });
+                if row.inner.clicked() {
+                    // One click does the two things a tree row does: it picks
+                    // the row, and it opens or shuts it.
                     selected = i;
+                    action = if expanded {
+                        UiAction::ClosePeek
+                    } else {
+                        UiAction::PeekWorkspace(i)
+                    };
                 }
+                if !expanded {
+                    continue;
+                }
+                ui.indent(("postman_ws_peek", i), |ui| {
+                    super::widgets::tree_rhythm(ui);
+                    match listed.get(i).and_then(Option::as_ref) {
+                        Some(names) if names.is_empty() => {
+                            ui.colored_label(colors.dim, s.postman_ws_peek_empty);
+                        }
+                        Some(names) => {
+                            for name in names {
+                                ui.colored_label(
+                                    colors.text,
+                                    format!("{} {name}", super::icons::FILE),
+                                );
+                            }
+                        }
+                        // Nothing listed yet: either the call is in flight or
+                        // it failed, and the error is printed under the list.
+                        None => {
+                            ui.colored_label(colors.dim, s.postman_ws_peek_busy);
+                        }
+                    }
+                });
             }
         });
     w.flow.selected = selected;
+    if let Some(err) = w.flow.peek_error() {
+        ui.colored_label(colors.err, err);
+    }
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(
-                !busy && !names.is_empty(),
-                egui::Button::new(s.gui_git_next),
-            )
+            .add_enabled(!busy && !rows.is_empty(), egui::Button::new(s.gui_git_next))
             .clicked()
         {
             action = UiAction::PickWorkspace;
@@ -811,33 +888,51 @@ fn draw_preview_list(
         .max_height(160.0)
         .id_salt("postman_preview_list")
         .show(ui, |ui| {
+            super::widgets::tree_rhythm(ui);
             for (index, (id, name, cached)) in items.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    let busy = pending.as_deref() == Some(id.as_str());
-                    let is_open = open.as_deref() == Some(id.as_str());
+                let busy = pending.as_deref() == Some(id.as_str());
+                let is_open = open.as_deref() == Some(id.as_str());
+                // A row that opens to show what is inside it is a tree node,
+                // and reads as one: a caret and a name, not a name with a
+                // "Preview" button bolted to its left. The button said what
+                // the row would cost, which is a real thing to say — so it
+                // moved to the hover, where it is read by the person who
+                // wonders rather than by everyone who scans the list.
+                let chev = if is_open {
+                    super::icons::CARET_DOWN
+                } else {
+                    super::icons::CARET_RIGHT
+                };
+                let hint = if *cached {
+                    s.postman_preview_cached
+                } else {
+                    s.postman_preview_action
+                };
+                let row = ui.horizontal(|ui| {
+                    let label = format!("{chev} {} {name}", super::icons::FILE);
+                    // Only one fetch runs at a time, so the rest go quiet
+                    // rather than queueing calls the user can't see.
+                    let can = is_open || pending.is_none();
+                    let hit = ui.add_enabled(
+                        can,
+                        egui::Button::selectable(
+                            is_open,
+                            egui::RichText::new(label).color(colors.text),
+                        ),
+                    );
                     if busy {
                         ui.spinner();
                     }
-                    let label = if *cached {
-                        s.postman_preview_cached
-                    } else {
-                        s.postman_preview_action
-                    };
-                    // Only one fetch runs at a time, so the rest go quiet
-                    // rather than queueing calls the user can't see.
-                    let can = pending.is_none();
-                    if is_open {
-                        if ui.button(s.gui_close).clicked() {
-                            *action = UiAction::ClosePreview;
-                        }
-                    } else if ui.add_enabled(can, egui::Button::new(label)).clicked() {
-                        *action = UiAction::Preview(index);
-                    }
-                    ui.colored_label(colors.text, name);
+                    hit.on_hover_text(hint)
                 });
-                if open.as_deref() == Some(id.as_str())
-                    && let Some(preview) = w.flow.preview()
-                {
+                if row.inner.clicked() {
+                    *action = if is_open {
+                        UiAction::ClosePreview
+                    } else {
+                        UiAction::Preview(index)
+                    };
+                }
+                if is_open && let Some(preview) = w.flow.preview() {
                     draw_preview_body(ui, preview, colors, s);
                 }
             }
@@ -1204,6 +1299,44 @@ mod tests {
         }
     }
 
+    /// Every word the dialog paints this frame, as one line. A few frames, so
+    /// egui's sizing and any newly opened section have settled.
+    fn painted(app: &mut GuiApp) -> String {
+        use eframe::egui;
+
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        app.theme.apply(&ctx);
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    super::show(app, &ctx);
+                },
+            );
+            last.clear();
+            out.shapes.iter().for_each(|sh| walk(&sh.shape, &mut last));
+        }
+        last.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn wizard() -> Wizard {
         let mut w = Wizard::new();
         w.flow.key = "PMAK-test".to_string();
@@ -1323,41 +1456,6 @@ mod tests {
     fn the_confirmation_step_can_read_a_collection_before_importing_it() {
         use crate::postman_api::ItemSummary;
         use crate::postman_flow::PreviewRow;
-        use eframe::egui;
-
-        fn painted(app: &mut GuiApp) -> String {
-            fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
-                match s {
-                    egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
-                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                    _ => {}
-                }
-            }
-            let ctx = egui::Context::default();
-            app.theme.apply(&ctx);
-            let mut last = Vec::new();
-            for _ in 0..3 {
-                let out = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::pos2(0.0, 0.0),
-                            egui::vec2(1200.0, 800.0),
-                        )),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        let ctx = ui.ctx().clone();
-                        super::show(app, &ctx);
-                    },
-                );
-                last.clear();
-                out.shapes.iter().for_each(|sh| walk(&sh.shape, &mut last));
-            }
-            last.join(" ")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
 
         let mut app = GuiApp::for_test(Session::default());
         app.postman.open();
@@ -1418,6 +1516,63 @@ mod tests {
         assert!(
             after.contains("sandbox script"),
             "and what would not convert, which is worth knowing beforehand"
+        );
+
+        // And it reads as a tree: a caret that turns, not a name with a
+        // "Preview" button in front of it. What the click costs moved to the
+        // row's hover, which is why the word is gone from the list.
+        assert!(
+            before.contains(super::super::icons::CARET_RIGHT)
+                && after.contains(super::super::icons::CARET_DOWN),
+            "the row's caret turns as it opens: {before:?} then {after:?}"
+        );
+        assert!(
+            !before.contains(s.postman_preview_action),
+            "and no button is drawn beside the name: {before:?}"
+        );
+    }
+
+    /// Which collections a workspace holds is the question the picker is
+    /// really asking, and it used to be answerable only two steps later — once
+    /// a workspace had been committed to and a plan fetched for it. Expanding
+    /// the row answers it in place.
+    #[test]
+    fn a_workspace_row_opens_to_show_the_collections_in_it() {
+        let mut app = GuiApp::for_test(Session::default());
+        app.postman.open();
+        app.postman.seed_step_for_audit(Step::PickWorkspace);
+        let flow = &mut app.postman.flow.as_mut().unwrap().flow;
+        flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        // Cached, so the test needs no Postman API behind it.
+        flow.seed_peek_cache("ws-a", vec!["Billing".to_string(), "Identity".to_string()]);
+
+        let before = painted(&mut app);
+        assert!(
+            before.contains("Alpha") && before.contains("Beta"),
+            "both workspaces are listed: {before:?}"
+        );
+        assert!(
+            !before.contains("Billing"),
+            "but nothing inside one is shown until it is opened: {before:?}"
+        );
+
+        app.postman
+            .flow
+            .as_mut()
+            .unwrap()
+            .flow
+            .open_workspace_peek("ws-a", &s());
+        let after = painted(&mut app);
+        assert!(
+            after.contains("Billing") && after.contains("Identity"),
+            "the collections in the opened workspace show under it: {after:?}"
+        );
+        assert!(
+            after.contains("Beta"),
+            "and the rest of the list stays where it was: {after:?}"
         );
     }
 

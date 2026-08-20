@@ -828,7 +828,10 @@ fn parse_form_field_line(body: &str, multipart: bool) -> Option<FormField> {
 
 /// Parse the `PATH; CONTENT-TYPE` part of a `[Multipart]` `file,…` value into a
 /// `File`/`Base64File` field, reversing [`escape_form_file_path`] on the path.
-fn parse_file_form_value(key: &str, spec: &str) -> FormField {
+///
+/// Also reachable from a report's `USING(multipart.x = …)` override, which has
+/// to read the same spelling for the same reason a `.hurl` file does.
+pub(crate) fn parse_file_form_value(key: &str, spec: &str) -> FormField {
     let (escaped_path, ct) = split_unescaped_semicolon(spec);
     let path = unescape_form_file_path(escaped_path);
     let ct = ct.trim();

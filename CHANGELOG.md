@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.4.0] - unreleased
+## [0.5.0] - 2026-08-20
 
 ### Changed
 
@@ -99,6 +99,173 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Ctrl+F finds text in a report's source view.** Reports grow past a screenful
+  quickly, and the only way to reach a request or a parameter halfway down was to
+  scroll for it. Ctrl+F opens a find bar above the editor: every occurrence is
+  shaded as you type, the current one more strongly, and a counter shows where
+  you are. Enter and Shift+Enter step forward and back while the box has focus,
+  F3 and Shift+F3 do the same from anywhere (so you can search, edit the script,
+  and jump on without going back to the box), and Escape closes the bar. Each
+  jump selects the match and scrolls it into the middle of the pane.
+
+- **`USING(…)` can be reached without opening the source view.** The request
+  node's configure dialog only drew its parameter section when the named request
+  already declared parameters — so on a collection where none does, which is the
+  usual state of an existing collection, the dialog showed no sign the clause
+  existed and there was no way to add one. The canvas chip was no help either:
+  it renders only a clause that is already there. The section is now always
+  shown; when the request declares nothing it says so and points at
+  Extract to parameter. Per-call overrides (`multipart.document = "{{FILE}}"`)
+  have a control for the first time in both front-ends — a target box and a
+  value box — and a target naming no part of a request is flagged as it is typed
+  rather than written out into a flow that wouldn't parse.
+
+- **The GUI's Headers table offers the common header names.** The terminal UI's
+  request wizard has always suggested them in its Key column; the GUI's Headers
+  table was a bare text box, so the names had to be remembered and typed. A
+  caret beside the key opens the same list, narrowed to whatever has been typed
+  so far. It is a caret rather than a popup that appears as you type, because
+  someone who doesn't know the list exists would never trigger the latter — and
+  a shortcut rather than a dropdown, because any header name is legal and the
+  field stays free text. Only sections with a vocabulary get the caret: a query
+  parameter's name is the API's business. Both front-ends now read one list, so
+  they can't drift apart.
+
+- **Jump to the active environment.** In a workspace of several hundred
+  environments the one currently in effect is the row you most often want back —
+  to read it, edit it or turn it off — and it is exactly the row you can never
+  find again. The Environments panel now has a control that goes straight to it:
+  `g` in the terminal UI, a crosshair button in the GUI's panel header. Both
+  widen whatever is hiding the row first (the name filter, then the
+  global/workspace source), because a "take me to it" that silently did nothing
+  behind a filter would be worse than no control at all — and both leave the
+  filters untouched when the row was on show all along. Neither front-end offers
+  the control when no environment is active.
+
+- **Requests can declare parameters, and PaperTrail calls say what they use.**
+  Driving a shared request from a report meant editing the request itself —
+  putting `{{FILE}}` where the file name went — which left it broken for anyone
+  who wanted to send it on its own, and re-broke the report the moment they
+  fixed it. A request now declares the names a caller may steer it by in its own
+  `[Options]` section, using Hurl's native `variable:` option
+  (`variable: FILE=./samples/example.pdf`). PaperBoy reads that as a **default**
+  rather than an assignment: sent on its own the request uses the declared
+  value, so it stays a complete working request; sent from a flow that has the
+  name in scope, the flow's value wins. Nothing else about the request changes,
+  and the file is still ordinary Hurl.
+
+  `REQUEST` and `REPORT REQUEST` gained a matching `USING(…)` clause. A bare
+  name in it — `REPORT REQUEST upload_document USING(FILE)` — is an assertion,
+  not a binding: the value still arrives through ordinary variable scope, but
+  the statement now fails loudly, at validation time and before anything is
+  sent, on a collection whose request never declared `FILE`. That was the one
+  real hazard of the feature: a script that reads exactly like a working one,
+  pointed at an unprepared collection, quietly uploading the author's sample
+  file on every row. A statement that calls a parameterised request without
+  naming its parameters is a warning for the same reason.
+
+  For a collection you can't edit, the same clause takes per-call overrides —
+  `USING(multipart.document = "{{FILE}}", header.X-Run = "{{RUN_ID}}")` — which
+  patch the copy being sent and leave the collection on disk alone. Targets are
+  `url`, `body`, `header.*`, `query.*`, `form.*`, `multipart.*`, `cookie.*`,
+  `option.*` and `basic_auth.user`/`.pass`. Adding a header this way is normal
+  and allowed; naming a `form.`/`multipart.` field the request doesn't have is
+  an error rather than a new field, because a typo there would send a subtly
+  wrong body and still report success.
+
+  Neither half has to be typed. The request editor's `[Options]` section now
+  names the parameters its `variable:` rows declare — in both front-ends —
+  because a grid of key/value cells was the one place that never said a
+  `variable:` row was anything other than an ordinary option. And a request node
+  in either report editor offers a checkbox per parameter the request declares,
+  with the declared default beside it, so `USING(FILE)` is a tick rather than a
+  piece of syntax to learn. The checklist sits above the reporting options
+  because `USING` belongs to the send: a plain `REQUEST` gets it too. A
+  requirement naming something the request doesn't declare is still listed, with
+  no default shown, so that error can be cleared where it is seen instead of
+  only in the source view; per-call overrides have no control and are carried
+  through the form untouched.
+
+  Declaring a parameter is itself two edits that have to agree — replace the
+  value with `{{NAME}}`, add the matching `variable:` row — and the request
+  sends something subtly wrong if they don't, so both front-ends now do it in
+  one action: `Ctrl+P` on any wizard field in the terminal UI, or right-click →
+  *Extract to parameter…* on a URL, body, form/multipart value or header, query,
+  cookie or option value in the GUI. A name is suggested from the value (a path
+  suggests its file stem, so `./samples/example.pdf` suggests `EXAMPLE`) and can
+  be edited before it is created. Extracting the *same* value twice reuses the
+  one declaration rather than adding a near-duplicate beside it — two fields
+  carrying the same file come to read one parameter — while a name the request
+  already declares for a *different* value is refused, because reusing it would
+  silently repoint the field at the other one's default. In the URL and the
+  body a selection extracts only the selected run; the terminal wizard's URL and
+  body fields gained Shift+←/→ selection to make that possible.
+
+- **The Postman import browses as a tree.** Looking inside a collection was a
+  "Preview" button that swapped the view for a list, which read as "go somewhere
+  else" when all the user wanted was to look inside the thing in front of them.
+  Workspaces and collections are now rows with a caret, expanded in place. The
+  workspace row is new: choosing which workspace to import from used to offer no
+  way to see the collections in it, so "is this the workspace I meant?" was a
+  question you answered by importing it and looking. Nothing is fetched until a
+  node is opened, and each is fetched only once.
+
+- **Tabs close from their own corner.** Every closable tab now carries a small
+  ✕, drawn dim until the pointer is over it and painted in the ordinary text
+  colour rather than a warning red — closing a tab is routine, not dangerous.
+  Middle-click and the right-click menu still work; the built-in Request tab has
+  no ✕, since it cannot be closed. The mark is interacted after the tab itself
+  so it wins the overlap, otherwise closing a tab would also switch to it on the
+  way out.
+
+- **A report's parameters are edited with the right control for their type.** A
+  `PARAM` block used to be a flat label: the declaration was visible but its
+  default could only be changed by editing the `.trail` by hand. Each kind now
+  gets the editor it deserves — `ENV` offers a dropdown of the loaded
+  environments, `CHOICE` a dropdown of its own declared options, `FOLDER` and
+  `FILE` a text box with a Browse button, and `TEXT`/`NUMBER` a plain box.
+  Clearing the box removes the default rather than storing an empty string, so
+  the parameter goes back to being required. The chip edits the *declaration's*
+  default — the value that travels with the file under version control — not the
+  value of the run in front of you.
+
+- **Type-to-filter on the collection chooser.** The list of collections a report
+  can bind to is as long as the workspace, and it was pick-by-scrolling. It now
+  opens with the same filter box the request dropdown has always had (the code
+  is now shared between the two rather than written twice), narrowing as you
+  type and saying so when nothing matches.
+
+- **"Improvements" sits beside "Regressions" in the results filter bar.** A run
+  that is compared against a baseline knows both which rows came right and which
+  broke, and the metric cards have always counted both — but only the breakages
+  could be listed. "We fixed nine and broke two" is a different story from "we
+  broke two", and the reader had no way to check the first half of it. The new
+  filter selects exactly the rows whose trend is `fixed`, in the terminal UI, the
+  GUI and the interactive HTML export alike, and — like every other filter here —
+  it is only offered when there are rows in its class, so it never appears as an
+  empty button implying nothing improved.
+
+- **Globs take brace alternation: `MATCH "*.{webm,mov,mp4}"`.** A corpus almost
+  always spells the same role several ways — a liveness clip is a `.webm`, a
+  `.mov` or an `.mp4`, and the face crop beside it is named `crop_face` or
+  `facefromdoc`. Matching only `*` and `?` meant one loop per spelling, so a
+  script stopped describing the corpus and started enumerating it. Alternatives
+  may nest, may hold their own wildcards, and work anywhere a glob does —
+  `FILES … MATCH`, `FOLDERS … MATCH` and `WITH role="…"` alike. An unclosed `{`
+  is still a literal brace, so a file that really is named `weird{name` matches
+  itself.
+
+- **Report columns can address a value by a filter: `jsonpath
+  "$.CardInfo[?(@.key == 'full_name')].value"`.** An API that returns its fields
+  as a list of `{key, value}` objects — which is common enough to be a house
+  style — offered no addressable path to a named field at all, so every such
+  column had to be captured in the collection and read back through a computed
+  column. `==` and `!=` against a quoted string or a number are supported, and
+  the left-hand `@.path` may be any dotted path within the element. A filter
+  that matches once yields that value; several matches yield the list. (The
+  filter already yields the matching value, so a trailing `nth 0` on top of one
+  is an error rather than a no-op.)
+
 - **A Postman collection can be read before it is imported.** A workspace list
   is a list of names, and a name is no help deciding whether this is the
   workspace you meant — the previous screen could only say "23 collections, 500
@@ -116,7 +283,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   question about one would spend the budget the screen exists to protect. So a
   collection is fetched only when asked for by name, one at a time, and each is
   remembered once read: opening it again, or coming back to it after looking at
-  another workspace, costs nothing. `p` in the terminal UI, a button per row in
+  another workspace, costs nothing. `p` in the terminal UI, a caret per row in
   the GUI.
 
 - **A request keeps the prose that explains it.** Postman lets each request
@@ -203,7 +370,188 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
-- **A run's result no longer belongs to whichever collection is open.** In a
+- **A wall of errors no longer hides the results.** A run that fails at one
+  step fails at it for every row, so the error list above the grid was
+  routinely as long as the table — forty wrapped errors pushed the rows off the
+  bottom of a pane that doesn't scroll, leaving no way to reach the very thing
+  the errors were about. The list is now a folding, scrolling box of bounded
+  height headed by its own count.
+
+- **A file override may be written the way the collection spells it.** A
+  `[Multipart]` file row *stores* the path alone — `file,PATH; TYPE` is how a
+  `.hurl` file writes it — so a report that copied that spelling into
+  `USING(multipart.clip = "file,{{V}};video/webm")` (the obvious thing to do,
+  since it is what the row looks like on screen) sent
+  `file,file,/a/b\;video/webm; video/webm` and failed on a path nobody had
+  written. Both spellings are now read the same way, and one that names no
+  content type keeps the row's own.
+
+- **A long path in the run settings is shown by its end.** A `FOLDER`/`FILE`
+  parameter's box is narrower than the answer, and it showed the front of it —
+  but every corpus under one tree shares a prefix, so
+  `/home/you/Development/dfa_in…` said nothing about which folder was actually
+  selected. It now reads `…les/absolute/trimmed`, and clicking in swaps the
+  abbreviation for the whole value with the caret at the end.
+
+- **`USING(…)` is accepted on either side of `AS`.** `REPORT REQUEST x USING(…)
+  AS y` — the order every documented example writes, and the natural one, since
+  the alias reads as a trailing label — was a syntax error; only
+  `AS y USING(…)` parsed. Both orders now parse to the same statement.
+
+- **A declared parameter is no longer warned about as possibly unset.** A
+  request that declares its own defaults with `[Options] variable:` was still
+  reported as "may not be set" by the report validator, which made a properly
+  parameterised collection noisier than an unparameterised one — exactly
+  backwards. Names the request declares are now known to be set; an undeclared
+  `{{VAR}}` beside them still warns.
+
+- **A report opens on the tab you left it on.** Clicking a report in the
+  workspace tree always landed on the results grid if it had any, so reading
+  the source of two reports side by side — open one, open the other, go back —
+  meant re-picking Source on every visit. The chosen tab now travels with the
+  parked run. A run that *finished* while the report was put away still opens
+  on its rows: that tab was picked before there was anything to see.
+
+- **A long line in the report block editor can be scrolled to.** The blocks
+  pane only scrolled vertically, and chips are laid out on one non-wrapping
+  line (a clause broken across two lines reads as two statements) — so a
+  request carrying a `USING(…)` and a `SHOW(…)` simply ran off the right edge
+  with no way to reach its tail. The pane now scrolls both ways, sized to its
+  widest row rather than to the pane.
+
+- **Tab stays inside a dialog.** The dimmed sheet behind a dialog swallowed
+  clicks but not keyboard focus, so tabbing past the last field walked on into
+  the panels underneath — where the next keystroke went into whatever request
+  or environment the dialog was asking about. Focus is now confined to the
+  dialog, as it is in every other desktop dialog.
+
+- **A report bound to a Postman collection no longer claims the collection
+  isn't loaded.** PaperBoy treats a Postman `.json` export as a collection
+  everywhere else — the workspace tree lists them, opening one imports it, the
+  report settings dropdown offers them, and the headless runner runs them — but
+  report *validation* read the bound file and tried to parse it as Hurl text.
+  JSON is not Hurl, so the parse failed and every request name in the report was
+  checked against nothing, under the message "The collection isn't loaded, so
+  request names can't be checked yet" — about a file the user could see selected
+  in the settings panel. The primary collection and each `AS` helper are now
+  imported the same way the runner imports them.
+
+- **Opening an environment you already have loaded reloads it, instead of
+  asking an unanswerable question.** Pressing Enter on a workspace environment
+  that was already open matched on its *name* alone, so the same file counted as
+  a clash with itself: the terminal UI raised the four-way Replace / Keep both /
+  Abort / Rename popup, in which none of the answers is "just show me the file
+  I asked for", and the GUI quietly added a second `dev (2)` beside the stale
+  original. The two cases are now told apart by where the environment came from
+  — same file (by path, resolved so a relative and an absolute route to it
+  count as one, or same git origin) is a reload, refreshed in place and keeping
+  the entry's identity so linked collections stay linked. Two genuinely
+  different files that happen to share a name still clash, and still ask.
+
+- **The environments panel says which key changes its source.** With a
+  workspace open the panel shows only some of the environments, and the `o` that
+  cycles between Workspace, Global and All was documented only on the help
+  screen — so a list that looked short for no apparent reason stayed that way.
+  The key now sits on the panel's own border beside `a` and `/`, and only when
+  there is a workspace to switch between, since with global environments alone
+  it does nothing.
+
+- **The environments panel's source filter says "All", not "Both".** The button
+  sits *before* the two it refers to, so "Both" was a pronoun with nothing behind
+  it yet — you had to read on to find out what the two things were. (GUI only;
+  the terminal UI's filter is unchanged.)
+
+- **Edits to a report survive a look at something else.** Opening another file
+  in a workspace — an environment in a neighbouring folder, say — and coming back
+  to a report showed the report as it was on disk: the block editor was rebuilt
+  from the file on the way back in, so everything typed since the last save was
+  quietly gone. There was no prompt and no error, which made it the worst kind
+  of data loss: the one you only notice later. An editor with unsaved changes is
+  now parked when it is closed and handed back when the same report is reopened,
+  so navigating away costs nothing.
+
+- **A report can bind to a collection that isn't open in a tab.** Picking a
+  collection in the block editor kept reporting "The collection isn't loaded, so
+  request names can't be checked yet", because bound collections were only ever
+  looked up among the open tabs — and in a workspace the `.hurl` you point a
+  report at is usually one you have not opened. The reference is now resolved
+  against the report's own folder and parsed from disk when no tab has it, so
+  request names validate and autocomplete, and a report whose collection was
+  never opened simply runs. An open collection still wins, so unsaved edits are
+  what you are checked against; `git:` references are never fetched, because
+  validation must not go near the network.
+
+- **Chips no longer lose their padding when they carry a modifier.** A chip
+  tethered to another one is laid out with the gap between them set to zero, and
+  a child `Ui` inherits its parent's spacing — so the zero leaked *inside* the
+  chip and its text box came out flush against its label. Only rows with a
+  modifier were affected, which is why `AS document` looked cramped next to
+  every other chip. The frame now restores the normal item spacing for its
+  contents; the tether itself is unchanged.
+
+- **Every file picker opens where the last one left off.** The report editor's
+  pickers — corpus folders, baseline files, parameter defaults — always started
+  at the top of the workspace, so picking three files from the same deep folder
+  meant walking down to it three times. Finished dialogs now record the folder
+  they landed in, and a picker with no starting folder of its own begins there.
+  The parameter picker additionally starts from the value it is editing, resolved
+  against the report's folder.
+
+- **The default-environment warning reads in every language.** The em dashes in
+  the report warnings were written as raw bytes rather than characters, so the
+  message arrived as "isn't loaded â€" pick another before running". They are
+  now proper characters in all three languages.
+
+- **A long "Run settings" line no longer eats the report toolbar — or drags the
+  whole report off the left of the pane.** The chip is the only item on that row
+  that stretches, and it was laid out before the buttons beside it, so on a pane
+  narrower than the settings were long it claimed every remaining pixel and
+  pushed Export and Save baseline past the left edge of the editor. Worse, an
+  overflowing row widens the region it sits in, so everything below it — the
+  metric cards, the filters, the results grid, the detail pane — was drawn
+  hanging off the left too, clipped mid-word, which is what made the view appear
+  to lose space from the wrong side after dragging a splitter. The chip is now
+  laid out last, taking only what the buttons leave, and its one-line eliding
+  actually applies: a widget silently overrides the wrap settings of the text it
+  is given unless that text is already laid out, so the "…" the chip asked for
+  was never being used. Long settings now shorten to fit and read in full on
+  hover, and nothing on the row goes without.
+
+- **Selecting a request no longer nudges the rows around it.** A tree row is a
+  selectable whose frame only appeared once the row was picked or hovered, and
+  because a frame's stroke is compensated inside its own margin, the framed row
+  came out two pixels wider and taller than the frameless one — so clicking a
+  request grew its name and pushed every request under it down the panel. The
+  border is now drawn *inside* the row that was already there instead of around
+  it, so selection and hover only recolour a row that never moves — and the
+  list keeps its original spacing rather than every row reserving room for a
+  border it isn't showing.
+
+- **The request and workspace trees are tighter.** Rows were separated by the
+  app-wide gap between *controls* and padded like buttons, which spaced a
+  folder of requests out as if each one were a thing to press. A tree row is
+  one line of a list, so rows now sit on their own, denser rhythm — more of a
+  long folder fits on screen, and the tree reads as one block instead of a
+  stack of widgets. The environments panel is a list of rows too, and is
+  spaced to match rather than being the airy one under the trees.
+
+- **Environment rows light up under the pointer.** Every other list in the app
+  says which row a click is about to land on; the environment list, alone,
+  showed nothing at all, so double-clicking a row to activate it was aimed
+  blind. Collapsible tree rows now paint the same hover wash the request tree
+  does.
+
+- **A huge environment value no longer swallows the panel.** Values wrap so a
+  token can be read rather than scrubbed through, but a JWT wraps to a hundred
+  lines, and one variable was pushing every other one off the screen (and the
+  Add button with them). A wrapping field now grows to at most six lines and
+  scrolls within itself after that — the whole value is still there to read,
+  select and edit, and the variables around it stay put. The same cap applies
+  to header, parameter and URL fields. A field only takes the viewport when it
+  actually overflows, so a one-line URL still sits on the same row as the
+  method picker and Send.
+
+
   Workspace tab a request kept its pass/fail tick and its response only while
   the file it lives in stayed loaded: opening another folder re-read that file
   from disk, and a freshly parsed request has never been run, so both the

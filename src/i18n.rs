@@ -247,6 +247,16 @@ strings! {
     content_type_auto_placeholder => "Auto", "Auto", "Auto";
     hint_pick_file => "^F browse", "^F parcourir", "^F gennemse";
     hint_delete_row => "^D delete row", "^D supprimer la ligne", "^D slet række";
+    extract_title => "Extract to parameter", "Extraire en paramètre", "Udtræk til parameter";
+    extract_value => "Value: {}", "Valeur\u{a0}: {}", "Værdi: {}";
+    extract_name_label => "Parameter name", "Nom du paramètre", "Parameternavn";
+    extract_hint => "Enter to extract · Esc to cancel", "Entrée pour extraire · Échap pour annuler", "Enter for at udtrække · Esc for at annullere";
+    extract_name_invalid => "A parameter name cannot be empty or contain spaces or braces", "Un nom de paramètre ne peut pas être vide ni contenir d'espaces ou d'accolades", "Et parameternavn må ikke være tomt eller indeholde mellemrum eller krøllede parenteser";
+    extract_name_conflict => "This request already declares {} as '{}' — reusing it here would change what this field sends", "Cette requête déclare déjà {} comme «\u{a0}{}\u{a0}» — le réutiliser ici changerait ce que ce champ envoie", "Denne forespørgsel erklærer allerede {} som '{}' — at genbruge det her ville ændre, hvad dette felt sender";
+    gui_extract_parameter => "Extract to parameter…", "Extraire en paramètre…", "Udtræk til parameter…";
+    hint_extract_parameter => "^P extract to parameter", "^P extraire en paramètre", "^P udtræk til parameter";
+    hint_declare_parameter => "variable: NAME=value declares a parameter a report can steer", "variable\u{a0}: NOM=valeur déclare un paramètre qu'un rapport peut piloter", "variable: NAVN=værdi erklærer en parameter, som en rapport kan styre";
+    wizard_options_parameters => "Parameters: {}", "Paramètres\u{a0}: {}", "Parametre: {}";
     hint_toggle_enabled => "^E toggle enabled", "^E activer/désactiver", "^E slå til/fra";
     add_header => "\u{FF0B} Add header", "\u{FF0B} Ajouter un en-tête", "\u{FF0B} Tilføj header";
     add_cookie => "\u{FF0B} Add cookie", "\u{FF0B} Ajouter un cookie", "\u{FF0B} Tilføj cookie";
@@ -278,7 +288,7 @@ strings! {
     env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
     env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
     env_source_label => "Source: ", "Source : ", "Kilde: ";
-    env_source_both => "Both", "Les deux", "Begge";
+    env_source_all => "All", "Tous", "Alle";
     env_source_global => "Global", "Global", "Global";
     env_source_workspace => "Workspace", "Workspace", "Workspace";
     env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
@@ -401,6 +411,10 @@ strings! {
     foot_run => "run", "exécuter", "kør";
     foot_run_all => "run all", "tout exécuter", "kør alle";
     foot_env_activate => "activate/deactivate", "activer/désactiver", "aktivér/deaktivér";
+    foot_env_source => "source", "source", "kilde";
+    // The Environments panel's "jump to the active environment" key. Short
+    // because it shares a one-line border with two other hints.
+    foot_env_goto_active => "go to active", "aller à l'actif", "gå til aktivt";
     foot_env_link => "link env", "lier env", "link miljø";
     foot_new => "New Request/Var", "Nouvelle requête/var", "Ny forespørgsel/var";
     foot_rename => "rename", "renommer", "omdøb";
@@ -475,6 +489,7 @@ strings! {
     help_env_rename => "rename the selected Global Environment", "renommer l'environnement global sélectionné", "omdøb det valgte globale miljø";
     help_env_filter => "filter the environments list by name (Esc clears it)", "filtrer la liste des environnements par nom (Échap l'efface)", "filtrér miljølisten efter navn (Esc rydder det)";
     help_env_source => "cycle environment source", "changer la source des environnements", "skift miljøkilde";
+    help_env_goto_active => "jump to the active environment (widens the filters if it is hidden)", "aller à l'environnement actif (élargit les filtres s'il est masqué)", "gå til det aktive miljø (udvider filtrene, hvis det er skjult)";
     help_env_activate_workspace => "activate the selected workspace environment file", "activer le fichier d'environnement sélectionné de l'espace de travail", "aktivér arbejdsområdets valgte miljøfil";
     help_revert_request => "revert the selected request to its last saved version on disk", "rétablir la requête sélectionnée à sa dernière version enregistrée sur le disque", "gendan den valgte anmodning til dens sidst gemte version på disken";
     help_revert_env => "revert the whole environment to its last saved values on disk", "rétablir tout l'environnement à ses dernières valeurs enregistrées sur le disque", "gendan hele miljøet til dets sidst gemte værdier på disken";
@@ -715,6 +730,13 @@ strings! {
     report_node_response_default => "default", "défaut", "standard";
     report_node_alias_label => "Alias", "Alias", "Alias";
     report_node_alias_none => "(request name)", "(nom de la requête)", "(forespørgselsnavn)";
+    report_node_param_undeclared => "not declared by this request", "non déclaré par cette requête", "ikke erklæret af denne forespørgsel";
+    report_node_override_target_label => "override", "remplacement", "tilsidesæt";
+    report_node_override_target_none => "‹part of the request, e.g. multipart.document›", "‹partie de la requête, p. ex. multipart.document›", "‹del af forespørgslen, f.eks. multipart.document›";
+    report_node_override_value_label => "=", "=", "=";
+    report_node_override_value_none => "‹value, e.g. {{FILE}}›", "‹valeur, p. ex. {{FILE}}›", "‹værdi, f.eks. {{FILE}}›";
+    report_node_override_add => "+ add a per-call override (Space)", "+ ajouter un remplacement pour cet appel (Espace)", "+ tilføj en tilsidesættelse for dette kald (mellemrum)";
+    report_node_using_none => "this request declares no parameters — extract one in the request editor", "cette requête ne déclare aucun paramètre — extrayez-en un dans l'éditeur de requête", "denne forespørgsel erklærer ingen parametre — udtræk en i forespørgselseditoren";
     report_node_envs_title => "Configure ENVS loop", "Configurer la boucle ENVS", "Konfigurer ENVS-løkke";
     report_node_envs_hint => "←/→ pick · Space toggle · b baseline · f file · n add · x remove · Enter apply · Esc cancel", "←/→ choisir env · b référence · f fichier · n ajouter · x retirer · Entrée appliquer · Échap annuler", "←/→ vælg miljø · b basislinje · f fil · n tilføj · x fjern · Enter anvend · Esc annuller";
     report_node_envs_var_label => "Loop variable", "Variable de boucle", "Løkkevariabel";
@@ -804,6 +826,8 @@ strings! {
     gui_username => "Username", "Nom d'utilisateur", "Brugernavn";
     gui_password => "Password", "Mot de passe", "Adgangskode";
     gui_per_request_options => "Per-request Hurl options (e.g. retry: 3, insecure: true)", "Options Hurl par requête (p. ex. retry: 3, insecure: true)", "Hurl-indstillinger pr. anmodning (f.eks. retry: 3, insecure: true)";
+    gui_options_parameters => "Parameters: {} — a report can steer these with USING(…); the value here is the default when nothing does.", "Paramètres\u{a0}: {} — un rapport peut les piloter avec USING(…)\u{a0}; la valeur ici est celle par défaut.", "Parametre: {} — en rapport kan styre disse med USING(…); værdien her er standardværdien, når intet gør det.";
+    gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
@@ -825,6 +849,7 @@ strings! {
     gui_hint_query => "query", "requête", "forespørgsel";
     gui_hint_description => "note", "note", "note";
     gui_hint_option => "option", "option", "indstilling";
+    gui_suggest_no_matches => "No matching names", "Aucun nom correspondant", "Ingen matchende navne";
     gui_hint_field => "field", "champ", "felt";
     // Example-shaped hints. The URL and the Hurl assertion are literal syntax
     // (a URL, a Hurl expression), so they stay identical across languages;
@@ -851,10 +876,11 @@ strings! {
     gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
     gui_env_filter_hint => "Filter environments…", "Filtrer les environnements…", "Filtrér miljøer…";
     gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
-    gui_env_source_both => "Both", "Les deux", "Begge";
+    gui_env_source_all => "All", "Tous", "Alle";
     gui_env_source_global => "Global", "Global", "Global";
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
     gui_env_source_no_matches => "No environments from this source.", "Aucun environnement de cette source.", "Ingen miljøer fra denne kilde.";
+    gui_env_goto_active_tooltip => "Go to the active environment (clears the filters if they hide it)", "Aller à l'environnement actif (efface les filtres s'ils le masquent)", "Gå til det aktive miljø (rydder filtrene, hvis de skjuler det)";
     gui_env_open_workspace_tooltip => "In this workspace — click to open and expand it", "Dans cet espace de travail — cliquez pour l'ouvrir et le développer", "I dette arbejdsområde — klik for at åbne og udvide det";
     gui_ws_revert_request => "Revert request to saved", "Rétablir la requête à la sauvegarde", "Gendan anmodning til gemt";
     gui_ws_revert_file => "Revert file to saved", "Rétablir le fichier à la sauvegarde", "Gendan fil til gemt";
@@ -1020,6 +1046,14 @@ strings! {
     node_form_response_default => "Default", "Défaut", "Standard";
     node_form_alias => "Column name (AS)", "Nom de colonne (AS)", "Kolonnenavn (AS)";
     node_form_show => "Show fields", "Afficher les champs", "Vis felter";
+    node_form_using => "Parameters (USING)", "Paramètres (USING)", "Parametre (USING)";
+    node_form_using_hint => "Tick the parameters this step steers, so it fails loudly on a collection that doesn't declare them", "Cochez les paramètres pilotés par cette étape, afin qu'elle échoue franchement sur une collection qui ne les déclare pas", "Markér de parametre, dette trin styrer, så det fejler tydeligt på en samling, der ikke erklærer dem";
+    node_form_using_none => "This request declares no parameters. Open it in the request editor and use Extract to parameter on the value this report should steer.", "Cette requête ne déclare aucun paramètre. Ouvrez-la dans l'éditeur de requête et utilisez « Extraire en paramètre » sur la valeur que ce rapport doit piloter.", "Denne forespørgsel erklærer ingen parametre. Åbn den i forespørgselseditoren, og brug \"Udtræk til parameter\" på den værdi, rapporten skal styre.";
+    node_form_override_hint => "Or patch one field of the request for this call only:", "Ou remplacez un seul champ de la requête, pour cet appel uniquement :", "Eller ret ét felt i forespørgslen, kun for dette kald:";
+    node_form_override_target_hint => "multipart.document", "multipart.document", "multipart.document";
+    node_form_override_value_hint => "{{FILE}}", "{{FILE}}", "{{FILE}}";
+    node_form_override_add => "Add an override", "Ajouter un remplacement", "Tilføj en tilsidesættelse";
+    node_form_override_bad_target => "Not a part of a request. Use url, body, header.NAME, query.NAME, form.NAME, multipart.NAME, cookie.NAME, option.NAME, basic_auth.user or basic_auth.pass.", "Ce n'est pas une partie de requête. Utilisez url, body, header.NOM, query.NOM, form.NOM, multipart.NOM, cookie.NOM, option.NOM, basic_auth.user ou basic_auth.pass.", "Ikke en del af en forespørgsel. Brug url, body, header.NAVN, query.NAVN, form.NAVN, multipart.NAVN, cookie.NAVN, option.NAVN, basic_auth.user eller basic_auth.pass.";
     node_form_show_hint => "Ticking every field is the same as showing them all", "Cocher tous les champs revient à tous les afficher", "At markere alle felter svarer til at vise dem alle";
     node_envs_environments => "Environments", "Environnements", "Miljøer";
     node_envs_baseline_show => "SHOW — baseline fields to carry onto every comparison row", "SHOW — champs de référence à reporter sur chaque ligne de comparaison", "SHOW — referencefelter der føres over på hver sammenligningsrække";
@@ -1049,6 +1083,10 @@ strings! {
     gui_report_empty_flow => "No steps yet — drag a block here from the palette.", "Aucune étape pour l'instant — glissez un bloc ici depuis la palette.", "Ingen trin endnu — træk en blok herind fra paletten.";
     report_add_setting => "Add a report setting", "Ajouter un réglage de rapport", "Tilføj en rapportindstilling";
     report_setting_unset => "not set", "non défini", "ikke sat";
+    gui_report_collection_filter_no_matches => "No collection matches the filter.", "Aucune collection ne correspond au filtre.", "Ingen samling matcher filteret.";
+    gui_report_param_value_hint => "default\u{2026}", "par défaut\u{2026}", "standard\u{2026}";
+    gui_report_param_no_default => "No default (ask every run)", "Aucune valeur par défaut (demander à chaque exécution)", "Ingen standardværdi (spørg hver gang)";
+    chip_help_param_value => "The value this parameter takes when a run doesn't supply one. Leave it empty to be asked every time.", "La valeur prise par ce paramètre lorsqu'une exécution n'en fournit pas. Laissez vide pour être invité à chaque fois.", "Værdien denne parameter får, når en kørsel ikke angiver en. Lad feltet stå tomt for at blive spurgt hver gang.";
     gui_report_ws_collections => "In this workspace", "Dans cet espace de travail", "I dette arbejdsområde";
     gui_report_other_collections => "Open elsewhere", "Ouvertes ailleurs", "Åbne andre steder";
     gui_report_show_all_collections => "Show collections outside this workspace", "Afficher les collections hors de cet espace de travail", "Vis samlinger uden for dette arbejdsområde";
@@ -1058,6 +1096,7 @@ strings! {
     chip_help_flow_end => "END — where the report finishes. Everything between BEGIN and here runs, top to bottom.", "END — fin du rapport. Tout ce qui se trouve entre BEGIN et ici s'exécute, de haut en bas.", "END — hvor rapporten slutter. Alt mellem BEGIN og her køres oppefra og ned.";
     chip_help_comment => "A comment — ignored when the report runs. Kept exactly as written.", "Un commentaire — ignoré à l'exécution du rapport. Conservé tel quel.", "En kommentar — ignoreres når rapporten kører. Bevares præcis som skrevet.";
     chip_help_end => "END — closes the FOR loop above it. Drop blocks between the loop and its END to repeat them.", "END — ferme la boucle FOR au-dessus. Déposez des blocs entre la boucle et son END pour les répéter.", "END — afslutter FOR-løkken ovenfor. Slip blokke mellem løkken og dens END for at gentage dem.";
+    chip_help_using => "USING(…) — the parameters this request must declare, and any per-call field overrides. Tick the parameters in the node form; overrides are edited in the source view.", "USING(…) — les paramètres que cette requête doit déclarer, et les remplacements de champs propres à cet appel. Cochez les paramètres dans le formulaire du nœud\u{a0}; les remplacements se modifient dans la vue source.", "USING(…) — de parametre, denne forespørgsel skal erklære, samt eventuelle felt-overskrivninger for dette kald. Markér parametrene i nodeformularen; overskrivninger redigeres i kildevisningen.";
     chip_help_request => "REQUEST — runs this request from the bound collection. Pick which one from the dropdown.", "REQUEST — exécute cette requête de la collection liée. Choisissez laquelle dans la liste déroulante.", "REQUEST — kører denne forespørgsel fra den tilknyttede samling. Vælg hvilken i rullelisten.";
     chip_help_report => "REPORT — turns the line into report output. Detach it with × to run the request without reporting on it.", "REPORT — transforme la ligne en sortie de rapport. Détachez-le avec × pour exécuter la requête sans la rapporter.", "REPORT — gør linjen til rapportoutput. Fjern det med × for at køre forespørgslen uden at rapportere den.";
     chip_help_response => "RESPONSE — includes the response body as a column. RAW keeps it verbatim, PRETTY re-formats JSON. Click to change.", "RESPONSE — inclut le corps de la réponse comme colonne. RAW le garde tel quel, PRETTY reformate le JSON. Cliquez pour changer.", "RESPONSE — medtager svarets indhold som en kolonne. RAW bevarer det ordret, PRETTY omformaterer JSON. Klik for at ændre.";
@@ -1134,8 +1173,17 @@ strings! {
     report_filter_differences => "Differences", "Différences", "Forskelle";
     report_filter_incorrect => "Incorrect", "Incorrect", "Forkerte";
     report_filter_regressions => "Regressions", "Régressions", "Regressioner";
+    report_filter_improvements => "Improvements", "Améliorations", "Forbedringer";
     report_find_placeholder => "Find in rows…", "Rechercher dans les lignes…", "Søg i rækker…";
     report_rows_shown => "{shown} of {total} rows", "{shown} lignes sur {total}", "{shown} af {total} rækker";
+    // The Source view's Ctrl+F bar. `{n}`/`{total}` count the match the caret is
+    // on out of all of them; the hint doubles as the "how do I move" prompt,
+    // because a find bar with no visible keys is a find bar people press Enter
+    // at and hope.
+    source_find_placeholder => "Find in script…", "Rechercher dans le script…", "Søg i scriptet…";
+    source_find_position => "{n} of {total}", "{n} sur {total}", "{n} af {total}";
+    source_find_none => "No matches", "Aucun résultat", "Ingen match";
+    source_find_hint => "Enter / Shift+Enter to step, Esc to close", "Entrée / Maj+Entrée pour naviguer, Échap pour fermer", "Enter / Skift+Enter for at gå videre, Esc for at lukke";
     // The terminal results view's pinned summary: one metric line per scored
     // column, and the filter line `f` cycles. The GUI says the same things in
     // cards and buttons; a terminal has one line to say them in.
@@ -1242,6 +1290,9 @@ strings! {
     postman_preview_hint => "↑↓ choose · p preview · Enter import · Esc back", "↑↓ choisir · p aperçu · Entrée importer · Échap retour", "↑↓ vælg · p forhåndsvis · Enter importér · Esc tilbage";
     postman_preview_close_hint => "↑↓ scroll · Esc close", "↑↓ défiler · Échap fermer", "↑↓ rul · Esc luk";
     postman_preview_untitled => "(untitled)", "(sans titre)", "(uden titel)";
+    postman_ws_peek_cost => "Expanding a workspace lists its collections: a single API call, remembered once read.", "Déplier un espace de travail liste ses collections\u{a0}: un seul appel d'API, mémorisé une fois lu.", "At folde et workspace ud viser dets samlinger: ét enkelt API-kald, som huskes, når det er læst.";
+    postman_ws_peek_busy => "Reading the workspace…", "Lecture de l'espace de travail…", "Læser workspacet…";
+    postman_ws_peek_empty => "This workspace has no collections.", "Cet espace de travail ne contient aucune collection.", "Dette workspace har ingen samlinger.";
     postman_rate_limit_note => "Paced to stay inside Postman’s rate limit.", "Rythme adapté à la limite de débit de Postman.", "Tempo tilpasset Postmans hastighedsgrænse.";
     postman_background => "Importing from Postman", "Import depuis Postman", "Importerer fra Postman";
     postman_background_button => "Continue in the background", "Continuer en arrière-plan", "Fortsæt i baggrunden";
@@ -1344,13 +1395,13 @@ strings! {
     param_required => "'{}' has no value and no default — set it before running (--param {}=…).", "« {} » n'a ni valeur ni valeur par défaut — renseignez-le avant d'exécuter (--param {}=…).", "'{}' har hverken en værdi eller en standardværdi — angiv den før kørslen (--param {}=…).";
     param_not_a_choice => "'{}' was given '{}', which isn't one of its choices ({}).", "« {} » a reçu « {} », qui ne fait pas partie de ses choix ({}).", "'{}' fik '{}', som ikke er et af dens valg ({}).";
     param_not_a_number => "'{}' was given '{}', which isn't a number.", "« {} » a reçu « {} », qui n'est pas un nombre.", "'{}' fik '{}', som ikke er et tal.";
-    diag_param_not_in_prelude => "PARAM '{}' comes too late to be offered before the run â move it above the first step.", "Le PARAM '{}' arrive trop tard pour être proposé avant l'exécution â placez-le au-dessus de la première étape.", "PARAM '{}' kommer for sent til at kunne tilbydes før kørslen â flyt den op over det første trin.";
+    diag_param_not_in_prelude => "PARAM '{}' comes too late to be offered before the run — move it above the first step.", "Le PARAM '{}' arrive trop tard pour être proposé avant l'exécution — placez-le au-dessus de la première étape.", "PARAM '{}' kommer for sent til at kunne tilbydes før kørslen — flyt den op over det første trin.";
     diag_param_duplicate => "PARAM '{}' is declared more than once.", "Le PARAM '{}' est déclaré plusieurs fois.", "PARAM '{}' er erklæret mere end én gang.";
     diag_param_prompt_clash => "Two parameters both ask for '{}' — give one of them a LABEL of its own.", "Deux paramètres demandent tous deux « {} » — donnez à l'un d'eux un LABEL qui lui soit propre.", "To parametre beder begge om '{}' — giv den ene sit eget LABEL.";
     diag_param_no_choices => "PARAM '{}' is a CHOICE with nothing to choose from.", "Le PARAM '{}' est un CHOICE sans aucun choix.", "PARAM '{}' er et CHOICE uden noget at vælge imellem.";
     diag_param_bad_choice => "PARAM '{}' has default '{}', which isn't one of its choices ({}).", "Le PARAM '{}' a la valeur par défaut '{}', qui ne fait pas partie de ses choix ({}).", "PARAM '{}' har standardværdien '{}', som ikke er et af dens valg ({}).";
     diag_param_not_a_number => "PARAM '{}' has default '{}', which isn't a number.", "Le PARAM '{}' a la valeur par défaut '{}', qui n'est pas un nombre.", "PARAM '{}' har standardværdien '{}', som ikke er et tal.";
-    diag_param_env_not_loaded => "PARAM '{}' defaults to environment '{}', which isn't loaded â pick another before running.", "Le PARAM '{}' utilise par défaut l'environnement '{}', qui n'est pas chargé â choisissez-en un autre avant d'exécuter.", "PARAM '{}' bruger som standard miljøet '{}', som ikke er indlæst â vælg et andet før kørslen.";
+    diag_param_env_not_loaded => "PARAM '{}' defaults to environment '{}', which isn't loaded — pick another before running.", "Le PARAM '{}' utilise par défaut l'environnement '{}', qui n'est pas chargé — choisissez-en un autre avant d'exécuter.", "PARAM '{}' bruger som standard miljøet '{}', som ikke er indlæst — vælg et andet før kørslen.";
     diag_show_unknown => "SHOW field '{}' on request '{}' isn't a field that request produces, so it will be ignored.", "Le champ SHOW '{}' de la requête '{}' n'est pas un champ produit par cette requête, il sera donc ignoré.", "SHOW-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer, så det ignoreres.";
     diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
     diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
@@ -1374,6 +1425,13 @@ strings! {
     diag_collection_helper_unreadable => "Helper collection '{}' could not be read: {}", "Impossible de lire la collection d'appoint '{}' : {}", "Hjælpesamlingen '{}' kunne ikke læses: {}";
     diag_request_not_found => "Request '{}' was not found in the bound collection.", "La requête '{}' est introuvable dans la collection liée.", "Forespørgslen '{}' blev ikke fundet i den bundne samling.";
     diag_request_ambiguous_leaf => "Request '{}' is ambiguous — {} requests end with that name; qualify it with its folder path.", "La requête '{}' est ambiguë — {} requêtes se terminent par ce nom\u{a0}; qualifiez-la avec son chemin de dossier.", "Forespørgslen '{}' er tvetydig — {} forespørgsler slutter med det navn; kvalificér den med dens mappesti.";
+    diag_using_undeclared => "Request '{}' does not declare a parameter '{}' (declares: {}). Add 'variable: {}=…' to its [Options] section.", "La requête '{}' ne déclare pas de paramètre '{}' (déclare\u{a0}: {}). Ajoutez 'variable: {}=…' à sa section [Options].", "Forespørgslen '{}' erklærer ikke en parameter '{}' (erklærer: {}). Tilføj 'variable: {}=…' til dens [Options]-sektion.";
+    diag_using_no_such_field => "Request '{}' has no {} field '{}' ({}).", "La requête '{}' n'a pas de champ {} nommé '{}' ({}).", "Forespørgslen '{}' har intet {}-felt '{}' ({}).";
+    diag_using_body_form_conflict => "Overriding the body of '{}' would give it both a body and Form/Multipart fields, which cannot be sent together.", "Remplacer le corps de '{}' lui donnerait à la fois un corps et des champs Form/Multipart, qui ne peuvent pas être envoyés ensemble.", "At overskrive brødteksten i '{}' ville give den både en brødtekst og Form-/Multipart-felter, som ikke kan sendes sammen.";
+    diag_using_parameter_not_required => "Request '{}' declares parameter(s) {} — name them in USING(…) so this statement fails loudly on a collection that doesn't.", "La requête '{}' déclare le(s) paramètre(s) {} — nommez-les dans USING(…) pour que cette instruction échoue franchement sur une collection qui ne les déclare pas.", "Forespørgslen '{}' erklærer parameteren/parametrene {} — navngiv dem i USING(…), så denne sætning fejler tydeligt på en samling, der ikke gør.";
+    diag_using_none => "none", "aucun", "ingen";
+    diag_using_no_fields => "it has no form fields", "elle n'a aucun champ de formulaire", "den har ingen formularfelter";
+    diag_using_has_fields => "it has: {}", "elle a\u{a0}: {}", "den har: {}";
     diag_envs_empty => "This ENVS loop has no environments to run over.", "Cette boucle ENVS n'a aucun environnement à parcourir.", "Denne ENVS-løkke har ingen miljøer at køre over.";
     diag_baseline_multiple => "At most one BASELINE environment is allowed.", "Un seul environnement BASELINE est autorisé.", "Højst ét BASELINE-miljø er tilladt.";
     diag_comparison_missing => "A BASELINE needs at least one COMPARISON environment to be compared against.", "Une BASELINE a besoin d'au moins un environnement COMPARISON auquel se comparer.", "En BASELINE har brug for mindst ét COMPARISON-miljø at blive sammenlignet med.";

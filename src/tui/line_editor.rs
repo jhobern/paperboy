@@ -209,6 +209,41 @@ impl Editor {
         }
     }
 
+    /// Replace the active selection — or, when there is none, the whole buffer
+    /// — with `replacement`, returning the text that was replaced.
+    ///
+    /// The primitive behind "extract to parameter": what comes out becomes the
+    /// new parameter's default, and what goes in is the `{{NAME}}` that reads
+    /// it. Whole-buffer is the right fallback because most cells this is
+    /// reached from hold exactly one value — a form field's path, a header's
+    /// value — so selecting nothing means "this field". `replacement` is
+    /// expected to be single-line (it is always a `{{NAME}}` placeholder).
+    pub fn replace_selection_or_all(&mut self, replacement: &str) -> String {
+        self.checkpoint();
+        match self.selection_range() {
+            Some(((sr, sc), (er, ec))) => {
+                let taken = self.selected_text().unwrap_or_default();
+                let head: String = self.lines[sr].chars().take(sc).collect();
+                let tail: String = self.lines[er].chars().skip(ec).collect();
+                self.col = head.chars().count() + replacement.chars().count();
+                self.lines.splice(
+                    sr..=er,
+                    std::iter::once(format!("{head}{replacement}{tail}")),
+                );
+                self.row = sr;
+                self.clear_selection();
+                taken
+            }
+            None => {
+                let taken = self.text();
+                self.lines = vec![replacement.to_string()];
+                self.row = 0;
+                self.col = replacement.chars().count();
+                taken
+            }
+        }
+    }
+
     /// Split the current line at the cursor (no-op in single-line mode).
     pub fn newline(&mut self) {
         if !self.multiline {

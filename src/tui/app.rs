@@ -3346,6 +3346,17 @@ impl TuiApp {
         let (mut env, pending) = parse_vars_pending(name, content);
         env.path = path;
         env.git_origin = git_origin;
+        // Opening a file that is already loaded is a reload, not a clash: the
+        // four-way prompt below asks which of two environments to keep, and
+        // when there is only one of them none of its answers is the answer.
+        if let Some(existing) = self.global_envs.iter().find(|e| {
+            crate::environment::is_same_source(e, env.path.as_deref(), env.git_origin.as_ref())
+        }) {
+            let existing_id = existing.id;
+            self.replace_environment_in_place(existing_id, env, pending);
+            self.status = Some(Status::Loaded);
+            return Some(existing_id);
+        }
         if let Some(existing) = self.global_envs.iter().find(|e| e.name == env.name) {
             let existing_id = existing.id;
             self.overlay = Some(Overlay::EnvCollision(Box::new(EnvCollision {
@@ -3680,6 +3691,35 @@ impl TuiApp {
     /// Apply the user's choice on an [`Overlay::EnvCollision`] popup,
     /// resolving the name clash between a freshly-loaded environment and one
     /// already in `global_envs`.
+    /// Swap freshly-loaded vars into the environment with `existing_id`, keeping
+    /// that entry's id, path and git origin so collection links and "Save
+    /// Environment" keep working. Shared by the collision popup's "Replace
+    /// existing" and by re-opening a file that is already loaded.
+    pub(crate) fn replace_environment_in_place(
+        &mut self,
+        existing_id: u64,
+        new_env: Environment,
+        pending: Vec<PendingSecret>,
+    ) {
+        let Some(idx) = self.global_envs.iter().position(|e| e.id == existing_id) else {
+            return;
+        };
+        let existing = &self.global_envs[idx];
+        let mut env = new_env;
+        env.id = existing.id;
+        env.path = existing.path.clone();
+        env.git_origin = existing.git_origin.clone();
+        self.global_envs[idx] = env;
+        if !pending.is_empty() {
+            self.pending_env
+                .push(spawn_resolution(existing_id, pending));
+        }
+        for col in &mut self.collections {
+            col.invalidate_request_json();
+        }
+        self.save_state();
+    }
+
     pub(crate) fn resolve_env_collision(&mut self, collision: EnvCollision) {
         let EnvCollision {
             new_env,
@@ -3691,24 +3731,7 @@ impl TuiApp {
             // Replace existing: keep the existing entry's id/path/git_origin
             // (so links and "Save Environment" keep working) but swap in the
             // freshly-loaded vars.
-            0 => {
-                if let Some(idx) = self.global_envs.iter().position(|e| e.id == existing_id) {
-                    let existing = &self.global_envs[idx];
-                    let mut env = new_env;
-                    env.id = existing.id;
-                    env.path = existing.path.clone();
-                    env.git_origin = existing.git_origin.clone();
-                    self.global_envs[idx] = env;
-                    if !pending.is_empty() {
-                        self.pending_env
-                            .push(spawn_resolution(existing_id, pending));
-                    }
-                    for col in &mut self.collections {
-                        col.invalidate_request_json();
-                    }
-                    self.save_state();
-                }
-            }
+            0 => self.replace_environment_in_place(existing_id, new_env, pending),
             // Keep both: add the new environment as a separate entry with
             // its own (already-fresh) id, duplicate name and all.
             1 => {

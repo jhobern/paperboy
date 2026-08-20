@@ -502,6 +502,39 @@ fn draw_report_node_request_overlay(
                 }
                 Line::from(Span::styled(text, base))
             }
+            FormRow::Param(pi) => {
+                let pr = &form.params[pi];
+                let mark = if pr.required { "[x]" } else { "[ ]" };
+                let style = if is_sel {
+                    base
+                } else if pr.required {
+                    Style::default().fg(th.subst)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                // The declared default is shown beside the name because it is
+                // what the request does when nothing steers it — the thing an
+                // author needs to see to know whether ticking the row matters.
+                // No default means the clause requires a name the request
+                // doesn't declare, which is an error, so it says so instead.
+                let note = match &pr.default {
+                    Some(v) => format!(" = {v}"),
+                    None => format!(" ({})", s.report_node_param_undeclared),
+                };
+                Line::from(vec![
+                    Span::styled(format!("{mark} USING {}", pr.name), style),
+                    Span::styled(
+                        note,
+                        if is_sel {
+                            base
+                        } else if pr.default.is_some() {
+                            Style::default().fg(th.dim)
+                        } else {
+                            Style::default().fg(th.err)
+                        },
+                    ),
+                ])
+            }
             FormRow::Field(fi) => {
                 let fr = &form.fields[fi];
                 let mark = if fr.included { "[x]" } else { "[ ]" };
@@ -562,18 +595,76 @@ fn draw_report_node_request_overlay(
                     Style::default().fg(th.dim)
                 },
             )),
+            FormRow::OverrideTarget(oi) => {
+                let row = &form.overrides[oi];
+                let shown = if row.target.is_empty() {
+                    s.report_node_override_target_none
+                } else {
+                    row.target.as_str()
+                };
+                let mut text = format!("USING {} {shown}", s.report_node_override_target_label);
+                if is_sel {
+                    text.push('▏');
+                }
+                // A target that names no part of a request can never work, and
+                // the row is the only place that is visible — the clause is
+                // dropped rather than written out broken.
+                let style = if is_sel {
+                    base
+                } else if crate::report::edit::override_target_valid(&row.target) {
+                    Style::default().fg(th.subst)
+                } else {
+                    Style::default().fg(th.err)
+                };
+                Line::from(Span::styled(text, style))
+            }
+            FormRow::OverrideValue(oi) => {
+                let row = &form.overrides[oi];
+                let shown = if row.value.is_empty() {
+                    s.report_node_override_value_none
+                } else {
+                    row.value.as_str()
+                };
+                let mut text = format!("    {} {shown}", s.report_node_override_value_label);
+                if is_sel {
+                    text.push('▏');
+                }
+                Line::from(Span::styled(
+                    text,
+                    if is_sel {
+                        base
+                    } else {
+                        Style::default().fg(th.dim)
+                    },
+                ))
+            }
+            FormRow::AddOverride => Line::from(Span::styled(
+                s.report_node_override_add.to_string(),
+                if is_sel {
+                    base
+                } else {
+                    Style::default().fg(th.dim)
+                },
+            )),
         };
         lines.push(line);
     }
     // The shortcut hint lives on the bottom border (a dim footer) rather than
     // crammed into the title, so a long request name no longer truncates it.
-    let block = panel(s.report_node_config_title.to_string(), true, th).title_bottom(
-        Line::from(Span::styled(
-            format!(" {} ", s.report_node_request_hint),
-            Style::default().fg(th.dim),
-        ))
-        .centered(),
-    );
+    // A request that declares no parameters shows an empty USING checklist,
+    // which reads as "there is nothing here" rather than "nothing has been
+    // declared yet". Say which, and say where the fix is — declaring one
+    // happens in the request editor, not here.
+    let hint = if form.params.is_empty() {
+        format!(
+            " {}  ·  {} ",
+            s.report_node_request_hint, s.report_node_using_none
+        )
+    } else {
+        format!(" {} ", s.report_node_request_hint)
+    };
+    let block = panel(s.report_node_config_title.to_string(), true, th)
+        .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))).centered());
     f.render_widget(Paragraph::new(lines).block(block), area);
     if let Some(app) = app {
         app.set_mouse_layer(MouseLayer::Overlay);
@@ -2410,14 +2501,27 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // The activate/deactivate hint lives on this panel's bottom border (same
     // convention as the Requests list's Run/Run All hint) since it acts on
     // whichever row is selected here, regardless of which pane has focus.
-    let activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
+    let mut activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
     let source = app.effective_env_source();
     let source_label = match source {
-        crate::env_panel::EnvSource::Both => s.env_source_both,
+        crate::env_panel::EnvSource::Both => s.env_source_all,
         crate::env_panel::EnvSource::Global => s.env_source_global,
         crate::env_panel::EnvSource::Workspace => s.env_source_workspace,
     };
+    // With hundreds of rows the active environment is rarely on screen, and it
+    // is the one people want back most often. Announced only when something is
+    // active, so the key is never advertised with nowhere to go.
+    if app.active_env_id.is_some() {
+        activate_hint.push_str(&format!("  g {}", s.foot_env_goto_active));
+    }
     let title = if app.has_workspace_env_source() {
+        // The panel title says *which* source is showing, but nothing said the
+        // filter was yours to change — the key was only in the help screen, so
+        // a list that looked short for no reason stayed that way. Announced
+        // only when there is a workspace to switch between: with global
+        // environments alone the key does nothing, and offering it would be a
+        // false lead.
+        activate_hint.push_str(&format!("  o {}", s.foot_env_source));
         format!("{} · {}", s.env_heading, source_label)
     } else {
         s.env_heading.to_string()
@@ -4196,6 +4300,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ),
                             ("/", s.help_env_filter),
                             ("o", s.help_env_source),
+                            ("g", s.help_env_goto_active),
                             ("x", s.help_env_delete),
                             ("u (Env panel)", s.help_env_reopen),
                             ("p (List pane)", s.help_env_link),

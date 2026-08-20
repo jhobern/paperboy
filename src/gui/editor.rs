@@ -7,10 +7,7 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::text::LayoutJob;
 use eframe::egui::{self, Color32, FontId, RichText, TextFormat};
 
-use crate::hurl::{FormField, FormFieldKind, HurlEntry};
-// Only the tests construct rows directly; the editor itself just borrows them.
-#[cfg(test)]
-use crate::hurl::KvRow;
+use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow};
 use crate::i18n::Strings;
 use crate::request::{SubstInfo, SubstKind, apply_request_json, build_request_json};
 
@@ -419,6 +416,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     let mut changed = false;
     let mut send = false;
+    // A right-click "Extract to parameter…" anywhere in the editor lands here
+    // and is turned into a dialog below, once the borrow of the entry the menu
+    // was drawn over has ended.
+    let mut extract: Option<PendingExtract> = None;
+    let ex_label = app.strings.gui_extract_parameter;
     let section = app.editor_section;
     // Local copy of the Code-view toggle; written back after the borrow of the
     // selected entry ends (egui closures can't borrow `app` again mid-frame).
@@ -468,6 +470,16 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             if url.changed() {
                 changed = true;
             }
+            // Usually only a segment of a URL varies, so a selection narrows
+            // the extraction the same way it does in the body.
+            extract_menu(
+                &url,
+                ex_label,
+                ExtractTarget::Url,
+                &entry.url,
+                true,
+                &mut extract,
+            );
             let btn = ui
                 .add_sized(
                     [80.0, 24.0],
@@ -634,13 +646,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry, &mut browse) {
+                            if draw_section(*sec, ui, &theme, st, entry, &mut browse, &mut extract)
+                            {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry, &mut browse) {
+                        if draw_section(other, ui, &theme, st, entry, &mut browse, &mut extract) {
                             changed = true;
                         }
                     }
@@ -669,6 +682,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 },
             );
         }
+    }
+
+    if let Some(p) = extract {
+        // The name is only ever a suggestion, so it is offered in a dialog
+        // rather than applied: extracting is two edits that have to agree, and
+        // the one thing the user cares about is what the parameter is called.
+        let declared = app.session.collections[ci].entries[sel].variable_defaults();
+        let name = crate::hurl::suggest_parameter_name(&p.value, &declared);
+        app.dialog = Some(super::app::Dialog::ExtractParameter {
+            ci,
+            entry: sel,
+            target: p.target,
+            value: p.value,
+            range: p.range,
+            name,
+        });
     }
 
     app.show_hurl = code_show_hurl;
@@ -734,6 +763,118 @@ fn section_title(section: EditorSection, s: &Strings) -> &'static str {
 /// changed. Shared by the single-section tabs and the combined "All" view.
 /// `All` and `Code` are handled by the caller (they need extra state) and are
 /// no-ops here.
+/// Which of the request editor's text fields an in-flight "extract to
+/// parameter" came from. Recorded rather than acted on immediately: the field
+/// is being rendered inside a closure that already borrows the entry, and the
+/// name still has to be confirmed in a dialog, so the write-back happens a
+/// frame later through [`apply_extract_parameter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExtractTarget {
+    Url,
+    Body,
+    FormField(usize),
+    Kv(KvSectionKind, usize),
+}
+
+/// Which `[Options]`-style table a [`ExtractTarget::Kv`] row belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvSectionKind {
+    Query,
+    Header,
+    Cookie,
+    Option,
+}
+
+/// A field the user asked to extract, before the name has been chosen.
+pub(super) struct PendingExtract {
+    pub target: ExtractTarget,
+    /// The text that will be replaced by `{{NAME}}`.
+    pub value: String,
+    /// Byte range of `value` within the field, or `None` for the whole field.
+    /// Only the free-text fields (URL, Body) can be partially extracted; a
+    /// table cell holds one value, so there is nothing to narrow.
+    pub range: Option<std::ops::Range<usize>>,
+}
+
+/// Attach the "Extract to parameter…" context menu to a just-drawn text field.
+///
+/// `selectable` fields report the user's selection so only the varying part of
+/// a URL or body is pulled out; everything else extracts whole. The selection
+/// is read from the `TextEdit`'s own state via the response's id, which is the
+/// same id the widget stored it under — no explicit `.id()` needed, because we
+/// only look *after* the field has been drawn.
+fn extract_menu(
+    resp: &egui::Response,
+    label: &str,
+    target: ExtractTarget,
+    full: &str,
+    selectable: bool,
+    out: &mut Option<PendingExtract>,
+) {
+    resp.context_menu(|ui| {
+        if ui.button(label).clicked() {
+            let range = selectable
+                .then(|| egui::TextEdit::load_state(ui.ctx(), resp.id))
+                .flatten()
+                .and_then(|st| st.cursor.char_range())
+                .map(|r| r.as_sorted_char_range())
+                .and_then(|r| char_range_to_bytes(full, r.start.0..r.end.0))
+                .filter(|r| !full[r.clone()].trim().is_empty());
+            let value = match &range {
+                Some(r) => full[r.clone()].to_string(),
+                None => full.to_string(),
+            };
+            if !value.trim().is_empty() {
+                *out = Some(PendingExtract {
+                    target,
+                    value,
+                    range,
+                });
+            }
+            ui.close();
+        }
+    });
+}
+
+/// Translate a char range (what egui's cursor speaks) into the byte range the
+/// same text is spliced by. An empty or out-of-range selection yields `None`,
+/// which the caller reads as "extract the whole field".
+/// Turn a `kv_editor`'s "the value on row *i* was right-clicked" into a
+/// [`PendingExtract`] naming which of the request's tables that row is in.
+fn kv_extract(
+    kind: KvSectionKind,
+    row: Option<usize>,
+    rows: &[KvRow],
+    out: &mut Option<PendingExtract>,
+) {
+    let Some(i) = row else { return };
+    let Some(r) = rows.get(i) else { return };
+    if r.value.trim().is_empty() {
+        return;
+    }
+    *out = Some(PendingExtract {
+        target: ExtractTarget::Kv(kind, i),
+        value: r.value.clone(),
+        range: None,
+    });
+}
+
+fn char_range_to_bytes(
+    text: &str,
+    chars: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    if chars.start >= chars.end {
+        return None;
+    }
+    let mut it = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()));
+    let start = it.by_ref().nth(chars.start)?;
+    let end = it.nth(chars.end - chars.start - 1)?;
+    Some(start..end)
+}
+
 fn draw_section(
     section: EditorSection,
     ui: &mut egui::Ui,
@@ -742,12 +883,17 @@ fn draw_section(
     entry: &mut HurlEntry,
     // Where a `[Form]` file picker opens when the field is still blank.
     browse: &mut Option<usize>,
+    // Where a right-click "Extract to parameter…" lands, to be confirmed in a
+    // dialog once the borrow of `entry` has ended.
+    extract: &mut Option<PendingExtract>,
 ) -> bool {
     let mut changed = false;
+    let ex_label = st.gui_extract_parameter;
     match section {
         EditorSection::All | EditorSection::Code => {}
         EditorSection::Params => {
             ui.label(RichText::new(st.gui_query_parameters).color(theme.dim));
+            let mut hit = None;
             if widgets::kv_editor(
                 ui,
                 theme,
@@ -758,11 +904,16 @@ fn draw_section(
                 st.gui_hint_value,
                 st.hdr_key,
                 st.hdr_value,
+                ex_label,
+                &mut hit,
+                &[],
             ) {
                 changed = true;
             }
+            kv_extract(KvSectionKind::Query, hit, &entry.queries, extract);
         }
         EditorSection::Headers => {
+            let mut hit = None;
             if widgets::kv_editor(
                 ui,
                 theme,
@@ -773,9 +924,13 @@ fn draw_section(
                 st.gui_hint_value,
                 st.gui_hint_header,
                 st.hdr_value,
+                ex_label,
+                &mut hit,
+                crate::http::COMMON_HEADERS,
             ) {
                 changed = true;
             }
+            kv_extract(KvSectionKind::Header, hit, &entry.headers, extract);
         }
         EditorSection::Body => {
             // A raw body and form fields are mutually exclusive on the wire
@@ -819,7 +974,15 @@ fn draw_section(
                 ui.add_space(4.0);
             }
             if form_mode {
-                if form_editor(ui, theme, st, &mut entry.form_fields, browse) {
+                if form_editor(
+                    ui,
+                    theme,
+                    st,
+                    &mut entry.form_fields,
+                    browse,
+                    ex_label,
+                    extract,
+                ) {
                     changed = true;
                 }
             } else {
@@ -834,6 +997,9 @@ fn draw_section(
                 if resp.changed() {
                     changed = true;
                 }
+                // The body is the one place a *part* of the field is usually
+                // what varies, so a selection narrows the extraction.
+                extract_menu(&resp, ex_label, ExtractTarget::Body, &body, true, extract);
                 entry.body = if body.is_empty() { None } else { Some(body) };
             }
         }
@@ -866,6 +1032,7 @@ fn draw_section(
             }
         }
         EditorSection::Cookies => {
+            let mut hit = None;
             if widgets::kv_editor(
                 ui,
                 theme,
@@ -876,12 +1043,34 @@ fn draw_section(
                 st.gui_hint_value,
                 st.hdr_name,
                 st.hdr_value,
+                ex_label,
+                &mut hit,
+                &[],
             ) {
                 changed = true;
             }
+            kv_extract(KvSectionKind::Cookie, hit, &entry.cookies, extract);
         }
         EditorSection::Options => {
             ui.label(RichText::new(st.gui_per_request_options).color(theme.dim));
+            // A `variable:` row is not an ordinary option: it declares a
+            // parameter — a default this request uses on its own, and a name a
+            // PaperTrail report can steer it by. That is invisible in a table of
+            // key/value rows, so the section says which names it has declared
+            // (or, when it has none, how to declare one).
+            let params = entry.variable_defaults();
+            let note = if params.is_empty() {
+                st.gui_options_declare_parameter.to_string()
+            } else {
+                let names = params
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                crate::i18n::fill(st.gui_options_parameters, &[&names])
+            };
+            ui.label(RichText::new(note).color(theme.dim));
+            let mut hit = None;
             if widgets::kv_editor(
                 ui,
                 theme,
@@ -892,9 +1081,13 @@ fn draw_section(
                 st.gui_hint_value,
                 st.hdr_option,
                 st.hdr_value,
+                ex_label,
+                &mut hit,
+                &[],
             ) {
                 changed = true;
             }
+            kv_extract(KvSectionKind::Option, hit, &entry.options, extract);
         }
         EditorSection::Asserts => {
             ui.label(RichText::new(st.gui_response_assertions).color(theme.dim));
@@ -988,6 +1181,8 @@ fn form_editor(
     s: &Strings,
     fields: &mut Vec<FormField>,
     browse: &mut Option<usize>,
+    ex_label: &str,
+    extract: &mut Option<PendingExtract>,
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
@@ -1060,17 +1255,27 @@ fn form_editor(
                 }
                 // A form value is often a path or a long token, so it
                 // wraps rather than hiding its tail.
-                if super::widgets::wrapping_field(
+                let val = super::widgets::wrapping_field(
                     ui,
                     spare.max(40.0),
                     &mut fields[i].value,
                     hint,
                     row_color,
-                )
-                .changed()
-                {
+                );
+                if val.changed() {
                     changed = true;
                 }
+                // A form row's value *is* the path — the kind and content-type
+                // live in their own columns — so there is nothing to select
+                // within it and the whole cell is what gets extracted.
+                extract_menu(
+                    &val,
+                    ex_label,
+                    ExtractTarget::FormField(i),
+                    &fields[i].value,
+                    false,
+                    extract,
+                );
                 super::widgets::flat_buttons(ui, |ui| {
                     // File/Base64 values are paths — offer a native file picker
                     // (the terminal UI has its in-app browser for the same).
@@ -1191,7 +1396,15 @@ mod tests {
                 ..Default::default()
             };
             let full = ctx.run_ui(input, |ui| {
-                draw_section(EditorSection::Body, ui, &th, &st, entry, &mut browse);
+                draw_section(
+                    EditorSection::Body,
+                    ui,
+                    &th,
+                    &st,
+                    entry,
+                    &mut browse,
+                    &mut None,
+                );
             });
             out = painted(&full.shapes);
         }
@@ -1534,6 +1747,89 @@ mod highlight_cache_tests {
     }
 }
 
+/// Commit an "extract to parameter": replace `range` (or the whole field) in
+/// `target` with `{{name}}`, and declare `name` as a request parameter unless
+/// the request already declares it with this very value — in which case the two
+/// fields simply come to share one parameter, which is the point.
+///
+/// Every index is re-checked rather than trusted, for the same reason as
+/// [`apply_picked_form_file`]: the dialog is modal to the user, not to the
+/// program, and the row it named may be gone by the time it is answered.
+pub(super) fn apply_extract_parameter(
+    app: &mut GuiApp,
+    ci: usize,
+    entry: usize,
+    target: ExtractTarget,
+    range: Option<std::ops::Range<usize>>,
+    value: &str,
+    name: &str,
+) {
+    let name = name.trim();
+    let Some(col) = app.session.collections.get_mut(ci) else {
+        return;
+    };
+    let Some(e) = col.entries.get_mut(entry) else {
+        return;
+    };
+    if crate::hurl::check_parameter_name(name, value, &e.variable_defaults()).is_some() {
+        return;
+    }
+    let already = e.declares_variable(name);
+    let placeholder = format!("{{{{{name}}}}}");
+    // Splicing the recorded range only if the text there is still what was
+    // extracted: the field is editable while the dialog is up, and replacing
+    // whatever now occupies those bytes would be a silent corruption.
+    let replace = |field: &mut String| -> bool {
+        match &range {
+            Some(r) if field.get(r.clone()) == Some(value) => {
+                field.replace_range(r.clone(), &placeholder);
+                true
+            }
+            Some(_) => false,
+            None if field == value => {
+                *field = placeholder.clone();
+                true
+            }
+            None => false,
+        }
+    };
+    let applied = match target {
+        ExtractTarget::Url => replace(&mut e.url),
+        ExtractTarget::Body => match e.body.as_mut() {
+            Some(b) => replace(b),
+            None => false,
+        },
+        ExtractTarget::FormField(i) => match e.form_fields.get_mut(i) {
+            Some(f) => replace(&mut f.value),
+            None => false,
+        },
+        ExtractTarget::Kv(kind, i) => {
+            let rows = match kind {
+                KvSectionKind::Query => &mut e.queries,
+                KvSectionKind::Header => &mut e.headers,
+                KvSectionKind::Cookie => &mut e.cookies,
+                KvSectionKind::Option => &mut e.options,
+            };
+            match rows.get_mut(i) {
+                Some(r) => replace(&mut r.value),
+                None => false,
+            }
+        }
+    };
+    if !applied {
+        return;
+    }
+    if !already {
+        e.options.push(KvRow::toggled(
+            "variable".to_string(),
+            format!("{name}={value}"),
+            true,
+        ));
+    }
+    e.modified = true;
+    col.invalidate_request_json();
+}
+
 /// Write back the file a Form/Multipart value's Browse dialog returned.
 ///
 /// Every index is re-checked rather than trusted: the user can switch request,
@@ -1626,5 +1922,199 @@ mod pick_tests {
             ""
         );
         assert!(!app.session.collections[0].entries[0].modified);
+    }
+}
+
+#[cfg(test)]
+mod extract_tests {
+    use super::*;
+    use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow};
+
+    fn app_with(entry: HurlEntry) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        GuiApp::for_test(session)
+    }
+
+    fn form_entry(value: &str) -> HurlEntry {
+        HurlEntry {
+            title: "upload".into(),
+            url: "http://h/upload".into(),
+            form_fields: vec![FormField {
+                key: "document".into(),
+                kind: FormFieldKind::File,
+                value: value.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The whole point: one action does both halves. Done by hand they are two
+    /// edits that have to agree, and the field silently sends nothing useful if
+    /// they don't.
+    #[test]
+    fn extracting_a_form_value_replaces_it_and_declares_the_parameter() {
+        let mut app = app_with(form_entry("./samples/example.pdf"));
+        apply_extract_parameter(
+            &mut app,
+            0,
+            0,
+            ExtractTarget::FormField(0),
+            None,
+            "./samples/example.pdf",
+            "FILE",
+        );
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(e.form_fields[0].value, "{{FILE}}");
+        assert_eq!(
+            e.variable_defaults(),
+            vec![("FILE".to_string(), "./samples/example.pdf".to_string())]
+        );
+        assert!(e.modified, "the request now differs from the file on disk");
+    }
+
+    /// A selection in a URL pulls out only the part that varies — the rest of
+    /// the URL is still the request's own.
+    #[test]
+    fn extracting_a_url_selection_leaves_the_rest_of_the_url_alone() {
+        let mut app = app_with(HurlEntry {
+            url: "http://h/orders/12345/items".into(),
+            ..form_entry("x")
+        });
+        let range = "http://h/orders/".len().."http://h/orders/12345".len();
+        apply_extract_parameter(
+            &mut app,
+            0,
+            0,
+            ExtractTarget::Url,
+            Some(range),
+            "12345",
+            "ORDER",
+        );
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(e.url, "http://h/orders/{{ORDER}}/items");
+        assert_eq!(
+            e.variable_defaults(),
+            vec![("ORDER".to_string(), "12345".to_string())]
+        );
+    }
+
+    /// Two fields carrying the same file should come to read the same
+    /// parameter, not declare it twice and then drift apart.
+    #[test]
+    fn extracting_the_same_value_twice_reuses_the_one_declaration() {
+        let mut entry = form_entry("./samples/example.pdf");
+        entry
+            .headers
+            .push(KvRow::toggled("X-Source", "./samples/example.pdf", true));
+        let mut app = app_with(entry);
+        for target in [
+            ExtractTarget::FormField(0),
+            ExtractTarget::Kv(KvSectionKind::Header, 0),
+        ] {
+            apply_extract_parameter(
+                &mut app,
+                0,
+                0,
+                target,
+                None,
+                "./samples/example.pdf",
+                "FILE",
+            );
+        }
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(e.form_fields[0].value, "{{FILE}}");
+        assert_eq!(e.headers[0].value, "{{FILE}}");
+        assert_eq!(e.variable_defaults().len(), 1, "one declaration, shared");
+    }
+
+    /// Reusing a name that already means something else would silently repoint
+    /// the field at the other one's default — refused, not merged.
+    #[test]
+    fn a_name_that_already_means_something_else_is_refused() {
+        let mut entry = form_entry("./samples/other.pdf");
+        entry.options.push(KvRow::toggled(
+            "variable",
+            "FILE=./samples/example.pdf",
+            true,
+        ));
+        let mut app = app_with(entry);
+        apply_extract_parameter(
+            &mut app,
+            0,
+            0,
+            ExtractTarget::FormField(0),
+            None,
+            "./samples/other.pdf",
+            "FILE",
+        );
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(
+            e.form_fields[0].value, "./samples/other.pdf",
+            "the field is untouched"
+        );
+        assert_eq!(e.variable_defaults().len(), 1, "and nothing was declared");
+    }
+
+    /// The dialog is modal to the user, not to the program: the field can be
+    /// edited, or the row deleted, while it is up. Writing `{{NAME}}` over
+    /// whatever now sits there would be a silent corruption.
+    #[test]
+    fn a_field_that_changed_under_the_dialog_is_left_alone() {
+        let mut app = app_with(form_entry("./samples/changed.pdf"));
+        apply_extract_parameter(
+            &mut app,
+            0,
+            0,
+            ExtractTarget::FormField(0),
+            None,
+            "./samples/example.pdf",
+            "FILE",
+        );
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(e.form_fields[0].value, "./samples/changed.pdf");
+        assert!(e.variable_defaults().is_empty(), "and nothing was declared");
+        assert!(!e.modified);
+    }
+
+    /// A row index that no longer exists is dropped rather than applied to
+    /// whatever slid into its place.
+    #[test]
+    fn a_row_that_no_longer_exists_is_dropped() {
+        let mut app = app_with(form_entry("./samples/example.pdf"));
+        apply_extract_parameter(
+            &mut app,
+            0,
+            0,
+            ExtractTarget::FormField(7),
+            None,
+            "./samples/example.pdf",
+            "FILE",
+        );
+        let e = &app.session.collections[0].entries[0];
+        assert_eq!(e.form_fields[0].value, "./samples/example.pdf");
+        assert!(e.variable_defaults().is_empty());
+    }
+
+    /// egui's cursor speaks characters; the text is spliced by bytes. A
+    /// multi-byte character before the selection used to shift the splice.
+    #[test]
+    fn a_char_range_over_multibyte_text_maps_to_the_right_bytes() {
+        let text = "héllo wörld";
+        let chars: Vec<char> = text.chars().collect();
+        let start = 6; // 'w'
+        let end = 11;
+        let r = char_range_to_bytes(text, start..end).expect("a non-empty range");
+        assert_eq!(&text[r], chars[start..end].iter().collect::<String>());
+        assert_eq!(
+            char_range_to_bytes(text, 3..3),
+            None,
+            "an empty range is no selection"
+        );
     }
 }

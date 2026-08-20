@@ -310,6 +310,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // the neighbouring panel at the wider content edge — leaving an
             // unpainted strip. Truncating keeps the content within the panel.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            super::widgets::tree_rhythm(ui);
             let entries = &app.session.collections[ci].entries;
             if entries.is_empty() {
                 ui.add_space(8.0);
@@ -615,6 +616,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            super::widgets::tree_rhythm(ui);
             // The empty space around the tree stands in for the workspace root,
             // so an item can be dragged back out to the top level (there is no
             // row representing the root to drop it on) and the New menu is
@@ -1740,6 +1742,59 @@ pub(crate) mod tests {
         let got = text_color(&out.shapes, "example.com/a2");
         assert_ne!(got, dim, "an unselected request is not disabled");
         assert_eq!(got, text, "it is ordinary content");
+    }
+
+    /// Tree rows sit on their own, tighter rhythm than the app-wide gap
+    /// between controls. A list spaced like a stack of buttons throws away a
+    /// good part of a long folder's screen — and once the selection border
+    /// stopped resizing rows, that gap was all that was left to trim.
+    #[test]
+    fn tree_rows_sit_closer_together_than_two_controls_would() {
+        redirect_saved_state();
+        let dir = ws_tmp("rowpitch");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        expand_all(&mut session.collections[ci], &dir);
+        assert!(session.load_workspace_file(ci, dir.join("api/v1/one.hurl")));
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        let ctx = egui::Context::default();
+        // The app's own spacing, or the gap being measured isn't the one the
+        // user sees: egui's defaults are tighter than the theme's.
+        crate::gui::theme::GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| crate::gui::requests::ui(&mut app, ui),
+        );
+        let drawn = texts(&out.shapes);
+        let row = |needle: &str| {
+            drawn
+                .iter()
+                .find(|(t, _)| t == needle)
+                .unwrap_or_else(|| panic!("{needle} is drawn"))
+                .1
+        };
+        // Two requests of the same file, one directly under the other.
+        let first = row("https://example.com/a");
+        let second = row("https://example.com/a2");
+        let pitch = second.top() - first.top();
+        assert!(pitch > 0.0, "the rows are drawn in order: {pitch}");
+        // A row is its text plus `widgets::TREE_ROW_PADDING` either side, so
+        // anything past that plus `TREE_ROW_SPACING` is the app-wide control
+        // gap (5px, see `theme.rs`) having crept back in between the rows.
+        assert!(
+            pitch <= 21.0,
+            "tree rows are spaced like separate controls ({pitch}px apart)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A row is a method badge, a name and some markers, but only the name used

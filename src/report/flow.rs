@@ -212,8 +212,12 @@ pub enum FlowNode {
     /// Holds the text *after* the `#`, verbatim (leading space included), so a
     /// comment round-trips byte for byte.
     Comment(String),
-    /// `REQUEST <name>` — send a request, emit no column.
-    Request { name: String },
+    /// `REQUEST <name> [USING(…)]` — send a request, emit no column.
+    Request {
+        name: String,
+        /// See [`ReportStmt::Request::using`].
+        using: Vec<UsingItem>,
+    },
     /// `REPORT …` — send/compute and emit column(s) into the current row.
     Report(ReportStmt),
     /// `[PARALLEL[(n)]] FOR <pattern> IN <producer> … END`.
@@ -362,13 +366,137 @@ impl ParamKind {
     }
 }
 
+/// One item of a `USING(…)` clause on a `REQUEST`/`REPORT REQUEST` statement.
+///
+/// The clause exists because a request's parameters are otherwise invisible at
+/// the call site. A request declares them as `[Options] variable: FILE=…`
+/// defaults (see [`crate::hurl::HurlEntry::variable_defaults`]) and a flow binds
+/// them simply by having `FILE` in scope — which reads beautifully until you
+/// copy the flow onto a collection whose `upload_document` hardcodes its path.
+/// Then nothing fails: the request runs, uploads the wrong file, and the script
+/// looks identical to the one it was copied from. `USING(FILE)` turns that into
+/// a validation error before a byte is sent, and makes the script say what it
+/// needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsingItem {
+    /// `USING(FILE)` — *this request must declare a parameter named `FILE`*.
+    ///
+    /// Binds nothing: the value already reaches the request through the
+    /// ordinary variable scope. It is an assertion about the request, checked
+    /// by validation, and documentation for the reader.
+    Require(String),
+    /// `USING(multipart.file = "{{FILE}}")` — patch one field of the request
+    /// for this call only.
+    ///
+    /// The escape hatch for a request that *can't* be parameterised: a shared
+    /// helper collection, or one loaded read-only from a git remote. It couples
+    /// the flow to the request's internal shape (rename the field and this
+    /// breaks), so it is deliberately the wordier of the two forms — the
+    /// parameter it should have been is one identifier long.
+    Override {
+        target: OverrideTarget,
+        /// The replacement, `{{VAR}}`-interpolated against the row's scope.
+        value: String,
+    },
+}
+
+impl UsingItem {
+    /// The clause item as it is written, without the surrounding `USING(…)`.
+    pub fn text(&self) -> String {
+        match self {
+            UsingItem::Require(name) => name.clone(),
+            UsingItem::Override { target, value } => {
+                format!("{} = {}", target.text(), quote(value))
+            }
+        }
+    }
+}
+
+/// Which part of a request a [`UsingItem::Override`] replaces.
+///
+/// Every variant addresses a field of [`crate::hurl::HurlEntry`] directly, which
+/// is what keeps the feature honest: there is no text-substitution mode, so an
+/// override either names a part of the request that exists or fails validation.
+/// A raw body has no addressable sub-parts, so `body` replaces the whole thing;
+/// a JSON-pointer form is deliberately left out until something asks for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideTarget {
+    Url,
+    Body,
+    Header(String),
+    Query(String),
+    Form(String),
+    Multipart(String),
+    Cookie(String),
+    Option(String),
+    BasicAuthUser,
+    BasicAuthPass,
+}
+
+impl OverrideTarget {
+    /// Parse a target path (`url`, `header.X-Trace`, `multipart.file`, …).
+    /// `None` for an unrecognised section or a missing/empty key, so the caller
+    /// can report it precisely.
+    pub fn parse(path: &str) -> Option<OverrideTarget> {
+        let (section, key) = match path.split_once('.') {
+            Some((s, k)) => (s, k.trim()),
+            None => (path, ""),
+        };
+        let keyed = |f: fn(String) -> OverrideTarget| (!key.is_empty()).then(|| f(key.to_string()));
+        match section.trim().to_ascii_lowercase().as_str() {
+            "url" if key.is_empty() => Some(OverrideTarget::Url),
+            "body" if key.is_empty() => Some(OverrideTarget::Body),
+            "header" => keyed(OverrideTarget::Header),
+            "query" => keyed(OverrideTarget::Query),
+            "form" => keyed(OverrideTarget::Form),
+            "multipart" => keyed(OverrideTarget::Multipart),
+            "cookie" => keyed(OverrideTarget::Cookie),
+            "option" => keyed(OverrideTarget::Option),
+            "basic_auth" => match key.to_ascii_lowercase().as_str() {
+                "user" => Some(OverrideTarget::BasicAuthUser),
+                "pass" => Some(OverrideTarget::BasicAuthPass),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The canonical written form, so a parsed flow round-trips.
+    pub fn text(&self) -> String {
+        match self {
+            OverrideTarget::Url => "url".into(),
+            OverrideTarget::Body => "body".into(),
+            OverrideTarget::Header(k) => format!("header.{k}"),
+            OverrideTarget::Query(k) => format!("query.{k}"),
+            OverrideTarget::Form(k) => format!("form.{k}"),
+            OverrideTarget::Multipart(k) => format!("multipart.{k}"),
+            OverrideTarget::Cookie(k) => format!("cookie.{k}"),
+            OverrideTarget::Option(k) => format!("option.{k}"),
+            OverrideTarget::BasicAuthUser => "basic_auth.user".into(),
+            OverrideTarget::BasicAuthPass => "basic_auth.pass".into(),
+        }
+    }
+}
+
+/// Render a `USING(…)` clause (with a leading space), or nothing when empty.
+fn using_text(items: &[UsingItem]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let inner: Vec<String> = items.iter().map(UsingItem::text).collect();
+    format!(" USING({})", inner.join(", "))
+}
+
 /// The column-emitting `REPORT` statement in its three forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportStmt {
-    /// `REPORT REQUEST <name> [AS <alias>] [RESPONSE …] [SHOW(…)] [HIDE(…)] [WITH … END]`.
+    /// `REPORT REQUEST <name> [AS <alias>] [USING(…)] [RESPONSE …] [SHOW(…)] [HIDE(…)] [WITH … END]`.
     Request {
         name: String,
         alias: Option<String>,
+        /// The `USING(…)` clause: required parameters and/or call-site
+        /// overrides. Empty = no clause, which stays the common case.
+        using: Vec<UsingItem>,
         response_fmt: Option<ResponseFmt>,
         /// The per-statement field selector `SHOW(a, b, …)`: when non-empty,
         /// only these field suffixes (intrinsics like `Time` and/or
@@ -998,8 +1126,8 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         FlowNode::Comment(text) => {
             let _ = writeln!(out, "#{text}");
         }
-        FlowNode::Request { name } => {
-            let _ = writeln!(out, "REQUEST {}", name_text(name));
+        FlowNode::Request { name, using } => {
+            let _ = writeln!(out, "REQUEST {}{}", name_text(name), using_text(using));
         }
         FlowNode::Report(stmt) => write_report(out, stmt, depth),
         FlowNode::ForEach {
@@ -1056,6 +1184,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
         ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -1065,6 +1194,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {}", name_text(a));
             }
+            out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }
@@ -1365,7 +1495,9 @@ impl FlowNode {
             }
             FlowNode::Param(p) => param_text(p),
             FlowNode::Comment(text) => format!("#{text}"),
-            FlowNode::Request { name } => format!("REQUEST {name}"),
+            FlowNode::Request { name, using } => {
+                format!("REQUEST {name}{}", using_text(using))
+            }
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {
                 pattern,
@@ -1403,6 +1535,7 @@ impl FlowNode {
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
+                using,
                 response_fmt,
                 show,
                 hide,
@@ -1412,6 +1545,7 @@ impl FlowNode {
                 if let Some(a) = alias {
                     let _ = write!(out, " AS {}", name_text(a));
                 }
+                out.push_str(&using_text(using));
                 if let Some(fmt) = response_fmt {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
                 }
@@ -1432,7 +1566,7 @@ impl FlowNode {
     /// whether the name resolves in the bound collection.
     pub fn request_name(&self) -> Option<&str> {
         match self {
-            FlowNode::Request { name } => Some(name),
+            FlowNode::Request { name, .. } => Some(name),
             FlowNode::Report(ReportStmt::Request { name, .. }) => Some(name),
             _ => None,
         }
@@ -1460,6 +1594,7 @@ fn report_label(stmt: &ReportStmt) -> String {
         ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -1469,6 +1604,7 @@ fn report_label(stmt: &ReportStmt) -> String {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {a}");
             }
+            out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
             }

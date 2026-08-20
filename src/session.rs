@@ -390,6 +390,38 @@ impl Session {
             return None;
         }
         let (mut env, pending) = parse_vars_pending(name, content);
+        // Opening a file that is already loaded is a reload, not a clash. The
+        // suffixing below is for two *different* environments that share a
+        // name; applied to the same file re-opened it left a stale copy behind
+        // and a `(2)` beside it, neither of which the user asked for.
+        if let Some(existing) = self
+            .global_envs
+            .iter()
+            .find(|e| crate::environment::is_same_source(e, path.as_deref(), git_origin.as_ref()))
+        {
+            let existing_id = existing.id;
+            let idx = self
+                .global_envs
+                .iter()
+                .position(|e| e.id == existing_id)
+                .expect("just found");
+            // The existing entry's id, path and origin are kept so collection
+            // links and "Save Environment" keep working across the reload.
+            env.id = existing_id;
+            env.path = self.global_envs[idx].path.clone();
+            env.git_origin = self.global_envs[idx].git_origin.clone();
+            self.global_envs[idx] = env;
+            if !pending.is_empty() {
+                self.pending_env
+                    .push(spawn_resolution(existing_id, pending));
+            }
+            for col in &mut self.collections {
+                col.invalidate_request_json();
+            }
+            self.status = Some(Status::Loaded);
+            self.save();
+            return Some(existing_id);
+        }
         // Disambiguate a duplicate name so both stay usable.
         if self.global_envs.iter().any(|e| e.name == env.name) {
             let base = env.name.clone();
@@ -1743,5 +1775,109 @@ mod workspace_tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod env_reload_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_env_reload_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Re-opening a file that is already loaded refreshes it. It used to leave
+    /// the stale copy in place and add a `dev (2)` beside it — two entries for
+    /// one file, only one of which the collection was linked to.
+    #[test]
+    fn re_opening_a_loaded_environment_refreshes_it_rather_than_suffixing_a_copy() {
+        let dir = tmp("same");
+        let path = dir.join("dev.vars");
+        std::fs::write(&path, "TOKEN=old\n").unwrap();
+        let mut s = Session::default();
+        let id = s
+            .load_environment_text("dev".into(), "TOKEN=old\n", Some(path.clone()), None)
+            .expect("loaded");
+
+        let again = s.load_environment_text("dev".into(), "TOKEN=new\n", Some(path.clone()), None);
+
+        assert_eq!(again, Some(id), "the same environment, refreshed in place");
+        assert_eq!(s.global_envs.len(), 1, "and not duplicated");
+        assert_eq!(s.global_envs[0].name, "dev", "with no `(2)` suffix");
+        assert_eq!(s.global_envs[0].vars[0].raw, "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative and an absolute route to the same file are the same file —
+    /// the workspace tree walks relative to its root, File → Load Environment
+    /// hands back an absolute path.
+    #[test]
+    fn the_same_file_reached_by_two_different_paths_is_still_one_environment() {
+        let dir = tmp("canon");
+        let nested = dir.join("envs");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("dev.vars");
+        std::fs::write(&path, "TOKEN=t\n").unwrap();
+        let indirect = dir.join("envs").join(".").join("dev.vars");
+
+        let mut s = Session::default();
+        let id = s
+            .load_environment_text("dev".into(), "TOKEN=t\n", Some(path), None)
+            .expect("loaded");
+        let again = s.load_environment_text("dev".into(), "TOKEN=t\n", Some(indirect), None);
+
+        assert_eq!(again, Some(id));
+        assert_eq!(s.global_envs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two genuinely different files that share a name are still two
+    /// environments — the suffix exists for exactly this case.
+    #[test]
+    fn two_different_files_with_the_same_name_are_still_disambiguated() {
+        let dir = tmp("clash");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/dev.vars"), "TOKEN=a\n").unwrap();
+        std::fs::write(dir.join("b/dev.vars"), "TOKEN=b\n").unwrap();
+
+        let mut s = Session::default();
+        s.load_environment_text(
+            "dev".into(),
+            "TOKEN=a\n",
+            Some(dir.join("a/dev.vars")),
+            None,
+        )
+        .expect("loaded");
+        s.load_environment_text(
+            "dev".into(),
+            "TOKEN=b\n",
+            Some(dir.join("b/dev.vars")),
+            None,
+        )
+        .expect("loaded");
+
+        assert_eq!(s.global_envs.len(), 2);
+        assert_eq!(s.global_envs[1].name, "dev (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-made environment has no source to re-read, so it never matches —
+    /// otherwise the first pathless environment would swallow every later one.
+    #[test]
+    fn a_hand_made_environment_is_never_treated_as_a_reload() {
+        let mut s = Session::default();
+        s.load_environment_text("dev".into(), "TOKEN=a\n", None, None)
+            .expect("loaded");
+        s.load_environment_text("dev".into(), "TOKEN=b\n", None, None)
+            .expect("loaded");
+        assert_eq!(s.global_envs.len(), 2);
     }
 }

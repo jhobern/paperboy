@@ -1222,6 +1222,246 @@ fn open_form_on_header(app: &mut TuiApp) {
     press(app, KeyCode::Enter); // creates Header(0, Key)
 }
 
+// ---- extract to parameter ------------------------------------------------
+
+fn ctrl(app: &mut TuiApp, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+}
+
+/// Move focus onto the first header row's Key cell in a wizard that is
+/// *already* open, without restarting it (`open_form_on_header` presses `n`
+/// first, which would throw away edits made so far). Alt+1 is the wizard's
+/// direct jump to the Headers section.
+fn goto_header_in_open_form(app: &mut TuiApp) {
+    app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+    press(app, KeyCode::Enter); // "+ Add Header" -> Header(0, Key)
+}
+
+/// Open the wizard with focus on the first Form field's Value cell, holding a
+/// file path — the case the whole feature exists for.
+fn open_form_on_multipart_value(app: &mut TuiApp) {
+    open_form_on_form_field_kind(app);
+    press(app, KeyCode::Tab); // Kind -> Value (Key was created focused, Kind next)
+    type_str(app, "./samples/example.pdf");
+}
+
+/// Ctrl+P on a form field's value pulls the whole cell out into a parameter:
+/// the cell becomes `{{EXAMPLE}}` and an `[Options] variable:` row appears
+/// holding the path. Both halves in one action is the point — done by hand they
+/// are two edits that have to agree.
+#[test]
+fn extracting_a_form_field_value_replaces_it_and_declares_the_parameter() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
+    ctrl(&mut app, KeyCode::Char('p'));
+    {
+        let f = form_ref(&app);
+        let p = f.extract.as_ref().expect("Ctrl+P opens the prompt");
+        assert_eq!(p.value, "./samples/example.pdf");
+        assert_eq!(
+            p.name.text(),
+            "EXAMPLE",
+            "the suggestion is the path's file stem, upper-cased"
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert!(f.extract.is_none(), "the prompt closes");
+    assert_eq!(f.form_fields[0].value.text(), "{{EXAMPLE}}");
+    assert_eq!(f.options.rows.len(), 1);
+    assert_eq!(f.options.rows[0].key.text(), "variable");
+    assert_eq!(
+        f.options.rows[0].value.text(),
+        "EXAMPLE=./samples/example.pdf"
+    );
+    assert_eq!(
+        f.declared_parameters(),
+        vec!["EXAMPLE".to_string()],
+        "and the request now advertises it as a parameter"
+    );
+}
+
+/// The suggested name is only a suggestion: typing over it is the common case,
+/// since the value rarely spells what the parameter means.
+#[test]
+fn the_extracted_parameter_can_be_renamed_before_it_is_created() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    for _ in 0.."EXAMPLE".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "FILE");
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.form_fields[0].value.text(), "{{FILE}}");
+    assert_eq!(f.options.rows[0].value.text(), "FILE=./samples/example.pdf");
+}
+
+/// A selection extracts only what is selected — the case for a URL, where the
+/// interesting part is one path segment and not the whole address.
+#[test]
+fn extracting_with_a_selection_takes_only_the_selected_text() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "http://api/orders/12345");
+    // Select the trailing id with Shift+Left.
+    for _ in 0..5 {
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    }
+    ctrl(&mut app, KeyCode::Char('p'));
+    {
+        let p = form_ref(&app).extract.as_ref().expect("the prompt opens");
+        assert_eq!(p.value, "12345");
+        assert_eq!(
+            p.name.text(),
+            "VALUE",
+            "a name cannot start with a digit, so the suggestion falls back"
+        );
+    }
+    for _ in 0.."VALUE".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "ORDER");
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.url.text(), "http://api/orders/{{ORDER}}");
+    assert_eq!(f.options.rows[0].value.text(), "ORDER=12345");
+}
+
+/// Extracting two fields that carry the same value under one name is the point
+/// of reuse: the second extraction writes the placeholder but does not declare
+/// the parameter twice.
+#[test]
+fn extracting_the_same_value_twice_reuses_the_one_declaration() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    // A header carrying the same path.
+    goto_header_in_open_form(&mut app);
+    type_str(&mut app, "X-Source");
+    press(&mut app, KeyCode::Tab);
+    type_str(&mut app, "./samples/example.pdf");
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.headers.rows[0].value.text(), "{{EXAMPLE}}");
+    assert_eq!(
+        f.options.rows.len(),
+        1,
+        "one declaration, shared: {:?}",
+        f.options
+            .rows
+            .iter()
+            .map(|r| r.value.text())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Reusing a name the request already declares for a *different* value would
+/// silently repoint the field at the other one's default. The prompt refuses
+/// rather than doing it, and Enter is a no-op until the name changes.
+#[test]
+fn extracting_onto_a_name_that_means_something_else_is_refused() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    goto_header_in_open_form(&mut app);
+    type_str(&mut app, "X-Source");
+    press(&mut app, KeyCode::Tab);
+    type_str(&mut app, "./samples/other.pdf");
+    ctrl(&mut app, KeyCode::Char('p'));
+    for _ in 0.."OTHER".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "EXAMPLE");
+    {
+        let p = form_ref(&app).extract.as_ref().expect("the prompt is open");
+        assert!(
+            matches!(
+                p.error,
+                Some(crate::hurl::ParamNameError::Conflict(ref v))
+                    if v == "./samples/example.pdf"
+            ),
+            "the clash is reported with what the name already means: {:?}",
+            p.error
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert!(
+        f.extract.is_some(),
+        "Enter cannot smuggle a refused name past"
+    );
+    assert_eq!(
+        f.headers.rows[0].value.text(),
+        "./samples/other.pdf",
+        "and the field is untouched"
+    );
+}
+
+/// Escape leaves everything exactly as it was — an extraction is two edits, and
+/// a cancelled one must be neither.
+#[test]
+fn cancelling_the_extract_prompt_changes_nothing() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Esc);
+    let f = form_ref(&app);
+    assert!(f.extract.is_none());
+    assert_eq!(f.form_fields[0].value.text(), "./samples/example.pdf");
+    assert!(f.options.rows.is_empty());
+}
+
+/// An empty cell has nothing to extract, so Ctrl+P opens no prompt — better
+/// than a modal whose only outcome is Escape.
+#[test]
+fn extracting_an_empty_cell_does_nothing() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab); // -> Url, empty
+    ctrl(&mut app, KeyCode::Char('p'));
+    assert!(form_ref(&app).extract.is_none());
+}
+
+/// The Options section names the parameters its `variable:` rows declare, read
+/// live from the editors — a `variable:` row is not an ordinary option, and a
+/// grid of key/value cells is the one place that never says so.
+#[test]
+fn the_wizard_reads_parameters_out_of_the_options_rows_as_they_are_typed() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions
+    press(&mut app, KeyCode::Enter); // creates Options(0, Key)
+    for c in "variable".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Tab); // -> Value
+    for c in "FILE=./sample.pdf".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(
+        form_ref(&app).declared_parameters(),
+        vec!["FILE".to_string()],
+        "the half-typed row is already a declaration"
+    );
+}
+
 fn open_form_on_form_field_kind(app: &mut TuiApp) {
     press(app, KeyCode::Char('n'));
     press(app, KeyCode::Tab); // -> Target
@@ -22164,6 +22404,226 @@ fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
     (app, idx)
 }
 
+/// Build a node-editor app whose single bound request (`upload`) declares the
+/// given parameters via `[Options] variable: NAME=value`, with the flow's text
+/// supplied by the caller.
+fn node_param_app(params: &[(&str, &str)], text: &str) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".to_string(),
+        method: "POST".to_string(),
+        url: "http://example/x".to_string(),
+        options: params
+            .iter()
+            .map(|(n, v)| crate::hurl::KvRow::new("variable", format!("{n}={v}")))
+            .collect(),
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".to_string(), vec![entry]));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(text);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    (app, idx)
+}
+
+/// The request form offers a checkbox per parameter the request declares, with
+/// the declared default beside it, and ticking one writes the `USING(…)`
+/// clause — the whole point being that an author never has to know the syntax.
+#[test]
+fn ticking_a_parameter_in_the_request_form_writes_the_using_clause() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf"), ("KIND", "invoice")],
+        "# collection: api\nREPORT REQUEST upload\n",
+    );
+    press(&mut app, KeyCode::Down); // select REPORT REQUEST upload
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    let seen: Vec<(&str, bool, Option<&str>)> = form
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), p.required, p.default.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("FILE", false, Some("./sample.pdf")),
+            ("KIND", false, Some("invoice")),
+        ],
+        "every declared parameter is offered, none required yet"
+    );
+    // Name, Report, then the parameter rows — `USING` describes the send, so it
+    // sits above the reporting options.
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text, "# collection: api\n\nREPORT REQUEST upload USING(FILE)\n",
+        "ticking the row writes the clause"
+    );
+}
+
+/// The complaint: a request that declares no parameters showed an empty
+/// checklist and no way to reach `USING` at all. An override can now be added
+/// from the form, without the author ever opening the source view.
+#[test]
+fn a_per_call_override_can_be_added_in_the_request_form() {
+    let (mut app, idx) = node_param_app(&[], "# collection: api\nREPORT REQUEST upload\n");
+    press(&mut app, KeyCode::Down); // select the node
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params.is_empty(), "the precondition: nothing declared");
+    assert!(
+        form.visible_rows()
+            .contains(&super::report_nodes::FormRow::AddOverride),
+        "and the add-an-override row is offered anyway"
+    );
+
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // + add an override
+    press(&mut app, KeyCode::Char(' '));
+    // Space lands on the new row's target box, which is where typing goes.
+    for c in "multipart.document".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Down); // the value box
+    for c in "{{FILE}}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(multipart.document = \"{{FILE}}\")\n",
+        "the override is written as a clause"
+    );
+}
+
+/// A target that names no part of a request is never written out — it would
+/// produce a flow that doesn't parse — and the row says so while it is typed.
+#[test]
+fn an_unusable_override_target_is_not_written_to_the_flow() {
+    let (mut app, idx) = node_param_app(&[], "# collection: api\nREPORT REQUEST upload\n");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // + add an override
+    press(&mut app, KeyCode::Char(' '));
+    for c in "nonsense".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(
+        !crate::report::edit::override_target_valid("nonsense"),
+        "the row is painted as an error while it is typed"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text, "# collection: api\n\nREPORT REQUEST upload\n",
+        "and nothing broken is written"
+    );
+}
+
+/// A plain `REQUEST` gets the checklist too: `USING` belongs to the send, not
+/// to the columns, so it must not hide behind the REPORT toggle.
+#[test]
+fn a_plain_request_node_still_offers_its_parameters() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREQUEST upload\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(!form.report, "this is a plain REQUEST");
+    assert_eq!(form.params.len(), 1, "the parameter is still offered");
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREQUEST upload USING(FILE)\n"
+    );
+}
+
+/// Opening a node that already requires a parameter shows it ticked, and
+/// un-ticking removes the clause without touching the per-call overrides the
+/// form has no row for.
+#[test]
+fn the_request_form_preserves_overrides_while_editing_requirements() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREPORT REQUEST upload USING(FILE, header.X-Run = \"1\")\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params[0].required, "the written requirement is ticked");
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' ')); // un-tick
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(header.X-Run = \"1\")\n",
+        "the override the form cannot edit survives"
+    );
+}
+
+/// A clause requiring a name the request doesn't declare is a validation error.
+/// The form still lists it — with no default, which is how it reads as wrong —
+/// so it can be un-ticked where the error is seen.
+#[test]
+fn a_requirement_the_request_does_not_declare_is_listed_so_it_can_be_removed() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREPORT REQUEST upload USING(FILE, NOPE)\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert_eq!(form.params.len(), 2);
+    assert_eq!(form.params[1].name, "NOPE");
+    assert!(
+        form.params[1].default.is_none(),
+        "no default is what marks the row as undeclared"
+    );
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Down); // USING NOPE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(FILE)\n"
+    );
+}
+
+/// A request that declares nothing gets no checklist at all — the form is
+/// exactly what it was before parameters existed.
+#[test]
+fn a_request_without_parameters_has_no_checklist() {
+    let (mut app, _idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params.is_empty());
+}
+
 /// Enter on a `REPORT REQUEST` node opens the configure form, whose field rows
 /// are the request's intrinsics plus its `[Reports]` fields, all ticked when
 /// the node has no `SHOW` clause yet (emit everything).
@@ -22206,10 +22666,10 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error, Response,
-    // status. The Response field is the 8th field ⇒ row index 7 + 4 = 11.
-    for _ in 0..11 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias, then fields
+    // HttpStatus, Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error,
+    // Response, status. The Response field is the 8th ⇒ row index 7 + 5 = 12.
+    for _ in 0..12 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -22244,9 +22704,9 @@ fn report_node_request_form_all_ticked_removes_show() {
         let ticked = form.fields.iter().filter(|r| r.included).count();
         assert_eq!(ticked, 1, "only the SHOW(status) field is preselected");
     }
-    // Move to the first field row (0 Name, 1 Report, 2 Response, 3 Alias, 4
-    // first field), then tick every unticked field.
-    for _ in 0..4 {
+    // Move to the first field row (0 Name, 1 Report, 2 Add override, 3
+    // Response, 4 Alias, 5 first field), then tick every unticked field.
+    for _ in 0..5 {
         press(&mut app, KeyCode::Down);
     }
     let total = {
@@ -22286,9 +22746,9 @@ fn report_node_request_form_ticking_a_timing_part_writes_show() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, TimeSetup, … ⇒ TimeSetup is the 3rd field, row index 2 + 4 = 6.
-    for _ in 0..6 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias, then fields
+    // HttpStatus, Time, TimeSetup, … ⇒ TimeSetup is the 3rd, row 2 + 5 = 7.
+    for _ in 0..7 {
         press(&mut app, KeyCode::Down);
     }
     {
@@ -22313,8 +22773,9 @@ fn report_node_request_form_sets_the_alias() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias — three Downs reach the alias.
-    for _ in 0..3 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias — four Downs
+    // reach the alias.
+    for _ in 0..4 {
         press(&mut app, KeyCode::Down);
     }
     for c in ['p', 'r', 'o', 'c'] {
@@ -22331,10 +22792,11 @@ fn report_node_request_form_sets_the_response_format() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response — two Downs reach the response row,
-    // then Space cycles Default -> RAW.
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response — three Downs reach
+    // the response row, then Space cycles Default -> RAW.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Enter);
     let text = &app.reports[idx].report.text;
@@ -22361,8 +22823,8 @@ fn report_node_request_form_opens_on_plain_request_nodes() {
     assert!(!form.report, "a plain REQUEST starts with Report unticked");
     assert_eq!(
         form.visible_rows().len(),
-        2,
-        "only Name + Report rows show until Report is ticked"
+        3,
+        "only Name + Report + the add-override row show until Report is ticked"
     );
 }
 
@@ -25182,6 +25644,72 @@ fn env_panel_workspace(tag: &str, files: &[(&str, &str)]) -> (TuiApp, std::path:
     (app, dir)
 }
 
+/// Opening an environment that is already loaded is a *reload*, not a name
+/// clash. The collision popup asks which of two environments to keep, and when
+/// both are the same file none of its four answers is what the user meant —
+/// which is what pressing Enter on a workspace environment used to raise.
+#[test]
+fn re_opening_a_loaded_environment_refreshes_it_instead_of_asking() {
+    let (mut app, dir) = env_panel_workspace("reopen", &[("eapi_dev.vars", "TOKEN=old\n")]);
+    let path = dir.join("eapi_dev.vars");
+    let id = app
+        .load_environment_text("eapi_dev".into(), "TOKEN=old\n", Some(path.clone()), None)
+        .expect("loaded");
+    // Link it, to prove the reload keeps the identity the link points at.
+    let ci = app.active_tab;
+    app.collections[ci].linked_env_id = Some(id);
+
+    std::fs::write(&path, "TOKEN=new\n").unwrap();
+    let again =
+        app.load_environment_text("eapi_dev".into(), "TOKEN=new\n", Some(path.clone()), None);
+
+    assert!(
+        app.overlay.is_none(),
+        "no popup: there is nothing to choose"
+    );
+    assert_eq!(again, Some(id), "the same environment, refreshed in place");
+    assert_eq!(app.global_envs.len(), 1, "and not duplicated");
+    assert_eq!(app.global_envs[0].vars[0].raw, "new", "with the new value");
+    assert_eq!(
+        app.collections[ci].linked_env_id,
+        Some(id),
+        "the link survives the reload"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two *different* files that happen to share a name are still a real clash —
+/// the popup is right in that case and must not be lost to the fix above.
+#[test]
+fn two_different_files_with_the_same_name_still_raise_the_collision_popup() {
+    let (mut app, dir) = env_panel_workspace("clash", &[]);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("a/dev.vars"), "TOKEN=a\n").unwrap();
+    std::fs::write(dir.join("b/dev.vars"), "TOKEN=b\n").unwrap();
+
+    app.load_environment_text(
+        "dev".into(),
+        "TOKEN=a\n",
+        Some(dir.join("a/dev.vars")),
+        None,
+    )
+    .expect("loaded");
+    let second = app.load_environment_text(
+        "dev".into(),
+        "TOKEN=b\n",
+        Some(dir.join("b/dev.vars")),
+        None,
+    );
+
+    assert_eq!(second, None, "the load waits on the popup");
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvCollision(_))),
+        "a genuine clash still asks"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With a workspace open the panel lists its environment files — including ones
 /// never opened — so a folder of them is browsable without hunting through the
 /// tree. Postman `.json` environments count, not just `.vars`.
@@ -25404,6 +25932,151 @@ fn a_filter_matching_nothing_empties_the_panel_without_stranding_the_selection()
         2,
         "Esc on the panel clears an applied filter"
     );
+}
+
+/// The source filter used to be discoverable only from the help screen, so a
+/// panel showing a fraction of the environments looked simply short. The key
+/// is announced on the panel's own border — but only when there is a workspace
+/// to switch between, since otherwise it does nothing.
+#[test]
+fn the_environments_panel_announces_the_source_key_when_there_is_one_to_use() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let render = |app: &TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| {
+            super::draw::draw_env_panel(f, f.area(), app, &s, &th);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let plain = TuiApp::default();
+    assert!(
+        !plain.has_workspace_env_source(),
+        "no workspace tab is the precondition"
+    );
+    assert!(
+        !render(&plain).contains(s.foot_env_source),
+        "a key that does nothing here must not be advertised"
+    );
+
+    let (ws, _dir) = env_panel_workspace("sourcehint", &[("dev.vars", "TOKEN=t\n")]);
+    assert!(
+        render(&ws).contains(s.foot_env_source),
+        "announced: {}",
+        render(&ws)
+    );
+}
+
+/// `g` puts the selection back on the active environment. The complaint: a
+/// workspace of several hundred environments makes the one currently in effect
+/// impossible to find again, and it is the row people most often want back.
+#[test]
+fn g_jumps_the_environments_panel_to_the_active_environment() {
+    let (mut app, dir) = env_panel_workspace(
+        "gotoactive",
+        &[
+            ("aaa.vars", "TOKEN=a\n"),
+            ("mmm.vars", "TOKEN=m\n"),
+            ("zzz.vars", "TOKEN=z\n"),
+        ],
+    );
+    let id = app
+        .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+
+    // Somewhere else entirely, the way scrolling a long list leaves you.
+    app.global_env_idx = 0;
+    assert_ne!(
+        app.env_rows()[0].env_id(),
+        Some(id),
+        "the precondition is that the selection is not already on it"
+    );
+
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(
+        app.env_rows()[app.global_env_idx].env_id(),
+        Some(id),
+        "the selection lands on the active environment"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The filters are widened as far as the row needs, because a "take me to it"
+/// that silently did nothing behind a filter would be worse than no key.
+#[test]
+fn g_clears_a_filter_that_is_hiding_the_active_environment() {
+    let (mut app, dir) = env_panel_workspace(
+        "gotofiltered",
+        &[("aaa.vars", "TOKEN=a\n"), ("mmm.vars", "TOKEN=m\n")],
+    );
+    let id = app
+        .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+    app.env_query = "aaa".into();
+    assert!(
+        app.env_rows().iter().all(|r| r.env_id() != Some(id)),
+        "the filter hides it"
+    );
+
+    press(&mut app, KeyCode::Char('g'));
+    assert!(
+        app.env_query.is_empty(),
+        "the filter is cleared to reach it"
+    );
+    assert_eq!(app.env_rows()[app.global_env_idx].env_id(), Some(id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The panel only advertises `g` when there is an active environment to go to.
+#[test]
+fn the_environments_panel_announces_the_goto_key_only_when_something_is_active() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let render = |app: &TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        term.draw(|f| super::draw::draw_env_panel(f, f.area(), app, &s, &th))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let (mut app, dir) = env_panel_workspace("gotohint", &[("dev.vars", "TOKEN=t\n")]);
+    assert!(
+        !render(&app).contains(s.foot_env_goto_active),
+        "nothing is active, so the key has nowhere to go"
+    );
+    let id = app
+        .load_environment_text("dev".into(), "TOKEN=t\n", Some(dir.join("dev.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+    assert!(
+        render(&app).contains(s.foot_env_goto_active),
+        "announced: {}",
+        render(&app)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `o` narrows the Environments panel by source, and reuses the same clamping

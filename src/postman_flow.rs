@@ -340,6 +340,28 @@ pub(crate) struct PostmanFlow {
     /// rate-limited.
     preview_error: Option<String>,
 
+    // -- Workspace contents ------------------------------------------------
+    /// The workspace whose collections are open in the picker, if any.
+    ///
+    /// Deciding which workspace to import is the same question the preview
+    /// answers one step later — "is this the one I meant?" — and it was being
+    /// asked two screens too late: the reader had to commit to a workspace and
+    /// wait for a plan before anything told them what was in it. Expanding a
+    /// row lists its collections for one call, which is the cheapest honest
+    /// answer there is.
+    peek_open: Option<String>,
+    /// Collections already listed, keyed by workspace id, so reopening a row —
+    /// or coming back to compare two workspaces — is free.
+    peek_cache: HashMap<String, Vec<String>>,
+    peek_rx: Option<Receiver<Result<(String, Vec<String>), String>>>,
+    /// The workspace id being listed, so its row can spin and a second click
+    /// can't queue a second call.
+    peek_pending: Option<String>,
+    /// A failed listing. An aside like [`Self::preview_error`], and for the
+    /// same reason: a workspace that imports fine shouldn't be unusable
+    /// because an optional extra call was rate-limited.
+    peek_error: Option<String>,
+
     // -- Worker -----------------------------------------------------------
     rx: Option<Receiver<Msg>>,
     progress_rx: Option<Receiver<ImportMsg>>,
@@ -575,6 +597,11 @@ impl PostmanFlow {
             preview_rx: None,
             preview_pending: None,
             preview_error: None,
+            peek_open: None,
+            peek_cache: HashMap::new(),
+            peek_rx: None,
+            peek_pending: None,
+            peek_error: None,
             rx: None,
             progress_rx: None,
             go: None,
@@ -853,6 +880,110 @@ impl PostmanFlow {
         }
     }
 
+    // -- Workspace contents ------------------------------------------------
+
+    /// Which workspace row is expanded, if any.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn peek_open(&self) -> Option<&str> {
+        self.peek_open.as_deref()
+    }
+
+    /// Whether a workspace listing is in flight, and for which workspace id.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn peek_pending(&self) -> Option<&str> {
+        self.peek_pending.as_deref()
+    }
+
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn peek_error(&self) -> Option<&str> {
+        self.peek_error.as_deref()
+    }
+
+    /// The collections in `id`, once they have been listed.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn workspace_peek(&self, id: &str) -> Option<&[String]> {
+        self.peek_cache.get(id).map(Vec::as_slice)
+    }
+
+    /// Expand `id`, listing its collections — from the cache if it has been
+    /// listed before, otherwise with one call on its own thread.
+    ///
+    /// The same shape as [`Self::preview_collection`], and for the same
+    /// reasons: one fetch at a time, off the paced importer (which isn't even
+    /// running yet at this step), and only ever because the user asked for
+    /// this row by name.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn open_workspace_peek(&mut self, id: &str, s: &Strings) {
+        if self.peek_pending.is_some() {
+            return;
+        }
+        self.peek_open = Some(id.to_string());
+        self.peek_error = None;
+        if self.peek_cache.contains_key(id) {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let raw = self.key.trim().to_string();
+        let base = self.base_url_opt();
+        let cache = Arc::clone(&self.resolved_key);
+        let bad_ref = s.postman_err_key_ref;
+        let wanted = id.to_string();
+        let id = id.to_string();
+        thread::spawn(move || {
+            let key = match resolve_key(&raw, &cache) {
+                Some(k) => k,
+                None => {
+                    let _ = tx.send(Err(bad_ref.to_string()));
+                    return;
+                }
+            };
+            let client = PostmanClient::new(key, base);
+            let msg = match client.list_collections(&id) {
+                Ok((items, _rate)) => Ok((id, items.into_iter().map(|i| i.name).collect())),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(msg);
+        });
+        self.peek_rx = Some(rx);
+        self.peek_pending = Some(wanted);
+    }
+
+    /// Collapse the expanded workspace, keeping what was listed. Returns
+    /// whether one was open, so a front-end can let Esc collapse a row before
+    /// it means "go back".
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub(crate) fn close_workspace_peek(&mut self) -> bool {
+        self.peek_error = None;
+        self.peek_open.take().is_some()
+    }
+
+    /// Fold in a finished workspace listing.
+    fn drain_peek(&mut self) {
+        let Some(rx) = self.peek_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((id, names))) => {
+                self.peek_cache.insert(id, names);
+                self.peek_rx = None;
+                self.peek_pending = None;
+            }
+            Ok(Err(e)) => {
+                self.peek_error = Some(e);
+                self.peek_rx = None;
+                self.peek_pending = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            // The thread died without answering; nothing to report but the
+            // spinner must stop.
+            Err(TryRecvError::Disconnected) => {
+                self.peek_rx = None;
+                self.peek_pending = None;
+            }
+        }
+    }
+
     pub(crate) fn workspaces(&self) -> &[WorkspaceSummary] {
         &self.workspaces
     }
@@ -1099,6 +1230,15 @@ impl PostmanFlow {
         self.preview_sel = 0;
     }
 
+    /// Forget which workspace row was expanded, but *not* what was listed:
+    /// the cache is keyed by workspace id, and the listing is still true.
+    fn reset_peek(&mut self) {
+        self.peek_open = None;
+        self.peek_rx = None;
+        self.peek_pending = None;
+        self.peek_error = None;
+    }
+
     /// Return to the first step to fix the key or the URL, discarding the
     /// listing — a workspace list belongs to the key that fetched it.
     pub(crate) fn back_to_connect(&mut self) {
@@ -1110,6 +1250,10 @@ impl PostmanFlow {
         self.chosen = None;
         self.plan = None;
         self.reset_preview();
+        // The key may be about to change, and a listing belongs to the key
+        // that fetched it — so unlike the preview cache this one is dropped.
+        self.reset_peek();
+        self.peek_cache.clear();
         self.selected = 0;
         self.filter.clear();
         self.step = Step::Connect;
@@ -1162,6 +1306,7 @@ impl PostmanFlow {
     pub(crate) fn poll(&mut self, s: &Strings) -> Option<PostmanEvent> {
         self.drain_progress();
         self.drain_preview();
+        self.drain_peek();
 
         let result = self.rx.as_ref().map(Receiver::try_recv)?;
         match result {
@@ -1312,6 +1457,13 @@ impl PostmanFlow {
     /// front-end's tests can open one without a Postman API behind them.
     pub(crate) fn seed_preview_cache(&mut self, preview: Preview) {
         self.preview_cache.insert(preview.uid.clone(), preview);
+    }
+
+    /// Put a workspace's collection listing in the cache as though it had been
+    /// fetched, so the picker's tree can be opened without a Postman API.
+    pub(crate) fn seed_peek_cache(&mut self, workspace_id: &str, collections: Vec<String>) {
+        self.peek_cache
+            .insert(workspace_id.to_string(), collections);
     }
 }
 

@@ -2,6 +2,7 @@
 //! app-level default variables (`AppVars`) and the Hurl-collection request
 //! building / running, so both front-ends behave identically.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -624,6 +625,110 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
     }
 }
 
+/// Layer a request's own declared parameters (`[Options] variable: NAME=value`,
+/// see [`HurlEntry::variable_defaults`]) *under* the caller's `vars`, producing
+/// the variable set the request actually runs with.
+///
+/// Precedence is the whole point: a declared parameter is a **default**, so it
+/// fills in only the names nobody else bound. Opened on its own, a request runs
+/// with the author's sample value; driven from a PaperTrail loop that binds
+/// `FILE`, it runs with the loop's value and the default stands aside. Hurl's
+/// native reading of the same line is the opposite (the entry option overwrites
+/// the run's variables), which is why the row is also stripped from the entry
+/// text before it is handed to the runner — see [`strip_variable_options`].
+///
+/// A default's own value is substituted against the caller's variables first,
+/// so one parameter can be expressed in terms of another (`variable:
+/// FILE={{SAMPLES}}/invoice.pdf`). Defaults are applied in written order and an
+/// earlier one is visible to a later one, which makes that composition
+/// predictable rather than order-of-iteration luck. Nothing is applied
+/// recursively: a default referencing a name that is itself only defaulted
+/// later is left as written, exactly as [`substitute`] leaves any unresolved
+/// placeholder.
+///
+/// Returns the caller's map untouched (borrowed) when the request declares no
+/// parameters — the overwhelmingly common case, and a send is hot enough that
+/// cloning every variable for nothing is worth avoiding.
+pub fn effective_vars<'a>(
+    base: &HurlEntry,
+    vars: &'a HashMap<String, String>,
+) -> Cow<'a, HashMap<String, String>> {
+    let defaults = base.variable_defaults();
+    if defaults.is_empty() {
+        return Cow::Borrowed(vars);
+    }
+    let mut merged = vars.clone();
+    for (name, value) in defaults {
+        if merged.contains_key(&name) {
+            continue;
+        }
+        let value = substitute(&value, &merged);
+        merged.insert(name, value);
+    }
+    Cow::Owned(merged)
+}
+
+/// Remove the `variable:` rows from a run entry's `[Options]`, having already
+/// folded them into the variable set via [`effective_vars`].
+///
+/// Left in, they would undo the default semantics for everything
+/// [`resolve_entry`] does not substitute in Rust — `[Captures]` and `[Asserts]`
+/// templates are resolved by Hurl itself, and Hurl treats the option as an
+/// assignment that beats the passed-in variables. A report binding `FILE` would
+/// then see its value in the URL and the request's sample value in an assert,
+/// which is the sort of half-applied override that takes a day to find.
+///
+/// Dropping them also closes the documented oddity that a `variable:` option
+/// leaks into *subsequent* entries of the same file, unlike every other option.
+fn strip_variable_options(entry: &mut HurlEntry) {
+    entry
+        .options
+        .retain(|r| !(r.enabled && r.key.trim().eq_ignore_ascii_case("variable")));
+}
+
+/// The whole-file counterpart of [`strip_variable_options`]: drop only the
+/// `variable:` rows whose name the caller has **already bound**, and report
+/// whether anything was removed.
+///
+/// A whole-collection run (the TUI's "Run All" in batch mode, `paperboy -c …`)
+/// hands the serialized file to Hurl without resolving it in Rust first, so
+/// Hurl applies the remaining defaults itself — which is exactly what is wanted
+/// for a name nobody bound. Removing just the bound ones therefore produces the
+/// same "default unless overridden" reading as the single-request path, with no
+/// second implementation of the precedence rule.
+///
+/// One residual difference is Hurl's, not ours: a surviving default still leaks
+/// into the entries *after* it in the same file (the documented exception to
+/// per-entry options). That is what a hand-written `.hurl` does today, so it is
+/// left alone rather than silently changed.
+pub fn strip_bound_variable_options(
+    entries: &mut [HurlEntry],
+    vars: &HashMap<String, String>,
+) -> bool {
+    let mut stripped = false;
+    for entry in entries {
+        let bound: Vec<String> = entry
+            .variable_defaults()
+            .into_iter()
+            .filter(|(name, _)| vars.contains_key(name))
+            .map(|(name, _)| name)
+            .collect();
+        if bound.is_empty() {
+            continue;
+        }
+        entry.options.retain(|r| {
+            let is_bound_default = r.enabled
+                && r.key.trim().eq_ignore_ascii_case("variable")
+                && r.value
+                    .split_once('=')
+                    .is_some_and(|(name, _)| bound.iter().any(|b| b == name.trim()));
+            !is_bound_default
+        });
+        stripped = true;
+    }
+    stripped
+}
+
 /// Run one already-chosen `base` entry with `vars` through the full per-request
 /// pipeline used for a normal single-request send — base64-form expansion →
 /// out-of-scope form-file staging → content-length defaulting → `to_hurl` →
@@ -641,9 +746,16 @@ pub fn run_resolved_entry(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> RunOutput {
-    let resolved = resolve_entry(base, vars);
+    // Declared parameters are resolved *here*, not left to Hurl's own late
+    // binding, because everything downstream works on resolved text: an
+    // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
+    // `stage_out_of_scope_form_files` as a literal filename, fail to stage, and
+    // then be rejected by Hurl's file sandbox when it finally did resolve.
+    let vars = effective_vars(base, vars);
+    let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
     run_entry.captures.extend(extra_captures.iter().cloned());
+    strip_variable_options(&mut run_entry);
 
     let mut entries = [run_entry];
     if let Err(e) = expand_base64_form_fields(&mut entries, file_root) {
@@ -658,7 +770,7 @@ pub fn run_resolved_entry(
     let run_root = staged_dir.as_deref().or(file_root);
 
     let content = run_entry.to_hurl();
-    let out = run_hurl(&content, vars, run_root);
+    let out = run_hurl(&content, &vars, run_root);
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -823,6 +935,11 @@ pub fn run_all_entries(
         for e in &mut run_entries {
             e.ensure_run_content_length();
         }
+        // A request's own `[Options] variable:` rows are defaults, so any name
+        // the environment/captures already bind must not be re-assigned by the
+        // request itself (Hurl's own reading). The rest stay in and Hurl
+        // applies them, which is what a default should do.
+        strip_bound_variable_options(&mut run_entries, &vars);
         let content = collection_to_hurl(&run_entries);
 
         let mut results: Vec<Option<bool>> = vec![None; total];
@@ -1827,5 +1944,177 @@ mod tests {
             "example.test/{{ TOK }}/{{ NOPE }}",
             "known values are substituted; pending and unknown placeholders are kept",
         );
+    }
+
+    // --- request-level parameter defaults ---------------------------------
+
+    /// A request that declares a parameter and is opened on its own runs with
+    /// the author's sample value — the whole point of the feature: the request
+    /// stays usable outside the report that drives it.
+    #[test]
+    fn a_declared_parameter_supplies_its_default_when_nobody_binds_it() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::new();
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(
+            effective.get("FILE"),
+            Some(&"./samples/invoice.pdf".to_string()),
+        );
+        assert_eq!(
+            resolve_entry(&entry, &effective).form_fields[0].value,
+            "./samples/invoice.pdf",
+            "the default reaches the multipart file field as a real path",
+        );
+    }
+
+    /// The same request driven from a PaperTrail loop takes the loop's value.
+    /// Hurl's own reading of an `[Options] variable:` row is the opposite (it
+    /// overwrites the caller), so this is the flip that makes one request serve
+    /// both a person and a report.
+    #[test]
+    fn a_caller_binding_beats_the_declared_default() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(effective.get("FILE"), Some(&"./inbox/real.pdf".to_string()));
+    }
+
+    /// The bound row is removed from the entry that is handed to Hurl, so the
+    /// request cannot re-assert its own value in the parts PaperBoy does not
+    /// substitute itself (`[Captures]`/`[Asserts]`).
+    #[test]
+    fn the_run_entry_never_carries_a_variable_option_to_hurl() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        let mut run_entry = to_run_entry(&entry, resolve_entry(&entry, &vars));
+        strip_variable_options(&mut run_entry);
+
+        assert!(
+            run_entry.options.iter().all(|r| r.key != "variable"),
+            "a variable: row would override the caller inside Hurl",
+        );
+        assert!(
+            run_entry.options.iter().any(|r| r.key == "retry"),
+            "behavioural options are untouched",
+        );
+    }
+
+    /// A whole-collection run hands the file to Hurl unresolved, so only the
+    /// *bound* defaults are removed — the rest stay in for Hurl to apply, which
+    /// is what a default should do.
+    #[test]
+    fn a_whole_file_run_strips_only_the_defaults_the_caller_bound() {
+        let mut entries = vec![param_entry("FILE", "./samples/invoice.pdf")];
+        entries[0]
+            .options
+            .push(KvRow::new("variable", "MODE=draft"));
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        assert!(strip_bound_variable_options(&mut entries, &vars));
+
+        let rows: Vec<&str> = entries[0]
+            .options
+            .iter()
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["3", "MODE=draft"],
+            "the bound FILE default is gone; the unbound MODE default survives",
+        );
+    }
+
+    /// Nothing to strip means nothing to re-serialize: the CLI runs a plain
+    /// `.hurl` file verbatim, and round-tripping one nobody parameterised would
+    /// be churn for its own sake.
+    #[test]
+    fn a_whole_file_run_reports_when_it_changed_nothing() {
+        let mut entries = vec![param_entry("FILE", "./samples/invoice.pdf")];
+
+        assert!(!strip_bound_variable_options(&mut entries, &HashMap::new()));
+        assert_eq!(entries[0].options.len(), 2);
+    }
+
+    /// One parameter may be written in terms of another, and in terms of a
+    /// caller-supplied variable — defaults are applied in written order so the
+    /// composition is predictable rather than hash-order luck.
+    #[test]
+    fn a_default_may_reference_another_variable() {
+        let mut entry = param_entry("SAMPLES", "{{ROOT}}/samples");
+        entry
+            .options
+            .push(KvRow::new("variable", "DOC={{SAMPLES}}/invoice.pdf"));
+        let vars = HashMap::from([("ROOT".to_string(), "/srv".to_string())]);
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(effective.get("SAMPLES"), Some(&"/srv/samples".to_string()));
+        assert_eq!(
+            effective.get("DOC"),
+            Some(&"/srv/samples/invoice.pdf".to_string()),
+        );
+    }
+
+    /// `[Options]` is a free-text grid the user may be mid-way through typing.
+    /// A half-written row is ignored, never an error that refuses the send.
+    #[test]
+    fn malformed_and_disabled_parameter_rows_are_ignored() {
+        let mut entry = param_entry("FILE", "./samples/invoice.pdf");
+        entry.options = vec![
+            KvRow::new("variable", "no-equals-sign"),
+            KvRow::new("variable", "=novalue"),
+            KvRow::new("variable", "SPACED NAME=x"),
+            KvRow::toggled("variable", "OFF=x", false),
+            KvRow::new("VARIABLE", "SHOUTED=y"),
+        ];
+
+        assert_eq!(
+            entry.variable_defaults(),
+            vec![("SHOUTED".to_string(), "y".to_string())],
+            "only the well-formed enabled row counts, and the option name is \
+             matched case-insensitively",
+        );
+    }
+
+    /// A request that declares nothing is handed the caller's own map, not a
+    /// clone of it — a send is hot enough that the common case should allocate
+    /// nothing.
+    #[test]
+    fn a_request_without_parameters_borrows_the_callers_variables() {
+        let entry = me_entry();
+        let vars = HashMap::from([("TOKEN".to_string(), "abc".to_string())]);
+
+        assert!(matches!(
+            effective_vars(&entry, &vars),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// A request declaring `FILE` for a `[Multipart]` file field — the case the
+    /// feature exists for.
+    fn param_entry(name: &str, default: &str) -> HurlEntry {
+        HurlEntry {
+            title: "upload_document".into(),
+            method: "POST".into(),
+            url: "https://example.test/documents".into(),
+            options: vec![
+                KvRow::new("retry", "3"),
+                KvRow::new("variable", format!("{name}={default}")),
+            ],
+            is_multipart: true,
+            form_fields: vec![FormField {
+                key: "file".into(),
+                value: format!("{{{{{name}}}}}"),
+                kind: FormFieldKind::File,
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
     }
 }

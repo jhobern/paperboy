@@ -50,8 +50,19 @@ pub fn resolve_path(root: Option<&Path>, p: &str) -> PathBuf {
     }
 }
 
-/// Match a glob (`*` = any run, `?` = one char, otherwise literal) against a
-/// single filename (no path separators). Case-sensitive, matching the shell.
+/// Match a glob (`*` = any run, `?` = one char, `{a,b,…}` = any one of the
+/// listed alternatives, otherwise literal) against a single filename (no path
+/// separators). Case-sensitive, matching the shell.
+///
+/// Brace alternation earns its keep on the one thing file corpora always do:
+/// spell the same role several ways. A liveness clip is a `.webm`, a `.mov` or
+/// an `.mp4`; the face crop beside it is named `crop_face` or `facefromdoc`.
+/// Without `{…}` each spelling needs a loop of its own, and the script stops
+/// describing the corpus and starts enumerating it.
+///
+/// Alternatives may nest and may themselves contain `*`/`?`; an unmatched `{`
+/// is treated as a literal brace, so a filename that really does contain one
+/// still matches itself.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     fn m(p: &[u8], n: &[u8]) -> bool {
         match p.first() {
@@ -61,10 +72,52 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
                 m(&p[1..], n) || (!n.is_empty() && m(p, &n[1..]))
             }
             Some(b'?') => !n.is_empty() && m(&p[1..], &n[1..]),
+            Some(b'{') => match brace_alternatives(p) {
+                // Each alternative is spliced in front of the pattern's tail
+                // and tried in turn: `a{b,c}d` is `abd` or `acd`.
+                Some((alts, rest)) => alts.iter().any(|alt| {
+                    let mut expanded = alt.to_vec();
+                    expanded.extend_from_slice(rest);
+                    m(&expanded, n)
+                }),
+                // No closing brace: an ordinary character after all.
+                None => !n.is_empty() && n[0] == b'{' && m(&p[1..], &n[1..]),
+            },
             Some(&c) => !n.is_empty() && n[0] == c && m(&p[1..], &n[1..]),
         }
     }
     m(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Split `p`, which starts at a `{`, into its top-level comma-separated
+/// alternatives and the pattern that follows the matching `}`.
+///
+/// Returns `None` when the brace is never closed, which is the caller's cue to
+/// treat it as a literal. Nested braces are counted rather than parsed, so an
+/// inner group's commas stay with the alternative that contains them and the
+/// recursion in [`glob_match`] handles the group itself.
+fn brace_alternatives(p: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    let mut depth = 0usize;
+    let mut start = 1usize;
+    let mut alts = Vec::new();
+    for (i, &c) in p.iter().enumerate() {
+        match c {
+            b'{' => depth += 1,
+            b',' if depth == 1 => {
+                alts.push(&p[start..i]);
+                start = i + 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    alts.push(&p[start..i]);
+                    return Some((alts, &p[i + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// List files under `dir` for a `FILES "dir" [MATCH glob]` producer. When the
@@ -421,6 +474,31 @@ mod tests {
         assert!(glob_match("img_?.png", "img_3.png"));
         assert!(!glob_match("img_?.png", "img_33.png"));
         assert!(glob_match("*", "anything"));
+    }
+
+    #[test]
+    fn glob_matches_brace_alternatives() {
+        // The two shapes the Engine4 corpora actually use.
+        assert!(glob_match("*.{webm,mov,mp4}", "clip.webm"));
+        assert!(glob_match("*.{webm,mov,mp4}", "clip.mp4"));
+        assert!(!glob_match("*.{webm,mov,mp4}", "clip.jpg"));
+        assert!(glob_match("*{crop_face,facefromdoc}*", "01_crop_face.jpg"));
+        assert!(glob_match("*{crop_face,facefromdoc}*", "facefromdoc.png"));
+        assert!(!glob_match("*{crop_face,facefromdoc}*", "front.jpg"));
+
+        // An empty alternative matches nothing extra, and alternatives may
+        // hold their own wildcards or nest.
+        assert!(glob_match("a{,b}c", "ac"));
+        assert!(glob_match("a{,b}c", "abc"));
+        assert!(glob_match("{*.jpg,*.png}", "x.png"));
+        assert!(glob_match("f{a{1,2},b}z", "fa2z"));
+        assert!(glob_match("f{a{1,2},b}z", "fbz"));
+        assert!(!glob_match("f{a{1,2},b}z", "fa3z"));
+
+        // An unclosed brace is a literal character, not a syntax error: a file
+        // really named `weird{name` still matches itself.
+        assert!(glob_match("weird{name", "weird{name"));
+        assert!(!glob_match("weird{name", "weirdname"));
     }
 
     #[test]

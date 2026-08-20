@@ -4466,6 +4466,7 @@ fn filter_label(s: &Strings, f: &crate::report::filter::RowFilter) -> String {
         RowFilter::Differ => s.report_filter_differences.to_string(),
         RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
         RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::Fixed => s.report_filter_improvements.to_string(),
         RowFilter::MatrixCell { .. } => f.label(),
     }
 }

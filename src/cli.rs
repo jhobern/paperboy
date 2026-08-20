@@ -17,6 +17,7 @@ use crate::hurl::{
     run_hurl, run_hurl_streaming,
 };
 use crate::postman::{looks_like_postman, parse_collection};
+use crate::request;
 use crate::shared_utils::stem;
 
 /// Run all requests in the collection. Returns an OS exit code (0 = all passed).
@@ -107,6 +108,20 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
         for v in &parse_vars(name, &env_content).vars {
             vars.insert(v.key.clone(), v.value.clone());
         }
+    }
+
+    // A request may declare parameters as `[Options] variable: NAME=value`.
+    // PaperBoy reads those as *defaults*, so a name the environment file binds
+    // must win — Hurl would let the request's own row overwrite it. Dropping
+    // just the bound rows leaves the rest for Hurl to apply as written. The
+    // re-serialize is conditional because a plain `.hurl` is otherwise run
+    // verbatim, and round-tripping a file nobody parameterised buys nothing.
+    let mut run_content = run_content;
+    if request::strip_bound_variable_options(&mut entries, &vars) {
+        for e in &mut entries {
+            e.ensure_run_content_length();
+        }
+        run_content = collection_to_hurl(&entries);
     }
 
     let color = color_enabled();

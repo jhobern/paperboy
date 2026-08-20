@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::hurl::{FormFieldKind, KvRow, METHODS};
-use crate::i18n::Strings;
+use crate::i18n::{Strings, fill};
+use crate::shared_utils::truncate_to_width;
 
 use super::super::app::{
     MouseHitTarget, MouseLayer, MouseScrollTarget, TuiApp, WizardDropdownKind,
@@ -18,42 +19,11 @@ use super::super::editor::*;
 use super::super::theme::*;
 use super::kvd_section::*;
 
-/// Common HTTP header names offered as autocomplete suggestions for the Key
-/// field of the New Request headers table. Kept in a sensible display order.
-pub(crate) const COMMON_HEADERS: &[&str] = &[
-    "Accept",
-    "Accept-Charset",
-    "Accept-Encoding",
-    "Accept-Language",
-    "Authorization",
-    "Cache-Control",
-    "Connection",
-    "Content-Length",
-    "Content-Type",
-    "Cookie",
-    "Date",
-    "ETag",
-    "Expect",
-    "Host",
-    "If-Match",
-    "If-Modified-Since",
-    "If-None-Match",
-    "Origin",
-    "Pragma",
-    "Range",
-    "Referer",
-    "User-Agent",
-    "X-Api-Key",
-    "X-Content-Type-Options",
-    "X-Correlation-ID",
-    "X-CSRF-Token",
-    "X-Forwarded-For",
-    "X-Forwarded-Host",
-    "X-Forwarded-Proto",
-    "X-Frame-Options",
-    "X-Request-ID",
-    "X-Requested-With",
-];
+// The header-name vocabulary lives in the core so the GUI's Headers table can
+// offer exactly the same list (see `crate::http`).
+#[cfg(test)]
+pub(crate) use crate::http::COMMON_HEADERS;
+pub(crate) use crate::http::filter_headers;
 
 /// File-extension → MIME-type table offered by the content-type override
 /// dropdown for `File`-kind Form/Multipart rows (see
@@ -145,20 +115,6 @@ pub(crate) fn filter_content_types(query: &str) -> Vec<&'static str> {
     content_type_options()
         .into_iter()
         .filter(|o| o.to_ascii_lowercase().contains(&q))
-        .collect()
-}
-
-/// Common header names matching `query` (case-insensitive substring). An empty
-/// query returns the full list.
-pub(crate) fn filter_headers(query: &str) -> Vec<&'static str> {
-    let q = query.trim().to_ascii_lowercase();
-    if q.is_empty() {
-        return COMMON_HEADERS.to_vec();
-    }
-    COMMON_HEADERS
-        .iter()
-        .copied()
-        .filter(|h| h.to_ascii_lowercase().contains(&q))
         .collect()
 }
 
@@ -500,6 +456,9 @@ pub(crate) struct NewReq {
     /// Highlighted index in the content-type dropdown (0 = "Auto", 1.. =
     /// `content_type_options()`); `None` while nothing is highlighted yet.
     pub(crate) ctype_hi: Option<usize>,
+    /// The "extract to parameter" prompt, when it is open. While it is, every
+    /// key belongs to it — it is a modal over the wizard, not another dropdown.
+    pub(crate) extract: Option<ExtractPrompt>,
     /// Set during draw: screen rect of the focused Key cell, so the suggestion
     /// dropdown can be anchored beneath it.
     pub(crate) key_cell_rect: std::cell::Cell<Option<Rect>>,
@@ -554,7 +513,141 @@ pub(crate) struct NewReq {
     pub(crate) tab_order: Vec<WizardTab>,
 }
 
+/// The "extract to parameter" prompt: a modal over the wizard that names the
+/// value being pulled out into an `[Options] variable:` row.
+///
+/// It holds the value it captured rather than re-reading it on confirm so the
+/// prompt can *show* what is about to be extracted — the user needs to see
+/// whether they caught the whole path or half of it before they commit.
+pub(crate) struct ExtractPrompt {
+    /// The text that will become the parameter's default.
+    pub(crate) value: String,
+    /// The name being typed (pre-filled with a suggestion, fully editable).
+    pub(crate) name: Editor,
+    /// Why the typed name can't be used, if it can't. Recomputed on every
+    /// keystroke so the prompt refuses before Enter rather than after.
+    pub(crate) error: Option<crate::hurl::ParamNameError>,
+}
+
 impl NewReq {
+    /// Whether the focused cell has anything to extract, for the hint bar.
+    /// Read-only twin of [`Self::extractable`], which needs `&mut self` because
+    /// [`Self::active_editor`] does.
+    pub(crate) fn extractable_hint(&self) -> bool {
+        let text = match self.focus {
+            NewField::Url => self.url.text(),
+            NewField::Body => self.body.text(),
+            NewField::Kvd(kind, i, col) => match self.kvd(kind).rows.get(i) {
+                Some(r) => match col {
+                    HdrCol::Key => r.key.text(),
+                    HdrCol::Value => r.value.text(),
+                    HdrCol::Desc => r.desc.text(),
+                    HdrCol::Enabled => return false,
+                },
+                None => return false,
+            },
+            NewField::FormField(i, FormCol::Value) => match self.form_fields.get(i) {
+                Some(r) => r.value.text(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        !text.trim().is_empty()
+    }
+
+    /// The value "extract to parameter" would pull out of the focused cell:
+    /// its selection, or the whole cell when nothing is selected. `None` when
+    /// the focused field isn't text, or holds nothing worth extracting.
+    pub(crate) fn extractable(&mut self) -> Option<String> {
+        let value = match self.active_editor() {
+            Some(ed) => ed.selected_text().unwrap_or_else(|| ed.text()),
+            None => return None,
+        };
+        (!value.trim().is_empty()).then_some(value)
+    }
+
+    /// Open the prompt on the focused cell, pre-filled with a suggested name.
+    /// Returns whether there was anything to extract.
+    pub(crate) fn begin_extract(&mut self) -> bool {
+        let Some(value) = self.extractable() else {
+            return false;
+        };
+        let declared = self.declared_parameter_defaults();
+        let name = crate::hurl::suggest_parameter_name(&value, &declared);
+        let mut ed = Editor::blank();
+        ed.insert_str(&name);
+        self.extract = Some(ExtractPrompt {
+            value,
+            name: ed,
+            error: None,
+        });
+        true
+    }
+
+    /// Re-check the typed name against what the request already declares.
+    pub(crate) fn recheck_extract(&mut self) {
+        let declared = self.declared_parameter_defaults();
+        if let Some(p) = self.extract.as_mut() {
+            p.error = crate::hurl::check_parameter_name(&p.name.text(), &p.value, &declared);
+        }
+    }
+
+    /// Commit the prompt: replace the focused cell's selection (or the whole
+    /// cell) with `{{NAME}}`, and declare `NAME` unless the request already
+    /// declares it with this very value — in which case the two fields simply
+    /// come to share one parameter, which is the point.
+    ///
+    /// Returns whether anything was applied; a name the prompt has already
+    /// refused is a no-op so Enter can't smuggle it past the check.
+    pub(crate) fn apply_extract(&mut self) -> bool {
+        self.recheck_extract();
+        let Some(p) = self.extract.take() else {
+            return false;
+        };
+        if p.error.is_some() {
+            self.extract = Some(p);
+            return false;
+        }
+        let name = p.name.text().trim().to_string();
+        let already = self.declared_parameters().iter().any(|n| n == &name);
+        let Some(ed) = self.active_editor() else {
+            return false;
+        };
+        let taken = ed.replace_selection_or_all(&format!("{{{{{name}}}}}"));
+        if !already {
+            let mut row = HeaderRow::new();
+            row.key.insert_str("variable");
+            row.value.insert_str(&format!("{name}={taken}"));
+            self.options.rows.push(row);
+        }
+        true
+    }
+
+    /// The parameters this request declares, with their defaults.
+    pub(crate) fn declared_parameter_defaults(&self) -> Vec<(String, String)> {
+        self.options
+            .rows
+            .iter()
+            .filter_map(|r| {
+                crate::hurl::HurlEntry::variable_default(r.enabled, &r.key.text(), &r.value.text())
+            })
+            .collect()
+    }
+
+    /// The parameters this request declares — the names of its enabled
+    /// `[Options] variable: NAME=value` rows, read live from the editors so the
+    /// section band updates as the row is typed.
+    pub(crate) fn declared_parameters(&self) -> Vec<String> {
+        self.options
+            .rows
+            .iter()
+            .filter_map(|r| {
+                crate::hurl::HurlEntry::variable_default(r.enabled, &r.key.text(), &r.value.text())
+                    .map(|(name, _)| name)
+            })
+            .collect()
+    }
+
     pub(crate) fn new(
         base_url: String,
         target_names: Vec<String>,
@@ -579,6 +672,7 @@ impl NewReq {
             target_idx: target_idx.min(target_names.len().saturating_sub(1)),
             target_names,
             base_url,
+            extract: None,
             suggest_hi: None,
             suggest_hidden: false,
             dropdown_scroll: ListScroll::default(),
@@ -719,6 +813,7 @@ impl NewReq {
             target_idx: ci.min(target_names.len().saturating_sub(1)),
             target_names,
             base_url,
+            extract: None,
             suggest_hi: None,
             suggest_hidden: false,
             dropdown_scroll: ListScroll::default(),
@@ -1897,6 +1992,21 @@ pub(crate) fn draw_new_request_with_hits(
     if on_deletable_row {
         hint = format!("{hint} · {}", s.hint_delete_row);
     }
+    // Contextual addition: only where there is something to extract, i.e. on a
+    // text cell that holds a value. Extracting is the one way to declare a
+    // parameter without knowing the `variable:` syntax, so it has to be
+    // findable from the field it applies to rather than only in the docs.
+    if form.extractable_hint() {
+        hint = format!("{hint} · {}", s.hint_extract_parameter);
+    }
+    // Contextual addition: only in the Options section, where the way to
+    // declare a report-steerable parameter is a `variable:` row and there is
+    // otherwise nothing to suggest that.
+    if matches!(form.focus, NewField::Kvd(KvdKind::Options, ..))
+        || form.focus == KvdKind::Options.add_field()
+    {
+        hint = format!("{hint} · {}", s.hint_declare_parameter);
+    }
     let title_text = if form.editing.is_some() {
         s.edit_request
     } else {
@@ -2150,6 +2260,7 @@ pub(crate) fn draw_new_request_with_hits(
     draw_key_suggestions(f, form, s, th, app);
     draw_kind_dropdown(f, form, s, th, app);
     draw_content_type_dropdown(f, form, s, th, app);
+    draw_extract_prompt(f, form, s, th);
 }
 
 fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &Strings) {
@@ -2217,7 +2328,27 @@ fn draw_kvd_section(
 ) {
     let focused =
         matches!(form.focus, NewField::Kvd(k, ..) if k == kind) || form.focus == kind.add_field();
-    draw_section_label(f, label, kind.title(s), focused, th);
+    // A `variable:` option row declares a *parameter*: a default this request
+    // uses on its own, and a name a PaperTrail report can steer it by. Nothing
+    // in a grid of key/value rows says so, so the section band names the
+    // parameters it has — the one place a reader is already looking when they
+    // wonder what those rows are.
+    let title = match kind {
+        KvdKind::Options => {
+            let names = form.declared_parameters().join(", ");
+            if names.is_empty() {
+                kind.title(s).to_string()
+            } else {
+                format!(
+                    "{} — {}",
+                    kind.title(s),
+                    fill(s.wizard_options_parameters, &[&names])
+                )
+            }
+        }
+        _ => kind.title(s).to_string(),
+    };
+    draw_section_label(f, label, &title, focused, th);
     draw_kvd_table_with_hits(f, table, form, kind, s, th, app);
 }
 
@@ -2456,6 +2587,60 @@ pub(crate) fn draw_kind_dropdown(
 /// [`content_type_options`], both filtered down to whatever the user has
 /// typed so far (see [`NewReq::ctype_dropdown_entries`]). The row's current
 /// value is pre-selected when it matches one of the options.
+/// The "extract to parameter" prompt: what is being pulled out, the name it
+/// will get, and — while the name is unusable — why it can't be used.
+///
+/// The value is shown because the action's one ambiguity is *how much* it
+/// caught: whether a selection landed on the whole path or half of it is not
+/// something the cell behind the modal can still be read for.
+pub(crate) fn draw_extract_prompt(f: &mut Frame, form: &NewReq, s: &Strings, th: &Theme) {
+    let Some(p) = form.extract.as_ref() else {
+        return;
+    };
+    let name = p.name.text();
+    let value = truncate_to_width(&p.value, 60);
+    let error = match &p.error {
+        Some(crate::hurl::ParamNameError::Invalid) => Some(s.extract_name_invalid.to_string()),
+        Some(crate::hurl::ParamNameError::Conflict(existing)) => {
+            Some(fill(s.extract_name_conflict, &[&name, existing]))
+        }
+        None => None,
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            fill(s.extract_value, &[&value]),
+            Style::default().fg(th.dim),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("{}: ", s.extract_name_label),
+                Style::default().fg(th.text),
+            ),
+            Span::styled(
+                format!("{name}▏"),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            error.clone().unwrap_or_else(|| s.extract_hint.to_string()),
+            Style::default().fg(if error.is_some() { th.err } else { th.dim }),
+        )),
+    ];
+    let w = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(30)
+        .clamp(30, 76) as u16
+        + 4;
+    let area = centered_rect(w.min(f.area().width), 5, f.area());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(panel(s.extract_title.to_string(), true, th)),
+        area,
+    );
+}
+
 pub(crate) fn draw_content_type_dropdown(
     f: &mut Frame,
     form: &NewReq,

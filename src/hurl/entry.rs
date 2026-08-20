@@ -416,6 +416,109 @@ pub struct HurlEntry {
     pub last_response: Option<crate::http::ApiResponse>,
 }
 
+/// Why a name typed into the "extract to parameter" prompt can't be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamNameError {
+    /// Not a usable `{{name}}` at all (empty, or containing whitespace/braces).
+    Invalid,
+    /// Already declared by this request, with a *different* default. Reusing it
+    /// would silently repoint this value at the other one's default, which is
+    /// the sort of change that looks like it worked. Carries the existing
+    /// default so the message can say what it would become.
+    Conflict(String),
+}
+
+/// Whether `name` can be used to extract `value`, or why not.
+///
+/// Re-using a name the request already declares *with the same value* is not an
+/// error — it is the point: two fields that carry the same file should end up
+/// reading the same parameter rather than declaring it twice.
+pub fn check_parameter_name(
+    name: &str,
+    value: &str,
+    declared: &[(String, String)],
+) -> Option<ParamNameError> {
+    if !is_variable_name(name.trim()) {
+        return Some(ParamNameError::Invalid);
+    }
+    let name = name.trim();
+    match declared.iter().find(|(n, _)| n == name) {
+        Some((_, existing)) if existing != value.trim() => {
+            Some(ParamNameError::Conflict(existing.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// A parameter name to offer for `value`, given what the request already
+/// `declared` as `(name, default)` pairs.
+///
+/// Derived from the value because that is what the user is looking at: a path
+/// suggests its file stem (`./samples/example.pdf` ⇒ `EXAMPLE`), anything else
+/// suggests itself, upper-cased and with runs of punctuation folded to `_` so
+/// the result reads like the `{{SHOUTING}}` every other variable in a Hurl file
+/// uses. Only a suggestion — the prompt it fills is fully editable — so it errs
+/// towards something short and obviously wrong over something clever.
+pub fn suggest_parameter_name(value: &str, declared: &[(String, String)]) -> String {
+    let value = value.trim();
+    // A declaration already holding this exact value is the answer: extracting
+    // the same path from a second field should join the existing parameter, not
+    // declare a near-duplicate beside it that then has to be kept in step.
+    if let Some((name, _)) = declared.iter().find(|(_, v)| v == value) {
+        return name.clone();
+    }
+    let taken: Vec<&String> = declared.iter().map(|(n, _)| n).collect();
+    // A path's identity is its file name, not the directories above it, and the
+    // extension is shared by every file it will be swapped for.
+    let core = match value.rsplit(['/', '\\']).next() {
+        Some(last) if value.contains('/') || value.contains('\\') => {
+            last.split('.').next().unwrap_or(last)
+        }
+        _ => value,
+    };
+    let mut base = String::new();
+    for ch in core.chars() {
+        if ch.is_alphanumeric() {
+            base.extend(ch.to_uppercase());
+        } else if !base.ends_with('_') {
+            base.push('_');
+        }
+    }
+    let base = base.trim_matches('_');
+    // A name has to survive being written as `{{NAME}}` and read back as an
+    // identifier, so a leading digit or an empty result falls back rather than
+    // producing something the user has to fix before they can use it.
+    let base = if base.is_empty() || base.starts_with(|c: char| c.is_ascii_digit()) {
+        "VALUE"
+    } else {
+        base
+    };
+    let base: String = base.chars().take(24).collect();
+    let base = base.trim_end_matches('_').to_string();
+    if !taken.iter().any(|t| **t == base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}_{n}"))
+        .find(|c| !taken.iter().any(|t| **t == *c))
+        .expect("an unused suffix always exists")
+}
+
+/// Whether `name` could be the name of a `{{name}}` variable.
+///
+/// Deliberately liberal — anything the `{{ … }}` placeholder pattern in
+/// [`crate::environment`] would match, i.e. non-empty with no whitespace and no
+/// braces. A stricter identifier rule would quietly refuse to default names
+/// that already work everywhere else in PaperBoy (`api-key`, `x.y`), and the
+/// two definitions of "a variable name" drifting apart is exactly the kind of
+/// bug nobody finds.
+pub fn is_variable_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c == '{' || c == '}')
+}
+
 impl HurlEntry {
     /// Build an entry from user-entered form fields. Rows with a blank key are
     /// dropped and the rest are trimmed. An empty `body` becomes `None`.
@@ -449,6 +552,56 @@ impl HurlEntry {
             body,
             ..Default::default()
         }
+    }
+
+    /// The request's declared **parameters**: the `variable: NAME=value` rows
+    /// of its `[Options]` section, in written order.
+    ///
+    /// Hurl reads such a row as an assignment that wins over anything the
+    /// caller passed in; PaperBoy reads it as a *default* — the value used only
+    /// when nobody else binds the name (see
+    /// [`crate::request::effective_vars`]). That flip is what lets one request
+    /// serve both audiences: opened on its own it runs with the author's sample
+    /// value, and driven from a PaperTrail loop (`FOR FILE IN FILES …`) it takes
+    /// the loop's value, with neither side editing the other's file. The
+    /// alternative — a bare `{{FILE}}` with no default — makes the request
+    /// unusable outside the report, which is the state this replaces.
+    ///
+    /// Rows are matched case-insensitively on the option name (Hurl's own
+    /// parser is case-sensitive here, but a request typed by hand in a form
+    /// should not fail silently over a capital letter). A row with no `=`, an
+    /// empty name, or a name that isn't a plausible variable identifier is
+    /// skipped rather than reported: `[Options]` is a free-text grid the user
+    /// may be halfway through typing, and refusing to send a request because a
+    /// half-written option row exists would be worse than ignoring it.
+    /// Disabled rows are skipped like every other disabled row.
+    pub fn variable_defaults(&self) -> Vec<(String, String)> {
+        self.options
+            .iter()
+            .filter_map(|r| Self::variable_default(r.enabled, &r.key, &r.value))
+            .collect()
+    }
+
+    /// The parameter one `[Options]` row declares, if it declares one.
+    ///
+    /// Split out of [`HurlEntry::variable_defaults`] because the request
+    /// editors need to read rows they are still editing — the terminal wizard
+    /// holds them as text editors, not as a [`HurlEntry`] — and both must agree
+    /// exactly on what counts as a declaration, or a row would read as a
+    /// parameter in the form and not be one when sent.
+    pub fn variable_default(enabled: bool, key: &str, value: &str) -> Option<(String, String)> {
+        if !enabled || !key.trim().eq_ignore_ascii_case("variable") {
+            return None;
+        }
+        let (name, value) = value.split_once('=')?;
+        let name = name.trim();
+        is_variable_name(name).then(|| (name.to_string(), value.trim().to_string()))
+    }
+
+    /// Whether this request declares a parameter named `name`
+    /// (case-sensitively, as `{{NAME}}` interpolation is).
+    pub fn declares_variable(&self, name: &str) -> bool {
+        self.variable_defaults().iter().any(|(n, _)| n == name)
     }
 
     /// Add an explicit `Content-Length: 0` header when this is a bodyless
