@@ -20,7 +20,7 @@ use crate::report::edit::{
     report_assignment, request_node, set_request_name, transfer_modifier,
 };
 use crate::report::filter::RowFilter;
-use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, WithItem};
+use crate::report::flow::{FlowNode, ReportFlow, ReportStmt, UsingItem, WithItem};
 use crate::report::indent::{
     INDENT_UNIT, ReformatError, indent_for_new_line, is_end_line, matching_opener_indent,
 };
@@ -54,6 +54,26 @@ pub enum ReportOrigin {
 
 /// The GUI report editor's state. Owns a core [`Report`] (text = source of
 /// truth) plus the parsed AST cache, current selection and per-view scratch.
+/// The Source view's find bar while it is open.
+///
+/// The matches themselves are recomputed each frame rather than stored: the
+/// script is a few hundred lines and it is being *edited*, so a cached list
+/// would have to be invalidated on every keystroke anyway — and a stale one
+/// would select a range that had moved.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SourceFind {
+    /// What to look for; matched case-insensitively, as a plain substring.
+    pub query: String,
+    /// Which match is the current one, as an index into the matches found this
+    /// frame. Kept rather than clamped at write time because the count changes
+    /// under it as the query and the script are typed.
+    pub current: usize,
+    /// Set when the bar is opened (or re-opened over an existing one) so the
+    /// next frame can put the caret in it: focus has to be asked for after the
+    /// widget exists.
+    pub focus: bool,
+}
+
 pub struct ReportEditor {
     pub origin: ReportOrigin,
     pub report: Report,
@@ -71,6 +91,14 @@ pub struct ReportEditor {
     /// disk and everything that needs them (the chip tints, the request combo,
     /// the highlighter) runs while drawing — i.e. on every frame.
     pub helpers: Vec<crate::report::run::HelperCollection>,
+    /// The requests of the collection the report is bound to, or `None` when
+    /// the reference resolves to nothing.
+    ///
+    /// Cached behind the same fingerprint gate as `helpers` and for the same
+    /// reason: [`context::bound_entries`] falls back to reading the file from
+    /// disk when no tab has it open, and the chip tints, the request combo and
+    /// the highlighter all ask for it while drawing.
+    pub primary: Option<Vec<crate::hurl::HurlEntry>>,
     /// The [`context::diagnostics_fingerprint`] the current `diagnostics` were
     /// computed from. Validation is re-run only when this changes, so it happens
     /// on an edit rather than on every frame — see that function for why.
@@ -116,6 +144,13 @@ pub struct ReportEditor {
     /// The results view's find box: a case-insensitive substring the shown
     /// columns are searched for, narrowing the rows the filter already chose.
     pub results_find: String,
+    /// The Source view's find bar, open only once Ctrl+F has asked for it.
+    ///
+    /// Separate from [`Self::results_find`] because the two search different
+    /// things and are looked at in different views: carrying a row filter over
+    /// into the script (or the other way about) would be a surprise, and a bar
+    /// that appeared in both at once would be describing only one of them.
+    pub source_find: Option<SourceFind>,
     /// The row whose drill-down panel is open, if any.
     ///
     /// One at a time, unlike the HTML export's independently-expanding rows: a
@@ -261,6 +296,7 @@ impl ReportEditor {
             parse_error_line: None,
             diagnostics: Vec::new(),
             helpers: Vec::new(),
+            primary: None,
             diag_key: None,
             hl_cache: None,
             selection: Vec::new(),
@@ -273,6 +309,7 @@ impl ReportEditor {
             last_export: None,
             results_filter: 0,
             results_find: String::new(),
+            source_find: None,
             results_detail: None,
             results_textures: std::collections::HashMap::new(),
             wizard: None,
@@ -306,6 +343,8 @@ impl ReportEditor {
     /// with the editor, because it is rebuilt from the report text anyway.
     pub fn park_run(&mut self) -> ParkedRun {
         ParkedRun {
+            view: Some(self.view),
+            had_result: self.result.is_some(),
             result: self.result.take(),
             progress: self.progress.take(),
             run: self.run.take(),
@@ -329,8 +368,16 @@ impl ReportEditor {
             // Already answered: don't overwrite them from the remembered set.
             self.params_seeded = true;
         }
-        if self.result.is_some() {
-            self.view = EditorView::Results;
+        // The tab the user last chose on *this* report wins -- but only if
+        // there was already something in the results grid when they chose it.
+        // Otherwise the choice was made about a report that hadn't run, and the
+        // rows that have arrived since are what they came back for.
+        match parked.view {
+            Some(view) if parked.had_result => {
+                self.view = view;
+            }
+            _ if self.result.is_some() => self.view = EditorView::Results,
+            _ => {}
         }
     }
 
@@ -940,6 +987,30 @@ enum ChipEdit {
     /// things you could change, so both were only ever found through the
     /// wizard. Boxes look editable.
     Loop(LoopEdit),
+    /// A `PARAM` declaration, with a control for its default value chosen from
+    /// the parameter's own type: a dropdown of the loaded environments for an
+    /// `ENV`, the declared options for a `CHOICE`, a picker beside the box for a
+    /// `FOLDER`/`FILE`, and a plain box for anything else.
+    ///
+    /// The run settings have always offered the right control for the type;
+    /// the block that *declares* the parameter showed the same choice as a
+    /// string to be retyped by hand, which is exactly where a typo becomes a
+    /// default nobody notices is wrong.
+    Param(ParamEdit),
+}
+
+/// The editable parts of a `PARAM` declaration (see [`ChipEdit::Param`]).
+#[derive(Clone)]
+struct ParamEdit {
+    kind: crate::report::flow::ParamKind,
+    /// The keyword as written, `CHOICE("a", "b")` options included, so the chip
+    /// says what the parameter accepts without repeating the parser.
+    keyword: String,
+    name: String,
+    /// The declared default, empty when the parameter is required.
+    value: String,
+    /// The `LABEL "…"`, shown after the value as plain text when present.
+    label: Option<String>,
 }
 
 /// The editable parts of a `FOR` loop head (see [`ChipEdit::Loop`]).
@@ -1012,6 +1083,10 @@ impl Chip {
                 }
                 (label, extra)
             }
+            ChipEdit::Param(p) => (
+                format!("PARAM {} {} =", p.keyword, p.name),
+                PARAM_VALUE_FIELD_WIDTH,
+            ),
         }
     }
 
@@ -1117,6 +1192,23 @@ impl Chip {
             hovered: false,
         }
     }
+    /// A `PARAM` declaration whose default value is edited in place, with the
+    /// control its type asks for. Still the row's base chip, so the keywords
+    /// stay the drag/select handle.
+    fn param(edit: ParamEdit, color: Color32) -> Chip {
+        Chip {
+            text: String::new(),
+            color,
+            is_base: true,
+            detach: None,
+            edit: ChipEdit::Param(edit),
+            help: "",
+            tethered: false,
+            join_prev: false,
+            join_next: false,
+            hovered: false,
+        }
+    }
     /// A `PARALLEL` chip whose concurrency limit is edited inline.
     fn parallel(degree: Option<u32>, color: Color32) -> Chip {
         Chip {
@@ -1131,6 +1223,26 @@ impl Chip {
             join_next: false,
             hovered: false,
         }
+    }
+}
+
+/// Break a `PARAM` declaration into the parts the chip edits in place.
+fn param_edit(p: &crate::report::flow::ParamDecl) -> ParamEdit {
+    use crate::report::flow::ParamKind;
+    let mut keyword = p.kind.keyword().to_string();
+    if let ParamKind::Choice(options) = &p.kind
+        && !options.is_empty()
+    {
+        keyword.push('(');
+        keyword.push_str(&options.join(", "));
+        keyword.push(')');
+    }
+    ParamEdit {
+        kind: p.kind.clone(),
+        keyword,
+        name: p.name.clone(),
+        value: p.default.clone().unwrap_or_default(),
+        label: p.label.clone(),
     }
 }
 
@@ -1323,12 +1435,15 @@ fn build_node_chips(
         FlowNode::Comment(text) => {
             vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
         }
-        FlowNode::Request { name } => {
-            vec![Chip::request(name, req_col).with_help(s.chip_help_request)]
+        FlowNode::Request { name, using } => {
+            let mut chips = vec![Chip::request(name, req_col).with_help(s.chip_help_request)];
+            chips.extend(using_chip(using, th.subst, s.chip_help_using));
+            chips
         }
         FlowNode::Report(ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -1339,6 +1454,10 @@ fn build_node_chips(
                     .with_help(s.chip_help_report),
             ];
             chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
+            // Shown as its own chip so a required parameter is visible in the
+            // block editor too — a clause the graphical view silently omitted
+            // would be worse than no clause at all.
+            chips.extend(using_chip(using, th.subst, s.chip_help_using));
             // RESPONSE / SHOW / HIDE are their own detachable chips so a long
             // reported request reads as a row of small, legible clauses rather
             // than one dense line.
@@ -1454,11 +1573,10 @@ fn build_node_chips(
             ));
             chips
         }
-        // One chip carrying the whole declaration. Editing it is the run
-        // settings panel's job, not the block editor's — what matters here is
-        // that a parameter is visible as the first thing the report does.
-        FlowNode::Param(_) => {
-            vec![Chip::base(node.label(), th.pending).with_help(s.chip_help_param)]
+        // The declaration, with its default value editable in place through
+        // the control its own type asks for (see [`ChipEdit::Param`]).
+        FlowNode::Param(p) => {
+            vec![Chip::param(param_edit(p), th.pending).with_help(s.chip_help_param)]
         }
         FlowNode::Assign { .. } | FlowNode::ListDecl { .. } => {
             let (col, help) = if matches!(node, FlowNode::Assign { .. }) {
@@ -1571,6 +1689,30 @@ fn build_node_chips(
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
 /// whole — so the two are drawn as one segmented pill (see [`link_tethers`]).
+/// The `USING(…)` chip for a request statement, or nothing when there is no
+/// clause.
+///
+/// A read-only chip: its requirements are ticked in the request node form and
+/// its overrides written in the source view, but it has to be *visible* here,
+/// because its whole purpose is to make a request's required parameters obvious
+/// at the call site. Tethered so it reads as part of the request pill rather
+/// than a statement of its own.
+fn using_chip(using: &[UsingItem], color: Color32, help: &'static str) -> Option<Chip> {
+    if using.is_empty() {
+        return None;
+    }
+    let list = using
+        .iter()
+        .map(UsingItem::text)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        Chip::base(format!("USING({list})"), color)
+            .with_help(help)
+            .tether(),
+    )
+}
+
 fn stats_chip(
     stats: &[crate::report::model::StatKind],
     th: &GuiTheme,
@@ -1750,6 +1892,18 @@ enum Act {
         path: Vec<usize>,
         file: bool,
     },
+    /// A `PARAM` block's default value was changed from its inline control —
+    /// a dropdown, a picker or a box, depending on the parameter's type. Blank
+    /// clears the default, making the parameter required again.
+    SetParamDefault {
+        path: Vec<usize>,
+        text: String,
+    },
+    /// The picker beside a `FOLDER`/`FILE` parameter's default.
+    PickParamDefault {
+        path: Vec<usize>,
+        folder: bool,
+    },
     /// The inline `PARALLEL` box committed a new max-concurrency for the loop at
     /// `path`; `None` clears it back to the prelude-driven default.
     SetParallelDegree {
@@ -1810,6 +1964,7 @@ impl Act {
                 | Act::SetLoopDir { .. }
                 | Act::SetLoopGlob { .. }
                 | Act::SetParallelDegree { .. }
+                | Act::SetParamDefault { .. }
                 | Act::SetHeader { .. }
         )
     }
@@ -1867,12 +2022,18 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     &app.strings,
                 );
                 ed.helpers = helpers;
+                ed.primary = context::bound_entries(
+                    &app.session.collections,
+                    flow,
+                    ed.report.path.as_deref(),
+                );
                 ed.diag_key = Some(key);
             }
         }
         None => {
             ed.diagnostics.clear();
             ed.helpers.clear();
+            ed.primary = None;
             ed.diag_key = None;
         }
     }
@@ -1986,17 +2147,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if dry.clicked() {
                     ed.pending_toolbar = Some(ToolbarAct::DryRun);
                 }
-                // The answers themselves, and the way back to the questions —
-                // one thing, not two. They used to be a button beside a dim
-                // label, which split reading from acting: the part you could
-                // read looked like a status message, and the part you could
-                // click said "Run settings" without saying what the settings
-                // were. Now the line *is* the button.
-                if ed.has_params() {
-                    if param_chip(ui, &ed, app, &th).clicked() {
-                        ed.pending_toolbar = Some(ToolbarAct::RunSettings);
-                    }
-                }
             }
             // What you can do with a *result*, shown only where there is one to
             // do it with. Left of the run controls, and separated from them:
@@ -2049,6 +2199,28 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if baseline.clicked() {
                     super::menu::save_via_picker(app, super::app::SaveKind::ReportBaseline);
                 }
+            }
+
+            // The answers themselves, and the way back to the questions — one
+            // thing, not two. They used to be a button beside a dim label,
+            // which split reading from acting: the part you could read looked
+            // like a status message, and the part you could click said "Run
+            // settings" without saying what the settings were. Now the line
+            // *is* the button.
+            //
+            // Drawn last of the right-hand group, because it is the only item
+            // here that stretches: it sizes itself to whatever width is left,
+            // so anything laid out after it gets none. Laid out earlier it
+            // swallowed the row and pushed Export/Save baseline past the left
+            // edge of the pane, which widened this `Ui` leftwards and dragged
+            // the whole view under it off-screen with them. Last in the group
+            // means it takes the leftovers and no one else goes without.
+            if !ed.is_running()
+                && ed.has_params()
+                && ui.available_width() > ui.spacing().interact_size.x
+                && param_chip(ui, &ed, app, &th).clicked()
+            {
+                ed.pending_toolbar = Some(ToolbarAct::RunSettings);
             }
         });
     });
@@ -2173,16 +2345,13 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         None => {}
     }
 
+    // The editor goes, the run stays — and so do any unsaved edits. Routed
+    // through the app's own close rather than parking the run by hand here,
+    // because that is where both of those promises are kept, and a second
+    // implementation of one of them is how this path came to drop the other.
+    app.report_editor = Some(ed);
     if close {
-        // The editor goes, the run stays: closing the view must not cancel a
-        // report mid-flight or discard the rows it has already collected.
-        let key = ed.run_key();
-        let parked = ed.park_run();
-        if parked.is_worth_keeping() {
-            app.report_runs.insert(key, parked);
-        }
-    } else {
-        app.report_editor = Some(ed);
+        app.close_report_editor();
     }
 }
 
@@ -2276,10 +2445,7 @@ fn dry_run_body(
 /// doesn't — so the Source view answers "is this report wired up?" at a glance,
 /// exactly as the terminal UI's does.
 fn highlight_ctx(ed: &mut ReportEditor, app: &GuiApp) -> std::rc::Rc<HlCtx> {
-    let bound = ed.flow.as_ref().and_then(|flow| {
-        context::resolve_bound_collection(&app.session.collections, flow, ed.report.path.as_deref())
-    });
-    let key = highlight_ctx_key(ed, app, bound);
+    let key = highlight_ctx_key(ed, app);
     if let Some((cached_key, ctx)) = &ed.hl_cache
         && *cached_key == key
     {
@@ -2287,18 +2453,20 @@ fn highlight_ctx(ed: &mut ReportEditor, app: &GuiApp) -> std::rc::Rc<HlCtx> {
     }
     let ctx = std::rc::Rc::new(HlCtx {
         error_line: ed.parse_error_line,
-        collection_resolves: bound.is_some(),
+        collection_resolves: ed.primary.is_some(),
         loaded_envs: app
             .session
             .global_envs
             .iter()
             .map(|e| e.name.clone())
             .collect(),
-        request_names: bound
-            .map(|ci| {
+        request_names: ed
+            .primary
+            .as_deref()
+            .map(|entries| {
                 // Qualified, so a helper's request reads green in the Source
                 // view rather than misleadingly amber.
-                context::request_choices(&app.session.collections[ci].entries, &ed.helpers)
+                context::request_choices(entries, &ed.helpers)
                     .into_iter()
                     .map(|c| c.qualified)
                     .collect()
@@ -2318,18 +2486,16 @@ fn highlight_ctx(ed: &mut ReportEditor, app: &GuiApp) -> std::rc::Rc<HlCtx> {
 ///
 /// **Maintenance:** anything [`highlight_ctx`] starts reading has to be added
 /// here, or the colours will stop following it.
-fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp, bound: Option<usize>) -> u64 {
+fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ed.parse_error_line.hash(&mut h);
-    bound.hash(&mut h);
+    ed.primary.is_some().hash(&mut h);
     for e in &app.session.global_envs {
         e.name.hash(&mut h);
     }
-    if let Some(ci) = bound {
-        for e in &app.session.collections[ci].entries {
-            e.title.hash(&mut h);
-        }
+    for e in ed.primary.iter().flatten() {
+        e.title.hash(&mut h);
     }
     for helper in &ed.helpers {
         helper.alias.hash(&mut h);
@@ -2672,7 +2838,10 @@ fn param_chip(
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     job.wrap.overflow_character = Some('…');
-    job.wrap.max_width = (ui.available_width() - 24.0).max(120.0);
+    // Never wider than the room it was given: the chip is drawn on a toolbar
+    // whose other items have already claimed their width, and a line that
+    // rounded its own width up would push them off the edge of the pane.
+    job.wrap.max_width = (ui.available_width() - 24.0).max(0.0);
     job.append(
         &format!("{} {}: ", super::icons::ENV, s.gui_report_run_settings),
         0.0,
@@ -2717,7 +2886,15 @@ fn param_chip(
             hover
         );
     }
-    ui.add(egui::Button::new(job)).on_hover_text(hover)
+    // Laid out here rather than handed to the button as a job: a widget
+    // *overwrites* `job.wrap` with its own wrap mode and the width it happens
+    // to have (`WidgetText::into_galley_impl`), so the one-row eliding above
+    // was quietly discarded and the chip rendered at its full natural width —
+    // which on a narrow pane shoved the rest of the toolbar off the edge. A
+    // galley is taken as-is.
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+    ui.add(egui::Button::new(egui::WidgetText::Galley(galley)))
+        .on_hover_text(hover)
 }
 
 /// `NAME=value · NAME=value`, with an empty value written as the same
@@ -2864,12 +3041,26 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
         ed.param_values.insert(name, value);
     }
     if let Some((name, folder)) = browse {
-        let seed = ed
+        let report_dir = ed
             .report
             .path
             .as_deref()
             .and_then(|p| p.parent())
             .map(std::path::Path::to_path_buf);
+        // Open on the folder the parameter already names — resolved against the
+        // report when it is relative, exactly as the run will resolve it — so
+        // re-picking a corpus starts where the last one was found instead of at
+        // the report's own directory every time.
+        let current = ed.param_values.get(&name).cloned().unwrap_or_default();
+        let seed = if current.is_empty() {
+            report_dir
+        } else {
+            let joined = match (&report_dir, std::path::Path::new(&current).is_absolute()) {
+                (Some(dir), false) => dir.join(&current),
+                _ => std::path::PathBuf::from(&current),
+            };
+            super::filepick::seed_dir(joined.to_string_lossy().as_ref()).or(report_dir)
+        };
         let kind = if folder {
             super::filepick::PickKind::Folder
         } else {
@@ -2906,6 +3097,9 @@ const FORM_MAX_WIDTH: f32 = 620.0;
 /// How wide a parameter's field is. Fixed rather than fitted to the value so a
 /// column of fields lines up — a form of ragged boxes reads as an accident.
 const PARAM_FIELD_WIDTH: f32 = 320.0;
+
+/// What a `TextEdit`'s own margins cost its text, either side.
+const FIELD_TEXT_INSET: f32 = 8.0;
 
 /// What a [`param_card`] asked for this frame.
 enum CardEdit {
@@ -2977,7 +3171,7 @@ fn param_card(
                         }
                     }
                     ParamKind::Folder | ParamKind::File => {
-                        if param_field(ui, &mut value, s.param_value_unset) {
+                        if param_field(ui, &name, &mut value, s.param_value_unset) {
                             edit = Some((name.clone(), CardEdit::Set(value.clone())));
                         }
                         if ui
@@ -2992,7 +3186,7 @@ fn param_card(
                         }
                     }
                     _ => {
-                        if param_field(ui, &mut value, s.param_value_unset) {
+                        if param_field(ui, &name, &mut value, s.param_value_unset) {
                             edit = Some((name.clone(), CardEdit::Set(value.clone())));
                         }
                     }
@@ -3007,19 +3201,73 @@ fn param_card(
     edit
 }
 
+/// `text` with as much of its *front* replaced by an ellipsis as it takes to
+/// fit in `width`. Returned unchanged when it already fits.
+fn elide_head(ui: &egui::Ui, text: &str, width: f32) -> String {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let measure = |s: String| {
+        ui.painter()
+            .layout_no_wrap(s, font.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    };
+    if text.is_empty() || measure(text.to_string()) <= width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for cut in 1..chars.len() {
+        let short: String = std::iter::once('\u{2026}')
+            .chain(chars[cut..].iter().copied())
+            .collect();
+        if measure(short.clone()) <= width {
+            return short;
+        }
+    }
+    '\u{2026}'.to_string()
+}
+
 /// A parameter's text field: fixed width, monospace, and hinted with what the
 /// run would use if it were left alone.
-fn param_field(ui: &mut egui::Ui, value: &mut String, hint: &str) -> bool {
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .hint_text(hint)
-            // Monospace for the same reason an inline field in the Blocks view
-            // is: what goes in here is the user's own text, not the editor's
-            // vocabulary, and the two shouldn't look alike.
-            .font(egui::TextStyle::Monospace)
-            .desired_width(PARAM_FIELD_WIDTH),
-    )
-    .changed()
+///
+/// A value too long for the box is shown by its *end* while nobody is typing in
+/// it. These are mostly paths, and every corpus under one tree shares a prefix
+/// — a box reading `/home/jonathan-hobern/Developmen…` says nothing about which
+/// folder is selected, where `…les/absolute/trimmed` says everything. Clicking
+/// in swaps the abbreviation for the real value, so what is edited is always
+/// the whole thing.
+fn param_field(ui: &mut egui::Ui, name: &str, value: &mut String, hint: &str) -> bool {
+    let id = ui.make_persistent_id(("pt_run_param", name));
+    let field = |ui: &mut egui::Ui, text: &mut String| {
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .id(id)
+                .hint_text(hint)
+                // Monospace for the same reason an inline field in the Blocks
+                // view is: what goes in here is the user's own text, not the
+                // editor's vocabulary, and the two shouldn't look alike.
+                .font(egui::TextStyle::Monospace)
+                .desired_width(PARAM_FIELD_WIDTH),
+        )
+    };
+    if ui.memory(|m| m.has_focus(id)) {
+        return field(ui, value).changed();
+    }
+    // The frame's shown text is a throwaway: edits cannot arrive on it, because
+    // the first thing any edit does is take focus, and focus takes the branch
+    // above from the next frame on.
+    let mut shown = elide_head(ui, value, PARAM_FIELD_WIDTH - FIELD_TEXT_INSET);
+    if field(ui, &mut shown).gained_focus() {
+        // The click landed on an abbreviation, so the character it picked is
+        // not the character it looked like. Put the caret at the end of the
+        // real value instead — for a path that is where anyone who has just
+        // opened the box to change it wants to be anyway.
+        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        let end = egui::text::CCursor::new(value.chars().count());
+        st.cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        st.store(ui.ctx(), id);
+    }
+    false
 }
 
 /// A parameter's drop-down: the closed set of answers its type allows, plus
@@ -3060,7 +3308,238 @@ fn param_combo(
     changed
 }
 
+/// Every case-insensitive occurrence of `query` in `text`, as byte ranges.
+///
+/// ASCII-folded rather than Unicode-folded, because `str::to_lowercase` can
+/// change a string's *length* (`İ` becomes two chars) and every byte offset
+/// after such a character would then point into the wrong place. A PaperTrail
+/// script is keywords, request names, globs and paths, so ASCII folding is the
+/// whole of the case-insensitivity anyone is asking of this box.
+fn find_matches(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let hay = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut at = 0;
+    // Non-overlapping: stepping through `aa` in `aaaa` should visit two places,
+    // not three, or "next match" walks one character at a time.
+    while let Some(i) = hay[at..].find(&needle) {
+        let start = at + i;
+        out.push(start..start + needle.len());
+        at = start + needle.len();
+    }
+    out
+}
+
+/// Paint the find bar's matches onto an already-highlighted job.
+///
+/// Sections that straddle a match are split rather than replaced, so the syntax
+/// colouring underneath survives: a match on a keyword stays keyword-coloured
+/// and simply gains a background.
+fn overlay_find_matches(
+    job: &mut egui::text::LayoutJob,
+    matches: &[std::ops::Range<usize>],
+    current: usize,
+    all: egui::Color32,
+    on: egui::Color32,
+) {
+    if matches.is_empty() {
+        return;
+    }
+    let part = |sec: &egui::text::LayoutSection,
+                range: std::ops::Range<usize>,
+                bg: Option<egui::Color32>| {
+        let mut out = sec.clone();
+        // Leading space indents the section it opens; a split piece that no
+        // longer starts where the original did must not indent again.
+        if range.start != sec.byte_range.start.0 {
+            out.leading_space = 0.0;
+        }
+        out.byte_range = egui::text::ByteIndex(range.start)..egui::text::ByteIndex(range.end);
+        if let Some(bg) = bg {
+            out.format.background = bg;
+        }
+        out
+    };
+    let mut out: Vec<egui::text::LayoutSection> =
+        Vec::with_capacity(job.sections.len() + matches.len() * 2);
+    for sec in std::mem::take(&mut job.sections) {
+        let (s, e) = (sec.byte_range.start.0, sec.byte_range.end.0);
+        if s == e {
+            out.push(sec);
+            continue;
+        }
+        let mut at = s;
+        for (i, m) in matches.iter().enumerate() {
+            let (ms, me) = (m.start.max(s), m.end.min(e));
+            if ms >= me {
+                continue;
+            }
+            if ms > at {
+                out.push(part(&sec, at..ms, None));
+            }
+            out.push(part(
+                &sec,
+                ms..me,
+                Some(if i == current { on } else { all }),
+            ));
+            at = me;
+        }
+        if at < e {
+            out.push(part(&sec, at..e, None));
+        }
+    }
+    job.sections = out;
+}
+
+/// The Source view's find bar: the box, the `3 of 12` counter and the keys that
+/// move between matches. Returns the match to jump to, if this frame asked for
+/// one.
+fn source_find_bar(
+    ed: &mut ReportEditor,
+    app: &GuiApp,
+    ui: &mut egui::Ui,
+    matches: &[std::ops::Range<usize>],
+) -> Option<usize> {
+    let th = app.theme;
+    let s = &app.strings;
+    let Some(find) = ed.source_find.as_mut() else {
+        return None;
+    };
+    let id = ui.id().with("trail_find");
+    let mut step = 0i64;
+    let mut jump = false;
+    ui.horizontal(|ui| {
+        ui.colored_label(th.dim, super::icons::SEARCH);
+        let box_resp = ui.add(
+            egui::TextEdit::singleline(&mut find.query)
+                .id(id)
+                .desired_width(220.0)
+                .hint_text(s.source_find_placeholder),
+        );
+        // Opening the bar has to put the caret in it, and that can only be asked
+        // for once the widget exists — hence the one-shot flag rather than a
+        // `request_focus` at the key press.
+        if std::mem::take(&mut find.focus) {
+            box_resp.request_focus();
+        }
+        // A changed query re-searches from the top: the old index counted
+        // matches that no longer exist.
+        if box_resp.changed() {
+            find.current = 0;
+            jump = true;
+        }
+        // Enter only steps while the *box* has focus — in the script itself it
+        // has to stay a newline.
+        if box_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            step = if ui.input(|i| i.modifiers.shift) {
+                -1
+            } else {
+                1
+            };
+        }
+        if matches.is_empty() {
+            ui.colored_label(
+                if find.query.is_empty() {
+                    th.dim
+                } else {
+                    th.err
+                },
+                if find.query.is_empty() {
+                    String::new()
+                } else {
+                    s.source_find_none.to_string()
+                },
+            );
+        } else {
+            ui.colored_label(
+                th.dim,
+                s.source_find_position
+                    .replace("{n}", &(find.current + 1).to_string())
+                    .replace("{total}", &matches.len().to_string()),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.colored_label(th.dim, s.source_find_hint);
+        });
+    });
+    // F3 works wherever the focus is, which is what makes "find, then keep
+    // typing in the script, then jump on" possible.
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F3)) {
+        step = 1;
+    }
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3)) {
+        step = -1;
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    if step != 0 {
+        let n = matches.len() as i64;
+        find.current = (find.current as i64 + step).rem_euclid(n) as usize;
+        jump = true;
+    }
+    find.current = find.current.min(matches.len() - 1);
+    jump.then_some(find.current)
+}
+
+/// Select the byte range `m` in the source editor and scroll it into view.
+///
+/// The editor's state is written directly rather than by faking key presses:
+/// selecting a range is the whole point (the match should be visible *as* a
+/// selection, ready to be typed over), and the galley is what turns a byte
+/// offset into a position on screen.
+fn select_and_reveal(
+    ui: &mut egui::Ui,
+    te_id: egui::Id,
+    out: &egui::text_edit::TextEditOutput,
+    text: &str,
+    m: &std::ops::Range<usize>,
+) {
+    // Cursors count characters, matches count bytes.
+    let chars_to =
+        |b: usize| egui::text::CCursor::new(egui::text::CharIndex(text[..b].chars().count()));
+    let (start, end) = (chars_to(m.start), chars_to(m.end));
+    let mut state = out.state.clone();
+    state
+        .cursor
+        .set_char_range(Some(egui::text_selection::CCursorRange::two(start, end)));
+    egui::TextEdit::store_state(ui.ctx(), te_id, state);
+    // Both ends, so a match wider than the pane still shows its beginning, and
+    // a little air around it so it doesn't land flush against the edge.
+    let rect = out
+        .galley
+        .pos_from_cursor(start)
+        .union(out.galley.pos_from_cursor(end))
+        .translate(out.galley_pos.to_vec2());
+    ui.scroll_to_rect(rect.expand(24.0), Some(egui::Align::Center));
+}
+
 fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
+    // Ctrl+F opens the bar, or re-aims an open one at the box: pressing it again
+    // while reading a match is a request to search for something else, not a
+    // no-op. Taken before the editor is built so the `TextEdit`'s focus lock
+    // (`code_editor` keeps Tab) never sees the chord.
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+        let find = ed.source_find.get_or_insert_with(SourceFind::default);
+        find.focus = true;
+    }
+    // Escape closes the bar rather than only dropping focus, and only while it
+    // is open, so it stays the script editor's way out the rest of the time.
+    if ed.source_find.is_some()
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        ed.source_find = None;
+    }
+    let matches = ed
+        .source_find
+        .as_ref()
+        .map(|f| find_matches(&ed.report.text, &f.query))
+        .unwrap_or_default();
+    let jump_to = source_find_bar(ed, app, ui, &matches);
+
     // Reserve room for the diagnostics panel at the bottom, then let the editor
     // fill the rest. Keeping the editor above avoids nesting egui panels inside
     // the centre panel (which egui 0.35 disallows in a `panel_frame` closure).
@@ -3075,9 +3554,17 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
     // that often is the expensive part, so it is cached and egui's galley cache
     // still handles the layout itself.
     let job_id = egui::Id::new("report_source_highlight");
+    // The find highlight is laid over the *cached* syntax job rather than baked
+    // into it: it changes on every keystroke in the find box and would otherwise
+    // throw away the tokenisation of the whole document each time.
+    let current = ed.source_find.as_ref().map_or(0, |f| f.current);
+    let all_bg = mix(th.bg, th.select_bg, 0.45);
+    let on_bg = th.select_bg;
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let job = cached_highlight_job(ui, job_id, buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        let mut job =
+            cached_highlight_job(ui, job_id, buf.as_str(), &hl, &spec, &th, font, wrap_width);
+        overlay_find_matches(&mut job, &matches, current, all_bg, on_bg);
         ui.ctx().fonts_mut(|f| f.layout_job(job))
     };
     egui::ScrollArea::vertical()
@@ -3113,17 +3600,24 @@ fn source_view(ed: &mut ReportEditor, app: &GuiApp, ui: &mut egui::Ui) {
                 new_cursor = Some(caret);
                 edited = true;
             }
-            let resp = ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .id(te_id)
-                    // Also locks focus, so Tab stays in the field (Escape is the
-                    // way out) — we just intercept it above to indent in spaces
-                    // rather than the literal `\t` egui would insert.
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(20)
-                    .layouter(&mut layouter),
-            );
+            let out = egui::TextEdit::multiline(&mut text)
+                .id(te_id)
+                // Also locks focus, so Tab stays in the field (Escape is the
+                // way out) — we just intercept it above to indent in spaces
+                // rather than the literal `\t` egui would insert.
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(20)
+                .layouter(&mut layouter)
+                // `show` rather than `add` for the galley, which is the only way
+                // to turn a match's byte offset into somewhere to scroll to.
+                .show(ui);
+            let resp = &out.response;
+            if let Some(i) = jump_to
+                && let Some(m) = matches.get(i)
+            {
+                select_and_reveal(ui, te_id, &out, &text, m);
+            }
             // A line that has just become `END` dedents to its opener. Done
             // after the widget so it also catches the `END` the user typed by
             // hand, not just the one a newline left behind.
@@ -3242,10 +3736,33 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     // Run-level errors (unresolved requests, producer problems) above the grid.
+    //
+    // A run that fails at one step fails at it for every row, so this list is
+    // routinely as long as the table: laid out in full it pushed the grid off
+    // the bottom of a pane that does not itself scroll, leaving no way to reach
+    // the rows the errors are about. It gets a scrolling box of bounded height
+    // and a header that folds it away once it has been read.
     if !result.errors.is_empty() {
-        for e in &result.errors {
-            ui.colored_label(th.err, format!("{} {e}", super::icons::FAIL));
-        }
+        let header = format!(
+            "{} {} {}",
+            super::icons::FAIL,
+            result.errors.len(),
+            app.strings.report_status_errors
+        );
+        let max_h = (ui.available_height() * 0.3).clamp(48.0, 160.0);
+        egui::CollapsingHeader::new(RichText::new(header).color(th.err))
+            .id_salt("pt_result_errors")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(max_h)
+                    .id_salt("pt_result_errors_scroll")
+                    .show(ui, |ui| {
+                        for e in &result.errors {
+                            ui.colored_label(th.err, format!("{} {e}", super::icons::FAIL));
+                        }
+                    });
+            });
         ui.add_space(2.0);
     }
 
@@ -3991,6 +4508,7 @@ fn filter_label(s: &crate::i18n::Strings, f: &RowFilter) -> String {
         RowFilter::Differ => s.report_filter_differences.to_string(),
         RowFilter::Incorrect => s.report_filter_incorrect.to_string(),
         RowFilter::Regressed => s.report_filter_regressions.to_string(),
+        RowFilter::Fixed => s.report_filter_improvements.to_string(),
         RowFilter::MatrixCell { .. } => f.label(),
     }
 }
@@ -4610,16 +5128,10 @@ fn flatten_cell(value: &str) -> String {
 }
 
 /// Per-cell display cap so one wide cell can't push the grid off-screen; the
-/// full value is available on hover. Mirrors the TUI's `MAX_COL_WIDTH`.
+/// full value is available on hover. Shares the TUI grid's truncation helper so
+/// the two front-ends cut and mark a wide cell identically.
 fn truncate_cell(value: &str) -> String {
-    const MAX: usize = 48;
-    if value.chars().count() > MAX {
-        let mut s: String = value.chars().take(MAX - 1).collect();
-        s.push('…');
-        s
-    } else {
-        value.to_string()
-    }
+    crate::shared_utils::truncate_to_width(value, 48)
 }
 
 /// Open the native save picker for exporting the active report's results,
@@ -4658,6 +5170,13 @@ fn open_export_dialog(app: &mut GuiApp) {
 }
 
 /// The Scratch-style block view: a toolbar plus the stacked, nested blocks.
+/// Where the widest laid-out row of the blocks pane is remembered between
+/// frames, so the pane can be as wide as its content instead of as wide as the
+/// infinite space a two-axis [`egui::ScrollArea`] offers.
+fn blocks_content_w_id() -> egui::Id {
+    egui::Id::new("pt_blocks_content_w")
+}
+
 fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let th = app.theme;
 
@@ -4675,14 +5194,8 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     };
 
     // Which request names resolve in the bound collection (for green/amber).
-    let bound = context::resolve_bound_collection(
-        &app.session.collections,
-        &flow,
-        ed.report.path.as_deref(),
-    );
-    let entries = bound
-        .map(|ci| app.session.collections[ci].entries.as_slice())
-        .unwrap_or(&[]);
+    let entries: Vec<crate::hurl::HurlEntry> = ed.primary.clone().unwrap_or_default();
+    let entries = entries.as_slice();
     let choices = context::request_choices(entries, &ed.helpers);
     // Primary collection first (guaranteed by `request_choices`), so a newly
     // dropped REQUEST block — which seeds itself from the first title — never
@@ -4790,10 +5303,30 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
             );
             palette_splitter(ed, ui, body_h);
             ui.vertical(|ui| {
-                egui::ScrollArea::vertical()
+                // Both axes: a request line with several modifiers on it is
+                // wider than any pane, and the chips run off the right edge
+                // rather than wrapping (they are laid out in a non-wrapping
+                // `horizontal_top`, because a clause broken across two lines
+                // reads as two statements). Without the sideways bar the tail
+                // of a long line was simply unreachable.
+                let out = egui::ScrollArea::both()
                     .id_salt("pt_blocks")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        // Enabling horizontal scrolling makes egui hand the
+                        // content an *infinite* width, which the full-width
+                        // bands below (hover highlights, drop strips, the
+                        // deselect background) would all inherit. Pin it back
+                        // to whichever is wider: the viewport, or what the
+                        // widest row actually needed last frame — so the bands
+                        // still span the content and stay finite.
+                        let want = ui
+                            .ctx()
+                            .data(|d| d.get_temp::<f32>(blocks_content_w_id()))
+                            .unwrap_or(0.0);
+                        let w = want.max(ui.clip_rect().width());
+                        ui.set_min_width(w);
+                        ui.set_max_width(w);
                         // A click on empty space in the blocks pane deselects.
                         // This background sense is registered *before* the rows
                         // so the chips (added on top, each sensing its own
@@ -4855,6 +5388,11 @@ fn blocks_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                             acts.push(Act::Select(Vec::new()));
                         }
                     });
+                // What the rows actually took, fed back in above. Measured
+                // rather than assumed: the widest line changes with every edit.
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(blocks_content_w_id(), out.content_size.x);
+                });
             });
         });
     });
@@ -5067,6 +5605,8 @@ const LOOP_VAR_FIELD_WIDTH: f32 = 72.0;
 /// A folder path is the longest thing on a loop head, and the one most worth
 /// being able to read without scrolling the row.
 const LOOP_PATH_FIELD_WIDTH: f32 = 150.0;
+/// A parameter's default: often a path, so it gets the same room as a loop's.
+const PARAM_VALUE_FIELD_WIDTH: f32 = 150.0;
 const LOOP_GLOB_FIELD_WIDTH: f32 = 84.0;
 /// How wide any inline field is allowed to grow to fit its contents.
 ///
@@ -6536,8 +7076,26 @@ fn collection_menu(
     picked: &mut Option<String>,
     browse: &mut bool,
 ) {
+    // The same type-to-filter box the request dropdown has (`filter_field`): a
+    // workspace of a few hundred collections is unusable as a flat list, and
+    // one way of narrowing a long list is enough for the whole editor.
+    let query_id = ui.make_persistent_id("pt_hdr_collection_query");
+    let query = filter_field(ui, s, query_id, f32::INFINITY);
+
+    let needle = query.trim().to_lowercase();
+    let matching: Vec<&CollectionChoice> = choices
+        .iter()
+        .filter(|c| {
+            needle.is_empty()
+                // The path counts as well as the name: two collections often
+                // share a name and the folder is what tells them apart.
+                || c.label.to_lowercase().contains(&needle)
+                || c.detail.to_lowercase().contains(&needle)
+        })
+        .collect();
+    let choices_len = choices.len();
     let (mine, others): (Vec<&CollectionChoice>, Vec<&CollectionChoice>) =
-        choices.iter().partition(|c| c.in_workspace);
+        matching.into_iter().partition(|c| c.in_workspace);
 
     let show_all_id = ui.make_persistent_id("pt_hdr_collection_show_all");
     // With no workspace to scope to there is nothing to reveal, so the toggle
@@ -6589,10 +7147,14 @@ fn collection_menu(
     // to list at all — and `collection:` is the one setting a report can't run
     // without. An empty menu would be a dead end, so say so and offer the way
     // out. Browse is always available; the list is a shortcut, not the only way.
-    if choices.is_empty() {
+    if choices_len == 0 {
         ui.colored_label(th.dim, s.gui_report_no_collections);
+    } else if mine.is_empty() && others.is_empty() {
+        // There *are* collections; the filter is simply hiding them all. Saying
+        // "none here yet" would send the user off to open one they already have.
+        ui.colored_label(th.dim, s.gui_report_collection_filter_no_matches);
     }
-    if !choices.is_empty() {
+    if choices_len > 0 {
         ui.separator();
     }
     if ui.button(s.gui_report_browse).clicked() {
@@ -7325,6 +7887,77 @@ fn pick_loop_dir(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], file: 
     );
 }
 
+/// Open the picker for the `FOLDER`/`FILE` parameter at `path`, seeded with the
+/// default it already names (resolved against the report, as the run resolves
+/// it) so re-picking starts where the last one was found.
+fn pick_param_default(ed: &mut ReportEditor, app: &mut GuiApp, path: &[usize], folder: bool) {
+    let report_dir = ed
+        .report
+        .path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf);
+    let current = ed
+        .flow
+        .as_ref()
+        .and_then(|f| edit::param_decl(f, path))
+        .and_then(|p| p.default)
+        .unwrap_or_default();
+    let seed = if current.is_empty() {
+        report_dir.clone()
+    } else {
+        let joined = match (&report_dir, std::path::Path::new(&current).is_absolute()) {
+            (Some(dir), false) => dir.join(&current),
+            _ => std::path::PathBuf::from(&current),
+        };
+        super::filepick::seed_dir(joined.to_string_lossy().as_ref()).or(report_dir.clone())
+    };
+    let (title, kind) = if folder {
+        (
+            app.strings.gui_pick_loop_folder,
+            super::filepick::PickKind::Folder,
+        )
+    } else {
+        (
+            app.strings.gui_pick_loop_file,
+            super::filepick::PickKind::File {
+                filters: super::filepick::owned_filters(&[("*", &["*"])]),
+            },
+        )
+    };
+    app.request_pick(
+        kind,
+        title,
+        seed.as_deref(),
+        super::menu::PickAction::ReportParamDefault {
+            path: path.to_vec(),
+        },
+    );
+}
+
+/// Write back the path a [`pick_param_default`] dialog returned, frames later.
+///
+/// Stored relative to the report where it can be, exactly as a loop's folder
+/// is: a workspace has to survive being handed to someone else, and an
+/// absolute path only means something on the machine it was picked on.
+pub(super) fn apply_picked_param_default(
+    app: &mut GuiApp,
+    path: &[usize],
+    picked: Option<std::path::PathBuf>,
+) {
+    let Some(picked) = picked else {
+        return; // cancelled
+    };
+    let Some(mut ed) = app.report_editor.take() else {
+        return; // the editor closed while the dialog was open
+    };
+    let text = relative_to_report(&picked, ed.report.path.as_deref());
+    ed.edit_flow(|flow| {
+        edit::set_param_default(flow, path, &text);
+    });
+    app.report_editor = Some(ed);
+}
+
 /// Write back the folder a [`pick_loop_dir`] dialog returned, frames later.
 pub(super) fn apply_picked_loop_dir(
     app: &mut GuiApp,
@@ -7598,6 +8231,15 @@ fn chip_shell<R>(
             // arithmetic: the max can only resolve to `h`, because `h` is by
             // definition at least the content plus its padding.
             ui.spacing_mut().interact_size.y = h;
+            // A chip that anchors a tether is laid out with the inter-chip gap
+            // zeroed (see `TETHER_GAP`) so the two sit flush — and a child `Ui`
+            // inherits its parent's spacing, which silently collapsed the gaps
+            // *inside* that chip as well: an `AS` label ended up jammed against
+            // its alias box on exactly the rows whose alias carried a modifier.
+            // A chip's contents always use the app's normal spacing, read from
+            // the context style so a caller's local override can't leak in.
+            let normal_gap = ui.ctx().style_of(ui.ctx().theme()).spacing.item_spacing.x;
+            ui.spacing_mut().item_spacing.x = normal_gap;
             ui.horizontal(|ui| {
                 if grow {
                     ui.set_min_height(h);
@@ -8055,6 +8697,11 @@ fn render_chip_body(
             loop_chip(ui, th, s, chip, path, &l, acts);
             return;
         }
+        ChipEdit::Param(p) => {
+            let p = p.clone();
+            param_decl_chip(ui, th, s, chip, selected, path, &p, env_choices, acts);
+            return;
+        }
         _ => {}
     }
 
@@ -8176,6 +8823,166 @@ fn alias_chip(
     if handle.dragged() {
         handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
     }
+}
+
+/// Render a `PARAM` declaration: the fixed words as the drag/select handle,
+/// with the control the parameter's own type asks for standing in for its
+/// default value.
+#[allow(clippy::too_many_arguments)]
+fn param_decl_chip(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &crate::i18n::Strings,
+    chip: &Chip,
+    selected: bool,
+    path: &[usize],
+    p: &ParamEdit,
+    env_choices: &[String],
+    acts: &mut Vec<Act>,
+) {
+    use crate::report::flow::ParamKind;
+    let tint = chip_colors(th, chip, selected);
+    let text_col = tint.text;
+    // A dropdown is taller than a label, and (like `combo_chip`) sets the row
+    // height itself; letting the shell grow as well would only inflate it.
+    let combo = matches!(p.kind, ParamKind::Env | ParamKind::Choice(_));
+    let mut picked: Option<String> = None;
+    let handle = chip_shell(ui, &tint, !combo, chip_corners(chip), |ui| {
+        // Every fixed word is a handle, as on a loop head: a parameter block
+        // must stay as easy to pick up as any other, and the boxes between the
+        // words must not start a drag.
+        let mut handle = ui.add(
+            egui::Label::new(
+                RichText::new(format!("PARAM {} {} =", p.keyword, p.name)).color(text_col),
+            )
+            .selectable(false)
+            .sense(egui::Sense::click_and_drag()),
+        );
+        match &p.kind {
+            // The environments actually loaded — the same list the run settings
+            // offer, and the only names a report can resolve (a `.vars` file is
+            // never auto-loaded by name).
+            ParamKind::Env => {
+                param_value_combo(ui, s, path, &p.value, env_choices, text_col, &mut picked);
+            }
+            ParamKind::Choice(options) => {
+                param_value_combo(ui, s, path, &p.value, options, text_col, &mut picked);
+            }
+            ParamKind::Folder | ParamKind::File => {
+                let folder = matches!(p.kind, ParamKind::Folder);
+                let id = ui.make_persistent_id(("pt_param_value", path));
+                if let Some(text) = inline_text_edit(
+                    ui,
+                    id,
+                    &p.value,
+                    s.gui_report_param_value_hint,
+                    s.chip_help_param_value,
+                    PARAM_VALUE_FIELD_WIDTH,
+                    FIELD_MAX_WIDTH,
+                ) && text != p.value
+                {
+                    acts.push(Act::SetParamDefault {
+                        path: path.to_vec(),
+                        text,
+                    });
+                }
+                let pick = ui
+                    .add(
+                        egui::Button::new(RichText::new(super::icons::FOLDER).color(text_col))
+                            .min_size(egui::vec2(PICKER_BUTTON_WIDTH, 0.0)),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(if folder {
+                        s.chip_help_loop_pick_folder
+                    } else {
+                        s.chip_help_loop_pick_file
+                    });
+                if pick.clicked() {
+                    acts.push(Act::PickParamDefault {
+                        path: path.to_vec(),
+                        folder,
+                    });
+                }
+            }
+            ParamKind::Text | ParamKind::Number => {
+                let id = ui.make_persistent_id(("pt_param_value", path));
+                if let Some(text) = inline_text_edit(
+                    ui,
+                    id,
+                    &p.value,
+                    s.gui_report_param_value_hint,
+                    s.chip_help_param_value,
+                    PARAM_VALUE_FIELD_WIDTH,
+                    FIELD_MAX_WIDTH,
+                ) && text != p.value
+                {
+                    acts.push(Act::SetParamDefault {
+                        path: path.to_vec(),
+                        text,
+                    });
+                }
+            }
+        }
+        if let Some(label) = &p.label {
+            handle |= ui.add(
+                egui::Label::new(RichText::new(format!("LABEL {label:?}")).color(text_col))
+                    .selectable(false)
+                    .sense(egui::Sense::click_and_drag()),
+            );
+        }
+        handle
+    });
+
+    if let Some(text) = picked
+        && text != p.value
+    {
+        acts.push(Act::SetParamDefault {
+            path: path.to_vec(),
+            text,
+        });
+    }
+    if handle.dragged() {
+        handle.dnd_set_drag_payload(chip_drag_payload(ui, chip, path));
+    }
+    if handle.double_clicked() {
+        acts.push(Act::OpenWizard(path.to_vec()));
+    } else if handle.clicked() {
+        acts.push(Act::Select(path.to_vec()));
+    }
+}
+
+/// The dropdown a `PARAM ENV` / `PARAM CHOICE` default is picked from. Empty is
+/// offered as a choice of its own: clearing the default is how a parameter is
+/// made required, and it must not need the text box the type doesn't have.
+fn param_value_combo(
+    ui: &mut egui::Ui,
+    s: &crate::i18n::Strings,
+    path: &[usize],
+    current: &str,
+    choices: &[String],
+    text_col: Color32,
+    picked: &mut Option<String>,
+) {
+    let shown = if current.is_empty() {
+        s.gui_report_param_value_hint
+    } else {
+        current
+    };
+    egui::ComboBox::from_id_salt((path, "pt_param_value"))
+        .selected_text(RichText::new(shown).color(text_col))
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(current.is_empty(), s.gui_report_param_no_default)
+                .clicked()
+            {
+                *picked = Some(String::new());
+            }
+            for c in choices {
+                if ui.selectable_label(c == current, c).clicked() {
+                    *picked = Some(c.clone());
+                }
+            }
+        });
 }
 
 /// The `PARALLEL` chip: a `PARALLEL` drag handle plus a small box for the
@@ -8484,6 +9291,29 @@ fn combo_chip(
     }
 }
 
+/// The auto-focused search box that heads a type-to-filter dropdown, and what
+/// is currently typed into it.
+///
+/// The query lives in egui temp memory under `id` so it survives the frames the
+/// menu is open for, and the box takes focus on the frame the menu opens
+/// (nothing else is focused yet) so the user can just start typing, like the
+/// terminal UI's picker. One function because every dropdown long enough to
+/// need filtering should filter the same way — the request picker and the
+/// collection picker both call this.
+fn filter_field(ui: &mut egui::Ui, s: &crate::i18n::Strings, id: egui::Id, width: f32) -> String {
+    let mut q = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_default();
+    let te = ui.add(
+        egui::TextEdit::singleline(&mut q)
+            .hint_text(s.gui_report_filter_hint)
+            .desired_width(width),
+    );
+    if q.is_empty() && ui.memory(|m| m.focused().is_none()) {
+        te.request_focus();
+    }
+    ui.data_mut(|d| d.insert_temp(id, q.clone()));
+    q
+}
+
 /// The filtered body of a request dropdown: an auto-focused search field at the
 /// top, then the choices narrowed (case-insensitively) by what's typed —
 /// mirroring the terminal UI's type-to-filter request picker. Sets `*picked`
@@ -8498,20 +9328,7 @@ fn filtered_choices(
     picked: &mut Option<String>,
 ) {
     let filt_id = ui.make_persistent_id(("pt_chip_filter", path, prefix));
-    let mut q = ui
-        .data(|d| d.get_temp::<String>(filt_id))
-        .unwrap_or_default();
-    let te = ui.add(
-        egui::TextEdit::singleline(&mut q)
-            .hint_text(s.gui_report_filter_hint)
-            .desired_width(200.0),
-    );
-    // Focus the filter the frame the dropdown opens (nothing else is focused
-    // yet) so the user can just start typing, like the TUI picker.
-    if q.is_empty() && ui.memory(|m| m.focused().is_none()) {
-        te.request_focus();
-    }
-    ui.data_mut(|d| d.insert_temp(filt_id, q.clone()));
+    let q = filter_field(ui, s, filt_id, 200.0);
     ui.separator();
     let needle = q.to_lowercase();
     egui::ScrollArea::vertical()
@@ -8869,6 +9686,15 @@ fn apply_block_actions(ed: &mut ReportEditor, app: &mut GuiApp, acts: Vec<Act>) 
             }
             Act::PickLoopDir { path, file } => {
                 pick_loop_dir(ed, app, &path, file);
+            }
+            Act::SetParamDefault { path, text } => {
+                ed.edit_flow(|flow| {
+                    edit::set_param_default(flow, &path, &text);
+                });
+                ed.selection = path;
+            }
+            Act::PickParamDefault { path, folder } => {
+                pick_param_default(ed, app, &path, folder);
             }
             Act::SetParallelDegree { path, degree } => {
                 ed.edit_flow(|flow| {
@@ -9905,6 +10731,78 @@ REPORT REQUEST x
         );
     }
 
+    /// A corpus path is longer than its box and every corpus under one tree
+    /// shares a prefix, so showing the front of it says nothing about which
+    /// folder is selected. The box shows the end instead — and a value that
+    /// already fits is left exactly as it is.
+    #[test]
+    fn a_run_setting_too_long_for_its_box_is_shown_from_the_end() {
+        // What the field actually paints for a value, which is not the value
+        // itself once it stops fitting.
+        fn painted(value: &str) -> String {
+            let ctx = egui::Context::default();
+            let mut text = value.to_string();
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                param_field(ui, "CORPUS", &mut text, "");
+            });
+            assert_eq!(text, value, "showing a value must never rewrite it");
+            out.shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        assert_eq!(
+            painted("/data"),
+            "/data",
+            "a value that fits is shown whole"
+        );
+
+        const LONG: &str = "/home/jonathan-hobern/Development/dfa_input_files/absolute/trimmed";
+        let shown = painted(LONG);
+        assert!(
+            shown.starts_with('\u{2026}'),
+            "a path too wide for the box loses its front, not its back: {shown:?}"
+        );
+        assert!(
+            LONG.ends_with(shown.trim_start_matches('\u{2026}')),
+            "and what is left is the tail of the real value: {shown:?}"
+        );
+        assert!(
+            shown.contains("trimmed"),
+            "which is the part that says which folder it is: {shown:?}"
+        );
+    }
+
+    /// The abbreviation is for reading only: the moment the box is being typed
+    /// in it holds the whole value, or an edit would silently save the ellipsis.
+    #[test]
+    fn a_run_setting_being_edited_holds_its_whole_value() {
+        const LONG: &str = "/home/jonathan-hobern/Development/dfa_input_files/absolute/trimmed";
+        let ctx = egui::Context::default();
+        let mut text = LONG.to_string();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let id = ui.make_persistent_id(("pt_run_param", "CORPUS"));
+            ui.memory_mut(|m| m.request_focus(id));
+            param_field(ui, "CORPUS", &mut text, "");
+        });
+        let painted: String = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            painted, LONG,
+            "a focused field lays out the real value, however far it overflows"
+        );
+    }
+
     /// A result still on screen after its answers have changed is the one case
     /// where the chip is not describing what is being looked at, so it says so
     /// — and a report that has never been run has not "changed".
@@ -10132,6 +11030,80 @@ REPORT REQUEST x
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every string painted in a frame, joined, so a test can say what the
+    /// dropdown showed.
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// The dropdown narrows as you type, the way every other long list in
+    /// PaperBoy does. A workspace of a few hundred collections is otherwise a
+    /// flat wall of names to scroll.
+    #[test]
+    fn the_collection_dropdown_narrows_as_you_type() {
+        let ctx = egui::Context::default();
+        GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = Strings::for_language(&Language::English);
+        let choices: Vec<CollectionChoice> = ["billing", "smoke", "billing-v2"]
+            .iter()
+            .map(|n| CollectionChoice {
+                value: format!("{n}.hurl"),
+                label: (*n).to_string(),
+                detail: format!("apis/{n}.hurl"),
+                in_workspace: true,
+            })
+            .collect();
+
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(400.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let draw = |ui: &mut egui::Ui| {
+            let (mut picked, mut browse) = (None, false);
+            collection_menu(ui, &th, &s, &choices, "", &mut picked, &mut browse);
+        };
+
+        // First frame: the box takes focus, everything is listed.
+        let out = ctx.run_ui(input.clone(), draw);
+        let shown = painted_text(&out.shapes);
+        assert!(shown.contains("smoke"), "unfiltered, everything is there");
+
+        // Then the user types — no click first, exactly as in the panel filters.
+        input.events.push(egui::Event::Text("bill".to_string()));
+        let _ = ctx.run_ui(input.clone(), draw);
+        input.events.clear();
+        let _ = ctx.run_ui(input.clone(), draw);
+        let out = ctx.run_ui(input, draw);
+        let shown = painted_text(&out.shapes);
+        assert!(
+            shown.contains("billing") && shown.contains("billing-v2"),
+            "the matches stay: {shown}"
+        );
+        assert!(
+            !shown.contains("smoke"),
+            "and everything else is gone: {shown}"
+        );
+        let _ = out;
     }
 
     /// A workspace has to survive being handed to someone else, so a report
@@ -11695,6 +12667,69 @@ REPORT REQUEST x
     }
 }
 
+/// A `PARAM` block's inline editor: the control offered for its default value
+/// is chosen from the parameter's declared type, exactly as the run settings do
+/// it — a `.trail` under version control keeps its defaults, and retyping an
+/// environment name by hand is where a silently wrong one comes from.
+#[cfg(test)]
+mod param_chip_tests {
+    use super::{ChipEdit, ParamEdit, node_chips};
+    use crate::gui::theme::GuiTheme;
+    use crate::i18n::{Language, Strings};
+    use crate::report::flow::ParamKind;
+
+    /// The `ParamEdit` the first node of `src` builds its chip from.
+    fn param_edit(src: &str) -> ParamEdit {
+        let flow = crate::report::parser::parse_flow(src).expect("the fixture flow parses");
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        node_chips(&flow.nodes[0], None, &th, &s)
+            .into_iter()
+            .find_map(|c| match c.edit {
+                ChipEdit::Param(p) => Some(p),
+                _ => None,
+            })
+            .expect("a PARAM renders a param chip")
+    }
+
+    #[test]
+    fn an_env_parameter_offers_its_environment_by_name() {
+        let p = param_edit("PARAM ENV TARGET = \"staging-au\" LABEL \"Environment\"\n");
+        assert!(matches!(p.kind, ParamKind::Env));
+        assert_eq!(p.name, "TARGET");
+        assert_eq!(p.value, "staging-au", "the default fills the dropdown");
+        assert_eq!(p.label.as_deref(), Some("Environment"));
+    }
+
+    /// A `FOLDER` parameter is a path, so the chip carries the picker rather
+    /// than only a box to type one into.
+    #[test]
+    fn a_folder_parameter_keeps_its_path_editable() {
+        let p = param_edit("PARAM FOLDER CORPUS = \"/data/faces\"\n");
+        assert!(matches!(p.kind, ParamKind::Folder));
+        assert_eq!(p.value, "/data/faces");
+    }
+
+    /// The declared options are part of the keyword, so the block says what the
+    /// parameter accepts even before its dropdown is opened.
+    #[test]
+    fn a_choice_parameter_shows_the_options_it_accepts() {
+        let p = param_edit("PARAM CHOICE(\"fast\", \"full\") MODE = \"fast\"\n");
+        assert_eq!(p.keyword, "CHOICE(fast, full)");
+        assert!(
+            matches!(&p.kind, ParamKind::Choice(o) if o == &["fast".to_string(), "full".to_string()])
+        );
+    }
+
+    /// A required parameter has no default; the control must still be there to
+    /// give it one, and must not invent a value of its own.
+    #[test]
+    fn a_required_parameter_starts_empty() {
+        let p = param_edit("PARAM TEXT TICKET\n");
+        assert!(p.value.is_empty());
+    }
+}
+
 /// The `FOR` loop head's inline editors: which parts of a loop the chip breaks
 /// out into boxes, and which it leaves as plain text for the wizard.
 #[cfg(test)]
@@ -12787,12 +13822,23 @@ mod toolbar_commit_tests {
         }
 
         let mut ed = app.report_editor.take().expect("editor");
+        // What `ui()` does behind the diagnostics fingerprint before drawing:
+        // the bound collection's requests are cached on the editor, not looked
+        // up per frame (they may have to be read from disk — see
+        // `context::bound_entries`).
+        let refresh = |ed: &mut ReportEditor, app: &GuiApp| {
+            ed.primary = ed.flow.as_ref().and_then(|f| {
+                context::bound_entries(&app.session.collections, f, ed.report.path.as_deref())
+            });
+        };
+        refresh(&mut ed, &app);
         let first = super::highlight_ctx(&mut ed, &app);
         assert!(
             first.request_names.contains("A"),
             "the bound collection's request is known: {:?}",
             first.request_names
         );
+        refresh(&mut ed, &app);
         let again = super::highlight_ctx(&mut ed, &app);
         assert!(
             std::rc::Rc::ptr_eq(&first, &again),
@@ -12801,6 +13847,7 @@ mod toolbar_commit_tests {
 
         // Renaming a request has to reach the colours.
         app.session.collections[0].entries[0].title = "B".into();
+        refresh(&mut ed, &app);
         let renamed = super::highlight_ctx(&mut ed, &app);
         assert!(
             !std::rc::Rc::ptr_eq(&first, &renamed),
@@ -12813,10 +13860,12 @@ mod toolbar_commit_tests {
         );
 
         // So does loading an environment, which the view underlines by name.
+        refresh(&mut ed, &app);
         let before_env = super::highlight_ctx(&mut ed, &app);
         app.session
             .global_envs
             .push(crate::environment::parse_vars("staging".into(), ""));
+        refresh(&mut ed, &app);
         let with_env = super::highlight_ctx(&mut ed, &app);
         assert!(
             !std::rc::Rc::ptr_eq(&before_env, &with_env),
@@ -12871,6 +13920,31 @@ mod toolbar_commit_tests {
         assert!(
             std::path::Path::new(&path).starts_with(&dir),
             "an unsaved report's results are offered in its base directory: {path}"
+        );
+    }
+
+    /// A request line with every modifier on it is wider than any pane, and the
+    /// chips do not wrap — so without a sideways scroll bar the tail of the line
+    /// was simply unreachable. The pane measures what its widest row took, which
+    /// is both what puts the bar there and what keeps the full-width bands
+    /// (hover highlights, drop strips) spanning the content instead of the
+    /// infinite width a two-axis scroll area hands out.
+    #[test]
+    fn a_line_too_wide_for_the_pane_can_be_scrolled_sideways() {
+        let long = "# collection: api\nREPORT REQUEST A AS AVeryLongAliasIndeed USING(multipart.document = \"{{FILE}}\", header.X-Correlation-Id = \"{{RUN}}\") SHOW(HttpStatus, Time, Asserts, Response)\n";
+        let mut app = app_with_report(long);
+        let ctx = egui::Context::default();
+        // Two passes: the width is measured on one and read back on the next.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input(), |ui| super::ui(&mut app, ui));
+        }
+        let measured = ctx
+            .data(|d| d.get_temp::<f32>(super::blocks_content_w_id()))
+            .expect("the blocks pane measures its content");
+        assert!(
+            measured > 1000.0,
+            "the line overruns the 1000px test window, which is what the \
+             horizontal bar exists for: {measured}"
         );
     }
 
@@ -12975,6 +14049,64 @@ mod toolbar_commit_tests {
             ed.report.text
         );
         assert!(ed.view == EditorView::Results, "and the button still acted");
+    }
+
+    /// The run-settings chip is the one elastic thing on the toolbar, so it has
+    /// to be laid out *after* the fixed-width buttons it shares the row with.
+    ///
+    /// Laid out before them it claimed every pixel the row had left, and the
+    /// buttons that follow it in the right-to-left group (Export, Save
+    /// baseline) were pushed past the pane's left edge — where they not only
+    /// couldn't be clicked but widened the enclosing `Ui` leftwards, so every
+    /// row of the view below (cards, filters, the grid, the detail pane) was
+    /// drawn hanging off the left of the pane and clipped mid-word.
+    #[test]
+    fn a_long_run_settings_line_never_pushes_the_toolbar_off_the_pane() {
+        let trail = format!(
+            "# name: Face\n# collection: api\nPARAM TEXT FILES_DIR = \"{}\"\nREPORT REQUEST A\n",
+            "/home/somebody/Development/inputs/absolute/trimmed/and/then/some/more"
+        );
+        let mut app = app_with_report(&trail);
+        app.report_editor.as_mut().expect("editor").view = EditorView::Results;
+
+        let ctx = egui::Context::default();
+        let mut painted_now = Vec::new();
+        // A few frames: the chip measures itself against the width the previous
+        // one left, so the overflow only settles after one round trip.
+        for _ in 0..3 {
+            let out = ctx.run_ui(input(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| super::ui(&mut app, ui));
+            });
+            painted_now = painted(&out.shapes);
+        }
+
+        let leftmost = painted_now
+            .iter()
+            .map(|(_, r)| r.left())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            leftmost >= 0.0,
+            "nothing is drawn off the left of the pane, but something starts at \
+             {leftmost}: {:?}",
+            painted_now
+                .iter()
+                .filter(|(_, r)| r.left() < 0.0)
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+        );
+        for label in [
+            app.strings.gui_report_export,
+            app.strings.gui_report_save_baseline,
+        ] {
+            assert!(
+                painted_now.iter().any(|(t, _)| t.contains(label)),
+                "{label:?} is still on the toolbar: {:?}",
+                painted_now
+                    .iter()
+                    .map(|(t, _)| t.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 
@@ -13158,10 +14290,48 @@ REPORT REQUEST x
             Some("FR-12")
         );
     }
+
+    /// Reading two reports side by side means opening one, then the other, then
+    /// the first again — and being dropped back on the results grid every time
+    /// meant re-picking Source on every visit. The tab a report was left on is
+    /// the tab it comes back on.
+    #[test]
+    fn a_report_comes_back_on_the_tab_it_was_left_on() {
+        let (_app, mut ed) = editor(TRAIL);
+        ed.result = Some(crate::gui::report_editor::stop_run_tests::result_with("x"));
+        ed.view = EditorView::Source;
+        let parked = ed.park_run();
+
+        let (_app2, mut fresh) = editor(TRAIL);
+        fresh.adopt_run(parked);
+        assert!(
+            fresh.view == EditorView::Source,
+            "the Source view the reader chose survives the round trip"
+        );
+    }
+
+    /// The other half of the same rule: a run that finished while the report was
+    /// put away still opens on its rows. The tab was picked before there was
+    /// anything in the grid, so it says nothing about wanting to avoid it.
+    #[test]
+    fn results_that_arrived_while_away_still_open_on_the_grid() {
+        let (_app, mut ed) = editor(TRAIL);
+        ed.view = EditorView::Blocks;
+        let mut parked = ed.park_run();
+        assert!(!parked.had_result, "nothing had run when it was put away");
+        parked.result = Some(crate::gui::report_editor::stop_run_tests::result_with("x"));
+
+        let (_app2, mut fresh) = editor(TRAIL);
+        fresh.adopt_run(parked);
+        assert!(
+            fresh.view == EditorView::Results,
+            "first sight of a finished run is still the grid"
+        );
+    }
 }
 
 #[cfg(test)]
-mod stop_run_tests {
+pub(crate) mod stop_run_tests {
     use super::*;
     use crate::gui::report_run::{RunUpdate, test_handle};
     use crate::report::Report;
@@ -13175,12 +14345,182 @@ mod stop_run_tests {
         (app, ed)
     }
 
-    fn result_with(cell: &str) -> ReportResult {
+    pub(crate) fn result_with(cell: &str) -> ReportResult {
         let mut res = ReportResult::default();
         let mut row = ReportRow::default();
         row.cells.insert("A".to_string(), cell.to_string());
         res.rows.push(row);
         res
+    }
+
+    /// Case-insensitively, and without overlapping: stepping through `aa` in
+    /// `aaaa` visits two places, not three, or "next match" crawls a character
+    /// at a time.
+    #[test]
+    fn the_find_box_matches_whole_occurrences_whatever_their_case() {
+        assert_eq!(
+            find_matches("REQUEST oauth2\nrequest x\n", "request"),
+            vec![0..7, 15..22]
+        );
+        assert_eq!(find_matches("aaaa", "aa"), vec![0..2, 2..4]);
+        assert_eq!(
+            find_matches("anything", ""),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+    }
+
+    /// A match lands *on* the syntax colouring rather than replacing it: the
+    /// section it falls inside is split, and the pieces either side keep the
+    /// colour they had.
+    #[test]
+    fn a_match_gains_a_background_without_losing_its_syntax_colour() {
+        use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
+        let keyword = egui::Color32::from_rgb(1, 2, 3);
+        let mut job = LayoutJob {
+            text: "REQUEST oauth2".to_string(),
+            sections: vec![LayoutSection {
+                leading_space: 0.0,
+                byte_range: ByteIndex(0)..ByteIndex(14),
+                format: TextFormat {
+                    color: keyword,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let on = egui::Color32::from_rgb(9, 9, 9);
+        overlay_find_matches(&mut job, &[8..13], 0, egui::Color32::RED, on);
+
+        let spans: Vec<_> = job
+            .sections
+            .iter()
+            .map(|s| {
+                (
+                    &job.text[s.byte_range.start.0..s.byte_range.end.0],
+                    s.format.color,
+                    s.format.background,
+                )
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("REQUEST ", keyword, egui::Color32::TRANSPARENT),
+                ("oauth", keyword, on),
+                ("2", keyword, egui::Color32::TRANSPARENT),
+            ],
+            "the match is a background on the same colour, not a repaint"
+        );
+    }
+
+    /// Ctrl+F opens the bar and Escape puts it away — and Escape only does that
+    /// while it is open, because it is also the script editor's way out of the
+    /// focus lock.
+    #[test]
+    fn ctrl_f_opens_the_find_bar_and_escape_closes_it() {
+        fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+            input.modifiers = modifiers;
+            input
+        }
+        let (app, mut ed) = editor();
+        ed.set_text("# collection: c\n\nREQUEST oauth2\n".to_string());
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run_ui(key(egui::Key::F, egui::Modifiers::COMMAND), |ui| {
+            source_view(&mut ed, &app, ui);
+        });
+        assert!(ed.source_find.is_some(), "Ctrl+F opens the bar");
+
+        let _ = ctx.run_ui(key(egui::Key::Escape, egui::Modifiers::NONE), |ui| {
+            source_view(&mut ed, &app, ui);
+        });
+        assert!(ed.source_find.is_none(), "Escape puts it away");
+    }
+
+    /// Stepping past the last match comes back to the first: a find that stops
+    /// dead at the bottom of the file makes you re-open the box to start again.
+    #[test]
+    fn stepping_past_the_last_match_wraps_to_the_first() {
+        let (app, mut ed) = editor();
+        ed.set_text("# collection: c\n\nREQUEST a\nREQUEST b\n".to_string());
+        ed.source_find = Some(SourceFind {
+            query: "REQUEST".to_string(),
+            current: 0,
+            focus: false,
+        });
+        let ctx = egui::Context::default();
+        let f3 = || {
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key: egui::Key::F3,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input
+        };
+
+        let step = |ctx: &egui::Context, ed: &mut ReportEditor| {
+            let _ = ctx.run_ui(f3(), |ui| source_view(ed, &app, ui));
+            ed.source_find.as_ref().expect("still open").current
+        };
+
+        assert_eq!(step(&ctx, &mut ed), 1, "F3 moves to the second match");
+        assert_eq!(
+            step(&ctx, &mut ed),
+            0,
+            "and past the last back to the first"
+        );
+    }
+
+    /// A run that fails at one step fails at it for every row, so this list is
+    /// routinely as long as the table. Laid out in full it pushed the grid off
+    /// the bottom of a pane that does not itself scroll, and the rows the
+    /// errors were about could not be reached at all: it is bounded now, and
+    /// scrolls inside itself.
+    #[test]
+    fn a_wall_of_errors_does_not_push_the_grid_off_the_screen() {
+        fn height_for(errors: usize) -> f32 {
+            let (mut app, mut ed) = editor();
+            let mut res = result_with("value");
+            res.column_order = vec!["A".to_string()];
+            res.errors = (0..errors)
+                .map(|i| format!("upload_liveness: File read access: clip {i}"))
+                .collect();
+            ed.result = Some(res);
+
+            // How far down the pane the first row's value lands: the grid is
+            // laid out below the errors, so an unbounded list pushes it off.
+            let ctx = egui::Context::default();
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                results_view(&mut ed, &mut app, ui);
+            });
+            out.shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text() == "value" => Some(t.pos.y),
+                    _ => None,
+                })
+                .next()
+                .expect("the row's value is drawn")
+        }
+
+        let few = height_for(3);
+        let many = height_for(60);
+        assert!(
+            many <= few + 200.0,
+            "the grid must stay near the top however long the list gets: \
+             three errors put it at {few}, sixty at {many}"
+        );
     }
 
     /// Stopping used to only raise the cancel flag and leave the handle in
@@ -13257,6 +14597,47 @@ mod stop_run_tests {
         assert!(
             flag.load(std::sync::atomic::Ordering::Relaxed),
             "dropping our end alone would not stop the worker: it watches the flag"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chip_spacing_tests {
+    use super::*;
+
+    fn a_frame() -> egui::RawInput {
+        let mut i = egui::RawInput::default();
+        i.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 400.0),
+        ));
+        i
+    }
+
+    /// A chip that anchors a tether is laid out with the row's inter-chip gap
+    /// zeroed so the pair reads as one segmented pill — but that spacing must
+    /// stop at the chip's border. It didn't, and the `AS` label of an alias
+    /// chip carrying a modifier ended up flush against its own text box.
+    #[test]
+    fn the_tether_gap_does_not_collapse_the_spacing_inside_a_chip() {
+        let ctx = egui::Context::default();
+        GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let mut gap = -1.0;
+        let _ = ctx.run_ui(a_frame(), |ui| {
+            let tint = chip_tint(&th, th.accent);
+            // Exactly what the row does before rendering a tether's anchor.
+            ui.spacing_mut().item_spacing.x = TETHER_GAP;
+            let (label, field) = chip_shell(ui, &tint, true, ROUND_CHIP, |ui| {
+                let label = ui.label("AS").rect;
+                let field = ui.label("Document").rect;
+                (label, field)
+            });
+            gap = field.left() - label.right();
+        });
+        assert!(
+            gap > 1.0,
+            "the label and the box beside it must not touch (gap {gap})"
         );
     }
 }

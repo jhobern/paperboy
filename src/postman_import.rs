@@ -1332,32 +1332,62 @@ mod tests {
 
     // -- pacer ------------------------------------------------------------
 
+    /// A `RateInfo` carrying just the two numbers the pacer reads.
+    fn budget(remaining: Option<u64>, reset_secs: Option<u64>) -> RateInfo {
+        RateInfo {
+            remaining,
+            reset_secs,
+            ..Default::default()
+        }
+    }
+
+    /// The pacer's rules, grouped: every case was the same two-line setup and a
+    /// single assertion about what the *next* `wait` costs, so they read far
+    /// better against each other than one `#[test]` apiece.
     #[test]
-    fn first_call_on_a_bucket_is_not_delayed() {
+    fn the_pacer_spaces_calls_per_bucket_and_follows_the_budget() {
         let clock = FakeClock::new();
+
+        // The first call on a bucket is never delayed; the second pays the
+        // bucket's interval.
         let mut p = Pacer::new();
         assert_eq!(p.wait(RateBucket::General, &clock), Duration::ZERO);
-    }
+        assert_eq!(p.wait(RateBucket::General, &clock), GENERAL_MIN_INTERVAL);
 
-    #[test]
-    fn second_call_waits_the_bucket_interval() {
-        let clock = FakeClock::new();
-        let mut p = Pacer::new();
-        p.wait(RateBucket::General, &clock);
-        let waited = p.wait(RateBucket::General, &clock);
-        assert_eq!(waited, GENERAL_MIN_INTERVAL);
-    }
-
-    #[test]
-    fn buckets_are_paced_independently() {
         // The whole point of two buckets: spending the slow one must not slow
         // the fast one down.
-        let clock = FakeClock::new();
         let mut p = Pacer::new();
         p.wait(RateBucket::Strict, &clock);
         assert_eq!(p.wait(RateBucket::General, &clock), Duration::ZERO);
-    }
 
+        // A healthy budget still never paces faster than the floor.
+        let mut p = Pacer::new();
+        p.observe(
+            RateBucket::General,
+            &budget(Some(300), Some(1)),
+            clock.now(),
+        );
+        p.wait(RateBucket::General, &clock);
+        assert_eq!(p.wait(RateBucket::General, &clock), GENERAL_MIN_INTERVAL);
+
+        // An exhausted budget waits for the window to reset.
+        let mut p = Pacer::new();
+        p.observe(RateBucket::General, &budget(Some(0), Some(7)), clock.now());
+        assert_eq!(p.wait(RateBucket::General, &clock), Duration::from_secs(7));
+
+        // Headers that don't carry both numbers say nothing, so the floor
+        // stands.
+        let mut p = Pacer::new();
+        p.observe(RateBucket::General, &budget(Some(1), None), clock.now());
+        p.wait(RateBucket::General, &clock);
+        assert_eq!(p.wait(RateBucket::General, &clock), GENERAL_MIN_INTERVAL);
+
+        // However long the server asks for, a wait is capped so the UI never
+        // looks frozen.
+        let mut p = Pacer::new();
+        let forever = p.back_off(RateBucket::General, Some(86_400), clock.now());
+        assert_eq!(forever, MAX_WAIT);
+    }
     #[test]
     fn strict_bucket_is_five_times_slower_than_general() {
         let clock = FakeClock::new();
@@ -1397,55 +1427,6 @@ mod tests {
     }
 
     #[test]
-    fn observing_a_healthy_budget_does_not_speed_past_the_floor() {
-        let clock = FakeClock::new();
-        let mut p = Pacer::new();
-        let info = RateInfo {
-            remaining: Some(300),
-            reset_secs: Some(1),
-            ..Default::default()
-        };
-        p.observe(RateBucket::General, &info, clock.now());
-        p.wait(RateBucket::General, &clock);
-        assert_eq!(p.wait(RateBucket::General, &clock), GENERAL_MIN_INTERVAL);
-    }
-
-    #[test]
-    fn an_exhausted_budget_waits_for_the_window_to_reset() {
-        let clock = FakeClock::new();
-        let mut p = Pacer::new();
-        let info = RateInfo {
-            remaining: Some(0),
-            reset_secs: Some(7),
-            ..Default::default()
-        };
-        p.observe(RateBucket::General, &info, clock.now());
-        assert_eq!(p.wait(RateBucket::General, &clock), Duration::from_secs(7));
-    }
-
-    #[test]
-    fn observe_ignores_incomplete_headers() {
-        let clock = FakeClock::new();
-        let mut p = Pacer::new();
-        let info = RateInfo {
-            remaining: Some(1),
-            reset_secs: None,
-            ..Default::default()
-        };
-        p.observe(RateBucket::General, &info, clock.now());
-        p.wait(RateBucket::General, &clock);
-        assert_eq!(p.wait(RateBucket::General, &clock), GENERAL_MIN_INTERVAL);
-    }
-
-    #[test]
-    fn a_wait_is_capped_so_the_ui_never_looks_frozen() {
-        let clock = FakeClock::new();
-        let mut p = Pacer::new();
-        let waited = p.back_off(RateBucket::General, Some(86_400), clock.now());
-        assert_eq!(waited, MAX_WAIT);
-    }
-
-    #[test]
     fn back_off_without_a_server_hint_still_pauses() {
         let clock = FakeClock::new();
         let mut p = Pacer::new();
@@ -1479,39 +1460,29 @@ mod tests {
         );
     }
 
+    /// What the pre-download estimate promises. Grouped: each case is one
+    /// assertion about the same `estimated_duration`.
     #[test]
-    fn the_estimate_counts_a_collection_as_dearer_than_an_environment() {
+    fn the_estimate_reflects_what_the_download_actually_costs() {
         // A 500-environment workspace and a 500-collection one are not the
         // same download, and quoting one figure for both is how "about 2
         // minutes" became a quarter of an hour.
         assert!(plan_of(10, 0).estimated_duration() > plan_of(0, 10).estimated_duration());
-    }
 
-    #[test]
-    fn the_estimate_allows_for_the_round_trip_not_just_the_pacing() {
         // Pacing is the floor, not the cost: an import that only counted the
         // interval between calls promised a time it could never hit.
         let plan = plan_of(60, 5);
         assert!(plan.estimated_duration() > GENERAL_MIN_INTERVAL * 65);
-    }
 
-    #[test]
-    fn an_empty_plan_estimates_nothing() {
         assert_eq!(plan_of(0, 0).estimated_duration(), Duration::ZERO);
+        assert!(!plan.strains_monthly_budget(), "silent without the header");
     }
-
     #[test]
     fn monthly_budget_warning_fires_when_the_import_is_a_big_share() {
         let mut plan = plan_of(60, 5);
         plan.remaining_month = Some(100);
         assert!(plan.strains_monthly_budget());
         plan.remaining_month = Some(100_000);
-        assert!(!plan.strains_monthly_budget());
-    }
-
-    #[test]
-    fn monthly_budget_warning_is_silent_without_the_header() {
-        let plan = plan_of(60, 5);
         assert!(!plan.strains_monthly_budget());
     }
 
@@ -2126,12 +2097,33 @@ mod tests {
 
     // -- workspace references ---------------------------------------------
 
+    /// What counts as a workspace reference. Grouped: the accepted forms all
+    /// normalise to the same id, and the rejected ones were already a table.
     #[test]
-    fn a_bare_workspace_id_is_taken_as_is() {
+    fn a_workspace_reference_is_parsed_or_rejected() {
         let id = "12ece9e1-2abf-4edc-8e34-de66e74114d2";
-        assert_eq!(parse_workspace_ref(id), Some(id.to_string()));
-    }
+        for (why, input) in [
+            ("a bare id is taken as is", id.to_string()),
+            (
+                "surrounding quotes and space are tolerated",
+                format!("  \"{id}\"  "),
+            ),
+            ("an uppercase id is normalised", id.to_uppercase()),
+        ] {
+            assert_eq!(parse_workspace_ref(&input), Some(id.to_string()), "{why}");
+        }
 
+        for bad in [
+            "",
+            "   ",
+            "My Workspace",
+            "https://go.postman.co/workspace/My-Team",
+            "12ece9e1-2abf-4edc-8e34",
+            "zzzzzzzz-2abf-4edc-8e34-de66e74114d2",
+        ] {
+            assert_eq!(parse_workspace_ref(bad), None, "should reject {bad:?}");
+        }
+    }
     #[test]
     fn a_pasted_workspace_url_yields_its_id() {
         // What a user actually has to hand is the address bar.
@@ -2146,37 +2138,6 @@ mod tests {
                 Some("12ece9e1-2abf-4edc-8e34-de66e74114d2".to_string()),
                 "failed on {url}"
             );
-        }
-    }
-
-    #[test]
-    fn surrounding_quotes_and_space_are_tolerated() {
-        let id = "12ece9e1-2abf-4edc-8e34-de66e74114d2";
-        assert_eq!(
-            parse_workspace_ref(&format!("  \"{id}\"  ")),
-            Some(id.to_string())
-        );
-    }
-
-    #[test]
-    fn an_uppercase_id_is_normalised() {
-        assert_eq!(
-            parse_workspace_ref("12ECE9E1-2ABF-4EDC-8E34-DE66E74114D2"),
-            Some("12ece9e1-2abf-4edc-8e34-de66e74114d2".to_string())
-        );
-    }
-
-    #[test]
-    fn something_that_is_not_a_workspace_reference_is_rejected() {
-        for bad in [
-            "",
-            "   ",
-            "My Workspace",
-            "https://go.postman.co/workspace/My-Team",
-            "12ece9e1-2abf-4edc-8e34",
-            "zzzzzzzz-2abf-4edc-8e34-de66e74114d2",
-        ] {
-            assert_eq!(parse_workspace_ref(bad), None, "should reject {bad:?}");
         }
     }
 

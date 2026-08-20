@@ -19,11 +19,143 @@
 
 use crate::i18n::Strings;
 use crate::report::flow::{
-    Binder, EnvClause, FlowNode, HeaderLine, ImageSpec, ParallelSpec, Pattern, Producer,
-    ReportFlow, ReportStmt, ResponseFmt, RoleRef, ShowField, WithItem,
+    Binder, EnvClause, FlowNode, HeaderLine, ImageSpec, OverrideTarget, ParallelSpec, Pattern,
+    Producer, ReportFlow, ReportStmt, ResponseFmt, RoleRef, ShowField, UsingItem, WithItem,
 };
 use crate::report::model::StatKind;
 use crate::report::parse_flow;
+
+// ---------------------------------------------------------------------------
+// The `USING(…)` requirement checklist
+// ---------------------------------------------------------------------------
+
+/// One row of a request node's `USING(…)` parameter checklist.
+pub struct ParamRow {
+    pub name: String,
+    /// Ticked ⇒ named in `USING(…)`: this call declares that it relies on the
+    /// request being steerable by that name.
+    pub required: bool,
+    /// The value the request declares as its default (`[Options] variable:
+    /// NAME=…`), shown beside the row so it is obvious what the request does
+    /// when nothing steers it. `None` means the clause requires a name the
+    /// request doesn't declare — a validation error, kept as a row so it can be
+    /// un-ticked where the error is seen rather than only in the source view.
+    pub default: Option<String>,
+}
+
+/// Build the checklist: one row per parameter the request declares, ticked when
+/// the clause requires it, followed by any requirement the request *doesn't*
+/// declare.
+///
+/// Both front-ends' request node forms show this, so it lives here rather than
+/// twice — the terminal UI draws it as a column of checkboxes and the GUI as an
+/// egui checklist, but which rows exist, and what they mean, is one decision.
+pub fn param_rows(declared: &[(String, String)], using: &[UsingItem]) -> Vec<ParamRow> {
+    let required = |name: &str| {
+        using
+            .iter()
+            .any(|i| matches!(i, UsingItem::Require(n) if n == name))
+    };
+    let mut rows: Vec<ParamRow> = declared
+        .iter()
+        .map(|(name, value)| ParamRow {
+            name: name.clone(),
+            required: required(name),
+            default: Some(value.clone()),
+        })
+        .collect();
+    for item in using {
+        if let UsingItem::Require(name) = item
+            && !rows.iter().any(|r| &r.name == name)
+        {
+            rows.push(ParamRow {
+                name: name.clone(),
+                required: true,
+                default: None,
+            });
+        }
+    }
+    rows
+}
+
+/// One per-call override of a `USING(…)` clause, as a node form edits it: two
+/// boxes of text rather than a parsed [`OverrideTarget`].
+///
+/// The target is kept as the user's text so a half-typed `multipart.` is a
+/// state the form can be *in*. Parsing happens on the way out
+/// ([`override_items`]), and [`override_target_valid`] is what the form paints
+/// red in the meantime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OverrideRow {
+    /// `url`, `body`, `multipart.document`, `header.X-Trace`, …
+    pub target: String,
+    pub value: String,
+}
+
+/// The editable rows for the overrides in `using`, in clause order.
+///
+/// Both front-ends' node forms build these, so which items count as overrides
+/// — everything that isn't a `Require` — is decided once.
+pub fn override_rows(using: &[UsingItem]) -> Vec<OverrideRow> {
+    using
+        .iter()
+        .filter_map(|i| match i {
+            UsingItem::Override { target, value } => Some(OverrideRow {
+                target: target.text(),
+                value: value.clone(),
+            }),
+            UsingItem::Require(_) => None,
+        })
+        .collect()
+}
+
+/// Whether a target box holds something [`OverrideTarget::parse`] accepts. An
+/// empty box is "not filled in yet" rather than wrong, so it reads as valid —
+/// the form shows an error for text that can never work, not for text that
+/// isn't finished.
+pub fn override_target_valid(target: &str) -> bool {
+    target.trim().is_empty() || OverrideTarget::parse(target.trim()).is_some()
+}
+
+/// The clause items for a form's override rows.
+///
+/// Rows with an unparseable or empty target are dropped: an override that names
+/// no part of the request has nothing to patch, and writing it out would
+/// produce a flow that doesn't parse. Front-ends must not let a row reach here
+/// in that state without having said so — see [`override_target_valid`].
+pub fn override_items(rows: &[OverrideRow]) -> Vec<UsingItem> {
+    rows.iter()
+        .filter_map(|r| {
+            OverrideTarget::parse(r.target.trim()).map(|target| UsingItem::Override {
+                target,
+                value: r.value.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The `USING(…)` clause for a checklist: the ticked parameters as
+/// requirements, then every item the checklist has no row for — the per-call
+/// overrides — verbatim.
+///
+/// This canonicalises the order, requirements first, which is the only thing
+/// about the clause a node form rewrites. A clause written the other way round
+/// in the source view means exactly the same thing, and grouping the
+/// requirements is what makes the checklist and the text agree on sight.
+pub fn using_items(params: &[ParamRow], carried: &[UsingItem]) -> Vec<UsingItem> {
+    let mut out: Vec<UsingItem> = params
+        .iter()
+        .filter(|p| p.required)
+        .map(|p| UsingItem::Require(p.name.clone()))
+        .collect();
+    out.extend(
+        carried
+            .iter()
+            .filter(|i| !matches!(i, UsingItem::Require(_)))
+            .cloned(),
+    );
+    out
+}
 
 // ---------------------------------------------------------------------------
 // The flattened, navigable outline
@@ -542,6 +674,7 @@ pub(crate) fn request_node(name: &str, report: bool) -> FlowNode {
         FlowNode::Report(ReportStmt::Request {
             name: name.to_string(),
             alias: None,
+            using: Vec::new(),
             response_fmt: None,
             show: Vec::new(),
             hide: Vec::new(),
@@ -550,6 +683,7 @@ pub(crate) fn request_node(name: &str, report: bool) -> FlowNode {
     } else {
         FlowNode::Request {
             name: name.to_string(),
+            using: Vec::new(),
         }
     }
 }
@@ -789,7 +923,8 @@ pub(crate) fn vars_in_scope(
         for node in nodes.iter().take(*index) {
             match node {
                 FlowNode::Assign { key, .. } => push(key, &mut out),
-                FlowNode::Request { name } | FlowNode::Report(ReportStmt::Request { name, .. }) => {
+                FlowNode::Request { name, .. }
+                | FlowNode::Report(ReportStmt::Request { name, .. }) => {
                     if let Some(entry) = crate::report::run::resolve_title(entries, name) {
                         for (cap, _) in &entry.captures {
                             push(cap, &mut out);
@@ -910,11 +1045,14 @@ pub(crate) fn attach_to_node(node: &mut FlowNode, m: Modifier) -> bool {
     }
     match m {
         Modifier::Report => {
-            if let FlowNode::Request { name } = node {
+            if let FlowNode::Request { name, using } = node {
                 let name = std::mem::take(name);
+                // See `CarriedMod::attach_to`: the clause belongs to the send.
+                let using = std::mem::take(using);
                 *node = FlowNode::Report(ReportStmt::Request {
                     name,
                     alias: None,
+                    using,
                     response_fmt: None,
                     show: Vec::new(),
                     hide: Vec::new(),
@@ -1063,7 +1201,7 @@ pub(crate) fn report_assignment(flow: &mut ReportFlow, path: &[usize]) -> Option
 /// Returns whether anything changed.
 pub(crate) fn set_request_name(flow: &mut ReportFlow, path: &[usize], name: &str) -> bool {
     match node_at_mut(flow, path) {
-        Some(FlowNode::Request { name: n })
+        Some(FlowNode::Request { name: n, .. })
         | Some(FlowNode::Report(ReportStmt::Request { name: n, .. })) => {
             *n = name.to_string();
             true
@@ -1249,6 +1387,40 @@ pub(crate) fn set_loop_dir(flow: &mut ReportFlow, path: &[usize], text: &str) ->
             }
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// The declared default of the `PARAM` at `path`, and the kind of control it
+/// asks for. `None` for any other node.
+pub(crate) fn param_decl(
+    flow: &ReportFlow,
+    path: &[usize],
+) -> Option<crate::report::flow::ParamDecl> {
+    match node_at(flow, path) {
+        Some(FlowNode::Param(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// Change the default value of the `PARAM` at `path` — what the block editor's
+/// dropdown / picker writes.
+///
+/// Blank clears it back to "required", which is meaningful: a parameter with no
+/// default is one the run settings open on, empty and flagged, rather than one
+/// that quietly runs with the last value someone happened to type. Returns
+/// whether anything changed.
+pub(crate) fn set_param_default(flow: &mut ReportFlow, path: &[usize], text: &str) -> bool {
+    let t = text.trim();
+    let new = (!t.is_empty()).then(|| t.to_string());
+    match node_at_mut(flow, path) {
+        Some(FlowNode::Param(p)) => {
+            if p.default == new {
+                return false;
+            }
+            p.default = new;
+            true
+        }
         _ => false,
     }
 }
@@ -1864,11 +2036,16 @@ impl CarriedMod {
         }
         match self {
             CarriedMod::Report => {
-                if let FlowNode::Request { name } = node {
+                if let FlowNode::Request { name, using } = node {
                     let name = std::mem::take(name);
+                    // `USING` describes the *send*, which survives the upgrade
+                    // to a reported one — dropping it here would silently
+                    // discard a required-parameter check.
+                    let using = std::mem::take(using);
                     *node = FlowNode::Report(ReportStmt::Request {
                         name,
                         alias: None,
+                        using,
                         response_fmt: None,
                         show: Vec::new(),
                         hide: Vec::new(),
@@ -1992,9 +2169,10 @@ fn detach_from_node(node: &mut FlowNode, which: DetachWhich) -> bool {
     match which {
         DetachWhich::Report => match node {
             // A reported request keeps sending: downgrade to a plain REQUEST.
-            FlowNode::Report(ReportStmt::Request { name, .. }) => {
+            FlowNode::Report(ReportStmt::Request { name, using, .. }) => {
                 let name = std::mem::take(name);
-                *node = FlowNode::Request { name };
+                let using = std::mem::take(using);
+                *node = FlowNode::Request { name, using };
                 false
             }
             // A reported variable/computed column has nothing left without
@@ -2233,6 +2411,38 @@ mod tests {
         // The loop head and its END share the same path; the body is deeper.
         assert_eq!(rows[2].path, rows[4].path);
         assert_eq!(rows[3].path, vec![1, 0]);
+    }
+
+    /// The block editor writes a parameter's default straight back into the
+    /// script, and clearing it makes the parameter required again rather than
+    /// leaving `= ""` behind — an empty default is a value, "no default" is not.
+    #[test]
+    fn a_parameters_default_can_be_set_and_cleared() {
+        let mut f = flow("PARAM ENV TARGET = \"staging\" LABEL \"Environment\"\n");
+
+        assert!(set_param_default(&mut f, &[0], "prod"));
+        assert!(
+            f.to_text().contains("PARAM ENV TARGET = \"prod\""),
+            "{}",
+            f.to_text()
+        );
+        assert!(
+            f.to_text().contains("LABEL \"Environment\""),
+            "the rest of the declaration is untouched: {}",
+            f.to_text()
+        );
+        assert!(
+            !set_param_default(&mut f, &[0], "prod"),
+            "setting the same value again is not an edit"
+        );
+
+        assert!(set_param_default(&mut f, &[0], "  "));
+        assert_eq!(param_decl(&f, &[0]).expect("still a PARAM").default, None);
+        assert!(
+            !f.to_text().contains('='),
+            "cleared, not emptied: {}",
+            f.to_text()
+        );
     }
 
     #[test]
@@ -3038,7 +3248,7 @@ REQUEST A
             .nodes
             .iter()
             .map(|n| match n {
-                FlowNode::Request { name } => name.clone(),
+                FlowNode::Request { name, .. } => name.clone(),
                 _ => String::new(),
             })
             .collect();
@@ -3059,7 +3269,7 @@ REQUEST A
         match &f.nodes[0] {
             FlowNode::ForEach { body, .. } => {
                 assert_eq!(body.len(), 2);
-                assert!(matches!(&body[0], FlowNode::Request { name } if name == "A"));
+                assert!(matches!(&body[0], FlowNode::Request { name, .. } if name == "A"));
             }
             other => panic!("expected the loop, got {other:?}"),
         }
@@ -3319,5 +3529,201 @@ mod repeatable_header_tests {
             f.header.get_all("collection"),
             vec!["./new.hurl", "./a.hurl AS a"]
         );
+    }
+
+    // ---- the USING(…) requirement checklist -----------------------------
+
+    fn ov(target: &str, value: &str) -> UsingItem {
+        UsingItem::Override {
+            target: crate::report::flow::OverrideTarget::parse(target).unwrap(),
+            value: value.into(),
+        }
+    }
+
+    fn decl(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    /// The override rows a node form edits are the clause's non-requirement
+    /// items, and they go back out unchanged — a round trip through the form
+    /// must not rewrite what the source view wrote.
+    #[test]
+    fn override_rows_round_trip_through_the_form() {
+        let using = vec![
+            UsingItem::Require("FILE".into()),
+            ov("multipart.document", "{{FILE}}"),
+            ov("header.X-Trace", "abc"),
+        ];
+        let rows = override_rows(&using);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.target.as_str(), r.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("multipart.document", "{{FILE}}"),
+                ("header.X-Trace", "abc")
+            ],
+            "the requirement is not an override"
+        );
+        assert_eq!(override_items(&rows), using[1..].to_vec());
+    }
+
+    /// A half-typed target is not yet wrong; one that can never name a part of
+    /// a request is, and the front-ends paint it so.
+    #[test]
+    fn a_target_is_wrong_only_once_it_cannot_work() {
+        assert!(
+            override_target_valid(""),
+            "an empty box isn't filled in yet"
+        );
+        assert!(override_target_valid("multipart.document"));
+        assert!(override_target_valid("url"));
+        assert!(!override_target_valid("multipart"), "a section needs a key");
+        assert!(!override_target_valid("nonsense.x"));
+    }
+
+    /// A row that names nothing is dropped rather than written out as a clause
+    /// that wouldn't parse.
+    #[test]
+    fn an_unusable_override_row_never_reaches_the_clause() {
+        let rows = vec![
+            OverrideRow {
+                target: "multipart.document".into(),
+                value: "{{FILE}}".into(),
+            },
+            OverrideRow::default(),
+            OverrideRow {
+                target: "nonsense.x".into(),
+                value: "v".into(),
+            },
+        ];
+        assert_eq!(
+            override_items(&rows),
+            vec![ov("multipart.document", "{{FILE}}")]
+        );
+    }
+
+    /// The whole clause a node form describes: ticked requirements first, then
+    /// the overrides it edited.
+    #[test]
+    fn a_form_builds_requirements_and_overrides_into_one_clause() {
+        let params = param_rows(
+            &decl(&[("FILE", "./s.pdf")]),
+            &[UsingItem::Require("FILE".into())],
+        );
+        let rows = vec![OverrideRow {
+            target: "header.X-Trace".into(),
+            value: "{{ID}}".into(),
+        }];
+        let out = using_items(&params, &override_items(&rows));
+        assert_eq!(
+            out.iter().map(UsingItem::text).collect::<Vec<_>>(),
+            vec!["FILE", "header.X-Trace = \"{{ID}}\""]
+        );
+    }
+
+    /// Every declared parameter gets a row, ticked only when the clause
+    /// requires it — the checklist is the request's parameters, not the
+    /// statement's, so an unused one is still offered.
+    #[test]
+    fn the_checklist_offers_every_declared_parameter_and_ticks_the_required_ones() {
+        let rows = param_rows(
+            &decl(&[("FILE", "./sample.pdf"), ("KIND", "invoice")]),
+            &[UsingItem::Require("FILE".into())],
+        );
+        let seen: Vec<(&str, bool, Option<&str>)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.required, r.default.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("FILE", true, Some("./sample.pdf")),
+                ("KIND", false, Some("invoice")),
+            ]
+        );
+    }
+
+    /// A requirement the request doesn't declare is the validation error the
+    /// feature exists to raise. It still gets a row — with no default, which is
+    /// how the form shows it as wrong — so it can be un-ticked where it is seen.
+    #[test]
+    fn a_requirement_the_request_does_not_declare_is_kept_as_an_undeclared_row() {
+        let rows = param_rows(
+            &decl(&[("FILE", "./x")]),
+            &[UsingItem::Require("NOPE".into())],
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].name, "NOPE");
+        assert!(rows[1].required);
+        assert!(
+            rows[1].default.is_none(),
+            "no default is what marks the row as undeclared"
+        );
+    }
+
+    /// Overrides have no row, so rebuilding the clause from the checklist must
+    /// carry them through untouched — the exact way the form could otherwise
+    /// silently delete what the source view wrote.
+    #[test]
+    fn rebuilding_the_clause_preserves_the_overrides_the_checklist_has_no_row_for() {
+        let carried = vec![
+            UsingItem::Require("FILE".into()),
+            ov("multipart.document", "{{FILE}}"),
+            ov("header.X-Run", "{{RUN}}"),
+        ];
+        let rows = param_rows(&decl(&[("FILE", "./x")]), &carried);
+        let out = using_items(&rows, &carried);
+        assert_eq!(
+            out.iter().map(UsingItem::text).collect::<Vec<_>>(),
+            vec![
+                "FILE".to_string(),
+                "multipart.document = \"{{FILE}}\"".to_string(),
+                "header.X-Run = \"{{RUN}}\"".to_string(),
+            ]
+        );
+    }
+
+    /// Un-ticking drops only that requirement, and ticking adds one — the
+    /// overrides are untouched either way.
+    #[test]
+    fn ticking_and_unticking_only_moves_requirements() {
+        let carried = vec![UsingItem::Require("FILE".into()), ov("header.X-Run", "1")];
+        let mut rows = param_rows(&decl(&[("FILE", "./x"), ("KIND", "invoice")]), &carried);
+        rows[0].required = false;
+        rows[1].required = true;
+        assert_eq!(
+            using_items(&rows, &carried)
+                .iter()
+                .map(UsingItem::text)
+                .collect::<Vec<_>>(),
+            vec!["KIND".to_string(), "header.X-Run = \"1\"".to_string()]
+        );
+    }
+
+    /// Requirements are grouped first even when the source wrote them last, so
+    /// the checklist and the text read the same way round.
+    #[test]
+    fn rebuilding_groups_the_requirements_before_the_overrides() {
+        let carried = vec![ov("header.X-Run", "1"), UsingItem::Require("FILE".into())];
+        let rows = param_rows(&decl(&[("FILE", "./x")]), &carried);
+        assert_eq!(
+            using_items(&rows, &carried)
+                .iter()
+                .map(UsingItem::text)
+                .collect::<Vec<_>>(),
+            vec!["FILE".to_string(), "header.X-Run = \"1\"".to_string()]
+        );
+    }
+
+    /// A request that declares nothing and a clause that requires nothing give
+    /// no rows at all — both front-ends hide the whole section on that.
+    #[test]
+    fn an_ordinary_request_has_no_checklist() {
+        assert!(param_rows(&[], &[]).is_empty());
+        assert!(param_rows(&[], &[ov("url", "http://x")]).is_empty());
     }
 }

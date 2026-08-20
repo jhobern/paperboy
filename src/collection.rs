@@ -10,36 +10,75 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::git_remote::GitOrigin;
-use crate::hurl::{HurlEntry, collection_to_hurl};
+use crate::hurl::{HurlEntry, RunStatus, collection_to_hurl};
 use crate::tree::{self, Row};
 
-/// The label shown for a request row in the workspace tree: the leaf segment of
-/// its folder-encoded title (e.g. `Auth/Login` → `Login`, since the `Auth`
-/// folder is already its own tree row), falling back to the URL when the
-/// request is untitled.
-/// The cached headline of one request in a collection that isn't loaded: what
-/// it is called and what it does. The method is cached with the name because a
-/// list of bare names makes the reader open a file to find out which row is the
-/// POST — the one thing the badge exists to save them.
+/// The cached headline of one request in a collection that isn't loaded: its
+/// **full** title (folder segments included, so the workspace tree can nest it
+/// — see [`WsRow::RequestFolder`]) and what it does.
+///
+/// The method is cached with the name because a list of bare names makes the
+/// reader open a file to find out which row is the POST — the one thing the
+/// badge exists to save them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsTitle {
+    /// The request's whole title, e.g. `"Auth/Tokens/Refresh"`. Empty for an
+    /// untitled request, which is displayed as its `url` instead.
     pub name: String,
+    /// What to show when the request has no title. Kept apart from `name`
+    /// rather than substituted into it because a URL is full of `/` and the
+    /// tree reads `/` as folder nesting — an untitled `GET https://x/a/b` must
+    /// be one row, not an `https:` folder holding an `x` folder.
+    pub url: String,
     pub method: String,
+}
+
+/// What a run left behind on one request: its pass/fail marker and the
+/// response it came back with.
+///
+/// A Workspace tab holds one file's requests at a time, and a file with no
+/// unsaved edits is re-read from disk when it is opened again — so a run's
+/// result lived exactly as long as the tab stayed on that collection. Running
+/// a request, looking at another folder and coming back lost both the tick and
+/// the response, which is precisely the moment someone wants to compare them.
+/// Results are parked here instead, per file, and handed back when the file
+/// returns; the tree also reads them so a file that isn't loaded still shows
+/// what happened to its requests this session.
+///
+/// Runtime-only, like [`Collection::workspace_pending`]: a response is a
+/// point-in-time answer from a server, not a fact about the collection, and
+/// has no business surviving a restart (or being written to disk, where the
+/// headers it carries would outlive the session that earned them).
+#[derive(Debug, Clone, Default)]
+pub struct RunRecord {
+    /// Identifies the request the result belongs to, so a file edited outside
+    /// PaperBoy between the run and the reopen can't hand a stale response to
+    /// whatever request now sits at that position.
+    key: String,
+    last_run: RunStatus,
+    last_response: Option<crate::http::ApiResponse>,
+}
+
+/// How a request is recognised across a reload: what it is and where it goes.
+fn run_key(entry: &HurlEntry) -> String {
+    format!("{}\u{1}{}\u{1}{}", entry.title, entry.method, entry.url)
 }
 
 fn ws_request_title(entry: &HurlEntry) -> WsTitle {
     WsTitle {
-        name: ws_request_label(entry),
+        name: entry.title.clone(),
+        url: entry.url.clone(),
         method: entry.method.clone(),
     }
 }
 
-fn ws_request_label(entry: &HurlEntry) -> String {
-    let leaf = crate::tree::entry_path(&entry.title)
-        .pop()
-        .unwrap_or_default();
+/// The name shown on a request's row: the last segment of its title, since the
+/// segments before it are drawn as the folder rows above it. An untitled
+/// request shows `url` instead — it still has to be findable in the tree.
+fn ws_leaf_label(title: &str, url: &str) -> String {
+    let leaf = crate::tree::entry_path(title).pop().unwrap_or_default();
     if leaf.is_empty() {
-        entry.url.clone()
+        url.to_string()
     } else {
         leaf
     }
@@ -61,14 +100,18 @@ fn read_collection_labels(path: &Path) -> Vec<WsTitle> {
 }
 
 /// One row in the Workspace tab's file-tree request list (see
-/// [`Collection::ws_rows`]). Unlike [`Row`], which navigates the *virtual*
-/// folders encoded in request titles inside one file, this navigates the real
-/// filesystem under the workspace root and inlines expanded collections'
-/// requests directly beneath their file rows (an accordion).
+/// [`Collection::ws_rows`]). This navigates the real filesystem under the
+/// workspace root and inlines expanded collections' requests directly beneath
+/// their file rows (an accordion) — and, within a file, the *virtual* folders
+/// encoded in request titles (see [`crate::tree`]), so an imported Postman
+/// collection keeps the folder structure it was written with instead of
+/// collapsing into one long list of leaf names.
 ///
 /// The tree is a real expand/collapse tree: `workspace_expanded` (on
-/// [`Collection`]) holds the set of open folders *and* open collection files;
-/// visibility is derived depth-first from that set.
+/// [`Collection`]) holds the set of open folders *and* open collection files
+/// *and* open virtual request folders; visibility is derived depth-first from
+/// that set. Unlike [`Row`], which shows one virtual folder at a time with an
+/// `Up` row, this shows the whole nesting inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsRow {
     /// A folder in the workspace tree.  `expanded` is true when the folder is
@@ -103,8 +146,27 @@ pub enum WsRow {
         name: String,
         depth: usize,
     },
-    /// A request shown indented under its [`WsRow::Collection`] row; `depth` is
-    /// the collection's depth + 1. `collection` is the owning file's path and
+    /// A *virtual* folder inside a collection file: the leading path segments
+    /// of its requests' titles (`"Auth/Login"` → an `Auth` folder holding
+    /// `Login`). It has no file of its own, so `path` is a synthetic key —
+    /// the collection file's path with the folder's segments pushed onto it
+    /// (see [`request_folder_path`]). That key can't collide with a real
+    /// entry, because the collection is a *file* and so has no children on
+    /// disk, which lets these rows share `workspace_expanded` (and its
+    /// persistence, and the move/rename repointing) with real folders.
+    RequestFolder {
+        /// The collection file whose requests this folder groups.
+        collection: PathBuf,
+        /// Synthetic expand/collapse key; see above.
+        path: PathBuf,
+        /// The folder's own name — the one title segment, not the whole path.
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    /// A request shown indented under its [`WsRow::Collection`] row, or under
+    /// the [`WsRow::RequestFolder`] rows its title nests it in; `depth` is the
+    /// containing row's depth + 1. `collection` is the owning file's path and
     /// `idx` the request's position within it. When `loaded` is true the file
     /// is the tab's currently-loaded collection, so `idx` indexes `entries` and
     /// the row renders in full detail; when false the row is drawn from the
@@ -113,6 +175,9 @@ pub enum WsRow {
     Request {
         collection: PathBuf,
         idx: usize,
+        /// The request's *leaf* name: any folder segments of its title are
+        /// shown as the [`WsRow::RequestFolder`] rows above it, not repeated
+        /// here.
         name: String,
         /// The request's HTTP method, known for every listed request whether or
         /// not its file is the loaded one.
@@ -128,16 +193,55 @@ impl WsRow {
     ///
     /// Lets callers that only care *where* a row is (revealing a just-created
     /// file, deciding which folder a new one goes in) avoid re-matching all
-    /// five variants each time.
+    /// six variants each time. A [`WsRow::RequestFolder`] answers with its
+    /// synthetic key rather than its collection, because the callers that ask
+    /// are the ones toggling `workspace_expanded`.
     pub fn path(&self) -> &Path {
         match self {
             WsRow::Folder { path, .. }
             | WsRow::Collection { path, .. }
             | WsRow::Report { path, .. }
-            | WsRow::Environment { path, .. } => path,
+            | WsRow::Environment { path, .. }
+            | WsRow::RequestFolder { path, .. } => path,
             WsRow::Request { collection, .. } => collection,
         }
     }
+
+    /// How far the row is indented in the tree.
+    pub fn depth(&self) -> usize {
+        match self {
+            WsRow::Folder { depth, .. }
+            | WsRow::Collection { depth, .. }
+            | WsRow::Report { depth, .. }
+            | WsRow::Environment { depth, .. }
+            | WsRow::RequestFolder { depth, .. }
+            | WsRow::Request { depth, .. } => *depth,
+        }
+    }
+}
+
+/// The synthetic `workspace_expanded` key for the virtual folder `folder`
+/// (title segments) inside the collection file at `collection` — see
+/// [`WsRow::RequestFolder`].
+///
+/// Segments are sanitised before being pushed: a request titled `"../x/y"` (or
+/// one with a `\` on Windows) would otherwise produce a key pointing outside
+/// the collection, which both collides with real paths and survives into
+/// persisted state. The sanitised form only ever has to be *consistent*, never
+/// reversible — nothing reads a folder name back out of one of these keys.
+pub fn request_folder_path(collection: &Path, folder: &[String]) -> PathBuf {
+    let mut path = collection.to_path_buf();
+    for seg in folder {
+        let safe: String = seg
+            .chars()
+            .map(|c| if std::path::is_separator(c) { '_' } else { c })
+            .collect();
+        path.push(match safe.trim_matches('.') {
+            "" => "_",
+            _ => safe.as_str(),
+        });
+    }
+    path
 }
 
 /// How long a workspace tree scan is reused before the disk is read again.
@@ -293,6 +397,11 @@ pub struct Collection {
     /// Runtime-only. A workspace tab's entries are never a trusted snapshot
     /// across a restart (see [`crate::persistence`]), so neither are these.
     pub workspace_pending: HashMap<PathBuf, Vec<HurlEntry>>,
+
+    /// Run results for this Workspace tab's files, keyed by file and indexed
+    /// the way [`Self::workspace_titles`] is — see [`RunRecord`] for why they
+    /// outlive the file being loaded, and why they are runtime-only.
+    pub workspace_runs: HashMap<PathBuf, Vec<RunRecord>>,
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -342,6 +451,7 @@ impl Collection {
             workspace_titles: HashMap::new(),
             workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
+            workspace_runs: HashMap::new(),
         };
         c.sync_folder_to_selected();
         c
@@ -555,42 +665,96 @@ impl Collection {
     /// The request rows shown under an expanded collection at `path`, indented
     /// to `depth`. For the currently-loaded file the rows come straight from
     /// `entries` (full detail, `loaded: true`); for any other expanded
-    /// collection they come from the cached titles in `workspace_titles`
-    /// (`loaded: false`), so several collections' requests can be listed at once
-    /// without re-parsing every file each frame. A collection with no cached
-    /// names yet contributes no rows.
+    /// The request rows shown under an expanded collection at `path`, indented
+    /// to `depth`, nested into the virtual folders their titles encode. For the
+    /// currently-loaded file the rows come straight from `entries` (full detail,
+    /// `loaded: true`); for any other expanded collection they come from the
+    /// cached titles in `workspace_titles` (`loaded: false`), so several
+    /// collections' requests can be listed at once without re-parsing every file
+    /// each frame. A collection with no cached names yet contributes no rows.
     fn request_rows_for(&self, path: &Path, depth: usize) -> Vec<WsRow> {
-        if self.path.as_deref() == Some(path) {
+        // (index in the file, full title, url, method) for every request to
+        // list, in file order — the one shape both sources reduce to.
+        let listing: Vec<(usize, String, String, String)> = if self.path.as_deref() == Some(path) {
             self.entries
                 .iter()
                 .enumerate()
-                .map(|(idx, e)| WsRow::Request {
-                    collection: path.to_path_buf(),
-                    idx,
-                    name: ws_request_label(e),
-                    method: e.method.clone(),
-                    depth,
-                    loaded: true,
-                })
+                .map(|(idx, e)| (idx, e.title.clone(), e.url.clone(), e.method.clone()))
                 .collect()
         } else {
-            self.workspace_titles
-                .get(path)
-                .map(|titles| {
-                    titles
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, t)| WsRow::Request {
-                            collection: path.to_path_buf(),
-                            idx,
-                            name: t.name.clone(),
-                            method: t.method.clone(),
-                            depth,
-                            loaded: false,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            match self.workspace_titles.get(path) {
+                Some(titles) => titles
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, t)| (idx, t.name.clone(), t.url.clone(), t.method.clone()))
+                    .collect(),
+                None => return Vec::new(),
+            }
+        };
+        let loaded = self.path.as_deref() == Some(path);
+        let mut out = Vec::new();
+        self.push_request_rows(path, &listing, &[], depth, loaded, &mut out);
+        out
+    }
+
+    /// Append the rows for the virtual folder `folder` of the collection at
+    /// `path`: its direct subfolders (each recursed into when expanded), then
+    /// its direct requests.
+    ///
+    /// Folders come before requests, and both keep the order the file puts them
+    /// in rather than being sorted — a collection is an ordered script (the
+    /// login that captures a token has to read as coming first), so re-ordering
+    /// it for display would misrepresent what running it does.
+    fn push_request_rows(
+        &self,
+        path: &Path,
+        listing: &[(usize, String, String, String)],
+        folder: &[String],
+        depth: usize,
+        loaded: bool,
+        out: &mut Vec<WsRow>,
+    ) {
+        let mut seen: Vec<String> = Vec::new();
+        let mut leaves: Vec<&(usize, String, String, String)> = Vec::new();
+
+        for item in listing {
+            let segs = tree::entry_path(&item.1);
+            if segs.len() <= folder.len() || segs[..folder.len()] != *folder {
+                continue;
+            }
+            if segs.len() == folder.len() + 1 {
+                leaves.push(item);
+            } else if !seen.contains(&segs[folder.len()]) {
+                seen.push(segs[folder.len()].clone());
+            }
+        }
+
+        for name in seen {
+            let mut child = folder.to_vec();
+            child.push(name.clone());
+            let key = request_folder_path(path, &child);
+            let expanded = self.workspace_expanded.contains(&key);
+            out.push(WsRow::RequestFolder {
+                collection: path.to_path_buf(),
+                path: key,
+                name,
+                depth,
+                expanded,
+            });
+            if expanded {
+                self.push_request_rows(path, listing, &child, depth + 1, loaded, out);
+            }
+        }
+
+        for (idx, title, url, method) in leaves {
+            out.push(WsRow::Request {
+                collection: path.to_path_buf(),
+                idx: *idx,
+                name: ws_leaf_label(title, url),
+                method: method.clone(),
+                depth,
+                loaded,
+            });
         }
     }
 
@@ -623,8 +787,10 @@ impl Collection {
         };
         self.workspace_pending.remove(&path);
         self.park_pending_edits();
+        self.park_run_results();
         self.snapshot_loaded_titles();
         self.entries = entries;
+        self.restore_run_results(&path);
         self.selected_entry = 0;
         self.path = Some(path);
         self.invalidate_request_json();
@@ -645,6 +811,89 @@ impl Collection {
         if let Some(path) = self.path.clone() {
             self.workspace_pending.insert(path, self.entries.clone());
         }
+    }
+
+    /// Park the loaded file's run results so they survive a switch to another
+    /// file in the same Workspace tab (see [`RunRecord`]).
+    ///
+    /// Unlike [`Self::park_pending_edits`] this runs whether or not the file
+    /// has been edited: an unedited file is re-read from disk when it comes
+    /// back, and a fresh parse has never been run.
+    fn park_run_results(&mut self) {
+        if self.workspace_root.is_none() {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let records: Vec<RunRecord> = self
+            .entries
+            .iter()
+            .map(|e| RunRecord {
+                key: run_key(e),
+                last_run: e.last_run,
+                last_response: e.last_response.clone(),
+            })
+            .collect();
+        // Nothing has been run: don't hold a row of empty records that would
+        // only have to be checked later.
+        if records
+            .iter()
+            .all(|r| r.last_run == RunStatus::NotRun && r.last_response.is_none())
+        {
+            self.workspace_runs.remove(&path);
+        } else {
+            self.workspace_runs.insert(path, records);
+        }
+    }
+
+    /// Put previously parked run results back onto the entries just loaded
+    /// from `path`, by position and only where the request still matches (see
+    /// [`RunRecord::key`]). An entry that already carries a result keeps it:
+    /// entries handed back from `workspace_pending` were never re-read, so
+    /// theirs is the live one.
+    fn restore_run_results(&mut self, path: &Path) {
+        let Some(records) = self.workspace_runs.get(path) else {
+            return;
+        };
+        for (entry, record) in self.entries.iter_mut().zip(records.iter()) {
+            if entry.last_run != RunStatus::NotRun || entry.last_response.is_some() {
+                continue;
+            }
+            if run_key(entry) == record.key {
+                entry.last_run = record.last_run;
+                entry.last_response = record.last_response.clone();
+            }
+        }
+    }
+
+    /// The run marker to show for request `idx` of the workspace file at
+    /// `path`, whether or not that file is the one this tab has loaded.
+    ///
+    /// The tree used to draw markers for the loaded collection only, on the
+    /// grounds that nothing else could have been run — which stopped being
+    /// true the moment results outlived the file being loaded.
+    pub fn workspace_run_status(&self, path: &Path, idx: usize) -> RunStatus {
+        if self.path.as_deref() == Some(path) {
+            return self
+                .entries
+                .get(idx)
+                .map(|e| e.last_run)
+                .unwrap_or(RunStatus::NotRun);
+        }
+        // A file with parked *edits* keeps its entries whole, results included;
+        // only a file that will be re-read needs the parked records.
+        if let Some(parked) = self.workspace_pending.get(path) {
+            return parked
+                .get(idx)
+                .map(|e| e.last_run)
+                .unwrap_or(RunStatus::NotRun);
+        }
+        self.workspace_runs
+            .get(path)
+            .and_then(|r| r.get(idx))
+            .map(|r| r.last_run)
+            .unwrap_or(RunStatus::NotRun)
     }
 
     /// `true` when this collection holds requests that have been added or
@@ -766,7 +1015,12 @@ impl Collection {
         self.workspace_pending.remove(path);
         if self.path.as_deref() == Some(path) {
             let sel = self.selected_entry;
+            // Reverting throws away *edits*, not the record of what happened
+            // when these requests were last run — so the results are parked
+            // across the reload like they are across a file switch.
+            self.park_run_results();
             self.entries = entries;
+            self.restore_run_results(path);
             self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
             self.invalidate_request_json();
             self.sync_folder_to_selected();
@@ -890,6 +1144,13 @@ impl Collection {
         if !self.is_workspace() {
             return;
         }
+        // A request nested in a virtual folder is hidden until that folder is
+        // open, and this is the one call that says "put the cursor on the
+        // selected request" — so it has to make it reachable first, or the
+        // cursor would silently fall back to the file row every time a nested
+        // request was selected from outside the tree (loading a file, saving
+        // the wizard, renaming).
+        self.expand_selected_request_folders();
         let rows = self.ws_rows();
         let sel = self.selected_entry;
         let loaded = self.path.clone();
@@ -907,6 +1168,29 @@ impl Collection {
             })
             .unwrap_or(0);
         self.list_cursor = target.min(rows.len().saturating_sub(1));
+    }
+
+    /// Open every virtual folder containing the loaded file's `selected_entry`,
+    /// so its row is visible in the workspace tree. A no-op when the selected
+    /// request sits at the top level of its file (the common case), so this
+    /// doesn't fight a user who has deliberately folded things away.
+    fn expand_selected_request_folders(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Some(title) = self
+            .entries
+            .get(self.selected_entry)
+            .map(|e| e.title.clone())
+        else {
+            return;
+        };
+        let segs = tree::entry_path(&title);
+        // The last segment is the request itself, not a folder.
+        for n in 1..segs.len() {
+            self.workspace_expanded
+                .insert(request_folder_path(&path, &segs[..n]));
+        }
     }
 
     /// Re-derive `folder`/`list_cursor` so the Requests list is browsing (and
@@ -1237,5 +1521,234 @@ mod revert_tests {
         assert_eq!(col.entries[0].url, "https://edited.example");
         assert!(col.has_unsaved_edits());
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// The workspace tree's *virtual* folders: the ones encoded in request titles
+/// inside a single collection file, as opposed to real directories.
+#[cfg(test)]
+mod request_folder_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_reqfold_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A collection whose requests carry folder-encoded titles, the way a
+    /// Postman import writes them.
+    fn nested_collection(root: &Path) -> (Collection, PathBuf) {
+        let path = root.join("api.hurl");
+        fs::write(
+            &path,
+            "# Auth/Login\nGET https://example.com/login\n\n\
+             # Auth/Tokens/Refresh\nPOST https://example.com/refresh\n\n\
+             # Health\nGET https://example.com/health\n",
+        )
+        .unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.to_path_buf());
+        col.load_workspace_file(path.clone()).unwrap();
+        (col, path)
+    }
+
+    /// What the tree shows, as `(indent, label)` pairs, ignoring row kind.
+    fn shape(col: &Collection) -> Vec<(usize, String)> {
+        col.ws_rows()
+            .into_iter()
+            .map(|r| match r {
+                WsRow::Folder { name, depth, .. }
+                | WsRow::Collection { name, depth, .. }
+                | WsRow::Report { name, depth, .. }
+                | WsRow::Environment { name, depth, .. }
+                | WsRow::RequestFolder { name, depth, .. }
+                | WsRow::Request { name, depth, .. } => (depth, name),
+            })
+            .collect()
+    }
+
+    /// The bug this whole feature exists for: a Postman import names its
+    /// requests `folder/request`, and the workspace tree used to drop
+    /// everything but the leaf — so a hundred requests from twenty folders
+    /// arrived as one flat, ambiguous list with several rows called `Login`.
+    #[test]
+    fn titles_with_slashes_nest_instead_of_flattening_into_one_list() {
+        let root = tmp_root("nest");
+        let (col, _) = nested_collection(&root);
+
+        assert_eq!(
+            shape(&col),
+            vec![
+                (0, "api.hurl".to_string()),
+                // Folders come before the file's own top-level requests, and
+                // `Auth` is open because the selected request (the first one)
+                // lives in it — see `expand_selected_request_folders`.
+                (1, "Auth".to_string()),
+                (2, "Tokens".to_string()),
+                (2, "Login".to_string()),
+                (1, "Health".to_string()),
+            ],
+            "each title segment is a row of its own"
+        );
+        assert!(
+            !shape(&col).iter().any(|(_, n)| n.contains('/')),
+            "no row still carries a raw `folder/request` name"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A folder the selection isn't in stays shut: revealing the selected
+    /// request must not amount to expanding the whole file.
+    #[test]
+    fn folders_the_selection_is_not_in_start_closed() {
+        let root = tmp_root("closed");
+        let (col, _) = nested_collection(&root);
+
+        assert!(
+            !shape(&col).iter().any(|(_, n)| n == "Refresh"),
+            "Auth/Tokens is closed, so the request inside it isn't listed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Opening a folder reveals its direct children only — its own subfolder
+    /// stays closed until asked for, exactly like a directory.
+    #[test]
+    fn opening_a_virtual_folder_reveals_one_level_at_a_time() {
+        let root = tmp_root("open");
+        let (mut col, path) = nested_collection(&root);
+
+        col.workspace_expanded
+            .insert(request_folder_path(&path, &["Auth".to_string()]));
+        assert_eq!(
+            shape(&col),
+            vec![
+                (0, "api.hurl".to_string()),
+                (1, "Auth".to_string()),
+                (2, "Tokens".to_string()),
+                (2, "Login".to_string()),
+                (1, "Health".to_string()),
+            ],
+            "Auth's own folder and request, indented under it"
+        );
+
+        col.workspace_expanded.insert(request_folder_path(
+            &path,
+            &["Auth".to_string(), "Tokens".to_string()],
+        ));
+        assert_eq!(
+            shape(&col),
+            vec![
+                (0, "api.hurl".to_string()),
+                (1, "Auth".to_string()),
+                (2, "Tokens".to_string()),
+                (3, "Refresh".to_string()),
+                (2, "Login".to_string()),
+                (1, "Health".to_string()),
+            ],
+            "the nested folder opens independently"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A request row keeps the index of its request in the *file*, however
+    /// deeply the tree nests it — that index is what selecting and running the
+    /// row acts on, so nesting must not renumber anything.
+    #[test]
+    fn nesting_does_not_disturb_the_request_indices() {
+        let root = tmp_root("idx");
+        let (mut col, path) = nested_collection(&root);
+        col.workspace_expanded
+            .insert(request_folder_path(&path, &["Auth".to_string()]));
+        col.workspace_expanded.insert(request_folder_path(
+            &path,
+            &["Auth".to_string(), "Tokens".to_string()],
+        ));
+
+        let found: Vec<(usize, String)> = col
+            .ws_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                WsRow::Request { idx, name, .. } => Some((idx, name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (1, "Refresh".to_string()),
+                (0, "Login".to_string()),
+                (2, "Health".to_string()),
+            ],
+            "the file's own order is what the indices mean"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An untitled request falls back to showing its URL — which is full of
+    /// `/`. That fallback is a *label*, not a path, so it must not be split
+    /// into an `https:` folder holding an `example.com` folder.
+    #[test]
+    fn an_untitled_requests_url_is_never_read_as_folders() {
+        let root = tmp_root("untitled");
+        let path = root.join("bare.hurl");
+        fs::write(&path, "GET https://example.com/a/b/c\n").unwrap();
+        let mut col = Collection::new("ws".into(), Vec::new());
+        col.workspace_root = Some(root.clone());
+        col.load_workspace_file(path).unwrap();
+
+        assert_eq!(
+            shape(&col),
+            vec![
+                (0, "bare.hurl".to_string()),
+                (1, "https://example.com/a/b/c".to_string()),
+            ],
+            "one row, showing the whole URL"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Selecting a request from outside the tree (loading a file, saving the
+    /// wizard, renaming) has to make its row reachable, or the cursor would
+    /// land somewhere else entirely because the row was folded away.
+    #[test]
+    fn selecting_a_nested_request_opens_the_folders_hiding_it() {
+        let root = tmp_root("reveal");
+        let (mut col, _) = nested_collection(&root);
+
+        col.selected_entry = 1; // Auth/Tokens/Refresh
+        col.sync_ws_cursor();
+
+        let rows = col.ws_rows();
+        let cursor = rows.get(col.list_cursor);
+        assert!(
+            matches!(cursor, Some(WsRow::Request { idx: 1, .. })),
+            "the cursor is on the selected request, not on a fallback row: {cursor:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The expand/collapse key is a path, and a title is free text: `..` or a
+    /// separator in a request name must not produce a key that climbs out of
+    /// the collection it belongs to (and then gets persisted).
+    #[test]
+    fn a_folder_key_cannot_escape_its_collection() {
+        let collection = Path::new("/ws/api.hurl");
+        let key = request_folder_path(
+            collection,
+            &["..".to_string(), "a/b".to_string(), ".".to_string()],
+        );
+        assert!(
+            key.starts_with(collection),
+            "every key stays under its collection: {key:?}"
+        );
+        assert!(
+            !key.components().any(|c| c.as_os_str() == ".."),
+            "and never contains a parent hop: {key:?}"
+        );
     }
 }

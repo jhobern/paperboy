@@ -1633,7 +1633,22 @@ impl TuiApp {
             self.status = Some(Status::WaitingSecrets(blocking));
             return;
         }
-        self.status = None;
+        // Undefined variables are reported but never block: sending a literal
+        // `{{ tokn }}` is valid Hurl, and refusing to run would be a worse
+        // answer than running and saying why it failed. The editor already
+        // paints them red; this is the same finding said out loud, for a user
+        // who pressed F5 without looking at the body.
+        // A raw body plus form fields is refused rather than reported: Hurl
+        // would send the body and silently drop every field, so the request
+        // "succeeds" having sent the wrong thing (see
+        // `HurlEntry::body_form_conflict`).
+        let conflicts = request::body_form_conflicts(&self.collections[col_idx]);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return;
+        }
+        let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1677,7 +1692,16 @@ impl TuiApp {
             self.status = Some(Status::WaitingSecrets(blocking));
             return;
         }
-        self.status = None;
+        // Reported, not blocking — see `run_entry`. Checked across every entry
+        // rather than only the selected one, to match the guard above it.
+        // Refused, not reported — see the single-request run.
+        let conflicts = request::body_form_conflicts_all(col);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return;
+        }
+        let undefined = request::undefined_request_keys_all(col, env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1698,8 +1722,10 @@ impl TuiApp {
             // Streaming Run All doesn't carry Hurl's automatic cookie jar
             // between requests — warn about it in the status bar (batch mode
             // is unaffected). Overwritten by the pass/fail summary once the
-            // run finishes.
-            if !self.run_all_batch_mode {
+            // run finishes. Never overwrites an undefined-variable report,
+            // though: that one names a request that is about to fail, where
+            // this is a note about how the run is chained.
+            if !self.run_all_batch_mode && self.status.is_none() {
                 self.status = Some(Status::RunAllStreamingCookies);
             }
             self.pending_batch_runs.push(rx);
@@ -3320,6 +3346,17 @@ impl TuiApp {
         let (mut env, pending) = parse_vars_pending(name, content);
         env.path = path;
         env.git_origin = git_origin;
+        // Opening a file that is already loaded is a reload, not a clash: the
+        // four-way prompt below asks which of two environments to keep, and
+        // when there is only one of them none of its answers is the answer.
+        if let Some(existing) = self.global_envs.iter().find(|e| {
+            crate::environment::is_same_source(e, env.path.as_deref(), env.git_origin.as_ref())
+        }) {
+            let existing_id = existing.id;
+            self.replace_environment_in_place(existing_id, env, pending);
+            self.status = Some(Status::Loaded);
+            return Some(existing_id);
+        }
         if let Some(existing) = self.global_envs.iter().find(|e| e.name == env.name) {
             let existing_id = existing.id;
             self.overlay = Some(Overlay::EnvCollision(Box::new(EnvCollision {
@@ -3654,6 +3691,35 @@ impl TuiApp {
     /// Apply the user's choice on an [`Overlay::EnvCollision`] popup,
     /// resolving the name clash between a freshly-loaded environment and one
     /// already in `global_envs`.
+    /// Swap freshly-loaded vars into the environment with `existing_id`, keeping
+    /// that entry's id, path and git origin so collection links and "Save
+    /// Environment" keep working. Shared by the collision popup's "Replace
+    /// existing" and by re-opening a file that is already loaded.
+    pub(crate) fn replace_environment_in_place(
+        &mut self,
+        existing_id: u64,
+        new_env: Environment,
+        pending: Vec<PendingSecret>,
+    ) {
+        let Some(idx) = self.global_envs.iter().position(|e| e.id == existing_id) else {
+            return;
+        };
+        let existing = &self.global_envs[idx];
+        let mut env = new_env;
+        env.id = existing.id;
+        env.path = existing.path.clone();
+        env.git_origin = existing.git_origin.clone();
+        self.global_envs[idx] = env;
+        if !pending.is_empty() {
+            self.pending_env
+                .push(spawn_resolution(existing_id, pending));
+        }
+        for col in &mut self.collections {
+            col.invalidate_request_json();
+        }
+        self.save_state();
+    }
+
     pub(crate) fn resolve_env_collision(&mut self, collision: EnvCollision) {
         let EnvCollision {
             new_env,
@@ -3665,24 +3731,7 @@ impl TuiApp {
             // Replace existing: keep the existing entry's id/path/git_origin
             // (so links and "Save Environment" keep working) but swap in the
             // freshly-loaded vars.
-            0 => {
-                if let Some(idx) = self.global_envs.iter().position(|e| e.id == existing_id) {
-                    let existing = &self.global_envs[idx];
-                    let mut env = new_env;
-                    env.id = existing.id;
-                    env.path = existing.path.clone();
-                    env.git_origin = existing.git_origin.clone();
-                    self.global_envs[idx] = env;
-                    if !pending.is_empty() {
-                        self.pending_env
-                            .push(spawn_resolution(existing_id, pending));
-                    }
-                    for col in &mut self.collections {
-                        col.invalidate_request_json();
-                    }
-                    self.save_state();
-                }
-            }
+            0 => self.replace_environment_in_place(existing_id, new_env, pending),
             // Keep both: add the new environment as a separate entry with
             // its own (already-fresh) id, duplicate name and all.
             1 => {
@@ -3877,16 +3926,57 @@ impl TuiApp {
                     _ => {}
                 }
             }
-            PostmanStage::Confirm => match key.code {
-                KeyCode::Esc => {
-                    w.flow.cancel();
+            PostmanStage::Confirm => {
+                // An open preview owns the keys: it is a list being read, and
+                // the screen underneath is only waiting.
+                if w.flow.preview().is_some() {
+                    match key.code {
+                        // Enter closes rather than imports. Starting a long
+                        // download from a screen that is showing something
+                        // else — and not the estimate — is not a thing to do
+                        // on one keystroke.
+                        KeyCode::Esc | KeyCode::Enter => {
+                            w.flow.close_preview();
+                            w.preview_scroll = 0;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            w.preview_scroll = w.preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            w.preview_scroll = w.preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            w.preview_scroll = w.preview_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp => {
+                            w.preview_scroll = w.preview_scroll.saturating_sub(10);
+                        }
+                        KeyCode::Home => w.preview_scroll = 0,
+                        _ => {}
+                    }
+                    self.overlay = Some(Overlay::PostmanImport(w));
                     return;
                 }
-                KeyCode::Enter => {
-                    w.flow.confirm();
+                match key.code {
+                    KeyCode::Esc => {
+                        w.flow.cancel();
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        w.flow.confirm();
+                    }
+                    KeyCode::Down => w.flow.move_preview_sel(1),
+                    KeyCode::Up => w.flow.move_preview_sel(-1),
+                    // Reading one collection costs a single API call, so it is
+                    // asked for explicitly rather than happening on arrival.
+                    KeyCode::Char('p') => {
+                        w.preview_scroll = 0;
+                        let strings = Strings::for_language(&self.language);
+                        w.flow.preview_selected(&strings);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             PostmanStage::Downloading => {
                 if key.code == KeyCode::Esc {
                     w.flow.cancel();

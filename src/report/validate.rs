@@ -18,7 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::flow::{
-    EnvClause, FlowNode, ParamKind, Pattern, Producer, ReportFlow, ReportStmt, RoleRef, ShowField,
+    EnvClause, FlowNode, OverrideTarget, ParamKind, Pattern, Producer, ReportFlow, ReportStmt,
+    RoleRef, ShowField, UsingItem,
 };
 use crate::i18n::{Strings, fill};
 
@@ -498,7 +499,10 @@ fn walk(
                     .unwrap()
                     .insert(name.clone(), producer.clone());
             }
-            FlowNode::Request { name } => check_request_name(name, ctx, diags),
+            FlowNode::Request { name, using } => {
+                check_request_name(name, ctx, diags);
+                check_using(name, using, ctx, diags);
+            }
             FlowNode::Report(stmt) => check_report(stmt, ctx, diags),
             FlowNode::ForEach {
                 pattern,
@@ -525,6 +529,7 @@ fn walk(
 fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     if let ReportStmt::Request {
         name,
+        using,
         show,
         hide,
         with,
@@ -532,9 +537,121 @@ fn check_report(stmt: &ReportStmt, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     } = stmt
     {
         check_request_name(name, ctx, diags);
+        check_using(name, using, ctx, diags);
         check_show_hide_overlap(show, hide, ctx.strings, diags);
         check_show_fields(name, show, with, ctx, diags);
         check_hide_fields(name, hide, with, ctx, diags);
+    }
+}
+
+/// Check a `USING(…)` clause against the request it names.
+///
+/// This is the check the clause exists for. A flow binds a request's parameters
+/// just by having them in scope, which reads well but means a flow copied onto
+/// a collection whose `upload_document` was never parameterised still *runs* —
+/// sending the request's own hardcoded value and reporting a healthy `200`.
+/// `USING(FILE)` states the requirement, and this turns a mismatch into an
+/// error the moment the report is opened, quoting what the request does
+/// declare so the fix is obvious.
+///
+/// Every check is skipped when the request can't be resolved (its name is
+/// already being reported) or the collection isn't bound — validation never
+/// invents a complaint out of what it can't see.
+fn check_using(name: &str, using: &[UsingItem], ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let Some(entries) = ctx.request_entries else {
+        return;
+    };
+    let Some(entry) = super::run::resolve_qualified(entries, ctx.helpers, name) else {
+        return;
+    };
+    let s = ctx.strings;
+
+    for item in using {
+        match item {
+            UsingItem::Require(param) => {
+                if entry.declares_variable(param) {
+                    continue;
+                }
+                let declared = entry.variable_defaults();
+                let declared = if declared.is_empty() {
+                    s.diag_using_none.to_string()
+                } else {
+                    declared
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                diags.push(Diagnostic::error(fill(
+                    s.diag_using_undeclared,
+                    &[name, param, &declared, param],
+                )));
+            }
+            // Only the payload-shaped targets are checked. A `header`/`query`/
+            // `cookie`/`option` override upserts by design (adding a header the
+            // request never had is a normal thing to want), so there is nothing
+            // to be wrong about; a `form`/`multipart` field that doesn't exist
+            // is a typo that would otherwise send a subtly wrong body.
+            UsingItem::Override { target, .. } => match target {
+                OverrideTarget::Form(k) | OverrideTarget::Multipart(k) => {
+                    if entry.form_fields.iter().any(|f| &f.key == k) {
+                        continue;
+                    }
+                    let known: Vec<&str> =
+                        entry.form_fields.iter().map(|f| f.key.as_str()).collect();
+                    let known = if known.is_empty() {
+                        s.diag_using_no_fields.to_string()
+                    } else {
+                        fill(s.diag_using_has_fields, &[&known.join(", ")])
+                    };
+                    let section = match target {
+                        OverrideTarget::Form(_) => "form",
+                        _ => "multipart",
+                    };
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_using_no_such_field,
+                        &[name, section, k, &known],
+                    )));
+                }
+                // Hurl builds a body and a form onto the same libcurl handle,
+                // so the pair is unsendable — see `BODY_FORM_CONFLICT_ERROR`.
+                // Overriding the body of a form request creates exactly that
+                // pair, silently, which is worth catching here rather than at
+                // the send.
+                OverrideTarget::Body if entry.form_fields.iter().any(|f| f.enabled) => {
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_using_body_form_conflict,
+                        &[name],
+                    )));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    // The nudge: a request that declares parameters is meant to be driven, and
+    // a statement that drives one without saying so is the copy-paste hazard
+    // this feature is about. A warning rather than an error — the flow is
+    // correct *here*, it just won't complain when it stops being.
+    let required: Vec<&str> = using
+        .iter()
+        .filter_map(|i| match i {
+            UsingItem::Require(p) => Some(p.as_str()),
+            _ => None,
+        })
+        .collect();
+    if required.is_empty() {
+        let declared: Vec<String> = entry
+            .variable_defaults()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        if !declared.is_empty() {
+            diags.push(Diagnostic::warning(fill(
+                s.diag_using_parameter_not_required,
+                &[name, &declared.join(", ")],
+            )));
+        }
     }
 }
 
@@ -1094,8 +1211,18 @@ fn warn_if_vars_undefined(
     // Alphabetical is also simply the more useful order to read them in.
     let mut refs: Vec<&String> = refs.iter().collect();
     refs.sort();
+    // A name the request declares in its own `[Options]` can never be unset:
+    // the declared value is a default, and the whole point of a request
+    // parameter is that the request still works when nobody binds it. Warning
+    // about those made a properly parameterised collection noisier than an
+    // unparameterised one, which is exactly backwards.
+    let declared: HashSet<String> = entry
+        .variable_defaults()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
     for var in refs {
-        if !defined.contains(var.as_str()) {
+        if !defined.contains(var.as_str()) && !declared.contains(var.as_str()) {
             diags.push(Diagnostic::warning(fill(
                 ctx.strings.diag_var_maybe_undefined,
                 &[name, &format!("{{{{{var}}}}}")],
@@ -1148,7 +1275,7 @@ fn check_var_availability(
             FlowNode::ListDecl { .. } => {}
             // A bare REQUEST (no report output) — check its vars, then thread
             // its captures forward.
-            FlowNode::Request { name } => {
+            FlowNode::Request { name, .. } => {
                 warn_if_vars_undefined(name, ctx, defined, diags);
                 add_entry_captures(name, ctx, defined);
             }
@@ -1219,6 +1346,150 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    /// Validate a flow against real entries — needed for anything that checks a
+    /// request's own shape (its declared parameters, its form fields).
+    fn diags_with_entries(src: &str, entries: &[crate::hurl::HurlEntry]) -> Vec<Diagnostic> {
+        let flow = parse_flow(src).expect("test source should parse");
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_entries: Some(entries),
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+    }
+
+    /// A request declaring the parameter, for the `USING` checks.
+    fn upload_entry(declares: &[&str], fields: &[&str]) -> crate::hurl::HurlEntry {
+        crate::hurl::HurlEntry {
+            title: "upload".into(),
+            method: "POST".into(),
+            url: "http://x".into(),
+            options: declares
+                .iter()
+                .map(|n| crate::hurl::KvRow::new("variable", format!("{n}=./sample.pdf")))
+                .collect(),
+            form_fields: fields
+                .iter()
+                .map(|k| crate::hurl::FormField {
+                    key: (*k).to_string(),
+                    enabled: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of the clause: the same flow text that works against a
+    /// parameterised collection fails *loudly* against one that isn't, instead
+    /// of silently sending the request's own hardcoded value.
+    #[test]
+    fn a_required_parameter_the_request_does_not_declare_is_an_error() {
+        let src = "# collection: c\n\nREQUEST upload USING(FILE)\n";
+
+        let ok = diags_with_entries(src, &[upload_entry(&["FILE"], &[])]);
+        assert!(
+            !ok.iter().any(|d| d.severity == Severity::Error),
+            "declared: {ok:?}"
+        );
+
+        let bad = diags_with_entries(src, &[upload_entry(&[], &[])]);
+        let msg = bad
+            .iter()
+            .find(|d| d.severity == Severity::Error)
+            .map(|d| d.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("does not declare a parameter 'FILE'") && msg.contains("declares: none"),
+            "the error names the fix: {bad:?}"
+        );
+    }
+
+    /// The nudge that moves people onto the clause: a request built to be
+    /// driven, driven without saying so, is the copy-paste hazard. A warning,
+    /// not an error — the flow is correct here, it just won't stay correct.
+    #[test]
+    fn driving_a_parameterised_request_without_using_is_a_warning() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREPORT REQUEST upload\n",
+            &[upload_entry(&["FILE"], &[])],
+        );
+
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("USING")),
+            "{diags:?}"
+        );
+    }
+
+    /// A request that declares nothing is not nagged — the warning only fires
+    /// where there is something to require.
+    #[test]
+    fn an_ordinary_request_is_not_nudged() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST upload\n",
+            &[upload_entry(&[], &[])],
+        );
+
+        assert!(
+            !diags.iter().any(|d| d.message.contains("USING")),
+            "{diags:?}"
+        );
+    }
+
+    /// A mistyped `multipart` field is caught before the run: applied, it would
+    /// invent a field and send a body the request's author never designed.
+    #[test]
+    fn an_override_of_a_field_the_request_lacks_is_an_error() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST upload USING(multipart.fil = \"x\")\n",
+            &[upload_entry(&[], &["file"])],
+        );
+
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("no multipart field 'fil'")
+                && d.message.contains("it has: file")),
+            "{diags:?}"
+        );
+    }
+
+    /// Adding a header the request never had is normal and unremarkable, so an
+    /// upserting target is never flagged.
+    #[test]
+    fn an_override_of_an_absent_header_is_fine() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST upload USING(header.X-Run = \"7\")\n",
+            &[upload_entry(&[], &["file"])],
+        );
+
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    /// Overriding the body of a form request would produce the one shape Hurl
+    /// cannot send (body + form on the same handle), so it is caught here
+    /// rather than at the send.
+    #[test]
+    fn overriding_the_body_of_a_form_request_is_an_error() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST upload USING(body = \"{}\")\n",
+            &[upload_entry(&[], &["file"])],
+        );
+
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error
+                    && d.message.contains("cannot be sent together")),
+            "{diags:?}"
+        );
     }
 
     /// The clause that motivated parameters in the first place: which two
@@ -1560,53 +1831,34 @@ mod tests {
         assert!(warns.is_empty(), "unbound flow shouldn't warn: {warns:?}");
     }
 
+    /// The header-directive diagnostics, grouped: each line is one "this source
+    /// does / does not raise that message" case, which is all these families
+    /// ever were. Grouped rather than one test apiece so the cases can be read
+    /// against each other; a failure names the source and the message it wanted.
     #[test]
-    fn missing_collection_is_an_error() {
+    fn collection_and_output_header_diagnostics() {
+        let t = titles();
+        // No collection at all, and a directive present but empty, are the same
+        // error: nothing to resolve request names against.
         assert!(has_err(
             "REQUEST Oauth\n",
             None,
             None,
             "No collection chosen"
         ));
-    }
+        let empty_directive = "# collection:\nREQUEST Oauth\n";
+        assert!(has_err(empty_directive, None, None, "No collection chosen"));
 
-    #[test]
-    fn empty_collection_directive_is_an_error() {
-        assert!(has_err(
-            "# collection:\nREQUEST Oauth\n",
-            None,
-            None,
-            "No collection chosen"
-        ));
+        let docx = "# collection: ./c.hurl\n# output: docx\nREQUEST Oauth\n";
+        assert!(has_err(docx, Some(&t), None, "unsupported output format"));
+        let csv = "# collection: ./c.hurl\n# output: csv\nREQUEST Oauth\n";
+        assert!(!has_err(csv, Some(&t), None, "unsupported"));
     }
-
     #[test]
     fn valid_header_with_bound_collection_has_no_errors() {
         let t = titles();
         let errs = errors("# collection: ./c.hurl\nREQUEST Oauth\n", Some(&t), None);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
-    }
-
-    #[test]
-    fn unsupported_output_format_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\n# output: docx\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "unsupported output format"
-        ));
-    }
-
-    #[test]
-    fn csv_output_is_accepted() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# output: csv\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "unsupported"
-        ));
     }
 
     #[test]
@@ -1667,54 +1919,31 @@ mod tests {
         );
     }
 
+    /// The `# environment:` directive's diagnostics, grouped.
     #[test]
-    fn environment_header_naming_an_unloaded_env_is_an_error() {
+    fn environment_header_diagnostics() {
         let t = titles();
-        let envs = ["au".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            Some(&envs),
-            "environment 'staging' is not loaded"
-        ));
-    }
+        let named_staging = "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n";
+        let only_au = ["au".to_string()];
+        let au_and_staging = ["au".to_string(), "staging".to_string()];
 
-    #[test]
-    fn environment_header_naming_a_loaded_env_is_accepted() {
-        let t = titles();
-        let envs = ["au".to_string(), "staging".to_string()];
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            Some(&envs),
-            "is not loaded"
-        ));
-    }
+        let unloaded = "environment 'staging' is not loaded";
+        assert!(has_err(named_staging, Some(&t), Some(&only_au), unloaded));
+        let loaded = Some(&au_and_staging[..]);
+        assert!(!has_err(named_staging, Some(&t), loaded, "is not loaded"));
 
-    #[test]
-    fn empty_environment_header_is_an_error() {
-        let t = titles();
+        let empty = "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n";
         assert!(has_err(
-            "# collection: ./c.hurl\n# environment:\nREQUEST Oauth\n",
+            empty,
             Some(&t),
             None,
             "environment setting is empty"
         ));
-    }
 
-    #[test]
-    fn environment_header_is_not_checked_until_envs_are_known() {
         // With no loaded-env context, a named environment can't be verified —
         // it must not spuriously error (mirrors how ENVS names are skipped).
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\n# environment: staging\nREQUEST Oauth\n",
-            Some(&t),
-            None,
-            "is not loaded"
-        ));
+        assert!(!has_err(named_staging, Some(&t), None, "is not loaded"));
     }
-
     #[test]
     fn unbound_collection_warns_but_does_not_error_on_names() {
         let diags = diags_for("# collection: ./c.hurl\nREQUEST Whatever\n", None, None);
@@ -1726,75 +1955,55 @@ mod tests {
         assert!(!diags.iter().any(|d| d.message.contains("not found")));
     }
 
+    /// How a `REQUEST` name is matched against the bound collection's titles.
     #[test]
-    fn request_name_resolves_by_exact_full_title() {
+    fn request_name_resolution_diagnostics() {
         let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nREQUEST upload/process_file\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
+        let full = "# collection: ./c.hurl\nREQUEST upload/process_file\n";
+        assert!(!has_err(full, Some(&t), None, "not found"));
 
-    #[test]
-    fn request_name_resolves_by_unique_leaf() {
-        let t = titles();
         // "process_file" is the leaf of "upload/process_file".
-        assert!(!has_err(
-            "# collection: ./c.hurl\nREPORT REQUEST process_file\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
+        let leaf = "# collection: ./c.hurl\nREPORT REQUEST process_file\n";
+        assert!(!has_err(leaf, Some(&t), None, "not found"));
 
+        let unknown = "# collection: ./c.hurl\nREQUEST nope\n";
+        assert!(has_err(unknown, Some(&t), None, "not found"));
+
+        // A leaf shared by two requests can't be resolved.
+        let dups = vec!["a/dup".to_string(), "b/dup".to_string()];
+        let ambiguous = "# collection: ./c.hurl\nREQUEST dup\n";
+        assert!(has_err(ambiguous, Some(&dups), None, "ambiguous"));
+    }
+    /// The `ENVS` loop-source diagnostics: role clauses and unloaded names.
     #[test]
-    fn unknown_request_name_is_an_error() {
+    fn envs_clause_diagnostics() {
         let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nREQUEST nope\n",
-            Some(&t),
-            None,
-            "not found"
-        ));
-    }
-
-    #[test]
-    fn ambiguous_leaf_is_an_error() {
-        let t = vec!["a/dup".to_string(), "b/dup".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\nREQUEST dup\n",
-            Some(&t),
-            None,
-            "ambiguous"
-        ));
-    }
-
-    #[test]
-    fn envs_plain_empty_is_an_error() {
         // An ENVS clause with no names can't be produced by the parser directly,
         // so drive check_env_clause via a role clause missing comparisons.
-        let t = titles();
+        let no_comparison =
+            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"prod\")\n  REQUEST Oauth\nEND\n";
         assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"prod\")\n  REQUEST Oauth\nEND\n",
+            no_comparison,
             Some(&t),
             None,
             "at least one COMPARISON"
         ));
-    }
 
-    #[test]
-    fn envs_multiple_baseline_is_an_error() {
-        let t = titles();
+        let two_baselines = "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"a\", \"b\"), COMPARISON(\"c\")\n  REQUEST Oauth\nEND\n";
         assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS BASELINE(\"a\", \"b\"), COMPARISON(\"c\")\n  REQUEST Oauth\nEND\n",
+            two_baselines,
             Some(&t),
             None,
             "at most one BASELINE"
         ));
-    }
 
+        let named = "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n";
+        let only_prod = vec!["prod-au".to_string()];
+        let both = vec!["prod-au".to_string(), "staging-au".to_string()];
+        let missing = "'staging-au' is not loaded";
+        assert!(has_err(named, Some(&t), Some(&only_prod), missing));
+        assert!(!has_err(named, Some(&t), Some(&both), "not loaded"));
+    }
     #[test]
     fn baseline_directive_with_envs_comparison_warns_it_is_ignored() {
         // Both a `# baseline:` snapshot diff and a live ENVS comparison target
@@ -1984,118 +2193,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// How many names a loop pattern binds versus how wide its source is, and
+    /// whether the list it names was ever declared.
     #[test]
-    fn envs_unloaded_environment_is_an_error() {
+    fn loop_arity_and_list_reference_diagnostics() {
         let t = titles();
-        let envs = vec!["prod-au".to_string()];
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            Some(&envs),
-            "'staging-au' is not loaded"
-        ));
-    }
+        let c = "# collection: ./c.hurl\n";
+        let check = |src: String, needle: &str| has_err(&src, Some(&t), None, needle);
 
-    #[test]
-    fn envs_all_loaded_has_no_env_error() {
-        let t = titles();
-        let envs = vec!["prod-au".to_string(), "staging-au".to_string()];
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR T IN ENVS \"prod-au\", \"staging-au\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            Some(&envs),
-            "not loaded"
-        ));
-    }
+        let two_from_one = format!("{c}FOR (A, B) IN FILES \"d\"\n  REQUEST Oauth\nEND\n");
+        assert!(check(two_from_one, "binds 2 name"));
+        let zip = format!("{c}FOR (A, B) IN ZIP(FILES \"x\", FILES \"y\")\n  REQUEST Oauth\nEND\n");
+        assert!(!check(zip, "binds"));
 
-    #[test]
-    fn arity_mismatch_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR (A, B) IN FILES \"d\"\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds 2 name"
-        ));
-    }
+        let concat_ok = format!(
+            "{c}FOR F IN CONCAT(FILES \"x\", FILES \"y\", FOLDERS \"z\")\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(!check(concat_ok, "arity"));
+        let concat_bad = format!(
+            "{c}FOR F IN CONCAT(FILES \"x\", ZIP(FILES \"a\", FILES \"b\"))\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(check(concat_bad, "inconsistent arity"));
 
-    #[test]
-    fn arity_match_on_zip_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR (A, B) IN ZIP(FILES \"x\", FILES \"y\")\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds"
-        ));
-    }
+        let ragged =
+            format!("{c}LIST L = [(\"a\", \"b\"), \"c\"]\nFOR (X, Y) IN L\n  REQUEST Oauth\nEND\n");
+        assert!(check(ragged, "inconsistent arity"));
+        // A rest pattern absorbs whatever extra positions a row carries.
+        let rest = format!(
+            "{c}LIST L = [(\"a\", \"b\", \"c\")]\nFOR (X, ...) IN L\n  REQUEST Oauth\nEND\n"
+        );
+        assert!(!check(rest, "binds"));
 
-    #[test]
-    fn concat_of_same_arity_sources_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", FILES \"y\", FOLDERS \"z\")\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "arity"
-        ));
+        let undeclared = format!("{c}FOR X IN MISSING\n  REQUEST Oauth\nEND\n");
+        assert!(check(undeclared, "unknown list"));
+        let declared = format!("{c}LIST DOCS = FILES \"d\"\nFOR X IN DOCS\n  REQUEST Oauth\nEND\n");
+        assert!(!check(declared, "unknown list"));
     }
-
-    #[test]
-    fn concat_of_mismatched_arity_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR F IN CONCAT(FILES \"x\", ZIP(FILES \"a\", FILES \"b\"))\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "inconsistent arity"
-        ));
-    }
-
-    #[test]
-    fn inconsistent_list_literal_arity_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nLIST L = [(\"a\", \"b\"), \"c\"]\nFOR (X, Y) IN L\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "inconsistent arity"
-        ));
-    }
-
-    #[test]
-    fn rest_pattern_absorbs_extra_positions() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nLIST L = [(\"a\", \"b\", \"c\")]\nFOR (X, ...) IN L\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "binds",
-        ));
-    }
-
-    #[test]
-    fn unknown_list_reference_is_an_error() {
-        let t = titles();
-        assert!(has_err(
-            "# collection: ./c.hurl\nFOR X IN MISSING\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "unknown list"
-        ));
-    }
-
-    #[test]
-    fn declared_list_reference_is_ok() {
-        let t = titles();
-        assert!(!has_err(
-            "# collection: ./c.hurl\nLIST DOCS = FILES \"d\"\nFOR X IN DOCS\n  REQUEST Oauth\nEND\n",
-            Some(&t),
-            None,
-            "unknown list"
-        ));
-    }
-
     #[test]
     fn show_and_hide_overlap_is_an_error() {
         // A field in both SHOW and HIDE is contradictory → validation error.
@@ -2188,6 +2321,38 @@ mod tests {
             .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be set"))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// A request that declares its own parameter supplies a value for it, so
+    /// the reference is never unset. Warning about it punished the collection
+    /// for being properly parameterised — and buried the warnings that matter
+    /// under one per parameter per call site.
+    #[test]
+    fn a_declared_parameter_is_not_reported_as_possibly_unset() {
+        let mut entry = test_entry("upload", &["FILE"], &[]);
+        entry.options.push(crate::hurl::KvRow::new(
+            "variable".to_string(),
+            "FILE=./samples/front.jpg".to_string(),
+        ));
+        let warns = var_warns("REQUEST upload\n", &[], &[], &[entry]);
+        assert!(
+            warns.is_empty(),
+            "the request declares FILE itself: {warns:?}"
+        );
+    }
+
+    /// The other side of it: an undeclared name is still reported, so removing
+    /// the noise hasn't removed the check.
+    #[test]
+    fn an_undeclared_var_is_still_reported_beside_a_declared_one() {
+        let mut entry = test_entry("upload", &["FILE", "SESSION"], &[]);
+        entry.options.push(crate::hurl::KvRow::new(
+            "variable".to_string(),
+            "FILE=./samples/front.jpg".to_string(),
+        ));
+        let warns = var_warns("REQUEST upload\n", &[], &[], &[entry]);
+        assert_eq!(warns.len(), 1, "only the undeclared one: {warns:?}");
+        assert!(warns[0].contains("SESSION"), "{warns:?}");
     }
 
     #[test]

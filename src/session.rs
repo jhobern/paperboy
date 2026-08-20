@@ -390,6 +390,38 @@ impl Session {
             return None;
         }
         let (mut env, pending) = parse_vars_pending(name, content);
+        // Opening a file that is already loaded is a reload, not a clash. The
+        // suffixing below is for two *different* environments that share a
+        // name; applied to the same file re-opened it left a stale copy behind
+        // and a `(2)` beside it, neither of which the user asked for.
+        if let Some(existing) = self
+            .global_envs
+            .iter()
+            .find(|e| crate::environment::is_same_source(e, path.as_deref(), git_origin.as_ref()))
+        {
+            let existing_id = existing.id;
+            let idx = self
+                .global_envs
+                .iter()
+                .position(|e| e.id == existing_id)
+                .expect("just found");
+            // The existing entry's id, path and origin are kept so collection
+            // links and "Save Environment" keep working across the reload.
+            env.id = existing_id;
+            env.path = self.global_envs[idx].path.clone();
+            env.git_origin = self.global_envs[idx].git_origin.clone();
+            self.global_envs[idx] = env;
+            if !pending.is_empty() {
+                self.pending_env
+                    .push(spawn_resolution(existing_id, pending));
+            }
+            for col in &mut self.collections {
+                col.invalidate_request_json();
+            }
+            self.status = Some(Status::Loaded);
+            self.save();
+            return Some(existing_id);
+        }
         // Disambiguate a duplicate name so both stay usable.
         if self.global_envs.iter().any(|e| e.name == env.name) {
             let base = env.name.clone();
@@ -786,7 +818,20 @@ impl Session {
             self.status = Some(Status::WaitingSecrets(blocking.clone()));
             return blocking;
         }
-        self.status = None;
+        // Undefined variables are reported but never block: sending a literal
+        // `{{ tokn }}` is valid Hurl, and refusing to run would be a worse
+        // answer than running and saying why it failed.
+        // A raw body plus form fields is refused rather than reported: Hurl
+        // would send the body and silently drop every field, so the request
+        // "succeeds" having sent the wrong thing (see
+        // `HurlEntry::body_form_conflict`).
+        let conflicts = request::body_form_conflicts(&self.collections[ci]);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return Vec::new();
+        }
+        let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.begin_request();
         let selected = self.collections[ci].selected_entry;
         if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
@@ -814,7 +859,14 @@ impl Session {
             self.status = Some(Status::WaitingSecrets(blocking.clone()));
             return blocking;
         }
-        self.status = None;
+        // Refused, not reported — see the single-request run.
+        let conflicts = request::body_form_conflicts_all(col);
+        if !conflicts.is_empty() {
+            self.status = Some(Status::BodyFormConflict(conflicts));
+            return Vec::new();
+        }
+        let undefined = request::undefined_request_keys_all(col, env.as_ref());
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;
@@ -1418,6 +1470,127 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Hurl builds a form and a body onto the same curl handle, so the body
+    /// wins and the form is never sent — and the request comes back 200 having
+    /// posted the wrong thing. Refusing is the only answer that tells anyone.
+    #[test]
+    fn a_request_with_both_a_body_and_form_fields_is_refused_rather_than_sent() {
+        let mut s = Session::default();
+        s.collections[0].entries = vec![crate::hurl::HurlEntry {
+            title: "Token".into(),
+            method: "POST".into(),
+            url: "https://example.com/token".into(),
+            // A single space: the shape of the accident this guards against.
+            body: Some(" ".into()),
+            form_fields: vec![crate::hurl::FormField {
+                key: "grant_type".into(),
+                value: "client_credentials".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        s.collections[0].selected_entry = 0;
+
+        s.run_entry(0);
+
+        match &s.status {
+            Some(crate::i18n::Status::BodyFormConflict(names)) => {
+                assert_eq!(names, &vec!["Token".to_string()], "it says which request");
+            }
+            other => panic!("expected the run to be refused, got {other:?}"),
+        }
+        assert_eq!(
+            s.collections[0].entries[0].last_run,
+            RunStatus::NotRun,
+            "nothing was sent"
+        );
+    }
+
+    /// A run's result belonged to whichever file the tab happened to have
+    /// loaded: switching to another collection and back re-read the file from
+    /// disk, and a freshly parsed request has never been run. The tick and the
+    /// response both vanished — at the exact moment someone goes to compare
+    /// one request's answer with another's.
+    #[test]
+    fn run_results_and_responses_survive_switching_collections() {
+        let dir = tmp("runs");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+        let health = dir.join("health.hurl");
+        let users = dir.join("api/users.hurl");
+
+        assert!(s.load_workspace_file(ci, health.clone()));
+        s.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+        s.collections[ci].entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            body: "{\"ok\":true}".into(),
+            ..Default::default()
+        });
+
+        // Look at another collection: the result still belongs to the request
+        // that earned it, so the tree can still mark its row.
+        assert!(s.load_workspace_file(ci, users.clone()));
+        assert_eq!(
+            s.collections[ci].workspace_run_status(&health, 0),
+            crate::hurl::RunStatus::Passed,
+            "a request run this session keeps its marker once the tab moves on"
+        );
+        assert_eq!(
+            s.collections[ci].workspace_run_status(&users, 0),
+            crate::hurl::RunStatus::NotRun
+        );
+
+        // ...and coming back brings the response with it.
+        assert!(s.load_workspace_file(ci, health));
+        assert_eq!(
+            s.collections[ci].entries[0].last_run,
+            crate::hurl::RunStatus::Passed
+        );
+        assert_eq!(
+            s.collections[ci].entries[0]
+                .last_response
+                .as_ref()
+                .map(|r| r.status),
+            Some(200),
+            "the response is there to read again, not just the tick"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The results are matched to requests by what they are, not only by where
+    /// they sit: a file edited outside PaperBoy between the run and the reopen
+    /// must not hand a stale response to whatever request now occupies that
+    /// position.
+    #[test]
+    fn a_changed_file_does_not_inherit_the_previous_requests_result() {
+        let dir = tmp("runs_changed");
+        let mut s = Session::default();
+        let ci = s.open_workspace(dir.clone());
+        let health = dir.join("health.hurl");
+
+        assert!(s.load_workspace_file(ci, health.clone()));
+        s.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+        s.collections[ci].entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            ..Default::default()
+        });
+        assert!(s.load_workspace_file(ci, dir.join("api/users.hurl")));
+
+        // Somebody else rewrote the file while we were away.
+        std::fs::write(&health, "DELETE https://example.com/health\n").unwrap();
+        assert!(s.load_workspace_file(ci, health));
+        assert_eq!(
+            s.collections[ci].entries[0].last_run,
+            crate::hurl::RunStatus::NotRun,
+            "a different request, so no marker"
+        );
+        assert!(s.collections[ci].entries[0].last_response.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn saving_a_collection_clears_its_edit_markers_and_parked_edits() {
         let dir = tmp("saved");
@@ -1602,5 +1775,109 @@ mod workspace_tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod env_reload_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_env_reload_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Re-opening a file that is already loaded refreshes it. It used to leave
+    /// the stale copy in place and add a `dev (2)` beside it — two entries for
+    /// one file, only one of which the collection was linked to.
+    #[test]
+    fn re_opening_a_loaded_environment_refreshes_it_rather_than_suffixing_a_copy() {
+        let dir = tmp("same");
+        let path = dir.join("dev.vars");
+        std::fs::write(&path, "TOKEN=old\n").unwrap();
+        let mut s = Session::default();
+        let id = s
+            .load_environment_text("dev".into(), "TOKEN=old\n", Some(path.clone()), None)
+            .expect("loaded");
+
+        let again = s.load_environment_text("dev".into(), "TOKEN=new\n", Some(path.clone()), None);
+
+        assert_eq!(again, Some(id), "the same environment, refreshed in place");
+        assert_eq!(s.global_envs.len(), 1, "and not duplicated");
+        assert_eq!(s.global_envs[0].name, "dev", "with no `(2)` suffix");
+        assert_eq!(s.global_envs[0].vars[0].raw, "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative and an absolute route to the same file are the same file —
+    /// the workspace tree walks relative to its root, File → Load Environment
+    /// hands back an absolute path.
+    #[test]
+    fn the_same_file_reached_by_two_different_paths_is_still_one_environment() {
+        let dir = tmp("canon");
+        let nested = dir.join("envs");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("dev.vars");
+        std::fs::write(&path, "TOKEN=t\n").unwrap();
+        let indirect = dir.join("envs").join(".").join("dev.vars");
+
+        let mut s = Session::default();
+        let id = s
+            .load_environment_text("dev".into(), "TOKEN=t\n", Some(path), None)
+            .expect("loaded");
+        let again = s.load_environment_text("dev".into(), "TOKEN=t\n", Some(indirect), None);
+
+        assert_eq!(again, Some(id));
+        assert_eq!(s.global_envs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two genuinely different files that share a name are still two
+    /// environments — the suffix exists for exactly this case.
+    #[test]
+    fn two_different_files_with_the_same_name_are_still_disambiguated() {
+        let dir = tmp("clash");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/dev.vars"), "TOKEN=a\n").unwrap();
+        std::fs::write(dir.join("b/dev.vars"), "TOKEN=b\n").unwrap();
+
+        let mut s = Session::default();
+        s.load_environment_text(
+            "dev".into(),
+            "TOKEN=a\n",
+            Some(dir.join("a/dev.vars")),
+            None,
+        )
+        .expect("loaded");
+        s.load_environment_text(
+            "dev".into(),
+            "TOKEN=b\n",
+            Some(dir.join("b/dev.vars")),
+            None,
+        )
+        .expect("loaded");
+
+        assert_eq!(s.global_envs.len(), 2);
+        assert_eq!(s.global_envs[1].name, "dev (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-made environment has no source to re-read, so it never matches —
+    /// otherwise the first pathless environment would swallow every later one.
+    #[test]
+    fn a_hand_made_environment_is_never_treated_as_a_reload() {
+        let mut s = Session::default();
+        s.load_environment_text("dev".into(), "TOKEN=a\n", None, None)
+            .expect("loaded");
+        s.load_environment_text("dev".into(), "TOKEN=b\n", None, None)
+            .expect("loaded");
+        assert_eq!(s.global_envs.len(), 2);
     }
 }

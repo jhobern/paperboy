@@ -29,6 +29,12 @@ pub const CARET_RIGHT: &str = p::CARET_RIGHT;
 /// Expanded tree row (folder/collection open) — leading disclosure caret.
 pub const CARET_DOWN: &str = p::CARET_DOWN;
 
+/// The Source view's find bar.
+pub const SEARCH: &str = p::MAGNIFYING_GLASS;
+
+/// The Environments panel's "go to the active environment" button.
+pub const GOTO_ACTIVE: &str = p::CROSSHAIR_SIMPLE;
+
 /// A folder in the workspace/collection tree.
 pub const FOLDER: &str = p::FOLDER;
 /// A collection file (`.hurl` / `.json`) in the tree.

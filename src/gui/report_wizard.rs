@@ -18,7 +18,7 @@ use crate::report::context;
 use crate::report::edit::node_at;
 use crate::report::flow::{
     EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportStmt, ResponseFmt, RoleRef,
-    ShowField, WithItem,
+    ShowField, UsingItem, WithItem,
 };
 use crate::report::model::StatKind;
 
@@ -210,6 +210,19 @@ pub struct RequestForm {
     hide_fields: Vec<(String, bool)>,
     /// Preserved verbatim across the edit (the form doesn't expose them).
     with: Vec<WithItem>,
+    /// The `USING(…)` clause as the node was opened with. Only its
+    /// requirements and overrides are editable here, both below; the field is
+    /// kept so anything a later clause item might carry survives the round trip.
+    using: Vec<UsingItem>,
+    /// The per-call overrides (`multipart.document = "…"`), as editable text.
+    /// See [`crate::report::edit::OverrideRow`].
+    overrides: Vec<crate::report::edit::OverrideRow>,
+    /// The `USING(…)` requirement checklist for the currently named request.
+    params: Vec<crate::report::edit::ParamRow>,
+    /// The parameters every request in the bound collection declares, so
+    /// picking a different name in the combo can re-derive the checklist
+    /// without a trip back to the session (the form is drawn without one).
+    params_by_request: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 impl RequestForm {
@@ -250,20 +263,44 @@ impl RequestForm {
         (!a.is_empty()).then(|| a.to_string())
     }
 
+    /// Re-derive the `USING(…)` checklist for the currently named request,
+    /// carrying the current ticks over.
+    /// The clause this form describes: the ticked requirements, then the
+    /// override rows that name a real part of the request.
+    fn using_clause(&self) -> Vec<UsingItem> {
+        crate::report::edit::using_items(
+            &self.params,
+            &crate::report::edit::override_items(&self.overrides),
+        )
+    }
+
+    fn refresh_params(&mut self) {
+        let using = crate::report::edit::using_items(&self.params, &self.using);
+        let declared = self
+            .params_by_request
+            .get(self.name.trim())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        self.params = crate::report::edit::param_rows(declared, &using);
+    }
+
     /// The node this form describes.
     fn to_node(&self) -> FlowNode {
         if self.report {
             FlowNode::Report(ReportStmt::Request {
                 name: self.name.trim().to_string(),
                 alias: self.alias_opt(),
+                using: self.using_clause(),
                 response_fmt: self.response,
                 show: self.show(),
                 hide: self.hide(),
                 with: self.with.clone(),
             })
         } else {
+            // `USING` describes the send, so it survives dropping REPORT.
             FlowNode::Request {
                 name: self.name.trim().to_string(),
+                using: self.using_clause(),
             }
         }
     }
@@ -437,10 +474,9 @@ fn build_vars(
         ),
         _ => (Vec::new(), String::new(), Vec::new(), None, None, false),
     };
-    let entries = context::resolve_bound_collection(&app.session.collections, flow, report_path)
-        .map(|ci| app.session.collections[ci].entries.as_slice())
-        .unwrap_or(&[]);
-    let in_scope = crate::report::edit::vars_in_scope(flow, path, entries);
+    let entries =
+        context::bound_entries(&app.session.collections, flow, report_path).unwrap_or_default();
+    let in_scope = crate::report::edit::vars_in_scope(flow, path, &entries);
     let mut vars: Vec<(String, bool)> = in_scope
         .iter()
         .map(|n| (n.clone(), chosen.contains(n)))
@@ -722,8 +758,8 @@ fn build_request(
     path: Vec<usize>,
     node: &FlowNode,
 ) -> RequestForm {
-    let (name, report, alias, response, show, hide, with) = match node {
-        FlowNode::Request { name } => (
+    let (name, report, alias, response, show, hide, with, using) = match node {
+        FlowNode::Request { name, using } => (
             name.clone(),
             false,
             None,
@@ -731,10 +767,12 @@ fn build_request(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            using.clone(),
         ),
         FlowNode::Report(ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -747,31 +785,47 @@ fn build_request(
             show.clone(),
             hide.clone(),
             with.clone(),
+            using.clone(),
         ),
         _ => unreachable!("build_request called on a non-request node"),
     };
 
-    let titles: Vec<String> =
-        context::resolve_bound_collection(&app.session.collections, flow, report_path)
-            .map(|ci| {
-                app.session.collections[ci]
-                    .entries
-                    .iter()
-                    .map(|e| e.title.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+    let bound = context::bound_entries(&app.session.collections, flow, report_path);
+    let titles: Vec<String> = bound
+        .as_deref()
+        .map(|es| es.iter().map(|e| e.title.clone()).collect())
+        .unwrap_or_default();
+
+    // Every request's declared parameters, not just this one's: the name combo
+    // can change which request the node calls, and the checklist has to follow
+    // it without the form being able to ask the session again.
+    let params_by_request: std::collections::HashMap<String, Vec<(String, String)>> = bound
+        .as_deref()
+        .map(|es| {
+            es.iter()
+                .map(|e| (e.title.clone(), e.variable_defaults()))
+                .filter(|(_, p)| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let params = crate::report::edit::param_rows(
+        params_by_request
+            .get(&name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        &using,
+    );
 
     // The fields the request can emit, in canonical order: intrinsics, the
     // request's own `[Reports]` fields, then this node's `WITH` fields, then any
     // unknown `SHOW` entry (so applying can't silently drop it), de-duplicated.
-    let report_fields =
-        context::resolve_bound_collection(&app.session.collections, flow, report_path)
-            .and_then(|ci| {
-                crate::report::run::resolve_title(&app.session.collections[ci].entries, &name)
-                    .map(|e| e.reports.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
+    let report_fields = bound
+        .as_deref()
+        .and_then(|es| {
+            crate::report::run::resolve_title(es, &name)
+                .map(|e| e.reports.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
     let mut names: Vec<String> = Vec::new();
     let push = |n: &str, names: &mut Vec<String>| {
         if !names.iter().any(|x| x == n) {
@@ -829,6 +883,10 @@ fn build_request(
             .collect(),
         hide_fields,
         with,
+        overrides: crate::report::edit::override_rows(&using),
+        using,
+        params,
+        params_by_request,
     }
 }
 
@@ -898,12 +956,10 @@ fn build_envs(
         });
     }
 
-    let bound_entries =
-        context::resolve_bound_collection(&app.session.collections, flow, report_path)
-            .map(|ci| app.session.collections[ci].entries.as_slice())
-            .unwrap_or(&[]);
+    let bound =
+        context::bound_entries(&app.session.collections, flow, report_path).unwrap_or_default();
     let baseline_show_fields =
-        crate::report::edit::baseline_show_choices(bound_entries, body, &baseline_show);
+        crate::report::edit::baseline_show_choices(&bound, body, &baseline_show);
 
     EnvsForm {
         path,
@@ -1086,8 +1142,21 @@ fn request_ui(
         .spacing([12.0, 6.0])
         .show(ui, |ui| {
             ui.label(RichText::new(s.node_form_name).color(th.dim));
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(180.0));
+            let before = f.name.clone();
+            // `horizontal_top`, and a text margin matched to the button
+            // padding, so the field and its picker are the same height and
+            // share a top edge. Left to themselves they are not: a ComboBox
+            // sizes itself from `button_padding` and a TextEdit from its own
+            // margin, and the `Align::Center` of a plain `horizontal` inside a
+            // Grid cell doesn't reconcile the two — the dropdown sat a couple
+            // of pixels low and hung below the field it belongs to.
+            ui.horizontal_top(|ui| {
+                let pad = ui.spacing().button_padding.y as i8;
+                ui.add(
+                    egui::TextEdit::singleline(&mut f.name)
+                        .desired_width(180.0)
+                        .margin(egui::Margin::symmetric(4, pad)),
+                );
                 if !f.titles.is_empty() {
                     egui::ComboBox::from_id_salt("pt_req_name_pick")
                         .selected_text(RichText::new("…").color(th.dim))
@@ -1100,6 +1169,13 @@ fn request_ui(
                         });
                 }
             });
+            // Parameters belong to the request, so changing which request this
+            // node calls has to re-derive the checklist. Ticks survive: a name
+            // the new request doesn't declare stays on as an undeclared row,
+            // which is the error to see rather than a row that quietly went.
+            if f.name != before {
+                f.refresh_params();
+            }
             ui.end_row();
 
             ui.label(RichText::new(s.node_form_report).color(th.dim));
@@ -1123,6 +1199,79 @@ fn request_ui(
                 ui.end_row();
             }
         });
+
+    // The `USING(…)` section is drawn unconditionally. It used to appear only
+    // when the named request declared parameters, which meant that for a
+    // collection where nothing does — the usual state of an existing
+    // collection — the dialog showed no sign the clause existed at all, and
+    // there was no way to reach it except by hand in the source view.
+    ui.add_space(6.0);
+    ui.label(RichText::new(s.node_form_using).color(th.dim));
+    ui.label(RichText::new(s.node_form_using_hint).color(th.dim));
+    if f.params.is_empty() {
+        // Say so, and say where the fix is: declaring a parameter happens in
+        // the *request* editor, which is not where the reader is looking.
+        ui.label(RichText::new(s.node_form_using_none).color(th.dim));
+    }
+    for p in &mut f.params {
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut p.required,
+                RichText::new(p.name.as_str()).color(th.text),
+            );
+            // The declared default is what the request does when nothing
+            // steers it — the thing an author needs to see to know whether
+            // ticking the row matters. No default means the clause requires
+            // a name the request doesn't declare, which is an error.
+            match &p.default {
+                Some(v) => {
+                    ui.label(RichText::new(format!("= {v}")).color(th.dim));
+                }
+                None => {
+                    ui.label(RichText::new(s.report_node_param_undeclared).color(th.err));
+                }
+            }
+        });
+    }
+
+    ui.add_space(4.0);
+    ui.label(RichText::new(s.node_form_override_hint).color(th.dim));
+    let mut drop_override: Option<usize> = None;
+    for (i, row) in f.overrides.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            // A target that can never work is shown wrong as it is typed
+            // rather than silently dropped on OK — the box is the only place
+            // the mistake is visible.
+            let ok = crate::report::edit::override_target_valid(&row.target);
+            let target = egui::TextEdit::singleline(&mut row.target)
+                .desired_width(150.0)
+                .hint_text(s.node_form_override_target_hint)
+                .text_color(if ok { th.text } else { th.err });
+            ui.add(target);
+            ui.label(RichText::new("=").color(th.dim));
+            ui.add(
+                egui::TextEdit::singleline(&mut row.value)
+                    .desired_width(180.0)
+                    .hint_text(s.node_form_override_value_hint),
+            );
+            if ui
+                .button(RichText::new(super::icons::CLOSE).color(th.err))
+                .clicked()
+            {
+                drop_override = Some(i);
+            }
+        });
+        if !crate::report::edit::override_target_valid(&row.target) {
+            ui.label(RichText::new(s.node_form_override_bad_target).color(th.err));
+        }
+    }
+    if let Some(i) = drop_override {
+        f.overrides.remove(i);
+    }
+    if ui.button(s.node_form_override_add).clicked() {
+        f.overrides
+            .push(crate::report::edit::OverrideRow::default());
+    }
 
     if f.report && !f.fields.is_empty() {
         ui.add_space(6.0);
@@ -2008,6 +2157,219 @@ mod tests {
         );
     }
 
+    /// The request name field and the picker that fills it are one control in
+    /// two halves, so they have to line up. A ComboBox sizes itself from
+    /// `button_padding` and a TextEdit from its own margin, and a plain
+    /// `horizontal` in a Grid cell reconciles neither the heights nor the tops
+    /// — the dropdown sat low and hung below the field it belongs to.
+    ///
+    /// Measured off what `request_ui` actually paints, so the test fails if the
+    /// row is rebuilt without the alignment rather than only if this exact
+    /// layout is changed.
+    #[test]
+    fn the_request_name_field_and_its_picker_are_the_same_box() {
+        use eframe::egui;
+        let ctx = egui::Context::default();
+        let spec = crate::theme::builtin_presets()[0].clone();
+        let th = super::super::theme::GuiTheme::from_spec(&spec);
+        th.apply(&ctx);
+        let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let mut f = param_form("upload", Vec::new());
+        f.titles = vec!["upload".into(), "warmup".into()];
+
+        fn rects_filled(shape: &egui::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == fill => out.push(r.rect),
+                egui::Shape::Vec(v) => {
+                    for sh in v {
+                        rects_filled(sh, fill, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Grid column widths settle from the previous pass, so run a few.
+        let mut out = egui::FullOutput::default();
+        for _ in 0..4 {
+            out = ctx.run_ui(Default::default(), |ui| {
+                request_ui(ui, &th, &s, &mut f);
+            });
+        }
+
+        let mut fields = Vec::new();
+        let mut buttons = Vec::new();
+        let button_fill = ctx
+            .style_of(egui::Theme::Dark)
+            .visuals
+            .widgets
+            .inactive
+            .bg_fill;
+        for cs in &out.shapes {
+            rects_filled(&cs.shape, th.field(), &mut fields);
+            rects_filled(&cs.shape, button_fill, &mut buttons);
+        }
+        // The name row is the form's first, so both halves are the topmost of
+        // their kind — chosen by position rather than by size, which the alias
+        // field below shares.
+        let topmost = |v: &[egui::Rect]| -> egui::Rect {
+            v.iter()
+                .copied()
+                .min_by(|a, b| a.top().total_cmp(&b.top()))
+                .expect("painted")
+        };
+        let field = topmost(&fields);
+        let picker = topmost(&buttons);
+
+        assert_eq!(
+            (field.top(), field.bottom()),
+            (picker.top(), picker.bottom()),
+            "field {field:?} and picker {picker:?} must occupy the same band"
+        );
+    }
+
+    /// A `RequestForm` whose bound collection declares `FILE` on `upload` and
+    /// nothing on `warmup`.
+    fn param_form(name: &str, using: Vec<UsingItem>) -> RequestForm {
+        let params_by_request: std::collections::HashMap<String, Vec<(String, String)>> = [(
+            "upload".to_string(),
+            vec![("FILE".to_string(), "./x".to_string())],
+        )]
+        .into_iter()
+        .collect();
+        let params = crate::report::edit::param_rows(
+            params_by_request
+                .get(name)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            &using,
+        );
+        RequestForm {
+            path: vec![0],
+            name: name.to_string(),
+            titles: vec!["upload".into(), "warmup".into()],
+            report: true,
+            response: None,
+            alias: String::new(),
+            fields: Vec::new(),
+            show_stats: Default::default(),
+            hide_fields: Vec::new(),
+            with: Vec::new(),
+            overrides: crate::report::edit::override_rows(&using),
+            using,
+            params,
+            params_by_request,
+        }
+    }
+
+    /// Ticking a parameter writes the requirement; the overrides the checklist
+    /// has no row for come through untouched.
+    #[test]
+    fn the_gui_request_form_writes_ticked_parameters_and_keeps_overrides() {
+        let carried = vec![UsingItem::Override {
+            target: crate::report::flow::OverrideTarget::parse("header.X-Run").unwrap(),
+            value: "1".into(),
+        }];
+        let mut f = param_form("upload", carried);
+        assert_eq!(f.params.len(), 1, "the declared parameter is offered");
+        assert!(!f.params[0].required, "and starts un-ticked");
+        f.params[0].required = true;
+        let FlowNode::Report(ReportStmt::Request { using, .. }) = f.to_node() else {
+            panic!("a reported request node");
+        };
+        assert_eq!(
+            using.iter().map(UsingItem::text).collect::<Vec<_>>(),
+            vec!["FILE".to_string(), "header.X-Run = \"1\"".to_string()]
+        );
+    }
+
+    /// The complaint that prompted the section being drawn unconditionally: a
+    /// request that declares nothing showed no sign `USING` existed, and there
+    /// was no way to add one outside the source view.
+    #[test]
+    fn the_using_section_is_offered_even_when_the_request_declares_nothing() {
+        let mut f = param_form("warmup", Vec::new());
+        assert!(f.params.is_empty(), "the precondition: nothing declared");
+
+        let ctx = egui::Context::default();
+        let th = super::super::theme::GuiTheme::from_spec(&crate::theme::default_preset());
+        let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let mut painted = Vec::new();
+        let full = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(700.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| request_ui(ui, &th, &s, &mut f),
+        );
+        fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        for cs in &full.shapes {
+            texts(&cs.shape, &mut painted);
+        }
+        let all = painted.join("\n");
+        assert!(
+            all.contains(s.node_form_using),
+            "the heading is there: {all}"
+        );
+        assert!(
+            all.contains(s.node_form_using_none),
+            "and it says why the list is empty, and where to fix it: {all}"
+        );
+        assert!(
+            all.contains(s.node_form_override_add),
+            "and an override can be added without leaving the dialog: {all}"
+        );
+    }
+
+    /// An override typed into the form reaches the node.
+    #[test]
+    fn an_override_edited_in_the_form_is_written_to_the_node() {
+        let mut f = param_form("warmup", Vec::new());
+        f.overrides.push(crate::report::edit::OverrideRow {
+            target: "multipart.document".into(),
+            value: "{{FILE}}".into(),
+        });
+        let FlowNode::Report(ReportStmt::Request { using, .. }) = f.to_node() else {
+            panic!("a reported request node");
+        };
+        assert_eq!(
+            using.iter().map(UsingItem::text).collect::<Vec<_>>(),
+            vec!["multipart.document = \"{{FILE}}\"".to_string()]
+        );
+    }
+
+    /// Pointing the node at another request re-derives the checklist: the
+    /// parameters belong to the request, not to the statement. The tick
+    /// survives as an undeclared row, which is the error to see rather than a
+    /// requirement that quietly disappeared.
+    #[test]
+    fn renaming_the_request_re_derives_the_parameter_checklist() {
+        let mut f = param_form("upload", vec![UsingItem::Require("FILE".into())]);
+        assert!(f.params[0].required && f.params[0].default.is_some());
+        f.name = "warmup".into();
+        f.refresh_params();
+        assert_eq!(f.params.len(), 1);
+        assert_eq!(f.params[0].name, "FILE");
+        assert!(
+            f.params[0].default.is_none(),
+            "warmup declares nothing, so the requirement now reads as undeclared"
+        );
+        f.params[0].required = false;
+        let FlowNode::Report(ReportStmt::Request { using, .. }) = f.to_node() else {
+            panic!("a reported request node");
+        };
+        assert!(using.is_empty(), "un-ticking clears the clause");
+    }
+
     #[test]
     fn a_show_field_no_request_offers_is_still_listed_so_editing_cannot_drop_it() {
         // Hand-written source may name a field the bound collection knows
@@ -2043,10 +2405,12 @@ mod tests {
         let nodes = vec![
             FlowNode::Request {
                 name: "warmup".into(),
+                using: Vec::new(),
             },
             FlowNode::Report(crate::report::flow::ReportStmt::Request {
                 name: "login".into(),
                 alias: None,
+                using: Vec::new(),
                 response_fmt: None,
                 show: Vec::new(),
                 hide: Vec::new(),

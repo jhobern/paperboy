@@ -159,6 +159,54 @@ pub fn rows(
     out
 }
 
+/// What a "go to the active environment" gesture has to change before the row
+/// can be shown at all.
+///
+/// Both filters are *widened* rather than respected. With a few hundred rows
+/// the active environment is usually somewhere behind a filter the user set for
+/// something else, and a "take me to it" that silently did nothing because the
+/// row was hidden would be worse than no control at all. Nothing is touched
+/// when the row was visible all along, so the common case costs the user
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RevealPlan {
+    pub clear_filter: bool,
+    pub widen_source: bool,
+}
+
+/// Work out the [`RevealPlan`] for `id` under the panel's current filters.
+/// Returns `None` when the environment has no row at all under *any* filter —
+/// it has been closed, and there is nowhere to go.
+pub fn reveal_plan(
+    envs: &[Environment],
+    workspace_files: &[PathBuf],
+    filter: &str,
+    source: EnvSource,
+    id: u64,
+) -> Option<RevealPlan> {
+    let shown = |filter: &str, source: EnvSource| {
+        rows(envs, workspace_files, filter, source)
+            .iter()
+            .any(|r| r.env_id() == Some(id))
+    };
+    if shown(filter, source) {
+        return Some(RevealPlan::default());
+    }
+    if shown("", source) {
+        return Some(RevealPlan {
+            clear_filter: true,
+            widen_source: false,
+        });
+    }
+    if shown("", EnvSource::Both) {
+        return Some(RevealPlan {
+            clear_filter: !filter.is_empty(),
+            widen_source: true,
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +350,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["prod global"]
         );
+    }
+
+    /// Nothing is disturbed when the active environment is already on show —
+    /// the common case must not cost the user their filter.
+    #[test]
+    fn revealing_a_visible_environment_changes_no_filters() {
+        let envs = vec![env("staging", None), env("prod", None)];
+        let plan = reveal_plan(&envs, &[], "", EnvSource::Both, envs[1].id).expect("has a row");
+        assert_eq!(plan, RevealPlan::default());
+    }
+
+    /// Hidden by the text filter alone: clear that, and leave the source be.
+    #[test]
+    fn revealing_an_environment_behind_the_text_filter_clears_only_the_filter() {
+        let envs = vec![env("staging", None), env("prod", None)];
+        let plan = reveal_plan(&envs, &[], "stag", EnvSource::Both, envs[1].id).expect("has a row");
+        assert_eq!(
+            plan,
+            RevealPlan {
+                clear_filter: true,
+                widen_source: false
+            }
+        );
+    }
+
+    /// A global environment hidden by a Workspace-only source needs the source
+    /// widened as well; the text filter goes too, since it was set for a list
+    /// the user is no longer looking at.
+    #[test]
+    fn revealing_a_global_environment_under_a_workspace_filter_widens_the_source() {
+        let dir = std::env::temp_dir().join("paperboy-reveal-plan");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("ws.vars");
+        let _ = std::fs::write(&file, "K=v");
+        let envs = vec![env("prod", None)];
+        let plan = reveal_plan(
+            &envs,
+            &[file.clone()],
+            "zzz",
+            EnvSource::Workspace,
+            envs[0].id,
+        )
+        .expect("has a row once the source is widened");
+        assert_eq!(
+            plan,
+            RevealPlan {
+                clear_filter: true,
+                widen_source: true
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An id that isn't in the list at all has nowhere to go, and says so
+    /// rather than clearing the user's filters for nothing.
+    #[test]
+    fn revealing_an_environment_that_is_no_longer_loaded_gives_no_plan() {
+        let envs = vec![env("prod", None)];
+        assert!(reveal_plan(&envs, &[], "", EnvSource::Both, envs[0].id + 999).is_none());
     }
 }

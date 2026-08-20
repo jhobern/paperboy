@@ -2,6 +2,7 @@
 //! app-level default variables (`AppVars`) and the Hurl-collection request
 //! building / running, so both front-ends behave identically.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -73,6 +74,18 @@ pub enum SubstKind {
     /// Failed to resolve, or a capture not yet initialised from a response
     /// (kept as `{{ VAR }}`, red).
     Failed,
+    /// Referenced by the request but defined nowhere at all — no environment
+    /// variable, no `[Captures]` name, no captured value (kept as `{{ VAR }}`,
+    /// red).
+    ///
+    /// Kept apart from [`SubstKind::Failed`] because the two ask for different
+    /// things: a failed variable exists and can be retried, while an undefined
+    /// one is usually a typo or a missing environment and has to be *added*.
+    /// Before this existed an undefined placeholder matched nothing in the
+    /// substitution map and was drawn as ordinary body text, so the one kind of
+    /// broken variable the user could do nothing about was also the only one
+    /// that looked completely fine.
+    Undefined,
 }
 
 /// How one referenced variable should be rendered when substituted.
@@ -612,6 +625,110 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
     }
 }
 
+/// Layer a request's own declared parameters (`[Options] variable: NAME=value`,
+/// see [`HurlEntry::variable_defaults`]) *under* the caller's `vars`, producing
+/// the variable set the request actually runs with.
+///
+/// Precedence is the whole point: a declared parameter is a **default**, so it
+/// fills in only the names nobody else bound. Opened on its own, a request runs
+/// with the author's sample value; driven from a PaperTrail loop that binds
+/// `FILE`, it runs with the loop's value and the default stands aside. Hurl's
+/// native reading of the same line is the opposite (the entry option overwrites
+/// the run's variables), which is why the row is also stripped from the entry
+/// text before it is handed to the runner — see [`strip_variable_options`].
+///
+/// A default's own value is substituted against the caller's variables first,
+/// so one parameter can be expressed in terms of another (`variable:
+/// FILE={{SAMPLES}}/invoice.pdf`). Defaults are applied in written order and an
+/// earlier one is visible to a later one, which makes that composition
+/// predictable rather than order-of-iteration luck. Nothing is applied
+/// recursively: a default referencing a name that is itself only defaulted
+/// later is left as written, exactly as [`substitute`] leaves any unresolved
+/// placeholder.
+///
+/// Returns the caller's map untouched (borrowed) when the request declares no
+/// parameters — the overwhelmingly common case, and a send is hot enough that
+/// cloning every variable for nothing is worth avoiding.
+pub fn effective_vars<'a>(
+    base: &HurlEntry,
+    vars: &'a HashMap<String, String>,
+) -> Cow<'a, HashMap<String, String>> {
+    let defaults = base.variable_defaults();
+    if defaults.is_empty() {
+        return Cow::Borrowed(vars);
+    }
+    let mut merged = vars.clone();
+    for (name, value) in defaults {
+        if merged.contains_key(&name) {
+            continue;
+        }
+        let value = substitute(&value, &merged);
+        merged.insert(name, value);
+    }
+    Cow::Owned(merged)
+}
+
+/// Remove the `variable:` rows from a run entry's `[Options]`, having already
+/// folded them into the variable set via [`effective_vars`].
+///
+/// Left in, they would undo the default semantics for everything
+/// [`resolve_entry`] does not substitute in Rust — `[Captures]` and `[Asserts]`
+/// templates are resolved by Hurl itself, and Hurl treats the option as an
+/// assignment that beats the passed-in variables. A report binding `FILE` would
+/// then see its value in the URL and the request's sample value in an assert,
+/// which is the sort of half-applied override that takes a day to find.
+///
+/// Dropping them also closes the documented oddity that a `variable:` option
+/// leaks into *subsequent* entries of the same file, unlike every other option.
+fn strip_variable_options(entry: &mut HurlEntry) {
+    entry
+        .options
+        .retain(|r| !(r.enabled && r.key.trim().eq_ignore_ascii_case("variable")));
+}
+
+/// The whole-file counterpart of [`strip_variable_options`]: drop only the
+/// `variable:` rows whose name the caller has **already bound**, and report
+/// whether anything was removed.
+///
+/// A whole-collection run (the TUI's "Run All" in batch mode, `paperboy -c …`)
+/// hands the serialized file to Hurl without resolving it in Rust first, so
+/// Hurl applies the remaining defaults itself — which is exactly what is wanted
+/// for a name nobody bound. Removing just the bound ones therefore produces the
+/// same "default unless overridden" reading as the single-request path, with no
+/// second implementation of the precedence rule.
+///
+/// One residual difference is Hurl's, not ours: a surviving default still leaks
+/// into the entries *after* it in the same file (the documented exception to
+/// per-entry options). That is what a hand-written `.hurl` does today, so it is
+/// left alone rather than silently changed.
+pub fn strip_bound_variable_options(
+    entries: &mut [HurlEntry],
+    vars: &HashMap<String, String>,
+) -> bool {
+    let mut stripped = false;
+    for entry in entries {
+        let bound: Vec<String> = entry
+            .variable_defaults()
+            .into_iter()
+            .filter(|(name, _)| vars.contains_key(name))
+            .map(|(name, _)| name)
+            .collect();
+        if bound.is_empty() {
+            continue;
+        }
+        entry.options.retain(|r| {
+            let is_bound_default = r.enabled
+                && r.key.trim().eq_ignore_ascii_case("variable")
+                && r.value
+                    .split_once('=')
+                    .is_some_and(|(name, _)| bound.iter().any(|b| b == name.trim()));
+            !is_bound_default
+        });
+        stripped = true;
+    }
+    stripped
+}
+
 /// Run one already-chosen `base` entry with `vars` through the full per-request
 /// pipeline used for a normal single-request send — base64-form expansion →
 /// out-of-scope form-file staging → content-length defaulting → `to_hurl` →
@@ -629,9 +746,16 @@ pub fn run_resolved_entry(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> RunOutput {
-    let resolved = resolve_entry(base, vars);
+    // Declared parameters are resolved *here*, not left to Hurl's own late
+    // binding, because everything downstream works on resolved text: an
+    // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
+    // `stage_out_of_scope_form_files` as a literal filename, fail to stage, and
+    // then be rejected by Hurl's file sandbox when it finally did resolve.
+    let vars = effective_vars(base, vars);
+    let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
     run_entry.captures.extend(extra_captures.iter().cloned());
+    strip_variable_options(&mut run_entry);
 
     let mut entries = [run_entry];
     if let Err(e) = expand_base64_form_fields(&mut entries, file_root) {
@@ -646,20 +770,24 @@ pub fn run_resolved_entry(
     let run_root = staged_dir.as_deref().or(file_root);
 
     let content = run_entry.to_hurl();
-    let out = run_hurl(&content, vars, run_root);
+    let out = run_hurl(&content, &vars, run_root);
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
     out
 }
 
-/// Human-readable error for the one Hurl request shape that can never be
-/// built: a `[Form]`/`[Multipart]` section together with a raw `[Body]`.
-/// Hurl's own parser rejects this (a body ends the entry, so a following
-/// `[Form]`/`[Multipart]` header is a syntax error) but with a cryptic
-/// message; detecting it ourselves lets us surface something the user can
-/// act on directly on the status bar.
-const BODY_FORM_CONFLICT_ERROR: &str = "Can't send: a request can't have both a Body and Form/Multipart fields (Hurl doesn't support combining them) — remove one.";
+/// Human-readable error for the one request shape that must never be sent: a
+/// `[Form]`/`[Multipart]` section together with a raw body.
+///
+/// Hurl builds both onto the same libcurl handle, so the body overwrites the
+/// form and the fields never leave the machine — while the `Content-Type` is
+/// still chosen from the form, so the body goes out mislabelled. Nothing
+/// errors: the request returns a perfectly good response to something the user
+/// never asked for. Both front-ends refuse such a request before it gets here
+/// (see [`body_form_conflicts`]); this is the backstop for every other caller,
+/// and for a `.hurl` edited by hand.
+const BODY_FORM_CONFLICT_ERROR: &str = "Can't send: a request can't have both a Body and Form/Multipart fields (Hurl sends the body and silently drops the fields) — remove one.";
 
 /// Run the collection's selected entry on a background thread via the Hurl
 /// runner, mapping the result (status, body, headers, `[Asserts]`, error) into
@@ -676,7 +804,7 @@ pub fn run_collection(
     state: Arc<Mutex<ApiResponse>>,
 ) -> Option<Receiver<CaptureUpdate>> {
     let base = col.entries.get(col.selected_entry)?;
-    if base.body.is_some() && !base.form_fields.is_empty() {
+    if base.body_form_conflict() {
         let mut r = state.lock().unwrap();
         r.loading = false;
         r.error = BODY_FORM_CONFLICT_ERROR.to_string();
@@ -772,11 +900,7 @@ pub fn run_all_entries(
     if col.entries.is_empty() {
         return None;
     }
-    if let Some(bad) = col
-        .entries
-        .iter()
-        .find(|e| e.body.is_some() && !e.form_fields.is_empty())
-    {
+    if let Some(bad) = col.entries.iter().find(|e| e.body_form_conflict()) {
         let mut r = state.lock().unwrap();
         r.loading = false;
         r.error = format!("{} ({})", BODY_FORM_CONFLICT_ERROR, bad.title);
@@ -811,6 +935,11 @@ pub fn run_all_entries(
         for e in &mut run_entries {
             e.ensure_run_content_length();
         }
+        // A request's own `[Options] variable:` rows are defaults, so any name
+        // the environment/captures already bind must not be re-assigned by the
+        // request itself (Hurl's own reading). The rest stay in and Hurl
+        // applies them, which is what a default should do.
+        strip_bound_variable_options(&mut run_entries, &vars);
         let content = collection_to_hurl(&run_entries);
 
         let mut results: Vec<Option<bool>> = vec![None; total];
@@ -1010,6 +1139,99 @@ pub fn pending_request_keys_all(col: &Collection, env: Option<&Environment>) -> 
     blocking.sort();
     blocking.dedup();
     blocking
+}
+
+/// Every variable name the collection can supply a value for, whether or not it
+/// has one yet: the environment's variables, every `[Captures]` name any request
+/// defines, and anything already captured this session.
+///
+/// A `[Captures]` name counts as defined even before it holds a value, because
+/// a collection that logs in and then uses `{{ token }}` is correct — the value
+/// arrives mid-run. Treating those as undefined would put a warning on every
+/// well-formed collection, which is the fastest way to teach someone to ignore
+/// warnings.
+fn defined_keys(col: &Collection, env: Option<&Environment>) -> std::collections::HashSet<String> {
+    let mut defined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(env) = env {
+        defined.extend(env.vars.iter().map(|v| v.key.clone()));
+    }
+    for entry in &col.entries {
+        defined.extend(entry.captures.iter().map(|(name, _)| name.clone()));
+    }
+    defined.extend(col.captures.keys().cloned());
+    defined
+}
+
+/// Variables the selected request references that nothing defines — the typo'd
+/// `{{ tokn }}`, or the whole environment nobody remembered to activate.
+///
+/// Unlike [`pending_request_keys`] this does **not** block the run: sending a
+/// literal `{{ tokn }}` is legal (Hurl will do it), and a front-end may have
+/// good reason to. It is reported instead, loudly, because the failure it
+/// causes otherwise surfaces as an unexplained 401 several steps later.
+/// Sorted for stable display.
+pub fn undefined_request_keys(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let Some(entry) = col.entries.get(col.selected_entry) else {
+        return Vec::new();
+    };
+    let defined = defined_keys(col, env);
+    let mut out: Vec<String> = entry_referenced_keys(entry)
+        .into_iter()
+        .filter(|k| !defined.contains(k))
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`undefined_request_keys`] across every entry in the collection — used by
+/// "Run All", which sends all of them.
+pub fn undefined_request_keys_all(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let defined = defined_keys(col, env);
+    let mut out: Vec<String> = col
+        .entries
+        .iter()
+        .flat_map(entry_referenced_keys)
+        .filter(|k| !defined.contains(k))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The name of the selected request if it carries both a raw body and enabled
+/// form fields, which Hurl cannot send together — see
+/// [`HurlEntry::body_form_conflict`](crate::hurl::HurlEntry::body_form_conflict).
+///
+/// Unlike [`undefined_request_keys`] this *does* block the run. An undefined
+/// variable is sent literally and fails visibly; this one succeeds while
+/// quietly dropping every form field, so the only way for a user to find out is
+/// to notice that the server behaved as though the fields were never there.
+pub fn body_form_conflicts(col: &Collection) -> Vec<String> {
+    col.entries
+        .get(col.selected_entry)
+        .filter(|e| e.body_form_conflict())
+        .map(|e| vec![request_label(e)])
+        .unwrap_or_default()
+}
+
+/// [`body_form_conflicts`] across every entry — used by "Run All".
+pub fn body_form_conflicts_all(col: &Collection) -> Vec<String> {
+    col.entries
+        .iter()
+        .filter(|e| e.body_form_conflict())
+        .map(request_label)
+        .collect()
+}
+
+/// How a request is named in a message about it: its title, or its method and
+/// URL when it hasn't been given one (an untitled request is still worth
+/// pointing at).
+fn request_label(e: &crate::hurl::HurlEntry) -> String {
+    if e.title.trim().is_empty() {
+        format!("{} {}", e.method, e.url)
+    } else {
+        e.title.clone()
+    }
 }
 
 /// Drain background secret-resolution results, applying each to the matching
@@ -1333,6 +1555,121 @@ mod tests {
         );
     }
 
+    // ── Undefined variables ───────────────────────────────────────────────
+
+    fn plain_var(key: &str, value: &str) -> EnvVar {
+        EnvVar {
+            key: key.into(),
+            value: value.into(),
+            source: ValueSource::Literal,
+            resolved: true,
+            loading: false,
+            original_value: value.into(),
+            modified: false,
+            user_added: false,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_variable_no_one_defines_is_reported() {
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ BASE_URL }}/{{ tokn }}".into(),
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+        let env = env_with(vec![plain_var("BASE_URL", "http://x")]);
+
+        assert_eq!(
+            undefined_request_keys(&col, Some(&env)),
+            vec!["tokn".to_string()],
+            "the typo is named; the variable that exists is not"
+        );
+    }
+
+    #[test]
+    fn a_capture_name_counts_as_defined_before_it_has_a_value() {
+        // The "log in, then use {{ token }}" shape: the value only exists
+        // mid-run, but the collection is correct and must not be flagged.
+        let login = HurlEntry {
+            method: "POST".into(),
+            url: "http://x/login".into(),
+            captures: vec![("token".into(), "jsonpath \"$.token\"".into())],
+            ..Default::default()
+        };
+        let use_it = HurlEntry {
+            method: "GET".into(),
+            url: "http://x/me?t={{ token }}".into(),
+            ..Default::default()
+        };
+        let mut col = Collection::new("c".into(), vec![login, use_it]);
+        col.selected_entry = 1;
+
+        assert!(
+            undefined_request_keys(&col, None).is_empty(),
+            "a captured name is defined even before the capture has run"
+        );
+    }
+
+    #[test]
+    fn a_pending_secret_is_defined_not_undefined() {
+        // It has a source and is on its way — that's WaitingSecrets' job to
+        // report, and double-reporting it would be noise.
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ API_TOKEN }}".into(),
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+        let env = env_with(vec![secret_var("API_TOKEN", false, true)]);
+
+        assert!(undefined_request_keys(&col, Some(&env)).is_empty());
+    }
+
+    #[test]
+    fn with_no_environment_active_every_referenced_variable_is_undefined() {
+        let entry = HurlEntry {
+            method: "GET".into(),
+            url: "{{ BASE_URL }}/x".into(),
+            headers: vec![KvRow::toggled(
+                "Authorization",
+                "Bearer {{ API_KEY }}",
+                true,
+            )],
+            ..Default::default()
+        };
+        let col = Collection::new("c".into(), vec![entry]);
+
+        assert_eq!(
+            undefined_request_keys(&col, None),
+            vec!["API_KEY".to_string(), "BASE_URL".to_string()],
+            "sorted, and headers are scanned as well as the URL"
+        );
+    }
+
+    #[test]
+    fn undefined_request_keys_all_checks_every_entry_and_dedupes() {
+        let first = HurlEntry {
+            method: "GET".into(),
+            url: "{{ nope }}/a".into(),
+            ..Default::default()
+        };
+        let second = HurlEntry {
+            method: "GET".into(),
+            url: "{{ nope }}/b".into(),
+            ..Default::default()
+        };
+        let mut col = Collection::new("c".into(), vec![first, second]);
+        col.selected_entry = 0;
+
+        assert_eq!(
+            undefined_request_keys_all(&col, None),
+            vec!["nope".to_string()],
+            "reported once, not once per entry that uses it"
+        );
+    }
+
     // ── Captures ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1476,6 +1813,7 @@ mod tests {
             form_fields: vec![FormField {
                 key: "f".into(),
                 value: "v".into(),
+                enabled: true,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1606,5 +1944,177 @@ mod tests {
             "example.test/{{ TOK }}/{{ NOPE }}",
             "known values are substituted; pending and unknown placeholders are kept",
         );
+    }
+
+    // --- request-level parameter defaults ---------------------------------
+
+    /// A request that declares a parameter and is opened on its own runs with
+    /// the author's sample value — the whole point of the feature: the request
+    /// stays usable outside the report that drives it.
+    #[test]
+    fn a_declared_parameter_supplies_its_default_when_nobody_binds_it() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::new();
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(
+            effective.get("FILE"),
+            Some(&"./samples/invoice.pdf".to_string()),
+        );
+        assert_eq!(
+            resolve_entry(&entry, &effective).form_fields[0].value,
+            "./samples/invoice.pdf",
+            "the default reaches the multipart file field as a real path",
+        );
+    }
+
+    /// The same request driven from a PaperTrail loop takes the loop's value.
+    /// Hurl's own reading of an `[Options] variable:` row is the opposite (it
+    /// overwrites the caller), so this is the flip that makes one request serve
+    /// both a person and a report.
+    #[test]
+    fn a_caller_binding_beats_the_declared_default() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(effective.get("FILE"), Some(&"./inbox/real.pdf".to_string()));
+    }
+
+    /// The bound row is removed from the entry that is handed to Hurl, so the
+    /// request cannot re-assert its own value in the parts PaperBoy does not
+    /// substitute itself (`[Captures]`/`[Asserts]`).
+    #[test]
+    fn the_run_entry_never_carries_a_variable_option_to_hurl() {
+        let entry = param_entry("FILE", "./samples/invoice.pdf");
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        let mut run_entry = to_run_entry(&entry, resolve_entry(&entry, &vars));
+        strip_variable_options(&mut run_entry);
+
+        assert!(
+            run_entry.options.iter().all(|r| r.key != "variable"),
+            "a variable: row would override the caller inside Hurl",
+        );
+        assert!(
+            run_entry.options.iter().any(|r| r.key == "retry"),
+            "behavioural options are untouched",
+        );
+    }
+
+    /// A whole-collection run hands the file to Hurl unresolved, so only the
+    /// *bound* defaults are removed — the rest stay in for Hurl to apply, which
+    /// is what a default should do.
+    #[test]
+    fn a_whole_file_run_strips_only_the_defaults_the_caller_bound() {
+        let mut entries = vec![param_entry("FILE", "./samples/invoice.pdf")];
+        entries[0]
+            .options
+            .push(KvRow::new("variable", "MODE=draft"));
+        let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
+
+        assert!(strip_bound_variable_options(&mut entries, &vars));
+
+        let rows: Vec<&str> = entries[0]
+            .options
+            .iter()
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["3", "MODE=draft"],
+            "the bound FILE default is gone; the unbound MODE default survives",
+        );
+    }
+
+    /// Nothing to strip means nothing to re-serialize: the CLI runs a plain
+    /// `.hurl` file verbatim, and round-tripping one nobody parameterised would
+    /// be churn for its own sake.
+    #[test]
+    fn a_whole_file_run_reports_when_it_changed_nothing() {
+        let mut entries = vec![param_entry("FILE", "./samples/invoice.pdf")];
+
+        assert!(!strip_bound_variable_options(&mut entries, &HashMap::new()));
+        assert_eq!(entries[0].options.len(), 2);
+    }
+
+    /// One parameter may be written in terms of another, and in terms of a
+    /// caller-supplied variable — defaults are applied in written order so the
+    /// composition is predictable rather than hash-order luck.
+    #[test]
+    fn a_default_may_reference_another_variable() {
+        let mut entry = param_entry("SAMPLES", "{{ROOT}}/samples");
+        entry
+            .options
+            .push(KvRow::new("variable", "DOC={{SAMPLES}}/invoice.pdf"));
+        let vars = HashMap::from([("ROOT".to_string(), "/srv".to_string())]);
+
+        let effective = effective_vars(&entry, &vars);
+
+        assert_eq!(effective.get("SAMPLES"), Some(&"/srv/samples".to_string()));
+        assert_eq!(
+            effective.get("DOC"),
+            Some(&"/srv/samples/invoice.pdf".to_string()),
+        );
+    }
+
+    /// `[Options]` is a free-text grid the user may be mid-way through typing.
+    /// A half-written row is ignored, never an error that refuses the send.
+    #[test]
+    fn malformed_and_disabled_parameter_rows_are_ignored() {
+        let mut entry = param_entry("FILE", "./samples/invoice.pdf");
+        entry.options = vec![
+            KvRow::new("variable", "no-equals-sign"),
+            KvRow::new("variable", "=novalue"),
+            KvRow::new("variable", "SPACED NAME=x"),
+            KvRow::toggled("variable", "OFF=x", false),
+            KvRow::new("VARIABLE", "SHOUTED=y"),
+        ];
+
+        assert_eq!(
+            entry.variable_defaults(),
+            vec![("SHOUTED".to_string(), "y".to_string())],
+            "only the well-formed enabled row counts, and the option name is \
+             matched case-insensitively",
+        );
+    }
+
+    /// A request that declares nothing is handed the caller's own map, not a
+    /// clone of it — a send is hot enough that the common case should allocate
+    /// nothing.
+    #[test]
+    fn a_request_without_parameters_borrows_the_callers_variables() {
+        let entry = me_entry();
+        let vars = HashMap::from([("TOKEN".to_string(), "abc".to_string())]);
+
+        assert!(matches!(
+            effective_vars(&entry, &vars),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// A request declaring `FILE` for a `[Multipart]` file field — the case the
+    /// feature exists for.
+    fn param_entry(name: &str, default: &str) -> HurlEntry {
+        HurlEntry {
+            title: "upload_document".into(),
+            method: "POST".into(),
+            url: "https://example.test/documents".into(),
+            options: vec![
+                KvRow::new("retry", "3"),
+                KvRow::new("variable", format!("{name}={default}")),
+            ],
+            is_multipart: true,
+            form_fields: vec![FormField {
+                key: "file".into(),
+                value: format!("{{{{{name}}}}}"),
+                kind: FormFieldKind::File,
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
     }
 }

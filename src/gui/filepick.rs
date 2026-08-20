@@ -104,6 +104,19 @@ pub fn spawn<A>(kind: PickKind, title: &str, dir: Option<&Path>, action: A) -> P
     }
 }
 
+/// A handle that has *already* answered, for tests: `spawn` opens no dialog
+/// under `cfg(test)` and so can only ever resolve as a cancel, which leaves the
+/// "the user actually chose something" half of every caller unexercised.
+#[cfg(test)]
+pub fn resolved<A>(action: A, path: Option<PathBuf>) -> PendingPick<A> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = tx.send(path);
+    PendingPick {
+        rx,
+        action: Some(action),
+    }
+}
+
 /// The blocking half of [`spawn`], on its own thread.
 #[cfg(not(test))]
 fn spawn_dialog(

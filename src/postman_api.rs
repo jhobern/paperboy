@@ -939,8 +939,11 @@ mod tests {
         assert_eq!(ws[0].kind, WorkspaceKind::Other("something-new".into()));
     }
 
+    /// How a paged listing is walked. Grouped: each case is one canned page
+    /// sequence and one assertion about how many items came back.
     #[test]
-    fn workspace_listing_follows_the_cursor_until_it_runs_out() {
+    fn a_listing_is_followed_to_the_end_and_no_further() {
+        // The cursor is followed until a page arrives without one.
         let (c, _) = client(vec![
             ok(
                 r#"{"workspaces":[{"id":"w1","name":"A","type":"team"}],"meta":{"nextCursor":"abc"}}"#,
@@ -949,10 +952,7 @@ mod tests {
         ]);
         let (ws, _) = c.list_workspaces(&[]).unwrap();
         assert_eq!(ws.len(), 2);
-    }
 
-    #[test]
-    fn a_cursor_that_never_advances_terminates_instead_of_looping_forever() {
         // Same cursor every time and the same page — a well-behaved client must
         // still stop.
         let page =
@@ -960,8 +960,14 @@ mod tests {
         let (c, _) = client(vec![ok(page), ok(page), ok(page), ok(page)]);
         let (ws, _) = c.list_workspaces(&[]).unwrap();
         assert_eq!(ws.len(), 1, "the repeated page is not counted twice");
-    }
 
+        // No `meta` at all is one complete page, not an invitation to ask again.
+        let (c, _) = client(vec![ok(
+            r#"{"collections":[{"id":"c0","uid":"u0","name":"Only"}]}"#,
+        )]);
+        let (items, _) = c.list_collections("ws").unwrap();
+        assert_eq!(items.len(), 1, "no second request is made without meta");
+    }
     #[test]
     fn collections_paginate_by_offset_until_meta_total_is_reached() {
         let page1 = format!(
@@ -1003,15 +1009,6 @@ mod tests {
             ],
             "the cursor is passed back percent-encoded"
         );
-    }
-
-    #[test]
-    fn a_listing_without_meta_is_treated_as_one_complete_page() {
-        let (c, _) = client(vec![ok(
-            r#"{"collections":[{"id":"c0","uid":"u0","name":"Only"}]}"#,
-        )]);
-        let (items, _) = c.list_collections("ws").unwrap();
-        assert_eq!(items.len(), 1, "no second request is made without meta");
     }
 
     #[test]
@@ -1060,25 +1057,24 @@ mod tests {
         assert!(matches!(c.get_collection("u-1"), Err(ApiError::Parse(_))));
     }
 
+    /// How a call is addressed and authenticated. Grouped: each case inspects
+    /// the same recorded request from a different angle.
     #[test]
-    fn ids_are_percent_encoded_into_the_query_so_they_cannot_alter_it() {
+    fn calls_are_addressed_and_authenticated_as_the_api_expects() {
+        // Ids reach the query percent-encoded, so they cannot alter it.
         let (c, rec) = client(vec![ok(r#"{"environments":[]}"#)]);
         c.list_environments("a b/c&d").unwrap();
         assert_eq!(
             rec.urls(),
             vec!["https://api.postman.com/environments?workspace=a%20b%2Fc%26d"]
         );
-    }
 
-    #[test]
-    fn the_api_key_is_sent_as_the_x_api_key_header_value_on_every_call() {
+        // The key travels as the X-Api-Key header value on every call.
         let (c, rec) = client(vec![ok(r#"{"environments":[]}"#)]);
         c.list_environments("ws").unwrap();
         assert_eq!(rec.keys.lock().unwrap().as_slice(), ["secret-key"]);
-    }
 
-    #[test]
-    fn the_base_url_is_configurable_for_eu_tenants_and_its_trailing_slash_ignored() {
+        // The base URL is configurable for EU tenants, trailing slash ignored.
         let (transport, rec) = FakeTransport::new(vec![ok(r#"{"workspaces":[]}"#)]);
         let c =
             PostmanClient::with_transport("k".into(), Some(format!("{EU_BASE_URL}/")), transport);
@@ -1089,7 +1085,6 @@ mod tests {
             "no doubled slash, and the EU host is used"
         );
     }
-
     #[test]
     fn http_statuses_map_onto_their_api_errors() {
         let cases: Vec<(u16, &str, ApiError)> = vec![

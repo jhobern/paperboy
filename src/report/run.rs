@@ -46,8 +46,8 @@ use crate::hurl::{EntryOutcome, RunOutput};
 
 use super::compare::{CORRECT_COLUMN, RESULT_COLUMN, TREND_COLUMN};
 use super::flow::{
-    Binder, Element, EnvClause, FlowNode, ParallelSpec, Pattern, Producer, ReportFlow, ReportStmt,
-    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
+    Binder, Element, EnvClause, FlowNode, OverrideTarget, ParallelSpec, Pattern, Producer,
+    ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
 use super::model::{ReportResult, ReportRow, Trend, Verdict};
 use super::producers::{self, ProducerItem};
@@ -782,8 +782,8 @@ impl<'a> Exec<'a> {
                         Err(e) => self.errors.push(e),
                     }
                 }
-                FlowNode::Request { name } => {
-                    self.run_request(name);
+                FlowNode::Request { name, using } => {
+                    self.run_request(name, using);
                 }
                 FlowNode::Report(stmt) => {
                     let cells = self.eval_report(stmt);
@@ -869,7 +869,7 @@ impl<'a> Exec<'a> {
     /// Send a request by name (no column emitted), threading its captures
     /// forward. Records an error (but does not abort) if the name is unresolved
     /// or the send fails.
-    fn run_request(&mut self, name: &str) -> Option<EntryOutcome> {
+    fn run_request(&mut self, name: &str, using: &[UsingItem]) -> Option<EntryOutcome> {
         let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
@@ -879,6 +879,13 @@ impl<'a> Exec<'a> {
             }
         };
         let vars = self.vars_for();
+        let base = match self.apply_using(name, base, using, &vars) {
+            Ok(base) => base,
+            Err(e) => {
+                self.errors.push(e);
+                return None;
+            }
+        };
         let out = self.ctx.runner.run(&base, &vars);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
@@ -890,6 +897,56 @@ impl<'a> Exec<'a> {
             }
         }
         eo
+    }
+
+    /// Apply a statement's `USING(…)` clause to the resolved request.
+    ///
+    /// Both halves of the clause are enforced *before the send*, which is the
+    /// point of having it: a flow copied onto a collection whose request was
+    /// never parameterised must fail loudly rather than quietly send the
+    /// request's own hardcoded value and report a perfectly healthy `200`.
+    /// Validation catches the same mistakes when the report is opened; this is
+    /// the backstop for a run started against a collection that has changed
+    /// since, or from a front-end path that skipped validation.
+    ///
+    /// `Err` means "do not send" — the caller turns it into a row error (and,
+    /// for a reported request, an `Error` cell).
+    fn apply_using(
+        &self,
+        name: &str,
+        mut base: HurlEntry,
+        using: &[UsingItem],
+        vars: &HashMap<String, String>,
+    ) -> Result<HurlEntry, String> {
+        for item in using {
+            match item {
+                UsingItem::Require(param) => {
+                    if !base.declares_variable(param) {
+                        let declared = base.variable_defaults();
+                        let declared = if declared.is_empty() {
+                            "none".to_string()
+                        } else {
+                            declared
+                                .iter()
+                                .map(|(n, _)| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        return Err(format!(
+                            "request '{name}' does not declare a parameter '{param}' \
+                             (declares: {declared}) — add `variable: {param}=…` to its \
+                             [Options] section"
+                        ));
+                    }
+                }
+                UsingItem::Override { target, value } => {
+                    let value = substitute(value, vars);
+                    apply_override(&mut base, target, value)
+                        .map_err(|e| format!("request '{name}': {e}"))?;
+                }
+            }
+        }
+        Ok(base)
     }
 
     /// Evaluate a `REPORT` statement into cells for the current row. Cells are
@@ -911,11 +968,20 @@ impl<'a> Exec<'a> {
             ReportStmt::Request {
                 name,
                 alias,
+                using,
                 response_fmt,
                 show,
                 hide,
                 with,
-            } => self.eval_report_request(name, alias.as_deref(), *response_fmt, show, hide, with),
+            } => self.eval_report_request(
+                name,
+                alias.as_deref(),
+                using,
+                *response_fmt,
+                show,
+                hide,
+                with,
+            ),
         }
     }
 
@@ -954,6 +1020,7 @@ impl<'a> Exec<'a> {
         &mut self,
         name: &str,
         alias: Option<&str>,
+        using: &[UsingItem],
         response_fmt: Option<ResponseFmt>,
         show: &[ShowField],
         hide: &[String],
@@ -978,6 +1045,17 @@ impl<'a> Exec<'a> {
         };
 
         let vars = self.vars_for();
+        // An unmet `USING` requirement means the request would send something
+        // other than what the flow asked for, so it is not sent at all: the row
+        // gets an `Error` cell instead of a plausible-looking success.
+        let base = match self.apply_using(name, base, using, &vars) {
+            Ok(base) => base,
+            Err(e) => {
+                self.errors.push(e.clone());
+                cells.push((format!("{alias}.Error"), e));
+                return cells;
+            }
+        };
         let out = self.ctx.runner.run(&base, &vars);
         let eo = match out.entries.into_iter().next() {
             Some(eo) => eo,
@@ -1470,6 +1548,98 @@ impl<'a> Exec<'a> {
 
 // --- helpers ---------------------------------------------------------------
 
+/// Patch one field of a request for a single call (`USING(target = "value")`).
+///
+/// Two different rules, because two different risks:
+///
+/// * `header`/`query`/`cookie`/`option` are **upserted**. Adding a header the
+///   request never had (`header.X-Run-Id`) is a normal thing to want, and a
+///   mistyped header name costs nothing worse than an ignored header.
+/// * `form`/`multipart` fields must **already exist**. These describe the shape
+///   of a payload the request's author designed; inventing a field because
+///   `multipart.fil` was mistyped would send a subtly wrong body and report a
+///   healthy `200`, which is the exact failure this whole feature exists to
+///   prevent. A typo is an error instead.
+///
+/// A disabled row that is targeted is re-enabled: an override says "send this
+/// value", and honouring the value while leaving the row switched off would be
+/// a null-op nobody could explain.
+fn apply_override(
+    entry: &mut HurlEntry,
+    target: &OverrideTarget,
+    value: String,
+) -> Result<(), String> {
+    fn upsert(rows: &mut Vec<crate::hurl::KvRow>, key: &str, value: String) {
+        match rows.iter_mut().find(|r| r.key == key) {
+            Some(row) => {
+                row.value = value;
+                row.enabled = true;
+            }
+            None => rows.push(crate::hurl::KvRow::new(key, value)),
+        }
+    }
+
+    match target {
+        OverrideTarget::Url => entry.url = value,
+        OverrideTarget::Body => entry.body = Some(value),
+        OverrideTarget::Header(k) => upsert(&mut entry.headers, k, value),
+        OverrideTarget::Query(k) => upsert(&mut entry.queries, k, value),
+        OverrideTarget::Cookie(k) => upsert(&mut entry.cookies, k, value),
+        OverrideTarget::Option(k) => upsert(&mut entry.options, k, value),
+        OverrideTarget::Form(k) | OverrideTarget::Multipart(k) => {
+            match entry.form_fields.iter_mut().find(|f| &f.key == k) {
+                Some(field) => {
+                    // A file row *stores* the path alone: `file,PATH; TYPE` is
+                    // the Hurl spelling of it, added back when the request is
+                    // serialized. Someone who copies that spelling out of the
+                    // collection into an override — the obvious thing to do,
+                    // since it is what the row looks like on screen — means the
+                    // same thing by it, so read it rather than nesting it. Left
+                    // alone it produced `file,file,/a/b\;video/webm; video/webm`
+                    // and a file-not-found naming a path nobody wrote.
+                    if field.kind.is_multipart()
+                        && let Some(spec) = value.strip_prefix("file,")
+                    {
+                        let parsed = crate::hurl::parse_file_form_value(k, spec);
+                        field.value = parsed.value;
+                        // A spelling that names no content type keeps the row's
+                        // own, which is the collection's considered answer.
+                        if parsed.content_type.is_some() {
+                            field.content_type = parsed.content_type;
+                        }
+                    } else {
+                        field.value = value;
+                    }
+                    field.enabled = true;
+                }
+                None => {
+                    let known: Vec<&str> =
+                        entry.form_fields.iter().map(|f| f.key.as_str()).collect();
+                    let known = if known.is_empty() {
+                        "it has no form fields".to_string()
+                    } else {
+                        format!("it has: {}", known.join(", "))
+                    };
+                    let section = match target {
+                        OverrideTarget::Form(_) => "form",
+                        _ => "multipart",
+                    };
+                    return Err(format!("has no {section} field '{k}' ({known})"));
+                }
+            }
+        }
+        OverrideTarget::BasicAuthUser => {
+            let (_, pass) = entry.basic_auth.clone().unwrap_or_default();
+            entry.basic_auth = Some((value, pass));
+        }
+        OverrideTarget::BasicAuthPass => {
+            let (user, _) = entry.basic_auth.clone().unwrap_or_default();
+            entry.basic_auth = Some((user, value));
+        }
+    }
+    Ok(())
+}
+
 /// The leaf (last `/`-segment) of a request title — the default alias.
 fn leaf(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
@@ -1582,11 +1752,30 @@ fn string_arg(s: &str) -> Option<String> {
 }
 
 /// Evaluate a minimal JSONPath (`$`, `.key`, `["key"]`/`['key']`, `[index]`)
-/// against a JSON value. Deliberately small — it covers the paths report fields
-/// actually use; wildcards/recursive-descent/filters are a documented follow-up.
+/// against a JSON value, plus the one filter shape that real payloads force on
+/// a report: `[?(@.key == 'x')]`.
+///
+/// The filter is not generality for its own sake. An API that returns its
+/// fields as a *list of key/value objects* — `CardInfo`, `files`, `breakdown`
+/// — has no addressable path to a named field at all without one, so every
+/// column reading such a payload would otherwise have to be captured in the
+/// collection and read back through a computed column. Supported comparisons
+/// are `==` and `!=` against a quoted string or a number; `@.key` may be any
+/// dotted path within the element.
+///
+/// Wildcards and recursive descent remain unimplemented.
 fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
     let rest = path.strip_prefix('$')?;
-    let mut cur = root;
+    // A filter turns one node into *many*, so the walk carries a set rather
+    // than a single node. Before any filter the set is the single root, which
+    // is why the ordinary path shapes behave exactly as they did.
+    let mut cur: Vec<&serde_json::Value> = vec![root];
+    // Whether a filter has widened the walk. It decides how the result is
+    // returned: an un-filtered path yields the node it landed on, while a
+    // filtered one yields a list — collapsed to the bare value when it holds
+    // exactly one, which is what makes `[?(@.key=='full_name')].value` read as
+    // the string it matched rather than a one-element array.
+    let mut filtered = false;
     let bytes = rest.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1601,27 +1790,99 @@ fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Val
                 if key.is_empty() {
                     return None;
                 }
-                cur = cur.get(key)?;
+                cur = cur.iter().filter_map(|v| v.get(key)).collect();
             }
             b'[' => {
                 let end = rest[i..].find(']')? + i;
                 let inner = rest[i + 1..end].trim();
-                cur = if let Some(k) = inner
+                if let Some(pred) = inner.strip_prefix("?(").and_then(|s| s.strip_suffix(')')) {
+                    let pred = parse_filter(pred)?;
+                    cur = cur
+                        .iter()
+                        .flat_map(|v| v.as_array().map(|a| a.iter()).into_iter().flatten())
+                        .filter(|el| pred.matches(el))
+                        .collect();
+                    filtered = true;
+                } else if let Some(k) = inner
                     .strip_prefix('"')
                     .and_then(|k| k.strip_suffix('"'))
                     .or_else(|| inner.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
                 {
-                    cur.get(k)?
+                    cur = cur.iter().filter_map(|v| v.get(k)).collect();
                 } else {
                     let idx: usize = inner.parse().ok()?;
-                    cur.get(idx)?
-                };
+                    cur = cur.iter().filter_map(|v| v.get(idx)).collect();
+                }
                 i = end + 1;
             }
             _ => return None,
         }
+        // An un-filtered path that has run out of nodes is a miss, exactly as
+        // the `?` on `cur.get(...)` used to be.
+        if !filtered && cur.is_empty() {
+            return None;
+        }
     }
-    Some(cur.clone())
+    if filtered {
+        return match cur.len() {
+            0 => None,
+            1 => Some(cur[0].clone()),
+            _ => Some(serde_json::Value::Array(cur.into_iter().cloned().collect())),
+        };
+    }
+    cur.first().map(|v| (*v).clone())
+}
+
+/// A `[?(@.path == 'literal')]` predicate: the path within an element, whether
+/// the comparison is negated, and the value to compare against.
+struct JsonFilter {
+    path: String,
+    negated: bool,
+    value: serde_json::Value,
+}
+
+impl JsonFilter {
+    fn matches(&self, el: &serde_json::Value) -> bool {
+        // A path that doesn't exist in this element is not equal to anything —
+        // and *is* unequal to everything, so `!=` matches it. That mirrors the
+        // way an absent key behaves in every other JSONPath implementation.
+        let found = json_path_get(el, &self.path);
+        let eq = found.as_ref() == Some(&self.value);
+        eq != self.negated
+    }
+}
+
+/// Parse the inside of a `?(…)` predicate. Only `@.path == literal` and
+/// `@.path != literal` are recognised; anything else yields `None`, which
+/// leaves the whole query a miss rather than a silently wrong match.
+fn parse_filter(pred: &str) -> Option<JsonFilter> {
+    let (lhs, rhs, negated) = match pred.split_once("==") {
+        Some((l, r)) => (l, r, false),
+        None => {
+            let (l, r) = pred.split_once("!=")?;
+            (l, r, true)
+        }
+    };
+    let path = lhs.trim().strip_prefix('@')?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let rhs = rhs.trim();
+    let value = if let Some(s) = rhs
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| rhs.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+    {
+        serde_json::Value::String(s.to_string())
+    } else {
+        serde_json::from_str(rhs).ok()?
+    };
+    Some(JsonFilter {
+        // `json_path_get` wants a `$`-rooted path, and `@` is "this element".
+        path: format!("${path}"),
+        negated,
+        value,
+    })
 }
 
 /// Render a JSON value as a report cell: a string node yields its inner text
@@ -1666,6 +1927,10 @@ mod tests {
     struct Fake {
         canned: HashMap<String, Canned>,
         calls: Mutex<Vec<(String, HashMap<String, String>)>>,
+        /// Every entry as it was actually handed to the runner — the only way
+        /// to observe a `USING(target = …)` override, which patches the entry
+        /// rather than the variables.
+        sent: Mutex<Vec<HurlEntry>>,
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay_ms: u64,
@@ -1679,6 +1944,7 @@ mod tests {
                     .map(|(k, c)| (k.to_string(), c.clone()))
                     .collect(),
                 calls: Mutex::new(Vec::new()),
+                sent: Mutex::new(Vec::new()),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 delay_ms: 0,
@@ -1697,6 +1963,15 @@ mod tests {
                 .find(|(t, _)| t == title)
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
+        }
+        /// The entry sent for `title`, as the runner received it.
+        fn sent_entry(&self, title: &str) -> Option<HurlEntry> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.title == title)
+                .cloned()
         }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
@@ -1718,6 +1993,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((base.title.clone(), vars.clone()));
+            self.sent.lock().unwrap().push(base.clone());
             let c = self.canned.get(&base.title).cloned().unwrap_or_default();
             let eo = EntryOutcome {
                 method: base.method.clone(),
@@ -1889,6 +2165,235 @@ mod tests {
             res.rows[0].target.as_deref(),
             Some("staging-eu"),
             "the collapse kept the candidate row for the chosen comparison env"
+        );
+    }
+
+    // --- USING(…) ----------------------------------------------------------
+
+    /// A request that declares the parameter the statement requires runs
+    /// normally: `USING` asserts, it does not bind.
+    #[test]
+    fn a_satisfied_requirement_sends_the_request() {
+        let mut entries = vec![entry("upload", &[])];
+        entries[0].options = vec![crate::hurl::KvRow::new("variable", "FILE=./sample.pdf")];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nFILE=./real.pdf\nREQUEST upload USING(FILE)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_count(), 1);
+        assert_eq!(
+            fake.call_vars("upload").get("FILE").map(String::as_str),
+            Some("./real.pdf")
+        );
+    }
+
+    /// The case the clause exists for: a flow copied onto a collection whose
+    /// request was never parameterised. Nothing is sent, and the error names
+    /// the fix — as opposed to a healthy `200` for the wrong file.
+    #[test]
+    fn an_unmet_requirement_stops_the_send() {
+        let entries = vec![entry("upload", &[])];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nFILE=./real.pdf\nREQUEST upload USING(FILE)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert_eq!(fake.call_count(), 0, "the request must not be sent");
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0].contains("does not declare a parameter 'FILE'"),
+            "{:?}",
+            res.errors
+        );
+    }
+
+    /// A reported request that can't meet its requirement still produces a row,
+    /// with the reason in its `Error` cell — the report's standing contract.
+    #[test]
+    fn an_unmet_requirement_reports_an_error_cell() {
+        let entries = vec![entry("upload", &[])];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nREPORT REQUEST upload USING(FILE)\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert_eq!(res.rows.len(), 1);
+        assert!(
+            res.rows[0].cells["upload.Error"].contains("does not declare a parameter 'FILE'"),
+            "{:?}",
+            res.rows[0].cells
+        );
+    }
+
+    /// The override form patches the entry itself, for a request that can't be
+    /// parameterised (a read-only helper collection). The value is interpolated
+    /// against the row's scope like any other template.
+    #[test]
+    fn an_override_patches_the_entry_before_it_is_sent() {
+        let mut entries = vec![entry("upload", &[])];
+        entries[0].form_fields = vec![crate::hurl::FormField {
+            key: "file".into(),
+            value: "./sample.pdf".into(),
+            kind: crate::hurl::FormFieldKind::File,
+            enabled: true,
+            ..Default::default()
+        }];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nDOC=./real.pdf\nREQUEST upload USING(multipart.file = \"{{DOC}}\", header.X-Run = \"7\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let sent = fake.sent_entry("upload").expect("sent");
+        assert_eq!(sent.form_fields[0].value, "./real.pdf");
+        assert_eq!(
+            sent.headers
+                .iter()
+                .find(|h| h.key == "X-Run")
+                .map(|h| h.value.as_str()),
+            Some("7"),
+            "a header the request never had is added",
+        );
+    }
+
+    /// A file row's stored value is the path alone; `file,PATH; TYPE` is only
+    /// how a `.hurl` file spells it. Copying that spelling into an override is
+    /// the natural mistake — it is what the row looks like on screen — so it is
+    /// read rather than nested, which is what produced `file,file,…\;video/webm`
+    /// and a file-not-found naming a path nobody had written.
+    #[test]
+    fn a_file_override_may_be_written_the_way_the_collection_spells_it() {
+        let mut entries = vec![entry("upload", &[])];
+        entries[0].form_fields = vec![crate::hurl::FormField {
+            key: "clip".into(),
+            value: String::new(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: Some("video/webm".into()),
+            // Off until a flow asks for it: the disabled row is the whole
+            // reason someone reaches for this override in the first place.
+            enabled: false,
+            ..Default::default()
+        }];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nV=/tmp/a b.webm\nREQUEST upload USING(multipart.clip = \"file,{{V}};video/mp4\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let sent = fake.sent_entry("upload").expect("sent");
+        assert_eq!(
+            sent.form_fields[0].value, "/tmp/a b.webm",
+            "the path is the path, escaping and all"
+        );
+        assert_eq!(
+            sent.form_fields[0].content_type.as_deref(),
+            Some("video/mp4"),
+            "and a content type the spelling names replaces the row's"
+        );
+        assert!(
+            sent.form_fields[0].enabled,
+            "overriding a row switches it on"
+        );
+    }
+
+    /// Without that spelling the value is the path verbatim, and the row keeps
+    /// the content type the collection chose for it.
+    #[test]
+    fn a_bare_path_override_keeps_the_rows_own_content_type() {
+        let mut entries = vec![entry("upload", &[])];
+        entries[0].form_fields = vec![crate::hurl::FormField {
+            key: "clip".into(),
+            value: String::new(),
+            kind: crate::hurl::FormFieldKind::File,
+            content_type: Some("video/webm".into()),
+            enabled: false,
+            ..Default::default()
+        }];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        run(
+            "# collection: c\n\nREQUEST upload USING(multipart.clip = \"/tmp/a.webm\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        let sent = fake.sent_entry("upload").expect("sent");
+        assert_eq!(sent.form_fields[0].value, "/tmp/a.webm");
+        assert_eq!(
+            sent.form_fields[0].content_type.as_deref(),
+            Some("video/webm")
+        );
+    }
+
+    /// The collection's own entry is untouched: an override is per call, so the
+    /// next iteration (and every other statement) starts from the original.
+    #[test]
+    fn an_override_does_not_leak_into_the_collection() {
+        let mut entries = vec![entry("upload", &[])];
+        entries[0].url = "http://x/original".into();
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        run(
+            "# collection: c\n\nREQUEST upload USING(url = \"http://x/patched\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert_eq!(entries[0].url, "http://x/original");
+        assert_eq!(fake.sent_entry("upload").unwrap().url, "http://x/patched");
+    }
+
+    /// A `multipart`/`form` override must name a field the request has: a typo
+    /// would otherwise invent a field and send a subtly wrong body.
+    #[test]
+    fn an_override_of_a_missing_form_field_stops_the_send() {
+        let entries = vec![entry("upload", &[])];
+        let fake = Fake::new(&[("upload", Canned::default())]);
+
+        let res = run(
+            "# collection: c\n\nREQUEST upload USING(multipart.fil = \"x\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+
+        assert_eq!(fake.call_count(), 0);
+        assert!(
+            res.errors[0].contains("has no multipart field 'fil'"),
+            "{:?}",
+            res.errors
         );
     }
 
@@ -2670,6 +3175,54 @@ mod tests {
         let entries = [entry("p", &[("n", "jsonpath \"$.items[1].name\"")])];
         let res = run("REPORT REQUEST p\n", &entries, &[], &[], &fake);
         assert_eq!(res.rows[0].cells.get("p.n"), Some(&"second".to_string()));
+    }
+
+    /// The shape every key/value-list payload forces: address a field by the
+    /// value of a *sibling* key rather than by position.
+    #[test]
+    fn jsonpath_supports_filter_predicates() {
+        let body = "{\"CardInfo\":[\
+            {\"key\":\"full_name\",\"value\":\"Jane Citizen\"},\
+            {\"key\":\"birth_date\",\"value\":\"1990-01-01\"},\
+            {\"key\":\"tag\",\"value\":\"a\"},\
+            {\"key\":\"tag\",\"value\":\"b\"}],\
+            \"nums\":[{\"n\":1,\"v\":\"one\"},{\"n\":2,\"v\":\"two\"}]}";
+        let fake = Fake::new(&[(
+            "p",
+            Canned {
+                status: 200,
+                raw_body: body.into(),
+                ..Default::default()
+            },
+        )]);
+        let entries = [entry(
+            "p",
+            &[
+                (
+                    "name",
+                    "jsonpath \"$.CardInfo[?(@.key=='full_name')].value\"",
+                ),
+                (
+                    "dob",
+                    "jsonpath \"$.CardInfo[?(@.key == \\\"birth_date\\\")].value\"",
+                ),
+                // Several matches stay a list rather than silently picking one.
+                ("tags", "jsonpath \"$.CardInfo[?(@.key=='tag')].value\""),
+                // A numeric literal, and the negated form.
+                ("two", "jsonpath \"$.nums[?(@.n==2)].v\""),
+                ("not_two", "jsonpath \"$.nums[?(@.n!=2)].v\""),
+                // No match is a miss, not an empty array.
+                ("gone", "jsonpath \"$.CardInfo[?(@.key=='nope')].value\""),
+            ],
+        )];
+        let res = run("REPORT REQUEST p\n", &entries, &[], &[], &fake);
+        let c = &res.rows[0].cells;
+        assert_eq!(c.get("p.name"), Some(&"Jane Citizen".to_string()));
+        assert_eq!(c.get("p.dob"), Some(&"1990-01-01".to_string()));
+        assert_eq!(c.get("p.tags"), Some(&"[\"a\",\"b\"]".to_string()));
+        assert_eq!(c.get("p.two"), Some(&"two".to_string()));
+        assert_eq!(c.get("p.not_two"), Some(&"one".to_string()));
+        assert_eq!(c.get("p.gone"), Some(&DEFAULT_NO_MATCH.to_string()));
     }
 
     #[test]

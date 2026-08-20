@@ -214,6 +214,48 @@ pub struct Environment {
     pub git_origin: Option<crate::git_remote::GitOrigin>,
 }
 
+/// Whether `env` was loaded from the very place a load of `path`/`git_origin`
+/// would read — i.e. this is the *same file* being opened again, not a second
+/// environment that happens to share a name.
+///
+/// The distinction matters because the two cases want opposite treatment.
+/// Re-opening a file you already have loaded should just refresh it; only a
+/// genuine clash between two different sources is a question worth asking (or,
+/// in the GUI, worth disambiguating with a `(2)` suffix). Matching on the name
+/// alone conflated them, so pressing Enter on a workspace environment that was
+/// already loaded raised a four-way prompt in which none of the answers was
+/// what the user meant.
+///
+/// A hand-made environment has no source, so it never matches: there is nothing
+/// to re-read it from.
+pub fn is_same_source(
+    env: &Environment,
+    path: Option<&std::path::Path>,
+    git_origin: Option<&crate::git_remote::GitOrigin>,
+) -> bool {
+    if let Some(origin) = git_origin {
+        return env.git_origin.as_ref() == Some(origin);
+    }
+    match (env.path.as_deref(), path) {
+        (Some(a), Some(b)) => same_file(a, b),
+        _ => false,
+    }
+}
+
+/// Whether two paths name the same file. Compared literally first so the common
+/// case costs nothing, then canonicalised, because the same environment can
+/// easily be reached by both a relative and an absolute path (the workspace
+/// tree walks relative to its root; File -> Load Environment returns absolute).
+/// A path that cannot be canonicalised - deleted since, or not yet written - is
+/// only equal to itself.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+}
+
 impl Environment {
     /// Serialize back to `.vars` source text (`KEY=source` per line), using each
     /// variable's `raw` form so resolved secret values are never written to disk.

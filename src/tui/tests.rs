@@ -688,6 +688,15 @@ fn press(app: &mut TuiApp, code: KeyCode) {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
+/// Type `text` into the app one character at a time, exactly as a user would.
+/// The tests care about the keystrokes (a field's own key handling runs per
+/// character), so this drives [`press`] rather than setting a buffer directly.
+fn type_str(app: &mut TuiApp, text: &str) {
+    for ch in text.chars() {
+        press(app, KeyCode::Char(ch));
+    }
+}
+
 fn add_global_env(app: &mut TuiApp, env: crate::environment::Environment) -> u64 {
     let id = env.id;
     app.global_envs.push(env);
@@ -937,16 +946,12 @@ fn creating_a_request_adds_it_to_the_request_tab() {
     press(&mut app, KeyCode::Char('n')); // open New Request form
     assert!(app.overlay.is_some());
 
-    for ch in "demo".chars() {
-        press(&mut app, KeyCode::Char(ch)); // Name field
-    }
+    type_str(&mut app, "demo"); // Name field
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Right); // GET -> POST
     press(&mut app, KeyCode::Tab); // -> URL
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     // Ctrl+Enter submits.
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
@@ -968,9 +973,7 @@ fn new_request_can_target_another_collection() {
     press(&mut app, KeyCode::Right); // target 0 (Request) -> 1 (api)
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     assert!(
@@ -996,18 +999,12 @@ fn creating_a_request_with_a_header_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Enter); // -> Header(0, Key)
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
-    for ch in "abc".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -1025,9 +1022,7 @@ fn empty_header_rows_are_not_added() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -1227,6 +1222,246 @@ fn open_form_on_header(app: &mut TuiApp) {
     press(app, KeyCode::Enter); // creates Header(0, Key)
 }
 
+// ---- extract to parameter ------------------------------------------------
+
+fn ctrl(app: &mut TuiApp, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+}
+
+/// Move focus onto the first header row's Key cell in a wizard that is
+/// *already* open, without restarting it (`open_form_on_header` presses `n`
+/// first, which would throw away edits made so far). Alt+1 is the wizard's
+/// direct jump to the Headers section.
+fn goto_header_in_open_form(app: &mut TuiApp) {
+    app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+    press(app, KeyCode::Enter); // "+ Add Header" -> Header(0, Key)
+}
+
+/// Open the wizard with focus on the first Form field's Value cell, holding a
+/// file path — the case the whole feature exists for.
+fn open_form_on_multipart_value(app: &mut TuiApp) {
+    open_form_on_form_field_kind(app);
+    press(app, KeyCode::Tab); // Kind -> Value (Key was created focused, Kind next)
+    type_str(app, "./samples/example.pdf");
+}
+
+/// Ctrl+P on a form field's value pulls the whole cell out into a parameter:
+/// the cell becomes `{{EXAMPLE}}` and an `[Options] variable:` row appears
+/// holding the path. Both halves in one action is the point — done by hand they
+/// are two edits that have to agree.
+#[test]
+fn extracting_a_form_field_value_replaces_it_and_declares_the_parameter() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
+    ctrl(&mut app, KeyCode::Char('p'));
+    {
+        let f = form_ref(&app);
+        let p = f.extract.as_ref().expect("Ctrl+P opens the prompt");
+        assert_eq!(p.value, "./samples/example.pdf");
+        assert_eq!(
+            p.name.text(),
+            "EXAMPLE",
+            "the suggestion is the path's file stem, upper-cased"
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert!(f.extract.is_none(), "the prompt closes");
+    assert_eq!(f.form_fields[0].value.text(), "{{EXAMPLE}}");
+    assert_eq!(f.options.rows.len(), 1);
+    assert_eq!(f.options.rows[0].key.text(), "variable");
+    assert_eq!(
+        f.options.rows[0].value.text(),
+        "EXAMPLE=./samples/example.pdf"
+    );
+    assert_eq!(
+        f.declared_parameters(),
+        vec!["EXAMPLE".to_string()],
+        "and the request now advertises it as a parameter"
+    );
+}
+
+/// The suggested name is only a suggestion: typing over it is the common case,
+/// since the value rarely spells what the parameter means.
+#[test]
+fn the_extracted_parameter_can_be_renamed_before_it_is_created() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    for _ in 0.."EXAMPLE".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "FILE");
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.form_fields[0].value.text(), "{{FILE}}");
+    assert_eq!(f.options.rows[0].value.text(), "FILE=./samples/example.pdf");
+}
+
+/// A selection extracts only what is selected — the case for a URL, where the
+/// interesting part is one path segment and not the whole address.
+#[test]
+fn extracting_with_a_selection_takes_only_the_selected_text() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "http://api/orders/12345");
+    // Select the trailing id with Shift+Left.
+    for _ in 0..5 {
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+    }
+    ctrl(&mut app, KeyCode::Char('p'));
+    {
+        let p = form_ref(&app).extract.as_ref().expect("the prompt opens");
+        assert_eq!(p.value, "12345");
+        assert_eq!(
+            p.name.text(),
+            "VALUE",
+            "a name cannot start with a digit, so the suggestion falls back"
+        );
+    }
+    for _ in 0.."VALUE".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "ORDER");
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.url.text(), "http://api/orders/{{ORDER}}");
+    assert_eq!(f.options.rows[0].value.text(), "ORDER=12345");
+}
+
+/// Extracting two fields that carry the same value under one name is the point
+/// of reuse: the second extraction writes the placeholder but does not declare
+/// the parameter twice.
+#[test]
+fn extracting_the_same_value_twice_reuses_the_one_declaration() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    // A header carrying the same path.
+    goto_header_in_open_form(&mut app);
+    type_str(&mut app, "X-Source");
+    press(&mut app, KeyCode::Tab);
+    type_str(&mut app, "./samples/example.pdf");
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert_eq!(f.headers.rows[0].value.text(), "{{EXAMPLE}}");
+    assert_eq!(
+        f.options.rows.len(),
+        1,
+        "one declaration, shared: {:?}",
+        f.options
+            .rows
+            .iter()
+            .map(|r| r.value.text())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Reusing a name the request already declares for a *different* value would
+/// silently repoint the field at the other one's default. The prompt refuses
+/// rather than doing it, and Enter is a no-op until the name changes.
+#[test]
+fn extracting_onto_a_name_that_means_something_else_is_refused() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Enter);
+    goto_header_in_open_form(&mut app);
+    type_str(&mut app, "X-Source");
+    press(&mut app, KeyCode::Tab);
+    type_str(&mut app, "./samples/other.pdf");
+    ctrl(&mut app, KeyCode::Char('p'));
+    for _ in 0.."OTHER".len() {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_str(&mut app, "EXAMPLE");
+    {
+        let p = form_ref(&app).extract.as_ref().expect("the prompt is open");
+        assert!(
+            matches!(
+                p.error,
+                Some(crate::hurl::ParamNameError::Conflict(ref v))
+                    if v == "./samples/example.pdf"
+            ),
+            "the clash is reported with what the name already means: {:?}",
+            p.error
+        );
+    }
+    press(&mut app, KeyCode::Enter);
+    let f = form_ref(&app);
+    assert!(
+        f.extract.is_some(),
+        "Enter cannot smuggle a refused name past"
+    );
+    assert_eq!(
+        f.headers.rows[0].value.text(),
+        "./samples/other.pdf",
+        "and the field is untouched"
+    );
+}
+
+/// Escape leaves everything exactly as it was — an extraction is two edits, and
+/// a cancelled one must be neither.
+#[test]
+fn cancelling_the_extract_prompt_changes_nothing() {
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    ctrl(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Esc);
+    let f = form_ref(&app);
+    assert!(f.extract.is_none());
+    assert_eq!(f.form_fields[0].value.text(), "./samples/example.pdf");
+    assert!(f.options.rows.is_empty());
+}
+
+/// An empty cell has nothing to extract, so Ctrl+P opens no prompt — better
+/// than a modal whose only outcome is Escape.
+#[test]
+fn extracting_an_empty_cell_does_nothing() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab); // -> Url, empty
+    ctrl(&mut app, KeyCode::Char('p'));
+    assert!(form_ref(&app).extract.is_none());
+}
+
+/// The Options section names the parameters its `variable:` rows declare, read
+/// live from the editors — a `variable:` row is not an ordinary option, and a
+/// grid of key/value cells is the one place that never says so.
+#[test]
+fn the_wizard_reads_parameters_out_of_the_options_rows_as_they_are_typed() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    press(&mut app, KeyCode::Tab); // -> AddHeader
+    press(&mut app, KeyCode::Tab); // -> AddCookie
+    press(&mut app, KeyCode::Tab); // -> AddQuery
+    press(&mut app, KeyCode::Tab); // -> AddOptions
+    press(&mut app, KeyCode::Enter); // creates Options(0, Key)
+    for c in "variable".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Tab); // -> Value
+    for c in "FILE=./sample.pdf".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(
+        form_ref(&app).declared_parameters(),
+        vec!["FILE".to_string()],
+        "the half-typed row is already a declaration"
+    );
+}
+
 fn open_form_on_form_field_kind(app: &mut TuiApp) {
     press(app, KeyCode::Char('n'));
     press(app, KeyCode::Tab); // -> Target
@@ -1333,9 +1568,7 @@ fn arrow_keys_move_between_columns_in_a_header_row() {
 fn left_right_move_the_cursor_before_crossing_cells() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "ab".chars() {
-        press(&mut app, KeyCode::Char(ch)); // Key = "ab", cursor at end
-    }
+    type_str(&mut app, "ab"); // Key = "ab", cursor at end
     // At the end of the text, Right crosses to the next cell.
     press(&mut app, KeyCode::Right);
     assert_eq!(
@@ -1377,9 +1610,7 @@ fn focused_cell_col(app: &TuiApp) -> usize {
 fn ctrl_left_right_jump_to_start_and_end_of_cell() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // focus Header(0, Key)
-    for ch in "hello".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "hello");
     assert_eq!(focused_cell_col(&app), 5, "cursor at end after typing");
 
     // Ctrl+Left jumps to the start of the field without leaving the cell.
@@ -1630,13 +1861,9 @@ fn up_down_in_the_body_move_the_cursor_then_leave_at_the_edges() {
     }
     assert_eq!(new_focus(&app), NewField::Body);
 
-    for ch in "line1".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "line1");
     press(&mut app, KeyCode::Enter); // newline (Body is multi-line)
-    for ch in "line2".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "line2");
 
     // The cursor is on the second line: Up moves it up, staying in the Body.
     press(&mut app, KeyCode::Up);
@@ -1684,9 +1911,7 @@ fn key_cell_shows_a_prepopulated_dropdown() {
 fn dropdown_filters_as_you_type_and_enter_fills_the_key() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "content".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "content");
     let sugs = form_ref(&app)
         .key_dropdown()
         .expect("matches for 'content'")
@@ -1755,9 +1980,7 @@ fn esc_dismisses_dropdown_before_cancelling_the_form() {
 fn typing_no_match_hides_the_dropdown() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app);
-    for ch in "zzz".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "zzz");
     assert!(
         form_ref(&app).key_dropdown().is_none(),
         "no header contains 'zzz'"
@@ -1860,9 +2083,7 @@ fn a_disabled_header_row_renders_its_key_dimmed() {
 
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // focus Header(0, Key)
-    for ch in "Zydeco".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "Zydeco");
     // Move focus off the key so it renders via the non-focused (coloured)
     // path rather than as the live editor.
     press(&mut app, KeyCode::Tab); // -> Header(0, Value)
@@ -1943,18 +2164,12 @@ fn disabled_header_is_not_sent() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Enter); // -> Header(0, Key)
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     press(&mut app, KeyCode::Tab); // -> Value
-    for ch in "abc".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc");
     // Disable the row via Ctrl+E (focus stays on the Value cell).
     app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     assert_eq!(
@@ -5377,9 +5592,7 @@ fn choose_target_typing_a_brand_new_branch_name_marks_it_as_new() {
     w.sel = None;
     app.overlay = Some(Overlay::GitSave(w));
 
-    for ch in "feature-x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "feature-x");
     press(&mut app, KeyCode::Enter);
 
     match &app.overlay {
@@ -6246,13 +6459,9 @@ fn env_var_form_key_then_value_adds_the_variable() {
     let env_id = add_empty_global_env(&mut app, "e");
     app.overlay = Some(Overlay::EnvPopup(EnvPopupState::new(env_id)));
     press(&mut app, KeyCode::Char('n')); // open the form (Key cell focused)
-    for ch in "API_TOKEN".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "API_TOKEN");
     press(&mut app, KeyCode::Tab); // Key -> Value
-    for ch in "abc123".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc123");
     press(&mut app, KeyCode::Enter); // commit
 
     assert!(
@@ -9785,9 +9994,7 @@ fn ctrl_r_on_an_unchanged_environment_keeps_the_popup_open() {
 fn tab_completes_the_hurl_ghost_in_a_save_prompt() {
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveCollection, "Save", "");
-    for ch in "myfile".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "myfile");
     press(&mut app, KeyCode::Tab);
     match &app.overlay {
         Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "myfile.hurl"),
@@ -9805,9 +10012,7 @@ fn tab_completes_the_hurl_ghost_in_a_save_prompt() {
 fn right_arrow_completes_the_vars_ghost_at_the_end() {
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveEnv, "Save", "");
-    for ch in "staging".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "staging");
     press(&mut app, KeyCode::Right); // cursor at end -> completes ".vars"
     match &app.overlay {
         Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "staging.vars"),
@@ -9824,9 +10029,7 @@ fn save_prompt_renders_the_dimmed_extension_ghost() {
 
     let mut app = TuiApp::default();
     app.open_path_prompt(FileAction::SaveCollection, "Save", "");
-    for ch in "myfile".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "myfile");
     let mut term = Terminal::new(TestBackend::new(72, 6)).unwrap();
     term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
         .unwrap();
@@ -10837,9 +11040,7 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10848,9 +11049,7 @@ fn creating_a_request_with_an_assert_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "jsonpath \"$.ok\" == \"yes\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.ok\" == \"yes\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -10944,9 +11143,7 @@ fn a_typed_status_assert_becomes_the_expected_status() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10955,9 +11152,7 @@ fn a_typed_status_assert_becomes_the_expected_status() {
     press(&mut app, KeyCode::Tab); // -> Body
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Enter); // -> Assert(0), a fresh row is added
-    for ch in "status == 201".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "status == 201");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
     let e = &app.collections[0].entries;
     assert_eq!(e.len(), 1);
@@ -10972,9 +11167,7 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader (headers start empty)
     press(&mut app, KeyCode::Tab); // -> AddCookie (cookies start empty)
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -10984,13 +11177,9 @@ fn creating_a_request_with_a_capture_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddAssert (asserts start empty)
     press(&mut app, KeyCode::Tab); // -> AddCapture (captures start empty)
     press(&mut app, KeyCode::Enter); // -> Capture(0, Name), a fresh row is added
-    for ch in "token".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "token");
     press(&mut app, KeyCode::Tab); // -> Capture(0, Expr)
-    for ch in "jsonpath \"$.token\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.token\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11062,9 +11251,7 @@ fn creating_a_request_with_a_cookie_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Enter); // -> Cookie(0, Key)
@@ -11072,13 +11259,9 @@ fn creating_a_request_with_a_cookie_via_the_table() {
         new_focus(&app),
         NewField::Kvd(KvdKind::Cookie, 0, HdrCol::Key)
     );
-    for ch in "session".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "session");
     press(&mut app, KeyCode::Tab); // -> Cookie(0, Value)
-    for ch in "abc123".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "abc123");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11096,9 +11279,7 @@ fn creating_a_request_with_an_option_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery, empty
@@ -11108,13 +11289,9 @@ fn creating_a_request_with_an_option_via_the_table() {
         new_focus(&app),
         NewField::Kvd(KvdKind::Options, 0, HdrCol::Key)
     );
-    for ch in "retry".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "retry");
     press(&mut app, KeyCode::Tab); // -> Options(0, Value)
-    for ch in "3".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "3");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11175,9 +11352,7 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, blank
     press(&mut app, KeyCode::Tab); // -> AddCookie, blank
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
@@ -11185,14 +11360,10 @@ fn creating_a_request_with_a_text_form_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Key));
-    for ch in "username".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "username");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind), defaults to Text
     press(&mut app, KeyCode::Tab); // -> FormField(0, Value)
-    for ch in "bob".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "bob");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11211,18 +11382,14 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader, empty
     press(&mut app, KeyCode::Tab); // -> AddCookie, empty
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
-    for ch in "avatar".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Kind));
 
@@ -11255,15 +11422,11 @@ fn form_field_kind_dropdown_flips_text_and_file_and_persists_content_type() {
     // longer captures them), so Right moves on to Value, then Ctype.
     press(&mut app, KeyCode::Right);
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Value));
-    for ch in "avatar.png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar.png");
     press(&mut app, KeyCode::Right);
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -11452,18 +11615,14 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery (queries start empty)
     press(&mut app, KeyCode::Tab); // -> AddOptions (options start empty)
     press(&mut app, KeyCode::Tab); // -> AddFormField
     press(&mut app, KeyCode::Enter); // -> FormField(0, Key)
-    for ch in "avatar".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "avatar");
     press(&mut app, KeyCode::Tab); // -> FormField(0, Kind)
     press(&mut app, KeyCode::Enter); // reveal the dropdown
     press(&mut app, KeyCode::Down); // flip Text -> File
@@ -11471,18 +11630,14 @@ fn content_type_and_description_are_independent_form_columns() {
     press(&mut app, KeyCode::Right); // -> FormField(0, Ctype)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
     press(&mut app, KeyCode::Esc); // dismiss the auto-opened dropdown so typing isn't intercepted
-    for ch in "text/csv".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "text/csv");
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Ctype));
 
     press(&mut app, KeyCode::Right); // -> Prefix (inert on a File row)
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Prefix));
     press(&mut app, KeyCode::Right); // -> Desc, independent from Ctype
     assert_eq!(new_focus(&app), NewField::FormField(0, FormCol::Desc));
-    for ch in "a note".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "a note");
 
     let row = &form_ref(&app).form_fields[0];
     assert_eq!(row.ctype.text(), "text/csv");
@@ -11625,9 +11780,7 @@ fn content_type_dropdown_auto_option_respects_the_filter() {
     let mut app = TuiApp::default();
     open_form_on_file_ctype(&mut app);
     let first_mime = content_type_options()[0];
-    for ch in first_mime.chars() {
-        press(&mut app, KeyCode::Char(ch)); // manually typed override
-    }
+    type_str(&mut app, first_mime); // manually typed override
     assert_eq!(form_ref(&app).form_fields[0].ctype.text(), first_mime);
     assert!(
         !form_ref(&app).ctype_filtered_options().is_empty()
@@ -11667,9 +11820,7 @@ fn typing_auto_keeps_the_auto_option_visible_and_typing_something_else_hides_it(
     open_form_on_file_ctype(&mut app);
     let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
 
-    for ch in "Auto".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "Auto");
     assert!(
         form_ref(&app).ctype_auto_visible(&s),
         "typing \"Auto\" itself must still match the Auto entry's own label"
@@ -11678,9 +11829,7 @@ fn typing_auto_keeps_the_auto_option_visible_and_typing_something_else_hides_it(
     for _ in "Auto".chars() {
         press(&mut app, KeyCode::Backspace);
     }
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     assert!(
         !form_ref(&app).ctype_auto_visible(&s),
         "typing an unrelated mime must hide the Auto entry"
@@ -11710,9 +11859,7 @@ fn a_populated_content_type_cell_hides_its_dropdown_until_enter_reveals_it() {
     open_form_on_file_ctype(&mut app); // -> Ctype, empty, dropdown auto-open
     assert!(form_ref(&app).ctype_dropdown_open());
     press(&mut app, KeyCode::Esc); // dismiss the dropdown so typing isn't intercepted
-    for ch in "image/png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "image/png");
     assert_eq!(form_ref(&app).form_fields[0].ctype.text(), "image/png");
 
     // Leaving and returning to the now-populated Ctype cell must not
@@ -11760,9 +11907,7 @@ fn typing_in_the_content_type_cell_filters_the_dropdown_like_the_key_dropdown_do
         "an empty query shows every option, same as filter_headers"
     );
 
-    for ch in "png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "png");
     assert!(
         form_ref(&app).ctype_dropdown_open(),
         "typing keeps (re-opens) the dropdown, like the Key dropdown"
@@ -11786,9 +11931,7 @@ fn typing_in_the_content_type_cell_filters_the_dropdown_like_the_key_dropdown_do
 
     // Typing something matching nothing empties the list (mirrors
     // `typing_no_match_hides_the_dropdown` for the Key dropdown).
-    for ch in "zzz".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "zzz");
     assert!(
         form_ref(&app).ctype_filtered_options().is_empty(),
         "no mime type contains \"pngzzz\""
@@ -11915,9 +12058,7 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
         a.last_browse_dir = Some(dir.clone());
     });
     open_form_on_file_value(&mut app);
-    for ch in "old-value.png".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "old-value.png");
     app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(matches!(app.overlay, Some(Overlay::Browser(..))));
 
@@ -11933,9 +12074,15 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
 
 // ── Body / Form-Multipart conflict ──────────────────────────────────────
 
+/// A body plus form fields is refused before anything is sent. It used to be
+/// caught deep in the runner and reported as a raw English string in the
+/// response pane; it is now a status of its own, in the user's language, that
+/// names the request — and the request panel says so before Send is ever
+/// pressed (see `sending is refused` below).
 #[test]
-fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_error() {
+fn sending_a_request_with_both_body_and_form_fields_is_refused_and_names_the_request() {
     let mut entry = HurlEntry {
+        title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://127.0.0.1:1/x".to_string(),
         body: Some("{\"a\":1}".to_string()),
@@ -11959,15 +12106,56 @@ fn sending_a_request_with_both_body_and_form_fields_shows_a_clear_status_bar_err
 
     app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
 
+    match &app.status {
+        Some(crate::i18n::Status::BodyFormConflict(names)) => {
+            assert_eq!(names, &vec!["Token".to_string()])
+        }
+        other => panic!("expected the run to be refused, got {other:?}"),
+    }
     let r = app.response.lock().unwrap();
     assert!(
         !r.loading,
         "must not be left stuck loading on a request that can never be built"
     );
+}
+
+/// …and it is visible without pressing Send at all: the whole trap is that the
+/// combination looks fine right up until something silently fails to arrive.
+#[test]
+fn the_request_panel_warns_about_a_body_and_form_fields_before_anything_is_sent() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut entry = HurlEntry {
+        title: "Token".to_string(),
+        method: "POST".to_string(),
+        url: "http://example.com/token".to_string(),
+        body: Some(" ".to_string()),
+        ..Default::default()
+    };
+    entry.form_fields.push(crate::hurl::FormField {
+        key: "grant_type".to_string(),
+        value: "client_credentials".to_string(),
+        enabled: true,
+        ..Default::default()
+    });
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+    app.active_tab = 1;
+    app.focus = Pane::Main;
+
+    let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    let s = Strings::for_language(&Language::English);
+    // Compared on a distinctive fragment: the panel is narrower than the whole
+    // sentence, so the line is cut off on screen.
+    let fragment = &s.body_form_conflict_hint[..40.min(s.body_form_conflict_hint.len())];
     assert!(
-        r.error.contains("Body") && r.error.contains("Form"),
-        "the error should explain the conflict clearly: {}",
-        r.error
+        text.contains(fragment),
+        "the panel warns about the conflict, got:\n{text}"
     );
 }
 
@@ -12056,9 +12244,7 @@ fn editing_on_a_section_tab_is_reflected_when_switching_back_to_all() {
 
     press(&mut app, KeyCode::PageDown); // -> Headers tab
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
-    for ch in "X-Test".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "X-Test");
     assert_eq!(form_ref(&app).headers[0].key.text(), "X-Test");
 
     press(&mut app, KeyCode::PageUp); // back -> All tab
@@ -12293,9 +12479,7 @@ fn brackets_cycle_wizard_section_tabs_on_non_text_fields() {
 fn brackets_are_typed_into_wizard_text_fields() {
     let mut app = TuiApp::default();
     open_form_on_header(&mut app); // -> Header(0, Key), a text field
-    for ch in "a[0]".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "a[0]");
     assert_eq!(
         form_ref(&app).view_tab,
         WizardTab::All,
@@ -16322,6 +16506,71 @@ fn a_request_carries_its_method_even_when_its_collection_is_not_loaded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A run's tick belongs to the request that earned it, not to whichever file
+/// the tab currently holds. Running a request, opening another collection in
+/// the same Workspace tab and looking back at the first must still show what
+/// happened — the terminal UI draws the marker on cached rows for exactly the
+/// same reason the GUI does.
+#[test]
+fn a_run_marker_stays_on_a_request_whose_collection_is_no_longer_loaded() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let dir = workspace_temp_dir_two_collections("ws_run_marker");
+    let (mut app, ci) = workspace_app(&dir);
+    app.active_tab = ci;
+    let one = dir.join("one.hurl");
+
+    app.collections[ci]
+        .load_workspace_file(one.clone())
+        .unwrap();
+    app.collections[ci].entries[0].last_run = crate::hurl::RunStatus::Passed;
+    app.collections[ci].entries[1].last_run = crate::hurl::RunStatus::Failed;
+
+    // Move the tab to the other collection, leaving one.hurl listed from cache.
+    app.collections[ci]
+        .load_workspace_file(dir.join("two.hurl"))
+        .unwrap();
+    app.collections[ci].workspace_expanded.insert(one.clone());
+    app.collections[ci].rebuild_expanded_titles();
+
+    assert_eq!(
+        app.collections[ci].workspace_run_status(&one, 0),
+        crate::hurl::RunStatus::Passed
+    );
+
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let screen: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<Vec<_>>()
+        .chunks(100)
+        .map(|row| row.concat())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let login = screen
+        .lines()
+        .find(|l| l.contains("Login"))
+        .expect("the not-loaded collection's Login row is drawn");
+    assert!(
+        login.contains('\u{2713}'),
+        "the passing run keeps its tick: {login:?}"
+    );
+    let logout = screen
+        .lines()
+        .find(|l| l.contains("Logout"))
+        .expect("the Logout row is drawn");
+    assert!(
+        logout.contains('\u{2717}'),
+        "and a failing one keeps its cross: {logout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A collection expanded but never loaded this session lists its request names
 /// straight from disk once `rebuild_expanded_titles` populates the cache — the
 /// path used by persistence restore.
@@ -16800,6 +17049,98 @@ fn run_all_entries_blocks_when_any_entry_references_a_still_pending_secret() {
         "no background run must be started while blocked"
     );
     assert!(!app.response.lock().unwrap().loading);
+}
+
+/// The TUI runs requests through its own `run_entry`, not the shared
+/// `session::run_entry`, so the undefined-variable report had to be wired into
+/// both — the editor painting `{{ VAR }}` red is no help to someone who hits
+/// F5 without reading the body.
+#[test]
+fn run_entry_reports_undefined_variables_without_blocking() {
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ MISSING }}".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+
+    app.run_entry(1);
+
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        "the unknown variable must be named, got {:?}",
+        app.status
+    );
+    // Reported, not blocked: a literal `{{ MISSING }}` is valid Hurl to send.
+    assert!(
+        app.response.lock().unwrap().loading,
+        "the request must still have been sent"
+    );
+}
+
+/// The streaming Run All cookie warning used to be written unconditionally,
+/// which would have buried the undefined-variable report a line after it was
+/// made. The one that names a request about to fail wins.
+#[test]
+fn run_all_streaming_cookie_note_does_not_hide_undefined_variables() {
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ MISSING }}".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    app.run_all_batch_mode = false;
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+
+    app.run_all_entries(1);
+
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        "undefined variables must outrank the cookie note, got {:?}",
+        app.status
+    );
+}
+
+/// With every variable accounted for, nothing is said — the status line is not
+/// somewhere to leave a permanent notice.
+#[test]
+fn run_entry_says_nothing_when_every_variable_is_defined() {
+    use crate::environment::{EnvVar, Environment, ValueSource};
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ HOST }}".into(),
+        ..Default::default()
+    };
+    let mut col = Collection::new("t".to_string(), vec![entry]);
+    let env = Environment {
+        id: 0,
+        name: "e".into(),
+        vars: vec![EnvVar {
+            key: "HOST".into(),
+            value: "example.net".into(),
+            source: ValueSource::Literal,
+            resolved: true,
+            loading: false,
+            original_value: "example.net".into(),
+            modified: false,
+            user_added: false,
+            raw: String::new(),
+        }],
+        path: None,
+        git_origin: None,
+    };
+
+    let mut app = TuiApp::default();
+    let env_id = add_global_env(&mut app, env);
+    col.linked_env_id = Some(env_id);
+    app.collections.push(col);
+
+    app.run_entry(1);
+
+    assert!(app.status.is_none(), "got {:?}", app.status);
 }
 
 #[test]
@@ -17504,16 +17845,28 @@ fn the_theme_list_starts_with_automatic_then_the_built_in_presets() {
     let s = crate::i18n::Strings::for_language(&app.language);
     let entries = app.theme_picker_entries(&s);
     assert_eq!(entries[0], s.theme_auto, "row 0 follows the language");
+    // Listed from the shared table rather than spelled out, so adding a preset
+    // is one edit rather than two.
+    let presets: Vec<String> = super::theme::builtin_presets()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert_eq!(&entries[1..], &presets[..]);
     assert_eq!(
-        &entries[1..],
-        &[
-            super::theme::PRESET_DEFAULT.to_string(),
-            super::theme::PRESET_ENGLISH.to_string(),
-            super::theme::PRESET_FRENCH.to_string(),
-            super::theme::PRESET_DANISH.to_string(),
-        ],
-        "the neutral default leads, then one preset per bundled language"
+        entries[1],
+        super::theme::PRESET_DEFAULT,
+        "the neutral default leads"
     );
+    for lang in [
+        super::theme::PRESET_ENGLISH,
+        super::theme::PRESET_FRENCH,
+        super::theme::PRESET_DANISH,
+    ] {
+        assert!(
+            presets.iter().any(|p| p == lang),
+            "the language presets are still offered: {lang}"
+        );
+    }
 }
 
 #[test]
@@ -17526,21 +17879,22 @@ fn selecting_a_preset_in_the_picker_activates_it() {
     );
 
     open_theme_editor(&mut app); // opens on the active theme (Graphite, row 1)
-    // Graphite(1) -> Britannia(2) -> Parisian Purple(3) -> Dannebrog(4).
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
+    // Down once per preset after the first, to land on the last one whatever
+    // the list holds.
+    let presets = super::theme::builtin_presets();
+    for _ in 1..presets.len() {
+        press(&mut app, KeyCode::Down);
+    }
     assert_eq!(
         app.active_theme.as_deref(),
-        Some(super::theme::PRESET_DANISH),
+        Some(presets.last().unwrap().name.as_str()),
         "hovering a preset activates it live"
     );
 
     // Walking all the way back up to row 0 clears the manual choice.
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
-    press(&mut app, KeyCode::Up);
+    for _ in 0..presets.len() {
+        press(&mut app, KeyCode::Up);
+    }
     assert_eq!(
         app.active_theme, None,
         "row 0 goes back to following the language"
@@ -17612,12 +17966,13 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
     for c in "Nordic".chars() {
         press(&mut app, KeyCode::Char(c));
     }
-    // Move focus into the base list and pick Dannebrog (Graphite, Britannia,
-    // Parisian, Dannebrog -> down three times from the first entry).
-    press(&mut app, KeyCode::Down); // Name -> Base (Graphite)
-    press(&mut app, KeyCode::Down); // -> Britannia
-    press(&mut app, KeyCode::Down); // -> Parisian Purple
-    press(&mut app, KeyCode::Down); // -> Dannebrog
+    // Move focus into the base list and walk to the last preset (the first
+    // Down moves Name -> Base, then one per preset after the first).
+    let presets = super::theme::builtin_presets();
+    press(&mut app, KeyCode::Down);
+    for _ in 1..presets.len() {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Enter);
 
     let created = app
@@ -17625,10 +17980,10 @@ fn the_new_theme_popup_copies_the_chosen_base_colours() {
         .iter()
         .find(|t| t.name == "Nordic")
         .expect("theme created");
-    let dannebrog = super::theme::preset_for_language(&Language::Danish);
+    let base = presets.last().unwrap();
     assert_eq!(
         created.color(0),
-        dannebrog.color(0),
+        base.color(0),
         "the new theme copies the chosen base's colours"
     );
 }
@@ -17914,8 +18269,8 @@ fn ctrl_d_deletes_a_custom_theme_but_never_a_preset() {
     );
     assert_eq!(
         app.all_themes().len(),
-        4,
-        "the built-in presets remain (Graphite plus one per language)"
+        super::theme::builtin_presets().len(),
+        "every built-in preset remains"
     );
 }
 
@@ -21218,9 +21573,7 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> Target
     press(&mut app, KeyCode::Tab); // -> Method
     press(&mut app, KeyCode::Tab); // -> Url
-    for ch in "http://h/x".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "http://h/x");
     press(&mut app, KeyCode::Tab); // -> AddHeader
     press(&mut app, KeyCode::Tab); // -> AddCookie
     press(&mut app, KeyCode::Tab); // -> AddQuery
@@ -21231,13 +21584,9 @@ fn creating_a_request_with_a_report_field_via_the_table() {
     press(&mut app, KeyCode::Tab); // -> AddCapture
     press(&mut app, KeyCode::Tab); // -> AddReport
     press(&mut app, KeyCode::Enter); // -> Report(0, Name)
-    for ch in "status".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "status");
     press(&mut app, KeyCode::Tab); // -> Report(0, Expr)
-    for ch in "jsonpath \"$.status\"".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "jsonpath \"$.status\"");
     app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
     let e = &app.collections[0].entries;
@@ -22055,6 +22404,226 @@ fn node_show_app(fields: &[&str]) -> (TuiApp, usize) {
     (app, idx)
 }
 
+/// Build a node-editor app whose single bound request (`upload`) declares the
+/// given parameters via `[Options] variable: NAME=value`, with the flow's text
+/// supplied by the caller.
+fn node_param_app(params: &[(&str, &str)], text: &str) -> (TuiApp, usize) {
+    let mut app = TuiApp::default();
+    let entry = HurlEntry {
+        title: "upload".to_string(),
+        method: "POST".to_string(),
+        url: "http://example/x".to_string(),
+        options: params
+            .iter()
+            .map(|(n, v)| crate::hurl::KvRow::new("variable", format!("{n}={v}")))
+            .collect(),
+        ..Default::default()
+    };
+    app.collections
+        .push(Collection::new("api".to_string(), vec![entry]));
+    app.new_report_tab();
+    let idx = app.active_report_index().unwrap();
+    app.reports[idx].report.set_text(text);
+    app.revalidate_report(idx);
+    press(&mut app, KeyCode::Enter); // Source -> Nodes
+    (app, idx)
+}
+
+/// The request form offers a checkbox per parameter the request declares, with
+/// the declared default beside it, and ticking one writes the `USING(…)`
+/// clause — the whole point being that an author never has to know the syntax.
+#[test]
+fn ticking_a_parameter_in_the_request_form_writes_the_using_clause() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf"), ("KIND", "invoice")],
+        "# collection: api\nREPORT REQUEST upload\n",
+    );
+    press(&mut app, KeyCode::Down); // select REPORT REQUEST upload
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    let seen: Vec<(&str, bool, Option<&str>)> = form
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), p.required, p.default.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("FILE", false, Some("./sample.pdf")),
+            ("KIND", false, Some("invoice")),
+        ],
+        "every declared parameter is offered, none required yet"
+    );
+    // Name, Report, then the parameter rows — `USING` describes the send, so it
+    // sits above the reporting options.
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text, "# collection: api\n\nREPORT REQUEST upload USING(FILE)\n",
+        "ticking the row writes the clause"
+    );
+}
+
+/// The complaint: a request that declares no parameters showed an empty
+/// checklist and no way to reach `USING` at all. An override can now be added
+/// from the form, without the author ever opening the source view.
+#[test]
+fn a_per_call_override_can_be_added_in_the_request_form() {
+    let (mut app, idx) = node_param_app(&[], "# collection: api\nREPORT REQUEST upload\n");
+    press(&mut app, KeyCode::Down); // select the node
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params.is_empty(), "the precondition: nothing declared");
+    assert!(
+        form.visible_rows()
+            .contains(&super::report_nodes::FormRow::AddOverride),
+        "and the add-an-override row is offered anyway"
+    );
+
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // + add an override
+    press(&mut app, KeyCode::Char(' '));
+    // Space lands on the new row's target box, which is where typing goes.
+    for c in "multipart.document".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Down); // the value box
+    for c in "{{FILE}}".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(multipart.document = \"{{FILE}}\")\n",
+        "the override is written as a clause"
+    );
+}
+
+/// A target that names no part of a request is never written out — it would
+/// produce a flow that doesn't parse — and the row says so while it is typed.
+#[test]
+fn an_unusable_override_target_is_not_written_to_the_flow() {
+    let (mut app, idx) = node_param_app(&[], "# collection: api\nREPORT REQUEST upload\n");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // + add an override
+    press(&mut app, KeyCode::Char(' '));
+    for c in "nonsense".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(
+        !crate::report::edit::override_target_valid("nonsense"),
+        "the row is painted as an error while it is typed"
+    );
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text, "# collection: api\n\nREPORT REQUEST upload\n",
+        "and nothing broken is written"
+    );
+}
+
+/// A plain `REQUEST` gets the checklist too: `USING` belongs to the send, not
+/// to the columns, so it must not hide behind the REPORT toggle.
+#[test]
+fn a_plain_request_node_still_offers_its_parameters() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREQUEST upload\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(!form.report, "this is a plain REQUEST");
+    assert_eq!(form.params.len(), 1, "the parameter is still offered");
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREQUEST upload USING(FILE)\n"
+    );
+}
+
+/// Opening a node that already requires a parameter shows it ticked, and
+/// un-ticking removes the clause without touching the per-call overrides the
+/// form has no row for.
+#[test]
+fn the_request_form_preserves_overrides_while_editing_requirements() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREPORT REQUEST upload USING(FILE, header.X-Run = \"1\")\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params[0].required, "the written requirement is ticked");
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Char(' ')); // un-tick
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(header.X-Run = \"1\")\n",
+        "the override the form cannot edit survives"
+    );
+}
+
+/// A clause requiring a name the request doesn't declare is a validation error.
+/// The form still lists it — with no default, which is how it reads as wrong —
+/// so it can be un-ticked where the error is seen.
+#[test]
+fn a_requirement_the_request_does_not_declare_is_listed_so_it_can_be_removed() {
+    let (mut app, idx) = node_param_app(
+        &[("FILE", "./sample.pdf")],
+        "# collection: api\nREPORT REQUEST upload USING(FILE, NOPE)\n",
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert_eq!(form.params.len(), 2);
+    assert_eq!(form.params[1].name, "NOPE");
+    assert!(
+        form.params[1].default.is_none(),
+        "no default is what marks the row as undeclared"
+    );
+    press(&mut app, KeyCode::Down); // Report
+    press(&mut app, KeyCode::Down); // USING FILE
+    press(&mut app, KeyCode::Down); // USING NOPE
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        app.reports[idx].report.text,
+        "# collection: api\n\nREPORT REQUEST upload USING(FILE)\n"
+    );
+}
+
+/// A request that declares nothing gets no checklist at all — the form is
+/// exactly what it was before parameters existed.
+#[test]
+fn a_request_without_parameters_has_no_checklist() {
+    let (mut app, _idx) = node_show_app(&["status"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::ReportNodeRequest(form)) = &app.overlay else {
+        panic!("Enter opens the configure form");
+    };
+    assert!(form.params.is_empty());
+}
+
 /// Enter on a `REPORT REQUEST` node opens the configure form, whose field rows
 /// are the request's intrinsics plus its `[Reports]` fields, all ticked when
 /// the node has no `SHOW` clause yet (emit everything).
@@ -22097,10 +22666,10 @@ fn report_node_request_form_writes_show_omitting_unticked() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error, Response,
-    // status. The Response field is the 8th field ⇒ row index 7 + 4 = 11.
-    for _ in 0..11 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias, then fields
+    // HttpStatus, Time, TimeSetup, TimeWait, TimeDownload, Asserts, Error,
+    // Response, status. The Response field is the 8th ⇒ row index 7 + 5 = 12.
+    for _ in 0..12 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Char(' ')); // untick Response
@@ -22135,9 +22704,9 @@ fn report_node_request_form_all_ticked_removes_show() {
         let ticked = form.fields.iter().filter(|r| r.included).count();
         assert_eq!(ticked, 1, "only the SHOW(status) field is preselected");
     }
-    // Move to the first field row (0 Name, 1 Report, 2 Response, 3 Alias, 4
-    // first field), then tick every unticked field.
-    for _ in 0..4 {
+    // Move to the first field row (0 Name, 1 Report, 2 Add override, 3
+    // Response, 4 Alias, 5 first field), then tick every unticked field.
+    for _ in 0..5 {
         press(&mut app, KeyCode::Down);
     }
     let total = {
@@ -22177,9 +22746,9 @@ fn report_node_request_form_ticking_a_timing_part_writes_show() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias, then fields HttpStatus,
-    // Time, TimeSetup, … ⇒ TimeSetup is the 3rd field, row index 2 + 4 = 6.
-    for _ in 0..6 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias, then fields
+    // HttpStatus, Time, TimeSetup, … ⇒ TimeSetup is the 3rd, row 2 + 5 = 7.
+    for _ in 0..7 {
         press(&mut app, KeyCode::Down);
     }
     {
@@ -22204,8 +22773,9 @@ fn report_node_request_form_sets_the_alias() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response, 3 Alias — three Downs reach the alias.
-    for _ in 0..3 {
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response, 4 Alias — four Downs
+    // reach the alias.
+    for _ in 0..4 {
         press(&mut app, KeyCode::Down);
     }
     for c in ['p', 'r', 'o', 'c'] {
@@ -22222,10 +22792,11 @@ fn report_node_request_form_sets_the_response_format() {
     let (mut app, idx) = node_show_app(&["status"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    // Rows: 0 Name, 1 Report, 2 Response — two Downs reach the response row,
-    // then Space cycles Default -> RAW.
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
+    // Rows: 0 Name, 1 Report, 2 Add override, 3 Response — three Downs reach
+    // the response row, then Space cycles Default -> RAW.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Enter);
     let text = &app.reports[idx].report.text;
@@ -22252,8 +22823,8 @@ fn report_node_request_form_opens_on_plain_request_nodes() {
     assert!(!form.report, "a plain REQUEST starts with Report unticked");
     assert_eq!(
         form.visible_rows().len(),
-        2,
-        "only Name + Report rows show until Report is ticked"
+        3,
+        "only Name + Report + the add-override row show until Report is ticked"
     );
 }
 
@@ -24870,9 +25441,7 @@ fn shift_n_in_a_workspace_names_a_new_file_and_its_extension_picks_the_kind() {
 
     // `.trail` asks for a report, not a collection — one prompt covers all
     // three kinds because the extension chooses between them.
-    for ch in "monthly.trail".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "monthly.trail");
     press(&mut app, KeyCode::Enter);
 
     let made = root.join("apis/monthly.trail");
@@ -24900,9 +25469,7 @@ fn a_new_workspace_file_with_no_extension_is_a_collection_like_the_ghost_suggest
     cursor_on_ws_row(&mut app, &root.join("apis"));
 
     press(&mut app, KeyCode::Char('N'));
-    for ch in "orders".chars() {
-        press(&mut app, KeyCode::Char(ch));
-    }
+    type_str(&mut app, "orders");
     press(&mut app, KeyCode::Enter);
 
     assert!(
@@ -25075,6 +25642,72 @@ fn env_panel_workspace(tag: &str, files: &[(&str, &str)]) -> (TuiApp, std::path:
     app.active_tab = ci;
     app.focus = Pane::GlobalEnv;
     (app, dir)
+}
+
+/// Opening an environment that is already loaded is a *reload*, not a name
+/// clash. The collision popup asks which of two environments to keep, and when
+/// both are the same file none of its four answers is what the user meant —
+/// which is what pressing Enter on a workspace environment used to raise.
+#[test]
+fn re_opening_a_loaded_environment_refreshes_it_instead_of_asking() {
+    let (mut app, dir) = env_panel_workspace("reopen", &[("eapi_dev.vars", "TOKEN=old\n")]);
+    let path = dir.join("eapi_dev.vars");
+    let id = app
+        .load_environment_text("eapi_dev".into(), "TOKEN=old\n", Some(path.clone()), None)
+        .expect("loaded");
+    // Link it, to prove the reload keeps the identity the link points at.
+    let ci = app.active_tab;
+    app.collections[ci].linked_env_id = Some(id);
+
+    std::fs::write(&path, "TOKEN=new\n").unwrap();
+    let again =
+        app.load_environment_text("eapi_dev".into(), "TOKEN=new\n", Some(path.clone()), None);
+
+    assert!(
+        app.overlay.is_none(),
+        "no popup: there is nothing to choose"
+    );
+    assert_eq!(again, Some(id), "the same environment, refreshed in place");
+    assert_eq!(app.global_envs.len(), 1, "and not duplicated");
+    assert_eq!(app.global_envs[0].vars[0].raw, "new", "with the new value");
+    assert_eq!(
+        app.collections[ci].linked_env_id,
+        Some(id),
+        "the link survives the reload"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two *different* files that happen to share a name are still a real clash —
+/// the popup is right in that case and must not be lost to the fix above.
+#[test]
+fn two_different_files_with_the_same_name_still_raise_the_collision_popup() {
+    let (mut app, dir) = env_panel_workspace("clash", &[]);
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("a/dev.vars"), "TOKEN=a\n").unwrap();
+    std::fs::write(dir.join("b/dev.vars"), "TOKEN=b\n").unwrap();
+
+    app.load_environment_text(
+        "dev".into(),
+        "TOKEN=a\n",
+        Some(dir.join("a/dev.vars")),
+        None,
+    )
+    .expect("loaded");
+    let second = app.load_environment_text(
+        "dev".into(),
+        "TOKEN=b\n",
+        Some(dir.join("b/dev.vars")),
+        None,
+    );
+
+    assert_eq!(second, None, "the load waits on the popup");
+    assert!(
+        matches!(app.overlay, Some(Overlay::EnvCollision(_))),
+        "a genuine clash still asks"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// With a workspace open the panel lists its environment files — including ones
@@ -25299,6 +25932,151 @@ fn a_filter_matching_nothing_empties_the_panel_without_stranding_the_selection()
         2,
         "Esc on the panel clears an applied filter"
     );
+}
+
+/// The source filter used to be discoverable only from the help screen, so a
+/// panel showing a fraction of the environments looked simply short. The key
+/// is announced on the panel's own border — but only when there is a workspace
+/// to switch between, since otherwise it does nothing.
+#[test]
+fn the_environments_panel_announces_the_source_key_when_there_is_one_to_use() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let render = |app: &TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| {
+            super::draw::draw_env_panel(f, f.area(), app, &s, &th);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let plain = TuiApp::default();
+    assert!(
+        !plain.has_workspace_env_source(),
+        "no workspace tab is the precondition"
+    );
+    assert!(
+        !render(&plain).contains(s.foot_env_source),
+        "a key that does nothing here must not be advertised"
+    );
+
+    let (ws, _dir) = env_panel_workspace("sourcehint", &[("dev.vars", "TOKEN=t\n")]);
+    assert!(
+        render(&ws).contains(s.foot_env_source),
+        "announced: {}",
+        render(&ws)
+    );
+}
+
+/// `g` puts the selection back on the active environment. The complaint: a
+/// workspace of several hundred environments makes the one currently in effect
+/// impossible to find again, and it is the row people most often want back.
+#[test]
+fn g_jumps_the_environments_panel_to_the_active_environment() {
+    let (mut app, dir) = env_panel_workspace(
+        "gotoactive",
+        &[
+            ("aaa.vars", "TOKEN=a\n"),
+            ("mmm.vars", "TOKEN=m\n"),
+            ("zzz.vars", "TOKEN=z\n"),
+        ],
+    );
+    let id = app
+        .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+
+    // Somewhere else entirely, the way scrolling a long list leaves you.
+    app.global_env_idx = 0;
+    assert_ne!(
+        app.env_rows()[0].env_id(),
+        Some(id),
+        "the precondition is that the selection is not already on it"
+    );
+
+    press(&mut app, KeyCode::Char('g'));
+    assert_eq!(
+        app.env_rows()[app.global_env_idx].env_id(),
+        Some(id),
+        "the selection lands on the active environment"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The filters are widened as far as the row needs, because a "take me to it"
+/// that silently did nothing behind a filter would be worse than no key.
+#[test]
+fn g_clears_a_filter_that_is_hiding_the_active_environment() {
+    let (mut app, dir) = env_panel_workspace(
+        "gotofiltered",
+        &[("aaa.vars", "TOKEN=a\n"), ("mmm.vars", "TOKEN=m\n")],
+    );
+    let id = app
+        .load_environment_text("mmm".into(), "TOKEN=m\n", Some(dir.join("mmm.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+    app.env_query = "aaa".into();
+    assert!(
+        app.env_rows().iter().all(|r| r.env_id() != Some(id)),
+        "the filter hides it"
+    );
+
+    press(&mut app, KeyCode::Char('g'));
+    assert!(
+        app.env_query.is_empty(),
+        "the filter is cleared to reach it"
+    );
+    assert_eq!(app.env_rows()[app.global_env_idx].env_id(), Some(id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The panel only advertises `g` when there is an active environment to go to.
+#[test]
+fn the_environments_panel_announces_the_goto_key_only_when_something_is_active() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+    let render = |app: &TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        term.draw(|f| super::draw::draw_env_panel(f, f.area(), app, &s, &th))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let (mut app, dir) = env_panel_workspace("gotohint", &[("dev.vars", "TOKEN=t\n")]);
+    assert!(
+        !render(&app).contains(s.foot_env_goto_active),
+        "nothing is active, so the key has nowhere to go"
+    );
+    let id = app
+        .load_environment_text("dev".into(), "TOKEN=t\n", Some(dir.join("dev.vars")), None)
+        .expect("loaded");
+    app.active_env_id = Some(id);
+    assert!(
+        render(&app).contains(s.foot_env_goto_active),
+        "announced: {}",
+        render(&app)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `o` narrows the Environments panel by source, and reuses the same clamping
@@ -26226,6 +27004,95 @@ fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
         remaining_month: None,
     });
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
+}
+
+/// A workspace is a list of collection names until something opens one, and a
+/// name is no help deciding whether this is the workspace you meant. `p` reads
+/// one — and Esc puts it away again rather than cancelling the whole import,
+/// which is what Esc means on the screen underneath.
+#[test]
+fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
+    use crate::postman_api::ItemSummary;
+    use crate::postman_flow::{Preview, PreviewRow};
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
+        w.flow.seed_step(PostmanStep::Confirm);
+        w.flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: vec![
+                ItemSummary {
+                    uid: "uid-a".to_string(),
+                    id: "id-a".to_string(),
+                    name: "Billing".to_string(),
+                },
+                ItemSummary {
+                    uid: "uid-b".to_string(),
+                    id: "id-b".to_string(),
+                    name: "Shipping".to_string(),
+                },
+            ],
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        // Cached, so the keystroke does not want a Postman API behind it.
+        w.flow.seed_preview_cache(Preview {
+            uid: "uid-b".to_string(),
+            name: "Shipping".to_string(),
+            rows: vec![PreviewRow {
+                depth: 0,
+                label: "Rates".to_string(),
+                method: Some("GET".to_string()),
+            }],
+            requests: 1,
+            notes: Vec::new(),
+        });
+    }
+    assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
+
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(
+        postman_wizard(&mut app)
+            .flow
+            .preview()
+            .map(|p| p.name.clone()),
+        Some("Shipping".to_string()),
+        "the highlighted collection must be the one opened"
+    );
+
+    // The panel really draws what it fetched, folders and all.
+    {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(painted.contains("Rates"), "the request must be listed");
+        assert!(painted.contains("GET"), "with its method");
+    }
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        postman_wizard(&mut app).flow.preview().is_none(),
+        "Esc closes the preview"
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::PostmanImport(_))),
+        "and leaves the import alone"
+    );
+    // Only now does Esc mean "give up on the import".
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none());
 }
 
 #[test]

@@ -106,6 +106,17 @@ pub struct ParkedRun {
     /// because they are what produced it -- and because retyping them after a
     /// trip to another tab would be a poor reward for having answered once.
     pub params: crate::report::params::ParamValues,
+    /// Which tab was open when the editor was put away, and whether it already
+    /// had results to show at the time.
+    ///
+    /// A report is often opened to *read* rather than to run -- comparing the
+    /// source of two of them means going back and forth -- and being returned
+    /// to the results grid on every visit meant re-picking Source every time.
+    /// The `had_result` half keeps the other behaviour intact: a run that
+    /// finished while nobody was looking still opens on its rows, because the
+    /// tab the user last chose was chosen before there was anything to see.
+    pub view: Option<super::report_editor::EditorView>,
+    pub had_result: bool,
 }
 
 impl ParkedRun {

@@ -12,7 +12,9 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use crate::hurl::{FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl};
+use crate::hurl::{
+    CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl,
+};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -26,12 +28,15 @@ struct Collection {
     /// The collection's default auth, inherited by every request that doesn't
     /// set its own.
     auth: Option<Auth>,
+    #[serde(rename = "protocolProfileBehavior")]
+    protocol_profile_behavior: Option<Profile>,
 }
 
 /// A folder (nested `item`s) or a leaf holding a `request`.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Item {
+    #[serde(deserialize_with = "de_str")]
     name: String,
     item: Option<Vec<Item>>,
     request: Option<Request>,
@@ -42,12 +47,41 @@ struct Item {
     /// Pre-request / test scripts. Only `test` scripts are mined for
     /// `pm.<store>.set(...)` capture calls (see [`captures_from_events`]).
     event: Vec<Event>,
+    #[serde(rename = "protocolProfileBehavior")]
+    protocol_profile_behavior: Option<Profile>,
+}
+
+/// Postman's per-request send-time switches. Set at collection, folder or
+/// request level, each inherited by everything below it until overridden.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+struct Profile {
+    /// Send a body even on a method that normally has none. Postman *strips*
+    /// the body from a GET unless this is set, so a request stored with both a
+    /// GET and a body is not a request with a body — it's a leftover.
+    #[serde(rename = "disableBodyPruning")]
+    disable_body_pruning: Option<bool>,
+    /// `false` means "don't verify the certificate" — Hurl's `insecure`.
+    #[serde(rename = "strictSSL")]
+    strict_ssl: Option<bool>,
+}
+
+impl Profile {
+    /// This level's settings over the inherited ones, field by field: Postman
+    /// overrides individually rather than replacing the whole block.
+    fn over(self, parent: Profile) -> Profile {
+        Profile {
+            disable_body_pruning: self.disable_body_pruning.or(parent.disable_body_pruning),
+            strict_ssl: self.strict_ssl.or(parent.strict_ssl),
+        }
+    }
 }
 
 /// A Postman `event` — a `prerequest` or `test` script attached to an item.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Event {
+    #[serde(deserialize_with = "de_str")]
     listen: String,
     script: Script,
 }
@@ -60,27 +94,28 @@ struct Script {
 
 #[derive(Deserialize)]
 struct Request {
-    #[serde(default = "get_method")]
+    #[serde(default = "get_method", deserialize_with = "de_method")]
     method: String,
     #[serde(default, deserialize_with = "de_url")]
-    url: String,
+    url: Url,
     #[serde(default)]
     header: Vec<Param>,
     auth: Option<Auth>,
     body: Option<Body>,
+    /// Prose documenting the request. A bare string, or `{"content": …}` with
+    /// a media type beside it.
+    #[serde(default, deserialize_with = "de_description")]
+    description: String,
 }
 
-fn get_method() -> String {
-    "GET".to_string()
-}
-
-/// A Postman URL is a bare string or an object with a `raw` field; anything
-/// else imports as an empty URL rather than failing the whole collection.
-fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+/// A Postman description is a string or a `{"content": …, "type": …}` object;
+/// anything else (including an explicit `null`) reads as no description rather
+/// than failing the collection.
+fn de_description<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::String(s) => s,
         Value::Object(m) => m
-            .get("raw")
+            .get("content")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
@@ -88,17 +123,81 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     })
 }
 
-/// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header) and `apikey` (→ a
-/// header or a query parameter) are mapped; credentials live in `key/value`
-/// lists keyed by `username`/`password`/`token`/`key`/`value`/`in`.
+fn get_method() -> String {
+    "GET".to_string()
+}
+
+/// Like [`de_str`], but a method that reads as blank (a `null`, or a structure
+/// we can't stringify) falls back to the same `GET` an absent one does rather
+/// than producing a request with no verb.
+fn de_method<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let m = de_str(d)?;
+    Ok(if m.trim().is_empty() { get_method() } else { m })
+}
+
+/// A Postman URL: the text as typed, plus the *path variables* declared for it.
+///
+/// Postman writes a path placeholder twice — once in `raw` as `/:batch_id`, and
+/// once in `variable` as a key/value pair holding the value to substitute. Only
+/// reading `raw` imported the colon form literally, so the request went out
+/// asking for a batch actually named ":batch_id".
+#[derive(Default)]
+struct Url {
+    raw: String,
+    /// Declared path variables, in declaration order. Empty for the bare-string
+    /// form of a URL, which has nowhere to put them.
+    variables: Vec<Param>,
+    /// The query parameters as Postman lists them. Only the *disabled* ones
+    /// matter here — enabled ones are already in `raw` and get parsed out of
+    /// it, but a switched-off parameter is left out of `raw` entirely, so it
+    /// used to disappear rather than import switched off.
+    queries: Vec<Param>,
+}
+
+/// A Postman URL is a bare string or an object with a `raw` field; anything
+/// else imports as an empty URL rather than failing the whole collection.
+fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => Url {
+            raw: s,
+            variables: Vec::new(),
+            queries: Vec::new(),
+        },
+        Value::Object(m) => Url {
+            raw: m
+                .get("raw")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            variables: m
+                .get("variable")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
+                .unwrap_or_default(),
+            queries: m
+                .get("query")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
+                .unwrap_or_default(),
+        },
+        _ => Url::default(),
+    })
+}
+
+/// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header), `apikey` (→ a
+/// header or a query parameter) and `oauth2` (→ a generated token request, see
+/// [`apply_oauth2`]) are mapped; credentials live in `key/value` lists keyed by
+/// `username`/`password`/`token`/`key`/`value`/`in`.
 #[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Auth {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "de_str")]
     kind: String,
     basic: Vec<Param>,
     bearer: Vec<Param>,
     apikey: Vec<Param>,
+    oauth2: Vec<Param>,
+    awsv4: Vec<Param>,
 }
 
 impl Auth {
@@ -129,10 +228,36 @@ impl Auth {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Body {
+    #[serde(deserialize_with = "de_str")]
     mode: String,
+    #[serde(deserialize_with = "de_str")]
     raw: String,
     urlencoded: Vec<Param>,
     formdata: Vec<Param>,
+    /// `{"src": "/path/to/file"}` — the whole request body read from a file.
+    file: FileBody,
+    graphql: GraphQl,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct FileBody {
+    #[serde(deserialize_with = "de_str")]
+    src: String,
+}
+
+/// Postman's GraphQL body is the query and its variables kept apart. On the
+/// wire GraphQL is an ordinary JSON POST, so this is a presentation split
+/// rather than a protocol one — which is why it can be imported rather than
+/// merely reported.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct GraphQl {
+    #[serde(deserialize_with = "de_str")]
+    query: String,
+    /// Held as a *string* of JSON, not as JSON.
+    #[serde(deserialize_with = "de_str")]
+    variables: String,
 }
 
 /// A `{key, value, …}` entry shared by headers, auth and body params; the extra
@@ -163,10 +288,22 @@ struct Param {
     description: String,
 }
 
-/// Deserialize a string field tolerantly: an explicit JSON `null` (which
-/// `#[serde(default)]` does *not* handle) becomes an empty string.
+/// Deserialize a string field tolerantly. Postman's schema is only loosely
+/// enforced by its own exporter, so a field documented as a string turns up as
+/// anything: an explicit JSON `null` (which `#[serde(default)]` does *not*
+/// handle), a number or bool from a hand-edited collection, or a nested
+/// structure — real exports carry `{"key": "tokenRequestParams", "value": []}`
+/// inside an oauth2 block. Because serde aborts the *whole* document on the
+/// first type error, and [`convert_postman`] answers a failed parse with an
+/// empty collection, being strict here silently emptied entire workspaces. So
+/// scalars stringify and structures become empty rather than fatal.
 fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null | Value::Array(_) | Value::Object(_) => String::new(),
+    })
 }
 
 impl Param {
@@ -379,11 +516,24 @@ pub fn import_postman(content: &str) -> Vec<HurlEntry> {
 /// none uses the collection's, and `"type": "noauth"` at any level means "no
 /// auth", not "ask my parent".
 pub fn convert_postman(content: &str) -> ConvertedCollection {
-    let Ok(root) = serde_json::from_str::<Value>(content)
+    // A file that doesn't deserialize produces *no* requests, which looks
+    // exactly like an empty collection — a shape of Postman JSON we mishandle
+    // is therefore invisible unless it says so. Record it as a note so the
+    // failure is reported rather than mistaken for "this collection is empty".
+    let root = match serde_json::from_str::<Value>(content)
         .map(|v| unwrap_envelope(v, "collection", "item"))
         .and_then(serde_json::from_value::<Collection>)
-    else {
-        return ConvertedCollection::default();
+    {
+        Ok(root) => root,
+        Err(e) => {
+            return ConvertedCollection {
+                notes: vec![ConversionNote {
+                    item: String::new(),
+                    detail: format!("collection could not be read: {e}"),
+                }],
+                ..ConvertedCollection::default()
+            };
+        }
     };
     let mut out = ConvertedCollection {
         variables: root
@@ -400,7 +550,16 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
         ..ConvertedCollection::default()
     };
     let inherited = root.auth.as_ref().filter(|a| !a.inherits());
-    walk_items(&root.item, &mut Vec::new(), inherited, &mut out);
+    let mut tokens = OAuthTokens::default();
+    walk_items(
+        &root.item,
+        &mut Vec::new(),
+        inherited,
+        &[],
+        root.protocol_profile_behavior.unwrap_or_default(),
+        &mut tokens,
+        &mut out,
+    );
     out
 }
 
@@ -410,18 +569,34 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
 /// a node unusually carries both `item` and `request`.
 ///
 /// `inherited` is the nearest enclosing auth, already resolved — `None` once
-/// some level has said `noauth`.
+/// some level has said `noauth`. `auth_path` is the folder breadcrumb of the
+/// level that *declared* it, which is where a generated OAuth 2 token request
+/// belongs: naming it after the first request that happens to use it would
+/// bury a collection-wide token three folders deep.
 fn walk_items(
     items: &[Item],
     path: &mut Vec<String>,
     inherited: Option<&Auth>,
+    auth_path: &[String],
+    profile: Profile,
+    tokens: &mut OAuthTokens,
     out: &mut ConvertedCollection,
 ) {
     for it in items {
         if let Some(sub) = &it.item {
             let here = resolve_auth(it.auth.as_ref(), inherited);
+            let declares_own = it.auth.as_ref().is_some_and(|a| !a.inherits());
             path.push(it.name.clone());
-            walk_items(sub, path, here, out);
+            let here_path = if declares_own {
+                path.clone()
+            } else {
+                auth_path.to_vec()
+            };
+            let here_profile = it
+                .protocol_profile_behavior
+                .unwrap_or_default()
+                .over(profile);
+            walk_items(sub, path, here, &here_path, here_profile, tokens, out);
             path.pop();
         } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
@@ -430,8 +605,18 @@ fn walk_items(
                 format!("{}/{}", path.join("/"), it.name)
             };
             let auth = resolve_auth(req.auth.as_ref(), inherited);
-            let mut entry = map_request(&title, req, &it.event, auth);
-            note_losses(&title, req, &it.event, auth, &entry, out);
+            // A request declaring its own auth owns it, so its own folder is
+            // where a token request for it belongs.
+            let declares_own = req.auth.as_ref().is_some_and(|a| !a.inherits());
+            let token_path: &[String] = if declares_own { path } else { auth_path };
+            let profile = it
+                .protocol_profile_behavior
+                .unwrap_or_default()
+                .over(profile);
+            let mut entry = map_request(&title, req, &it.event, auth, profile);
+            apply_path_variables(&title, &req.url, &mut entry, out);
+            apply_oauth2(&title, token_path, auth, &mut entry, tokens, out);
+            note_losses(&title, req, &it.event, auth, profile, &entry, out);
             for name in rename_dynamic_variables(&mut entry) {
                 out.notes.push(ConversionNote {
                     item: title.clone(),
@@ -442,6 +627,347 @@ fn walk_items(
                 });
             }
             out.entries.push(entry);
+        }
+    }
+}
+
+/// Postman's OAuth 2 configuration, flattened out of its `key`/`value` list.
+///
+/// Postman fetches the token itself, behind the scenes, and never writes it to
+/// the export — so an OAuth 2 collection used to import as a pile of requests
+/// with no credentials on them at all. Hurl has no such machinery, but it
+/// doesn't need any: a token request is just a request, and `[Captures]` feeds
+/// its answer to the ones that follow. That is exactly the shape a hand-written
+/// Hurl collection uses, so this generates it.
+struct OAuth2 {
+    access_token_url: String,
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
+    username: String,
+    password: String,
+    scope: String,
+    /// `header` (HTTP Basic, Postman's default) or `body` (credentials as form
+    /// fields) — how the token endpoint expects the client to identify itself.
+    client_authentication: String,
+    /// Text placed before the token, e.g. `"Bearer "`. Postman stores the
+    /// trailing space; exports that omit it fall back to `tokenType`.
+    header_prefix: String,
+    /// `header` (the default) or `queryParams`.
+    add_token_to: String,
+}
+
+impl OAuth2 {
+    fn read(auth: &Auth) -> Self {
+        let f = |name: &str| Auth::field(&auth.oauth2, name);
+        let prefix = match (f("headerPrefix"), f("tokenType")) {
+            (p, _) if !p.trim().is_empty() => p,
+            (_, t) if !t.trim().is_empty() => format!("{} ", t.trim()),
+            _ => "Bearer ".to_string(),
+        };
+        OAuth2 {
+            access_token_url: f("accessTokenUrl"),
+            grant_type: f("grant_type"),
+            client_id: f("clientId"),
+            client_secret: f("clientSecret"),
+            username: f("username"),
+            password: f("password"),
+            scope: f("scope"),
+            client_authentication: f("client_authentication"),
+            header_prefix: prefix,
+            add_token_to: f("addTokenTo"),
+        }
+    }
+
+    /// What makes two OAuth 2 blocks the same token. Folders repeat the whole
+    /// configuration rather than referring to a shared one, so without this a
+    /// collection with the same credentials on six folders would fetch six
+    /// identical tokens.
+    fn identity(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.access_token_url,
+            self.grant_type,
+            self.client_id,
+            self.scope,
+            self.client_authentication
+        )
+    }
+}
+
+/// Tokens generated so far: identity → the variable its value is captured into.
+/// Threaded through the walk so the token request is emitted once, immediately
+/// before the first request that needs it — which is also the order "Run All"
+/// needs, since a collection is a script that runs top to bottom.
+#[derive(Default)]
+struct OAuthTokens {
+    issued: Vec<(String, String)>,
+}
+
+impl OAuthTokens {
+    fn var_for(&self, identity: &str) -> Option<&str> {
+        self.issued
+            .iter()
+            .find(|(id, _)| id == identity)
+            .map(|(_, var)| var.as_str())
+    }
+
+    /// A fresh capture name. The first token is plain `access_token` — the name
+    /// the endpoint's own JSON uses and the one anybody reading the collection
+    /// will expect; later ones are numbered rather than named after the folder,
+    /// because a folder can be renamed and the variable would then lie.
+    fn next_var(&self) -> String {
+        match self.issued.len() {
+            0 => "access_token".to_string(),
+            n => format!("access_token_{}", n + 1),
+        }
+    }
+}
+
+/// Turn a Postman OAuth 2 block into a real request: a token request generated
+/// once, plus the `Authorization` header (or query parameter) on every request
+/// that inherits it.
+///
+/// Only the grants that are *just an HTTP POST* are generated —
+/// `client_credentials` and `password`. `authorization_code`, `implicit` and
+/// PKCE need a browser, a redirect and a human, none of which a file of
+/// requests can carry, so they are reported rather than half-built.
+fn apply_oauth2(
+    title: &str,
+    path: &[String],
+    auth: Option<&Auth>,
+    entry: &mut HurlEntry,
+    tokens: &mut OAuthTokens,
+    out: &mut ConvertedCollection,
+) {
+    let Some(auth) = auth.filter(|a| a.kind == "oauth2") else {
+        return;
+    };
+    let cfg = OAuth2::read(auth);
+    let mut note = |detail: String| {
+        out.notes.push(ConversionNote {
+            item: title.to_string(),
+            detail,
+        })
+    };
+
+    // A request that spells its own credentials out keeps them. Real exports do
+    // this constantly — a hand-written token request sitting inside a folder
+    // that also has OAuth 2 configured on it, so it ends up asking for a token
+    // using a token it doesn't have yet. Appending ours as well would leave two
+    // `Authorization` headers on the wire and let the collection's own,
+    // deliberate choice lose to a generated one.
+    let already_authorized = if cfg.add_token_to == "queryParams" {
+        entry.queries.iter().any(|q| q.key == "access_token")
+    } else {
+        entry
+            .headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case("authorization"))
+    };
+    if already_authorized {
+        note(
+            "this request sets its own Authorization, so the folder's OAuth 2 token was not \
+             added on top of it"
+                .into(),
+        );
+        return;
+    }
+
+    // A folder may override only the presentation (`headerPrefix`) and leave
+    // the token configuration to its parent. There is nothing to fetch, so
+    // reuse whatever the enclosing level already issued.
+    let var = if cfg.access_token_url.trim().is_empty() {
+        match tokens.issued.last() {
+            Some((_, var)) => var.clone(),
+            None => {
+                note(
+                    "OAuth 2 auth with no token URL — Postman was holding a token it fetched \
+                     elsewhere, which an export can't carry, so this request has no credentials"
+                        .into(),
+                );
+                return;
+            }
+        }
+    } else if !matches!(cfg.grant_type.as_str(), "client_credentials" | "password") {
+        note(format!(
+            "the OAuth 2 `{}` grant needs a browser redirect, which a file of requests can't \
+             perform — fetch a token by hand and put it in a variable",
+            cfg.grant_type
+        ));
+        return;
+    } else {
+        let identity = cfg.identity();
+        match tokens.var_for(&identity) {
+            Some(var) => var.to_string(),
+            None => {
+                let var = tokens.next_var();
+                let (token_entry, missing) = token_request(&cfg, &var, path);
+                if missing {
+                    note(
+                        "Postman keeps OAuth 2 client credentials outside the export, so the \
+                         generated token request refers to `{{oauth_client_id}}` and \
+                         `{{oauth_client_secret}}` — fill them in alongside the collection"
+                            .into(),
+                    );
+                }
+                out.entries.push(token_entry);
+                tokens.issued.push((identity, var.clone()));
+                var
+            }
+        }
+    };
+
+    if cfg.add_token_to == "queryParams" {
+        entry
+            .queries
+            .push(KvRow::new("access_token", format!("{{{{{var}}}}}")));
+    } else {
+        entry.headers.push(KvRow::new(
+            "Authorization",
+            format!("{}{{{{{var}}}}}", cfg.header_prefix),
+        ));
+    }
+}
+
+/// Build the token request itself. Returns it plus whether the credentials had
+/// to be stubbed out as variables because the export didn't carry them.
+fn token_request(cfg: &OAuth2, var: &str, path: &[String]) -> (HurlEntry, bool) {
+    let missing = cfg.client_id.trim().is_empty() && cfg.client_secret.trim().is_empty();
+    let (id, secret) = if missing {
+        (
+            "{{oauth_client_id}}".to_string(),
+            "{{oauth_client_secret}}".to_string(),
+        )
+    } else {
+        (cfg.client_id.clone(), cfg.client_secret.clone())
+    };
+
+    let mut form: Vec<FormField> = Vec::new();
+    let mut text = |key: &str, value: String| {
+        form.push(FormField {
+            key: key.to_string(),
+            value,
+            kind: FormFieldKind::Text,
+            content_type: None,
+            base64_prefix: None,
+            enabled: true,
+            desc: String::new(),
+        })
+    };
+    text("grant_type", cfg.grant_type.clone());
+    if !cfg.scope.trim().is_empty() {
+        text("scope", cfg.scope.clone());
+    }
+    if cfg.grant_type == "password" {
+        text("username", cfg.username.clone());
+        text("password", cfg.password.clone());
+    }
+    // Postman's default is HTTP Basic ("header"); "body" sends the credentials
+    // as ordinary form fields instead. Both are in the spec and endpoints
+    // differ on which they accept, so the export's choice is honoured.
+    let basic_auth = if cfg.client_authentication == "body" {
+        text("client_id", id);
+        text("client_secret", secret);
+        None
+    } else {
+        Some((id, secret))
+    };
+
+    // The name is prefixed with the folder that declared the auth so it nests
+    // beside the requests that use it, and reads as the first step of that
+    // folder rather than a stray request at the top of the collection.
+    let title = if path.is_empty() {
+        "Get access token".to_string()
+    } else {
+        format!("{}/Get access token", path.join("/"))
+    };
+
+    let entry = HurlEntry {
+        title,
+        method: "POST".to_string(),
+        url: cfg.access_token_url.clone(),
+        form_fields: form,
+        basic_auth,
+        // Asserted, not merely hoped for: without it a failed token request
+        // captures nothing and every request after it fails for a reason that
+        // has scrolled off the screen.
+        expected_status: Some(200),
+        captures: vec![(var.to_string(), "jsonpath \"$.access_token\"".to_string())],
+        ..Default::default()
+    };
+    (entry, missing)
+}
+
+/// Rewrite Postman's `/:name` path placeholders to `{{name}}`, and carry the
+/// values it declared for them into the collection's variables.
+///
+/// Postman substitutes a path variable from `url.variable` at send time, so
+/// importing `raw` alone produced a URL that asks the server for a resource
+/// literally named ":batch_id". Hurl's equivalent is an ordinary `{{name}}`,
+/// which keeps the request parameterised rather than baking one value in.
+///
+/// Only whole segments are rewritten, and only for names the export actually
+/// declares: `:` is legal in a URL (`http://host:8080`, a `mailto:`), and
+/// Postman itself only substitutes what is in the `variable` list.
+///
+/// A declared value is seeded into the collection's variables so the request
+/// works as imported. The first value for a name wins — path variables are
+/// per-request, so several requests can declare the same name with different
+/// values, and there is exactly one `.vars` file for them to land in. A
+/// conflict is reported rather than silently resolved, since guessing which
+/// batch id was meant is not something an importer can do.
+fn apply_path_variables(
+    title: &str,
+    url: &Url,
+    entry: &mut HurlEntry,
+    out: &mut ConvertedCollection,
+) {
+    let declared: Vec<&Param> = url
+        .variables
+        .iter()
+        .filter(|v| !v.disabled && !v.key.trim().is_empty())
+        .collect();
+    if declared.is_empty() {
+        return;
+    }
+
+    // Rewrite the path only. The query string can contain a bare `:` in a
+    // value, and Postman never substitutes path variables there.
+    let (path, query) = match entry.url.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (entry.url.clone(), None),
+    };
+    let rewritten: Vec<String> = path
+        .split('/')
+        .map(|seg| match seg.strip_prefix(':') {
+            Some(name) if declared.iter().any(|v| v.key.trim() == name) => {
+                format!("{{{{{name}}}}}")
+            }
+            _ => seg.to_string(),
+        })
+        .collect();
+    entry.url = match query {
+        Some(q) => format!("{}?{}", rewritten.join("/"), q),
+        None => rewritten.join("/"),
+    };
+
+    for var in declared {
+        let key = var.key.trim().to_string();
+        let value = var.value.replace(['\n', '\r'], " ").trim().to_string();
+        match out.variables.iter().find(|(k, _)| *k == key) {
+            Some((_, existing)) if *existing != value && !value.is_empty() => {
+                out.notes.push(ConversionNote {
+                    item: title.to_string(),
+                    detail: format!(
+                        "the path variable `{key}` is declared here as `{value}` but is already \
+                         `{existing}` — a `.vars` file holds one value per name, so the first was \
+                         kept"
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => out.variables.push((key, value)),
         }
     }
 }
@@ -501,6 +1027,15 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
     found
 }
 
+/// `value` unless it is blank, in which case `fallback`.
+fn non_empty(value: String, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
 /// Which auth applies at this level: its own if it declares any, otherwise
 /// whatever it inherits — and nothing at all if it opts out.
 fn resolve_auth<'a>(own: Option<&'a Auth>, inherited: Option<&'a Auth>) -> Option<&'a Auth> {
@@ -519,6 +1054,7 @@ fn note_losses(
     req: &Request,
     events: &[Event],
     auth: Option<&Auth>,
+    profile: Profile,
     entry: &HurlEntry,
     out: &mut ConvertedCollection,
 ) {
@@ -530,7 +1066,10 @@ fn note_losses(
     };
 
     if let Some(auth) = auth
-        && !matches!(auth.kind.as_str(), "basic" | "bearer" | "apikey")
+        && !matches!(
+            auth.kind.as_str(),
+            "basic" | "bearer" | "apikey" | "oauth2" | "awsv4"
+        )
     {
         note(format!(
             "auth type `{}` has no Hurl equivalent and was dropped",
@@ -538,15 +1077,60 @@ fn note_losses(
         ));
     }
     if let Some(auth) = auth
+        && auth.kind == "awsv4"
+        && Auth::field(&auth.awsv4, "accessKey").trim().is_empty()
+    {
+        note(
+            "AWS auth carried no keys — real exports keep them in variables or outside the file \
+             — so the request signs with `{{aws_access_key_id}}` and `{{aws_secret_access_key}}`"
+                .into(),
+        );
+    }
+    if let Some(auth) = auth
         && auth.kind == "apikey"
         && !matches!(Auth::field(&auth.apikey, "in").as_str(), "" | "header")
     {
         note("API-key auth is sent in the query string; it was added as a query parameter".into());
     }
+    let pruned =
+        matches!(req.method.as_str(), "GET" | "HEAD") && profile.disable_body_pruning != Some(true);
     if let Some(b) = &req.body
-        && !matches!(b.mode.as_str(), "" | "raw" | "urlencoded" | "formdata")
+        && pruned
+        && !(b.raw.is_empty() && b.mode.is_empty())
     {
-        note(format!("body mode `{}` was dropped", b.mode));
+        note(format!(
+            "the stored {} body was left out, because Postman would not have sent it on a {} \
+             either — nothing turned its body pruning off",
+            if b.mode.is_empty() {
+                "request"
+            } else {
+                &b.mode
+            },
+            req.method
+        ));
+    } else if let Some(b) = &req.body {
+        match b.mode.as_str() {
+            "" | "raw" | "urlencoded" | "formdata" => {}
+            // Hurl can send a whole body from a file, but PaperBoy's own
+            // request model has no place to keep one — a `file,path;` body
+            // serialises correctly and then reads back as nothing, so importing
+            // it would produce a request that quietly loses its body the first
+            // time the collection is reopened. Better to say so.
+            "file" if b.file.src.trim().is_empty() => note(
+                "the body is a file, and Postman never had one chosen — attach it here instead"
+                    .into(),
+            ),
+            "file" => note(format!(
+                "the body was the file `{}`; attach it here instead, as PaperBoy sends file \
+                 bodies as form or multipart parts rather than as the whole body",
+                b.file.src.trim()
+            )),
+            "graphql" if b.graphql.query.trim().is_empty() => {
+                note("the GraphQL body held no query, so there was nothing to send".into())
+            }
+            "graphql" => {}
+            mode => note(format!("body mode `{mode}` was dropped")),
+        }
     }
     for f in &entry.form_fields {
         if f.kind == FormFieldKind::File && !f.enabled {
@@ -572,9 +1156,16 @@ fn note_losses(
     }
 }
 
-fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>) -> HurlEntry {
+fn map_request(
+    name: &str,
+    req: &Request,
+    events: &[Event],
+    auth: Option<&Auth>,
+    profile: Profile,
+) -> HurlEntry {
     let mut headers: Vec<KvRow> = req.header.iter().filter_map(Param::enabled_kve).collect();
     let mut queries: Vec<KvRow> = Vec::new();
+    let mut options: Vec<KvRow> = Vec::new();
 
     // Auth → basic_auth, or a header/query parameter. `auth` is already
     // resolved against the enclosing folder and collection by `walk_items`.
@@ -609,6 +1200,43 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
                     }
                 }
             }
+            // AWS Signature v4 is a signing algorithm, not a header PaperBoy
+            // could write out: the signature covers the method, path, headers
+            // and body, so it can only be computed at send time. curl does it,
+            // Hurl exposes it as the `aws-sigv4` option, and the credentials
+            // ride in `user` — so this maps exactly, which is worth doing for
+            // an auth type that otherwise loses every request under it.
+            "awsv4" => {
+                let f = |name: &str| Auth::field(&auth.awsv4, name);
+                // `aws:amz` is the provider pair every AWS endpoint uses.
+                // Region and service are appended only when the export names
+                // them, because curl infers both from the hostname and a blank
+                // guess would be worse than no guess.
+                let mut provider = "aws:amz".to_string();
+                let (region, service) = (f("region"), f("service"));
+                if !region.trim().is_empty() || !service.trim().is_empty() {
+                    provider.push(':');
+                    provider.push_str(region.trim());
+                    if !service.trim().is_empty() {
+                        provider.push(':');
+                        provider.push_str(service.trim());
+                    }
+                }
+                options.push(KvRow::new("aws-sigv4", provider));
+
+                // Postman usually stores these as collection variables rather
+                // than in the auth block, and real exports leave the block
+                // empty altogether — so fall back to named variables the user
+                // can fill in rather than signing with nothing.
+                let key = non_empty(f("accessKey"), "{{aws_access_key_id}}");
+                let secret = non_empty(f("secretKey"), "{{aws_secret_access_key}}");
+                options.push(KvRow::new("user", format!("{key}:{secret}")));
+
+                let session = f("sessionToken");
+                if !session.trim().is_empty() {
+                    headers.push(KvRow::new("x-amz-security-token", session));
+                }
+            }
             _ => {}
         }
     }
@@ -617,21 +1245,85 @@ fn map_request(name: &str, req: &Request, events: &[Event], auth: Option<&Auth>)
     // form fields (file-type form-data fields become `File` fields).
     let mut form_fields = Vec::new();
     let mut body = String::new();
-    if let Some(b) = &req.body {
+    // Postman strips the body from a body-less method unless `disableBodyPruning`
+    // says otherwise, so a GET stored with a body is not a GET that sends one —
+    // it's the remains of an edit. Importing it anyway would change what the
+    // collection does, and some servers reject a GET with a body outright.
+    let pruned =
+        matches!(req.method.as_str(), "GET" | "HEAD") && profile.disable_body_pruning != Some(true);
+    if let Some(b) = &req.body.as_ref().filter(|_| !pruned) {
         match b.mode.as_str() {
             "raw" => body = b.raw.clone(),
             "urlencoded" => {
                 form_fields = b.urlencoded.iter().filter_map(Param::form_field).collect()
             }
             "formdata" => form_fields = b.formdata.iter().filter_map(Param::form_field).collect(),
+            // GraphQL over HTTP is a JSON POST of `{query, variables}`; the two
+            // halves are only kept apart for editing.
+            "graphql" if !b.graphql.query.trim().is_empty() => {
+                let mut doc = serde_json::Map::new();
+                doc.insert("query".into(), Value::String(b.graphql.query.clone()));
+                // Variables arrive as a string of JSON. Parsed, they nest as an
+                // object the way the server expects; unparseable, they are left
+                // out rather than sent as a quoted blob the server would reject.
+                if let Ok(vars) = serde_json::from_str::<Value>(&b.graphql.variables)
+                    && !vars.is_null()
+                {
+                    doc.insert("variables".into(), vars);
+                }
+                body = serde_json::to_string_pretty(&Value::Object(doc)).unwrap_or_default();
+                if !headers
+                    .iter()
+                    .any(|h| h.key.eq_ignore_ascii_case("content-type"))
+                {
+                    headers.push(KvRow::new("Content-Type", "application/json"));
+                }
+            }
             _ => {}
         }
     }
 
-    let mut entry = HurlEntry::from_fields(name, &req.method, &req.url, headers, &body);
+    let mut entry = HurlEntry::from_fields(name, &req.method, &req.url.raw, headers, &body);
     entry.basic_auth = basic_auth;
     entry.form_fields = form_fields;
+    // A parameter Postman has switched off is left out of the URL text, so
+    // reading the text alone threw it away. It is part of the request as
+    // documentation — the optional filter someone turns on now and again — and
+    // PaperBoy has a switched-off row for exactly this.
+    entry.queries.extend(
+        req.url
+            .queries
+            .iter()
+            .filter(|q| q.disabled)
+            .filter_map(Param::enabled_kve),
+    );
     entry.queries.extend(queries);
+    // Postman's prose about the request. Kept as comments in the header
+    // region rather than folded into the title: the title is the request's
+    // *name* and is what every list in the app shows, so a paragraph in it
+    // would be unreadable — but dropping it loses the only explanation of what
+    // half these requests are for. `EntryComment` already round-trips.
+    entry.comments.extend(
+        req.description
+            .replace("\r\n", "\n")
+            .lines()
+            .map(|line| EntryComment {
+                anchor: CommentAnchor::Headers,
+                text: if line.trim().is_empty() {
+                    "#".to_string()
+                } else {
+                    format!("# {}", line.trim_end())
+                },
+            }),
+    );
+    entry.options.extend(options);
+    // `strictSSL: false` is Postman being told not to verify the certificate,
+    // which is Hurl's `insecure` — a real behavioural setting that would
+    // otherwise import as a request that simply fails against the staging box
+    // it was written for.
+    if profile.strict_ssl == Some(false) {
+        entry.options.push(KvRow::new("insecure", "true"));
+    }
     // Captured variables from the request's `test` script (#24). A request that
     // gets captures serializes with a `HTTP *` line automatically; one with none
     // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
@@ -1020,7 +1712,7 @@ mod tests {
           "info": { "name": "demo", "schema": "https://schema.getpostman.com/..v2.1.0" },
           "item": [
             { "name": "search", "request": {
-                "method": "GET",
+                "method": "POST",
                 "url": {
                   "raw": "{{url}}/search?q=cats",
                   "host": ["{{url}}"],
@@ -1049,6 +1741,751 @@ mod tests {
             e.form_fields[0].desc, "which cluster",
             "and so should a form field's"
         );
+    }
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::*;
+
+    fn one(request: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {{ "name": "r", "request": {request} }} ] }}"#
+        ))
+    }
+
+    fn comments(e: &HurlEntry) -> Vec<&str> {
+        e.comments.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    /// 88 requests in the exports on hand carry prose, and it was the only
+    /// explanation of what half of them are for.
+    #[test]
+    fn a_request_description_is_kept_as_comments() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x",
+                 "description": "Returns the current user.\n\nRequires the `read` scope." }"#);
+        assert_eq!(
+            comments(&c.entries[0]),
+            vec![
+                "# Returns the current user.",
+                "#",
+                "# Requires the `read` scope."
+            ]
+        );
+    }
+
+    /// The title is the request's *name* and is what every list in the app
+    /// shows, so a paragraph must not end up in it.
+    #[test]
+    fn the_description_never_becomes_part_of_the_name() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x", "description": "long prose" }"#);
+        assert_eq!(c.entries[0].title, "r");
+    }
+
+    /// Postman writes the newer descriptions as an object with a media type.
+    #[test]
+    fn an_object_description_is_read_too() {
+        let c = one(r##"{ "method": "GET", "url": "https://h/x",
+                 "description": { "content": "Heading", "type": "text/markdown" } }"##);
+        assert_eq!(comments(&c.entries[0]), vec!["# Heading"]);
+    }
+
+    /// A description that isn't there mustn't leave an empty comment behind.
+    #[test]
+    fn no_description_adds_nothing() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x" }"#);
+        assert!(c.entries[0].comments.is_empty());
+    }
+
+    /// Postman writes an explicit `null` for fields it leaves blank, which must
+    /// not fail the whole import.
+    #[test]
+    fn a_null_description_is_survivable() {
+        let c = one(r#"{ "method": "GET", "url": "https://h/x", "description": null }"#);
+        assert_eq!(c.entries.len(), 1);
+        assert!(c.entries[0].comments.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod body_mode_tests {
+    use super::*;
+
+    fn post(body: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {{ "name": "r", "request": {{ "method": "POST",
+                   "url": "https://h/x", "body": {body} }} }} ] }}"#
+        ))
+    }
+
+    /// GraphQL over HTTP is an ordinary JSON POST; Postman only keeps the query
+    /// and its variables apart so they can be edited separately. That made this
+    /// a presentation difference the importer was treating as a protocol one.
+    #[test]
+    fn a_graphql_body_becomes_the_json_post_it_actually_is() {
+        let c = post(
+            r#"{ "mode": "graphql", "graphql": {
+                 "query": "query Q($id: ID){ thing(id: $id) }",
+                 "variables": "{ \"id\": \"7\" }" } }"#,
+        );
+        let e = &c.entries[0];
+        let sent: serde_json::Value = serde_json::from_str(e.body.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["query"], "query Q($id: ID){ thing(id: $id) }");
+        assert_eq!(
+            sent["variables"]["id"], "7",
+            "the variables nest as an object, not as the string Postman stores"
+        );
+        assert!(
+            e.headers
+                .iter()
+                .any(|h| h.key.eq_ignore_ascii_case("content-type")
+                    && h.value.contains("application/json"))
+        );
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("graphql")),
+            "and nothing was lost to report: {:?}",
+            c.notes
+        );
+    }
+
+    /// Half-written variables are left out rather than sent as a quoted blob
+    /// the server would reject.
+    #[test]
+    fn unparseable_graphql_variables_are_left_out() {
+        let c = post(
+            r#"{ "mode": "graphql", "graphql": { "query": "{ ping }",
+                 "variables": "{ not json" } }"#,
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(c.entries[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(sent["query"], "{ ping }");
+        assert!(sent.get("variables").is_none());
+    }
+
+    /// A `file,path;` body serialises as valid Hurl and then reads back as
+    /// nothing, because PaperBoy's request model has nowhere to keep one. An
+    /// import that vanished on the next reload would be worse than a note.
+    #[test]
+    fn a_file_body_is_reported_rather_than_imported_and_lost() {
+        let c = post(r#"{ "mode": "file", "file": { "src": "./payload.bin" } }"#);
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("./payload.bin")),
+            "the path is named so it can be attached by hand: {:?}",
+            c.notes
+        );
+    }
+
+    /// Both file bodies in the exports on hand are `{"src": ""}` — the mode was
+    /// chosen and a file never was.
+    #[test]
+    fn a_file_body_with_no_file_is_reported_not_invented() {
+        let c = post(r#"{ "mode": "file", "file": { "src": "" } }"#);
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("never had one chosen")),
+            "{:?}",
+            c.notes
+        );
+    }
+}
+
+#[cfg(test)]
+mod profile_behavior_tests {
+    use super::*;
+
+    fn convert(item: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{ "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+                 "item": [ {item} ] }}"#
+        ))
+    }
+
+    /// Postman strips the body from a GET unless told not to, so a GET stored
+    /// with a body is the remains of an edit, not a request that sends one.
+    #[test]
+    fn a_get_body_postman_would_not_have_sent_is_left_out() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "GET", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{\"stale\":true}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body, None);
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("body pruning")),
+            "and it says why, since the text is visibly in the export: {:?}",
+            c.notes
+        );
+    }
+
+    /// ...but 318 requests in the exports on hand explicitly turn pruning off,
+    /// and those really do send a body on a GET.
+    #[test]
+    fn disable_body_pruning_keeps_the_body() {
+        let c = convert(
+            r#"{ "name": "r", "protocolProfileBehavior": { "disableBodyPruning": true },
+                 "request": { "method": "GET", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// A POST body is never pruned, whatever the setting says.
+    #[test]
+    fn a_post_body_is_untouched() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "POST", "url": "https://h/x",
+                 "body": { "mode": "raw", "raw": "{}" } } }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// The setting is inherited, and Postman overrides field by field rather
+    /// than replacing the whole block.
+    #[test]
+    fn a_folder_can_turn_pruning_off_for_everything_inside_it() {
+        let c = convert(
+            r#"{ "name": "F", "protocolProfileBehavior": { "disableBodyPruning": true },
+                 "item": [ { "name": "r", "request": { "method": "GET", "url": "https://h/x",
+                   "body": { "mode": "raw", "raw": "{}" } } } ] }"#,
+        );
+        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+    }
+
+    /// `strictSSL: false` is a real behavioural setting; without it the request
+    /// imports and then simply fails against the box it was written for.
+    #[test]
+    fn strict_ssl_off_becomes_the_insecure_option() {
+        let c = convert(
+            r#"{ "name": "r", "protocolProfileBehavior": { "strictSSL": false },
+                 "request": { "method": "GET", "url": "https://h/x" } }"#,
+        );
+        assert!(
+            c.entries[0]
+                .options
+                .contains(&KvRow::toggled("insecure", "true", true))
+        );
+    }
+
+    /// The default must stay strict — silently disabling certificate checks
+    /// would be the worst possible thing to get wrong here.
+    #[test]
+    fn certificate_checking_stays_on_by_default() {
+        let c = convert(r#"{ "name": "r", "request": { "method": "GET", "url": "https://h/x" } }"#);
+        assert!(c.entries[0].options.is_empty());
+    }
+
+    /// A switched-off parameter is left out of the URL text, so reading the
+    /// text alone lost it. It is documentation — the optional filter someone
+    /// turns on now and again — and there is a switched-off row for it.
+    #[test]
+    fn a_disabled_query_parameter_imports_switched_off() {
+        let c = convert(
+            r#"{ "name": "r", "request": { "method": "GET", "url": {
+                 "raw": "https://h/x?page=2",
+                 "query": [ { "key": "page", "value": "2" },
+                            { "key": "verbose", "value": "true", "disabled": true } ] } } }"#,
+        );
+        let q = &c.entries[0].queries;
+        assert!(
+            q.contains(&KvRow::toggled("verbose", "true", false)),
+            "the disabled parameter is kept, switched off: {q:?}"
+        );
+        assert_eq!(
+            q.iter().filter(|r| r.key == "page").count(),
+            0,
+            "and the enabled one is not duplicated — it is already in the URL text"
+        );
+        assert_eq!(c.entries[0].url, "https://h/x?page=2");
+    }
+}
+
+#[cfg(test)]
+mod awsv4_tests {
+    use super::*;
+
+    fn one(auth: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [ {{ "name": "r", "request": {{ "method": "GET",
+                "url": "https://api.example.com/v1/x", "auth": {auth} }} }} ]
+            }}"#
+        ))
+    }
+
+    fn option(e: &HurlEntry, name: &str) -> Option<String> {
+        e.options
+            .iter()
+            .find(|o| o.key == name)
+            .map(|o| o.value.clone())
+    }
+
+    /// A v4 signature covers the method, path, headers and body, so it can only
+    /// be computed at send time — which is precisely what Hurl's `aws-sigv4`
+    /// option asks curl to do. Every request under this auth used to import
+    /// unsigned, with a note saying so.
+    #[test]
+    fn awsv4_auth_becomes_the_aws_sigv4_option() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                 { "key": "accessKey", "value": "AKIA1" },
+                 { "key": "secretKey", "value": "s3cret" },
+                 { "key": "region", "value": "eu-west-1" },
+                 { "key": "service", "value": "execute-api" } ] }"#);
+        let e = &c.entries[0];
+        assert_eq!(
+            option(e, "aws-sigv4").as_deref(),
+            Some("aws:amz:eu-west-1:execute-api")
+        );
+        assert_eq!(option(e, "user").as_deref(), Some("AKIA1:s3cret"));
+    }
+
+    /// curl works the region and service out from the hostname, so naming them
+    /// blank would be worse than not naming them.
+    #[test]
+    fn an_unnamed_region_is_left_for_curl_to_infer() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                        { "key": "accessKey", "value": "AKIA1" },
+                        { "key": "secretKey", "value": "s3cret" } ] }"#);
+        assert_eq!(
+            option(&c.entries[0], "aws-sigv4").as_deref(),
+            Some("aws:amz")
+        );
+    }
+
+    /// Both AWS-signed collections in the exports on hand are exactly this:
+    /// a bare `{"type": "awsv4"}`, with the keys kept somewhere else entirely.
+    #[test]
+    fn a_bare_aws_auth_block_signs_with_named_variables_and_says_so() {
+        let c = one(r#"{ "type": "awsv4" }"#);
+        assert_eq!(
+            option(&c.entries[0], "user").as_deref(),
+            Some("{{aws_access_key_id}}:{{aws_secret_access_key}}")
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("aws_access_key_id")),
+            "the user is told where to put the keys: {:?}",
+            c.notes
+        );
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("was dropped")),
+            "and it is no longer reported as a lost auth type"
+        );
+    }
+
+    /// Temporary credentials need the session token alongside the signature.
+    #[test]
+    fn a_session_token_rides_in_its_own_header() {
+        let c = one(r#"{ "type": "awsv4", "awsv4": [
+                        { "key": "accessKey", "value": "A" },
+                        { "key": "secretKey", "value": "B" },
+                        { "key": "sessionToken", "value": "tok" } ] }"#);
+        assert!(c.entries[0].headers.contains(&KvRow::toggled(
+            "x-amz-security-token",
+            "tok",
+            true
+        )));
+    }
+}
+
+#[cfg(test)]
+mod oauth2_tests {
+    use super::*;
+
+    /// A folder that authenticates with client credentials, holding two
+    /// requests — the real shape from the IDKit exports.
+    fn folder_oauth2(extra: &str) -> String {
+        format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [
+                {{ "name": "Tenant API",
+                   "auth": {{ "type": "oauth2", "oauth2": [
+                     {{ "key": "accessTokenUrl", "value": "https://id.example.com/v1/token" }},
+                     {{ "key": "grant_type", "value": "client_credentials" }},
+                     {{ "key": "clientId", "value": "abc" }},
+                     {{ "key": "clientSecret", "value": "shh" }},
+                     {{ "key": "scope", "value": "read write" }},
+                     {{ "key": "tokenType", "value": "Bearer" }}
+                     {extra}
+                   ] }},
+                   "item": [
+                     {{ "name": "list", "request": {{ "method": "GET", "url": "https://h/a" }} }},
+                     {{ "name": "get", "request": {{ "method": "GET", "url": "https://h/b" }} }}
+                   ] }}
+              ]
+            }}"#
+        )
+    }
+
+    fn header(e: &HurlEntry, name: &str) -> Option<String> {
+        e.headers
+            .iter()
+            .find(|h| h.key.eq_ignore_ascii_case(name))
+            .map(|h| h.value.clone())
+    }
+
+    fn field(e: &HurlEntry, key: &str) -> Option<String> {
+        e.form_fields
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| f.value.clone())
+    }
+
+    /// The point of the feature: Postman fetches the token itself and never
+    /// writes it to the export, so these requests used to import with no
+    /// credentials at all. Hurl doesn't need the machinery — a token request is
+    /// just a request.
+    #[test]
+    fn a_folders_client_credentials_auth_becomes_a_token_request() {
+        let c = convert_postman(&folder_oauth2(""));
+        let titles: Vec<&str> = c.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Tenant API/Get access token",
+                "Tenant API/list",
+                "Tenant API/get"
+            ],
+            "the token request is generated once, in the folder that declared \
+             the auth, ahead of the requests that need it"
+        );
+
+        let token = &c.entries[0];
+        assert_eq!(token.method, "POST");
+        assert_eq!(token.url, "https://id.example.com/v1/token");
+        assert_eq!(
+            field(token, "grant_type").as_deref(),
+            Some("client_credentials")
+        );
+        assert_eq!(field(token, "scope").as_deref(), Some("read write"));
+        assert_eq!(
+            token.basic_auth,
+            Some(("abc".to_string(), "shh".to_string())),
+            "Postman's default client authentication is HTTP Basic"
+        );
+        assert_eq!(
+            token.captures,
+            vec![(
+                "access_token".to_string(),
+                "jsonpath \"$.access_token\"".to_string()
+            )]
+        );
+        assert_eq!(
+            token.expected_status,
+            Some(200),
+            "without this a failed token request captures nothing and every \
+             request after it fails for a reason that has scrolled away"
+        );
+
+        for e in &c.entries[1..] {
+            assert_eq!(
+                header(e, "Authorization").as_deref(),
+                Some("Bearer {{access_token}}"),
+                "{} must actually use the token",
+                e.title
+            );
+        }
+    }
+
+    /// Folders repeat the whole configuration rather than pointing at a shared
+    /// one, so the same credentials on six folders must not fetch six tokens.
+    #[test]
+    fn one_token_request_is_generated_per_distinct_configuration() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [
+                { "name": "A", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "same" } ] },
+                  "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x" } } ] },
+                { "name": "B", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "same" } ] },
+                  "item": [ { "name": "y", "request": { "method": "GET", "url": "https://h/y" } } ] },
+                { "name": "C", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "accessTokenUrl", "value": "https://id/t" },
+                    { "key": "grant_type", "value": "client_credentials" },
+                    { "key": "clientId", "value": "other" } ] },
+                  "item": [ { "name": "z", "request": { "method": "GET", "url": "https://h/z" } } ] }
+              ]
+            }"#,
+        );
+        let tokens: Vec<&str> = c
+            .entries
+            .iter()
+            .filter(|e| e.title.ends_with("Get access token"))
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec!["A/Get access token", "C/Get access token"],
+            "identical configurations share a token; a different client gets its own"
+        );
+        let used = |title: &str| {
+            c.entries
+                .iter()
+                .find(|e| e.title == title)
+                .and_then(|e| header(e, "Authorization"))
+        };
+        assert_eq!(used("A/x"), used("B/y"), "B reuses A's token");
+        assert_eq!(used("C/z").as_deref(), Some("Bearer {{access_token_2}}"));
+    }
+
+    /// `client_authentication: body` puts the credentials in the form instead
+    /// of the Basic header; endpoints differ on which they accept.
+    #[test]
+    fn body_client_authentication_sends_the_credentials_as_form_fields() {
+        let c = convert_postman(&folder_oauth2(
+            r#", { "key": "client_authentication", "value": "body" }"#,
+        ));
+        let token = &c.entries[0];
+        assert_eq!(token.basic_auth, None);
+        assert_eq!(field(token, "client_id").as_deref(), Some("abc"));
+        assert_eq!(field(token, "client_secret").as_deref(), Some("shh"));
+    }
+
+    /// Postman can be told to put the token in the query string instead.
+    #[test]
+    fn add_token_to_query_params_uses_a_query_parameter() {
+        let c = convert_postman(&folder_oauth2(
+            r#", { "key": "addTokenTo", "value": "queryParams" }"#,
+        ));
+        let list = c
+            .entries
+            .iter()
+            .find(|e| e.title == "Tenant API/list")
+            .unwrap();
+        assert_eq!(header(list, "Authorization"), None);
+        assert!(
+            list.queries
+                .contains(&KvRow::toggled("access_token", "{{access_token}}", true))
+        );
+    }
+
+    /// A browser redirect is not something a file of requests can perform, so
+    /// this is reported rather than half-built.
+    #[test]
+    fn the_authorization_code_grant_is_reported_not_invented() {
+        let c =
+            convert_postman(&folder_oauth2("").replace("client_credentials", "authorization_code"));
+        assert!(
+            c.entries
+                .iter()
+                .all(|e| !e.title.ends_with("Get access token")),
+            "nothing is generated for a flow that needs a human"
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("authorization_code")),
+            "but the user is told why: {:?}",
+            c.notes
+        );
+    }
+
+    /// Postman keeps client credentials outside the export, which is most of
+    /// the real exports. The request still has to be generated -- with the
+    /// secrets as variables, where PaperBoy keeps secrets anyway.
+    #[test]
+    fn missing_credentials_become_variables_and_a_note() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x",
+                "auth": { "type": "oauth2", "oauth2": [
+                  { "key": "accessTokenUrl", "value": "https://id/t" },
+                  { "key": "grant_type", "value": "client_credentials" },
+                  { "key": "clientId", "value": "" },
+                  { "key": "clientSecret", "value": "" } ] } } } ]
+            }"#,
+        );
+        assert_eq!(
+            c.entries[0].basic_auth,
+            Some((
+                "{{oauth_client_id}}".to_string(),
+                "{{oauth_client_secret}}".to_string()
+            ))
+        );
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("oauth_client_id")),
+            "and it says so rather than leaving a silently unusable request"
+        );
+    }
+
+    /// A folder can override only the presentation and leave the token
+    /// configuration to its parent; there is nothing to fetch.
+    #[test]
+    fn an_override_with_no_token_url_reuses_the_inherited_token() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "auth": { "type": "oauth2", "oauth2": [
+                { "key": "accessTokenUrl", "value": "https://id/t" },
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "clientId", "value": "abc" } ] },
+              "item": [
+                { "name": "plain", "request": { "method": "GET", "url": "https://h/a" } },
+                { "name": "F", "auth": { "type": "oauth2", "oauth2": [
+                    { "key": "headerPrefix", "value": "Token " } ] },
+                  "item": [ { "name": "y", "request": { "method": "GET", "url": "https://h/y" } } ] }
+              ]
+            }"#,
+        );
+        assert_eq!(
+            c.entries
+                .iter()
+                .filter(|e| e.title.ends_with("Get access token"))
+                .count(),
+            1,
+            "the override has no token URL of its own to fetch from"
+        );
+        let y = c.entries.iter().find(|e| e.title == "F/y").unwrap();
+        assert_eq!(
+            header(y, "Authorization").as_deref(),
+            Some("Token {{access_token}}"),
+            "but its prefix override is honoured"
+        );
+    }
+
+    /// A collection-wide token belongs at the top, not wherever the first
+    /// request that uses it happens to live.
+    #[test]
+    fn a_collection_wide_token_is_not_buried_in_a_folder() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "auth": { "type": "oauth2", "oauth2": [
+                { "key": "accessTokenUrl", "value": "https://id/t" },
+                { "key": "grant_type", "value": "client_credentials" },
+                { "key": "clientId", "value": "abc" } ] },
+              "item": [ { "name": "Deep", "item": [ { "name": "Deeper", "item": [
+                { "name": "x", "request": { "method": "GET", "url": "https://h/x" } } ] } ] } ]
+            }"#,
+        );
+        assert_eq!(c.entries[0].title, "Get access token");
+    }
+
+    /// The `password` grant is also just a POST, so it is generated too.
+    #[test]
+    fn the_password_grant_is_generated_like_client_credentials() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [ { "name": "x", "request": { "method": "GET", "url": "https://h/x",
+                "auth": { "type": "oauth2", "oauth2": [
+                  { "key": "accessTokenUrl", "value": "https://id/t" },
+                  { "key": "grant_type", "value": "password" },
+                  { "key": "clientId", "value": "abc" },
+                  { "key": "username", "value": "u" },
+                  { "key": "password", "value": "p" } ] } } } ]
+            }"#,
+        );
+        let token = &c.entries[0];
+        assert_eq!(field(token, "grant_type").as_deref(), Some("password"));
+        assert_eq!(field(token, "username").as_deref(), Some("u"));
+        assert_eq!(field(token, "password").as_deref(), Some("p"));
+    }
+}
+
+#[cfg(test)]
+mod path_variable_tests {
+    use super::*;
+
+    fn one(url: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [ {{ "name": "r", "request": {{ "method": "GET", "url": {url} }} }} ]
+            }}"#
+        ))
+    }
+
+    /// The bug: importing `raw` alone asked the server for a batch literally
+    /// named ":batch_id".
+    #[test]
+    fn a_declared_path_variable_becomes_a_hurl_variable() {
+        let c = one(r#"{ "raw": "{{base}}/v1/batches/:batch_id/add",
+                 "variable": [{ "key": "batch_id", "value": "se-28529731" }] }"#);
+        assert_eq!(c.entries[0].url, "{{base}}/v1/batches/{{batch_id}}/add");
+        assert!(
+            c.variables
+                .contains(&("batch_id".into(), "se-28529731".into())),
+            "and the value Postman would have substituted comes with it"
+        );
+    }
+
+    /// A colon is legal in a URL, and Postman only substitutes what it declares.
+    #[test]
+    fn an_undeclared_colon_segment_is_left_alone() {
+        let c = one(r#"{ "raw": "http://localhost:8080/v1/:not_declared" }"#);
+        assert_eq!(c.entries[0].url, "http://localhost:8080/v1/:not_declared");
+        assert!(c.variables.is_empty());
+    }
+
+    /// Only whole segments — a port is not a path variable even when a
+    /// same-named variable happens to be declared.
+    #[test]
+    fn a_port_is_never_mistaken_for_a_path_variable() {
+        let c = one(r#"{ "raw": "http://host:8080/x/:id",
+                 "variable": [{ "key": "id", "value": "7" }] }"#);
+        assert_eq!(c.entries[0].url, "http://host:8080/x/{{id}}");
+    }
+
+    /// Rewriting the query string too would corrupt values that legitimately
+    /// contain a colon.
+    #[test]
+    fn the_query_string_is_not_rewritten() {
+        let c = one(r#"{ "raw": "https://h/x/:id?at=12:30&who=:id",
+                 "variable": [{ "key": "id", "value": "7" }] }"#);
+        assert_eq!(
+            c.entries[0].url, "https://h/x/{{id}}?at=12:30&who=:id",
+            "the path placeholder is rewritten; the colons after the `?` are not"
+        );
+    }
+
+    /// Path variables are per-request but a `.vars` file has one value per
+    /// name, so a clash has to be reported rather than quietly picked.
+    #[test]
+    fn two_requests_declaring_the_same_name_differently_are_reported() {
+        let c = convert_postman(
+            r#"{
+              "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+              "item": [
+                { "name": "a", "request": { "method": "GET", "url": {
+                    "raw": "https://h/:id", "variable": [{ "key": "id", "value": "1" }] } } },
+                { "name": "b", "request": { "method": "GET", "url": {
+                    "raw": "https://h/:id", "variable": [{ "key": "id", "value": "2" }] } } }
+              ]
+            }"#,
+        );
+        assert_eq!(c.variables, vec![("id".to_string(), "1".to_string())]);
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.item == "b" && n.detail.contains("id")),
+            "the discarded second value is named, not swallowed: {:?}",
+            c.notes
+        );
+    }
+
+    /// ShipEngine's exports declare the name but leave the value blank. The
+    /// request must still be parameterised — and the empty variable is exactly
+    /// what the undefined-variable warning is for.
+    #[test]
+    fn a_declared_variable_with_no_value_still_parameterises_the_url() {
+        let c = one(r#"{ "raw": "{{baseUrl}}/v1/batches/:batch_id",
+                 "variable": [{ "key": "batch_id", "value": "", "description": "Batch ID" }] }"#);
+        assert_eq!(c.entries[0].url, "{{baseUrl}}/v1/batches/{{batch_id}}");
+        assert_eq!(c.variables, vec![("batch_id".to_string(), String::new())]);
     }
 }
 
@@ -1184,8 +2621,8 @@ mod inheritance_tests {
         let json = r#"{
           "info": { "name": "d", "schema": "x" },
           "item": [
-            { "name": "oauth", "request": { "method": "GET", "url": "https://x",
-                "auth": { "type": "oauth2" } } },
+            { "name": "oauth1", "request": { "method": "GET", "url": "https://x",
+                "auth": { "type": "oauth1" } } },
             { "name": "gql", "request": { "method": "POST", "url": "https://x",
                 "body": { "mode": "graphql" } } },
             { "name": "scripted", "request": { "method": "GET", "url": "https://x" },
@@ -1202,10 +2639,13 @@ mod inheritance_tests {
                 .collect::<Vec<_>>()
         };
         assert!(
-            for_item("oauth")[0].contains("oauth2"),
+            for_item("oauth1")[0].contains("oauth1"),
             "the auth type that was lost is named: {notes:?}"
         );
-        assert!(for_item("gql")[0].contains("graphql"));
+        assert!(
+            for_item("gql")[0].contains("GraphQL"),
+            "an empty GraphQL body has nothing to send, and says so"
+        );
         assert!(for_item("scripted")[0].contains("pre-request"));
     }
 
@@ -1302,5 +2742,101 @@ mod inheritance_tests {
             "header": [ { "key": "Accept", "value": "application/json" } ] } } ]
         }"#;
         assert_eq!(convert_postman(json).notes, vec![]);
+    }
+}
+
+#[cfg(test)]
+mod field_tolerance_tests {
+    use super::*;
+
+    /// A collection whose oauth2 block carries the request-parameter lists
+    /// Postman writes out as *arrays* — `{"key": "tokenRequestParams",
+    /// "value": []}`. Real exports (the IDKit workspaces) all have these.
+    fn collection_with(param: &str) -> String {
+        format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "auth": {{ "type": "oauth2", "oauth2": [
+                {{ "key": "accessTokenUrl", "value": "https://id.example.com/token" }},
+                {{ "key": "grant_type", "value": "client_credentials" }},
+                {{ "key": "clientId", "value": "abc" }},
+                {{ "key": "clientSecret", "value": "shh" }},
+                {param}
+              ] }},
+              "item": [
+                {{ "name": "Ping", "request": {{ "method": "GET", "url": "https://x/ping" }} }}
+              ]
+            }}"#
+        )
+    }
+
+    /// The regression: a non-string `value` anywhere aborted the *whole*
+    /// document, and a failed parse imports as an empty collection — so one
+    /// unexpected field silently emptied entire workspaces rather than
+    /// degrading the one row it appeared on.
+    #[test]
+    fn array_valued_auth_param_does_not_empty_the_collection() {
+        for value in [r#"[]"#, r#"[{"key": "a", "value": "b"}]"#, r#"{"a": 1}"#] {
+            let json = collection_with(&format!(
+                r#"{{ "key": "tokenRequestParams", "value": {value}, "type": "any" }}"#
+            ));
+            let out = convert_postman(&json);
+            assert!(
+                out.entries.iter().any(|e| e.title == "Ping"),
+                "value {value} emptied the collection"
+            );
+            assert!(
+                out.notes
+                    .iter()
+                    .all(|n| !n.detail.contains("could not be read")),
+                "value {value} failed to parse"
+            );
+        }
+    }
+
+    /// Numbers and bools stringify rather than failing — hand-edited and
+    /// third-party-generated collections write both.
+    #[test]
+    fn scalar_valued_fields_stringify() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [ { "name": "Ping", "request": {
+            "method": "GET", "url": "https://x/ping",
+            "header": [ { "key": "X-Retry", "value": 3 },
+                        { "key": "X-Debug", "value": true } ] } } ]
+        }"#;
+        let entries = import_postman(json);
+        let headers = &entries[0].headers;
+        assert_eq!(
+            headers.iter().find(|h| h.key == "X-Retry").unwrap().value,
+            "3"
+        );
+        assert_eq!(
+            headers.iter().find(|h| h.key == "X-Debug").unwrap().value,
+            "true"
+        );
+    }
+
+    /// A `null` method is still a `GET`, like an absent one.
+    #[test]
+    fn null_method_falls_back_to_get() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" },
+          "item": [ { "name": "Ping", "request": { "method": null, "url": "https://x/ping" } } ]
+        }"#;
+        assert_eq!(import_postman(json)[0].method, "GET");
+    }
+
+    /// When a collection genuinely can't be read, say so — an empty result on
+    /// its own is indistinguishable from an empty collection.
+    #[test]
+    fn unreadable_collection_is_reported_rather_than_silently_empty() {
+        let json = r#"{ "info": { "schema": "https://schema.getpostman.com/..v2.1.0" },
+                        "item": "not a list" }"#;
+        let out = convert_postman(json);
+        assert!(out.entries.is_empty());
+        assert_eq!(out.notes.len(), 1);
+        assert!(out.notes[0].item.is_empty());
+        assert!(out.notes[0].detail.contains("could not be read"));
     }
 }

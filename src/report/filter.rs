@@ -83,6 +83,11 @@ pub enum RowFilter {
     /// Rows that were right before and are wrong now — the ones a release
     /// decision turns on.
     Regressed,
+    /// Rows that were wrong before and are right now — the other half of the
+    /// same question. A release is judged on both: "we fixed nine and broke
+    /// two" is a different story from "we broke two", and only offering the
+    /// regressions made the second the only one the grid could tell.
+    Fixed,
     /// One cell of a confusion matrix: rows where `column`'s ground truth is
     /// the `truth` class and its answer is the `answer` class. This is what
     /// makes the matrix clickable — "which 7 rows are those?" is the first
@@ -107,6 +112,7 @@ impl RowFilter {
             RowFilter::Differ => "Differences".to_string(),
             RowFilter::Incorrect => "Incorrect".to_string(),
             RowFilter::Regressed => "Regressions".to_string(),
+            RowFilter::Fixed => "Improvements".to_string(),
             RowFilter::MatrixCell { truth, answer, .. } => format!("{truth} → {answer}"),
         }
     }
@@ -129,6 +135,9 @@ impl RowFilter {
         if facts.iter().any(|f| f.trend == Some(Trend::Regressed)) {
             out.push(RowFilter::Regressed);
         }
+        if facts.iter().any(|f| f.trend == Some(Trend::Fixed)) {
+            out.push(RowFilter::Fixed);
+        }
         out
     }
 
@@ -145,6 +154,7 @@ impl RowFilter {
             RowFilter::Differ => RowFacts::of(result, r).differs,
             RowFilter::Incorrect => RowFacts::of(result, r).verdict == Some(Verdict::Incorrect),
             RowFilter::Regressed => RowFacts::of(result, r).trend == Some(Trend::Regressed),
+            RowFilter::Fixed => RowFacts::of(result, r).trend == Some(Trend::Fixed),
             RowFilter::MatrixCell {
                 column,
                 truth,
@@ -365,6 +375,11 @@ mod tests {
             vec![2],
             "`still wrong` is failing, but it is not a regression"
         );
+        assert_eq!(
+            pick(RowFilter::Fixed),
+            vec![1],
+            "and the row that came right is the improvement, on its own"
+        );
     }
 
     /// An unlabelled row is unchecked, not wrong: merging the two is how a
@@ -444,7 +459,9 @@ mod tests {
     }
 
     /// A filter that could only ever select nothing is not offered: an
-    /// always-empty "Regressions" button reads as "there are none".
+    /// always-empty "Regressions" button reads as "there are none" — and the
+    /// same is true of "Improvements", which is why the pair is offered
+    /// independently rather than together.
     #[test]
     fn only_the_filters_a_report_can_answer_are_offered() {
         assert_eq!(
@@ -453,7 +470,8 @@ mod tests {
                 RowFilter::All,
                 RowFilter::Differ,
                 RowFilter::Incorrect,
-                RowFilter::Regressed
+                RowFilter::Regressed,
+                RowFilter::Fixed
             ]
         );
         let plain = ReportResult {
@@ -461,6 +479,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(RowFilter::available(&plain), vec![RowFilter::All]);
+    }
+
+    /// The two halves of "what moved?" are offered on their own terms: a run
+    /// that only fixed things still gets an Improvements button, and isn't
+    /// given a Regressions one to prove empty.
+    #[test]
+    fn a_run_that_only_fixed_things_is_offered_the_improvements_filter() {
+        let mut res = fixture();
+        res.rows.remove(2);
+        res.trends = [
+            ((0, "Verdict".to_string()), Trend::Unchanged),
+            ((1, "Verdict".to_string()), Trend::Fixed),
+            ((2, "Verdict".to_string()), Trend::StillWrong),
+        ]
+        .into_iter()
+        .collect();
+        let offered = RowFilter::available(&res);
+        assert!(
+            offered.contains(&RowFilter::Fixed),
+            "something came right, so the filter that shows it is there: {offered:?}"
+        );
+        assert!(
+            !offered.contains(&RowFilter::Regressed),
+            "nothing broke, so there is no button inviting the reader to look: {offered:?}"
+        );
     }
 
     /// A live run must not offer a filtered view that is mostly empty skeleton.

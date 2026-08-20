@@ -114,6 +114,53 @@ pub fn resolve_bound_collection(
         .position(|c| c.path.as_ref().is_some_and(|p| paths_equal(p, &target)) || c.name == cref)
 }
 
+/// The requests of the collection a report is bound to — from the open tab
+/// when it is open, and otherwise read off disk.
+///
+/// The disk fallback is the whole point. A report's `# collection:` is a *path*
+/// (portable, relative to the report where it can be), and in a Workspace tab
+/// the file it names is usually not the one the tab happens to have loaded —
+/// picking `Collections/EAPI V4.3.hurl` from the settings dropdown left the
+/// report saying "the collection isn't loaded, so request names can't be
+/// checked yet" about a file sitting right there in the same workspace. Helper
+/// collections have always been read this way ([`load_helpers`]); the primary
+/// one was the odd exception, and it is the one that matters most.
+///
+/// An open collection still wins, so the report is validated against unsaved
+/// edits rather than the older text on disk. `git:` references are not fetched
+/// — that would be network I/O, which validation must never do — so they stay
+/// unresolved until the remote collection is opened.
+pub fn bound_entries(
+    collections: &[Collection],
+    flow: &ReportFlow,
+    report_path: Option<&Path>,
+) -> Option<Vec<HurlEntry>> {
+    if let Some(ci) = resolve_bound_collection(collections, flow, report_path) {
+        return Some(collections[ci].entries.clone());
+    }
+    let cref = flow.header.collection()?;
+    if cref.starts_with("git:") {
+        return None;
+    }
+    let text = std::fs::read_to_string(resolve_ref_path(report_path, cref)).ok()?;
+    // A bound collection is not necessarily Hurl text: the workspace tree lists
+    // Postman `.json` exports as collections, opening one imports it, and the
+    // settings dropdown offers it — so a report can perfectly reasonably bind
+    // to one. Import it here the way the runner does (see `report_cli`), rather
+    // than failing to parse JSON as Hurl and then telling the user the
+    // collection they just picked "isn't loaded".
+    if crate::postman::looks_like_postman(&text) {
+        return Some(crate::postman::import_postman(&text));
+    }
+    // An unparseable file is not a collection; saying "not loaded" of it is
+    // more honest than validating against the handful of requests that did
+    // survive the parse.
+    if crate::hurl::parse_hurl_error(&text).is_some() {
+        return None;
+    }
+    Some(crate::hurl::parse_hurl(&text))
+}
+
 /// One selectable request across the primary collection and every declared
 /// helper — what every picker, completion list and known/unknown tint is built
 /// from, so all of them agree on what exists and how it must be written.
@@ -207,6 +254,13 @@ pub fn load_helpers(
         }
         let path = resolve_ref_path(report_path, reference);
         match std::fs::read_to_string(&path) {
+            // A helper may be a Postman export too — see `bound_entries`.
+            Ok(text) if crate::postman::looks_like_postman(&text) => {
+                loaded.push(HelperCollection {
+                    alias: alias.to_string(),
+                    entries: crate::postman::import_postman(&text),
+                })
+            }
             Ok(text) => match crate::hurl::parse_hurl_error(&text) {
                 Some(err) => errors.push((reference.to_string(), err)),
                 None => loaded.push(HelperCollection {
@@ -260,19 +314,16 @@ pub fn report_diagnostics(
     strings: &crate::i18n::Strings,
 ) -> Vec<Diagnostic> {
     let bound = resolve_bound_collection(collections, flow, report_path);
-    let titles: Option<Vec<String>> = bound.map(|ci| {
-        collections[ci]
-            .entries
-            .iter()
-            .map(|e| e.title.clone())
-            .collect()
-    });
+    // Not `bound` — the collection may well be one the workspace holds but no
+    // tab has open, and it is still perfectly checkable (see [`bound_entries`]).
+    let request_entries_owned = bound_entries(collections, flow, report_path);
+    let titles: Option<Vec<String>> = request_entries_owned
+        .as_ref()
+        .map(|es| es.iter().map(|e| e.title.clone()).collect());
     // Each entry's [Reports] field names, so a SHOW(...) selector can be
     // validated against what the request can produce.
-    let fields: Option<Vec<(String, Vec<String>)>> = bound.map(|ci| {
-        collections[ci]
-            .entries
-            .iter()
+    let fields: Option<Vec<(String, Vec<String>)>> = request_entries_owned.as_ref().map(|es| {
+        es.iter()
             .map(|e| {
                 (
                     e.title.clone(),
@@ -293,9 +344,6 @@ pub fn report_diagnostics(
         .collect();
     all_env_var_names.sort();
     all_env_var_names.dedup();
-    let request_entries_owned: Option<Vec<HurlEntry>> =
-        bound.map(|ci| collections[ci].entries.clone());
-
     let (helpers, helper_errors) = load_helpers(collections, flow, report_path, strings);
     let ctx = Context {
         request_titles: titles.as_deref(),
@@ -347,7 +395,9 @@ pub fn report_diagnostics(
 /// the report changes. Hashing it properly would mean reading every helper
 /// from disk on every frame, which is the exact cost this cache exists to
 /// avoid; a helper opened as a tab (the normal way to edit one) is a
-/// `Collection` and *is* hashed field by field below.
+/// `Collection` and *is* hashed field by field below. The same now goes for a
+/// *primary* collection that isn't open as a tab, which `report_diagnostics`
+/// also reads from disk.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn diagnostics_fingerprint(
     collections: &[Collection],
@@ -417,8 +467,11 @@ pub fn report_run_inputs(
     flow: &ReportFlow,
     report_path: Option<&Path>,
 ) -> Result<ReportRunInputs, RunInputError> {
-    let ci =
-        resolve_bound_collection(collections, flow, report_path).ok_or(RunInputError::Unbound)?;
+    let ci = resolve_bound_collection(collections, flow, report_path);
+    // A collection the workspace holds but no tab has open still runs — the
+    // requests come off disk (see [`bound_entries`]). Only a reference that
+    // resolves to nothing at all is `Unbound`.
+    let entries = bound_entries(collections, flow, report_path).ok_or(RunInputError::Unbound)?;
 
     // Base variable layer. A `# environment:` directive names a single loaded
     // environment for a plain, no-comparison run; otherwise fall back to the
@@ -434,7 +487,8 @@ pub fn report_run_inputs(
             .find(|e| e.name == name)
             .map(flatten_env)
             .unwrap_or_default(),
-        None => effective_env(collections, global_envs, ci, active_env_id)
+        None => ci
+            .and_then(|ci| effective_env(collections, global_envs, ci, active_env_id))
             .map(|env| flatten_env(&env))
             .unwrap_or_default(),
     };
@@ -453,8 +507,15 @@ pub fn report_run_inputs(
     };
     // The live runner is rooted at the bound collection's directory so relative
     // form-file paths in its requests resolve as they would by hand.
-    let file_root = collections[ci]
-        .path
+    let collection_path: Option<PathBuf> = match ci {
+        Some(ci) => collections[ci].path.clone(),
+        None => flow
+            .header
+            .collection()
+            .filter(|c| !c.starts_with("git:"))
+            .map(|c| resolve_ref_path(report_path, c)),
+    };
+    let file_root = collection_path
         .as_deref()
         .and_then(|p| p.parent())
         .map(Path::to_path_buf);
@@ -470,7 +531,7 @@ pub fn report_run_inputs(
     );
     Ok(ReportRunInputs {
         flow: flow.clone(),
-        entries: collections[ci].entries.clone(),
+        entries,
         helpers,
         base_vars,
         named_envs,
@@ -614,6 +675,14 @@ mod helper_loading_tests {
 
     const HELPER_HURL: &str = "# fetch_frame\nGET http://example.test/frame\n\n";
 
+    /// A minimal Postman v2.1 export holding one request named `Oauth`.
+    const POSTMAN_JSON: &str = r#"{
+  "info": { "name": "API", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "item": [
+    { "name": "Oauth", "request": { "method": "POST", "url": { "raw": "http://example.test/t" } } }
+  ]
+}"#;
+
     /// The whole point of the feature: the helper is a plain `.hurl` file that
     /// is *not* open anywhere, and it still resolves.
     #[test]
@@ -637,6 +706,111 @@ mod helper_loading_tests {
         assert_eq!(helpers[0].entries.len(), 1);
         assert!(crate::report::run::resolve_qualified(&[], &helpers, "h/fetch_frame").is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complaint that prompted the disk fallback: a workspace collection is
+    /// picked in the settings panel, no tab has it open, and the report says
+    /// "the collection isn't loaded, so request names can't be checked yet".
+    #[test]
+    fn a_primary_collection_is_read_from_disk_when_no_tab_has_it_open() {
+        let dir = tmpdir("primary");
+        std::fs::write(
+            dir.join("api.hurl"),
+            "# Oauth\nPOST http://example.test/t\n\n",
+        )
+        .unwrap();
+        let report = dir.join("r.trail");
+        let flow = parse_flow("# collection: ./api.hurl\n\nREQUEST Oauth\n").expect("parses");
+
+        let entries = bound_entries(&[], &flow, Some(report.as_path())).expect("read from disk");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Oauth");
+
+        let diags = report_diagnostics(
+            &[],
+            &[],
+            None,
+            &flow,
+            Some(report.as_path()),
+            crate::i18n::Strings::english(),
+        );
+        let s = crate::i18n::Strings::english();
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message == s.diag_collection_not_loaded),
+            "{diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("Oauth")),
+            "the request resolves, so nothing should complain about it: {diags:?}"
+        );
+
+        // And it runs: the entries come from disk rather than from a tab.
+        let inputs = report_run_inputs(&[], &[], None, &flow, Some(report.as_path()))
+            .expect("bound to the file on disk");
+        assert_eq!(inputs.entries.len(), 1);
+        assert_eq!(inputs.file_root.as_deref(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Postman export bound as the primary collection. The workspace tree
+    /// lists `.json` exports as collections and the settings dropdown offers
+    /// them, so this is a perfectly ordinary thing to point a report at — it
+    /// used to fail to parse as Hurl and report "the collection isn't loaded"
+    /// about a file the user could see selected in the panel.
+    #[test]
+    fn a_postman_export_bound_as_the_collection_is_imported_not_rejected() {
+        let dir = tmpdir("postman-primary");
+        std::fs::write(dir.join("api.json"), POSTMAN_JSON).unwrap();
+        let report = dir.join("r.trail");
+        let flow = parse_flow("# collection: ./api.json\n\nREQUEST Oauth\n").expect("parses");
+
+        let entries = bound_entries(&[], &flow, Some(report.as_path())).expect("imported");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Oauth");
+
+        let s = crate::i18n::Strings::english();
+        let diags = report_diagnostics(&[], &[], None, &flow, Some(report.as_path()), s);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message == s.diag_collection_not_loaded),
+            "{diags:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same for a helper: `# collection: ./h.json AS h` resolves.
+    #[test]
+    fn a_postman_export_bound_as_a_helper_is_imported_not_rejected() {
+        let dir = tmpdir("postman-helper");
+        std::fs::write(dir.join("h.json"), POSTMAN_JSON).unwrap();
+        let report = dir.join("r.trail");
+        let flow = parse_flow(
+            "# collection: ./api.hurl\n# collection: ./h.json AS h\n\nREQUEST h/Oauth\n",
+        )
+        .expect("parses");
+        let (helpers, errors) = load_helpers(
+            &[],
+            &flow,
+            Some(report.as_path()),
+            crate::i18n::Strings::english(),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(helpers.len(), 1);
+        assert_eq!(helpers[0].entries.len(), 1);
+        assert!(crate::report::run::resolve_qualified(&[], &helpers, "h/Oauth").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reference to a `git:` collection is never fetched — validation does no
+    /// network I/O — so it stays "not loaded" until the tab is opened.
+    #[test]
+    fn a_git_collection_reference_is_not_fetched_from_disk() {
+        let flow = parse_flow("# collection: git:origin#main:api.hurl\n\nREQUEST Oauth\n")
+            .expect("parses");
+        assert!(bound_entries(&[], &flow, None).is_none());
     }
 
     #[test]

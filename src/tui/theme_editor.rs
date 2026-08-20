@@ -117,23 +117,7 @@ impl ThemeEditorState {
     }
 }
 
-/// The localised label for the `i`th theme colour, matching [`ThemeSpec::color`]
-/// order.
-pub(crate) fn color_label(s: &Strings, i: usize) -> &'static str {
-    match i {
-        0 => s.theme_c_bg,
-        1 => s.theme_c_panel,
-        2 => s.theme_c_text,
-        3 => s.theme_c_dim,
-        4 => s.theme_c_accent,
-        5 => s.theme_c_ok,
-        6 => s.theme_c_err,
-        7 => s.theme_c_subst,
-        8 => s.theme_c_pending,
-        9 => s.theme_c_select_bg,
-        _ => s.theme_c_select_fg,
-    }
-}
+pub(crate) use crate::theme::color_label;
 
 /// `#RRGGBB` (uppercase) for display.
 fn hex_display([r, g, b]: [u8; 3]) -> String {

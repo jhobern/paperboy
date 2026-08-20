@@ -737,11 +737,18 @@ pub(crate) fn filter_indices<'a>(items: impl Iterator<Item = &'a str>, filter: &
         .collect()
 }
 
-/// A tab name for a workspace loaded from `url`, taken from the repo name.
+/// A tab name for a workspace loaded from `url`, taken from the repository's own
+/// name (`…/team/api-tests.git` → `api-tests`). The folder it was downloaded
+/// into is a meaningless temp path, so the URL is the only human-readable
+/// source. Shared by both front-ends so a workspace is named the same either
+/// way. Empty path segments are skipped so a trailing `//` still yields a name.
 pub(crate) fn workspace_name_from_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
-    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
-    let stem = last.strip_suffix(".git").unwrap_or(last);
+    let last = trimmed
+        .rsplit(['/', ':'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(trimmed);
+    let stem = last.strip_suffix(".git").unwrap_or(last).trim();
     if stem.is_empty() {
         "workspace".to_string()
     } else {
@@ -955,6 +962,12 @@ mod tests {
         assert_eq!(workspace_name_from_url("https://x.com/o/api/"), "api");
         assert_eq!(workspace_name_from_url("git@github.com:o/api.git"), "api");
         assert_eq!(workspace_name_from_url(""), "workspace");
+        // Empty trailing segments are skipped rather than yielding a blank name.
+        assert_eq!(workspace_name_from_url("https://x.com/o/api//"), "api");
+        assert_eq!(
+            workspace_name_from_url("  https://x.com/o/api.git  "),
+            "api"
+        );
     }
 
     #[test]

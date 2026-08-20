@@ -25,6 +25,7 @@ use crate::report::run::{DryRunner, LiveRunner, RowEvent, RunContext, finalize, 
 use crate::report::validate::{Context, Severity, validate};
 use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
 use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
+use crate::shared_utils::sanitize_file_stem;
 
 /// Run a report headlessly. Returns an OS exit code (0 = success, 1 = a fatal
 /// setup/validation error; a run that merely collected per-row errors still
@@ -458,28 +459,6 @@ fn derived_output_path(report: &Report, ext: &str) -> PathBuf {
         return path.with_extension(ext);
     }
     PathBuf::from(format!("{}.{ext}", sanitize_file_stem(&report.name)))
-}
-
-/// Turn a display name into a safe single-segment file stem (path separators and
-/// awkward characters → `_`), so a name can't escape the target directory.
-/// Mirrors the TUI helper of the same name.
-fn sanitize_file_stem(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "report".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 /// Routes human-readable lines to the right stream: stderr when the CSV is going

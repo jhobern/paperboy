@@ -14,7 +14,8 @@ use eframe::egui;
 
 use crate::i18n::{Status, Strings};
 use crate::postman_flow::{
-    KeySource, PostmanEvent, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
+    KeySource, PostmanEvent, PostmanFlow, Preview, Step, default_dest_name, human_duration,
+    item_kind_label,
 };
 use crate::postman_import::{ImportFormat, ImportSummary, WaitReason};
 
@@ -285,6 +286,15 @@ enum UiAction {
     BrowseDest,
     BackToConnect,
     BackToWorkspaces,
+    /// Read the plan's nth collection, so the user can see what is inside a
+    /// workspace before spending the rest of their API budget on it.
+    Preview(usize),
+    ClosePreview,
+    /// Expand the nth visible workspace in the picker, listing the collections
+    /// in it. An index rather than an id so this stays a `Copy` action like
+    /// every other one here; the id is looked up when it is acted on.
+    PeekWorkspace(usize),
+    ClosePeek,
 }
 
 #[derive(Clone, Copy)]
@@ -385,6 +395,21 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         UiAction::Confirm => {
             w.flow.confirm();
         }
+        UiAction::Preview(i) => {
+            w.flow.preview_collection(i, &app.strings);
+        }
+        UiAction::ClosePreview => {
+            w.flow.close_preview();
+        }
+        UiAction::PeekWorkspace(i) => {
+            let id = w.flow.visible_workspaces().get(i).map(|ws| ws.id.clone());
+            if let Some(id) = id {
+                w.flow.open_workspace_peek(&id, &app.strings);
+            }
+        }
+        UiAction::ClosePeek => {
+            w.flow.close_workspace_peek();
+        }
         UiAction::BrowseDest => {
             let seed = std::path::PathBuf::from(w.flow.dest.trim());
             let seed = seed.parent().filter(|p| p.exists());
@@ -475,11 +500,11 @@ fn draw_connect(
             ui.colored_label(colors.dim, s.postman_key_source_label);
             egui::ComboBox::from_id_salt("pb_postman_key_source")
                 .width(200.0)
-                .selected_text(key_source_label(w.key_source, s))
+                .selected_text(w.key_source.source_label(s))
                 .show_ui(ui, |ui| {
                     for src in KeySource::ALL {
                         if ui
-                            .selectable_label(src == w.key_source, key_source_label(src, s))
+                            .selectable_label(src == w.key_source, src.source_label(s))
                             .clicked()
                         {
                             w.key_source = src;
@@ -488,7 +513,7 @@ fn draw_connect(
                 });
             ui.end_row();
 
-            ui.colored_label(colors.dim, key_field_label(w.key_source, s));
+            ui.colored_label(colors.dim, w.key_source.field_label(s));
             // The references this key has been read from before, offered beside
             // the field: finding the 1Password item path is the tedious half of
             // setting an import up, and it is the same path every time. Only
@@ -509,7 +534,7 @@ fn draw_connect(
                     !busy,
                     egui::TextEdit::singleline(&mut w.key_entry)
                         .password(w.key_source.is_secret())
-                        .hint_text(key_field_hint(w.key_source, s))
+                        .hint_text(w.key_source.field_hint(s))
                         .desired_width(if known.is_empty() { 340.0 } else { 250.0 }),
                 );
                 if !known.is_empty() {
@@ -534,10 +559,8 @@ fn draw_connect(
             // address before.
             ui.label("");
             ui.add(
-                egui::Label::new(
-                    egui::RichText::new(key_field_help(w.key_source, s)).color(colors.dim),
-                )
-                .wrap(),
+                egui::Label::new(egui::RichText::new(w.key_source.field_help(s)).color(colors.dim))
+                    .wrap(),
             );
             ui.end_row();
 
@@ -576,48 +599,6 @@ fn draw_connect(
     action
 }
 
-/// The name of a key source as the picker shows it.
-fn key_source_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_source_paste,
-        KeySource::OnePassword => s.postman_key_source_op,
-        KeySource::Ssm => s.postman_key_source_ssm,
-        KeySource::Env => s.postman_key_source_env,
-    }
-}
-
-/// What the key field is asking for, and an example of it — both follow the
-/// chosen source, because "API key" is the wrong prompt when the field wants
-/// the name of a 1Password item.
-fn key_field_label(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_label,
-        KeySource::OnePassword => s.postman_key_label_op,
-        KeySource::Ssm => s.postman_key_label_ssm,
-        KeySource::Env => s.postman_key_label_env,
-    }
-}
-
-fn key_field_hint(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_hint,
-        KeySource::OnePassword => s.postman_key_hint_op,
-        KeySource::Ssm => s.postman_key_hint_ssm,
-        KeySource::Env => s.postman_key_hint_env,
-    }
-}
-
-/// What picking this source commits the user to: where the key is read from,
-/// when, and what has to be installed for that to work.
-fn key_field_help(src: KeySource, s: &Strings) -> &'static str {
-    match src {
-        KeySource::Paste => s.postman_key_help_paste,
-        KeySource::OnePassword => s.postman_key_help_op,
-        KeySource::Ssm => s.postman_key_help_ssm,
-        KeySource::Env => s.postman_key_help_env,
-    }
-}
-
 fn draw_pick_workspace(
     ui: &mut egui::Ui,
     w: &mut Wizard,
@@ -640,31 +621,94 @@ fn draw_pick_workspace(
     );
     ui.add_space(4.0);
 
-    let names: Vec<String> = w
+    // Each row is a tree node, not a bare name: a workspace *contains*
+    // collections, and which ones it contains is the question the reader is
+    // actually answering here. It used to be answerable only two steps later,
+    // once a workspace had been committed to and planned — so choosing between
+    // "IDV Platform" and "IDV Platform (old)" meant importing one to find out.
+    let rows: Vec<(String, String)> = w
         .flow
         .visible_workspaces()
         .iter()
-        .map(|ws| ws.name.clone())
+        .map(|ws| (ws.id.clone(), ws.name.clone()))
+        .collect();
+    if !rows.is_empty() {
+        ui.colored_label(colors.dim, s.postman_ws_peek_cost);
+    }
+    let open = w.flow.peek_open().map(str::to_string);
+    let pending = w.flow.peek_pending().map(str::to_string);
+    let listed: Vec<Option<Vec<String>>> = rows
+        .iter()
+        .map(|(id, _)| w.flow.workspace_peek(id).map(<[String]>::to_vec))
         .collect();
     let mut selected = w.flow.selected;
     egui::ScrollArea::vertical()
         .max_height(260.0)
         .show(ui, |ui| {
-            for (i, name) in names.iter().enumerate() {
-                if ui.selectable_label(selected == i, name).clicked() {
+            super::widgets::tree_rhythm(ui);
+            for (i, (id, name)) in rows.iter().enumerate() {
+                let expanded = open.as_deref() == Some(id.as_str());
+                let busy = pending.as_deref() == Some(id.as_str());
+                let chev = if expanded {
+                    super::icons::CARET_DOWN
+                } else {
+                    super::icons::CARET_RIGHT
+                };
+                let row = ui.horizontal(|ui| {
+                    let label = format!("{chev} {} {name}", super::icons::FOLDER);
+                    let hit = ui.selectable_label(selected == i, label);
+                    // The spinner sits *after* the row so it can't shift the
+                    // name sideways when it appears and vanishes.
+                    if busy {
+                        ui.spinner();
+                    }
+                    hit
+                });
+                if row.inner.clicked() {
+                    // One click does the two things a tree row does: it picks
+                    // the row, and it opens or shuts it.
                     selected = i;
+                    action = if expanded {
+                        UiAction::ClosePeek
+                    } else {
+                        UiAction::PeekWorkspace(i)
+                    };
                 }
+                if !expanded {
+                    continue;
+                }
+                ui.indent(("postman_ws_peek", i), |ui| {
+                    super::widgets::tree_rhythm(ui);
+                    match listed.get(i).and_then(Option::as_ref) {
+                        Some(names) if names.is_empty() => {
+                            ui.colored_label(colors.dim, s.postman_ws_peek_empty);
+                        }
+                        Some(names) => {
+                            for name in names {
+                                ui.colored_label(
+                                    colors.text,
+                                    format!("{} {name}", super::icons::FILE),
+                                );
+                            }
+                        }
+                        // Nothing listed yet: either the call is in flight or
+                        // it failed, and the error is printed under the list.
+                        None => {
+                            ui.colored_label(colors.dim, s.postman_ws_peek_busy);
+                        }
+                    }
+                });
             }
         });
     w.flow.selected = selected;
+    if let Some(err) = w.flow.peek_error() {
+        ui.colored_label(colors.err, err);
+    }
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(
-                !busy && !names.is_empty(),
-                egui::Button::new(s.gui_git_next),
-            )
+            .add_enabled(!busy && !rows.is_empty(), egui::Button::new(s.gui_git_next))
             .clicked()
         {
             action = UiAction::PickWorkspace;
@@ -794,6 +838,16 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         ui.colored_label(colors.err, s.postman_budget_warning);
     }
 
+    // What is actually in there. The plan can only count collections, and a
+    // count is no help deciding whether this is the workspace someone meant —
+    // so each one can be opened and read before anything bulk is fetched.
+    // Backing out here is still free: nothing but this has been downloaded.
+    if !w.flow.previewable().is_empty() {
+        ui.add_space(8.0);
+        ui.colored_label(colors.dim, s.postman_preview_cost);
+        draw_preview_list(ui, w, colors, s, &mut action);
+    }
+
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         if ui.button(s.postman_start).clicked() {
@@ -804,6 +858,136 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
         }
     });
     action
+}
+
+/// The plan's collections, each openable, with whichever one is open shown
+/// underneath. Kept in the dialog rather than a window of its own: the
+/// question it answers ("is this the workspace I wanted?") is the question the
+/// confirmation step is already asking.
+fn draw_preview_list(
+    ui: &mut egui::Ui,
+    w: &Wizard,
+    colors: UiColors,
+    s: &Strings,
+    action: &mut UiAction,
+) {
+    let pending = w.flow.preview_pending().map(str::to_string);
+    let open = w.flow.preview().map(|p| p.uid.clone());
+    let items: Vec<(String, String, bool)> = w
+        .flow
+        .previewable()
+        .iter()
+        .map(|i| {
+            let id = i.fetch_id().to_string();
+            let cached = w.flow.preview_is_cached(&id);
+            (id, i.name.clone(), cached)
+        })
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .id_salt("postman_preview_list")
+        .show(ui, |ui| {
+            super::widgets::tree_rhythm(ui);
+            for (index, (id, name, cached)) in items.iter().enumerate() {
+                let busy = pending.as_deref() == Some(id.as_str());
+                let is_open = open.as_deref() == Some(id.as_str());
+                // A row that opens to show what is inside it is a tree node,
+                // and reads as one: a caret and a name, not a name with a
+                // "Preview" button bolted to its left. The button said what
+                // the row would cost, which is a real thing to say — so it
+                // moved to the hover, where it is read by the person who
+                // wonders rather than by everyone who scans the list.
+                let chev = if is_open {
+                    super::icons::CARET_DOWN
+                } else {
+                    super::icons::CARET_RIGHT
+                };
+                let hint = if *cached {
+                    s.postman_preview_cached
+                } else {
+                    s.postman_preview_action
+                };
+                let row = ui.horizontal(|ui| {
+                    let label = format!("{chev} {} {name}", super::icons::FILE);
+                    // Only one fetch runs at a time, so the rest go quiet
+                    // rather than queueing calls the user can't see.
+                    let can = is_open || pending.is_none();
+                    let hit = ui.add_enabled(
+                        can,
+                        egui::Button::selectable(
+                            is_open,
+                            egui::RichText::new(label).color(colors.text),
+                        ),
+                    );
+                    if busy {
+                        ui.spinner();
+                    }
+                    hit.on_hover_text(hint)
+                });
+                if row.inner.clicked() {
+                    *action = if is_open {
+                        UiAction::ClosePreview
+                    } else {
+                        UiAction::Preview(index)
+                    };
+                }
+                if is_open && let Some(preview) = w.flow.preview() {
+                    draw_preview_body(ui, preview, colors, s);
+                }
+            }
+        });
+
+    if let Some(err) = w.flow.preview_error() {
+        ui.colored_label(colors.err, err);
+    }
+    if w.flow.preview_pending().is_some() {
+        ui.colored_label(colors.accent, s.postman_preview_busy);
+    }
+}
+
+/// One opened collection: its requests in their folders, then what would not
+/// survive the conversion.
+fn draw_preview_body(ui: &mut egui::Ui, preview: &Preview, colors: UiColors, s: &Strings) {
+    ui.indent("postman_preview_body", |ui| {
+        if preview.rows.is_empty() {
+            ui.colored_label(colors.dim, s.postman_preview_empty);
+            return;
+        }
+        ui.colored_label(
+            colors.dim,
+            format!("{} {}", preview.requests, s.postman_preview_requests),
+        );
+        for row in &preview.rows {
+            ui.horizontal(|ui| {
+                // Indent by depth: the folders are the whole point of reading
+                // this, and a flat list would be the very complaint the
+                // workspace tree was reshaped to answer.
+                ui.add_space(row.depth as f32 * 12.0);
+                let label = if row.label.trim().is_empty() {
+                    s.postman_preview_untitled
+                } else {
+                    row.label.as_str()
+                };
+                match &row.method {
+                    Some(method) => {
+                        ui.colored_label(colors.accent, method);
+                        ui.colored_label(colors.text, label);
+                    }
+                    None => {
+                        ui.colored_label(colors.dim, format!("{label}/"));
+                    }
+                }
+            });
+        }
+        if !preview.notes.is_empty() {
+            ui.add_space(4.0);
+            ui.colored_label(colors.err, s.postman_preview_notes);
+            for note in &preview.notes {
+                ui.colored_label(colors.dim, note);
+            }
+        }
+    });
 }
 
 fn draw_downloading(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings) -> UiAction {
@@ -1115,6 +1299,44 @@ mod tests {
         }
     }
 
+    /// Every word the dialog paints this frame, as one line. A few frames, so
+    /// egui's sizing and any newly opened section have settled.
+    fn painted(app: &mut GuiApp) -> String {
+        use eframe::egui;
+
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        app.theme.apply(&ctx);
+        let mut last = Vec::new();
+        for _ in 0..3 {
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    super::show(app, &ctx);
+                },
+            );
+            last.clear();
+            out.shapes.iter().for_each(|sh| walk(&sh.shape, &mut last));
+        }
+        last.join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn wizard() -> Wizard {
         let mut w = Wizard::new();
         w.flow.key = "PMAK-test".to_string();
@@ -1225,6 +1447,133 @@ mod tests {
         let mut w = wizard();
         w.flow.seed_step(Step::Downloading);
         assert!(w.working());
+    }
+
+    /// A plan can only count collections, and a count does not answer "is this
+    /// the workspace I meant?". Opening one lists what the import would land,
+    /// folders and all, before any of it is fetched.
+    #[test]
+    fn the_confirmation_step_can_read_a_collection_before_importing_it() {
+        use crate::postman_api::ItemSummary;
+        use crate::postman_flow::PreviewRow;
+
+        let mut app = GuiApp::for_test(Session::default());
+        app.postman.open();
+        app.postman.seed_step_for_audit(Step::Confirm);
+        let flow = &mut app.postman.flow.as_mut().unwrap().flow;
+        flow.seed_plan(ImportPlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: vec![ItemSummary {
+                uid: "uid-a".to_string(),
+                id: "id-a".to_string(),
+                name: "Billing".to_string(),
+            }],
+            environments: Vec::new(),
+            remaining_month: None,
+        });
+        // Cached, so the test needs no Postman API behind it.
+        flow.seed_preview_cache(Preview {
+            uid: "uid-a".to_string(),
+            name: "Billing".to_string(),
+            rows: vec![
+                PreviewRow {
+                    depth: 0,
+                    label: "Invoices".to_string(),
+                    method: None,
+                },
+                PreviewRow {
+                    depth: 1,
+                    label: "Create invoice".to_string(),
+                    method: Some("POST".to_string()),
+                },
+            ],
+            requests: 1,
+            notes: vec!["Create invoice: uses a Postman sandbox script".to_string()],
+        });
+
+        // The collection is offered, but nothing of its content is shown until
+        // it is asked for — that is the API call this screen exists to avoid
+        // spending by accident.
+        let before = painted(&mut app);
+        assert!(before.contains("Billing"), "the collection is listed");
+        assert!(
+            !before.contains("Create invoice"),
+            "nothing is read until asked for, got {before:?}"
+        );
+
+        let s = s();
+        app.postman
+            .flow
+            .as_mut()
+            .unwrap()
+            .flow
+            .preview_collection(0, &s);
+        let after = painted(&mut app);
+        assert!(after.contains("Invoices"), "the folder must show");
+        assert!(after.contains("Create invoice"), "and the request under it");
+        assert!(after.contains("POST"), "with its method");
+        assert!(
+            after.contains("sandbox script"),
+            "and what would not convert, which is worth knowing beforehand"
+        );
+
+        // And it reads as a tree: a caret that turns, not a name with a
+        // "Preview" button in front of it. What the click costs moved to the
+        // row's hover, which is why the word is gone from the list.
+        assert!(
+            before.contains(super::super::icons::CARET_RIGHT)
+                && after.contains(super::super::icons::CARET_DOWN),
+            "the row's caret turns as it opens: {before:?} then {after:?}"
+        );
+        assert!(
+            !before.contains(s.postman_preview_action),
+            "and no button is drawn beside the name: {before:?}"
+        );
+    }
+
+    /// Which collections a workspace holds is the question the picker is
+    /// really asking, and it used to be answerable only two steps later — once
+    /// a workspace had been committed to and a plan fetched for it. Expanding
+    /// the row answers it in place.
+    #[test]
+    fn a_workspace_row_opens_to_show_the_collections_in_it() {
+        let mut app = GuiApp::for_test(Session::default());
+        app.postman.open();
+        app.postman.seed_step_for_audit(Step::PickWorkspace);
+        let flow = &mut app.postman.flow.as_mut().unwrap().flow;
+        flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        // Cached, so the test needs no Postman API behind it.
+        flow.seed_peek_cache("ws-a", vec!["Billing".to_string(), "Identity".to_string()]);
+
+        let before = painted(&mut app);
+        assert!(
+            before.contains("Alpha") && before.contains("Beta"),
+            "both workspaces are listed: {before:?}"
+        );
+        assert!(
+            !before.contains("Billing"),
+            "but nothing inside one is shown until it is opened: {before:?}"
+        );
+
+        app.postman
+            .flow
+            .as_mut()
+            .unwrap()
+            .flow
+            .open_workspace_peek("ws-a", &s());
+        let after = painted(&mut app);
+        assert!(
+            after.contains("Billing") && after.contains("Identity"),
+            "the collections in the opened workspace show under it: {after:?}"
+        );
+        assert!(
+            after.contains("Beta"),
+            "and the rest of the list stays where it was: {after:?}"
+        );
     }
 
     /// The point of hiding it: the status bar keeps saying how far along the

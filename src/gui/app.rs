@@ -45,6 +45,17 @@ pub enum ResponseSection {
 pub enum Dialog {
     /// Rename a request or collection tab.
     Rename { target: RenameTarget, text: String },
+    /// Naming the parameter a right-clicked request field is being extracted
+    /// into. Carries where the text came from so the edit can be re-checked
+    /// against the request as it stands when the dialog is answered.
+    ExtractParameter {
+        ci: usize,
+        entry: usize,
+        target: super::editor::ExtractTarget,
+        value: String,
+        range: Option<std::ops::Range<usize>>,
+        name: String,
+    },
     /// The theme editor.
     Theme(Box<super::menu::ThemeEditState>),
     /// Simple text prompt (base URL, new env name, …).
@@ -210,6 +221,18 @@ pub struct GuiApp {
     /// already collected are the whole point of having run it.
     pub report_runs:
         std::collections::HashMap<super::report_run::RunKey, super::report_run::ParkedRun>,
+    /// Edited reports whose editor is no longer on screen, by file path.
+    ///
+    /// The editor is torn down and rebuilt from disk whenever the user clicks
+    /// another file, an environment, or a tab — so without this, editing a
+    /// report and glancing at anything else in the workspace silently threw
+    /// the edits away and handed back what the file still said. This is the
+    /// report half of [`Collection::workspace_pending`], and works the same
+    /// way: the unsaved text is parked when the view closes and taken back the
+    /// moment the same file is opened again.
+    ///
+    /// [`Collection::workspace_pending`]: crate::collection::Collection::workspace_pending
+    pub report_pending: std::collections::HashMap<PathBuf, crate::report::Report>,
     /// Git remote load/save UI state (self-contained in `remote.rs`).
     pub remote: super::remote::RemoteUi,
     pub postman: super::postman::PostmanUi,
@@ -307,6 +330,7 @@ impl GuiApp {
             show_reports: false,
             report_editor: None,
             report_runs: std::collections::HashMap::new(),
+            report_pending: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
             postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
@@ -344,6 +368,7 @@ impl GuiApp {
             show_reports: false,
             report_editor: None,
             report_runs: std::collections::HashMap::new(),
+            report_pending: std::collections::HashMap::new(),
             remote: super::remote::RemoteUi::default(),
             postman: super::postman::PostmanUi::default(),
             workspace_redownload: None,
@@ -474,6 +499,16 @@ impl GuiApp {
         let Some(mut ed) = self.report_editor.take() else {
             return;
         };
+        // Unsaved edits outlive the view that was showing them. Closing the
+        // editor is not a decision about the *document* — it happens on every
+        // click that puts something else in the centre column — so throwing
+        // the text away here made looking at anything else in the workspace a
+        // way to lose work with no warning and no undo.
+        if ed.report.dirty
+            && let Some(path) = ed.report.path.clone()
+        {
+            self.report_pending.insert(path, ed.report.clone());
+        }
         let key = ed.run_key();
         let parked = ed.park_run();
         if parked.is_worth_keeping() {
@@ -511,6 +546,21 @@ impl GuiApp {
     /// resized palette or diagnostics panel that only came back on *one* of
     /// those paths reads as the setting not being saved at all.
     pub fn open_report_editor(&mut self, origin: ReportOrigin, report: crate::report::Report) {
+        // Whatever was open keeps its run *and* its unsaved edits, so this has
+        // to happen before the parked edits below are looked for — the report
+        // being opened may be the one just closed.
+        self.close_report_editor();
+        // A report edited and then navigated away from comes back as it was
+        // left. The caller has just read the file off disk (every path here
+        // does), which is the older of the two by definition.
+        let report = match report
+            .path
+            .as_ref()
+            .and_then(|p| self.report_pending.remove(p))
+        {
+            Some(parked) => parked,
+            None => report,
+        };
         let mut ed = report_editor::ReportEditor::new(origin, report);
         if let Some(h) = self.session.gui.report_diag_height {
             ed.diag_h = h;
@@ -524,8 +574,7 @@ impl GuiApp {
         if let Some(h) = self.session.gui.report_summary_height {
             ed.summary_h = h;
         }
-        // Whatever was open keeps its run, and this report takes back its own.
-        self.close_report_editor();
+        // And this report takes back its own run.
         if let Some(parked) = self.report_runs.remove(&ed.run_key()) {
             ed.adopt_run(parked);
         }
@@ -750,6 +799,97 @@ impl GuiApp {
 
     /// Wrap a panel body in a titled, focus-aware frame and register a click on
     /// it as focusing that panel.
+    /// A red band above the request editor naming every `{{ VAR }}` the selected
+    /// request references that nothing defines.
+    ///
+    /// Derived state, recomputed each frame rather than stored: it is the exact
+    /// answer for the request that is on screen *now*, so it appears the moment
+    /// the typo is made and vanishes the moment it is fixed. That is also why
+    /// there is no dismiss button — there is nothing to dismiss, only something
+    /// to fix. Colouring the tokens red in the editor (see `editor.rs`) says
+    /// *where*; this says *that*, for the tokens scrolled out of view.
+    ///
+    /// The headline and the names, and nothing else. A line of advice under
+    /// them ("add them to an environment, or check the spelling") only told
+    /// someone looking at a list of their own variable names what they already
+    /// knew, in small dim type, and pushed the request itself further down the
+    /// screen every time it appeared.
+    fn undefined_vars_banner(&mut self, ui: &mut egui::Ui) {
+        let ci = self.active_ci();
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        let env = self.session.effective_env(ci);
+        let missing = crate::request::undefined_request_keys(col, env.as_ref());
+        if missing.is_empty() {
+            return;
+        }
+        let s = &self.strings;
+        let headline = if missing.len() == 1 {
+            s.gui_undefined_banner_one.to_string()
+        } else {
+            s.gui_undefined_banner_many
+                .replace("{n}", &missing.len().to_string())
+        };
+        let th = self.theme;
+        // Drawn inline at the top of the centre panel rather than in a
+        // `Panel::top`: a panel would reserve a fixed strip and clip the list
+        // of names, and this band's height depends on how many names there are.
+        egui::Frame::new()
+            .fill(th.panel)
+            .stroke(egui::Stroke::new(1.0, th.err))
+            .inner_margin(6.0)
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(egui::RichText::new(headline).color(th.err).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(missing.join(", "))
+                            .color(th.err)
+                            .monospace(),
+                    );
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    /// Names the selected request when it carries both a raw body and form
+    /// fields, which Hurl cannot send together.
+    ///
+    /// Beside the undefined-variables banner and for the same reason: the
+    /// Body section says it in place and offers the fix, but a user who is
+    /// looking at Headers (or at nothing in particular) would otherwise press
+    /// Send, watch a 200 come back, and never learn that none of their form
+    /// fields left the machine. Recomputed each frame, like the banner above
+    /// it, so it appears and disappears with the request itself.
+    fn body_form_conflict_banner(&mut self, ui: &mut egui::Ui) {
+        let ci = self.active_ci();
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        if crate::request::body_form_conflicts(col).is_empty() {
+            return;
+        }
+        let th = self.theme;
+        let s = &self.strings;
+        egui::Frame::new()
+            .fill(th.panel)
+            .stroke(egui::Stroke::new(1.0, th.err))
+            .inner_margin(6.0)
+            .corner_radius(4.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    egui::RichText::new(s.gui_body_conflict_headline)
+                        .color(th.err)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(s.gui_body_conflict_detail).color(th.text));
+            });
+        ui.add_space(4.0);
+    }
+
     pub fn panel_frame<R>(
         &mut self,
         ui: &mut egui::Ui,
@@ -895,12 +1035,54 @@ impl GuiApp {
                 } else {
                     text = text.color(self.theme.dim);
                 }
-                let resp = super::widgets::selectable(ui, selected, text);
-                if resp.clicked() {
+                // The tab carries its own close button, as every tab strip
+                // people already use does. It is reserved *inside* the tab's
+                // own frame (an atom with a size and no content), so the strip
+                // doesn't reflow when one appears, and it is painted in the
+                // dim colour used for everything that is present but not being
+                // asked about — closing a tab is not an error, and a red ✕ on
+                // every tab reads as one. The built-in Request tab can't be
+                // closed, so it doesn't reserve the room.
+                let closable = i != 0;
+                let close_id = ui.id().with(("tab_close", i));
+                let mark = ui.text_style_height(&egui::TextStyle::Body) * 0.85;
+                let mut atoms = egui::Atoms::new(text);
+                if closable {
+                    atoms.push_right(egui::Atom::custom(close_id, egui::vec2(mark, mark)));
+                }
+                let laid = egui::Button::selectable(selected, atoms)
+                    .frame_when_inactive(true)
+                    .atom_ui(ui);
+                let close_rect = laid.rect(close_id);
+                let resp = laid.response;
+                // Interacted after the tab, so the ✕ wins the pointer where
+                // the two overlap; the tab's own click is then ignored, or
+                // closing a tab would also switch to it on the way out.
+                let closed = close_rect.map(|rect| {
+                    let hit = ui
+                        .interact(rect, close_id, egui::Sense::click())
+                        .on_hover_text(lbl_close);
+                    let colour = if hit.hovered() {
+                        self.theme.text
+                    } else {
+                        self.theme.dim
+                    };
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        super::icons::CLOSE,
+                        egui::FontId::new(mark, egui::FontFamily::Proportional),
+                        colour,
+                    );
+                    hit.clicked()
+                });
+                if closed == Some(true) {
+                    close_tab = Some(i);
+                } else if resp.clicked() {
                     self.switch_to_tab(i);
                 }
                 // Middle-click closes a tab (not the built-in Request tab).
-                if i != 0 && resp.middle_clicked() {
+                if closable && resp.middle_clicked() {
                     self.request_close_tab(i);
                 }
                 // Right-click: rename the collection, or close it (parity with
@@ -1027,7 +1209,20 @@ impl GuiApp {
         if self.pending_pick.is_some() {
             return;
         }
-        self.pending_pick = Some(super::filepick::spawn(kind, title, dir, action));
+        // A caller's own seed wins — it knows the field's current value, or the
+        // folder the thing being picked belongs beside. Only when it hasn't got
+        // one (or it no longer exists) does the dialog fall back to wherever the
+        // user last browsed, which beats opening on the process's working
+        // directory.
+        let remembered = self
+            .session
+            .picker_dir(crate::session::PickerKind::Other)
+            .map(std::path::Path::to_path_buf);
+        let dir = dir
+            .filter(|d| d.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .or(remembered);
+        self.pending_pick = Some(super::filepick::spawn(kind, title, dir.as_deref(), action));
     }
 }
 
@@ -1144,6 +1339,8 @@ impl GuiApp {
                 self.panel_frame(ui, Focus::Main, |app, ui| reports::ui(app, ui));
                 return;
             }
+            self.undefined_vars_banner(ui);
+            self.body_form_conflict_banner(ui);
             let avail = ui.available_height();
             let resp_h = self.session.gui.response_height.unwrap_or_else(|| {
                 (avail * self.session.response_pct as f32 / 100.0)
@@ -1328,6 +1525,89 @@ mod tests {
         c
     }
 
+    /// Every closable tab carries its own ✕, and clicking it closes that tab
+    /// rather than merely switching to it.
+    ///
+    /// The built-in Request tab is not closable, so it must not show one — an
+    /// ✕ that does nothing is worse than no ✕ at all.
+    #[test]
+    fn a_tab_is_closed_by_the_mark_in_its_own_corner() {
+        let mut session = crate::session::Session::default();
+        session.add_collection("scratch");
+        assert_eq!(session.tab_count(), 2);
+        let mut app = GuiApp::for_test(session);
+        app.session.activate_tab(0);
+
+        let ctx = egui::Context::default();
+        app.theme.apply(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 200.0),
+            )),
+            ..Default::default()
+        };
+
+        // Where the marks are painted. Two frames: egui sizes the strip on the
+        // first and only paints it settled on the second.
+        let mut marks: Vec<egui::Rect> = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(input(), |ui| app.tab_strip(ui));
+            marks = close_marks(&out.shapes);
+        }
+        assert_eq!(
+            marks.len(),
+            1,
+            "one mark, on the one closable tab — not on the Request tab"
+        );
+
+        let at = marks[0].center();
+        let mut i = input();
+        i.events.push(egui::Event::PointerMoved(at));
+        i.events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        i.events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run_ui(i, |ui| app.tab_strip(ui));
+
+        assert_eq!(app.session.tab_count(), 1, "the tab is gone");
+        assert!(
+            app.dialog.is_none(),
+            "an untouched tab closes without asking"
+        );
+        assert_eq!(
+            app.active_ci(),
+            0,
+            "and the ✕ didn't switch to it on the way"
+        );
+    }
+
+    /// The rects of every close mark painted in a frame.
+    fn close_marks(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Rect> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<egui::Rect>) {
+            match s {
+                egui::epaint::Shape::Text(t) if t.galley.text() == super::super::icons::CLOSE => {
+                    out.push(t.visual_bounding_rect())
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
     /// "Save all changes" has to leave nothing behind for the dialog to object
     /// to a second time -- otherwise the button would appear to do nothing.
     #[test]
@@ -1465,6 +1745,68 @@ mod tests {
         let out = ctx.run_ui(close_request(), |ui| app.intercept_close(ui.ctx()));
         assert!(!cancelled(&out), "a confirmed quit must not be intercepted");
         assert!(app.dialog.is_none(), "and must not ask a second time");
+    }
+
+    /// Does any text painted this frame contain `needle`? Shapes nest (a
+    /// `Frame` emits a `Shape::Vec`), so this has to recurse rather than scan
+    /// the top level.
+    fn painted(out: &egui::FullOutput, needle: &str) -> bool {
+        fn walk(shape: &egui::Shape, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.text().contains(needle),
+                egui::Shape::Vec(v) => v.iter().any(|s| walk(s, needle)),
+                _ => false,
+            }
+        }
+        out.shapes.iter().any(|c| walk(&c.shape, needle))
+    }
+
+    /// Paint the banner once with a real screen rect — without one, egui has no
+    /// room to lay anything out and paints nothing at all.
+    fn banner_frame(app: &mut GuiApp) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(640.0, 480.0),
+        ));
+        ctx.run_ui(input, |ui| app.undefined_vars_banner(ui))
+    }
+
+    fn app_referencing(url: &str) -> GuiApp {
+        let mut e = crate::hurl::HurlEntry::default();
+        e.title = "req".into();
+        e.method = "GET".into();
+        e.url = url.into();
+        let mut session = Session::default();
+        session.collections.clear();
+        session
+            .collections
+            .push(crate::collection::Collection::new("c".to_string(), vec![e]));
+        GuiApp::for_test(session)
+    }
+
+    /// The whole point of feature: a variable nothing defines used to be
+    /// invisible — it rendered as ordinary body text and the run just 401'd.
+    #[test]
+    fn undefined_variables_are_named_in_a_banner() {
+        let mut app = app_referencing("https://x/{{ tokn }}");
+        let out = banner_frame(&mut app);
+        assert!(
+            painted(&out, "tokn"),
+            "the offending variable must be named, not just counted"
+        );
+    }
+
+    /// ...and it must be silent otherwise, or it becomes wallpaper.
+    #[test]
+    fn a_request_with_no_variables_gets_no_banner() {
+        let mut app = app_referencing("https://x/plain");
+        let out = banner_frame(&mut app);
+        assert!(
+            !painted(&out, "undefined"),
+            "nothing is wrong, so nothing should be said"
+        );
     }
 
     /// Nothing unsaved, nothing to say — the window closes without a word.
@@ -1628,6 +1970,53 @@ mod report_run_persistence_tests {
                 .contains_key(&RunKey::Path("/tmp/nightly.trail".into())),
             "the run is held in one place at a time, not two"
         );
+    }
+
+    /// Editing a report and then clicking anything else in the workspace — an
+    /// environment, another collection, another tab — tears the editor down
+    /// and rebuilds it from the file on disk. Without somewhere for the
+    /// unsaved text to wait, that silently threw the edits away and handed
+    /// back what the file still said, with no warning and nothing to undo.
+    #[test]
+    fn an_edited_report_survives_looking_at_something_else() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let ed = app.report_editor.as_mut().expect("editor is open");
+        ed.report.text = "# name: nightly\nREPORT REQUEST typed_by_hand\n".to_string();
+        ed.report.dirty = true;
+
+        // Whatever the user clicked takes the centre column.
+        app.close_report_editor();
+        assert!(app.report_editor.is_none(), "the editor really did close");
+
+        // And back. Every path that reopens one reads the file off disk, which
+        // is what `report()` stands in for here.
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        let ed = app.report_editor.as_ref().expect("the editor is back");
+        assert!(
+            ed.report.text.contains("typed_by_hand"),
+            "the edits come back, not the file: {:?}",
+            ed.report.text
+        );
+        assert!(
+            ed.report.dirty,
+            "and they are still unsaved, so Save is still offered"
+        );
+        assert!(
+            app.report_pending.is_empty(),
+            "and they are held in one place at a time, not two"
+        );
+    }
+
+    /// Only *unsaved* text is worth keeping. A report closed with nothing
+    /// outstanding must come back from disk, or a later change made outside
+    /// PaperBoy would be masked forever by a stale copy of the same file.
+    #[test]
+    fn an_unedited_report_is_not_parked() {
+        let mut app = app();
+        app.open_report_editor(ReportOrigin::Workspace, report("nightly"));
+        app.close_report_editor();
+        assert!(app.report_pending.is_empty());
     }
 
     /// A report is loaded afresh from disk each time it is opened from a

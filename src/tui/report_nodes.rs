@@ -29,11 +29,13 @@ use super::editor::Editor;
 use super::new_request::draw_scrollbar;
 use super::theme::Theme;
 use crate::i18n::{Status, Strings};
+use crate::report::edit;
 use crate::report::flow::{
     Element, EnvClause, FlowNode, ImageSpec, ParallelSpec, Pattern, Producer, ReportStmt,
-    ResponseFmt, RoleBinding, RoleRef, ShowField, WithItem,
+    ResponseFmt, RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
 use crate::report::model::StatKind;
+use crate::shared_utils::truncate_to_width;
 
 // The pure structural-editing core (flatten/insert/remove/move/replace/parse
 // of the flow AST, plus the node-kind palette templates) lives in the
@@ -104,6 +106,10 @@ pub(crate) enum FormRow {
     Response,
     /// The `AS <alias>` namespace (only when reporting).
     Alias,
+    /// A `USING(…)` parameter checkbox (index into [`RequestForm::params`]).
+    /// Not reporting-only: `USING` describes the send, so a plain `REQUEST`
+    /// has it too.
+    Param(usize),
     /// A `SHOW(…)` field checkbox (index into [`RequestForm::fields`]).
     Field(usize),
     /// A `HIDE(…)` field checkbox (index into [`RequestForm::hide_fields`]).
@@ -113,6 +119,16 @@ pub(crate) enum FormRow {
     With(usize),
     /// The "add a `WITH` field" row, which opens an empty [`WithFieldForm`].
     AddWith,
+    /// The target box of a per-call `USING(…)` override — `multipart.document`
+    /// (index into [`RequestForm::overrides`]). Edited inline like the alias
+    /// rather than in a sub-form: an override is two short strings, and the
+    /// `WITH` field's sub-form exists because a `WITH` item carries a checklist
+    /// too.
+    OverrideTarget(usize),
+    /// The value box of the same override, `{{FILE}}`.
+    OverrideValue(usize),
+    /// The "add a per-call override" row.
+    AddOverride,
 }
 
 /// The request configure form ([`Overlay::ReportNodeRequest`]), reached with
@@ -146,6 +162,15 @@ pub(crate) struct RequestForm {
     /// The node's `WITH … END` items, preserved verbatim across an edit (the
     /// form doesn't edit them, but must not drop them when re-serializing).
     pub(crate) with: Vec<WithItem>,
+    /// The node's `USING(…)` clause as the form was opened with, kept so
+    /// anything the form has no row for survives being rebuilt from it.
+    pub(crate) using: Vec<UsingItem>,
+    /// The clause's per-call overrides (`multipart.document = "…"`), as the two
+    /// boxes of text the form edits. See [`edit::OverrideRow`].
+    pub(crate) overrides: Vec<edit::OverrideRow>,
+    /// The `USING(…)` requirement checklist: every parameter the request
+    /// declares, plus any the clause requires that it doesn't.
+    pub(crate) params: Vec<edit::ParamRow>,
     /// The `HIDE(…)` checklist, over the same field names as [`Self::fields`].
     /// A ticked row is *hidden*; nothing ticked ⇒ no `HIDE` clause. `SHOW` and
     /// `HIDE` are separate clauses in the grammar, so they get separate lists
@@ -173,7 +198,9 @@ impl RequestForm {
         response: Option<ResponseFmt>,
         current_show: &[ShowField],
         report_fields: &[String],
+        declared_params: &[(String, String)],
         with: Vec<WithItem>,
+        using: Vec<UsingItem>,
         hide: Vec<String>,
     ) -> Self {
         let with_fields: Vec<String> = with
@@ -236,6 +263,9 @@ impl RequestForm {
             request,
             titles,
             report,
+            params: edit::param_rows(declared_params, &using),
+            overrides: edit::override_rows(&using),
+            using,
             // Carried, never edited: the checklist has no row for a statistic.
             show_stats: current_show
                 .iter()
@@ -255,6 +285,17 @@ impl RequestForm {
     /// alias, field checklist) appear only when [`Self::report`] is set.
     pub(crate) fn visible_rows(&self) -> Vec<FormRow> {
         let mut rows = vec![FormRow::Name, FormRow::Report];
+        // `USING` sits above the reporting options because it belongs to the
+        // *send*, not to the columns: a plain `REQUEST` has it too.
+        rows.extend((0..self.params.len()).map(FormRow::Param));
+        // The overrides sit with the requirements: they are the other half of
+        // the same clause, and a request that declares nothing has them as its
+        // only way to be steered at all.
+        for i in 0..self.overrides.len() {
+            rows.push(FormRow::OverrideTarget(i));
+            rows.push(FormRow::OverrideValue(i));
+        }
+        rows.push(FormRow::AddOverride);
         if self.report {
             rows.push(FormRow::Response);
             rows.push(FormRow::Alias);
@@ -1743,8 +1784,8 @@ impl TuiApp {
         node: &FlowNode,
     ) -> Option<RequestForm> {
         let report_id = self.reports[idx].report.id;
-        let (name, report, alias, response, current_show, current_hide, with) = match node {
-            FlowNode::Request { name } => (
+        let (name, report, alias, response, current_show, current_hide, with, using) = match node {
+            FlowNode::Request { name, using } => (
                 name.clone(),
                 false,
                 None,
@@ -1752,10 +1793,12 @@ impl TuiApp {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                using.clone(),
             ),
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
+                using,
                 response_fmt,
                 show,
                 hide,
@@ -1768,10 +1811,12 @@ impl TuiApp {
                 show.clone(),
                 hide.clone(),
                 with.clone(),
+                using.clone(),
             ),
             _ => return None,
         };
         let report_fields = self.request_report_fields(report_id, &name);
+        let declared_params = self.request_parameters(report_id, &name);
         let titles = self.bound_request_titles(report_id);
         Some(RequestForm::build(
             report_id,
@@ -1783,7 +1828,9 @@ impl TuiApp {
             response,
             &current_show,
             &report_fields,
+            &declared_params,
             with,
+            using,
             current_hide,
         ))
     }
@@ -1828,6 +1875,36 @@ impl TuiApp {
             .unwrap_or_default()
     }
 
+    /// The parameters a request declares (`[Options] variable: NAME=value`),
+    /// in written order, for the form's `USING(…)` checklist. Empty when the
+    /// request can't be resolved — an unbound collection offers no parameters
+    /// to tick, which is the same "nothing to configure" state as a request
+    /// that simply declares none.
+    fn request_parameters(&self, report_id: u64, name: &str) -> Vec<(String, String)> {
+        let Some(idx) = self.report_index_by_id(report_id) else {
+            return Vec::new();
+        };
+        let rt = &self.reports[idx];
+        let entries = self
+            .resolve_bound_collection(&rt.report)
+            .map(|ci| self.collections[ci].entries.as_slice())
+            .unwrap_or(&[]);
+        crate::report::run::resolve_qualified(entries, &rt.helpers, name)
+            .map(|e| e.variable_defaults())
+            .unwrap_or_default()
+    }
+
+    /// Re-derive the `USING(…)` checklist after the request name changes. The
+    /// parameters belong to the request, so cycling to another one must not
+    /// leave the previous request's rows on screen. Ticks survive: a name the
+    /// new request doesn't declare stays as an un-declared row, which is the
+    /// error the user needs to see rather than a row that quietly vanished.
+    fn refresh_form_params(&self, form: &mut RequestForm) {
+        let declared = self.request_parameters(form.report_id, &form.request);
+        let using = edit::using_items(&form.params, &form.using);
+        form.params = edit::param_rows(&declared, &using);
+    }
+
     /// Finish a [`RequestForm`]: rebuild the node from the form and write it
     /// back. The `REPORT` toggle chooses the node kind — a plain `REQUEST`
     /// (dropping any reporting options) or a `REPORT REQUEST` carrying the
@@ -1842,14 +1919,18 @@ impl TuiApp {
             FlowNode::Report(ReportStmt::Request {
                 name: form.request.clone(),
                 alias: form.alias_opt(),
+                using: edit::using_items(&form.params, &edit::override_items(&form.overrides)),
                 response_fmt: form.response,
                 show: form.show(),
                 hide: form.hide(),
                 with: form.with.clone(),
             })
         } else {
+            // Downgrading to a plain REQUEST drops the *reporting* options, but
+            // `USING` describes the send itself and survives.
             FlowNode::Request {
                 name: form.request.clone(),
+                using: edit::using_items(&form.params, &edit::override_items(&form.overrides)),
             }
         };
         self.apply_node_replace(idx, &form.path, node);
@@ -2399,6 +2480,7 @@ impl TuiApp {
         let Some(FlowNode::Report(ReportStmt::Request {
             name,
             alias,
+            using,
             response_fmt,
             show,
             hide,
@@ -2421,6 +2503,7 @@ impl TuiApp {
         let node = FlowNode::Report(ReportStmt::Request {
             name: name.clone(),
             alias: alias.clone(),
+            using: using.clone(),
             response_fmt: *response_fmt,
             show: show.clone(),
             hide: hide.clone(),
@@ -2916,10 +2999,12 @@ impl TuiApp {
                     Some(FormRow::Name) => match key.code {
                         KeyCode::Char(' ') | KeyCode::Right => {
                             form.cycle_name(true);
+                            self.refresh_form_params(&mut form);
                             keep(self, form);
                         }
                         KeyCode::Left => {
                             form.cycle_name(false);
+                            self.refresh_form_params(&mut form);
                             keep(self, form);
                         }
                         _ => keep(self, form),
@@ -2957,6 +3042,84 @@ impl TuiApp {
                                 form.alias.pop();
                             }
                             _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    // A per-call override's target box. Free text: it names a
+                    // part of the request (`multipart.document`), not an
+                    // identifier, so `.` and `-` have to get through.
+                    Some(FormRow::OverrideTarget(oi)) => {
+                        match key.code {
+                            KeyCode::Char(c) if !c.is_control() => {
+                                if let Some(row) = form.overrides.get_mut(oi) {
+                                    row.target.push(c);
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(row) = form.overrides.get_mut(oi) {
+                                    row.target.pop();
+                                }
+                            }
+                            // Delete removes the whole override, as `x`/Del
+                            // does on a WITH field. Not `x`: that is a legal
+                            // character in a target.
+                            KeyCode::Delete => {
+                                if oi < form.overrides.len() {
+                                    form.overrides.remove(oi);
+                                    form.selected = form.selected.min(form.last_row());
+                                }
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    // The same override's value. Anything may appear here —
+                    // it is `{{VAR}}`-interpolated text, including spaces.
+                    Some(FormRow::OverrideValue(oi)) => {
+                        match key.code {
+                            KeyCode::Char(c) if !c.is_control() => {
+                                if let Some(row) = form.overrides.get_mut(oi) {
+                                    row.value.push(c);
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(row) = form.overrides.get_mut(oi) {
+                                    row.value.pop();
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if oi < form.overrides.len() {
+                                    form.overrides.remove(oi);
+                                    form.selected = form.selected.min(form.last_row());
+                                }
+                            }
+                            _ => {}
+                        }
+                        keep(self, form);
+                    }
+                    // Add an override. Space, not Enter: Enter applies the
+                    // whole form, the same split the WITH rows use.
+                    Some(FormRow::AddOverride) => {
+                        if key.code == KeyCode::Char(' ') {
+                            form.overrides.push(edit::OverrideRow::default());
+                            // Land on the new row's target box, which is where
+                            // the user has to type next.
+                            form.selected = form
+                                .visible_rows()
+                                .iter()
+                                .position(|r| {
+                                    *r == FormRow::OverrideTarget(form.overrides.len() - 1)
+                                })
+                                .unwrap_or(form.selected);
+                        }
+                        keep(self, form);
+                    }
+                    // A USING(…) parameter checkbox.
+                    Some(FormRow::Param(pi)) => {
+                        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char('x'))
+                            && let Some(row) = form.params.get_mut(pi)
+                        {
+                            row.required = !row.required;
                         }
                         keep(self, form);
                     }
@@ -3655,16 +3818,6 @@ fn render_setting_row(
         Span::styled(head.to_string(), Style::default().fg(key_colour)),
         Span::styled(tail.to_string(), Style::default().fg(value_colour)),
     ])
-}
-
-/// Cut `text` to `width` display columns, marking the cut with an ellipsis.
-fn truncate_to_width(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn render_node_row(

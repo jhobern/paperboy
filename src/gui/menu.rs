@@ -599,6 +599,14 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
     };
     match dialog {
         Dialog::Rename { target, text } => rename_dialog(app, ctx, target, text),
+        Dialog::ExtractParameter {
+            ci,
+            entry,
+            target,
+            value,
+            range,
+            name,
+        } => extract_parameter_dialog(app, ctx, ci, entry, target, value, range, name),
         Dialog::Prompt { kind, text } => prompt_dialog(app, ctx, kind, text),
         Dialog::Theme(state) => theme_dialog(app, ctx, *state),
         Dialog::CloseGitWorkspace { ci, root } => close_git_workspace_dialog(app, ctx, ci, root),
@@ -1107,6 +1115,10 @@ pub enum PickAction {
     ReportParamPath {
         name: String,
     },
+    /// The default value of a `FOLDER`/`FILE` `PARAM`, picked from its block.
+    ReportParamDefault {
+        path: Vec<usize>,
+    },
     /// The folder (or file) a `FOR … IN FILES/FOLDERS` loop walks.
     ReportLoopDir {
         path: Vec<usize>,
@@ -1141,9 +1153,18 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
         return; // still open — the usual case
     };
     app.pending_pick = None;
+    // Every picker teaches the next one where the user just was. The report
+    // editor's own dialogs used to be left out of this, so browsing to a corpus
+    // folder was forgotten and the next Browse… opened back at the workspace
+    // root — the one complaint this is here to fix. `Other` deliberately seeds
+    // only the general last-browsed folder, leaving the environment/import
+    // memories to the pickers those are actually about.
+    if let Some(path) = picked.as_ref() {
+        app.session
+            .remember_picker_dir(crate::session::PickerKind::Other, path);
+    }
     // The report editor's own pickers write into the open editor rather than
-    // loading a file, so they neither seed the shared picker directory nor have
-    // an error to report.
+    // loading a file, so they have no error to report.
     match action {
         PickAction::ReportParamPath { name } => {
             if let Some(path) = picked.as_ref()
@@ -1156,6 +1177,10 @@ pub fn poll_pending_pick(app: &mut GuiApp) {
         }
         PickAction::ReportHeaderFile { key, occurrence } => {
             super::report_editor::apply_picked_header_file(app, key, occurrence, picked);
+            return;
+        }
+        PickAction::ReportParamDefault { path } => {
+            super::report_editor::apply_picked_param_default(app, &path, picked);
             return;
         }
         PickAction::ReportLoopDir { path, file } => {
@@ -1678,6 +1703,100 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
     app.dialog = Some(Dialog::Rename { target, text });
 }
 
+/// Name the parameter a request field is being extracted into.
+///
+/// The name is re-checked against the request every frame rather than once on
+/// submit, so the refusal appears as the offending name is typed; and the OK
+/// button is a no-op while it stands, so Enter can't smuggle a refused name
+/// past the check.
+#[allow(clippy::too_many_arguments)]
+fn extract_parameter_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    entry: usize,
+    target: super::editor::ExtractTarget,
+    value: String,
+    range: Option<std::ops::Range<usize>>,
+    mut name: String,
+) {
+    let title = app.strings.extract_title;
+    let lbl_value = app.strings.extract_value;
+    let lbl_name = app.strings.extract_name_label;
+    let lbl_ok = app.strings.gui_ok;
+    let lbl_cancel = app.strings.gui_cancel;
+    let dim = app.theme.dim;
+    let err_color = app.theme.err;
+    let declared = app
+        .session
+        .collections
+        .get(ci)
+        .and_then(|c| c.entries.get(entry))
+        .map(|e| e.variable_defaults())
+        .unwrap_or_default();
+    let msg_invalid = app.strings.extract_name_invalid;
+    let msg_conflict = app.strings.extract_name_conflict;
+    let frame = modal(ctx, title, |ui| {
+        ui.label(egui::RichText::new(crate::i18n::fill(lbl_value, &[&value])).color(dim));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(lbl_name).color(dim));
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .desired_width(320.0)
+                .hint_text(lbl_name),
+        );
+        let error = crate::hurl::check_parameter_name(&name, &value, &declared);
+        match &error {
+            Some(crate::hurl::ParamNameError::Invalid) => {
+                ui.label(egui::RichText::new(msg_invalid).color(err_color));
+            }
+            Some(crate::hurl::ParamNameError::Conflict(existing)) => {
+                ui.label(
+                    egui::RichText::new(crate::i18n::fill(msg_conflict, &[&name, existing]))
+                        .color(err_color),
+                );
+            }
+            None => {}
+        }
+        let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut keep = true;
+        let mut go = submit;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(error.is_none(), egui::Button::new(lbl_ok))
+                .clicked()
+            {
+                go = true;
+            }
+            if ui.button(lbl_cancel).clicked() {
+                keep = false;
+            }
+        });
+        (keep, go && error.is_none())
+    });
+    // A frame egui never drew is not an answer: keep the dialog open;
+    // dismissing it is the Cancel button.
+    let dismissed = frame.dismissed;
+    let (keep, submit) = frame.inner_or((true, false));
+    let keep = keep && !dismissed;
+    if !keep {
+        return;
+    }
+    if submit {
+        super::editor::apply_extract_parameter(app, ci, entry, target, range, &value, &name);
+        app.session.save();
+        return;
+    }
+    app.dialog = Some(Dialog::ExtractParameter {
+        ci,
+        entry,
+        target,
+        value,
+        range,
+        name,
+    });
+}
+
 fn prompt_dialog(app: &mut GuiApp, ctx: &egui::Context, kind: PromptKind, mut text: String) {
     let title = match &kind {
         PromptKind::BaseUrl => app.strings.gui_base_url_title,
@@ -1827,21 +1946,7 @@ fn file_stem(path: &str) -> String {
 
 /// The i18n label for the `i`th editable theme colour (mirrors the terminal
 /// UI's `theme_editor::color_label`, reading the same `Strings` fields).
-fn color_label(s: &Strings, i: usize) -> &'static str {
-    match i {
-        0 => s.theme_c_bg,
-        1 => s.theme_c_panel,
-        2 => s.theme_c_text,
-        3 => s.theme_c_dim,
-        4 => s.theme_c_accent,
-        5 => s.theme_c_ok,
-        6 => s.theme_c_err,
-        7 => s.theme_c_subst,
-        8 => s.theme_c_pending,
-        9 => s.theme_c_select_bg,
-        _ => s.theme_c_select_fg,
-    }
-}
+use crate::theme::color_label;
 
 #[cfg(test)]
 mod tests {
@@ -1851,6 +1956,38 @@ mod tests {
 
     fn app() -> GuiApp {
         GuiApp::for_test(Session::default())
+    }
+
+    /// Every picker leaves a trail: after the report editor's own parameter
+    /// dialog lands somewhere, the next dialog that has no seed of its own
+    /// opens there rather than back at square one.
+    #[test]
+    fn a_report_editors_picker_teaches_the_next_one_where_the_user_was() {
+        let dir = std::env::temp_dir().join(format!("pb_pick_memory_{}", std::process::id()));
+        let corpus = dir.join("Face");
+        std::fs::create_dir_all(&corpus).unwrap();
+
+        let mut app = app();
+        assert!(
+            app.session
+                .picker_dir(crate::session::PickerKind::Other)
+                .is_none(),
+            "nothing browsed yet"
+        );
+        app.pending_pick = Some(super::super::filepick::resolved(
+            PickAction::ReportParamPath {
+                name: "CORPUS".to_string(),
+            },
+            Some(corpus.clone()),
+        ));
+        poll_pending_pick(&mut app);
+
+        assert_eq!(
+            app.session.picker_dir(crate::session::PickerKind::Other),
+            Some(corpus.as_path()),
+            "the folder just picked is where the next picker starts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The desktop import route asks for "a file you exported from Postman"

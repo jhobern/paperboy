@@ -23,6 +23,43 @@ use super::theme::GuiTheme;
 /// room.
 const SCROLLBAR_GUTTER: f32 = 10.0;
 
+/// Draw a tree row and make **all** of it clickable, not just the label in it.
+///
+/// A row is a method badge, a name and a couple of markers, but only the name
+/// was a widget — clicking the badge, or the gap between the name and the
+/// marker, did nothing at all, so selecting a request meant aiming at its
+/// text. The row's full width is interacted with as one target and unioned
+/// with whatever the content returned, so a click anywhere on the line counts
+/// (and a click on the label still behaves exactly as it did).
+///
+/// The hover wash is painted *behind* the content — reserved before it is
+/// drawn and filled in afterwards — so the row shows its own extent, which is
+/// how the widened target announces itself. The terminal UI needs none of
+/// this: it hit-tests a click by which line it landed on, so its rows have
+/// always been clickable end to end.
+fn clickable_row(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    content: impl FnOnce(&mut egui::Ui) -> egui::Response,
+) -> egui::Response {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let drawn = ui.push_id(id, content);
+    let rect = drawn.response.rect;
+    let hit = ui.interact(
+        rect,
+        drawn.response.id.with("whole_row"),
+        egui::Sense::click(),
+    );
+    if hit.hovered() || drawn.inner.hovered() {
+        let visuals = ui.visuals().widgets.hovered;
+        ui.painter().set(
+            bg,
+            egui::epaint::RectShape::filled(rect, visuals.corner_radius, visuals.weak_bg_fill),
+        );
+    }
+    drawn.inner | hit
+}
+
 fn run_marker(status: RunStatus) -> (&'static str, bool) {
     match status {
         RunStatus::Passed => (super::icons::PASS, true),
@@ -139,35 +176,38 @@ fn render_node(
         // silently renumber everything after them the moment one appears or
         // disappears — which egui then flags with a red id-clash outline. A
         // stable per-row salt keeps the row's ids tied to the row itself.
-        let row = ui
-            .push_id(("req_row", i), |ui| {
-                ui.horizontal(|ui| {
-                    super::widgets::method_badge(ui, theme, &entry.method);
-                    let text = if is_sel {
-                        RichText::new(&label).strong().color(theme.text)
-                    } else {
-                        RichText::new(&label).color(theme.dim)
-                    };
-                    // Reserve the run marker on the right, then let the name fill
-                    // (and truncate within) the remaining space, so a long name
-                    // never pushes the row — and the panel — wider than its width.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(SCROLLBAR_GUTTER);
-                        if !marker.is_empty() {
-                            let mc = if ok { theme.ok } else { theme.err };
-                            ui.colored_label(mc, marker);
-                        }
-                        edited_marker(ui, entry, theme, lbl_edited);
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            super::widgets::selectable(ui, is_sel, text)
-                        })
-                        .inner
+        let row = clickable_row(ui, ("req_row", i), |ui| {
+            ui.horizontal(|ui| {
+                super::widgets::method_badge(ui, theme, &entry.method);
+                // A request that isn't selected is still a request: `dim` is
+                // the colour this app uses for things that don't apply
+                // (disabled rows, hints), and spending it on every name in the
+                // tree made the whole list look switched off. The selected one
+                // leads with weight instead.
+                let text = if is_sel {
+                    RichText::new(&label).strong().color(theme.text)
+                } else {
+                    RichText::new(&label).color(theme.text)
+                };
+                // Reserve the run marker on the right, then let the name fill
+                // (and truncate within) the remaining space, so a long name
+                // never pushes the row — and the panel — wider than its width.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(SCROLLBAR_GUTTER);
+                    if !marker.is_empty() {
+                        let mc = if ok { theme.ok } else { theme.err };
+                        ui.colored_label(mc, marker);
+                    }
+                    edited_marker(ui, entry, theme, lbl_edited);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        super::widgets::selectable_row(ui, is_sel, text)
                     })
                     .inner
                 })
                 .inner
             })
-            .inner;
+            .inner
+        });
         if row.clicked() {
             actions.select = Some(i);
         }
@@ -270,6 +310,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // the neighbouring panel at the wider content edge — leaving an
             // unpainted strip. Truncating keeps the content within the panel.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            super::widgets::tree_rhythm(ui);
             let entries = &app.session.collections[ci].entries;
             if entries.is_empty() {
                 ui.add_space(8.0);
@@ -575,6 +616,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            super::widgets::tree_rhythm(ui);
             // The empty space around the tree stands in for the workspace root,
             // so an item can be dragged back out to the top level (there is no
             // row representing the root to drop it on) and the New menu is
@@ -676,6 +718,34 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
+                    // A virtual folder inside a collection file. It looks and
+                    // toggles like a filesystem folder, but deliberately has
+                    // neither the New/right-click menu nor drag-and-drop: those
+                    // act on real files, and this row has none — the requests
+                    // under it live inside their collection.
+                    WsRow::RequestFolder {
+                        path,
+                        name,
+                        depth,
+                        expanded,
+                        ..
+                    } => {
+                        let chev = if *expanded {
+                            super::icons::CARET_DOWN
+                        } else {
+                            super::icons::CARET_RIGHT
+                        };
+                        let text = RichText::new(format!("{chev} {} {name}", super::icons::FOLDER))
+                            .color(theme.text);
+                        let resp = ui
+                            .push_id(("ws_req_folder", path), |ui| {
+                                ws_row(ui, *depth, false, text)
+                            })
+                            .inner;
+                        if resp.clicked() {
+                            actions.push(WsAction::ToggleFolder(path.clone()));
+                        }
+                    }
                     WsRow::Request {
                         collection,
                         idx,
@@ -690,17 +760,14 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         // The method is known for every listed request — which row
                         // is the POST is the question the badge answers, and a
                         // reader shouldn't have to open a file to ask it. The
-                        // run marker really is loaded-only: nothing else has
-                        // been run this session.
-                        let marker = if *loaded {
-                            app.session.collections[ci]
-                                .entries
-                                .get(*idx)
-                                .map(|e| run_marker(e.last_run))
-                                .unwrap_or(("", true))
-                        } else {
-                            ("", true)
-                        };
+                        // run marker used to be loaded-only, on the grounds
+                        // that nothing else could have been run; a run's result
+                        // now outlives the file being loaded (see
+                        // `collection::RunRecord`), so a request run before the
+                        // tab moved on still shows how it fared.
+                        let marker = run_marker(
+                            app.session.collections[ci].workspace_run_status(collection, *idx),
+                        );
                         // Unlike the method badge and the run marker, the edit
                         // pencil is shown for every collection's rows, not just
                         // the loaded one's — an edit parked while the user looks
@@ -712,46 +779,43 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         // only appears for the loaded collection, so without it
                         // every row's ids shift the moment the tab changes which
                         // file it holds (see `render_node`).
-                        let resp = ui
-                            .push_id(("ws_req", collection, idx), |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(*depth as f32 * WS_INDENT);
-                                    if !method.is_empty() {
-                                        super::widgets::method_badge(ui, &theme, method);
-                                    }
-                                    let text = if is_sel {
-                                        RichText::new(name).strong().color(theme.text)
-                                    } else {
-                                        RichText::new(name).color(theme.dim)
-                                    };
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.add_space(SCROLLBAR_GUTTER);
-                                            let (mk, ok) = marker;
-                                            if !mk.is_empty() {
-                                                let mc = if ok { theme.ok } else { theme.err };
-                                                ui.colored_label(mc, mk);
-                                            }
-                                            if edited {
-                                                ui.colored_label(
-                                                    theme.pending,
-                                                    super::icons::EDITED,
-                                                )
+                        let resp = clickable_row(ui, ("ws_req", collection, idx), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_space(*depth as f32 * WS_INDENT);
+                                if !method.is_empty() {
+                                    super::widgets::method_badge(ui, &theme, method);
+                                }
+                                let text = if is_sel {
+                                    RichText::new(name).strong().color(theme.text)
+                                } else {
+                                    // See the collection tree: an unselected
+                                    // request is not a disabled one.
+                                    RichText::new(name).color(theme.text)
+                                };
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(SCROLLBAR_GUTTER);
+                                        let (mk, ok) = marker;
+                                        if !mk.is_empty() {
+                                            let mc = if ok { theme.ok } else { theme.err };
+                                            ui.colored_label(mc, mk);
+                                        }
+                                        if edited {
+                                            ui.colored_label(theme.pending, super::icons::EDITED)
                                                 .on_hover_text(lbl_edited);
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| super::widgets::selectable(ui, is_sel, text),
-                                            )
-                                            .inner
-                                        },
-                                    )
-                                    .inner
-                                })
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| super::widgets::selectable_row(ui, is_sel, text),
+                                        )
+                                        .inner
+                                    },
+                                )
                                 .inner
                             })
-                            .inner;
+                            .inner
+                        });
                         if resp.clicked() {
                             actions.push(WsAction::SelectRequest {
                                 collection: collection.clone(),
@@ -1597,6 +1661,198 @@ pub(crate) mod tests {
         ));
         let out = ctx.run_ui(input, |panel| crate::gui::requests::ui(app, panel));
         id_clashes(&out.shapes)
+    }
+
+    /// Every text rectangle painted this frame, with the text it holds.
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for cs in shapes {
+            walk(&cs.shape, &mut out);
+        }
+        out
+    }
+
+    /// The colour a name is painted in, by name.
+    fn text_color(shapes: &[egui::epaint::ClippedShape], needle: &str) -> egui::Color32 {
+        fn walk(shape: &egui::epaint::Shape, needle: &str, out: &mut Option<egui::Color32>) {
+            match shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    *out = t
+                        .override_text_color
+                        .or_else(|| t.galley.job.sections.first().map(|s| s.format.color));
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, needle, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for cs in shapes {
+            walk(&cs.shape, needle, &mut out);
+        }
+        out.expect("the name is drawn")
+    }
+
+    /// `dim` is this app's colour for what doesn't apply — hints, disabled
+    /// rows, empty states. Spending it on every request that merely isn't the
+    /// selected one made the tree look switched off.
+    #[test]
+    fn an_unselected_request_is_not_painted_in_the_disabled_colour() {
+        redirect_saved_state();
+        let dir = ws_tmp("dimrow");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        expand_all(&mut session.collections[ci], &dir);
+        assert!(session.load_workspace_file(ci, dir.join("api/v1/one.hurl")));
+        session.collections[ci].selected_entry = 0;
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let dim = app.theme.dim;
+        let text = app.theme.text;
+
+        let ctx = egui::Context::default();
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| crate::gui::requests::ui(&mut app, ui),
+        );
+
+        let got = text_color(&out.shapes, "example.com/a2");
+        assert_ne!(got, dim, "an unselected request is not disabled");
+        assert_eq!(got, text, "it is ordinary content");
+    }
+
+    /// Tree rows sit on their own, tighter rhythm than the app-wide gap
+    /// between controls. A list spaced like a stack of buttons throws away a
+    /// good part of a long folder's screen — and once the selection border
+    /// stopped resizing rows, that gap was all that was left to trim.
+    #[test]
+    fn tree_rows_sit_closer_together_than_two_controls_would() {
+        redirect_saved_state();
+        let dir = ws_tmp("rowpitch");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        expand_all(&mut session.collections[ci], &dir);
+        assert!(session.load_workspace_file(ci, dir.join("api/v1/one.hurl")));
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        let ctx = egui::Context::default();
+        // The app's own spacing, or the gap being measured isn't the one the
+        // user sees: egui's defaults are tighter than the theme's.
+        crate::gui::theme::GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| crate::gui::requests::ui(&mut app, ui),
+        );
+        let drawn = texts(&out.shapes);
+        let row = |needle: &str| {
+            drawn
+                .iter()
+                .find(|(t, _)| t == needle)
+                .unwrap_or_else(|| panic!("{needle} is drawn"))
+                .1
+        };
+        // Two requests of the same file, one directly under the other.
+        let first = row("https://example.com/a");
+        let second = row("https://example.com/a2");
+        let pitch = second.top() - first.top();
+        assert!(pitch > 0.0, "the rows are drawn in order: {pitch}");
+        // A row is its text plus `widgets::TREE_ROW_PADDING` either side, so
+        // anything past that plus `TREE_ROW_SPACING` is the app-wide control
+        // gap (5px, see `theme.rs`) having crept back in between the rows.
+        assert!(
+            pitch <= 21.0,
+            "tree rows are spaced like separate controls ({pitch}px apart)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row is a method badge, a name and some markers, but only the name used
+    /// to be a widget: clicking the badge, or the gap after the name, did
+    /// nothing, so picking a request meant aiming at its text. The whole line
+    /// is one target now. Clicked here on the *badge*, which is as far from the
+    /// old target as a row gets.
+    #[test]
+    fn clicking_anywhere_on_a_request_row_selects_it() {
+        redirect_saved_state();
+        let dir = ws_tmp("rowclick");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        expand_all(&mut session.collections[ci], &dir);
+        assert!(session.load_workspace_file(ci, dir.join("api/v1/one.hurl")));
+        session.collections[ci].selected_entry = 0;
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        // Where the *second* request's name is drawn — the row that isn't
+        // already selected.
+        let out = ctx.run_ui(frame(Vec::new()), |ui| {
+            crate::gui::requests::ui(&mut app, ui)
+        });
+        let row = texts(&out.shapes)
+            .into_iter()
+            .find(|(t, _)| t.contains("example.com/a2"))
+            .expect("the second request's row is drawn")
+            .1;
+        // The badge sits at the row's left edge, well clear of the name.
+        let badge = egui::pos2(row.left() - 20.0, row.center().y);
+        assert!(badge.x > 0.0, "the badge is inside the panel");
+
+        let mut events = vec![egui::Event::PointerMoved(badge)];
+        for pressed in [true, false] {
+            events.push(egui::Event::PointerButton {
+                pos: badge,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = ctx.run_ui(frame(events), |ui| crate::gui::requests::ui(&mut app, ui));
+
+        assert_eq!(
+            app.session.collections[ci].selected_entry, 1,
+            "clicking the method badge selects the row it belongs to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The red square the user sees flash around the edit pencil is egui's
