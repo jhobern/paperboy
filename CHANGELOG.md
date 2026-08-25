@@ -51,6 +51,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   now share one definition of a writable name, so every row PaperBoy will write
   is a row it can read back.
 
+- **A `file,…;` or `base64,…;` request body is no longer deleted when the
+  collection is saved.** Neither form has a textual value, and PaperBoy's reader
+  returned "no body" for both — indistinguishable from a request that genuinely
+  has none, so the line was dropped the next time the file was written. Saving
+  rewrites *every* request in a collection rather than only the edited one, so
+  editing any request anywhere silently emptied the body of every file- or
+  base64-bodied request in the same file, with no error and no visible change to
+  hint at it. Expected response bodies were lost the same way. Both forms are
+  now preserved verbatim. Note that a body file outside the run's file root is
+  still rejected by Hurl at run time — unlike `[Form]` and `[Multipart]` files,
+  body files aren't yet staged into scope.
+
 - **The Browse button in the run settings sat lower than the field beside it.**
   A button is slightly taller than a text field, and egui centres each item
   against the height the row has reached *so far* — so a taller button placed

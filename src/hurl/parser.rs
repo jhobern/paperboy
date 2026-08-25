@@ -245,7 +245,7 @@ fn map_entry(
             resp.status.source_info.start.line + 1,
             first_response_anchor(resp),
         );
-        response_body = resp.body.as_ref().and_then(body_source);
+        response_body = resp.body.as_ref().and_then(|b| body_source(b, lines));
         for section in &resp.sections {
             match &section.value {
                 SectionValue::Captures(caps) => {
@@ -285,7 +285,7 @@ fn map_entry(
         queries: query_params,
         cookies,
         options,
-        body: req.body.as_ref().and_then(body_source),
+        body: req.body.as_ref().and_then(|b| body_source(b, lines)),
         expected_status,
         response_version,
         response_headers,
@@ -957,16 +957,27 @@ fn multipart_field(p: &MultipartParam) -> FormField {
     }
 }
 
-/// Render a request body back to its Hurl source form.
-fn body_source(b: &Body) -> Option<String> {
+/// Render a request or response body back to its Hurl source form.
+///
+/// `file,…;` and `base64,…;` bodies have no textual value to render, so they
+/// are recovered from the source line itself. Returning `None` for them (as
+/// this did) is indistinguishable from "this request has no body", and since
+/// [`collection_to_hurl`](super::entry::collection_to_hurl) rewrites *every*
+/// entry on every save — not just the edited one — a single save anywhere in
+/// the collection silently deleted the body line of every such request, with
+/// no parse error and no change in entry count to hint at it.
+///
+/// Both forms are a single line and carry a source span, so `source_line`
+/// gives them back verbatim and the round trip is byte-stable.
+fn body_source(b: &Body, lines: &[&str]) -> Option<String> {
     let s = match &b.value {
         Bytes::Json(v) => v.to_source().to_string(),
         Bytes::Xml(x) => x.clone(),
         Bytes::OnelineString(t) => t.to_source().to_string(),
         Bytes::MultilineString(m) => m.to_source().to_string(),
         Bytes::Hex(h) => h.to_string(),
-        // Base64 / file bodies aren't represented in HurlEntry's string body.
-        Bytes::Base64(_) | Bytes::File(_) => return None,
+        Bytes::Base64(x) => source_line(x.space0.source_info.start.line, lines)?,
+        Bytes::File(x) => source_line(x.space0.source_info.start.line, lines)?,
     };
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
@@ -2159,6 +2170,64 @@ mod tests {
             "the response body must follow the response sections:\n{text}"
         );
         assert_sections_round_trip(src);
+    }
+
+    /// A `file,…;` body used to come back as `None` — indistinguishable from
+    /// "no body at all" — so the next save dropped the line entirely. Because
+    /// `collection_to_hurl` rewrites *every* entry, editing any request in the
+    /// collection silently deleted the body of every file-bodied one, with no
+    /// parse error to hint at it.
+    #[test]
+    fn a_file_body_survives_a_save() {
+        let src = "POST http://h/a\nContent-Type: application/json\nfile, body.json;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].body.as_deref(), Some("file, body.json;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("file, body.json;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        // Idempotent: a second save must not rewrite it again.
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// The same for a `base64,…;` body, the other `Bytes` variant with no
+    /// textual value to render.
+    #[test]
+    fn a_base64_body_survives_a_save() {
+        let src = "POST http://h/a\nbase64,SGVsbG8=;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].body.as_deref(), Some("base64,SGVsbG8=;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("base64,SGVsbG8=;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// Expected *response* bodies read through the same helper, so they were
+    /// lost the same way.
+    #[test]
+    fn a_file_response_body_survives_a_save() {
+        let src = "POST http://h/a\n{\"a\":1}\n\nHTTP 200\nfile,expected.json;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_body.as_deref(), Some("file,expected.json;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("file,expected.json;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// The blast radius that made this severe: a save triggered by editing one
+    /// request must not quietly empty the body of an untouched neighbour.
+    #[test]
+    fn a_file_body_is_not_lost_when_another_request_is_edited() {
+        let src = "POST http://h/a\nfile, body.json;\n\nGET http://h/b\n";
+        let mut e = parse_hurl(src);
+        e[1].url = "http://h/c".into();
+        let text = collection_to_hurl(&e);
+        assert!(
+            text.contains("file, body.json;"),
+            "the untouched request keeps its body:\n{text}"
+        );
+        assert_eq!(parse_hurl(&text).len(), 2, "\n{text}");
     }
 
     #[test]
