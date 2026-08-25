@@ -6762,6 +6762,142 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
     );
 }
 
+/// The same guard, generalised: a name Hurl can't carry for any other reason —
+/// a colon, a `#`, a space — and a *value* holding a newline or a tab. Each
+/// would make the collection file unparseable, which costs every request in it.
+#[test]
+fn f2_with_an_unwritable_row_keeps_the_wizard_open_and_warns() {
+    use crate::i18n::Status;
+    let cases: [(&str, &str, fn(&Status) -> bool); 5] = [
+        (
+            "X-A:B",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X-A:B" && *c == ':'),
+        ),
+        (
+            "X-A#B",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X-A#B" && *c == '#'),
+        ),
+        (
+            "X A",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X A" && *c == ' '),
+        ),
+        (
+            "X-A",
+            "one\ntwo",
+            |st| matches!(st, Status::NewRequestValueChar(k, c) if k == "X-A" && *c == '\n'),
+        ),
+        (
+            "X-A",
+            "one\ttwo",
+            |st| matches!(st, Status::NewRequestValueChar(k, c) if k == "X-A" && *c == '\t'),
+        ),
+    ];
+    for (key, value, expected) in cases {
+        let mut app = TuiApp {
+            focus: Pane::List,
+            ..Default::default()
+        };
+        press(&mut app, KeyCode::Char('n'));
+        let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+            panic!("wizard did not open");
+        };
+        form.url = super::editor::Editor::new("http://h/a", false);
+        form.headers.clear();
+        let mut row = HeaderRow::new();
+        row.key = super::editor::Editor::new(key, false);
+        row.value = super::editor::Editor::new(value, false);
+        form.headers.push(row);
+
+        press(&mut app, KeyCode::F(2));
+
+        match &app.overlay {
+            Some(Overlay::NewRequest(form)) => assert_eq!(
+                form.focus,
+                NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+                "{key:?}/{value:?}: focus jumps to the offending row"
+            ),
+            _ => panic!("{key:?}/{value:?}: the wizard must stay open"),
+        }
+        let status = app.status.as_ref().expect("a status hint is set");
+        assert!(
+            expected(status),
+            "{key:?}/{value:?}: unexpected status {status:?}"
+        );
+        assert!(
+            app.collections[0].entries.is_empty(),
+            "{key:?}/{value:?}: nothing was saved"
+        );
+    }
+}
+
+/// A wholly blank row is the wizard's own trailing placeholder, not something
+/// the user asked to save, so it must not trip the empty-name guard.
+#[test]
+fn f2_with_a_blank_placeholder_row_still_saves() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    press(&mut app, KeyCode::F(2));
+    assert!(app.overlay.is_none(), "the wizard closed: {:?}", app.status);
+    assert_eq!(app.collections[0].entries.len(), 1);
+}
+
+#[test]
+fn f2_with_a_bracket_row_key_keeps_the_wizard_open_and_warns() {
+    // A row named `[Body]` serialises to `[Body]: value`, which Hurl reads as
+    // a section header. Because `parse_hurl` yields no entries at all for a
+    // file that doesn't parse, saving one used to cost the user every request
+    // in the collection on the next load — so the wizard blocks it, exactly as
+    // it blocks an empty URL.
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.headers.clear();
+    let mut row = HeaderRow::new();
+    row.key = super::editor::Editor::new("[Body]", false);
+    row.value = super::editor::Editor::new("value", false);
+    form.headers.push(row);
+
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::NewRequest(form)) => {
+            assert_eq!(
+                form.focus,
+                NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+                "focus jumps to the offending Key cell"
+            );
+            assert_eq!(form.view_tab, WizardTab::Headers, "and to its section");
+            assert_eq!(form.url.text(), "http://h/a", "typed fields are preserved");
+        }
+        _ => panic!("the wizard must stay open on a bracket-key submit"),
+    }
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::NewRequestBracketKey(ref k)) if k == "[Body]"),
+        "a status hint names the offending key, got {:?}",
+        app.status
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "nothing was saved to any collection"
+    );
+}
+
 #[test]
 fn f2_with_an_empty_url_keeps_the_wizard_open_and_warns_instead_of_discarding() {
     let mut app = TuiApp {

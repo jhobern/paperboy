@@ -1404,6 +1404,67 @@ impl NewReq {
         }
     }
 
+    /// The first Headers/Cookies/Queries/Options/Form row the Hurl format can't
+    /// carry, as the cell to focus and the status explaining why.
+    ///
+    /// Such a row serialises to a line Hurl can't read back as a `key: value`
+    /// pair — at worst one it reads as a section header or splits in two — and
+    /// a Hurl file that doesn't parse yields *no* entries at all, so saving one
+    /// would cost the user every request in the collection on the next load.
+    /// Disabled rows are checked too: they go out commented and are harmless
+    /// right now, but a single keypress re-enables them, and by then the wizard
+    /// is long closed.
+    pub(crate) fn first_unwritable_row(&self) -> Option<(NewField, crate::i18n::Status)> {
+        use crate::hurl::KeyProblem;
+        use crate::i18n::Status;
+        fn problem(key: &str, value: &str) -> Option<Status> {
+            let key = key.trim();
+            match crate::hurl::key_problem(key) {
+                Some(KeyProblem::Empty) => return Some(Status::NewRequestKeyEmpty),
+                Some(KeyProblem::LeadingBracket) => {
+                    return Some(Status::NewRequestBracketKey(key.to_string()));
+                }
+                Some(KeyProblem::Char(c)) => {
+                    return Some(Status::NewRequestKeyChar(key.to_string(), c));
+                }
+                None => {}
+            }
+            crate::hurl::value_problem(value)
+                .map(|c| Status::NewRequestValueChar(key.to_string(), c))
+        }
+
+        for kind in KvdKind::ALL {
+            for (i, row) in self.kvd(kind).rows.iter().enumerate() {
+                // A wholly blank row is the wizard's own placeholder, not
+                // something the user asked to save — `submit_new_request`
+                // drops it. Only a row with something in it is judged.
+                if row.key.text().trim().is_empty() && row.value.text().trim().is_empty() {
+                    continue;
+                }
+                if let Some(st) = problem(&row.key.text(), &row.value.text()) {
+                    return Some((kind.field(i, HdrCol::Key), st));
+                }
+            }
+        }
+        for (i, row) in self.form_fields.iter().enumerate() {
+            if row.key.text().trim().is_empty() && row.value.text().trim().is_empty() {
+                continue;
+            }
+            // Only a Text field's value is judged: a File row's value is a path,
+            // and the serializer escapes those itself.
+            let value = row.value.text();
+            let value = if row.kind == FormFieldKind::Text {
+                value.as_str()
+            } else {
+                ""
+            };
+            if let Some(st) = problem(&row.key.text(), value) {
+                return Some((NewField::FormField(i, FormCol::Key), st));
+            }
+        }
+        None
+    }
+
     /// The ordered list of fields Tab / Shift+Tab visits, in visual order,
     /// given the current form state. A section that is entirely blank
     /// contributes a single "entry" stop (its first row, or its "+ Add …"

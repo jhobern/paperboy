@@ -171,6 +171,102 @@ impl<'de> Deserialize<'de> for KvRow {
 /// apart and the comment scanner doesn't also capture it as a stray comment.
 pub(crate) const DESC_MARKER: &str = "# @desc ";
 
+/// The characters Hurl can carry *inside* a request row's name, outside of a
+/// `{{…}}` template.
+///
+/// Deliberately the same set [`split_kv`](super::parser::split_kv) accepts when
+/// reading a row back, because the two must agree: a name the writer emits but
+/// the reader won't take is a row that vanishes on the next load, and a name
+/// the reader would take but Hurl won't parse is a collection that fails to
+/// load at all. Anything outside the set — `:` `#` `"` `\` `;` `,`, whitespace
+/// — either ends the name early, starts a comment, or breaks the line in two.
+///
+/// Non-ASCII letters and digits are allowed (Hurl accepts `X-Ké`), as are the
+/// square brackets real APIs use for nested parameters: `filter[name]`. Braces
+/// are *not* in this set — Hurl only accepts them as a matched `{{…}}` pair,
+/// which [`key_problem`] handles separately.
+pub(crate) fn key_char_allowed(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']' | '$')
+}
+
+/// The narrower set a name may *start* with: a leading `[` opens a Hurl
+/// section, so `[Body]: v` is read as a malformed section header rather than a
+/// row — and a file that doesn't parse yields no requests at all.
+pub(crate) fn key_start_allowed(c: char) -> bool {
+    key_char_allowed(c) && c != '['
+}
+
+/// Why a Header/Cookie/Query/Options/Form row's name can't be written to a
+/// Hurl file, if it can't. `None` means the name is fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProblem {
+    /// No name at all — the line would begin with its own `:`.
+    Empty,
+    /// A leading `[`, which Hurl reads as the start of a section.
+    LeadingBracket,
+    /// A character Hurl's row grammar can't carry in a name.
+    Char(char),
+}
+
+/// The first reason `key` can't be a row name, if there is one.
+///
+/// A `{{…}}` template is skipped whole: a name may be, contain, or be built
+/// from variable references (`{{VAR}}`, `X-{{Tenant}}-Id`), and their contents
+/// are the substitution's business, not the row grammar's. A *lone* brace is
+/// refused, because Hurl fails the whole file on one (`A}B: v` doesn't parse).
+pub fn key_problem(key: &str) -> Option<KeyProblem> {
+    let key = key.trim();
+    let Some(first) = key.chars().next() else {
+        return Some(KeyProblem::Empty);
+    };
+    if first == '[' {
+        return Some(KeyProblem::LeadingBracket);
+    }
+    let mut rest = key;
+    let mut at_start = true;
+    while let Some(c) = rest.chars().next() {
+        if let Some(after) = rest.strip_prefix("{{") {
+            // Skip the template whole, including an unterminated one: Hurl
+            // rejects `{{` without a closing `}}` too, and reporting the `{`
+            // is the clearest thing to say about it either way.
+            let Some(end) = after.find("}}") else {
+                return Some(KeyProblem::Char('{'));
+            };
+            rest = &after[end + 2..];
+            at_start = false;
+            continue;
+        }
+        let ok = if at_start {
+            key_start_allowed(c)
+        } else {
+            key_char_allowed(c)
+        };
+        if !ok {
+            return Some(KeyProblem::Char(c));
+        }
+        rest = &rest[c.len_utf8()..];
+        at_start = false;
+    }
+    None
+}
+
+/// The first character a row's *value* can't carry, if any.
+///
+/// Values are far more permissive than names — `#`, `:`, `[` and quotes are all
+/// fine — but three characters still break the file: a newline ends the row
+/// mid-way and the remainder is parsed as Hurl, a tab isn't accepted in the
+/// value grammar at all, and a lone backslash starts an escape sequence.
+///
+/// Escaping these on the way out would be the nicer fix, but the reader stores
+/// a value as its raw source text rather than unescaping it, so a writer-only
+/// escape would double the backslashes on every save/load cycle. Until the two
+/// are changed together, such a value is refused.
+pub fn value_problem(value: &str) -> Option<char> {
+    value
+        .chars()
+        .find(|c| matches!(c, '\n' | '\r' | '\t' | '\\'))
+}
+
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
 /// as a real filesystem path (spaces and other characters unescaped, as the
 /// file picker produces), but Hurl's filename grammar requires a backslash
@@ -200,6 +296,13 @@ fn escape_form_file_path(path: &str) -> String {
 fn push_line(out: &mut String, line: &str, enabled: bool) {
     if !enabled {
         out.push_str("# ");
+        // A commented row has to stay on one line. A newline inside it would
+        // end the comment, and everything after it would be read as Hurl —
+        // which is how a disabled row carrying a multi-line value used to
+        // break the file just as thoroughly as an enabled one.
+        out.push_str(&line.replace(['\n', '\r'], " "));
+        out.push('\n');
+        return;
     }
     out.push_str(line);
     out.push('\n');
@@ -210,7 +313,19 @@ fn push_line(out: &mut String, line: &str, enabled: bool) {
 /// sections, which are otherwise identical.
 fn push_kv_line(out: &mut String, row: &KvRow) {
     push_desc(out, &row.desc);
-    push_line(out, &format!("{}: {}", row.key, row.value), row.enabled);
+    // A row Hurl can't carry is emitted commented even when enabled: the line
+    // would otherwise cost the user *every* request in the file on reload (see
+    // `key_problem`/`value_problem`). Both front-ends refuse such a row at
+    // input; this is the backstop for every other producer (Postman import, Raw
+    // Mode, a hand-edited file), and it is deliberately lossy-but-visible — the
+    // row survives in the text where the user can see and fix it, instead of
+    // taking the collection with it.
+    let writable = key_problem(&row.key).is_none() && value_problem(&row.value).is_none();
+    push_line(
+        out,
+        &format!("{}: {}", row.key, row.value),
+        row.enabled && writable,
+    );
 }
 
 /// Emit a row's description as the `# @desc …` line above it, if it has one.
@@ -743,7 +858,13 @@ impl HurlEntry {
             });
             for f in &self.form_fields {
                 push_desc(&mut out, &f.desc);
-                push_line(&mut out, &form_field_line(f), f.enabled);
+                // Commented when the row would break parsing, as in
+                // `push_kv_line`. Only a Text field's value is checked: a
+                // File/Base64File value is a path, and `escape_form_file_path`
+                // already escapes the backslashes and newlines a path can hold.
+                let writable = key_problem(&f.key).is_none()
+                    && (f.kind != FormFieldKind::Text || value_problem(&f.value).is_none());
+                push_line(&mut out, &form_field_line(f), f.enabled && writable);
             }
         }
         push_comments(&mut out, Options);
@@ -1043,5 +1164,261 @@ mod tests {
         let back: KvRow = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
         assert_eq!(back.desc, "staging only");
         assert_eq!(back.key, "X-Trace");
+    }
+
+    /// A row keyed `[Body]` used to serialize to `[Body]: value`, which Hurl
+    /// reads as a section header — and `parse_hurl` yields *no* entries for a
+    /// file that doesn't parse, so a single such row silently destroyed every
+    /// request in the collection on the next load. The writer now emits it
+    /// commented so the file still parses and the row stays visible.
+    #[test]
+    fn a_bracket_key_never_breaks_the_collection_file() {
+        for row_of in [
+            (|r| HurlEntry {
+                headers: vec![r],
+                ..Default::default()
+            }) as fn(KvRow) -> HurlEntry,
+            |r| HurlEntry {
+                cookies: vec![r],
+                ..Default::default()
+            },
+            |r| HurlEntry {
+                queries: vec![r],
+                ..Default::default()
+            },
+            |r| HurlEntry {
+                options: vec![r],
+                ..Default::default()
+            },
+        ] {
+            let mut e = row_of(KvRow::new("[Body]", "value"));
+            e.method = "POST".into();
+            e.url = "http://h/a".into();
+            let text = e.to_hurl();
+            assert!(
+                text.contains("# [Body]: value"),
+                "the row must be commented, got:\n{text}"
+            );
+            assert_eq!(
+                crate::hurl::parse_hurl_error(&text),
+                None,
+                "must still parse:\n{text}"
+            );
+            assert_eq!(
+                crate::hurl::parse_hurl(&text).len(),
+                1,
+                "the entry must survive:\n{text}"
+            );
+        }
+    }
+
+    /// The same guard for `[Form]`/`[Multipart]` field names, which share the
+    /// section-line grammar.
+    #[test]
+    fn a_bracket_form_field_key_never_breaks_the_collection_file() {
+        let e = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            form_fields: vec![FormField {
+                key: "[Body]".into(),
+                value: "v".into(),
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = e.to_hurl();
+        assert_eq!(crate::hurl::parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(crate::hurl::parse_hurl(&text).len(), 1, "\n{text}");
+    }
+
+    /// One bad row must not take its *neighbours* with it — the regression that
+    /// made this severe rather than cosmetic.
+    #[test]
+    fn a_bracket_key_does_not_lose_the_other_requests_in_the_file() {
+        let bad = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            headers: vec![KvRow::new("[Body]", "value")],
+            ..Default::default()
+        };
+        let good = HurlEntry {
+            method: "GET".into(),
+            url: "http://h/b".into(),
+            ..Default::default()
+        };
+        let text = crate::hurl::collection_to_hurl(&[bad, good]);
+        assert_eq!(crate::hurl::parse_hurl(&text).len(), 2, "\n{text}");
+    }
+
+    /// Only a *leading* bracket is a section-header ambiguity: `filter[name]`
+    /// is an ordinary query key and must be left enabled — and, crucially, must
+    /// come *back* as an enabled row. An earlier version of this test only
+    /// asserted the file parsed, which it did while `split_kv` silently dropped
+    /// the row on reload.
+    #[test]
+    fn a_bracket_inside_a_key_is_still_a_normal_row() {
+        assert_eq!(key_problem("filter[name]"), None);
+        assert_eq!(key_problem("[Body]"), Some(KeyProblem::LeadingBracket));
+        assert_eq!(key_problem("  [Options]"), Some(KeyProblem::LeadingBracket));
+        let e = HurlEntry {
+            method: "GET".into(),
+            url: "http://h/a".into(),
+            queries: vec![KvRow::new("filter[name]", "x")],
+            ..Default::default()
+        };
+        let text = e.to_hurl();
+        assert!(text.contains("\nfilter[name]: x"), "\n{text}");
+        assert_eq!(crate::hurl::parse_hurl_error(&text), None, "\n{text}");
+        let back = crate::hurl::parse_hurl(&text);
+        assert_eq!(
+            back[0].queries,
+            vec![("filter[name]".into(), "x".into(), true)]
+        );
+    }
+
+    /// Names real APIs use that Hurl accepts but PaperBoy's reader used to
+    /// refuse, silently deleting the row on the next load. The writer/reader
+    /// pair must round-trip every one of them.
+    #[test]
+    fn permissive_key_shapes_round_trip() {
+        for key in [
+            "filter[name]",
+            "{{VAR}}",
+            "X-Ké",
+            "-X-A",
+            "_X_A",
+            "$X",
+            "X.A",
+            "X-A]B",
+            "X-{{Tenant}}-Id",
+        ] {
+            assert_eq!(key_problem(key), None, "{key} should be writable");
+            let e = HurlEntry {
+                method: "GET".into(),
+                url: "http://h/a".into(),
+                headers: vec![KvRow::new(key, "v")],
+                ..Default::default()
+            };
+            let text = e.to_hurl();
+            assert_eq!(crate::hurl::parse_hurl_error(&text), None, "{key}\n{text}");
+            let back = crate::hurl::parse_hurl(&text);
+            assert_eq!(
+                back.first().map(|e| e.headers.clone()).unwrap_or_default(),
+                vec![(key.to_string(), "v".to_string(), true)],
+                "{key} must survive a save/load round trip:\n{text}"
+            );
+        }
+    }
+
+    /// The names that genuinely can't be carried. Each one either ends the name
+    /// early, opens a comment, or splits the line in two, so the writer has to
+    /// refuse them rather than emit a line the reader can't take back.
+    #[test]
+    fn unwritable_key_shapes_are_refused() {
+        for key in [
+            "X-A:B", "X-A#B", "X\"A", "X\\A", "X;A", "X,A", "X A", "X\tA", "X\nY", "X/A", "X@A",
+            "X(A", "A}B", "A{B", "{V}", "X-{{V",
+        ] {
+            assert!(
+                matches!(key_problem(key), Some(KeyProblem::Char(_))),
+                "{key:?} must be refused"
+            );
+        }
+        assert_eq!(key_problem(""), Some(KeyProblem::Empty));
+        assert_eq!(key_problem("   "), Some(KeyProblem::Empty));
+    }
+
+    /// Values are far more permissive than names, and over-refusing them would
+    /// block ordinary request data — a JSON blob, a URL with a fragment, a
+    /// variable reference. Only the three characters that actually break the
+    /// line are refused.
+    #[test]
+    fn only_line_breaking_characters_are_refused_in_a_value() {
+        for value in [
+            "plain",
+            "a: b",
+            "a # b",
+            "[bracketed]",
+            "{{VAR}}",
+            "\"quoted\"",
+            "a;b,c",
+            "",
+        ] {
+            assert_eq!(value_problem(value), None, "{value:?} should be writable");
+        }
+        assert_eq!(value_problem("a\nb"), Some('\n'));
+        assert_eq!(value_problem("a\tb"), Some('\t'));
+        assert_eq!(value_problem("a\\b"), Some('\\'));
+    }
+
+    /// The writer/reader invariant, stated directly: for every row the writer
+    /// accepts, the file parses *and* the row comes back byte-identical. This
+    /// is the property that makes the guard trustworthy — the individual cases
+    /// above are only the interesting samples of it.
+    #[test]
+    fn every_writable_row_survives_a_round_trip() {
+        let keys = [
+            "X-A",
+            "filter[name]",
+            "{{V}}",
+            "X-Ké",
+            "$X",
+            "_A",
+            "-A",
+            "A.B",
+            "A{{V}}B",
+            "9",
+        ];
+        let values = ["v", "a: b", "a # b", "{{V}}", "[x]", "a;b", "\"q\""];
+        for key in keys {
+            for value in values {
+                assert_eq!(key_problem(key), None, "{key:?}");
+                assert_eq!(value_problem(value), None, "{value:?}");
+                let e = HurlEntry {
+                    method: "GET".into(),
+                    url: "http://h/a".into(),
+                    headers: vec![KvRow::new(key, value)],
+                    ..Default::default()
+                };
+                let text = e.to_hurl();
+                assert_eq!(
+                    crate::hurl::parse_hurl_error(&text),
+                    None,
+                    "{key:?} / {value:?}\n{text}"
+                );
+                let back = crate::hurl::parse_hurl(&text);
+                assert_eq!(
+                    back.first().map(|e| e.headers.clone()).unwrap_or_default(),
+                    vec![(key.to_string(), value.to_string(), true)],
+                    "{key:?} / {value:?} must round-trip:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// A *disabled* row goes out as a `#` comment, so a newline in its value
+    /// used to escape the comment and leave the tail of the value as a stray
+    /// line of Hurl. The writer now folds the line breaks into spaces.
+    #[test]
+    fn a_disabled_row_with_a_multiline_value_keeps_the_file_parseable() {
+        let e = HurlEntry {
+            method: "GET".into(),
+            url: "http://h/a".into(),
+            headers: vec![KvRow {
+                key: "X-A".into(),
+                value: "one\nGET http://evil/".into(),
+                enabled: false,
+                desc: String::new(),
+            }],
+            ..Default::default()
+        };
+        let text = e.to_hurl();
+        assert_eq!(crate::hurl::parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(
+            crate::hurl::parse_hurl(&text).len(),
+            1,
+            "the value must not become a second entry:\n{text}"
+        );
     }
 }

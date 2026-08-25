@@ -5979,6 +5979,17 @@ impl TuiApp {
                 self.status = Some(Status::NewRequestUrlRequired);
                 form.focus = NewField::Url;
                 form.view_tab = WizardTab::All;
+            } else if let Some((field, status)) = form.first_unwritable_row() {
+                // A row Hurl can't carry — a name holding `[`, `:`, `#`, a
+                // space, or a value holding a newline or tab — serialises to a
+                // line that makes the *whole* collection file unparseable, and
+                // `parse_hurl` returns no entries at all for a file that
+                // doesn't parse. Saving this would lose every request in the
+                // tab on the next load. Same treatment as the empty URL: stay
+                // open, point at the offending cell.
+                self.status = Some(status);
+                form.view_tab = field.wizard_section().unwrap_or(WizardTab::All);
+                form.focus = field;
             } else {
                 do_submit = true;
                 keep = false;

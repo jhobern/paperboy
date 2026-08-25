@@ -709,7 +709,18 @@ pub fn kv_editor(
                     }
                     // A disabled row (checkbox unticked) isn't sent, so grey its
                     // key/value out to read as inactive — matching the terminal UI.
-                    let row_color = if rows[i].enabled {
+                    // A name or value the Hurl row grammar can't carry overrides
+                    // that: the serializer has to comment such a row out to keep
+                    // the file loadable at all (see `key_problem` and
+                    // `value_problem`), so it is flagged in the error colour
+                    // where it is typed rather than silently dropping off the
+                    // wire later.
+                    let bad_key = crate::hurl::key_problem(&rows[i].key).is_some()
+                        && !rows[i].key.trim().is_empty();
+                    let bad_value = crate::hurl::value_problem(&rows[i].value).is_some();
+                    let row_color = if bad_key || bad_value {
+                        theme.err
+                    } else if rows[i].enabled {
                         theme.text
                     } else {
                         theme.dim
@@ -733,11 +744,17 @@ pub fn kv_editor(
                     if k.changed() {
                         changed = true;
                     }
+                    if bad_key {
+                        k.on_hover_text(s.gui_bad_key_warning);
+                    }
                     // The value is the one cell whose content is the request
                     // itself, so it is the one that wraps rather than truncates.
                     let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
                     if v.changed() {
                         changed = true;
+                    }
+                    if bad_value {
+                        v.clone().on_hover_text(s.gui_bad_value_warning);
                     }
                     if !rows[i].value.trim().is_empty() {
                         v.context_menu(|ui| {

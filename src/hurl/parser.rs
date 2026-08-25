@@ -657,17 +657,15 @@ fn uncomment(line: &str) -> (bool, &str) {
 }
 
 /// Split a `key: value` line into its trimmed key and value, requiring the key
-/// to be a plausible header/param token (starts alphanumeric, token characters
-/// only). Returns `None` for anything else.
+/// to be a name Hurl can carry. The test is
+/// [`key_problem`](crate::hurl::key_problem) — the *same* one the writer
+/// enforces, so a row that can be written can always be read back. Returns
+/// `None` for anything else, which is also what keeps an ordinary prose comment
+/// (`# see also: the docs`) from being mistaken for a disabled row.
 fn split_kv(text: &str) -> Option<(&str, &str)> {
     let colon = text.find(':')?;
     let key = text[..colon].trim();
-    let mut chars = key.chars();
-    let starts_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let token_ok = key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if !starts_ok || !token_ok {
+    if crate::hurl::key_problem(key).is_some() {
         return None;
     }
     Some((key, text[colon + 1..].trim()))

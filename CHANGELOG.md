@@ -28,6 +28,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A Header, Cookie, Query, Options or Form row can no longer destroy the whole
+  collection.** Hurl decides what a line inside a request is by its first
+  character, so a row keyed with a leading `[` was written out as `[Body]:
+  value` — which Hurl reads as a malformed section header rather than a `key:
+  value` row. The damage wasn't local: a `.hurl` file that doesn't parse yields
+  *no* requests at all, so one such row silently emptied the entire collection
+  the next time it was loaded. The same held for a name containing `:`, `#`,
+  `"`, `\`, `;`, `,` or whitespace, and for a value containing a newline, a tab
+  or a backslash. The request wizard now refuses to save any of them, staying
+  open on the offending cell and saying why (as it already does for a missing
+  URL), and the GUI flags the cell as you type it. As a backstop for every other
+  producer — Postman import, Raw Mode, a hand-edited file — such a row is now
+  written out commented, so the file still loads and the row stays visible
+  instead of taking its neighbours with it.
+
+- **Rows with a valid but unusual name are no longer dropped when a collection
+  is reloaded.** PaperBoy's reader accepted a narrower set of names than Hurl
+  itself does, and a row it didn't recognise was quietly discarded rather than
+  reported — so `filter[name]`, `{{VAR}}`, `X-Ké`, `$X` and names beginning with
+  `-` or `_` survived being saved but not being loaded again. Reader and writer
+  now share one definition of a writable name, so every row PaperBoy will write
+  is a row it can read back.
+
 - **The Browse button in the run settings sat lower than the field beside it.**
   A button is slightly taller than a text field, and egui centres each item
   against the height the row has reached *so far* — so a taller button placed

@@ -197,6 +197,10 @@ strings! {
     ws_item_exists => "'{name}' already exists — nothing created.", "« {name} » existe déjà — rien n'a été créé.", "'{name}' findes allerede — intet oprettet.";
     workspace_report_escaped => "Destination '{name}' resolves outside the workspace — report not created.", "La destination « {name} » pointe hors du workspace — rapport non créé.", "Destinationen '{name}' peger uden for workspacet — rapport ikke oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
+    new_request_bracket_key => "Can't save: a name can't start with '[' (Hurl would read it as a section) — rename '{name}'.", "Impossible d'enregistrer : un nom ne peut pas commencer par « [ » (Hurl y verrait une section) — renommez « {name} ».", "Kan ikke gemme: et navn må ikke starte med '[' (Hurl ville læse det som en sektion) — omdøb '{name}'.";
+    new_request_key_empty => "Can't save: a row needs a name.", "Impossible d'enregistrer : une ligne doit avoir un nom.", "Kan ikke gemme: en række skal have et navn.";
+    new_request_key_char => "Can't save: Hurl can't carry '{char}' in a name — rename '{name}'.", "Impossible d'enregistrer : Hurl ne peut pas contenir « {char} » dans un nom — renommez « {name} ».", "Kan ikke gemme: Hurl kan ikke bære '{char}' i et navn — omdøb '{name}'.";
+    new_request_value_char => "Can't save: the value of '{name}' contains '{char}', which Hurl can't carry on a row.", "Impossible d'enregistrer : la valeur de « {name} » contient « {char} », que Hurl ne peut pas porter sur une ligne.", "Kan ikke gemme: værdien af '{name}' indeholder '{char}', som Hurl ikke kan bære på en række.";
     workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
     workspace_tree_filter_on => "Tree filter on: .hurl/.json/.vars/.trail only", "Filtre de l'arbre activé : .hurl/.json/.vars/.trail uniquement", "Træfilter til: kun .hurl/.json/.vars/.trail";
@@ -845,6 +849,8 @@ strings! {
     gui_hint_key => "key", "clé", "nøgle";
     gui_hint_value => "value", "valeur", "værdi";
     gui_hint_header => "Header", "En-tête", "Header";
+    gui_bad_key_warning => "Hurl can't carry this character in a name — the whole collection would fail to load. This row won't be sent until it's renamed.", "Hurl ne peut pas porter ce caractère dans un nom — toute la collection ne se chargerait plus. Cette ligne ne sera pas envoyée tant qu'elle n'est pas renommée.", "Hurl kan ikke bære dette tegn i et navn — hele samlingen ville ikke kunne indlæses. Denne række sendes ikke, før den omdøbes.";
+    gui_bad_value_warning => "Hurl can't carry a newline, tab or backslash in a value. This row won't be sent until it's edited.", "Hurl ne peut pas porter de saut de ligne, de tabulation ni de barre oblique inverse dans une valeur. Cette ligne ne sera pas envoyée tant qu'elle n'est pas modifiée.", "Hurl kan ikke bære linjeskift, tabulator eller omvendt skråstreg i en værdi. Denne række sendes ikke, før den redigeres.";
     gui_hint_name => "name", "nom", "navn";
     gui_hint_query => "query", "requête", "forespørgsel";
     gui_hint_description => "note", "note", "note";
@@ -1599,6 +1605,20 @@ pub enum Status {
     /// wizard is kept open (focused on the URL field) instead of silently
     /// discarding everything the user typed.
     NewRequestUrlRequired,
+    /// The wizard was submitted with a Headers/Cookies/Queries/Options/Form row
+    /// whose name starts with `[`. Such a row serialises to a line Hurl reads
+    /// as a section header, which makes the *whole file* unparseable (see
+    /// [`key_breaks_hurl_parsing`](crate::hurl::key_breaks_hurl_parsing)), so
+    /// the wizard stays open focused on the offending cell. Holds the key.
+    NewRequestBracketKey(String),
+    /// The wizard was submitted with a row that has no name at all.
+    NewRequestKeyEmpty,
+    /// …or whose name holds a character Hurl's row grammar can't carry. Holds
+    /// the name and the offending character.
+    NewRequestKeyChar(String, char),
+    /// …or whose *value* holds one (a newline, tab or backslash). Holds the
+    /// row's name and the offending character.
+    NewRequestValueChar(String, char),
     /// A request was deleted from a collection (`x` / delete). Holds the HTTP
     /// method so the message can name it, and always pairs with the "press u
     /// to restore" hint since deletions are easy to trigger by accident.
@@ -1817,6 +1837,16 @@ impl Status {
             Status::WsItemMoveExists(name) => s.ws_item_move_exists.replace("{name}", name),
             Status::WsItemMoveIntoItself => s.ws_item_move_into_itself.to_string(),
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
+            Status::NewRequestBracketKey(k) => s.new_request_bracket_key.replace("{name}", k),
+            Status::NewRequestKeyEmpty => s.new_request_key_empty.to_string(),
+            Status::NewRequestKeyChar(k, c) => s
+                .new_request_key_char
+                .replace("{char}", &c.escape_debug().to_string())
+                .replace("{name}", k),
+            Status::NewRequestValueChar(k, c) => s
+                .new_request_value_char
+                .replace("{char}", &c.escape_debug().to_string())
+                .replace("{name}", k),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),
             Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
