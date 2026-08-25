@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.1] - 2026-08-25
+
+### Changed
+
+- **Installation now recommends `cargo install paperboy --locked`.** Without it
+  Cargo re-resolves every transitive dependency to whatever is newest at install
+  time; `--locked` builds the versions PaperBoy was published and tested
+  against, from the lockfile shipped in the package, so the build is
+  reproducible and a freshly compromised semver-compatible release five levels
+  down can't silently reach your binary. The trade-off is that pinned
+  dependencies don't pick up their own patch releases either, so the pin is only
+  as current as the last PaperBoy release. The motivating case: `arrayref` — a
+  transitive dependency of `winit`, and so of the GUI — had releases yanked on
+  2026-08-20 after a supply-chain attack (since resolved), and while the yank
+  stood a plain `cargo install paperboy` failed outright while `--locked` kept
+  building. It took the terminal-only build down with it, because Cargo resolves
+  optional dependencies whether or not the feature enabling them is on.
+
+### Fixed
+
+- **The Browse button in the run settings sat lower than the field beside it.**
+  A button is slightly taller than a text field, and egui centres each item
+  against the height the row has reached *so far* — so a taller button placed
+  after the field grew the row downwards once the field had already been
+  positioned, leaving the two sharing a top edge with the button hanging below
+  it. Each parameter's row now claims the height of the tallest control it could
+  hold before anything goes in it, so the field and the button are centred on
+  the same line. Rows holding a dropdown or a plain field come out the same
+  height as each other too.
+
+
 ## [0.5.0] - 2026-08-20
 
 ### Changed

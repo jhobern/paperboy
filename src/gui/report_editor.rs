@@ -3156,6 +3156,16 @@ fn param_card(
             let mut value = row.value.clone();
             let name = row.name.clone();
             ui.horizontal(|ui| {
+                // Reserve the row's height before anything is placed in it.
+                // egui centres each item against the height the row has *so
+                // far*, so a Browse button taller than the field it follows
+                // grows the row downwards after the field has already been
+                // positioned — leaving the two top-aligned with the button
+                // hanging below. Claiming the tallest inline control's height
+                // up front gives both the same height to centre against, and
+                // keeps every card's row the same height whichever control it
+                // turns out to hold.
+                ui.set_min_height(chip_h(ui));
                 match &row.kind {
                     ParamKind::Choice(options) if !options.is_empty() => {
                         if param_combo(ui, th, &name, &mut value, options) {
@@ -3171,7 +3181,7 @@ fn param_card(
                         }
                     }
                     ParamKind::Folder | ParamKind::File => {
-                        if param_field(ui, &name, &mut value, s.param_value_unset) {
+                        if param_field(ui, &name, &mut value, s.param_value_unset).0 {
                             edit = Some((name.clone(), CardEdit::Set(value.clone())));
                         }
                         if ui
@@ -3186,7 +3196,7 @@ fn param_card(
                         }
                     }
                     _ => {
-                        if param_field(ui, &name, &mut value, s.param_value_unset) {
+                        if param_field(ui, &name, &mut value, s.param_value_unset).0 {
                             edit = Some((name.clone(), CardEdit::Set(value.clone())));
                         }
                     }
@@ -3235,7 +3245,14 @@ fn elide_head(ui: &egui::Ui, text: &str, width: f32) -> String {
 /// folder is selected, where `…les/absolute/trimmed` says everything. Clicking
 /// in swaps the abbreviation for the real value, so what is edited is always
 /// the whole thing.
-fn param_field(ui: &mut egui::Ui, name: &str, value: &mut String, hint: &str) -> bool {
+/// Returns whether the value was edited, and the box's rect — the caller lays a
+/// Browse button beside it and has to know what it is aligning against.
+fn param_field(
+    ui: &mut egui::Ui,
+    name: &str,
+    value: &mut String,
+    hint: &str,
+) -> (bool, egui::Rect) {
     let id = ui.make_persistent_id(("pt_run_param", name));
     let field = |ui: &mut egui::Ui, text: &mut String| {
         ui.add(
@@ -3250,13 +3267,15 @@ fn param_field(ui: &mut egui::Ui, name: &str, value: &mut String, hint: &str) ->
         )
     };
     if ui.memory(|m| m.has_focus(id)) {
-        return field(ui, value).changed();
+        let r = field(ui, value);
+        return (r.changed(), r.rect);
     }
     // The frame's shown text is a throwaway: edits cannot arrive on it, because
     // the first thing any edit does is take focus, and focus takes the branch
     // above from the next frame on.
     let mut shown = elide_head(ui, value, PARAM_FIELD_WIDTH - FIELD_TEXT_INSET);
-    if field(ui, &mut shown).gained_focus() {
+    let resp = field(ui, &mut shown);
+    if resp.gained_focus() {
         // The click landed on an abbreviation, so the character it picked is
         // not the character it looked like. Put the caret at the end of the
         // real value instead — for a path that is where anyone who has just
@@ -3267,7 +3286,7 @@ fn param_field(ui: &mut egui::Ui, name: &str, value: &mut String, hint: &str) ->
             .set_char_range(Some(egui::text::CCursorRange::one(end)));
         st.store(ui.ctx(), id);
     }
-    false
+    (false, resp.rect)
 }
 
 /// A parameter's drop-down: the closed set of answers its type allows, plus
@@ -10774,6 +10793,76 @@ REPORT REQUEST x
         assert!(
             shown.contains("trimmed"),
             "which is the part that says which folder it is: {shown:?}"
+        );
+    }
+
+    /// A folder parameter's row holds a text field and a Browse button of
+    /// different natural heights. They have to sit on a shared centre line —
+    /// egui otherwise grows the row downwards around the taller one *after* the
+    /// field has been placed, leaving the button hanging below it.
+    #[test]
+    fn a_browse_button_is_centred_against_the_field_beside_it() {
+        use crate::report::flow::ParamKind;
+        use crate::report::params::ParamRow;
+
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
+        ctx.set_fonts(fonts);
+        // The button's padding is what makes it the taller of the two, so the
+        // app's own value has to be in place for this to measure anything.
+        ctx.all_styles_mut(|s| s.spacing.button_padding = egui::vec2(7.0, 3.0));
+
+        let row = ParamRow {
+            name: "FILES_DIR".to_string(),
+            prompt: "DFA corpus".to_string(),
+            kind: ParamKind::Folder,
+            value: "/data".to_string(),
+            problem: None,
+        };
+        let s = Strings::for_language(&crate::i18n::Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+
+        // Painted frames rather than returned responses: this has to measure
+        // what `param_card` itself lays out, not a re-creation of it.
+        let mut rects: Vec<egui::Rect> = Vec::new();
+        // Twice: the first pass is what teaches egui the row's size.
+        for _ in 0..2 {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                param_card(ui, &th, &row, &[], &s);
+            });
+            rects = out
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+        }
+        // The field is the only thing exactly as wide as a parameter field; the
+        // button is whatever is painted to the right of it on the same row.
+        let field = *rects
+            .iter()
+            .find(|r| (r.width() - PARAM_FIELD_WIDTH).abs() < 1.0)
+            .expect("the card paints a parameter field");
+        let button = *rects
+            .iter()
+            .filter(|r| r.min.x > field.max.x && r.min.y < field.max.y && r.max.y > field.min.y)
+            .min_by(|a, b| a.min.x.total_cmp(&b.min.x))
+            .expect("with a Browse button beside it");
+
+        assert!(
+            button.height() > field.height(),
+            "the premise: the button is the taller of the two ({} vs {})",
+            button.height(),
+            field.height()
+        );
+        assert!(
+            (button.center().y - field.center().y).abs() <= 0.5,
+            "they must share a centre line, not a top edge: field {:?}, button {:?}",
+            field,
+            button
         );
     }
 

@@ -37,9 +37,29 @@ git-remote workflows behave identically across them.
 ## Installing & running
 
 ```sh
-cargo install paperboy                 # terminal UI + headless runner
-cargo install paperboy --features gui  # …and the graphical UI
+cargo install paperboy --locked                 # terminal UI + headless runner
+cargo install paperboy --locked --features gui  # …and the graphical UI
 ```
+
+`--locked` is a deliberate recommendation, not a workaround. It builds the exact
+dependency versions PaperBoy was published and tested against, from the lockfile
+shipped inside the package, instead of letting Cargo re-resolve every transitive
+dependency to whatever is newest at install time. That makes the build
+reproducible, and it means a freshly published — or freshly compromised —
+semver-compatible release of some crate five levels down doesn't silently end up
+in your binary.
+
+The trade-off is the honest one: pinned dependencies don't pick up their own
+patch releases either, security fixes included, so the pin is only as current as
+the last PaperBoy release. Dropping `--locked` is a reasonable choice if you'd
+rather have the newer transitive versions.
+
+This isn't hypothetical. `arrayref` — a transitive dependency of `winit`, and so
+of the GUI — had releases yanked on 2026-08-20 following a supply-chain attack on
+the crate (since resolved). While the yank stood, a plain `cargo install
+paperboy` failed outright on `arrayref = "^0.3.6"` while `--locked` kept
+building. Note that it took the terminal-only build down with it: Cargo resolves
+optional dependencies whether or not the feature enabling them is switched on.
 
 The graphical UI is behind the `gui` feature because it pulls in
 eframe/winit/wgpu — roughly twice as many crates as everything else combined —

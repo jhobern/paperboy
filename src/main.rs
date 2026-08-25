@@ -118,7 +118,7 @@ struct Cli {
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
-    /// with the `gui` feature (`cargo install paperboy --features gui`).
+    /// with the `gui` feature (`cargo install paperboy --locked --features gui`).
     #[arg(short = 'g', long)]
     gui: bool,
 
@@ -240,7 +240,7 @@ fn run_gui() -> i32 {
 fn run_gui() -> i32 {
     eprintln!(
         "This build of PaperBoy has no GUI. Reinstall it with the `gui` feature:\n\
-         \x20   cargo install paperboy --features gui"
+         \x20   cargo install paperboy --locked --features gui"
     );
     1
 }
