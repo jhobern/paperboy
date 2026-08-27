@@ -52,6 +52,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Panel shortcut hints no longer get cut off mid-word.** A hint that didn't
+  fit on a panel's border was simply clipped by the renderer, so the
+  Environments panel showed "g go to act" — which reads as a rendering fault
+  rather than a shortage of room. Hints are now built as a priority-ordered
+  list and whole items are dropped from the end until what remains fits, so
+  everything on screen is legible and the help overlay (`?`) is still the
+  complete list. The Environments panel had no width check of any kind before
+  this; the Requests list had one, but it measured against the panel's full
+  width instead of the room inside its borders, so it could still clip by a
+  column or two.
+
+- **"w browse workspace" moved to the footer.** It used to sit beside the
+  collection name on the Requests panel's top border, shown only when the name
+  left room for it — which is why it seemed to come and go for no reason: a
+  long workspace name simply squeezed it out, with nothing to say why. The
+  footer spans the terminal and is where every other pane-independent shortcut
+  already lives, so the hint now appears for every Workspace-bound tab however
+  long its name.
+
+- **`? help` and `q quit` sit at a fixed spot at the front of the footer.**
+  They are the two hints that are always present and never change, but they
+  were at the end, so they slid left and right as the context-dependent hints
+  around them came and went. A hint that moves is one you have to re-find every
+  time; they now follow `Tab focus` at the head of the row, ahead of everything
+  that varies.
+
 - **`x` and F2 no longer act on the collection tab from anywhere.** Both were
   fall-through cases, so as well as their scoped uses — `x` deleting a request
   in the Requests list or an environment in the Environments panel, F2 renaming

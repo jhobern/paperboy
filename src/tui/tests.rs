@@ -16,6 +16,7 @@ use crate::persistence::PersistedState;
 use crate::request::RequestView;
 
 use super::app::*;
+use super::draw::fit_border_hint;
 use super::editor::Editor;
 use super::git_save::*;
 use super::new_request::*;
@@ -16203,54 +16204,49 @@ fn workspace_bound_tabs_show_the_folder_icon_in_the_tab_bar_and_list_title() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The "w browse workspace" hint lives in the footer, and appears there for
+/// every Workspace-bound tab regardless of how long its name is.
+///
+/// It used to sit beside the collection name on the Requests panel's title,
+/// shown only when the name left room for it — so on a long workspace name it
+/// vanished with nothing to say why. The Requests panel's *bottom* border is
+/// no better: at the default panel width the two run hints alone very nearly
+/// fill it. The footer spans the terminal, so there is room.
 #[test]
-fn workspace_bound_list_title_hints_the_w_shortcut_when_there_is_room_but_not_on_a_narrow_terminal()
-{
+fn a_workspace_tab_advertises_the_w_shortcut_in_the_footer() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let s = Strings::for_language(&Language::English);
     let dir = workspace_temp_dir("title_hint");
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
-    // Dismiss the auto-opened picker prompt so it doesn't cover the
-    // List panel's title bar in this render.
+    // Dismiss the auto-opened picker prompt so it doesn't cover the panel.
     col.workspace_auto_prompt_dismissed = true;
     let mut app = TuiApp::default();
     app.collections.push(col);
     app.active_tab = app.collections.len() - 1;
 
-    // A spacious terminal has room in the List panel's title bar for
-    // the "w to browse" reminder, right next to the folder icon —
-    // easier for new users to spot than the busier bottom-border hint.
-    let mut wide_term = Terminal::new(TestBackend::new(160, 40)).unwrap();
-    wide_term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let wide_text = buffer_text(wide_term.backend().buffer());
+    let hint = format!("w {}", s.foot_workspace);
+
+    // It's in the footer — the bottom row — not the Requests panel.
     assert!(
-        wide_text.contains(&format!("w {}", s.foot_workspace)),
-        "the title bar shows the w-to-browse hint on a wide terminal"
+        render_footer(&mut app).contains(&hint),
+        "the footer carries the w-to-browse hint"
     );
 
-    // A narrow terminal shrinks the List panel below the hint's width
-    // requirement, so it's dropped rather than clipped mid-word.
-    let mut narrow_term = Terminal::new(TestBackend::new(40, 40)).unwrap();
-    narrow_term
-        .draw(|f| super::draw::draw(f, &mut app))
-        .unwrap();
-    let narrow_text = buffer_text(narrow_term.backend().buffer());
+    // And it survives a name long enough that the old title-bar placement
+    // would have dropped it.
+    let ci = app.active_tab;
+    app.collections[ci].name = "EngineAPIClientPostmanExportv4_3".to_string();
     assert!(
-        !narrow_text.contains(&format!("w {}", s.foot_workspace)),
-        "the title bar hides the w-to-browse hint on a narrow terminal"
+        render_footer(&mut app).contains(&hint),
+        "a long collection name no longer costs the hint its place"
     );
 
-    // A non-Workspace tab never shows this hint even with plenty of room.
+    // A non-Workspace tab never shows it.
     let mut plain_app = TuiApp::default();
-    let mut plain_term = Terminal::new(TestBackend::new(160, 40)).unwrap();
-    plain_term
-        .draw(|f| super::draw::draw(f, &mut plain_app))
-        .unwrap();
-    let plain_text = buffer_text(plain_term.backend().buffer());
     assert!(
-        !plain_text.contains(&format!("w {}", s.foot_workspace)),
+        !render_footer(&mut plain_app).contains(&hint),
         "a plain (non-Workspace) tab never shows the workspace hint"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -30643,4 +30639,101 @@ fn the_footer_drops_the_universal_hints_and_scopes_the_pane_specific_ones() {
         foot.contains(&format!("F2 {}", s.foot_rename)),
         "F2 renames a real tab from the tab bar: {foot}"
     );
+}
+
+/// Render the whole UI at `width` and return the row holding the Environments
+/// panel's bottom border (the one carrying its shortcut hint).
+fn render_env_hint_row(app: &mut TuiApp, width: u16) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (w, h) = (width, 30u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .find(|row| row.contains("activate"))
+        .unwrap_or_default()
+}
+
+/// A border hint drops whole items rather than letting ratatui clip the last
+/// one mid-word. Half a shortcut reads as a rendering fault; a missing one just
+/// sends people to the help overlay.
+#[test]
+fn a_border_hint_drops_whole_items_instead_of_clipping_one() {
+    let parts = [
+        "F5 run".to_string(),
+        "Alt+F5 run all".to_string(),
+        "p link env".to_string(),
+    ];
+    let sep = " \u{00b7} ";
+    let all = parts.join(sep);
+
+    // Wide enough for everything (the helper reserves 3 columns for the two
+    // border cells plus a gap, so ask for 3 more than the text needs).
+    assert_eq!(
+        fit_border_hint(&parts, sep, all.chars().count() as u16 + 3),
+        all
+    );
+
+    // One column short of the whole thing loses the *last* item outright,
+    // never a fragment of it.
+    let two = parts[..2].join(sep);
+    assert_eq!(
+        fit_border_hint(&parts, sep, all.chars().count() as u16 + 2),
+        two
+    );
+
+    // Likewise down to a single item, and then to nothing at all rather than a
+    // stub of the highest-priority hint.
+    assert_eq!(
+        fit_border_hint(&parts, sep, two.chars().count() as u16 + 2),
+        parts[0]
+    );
+    assert_eq!(fit_border_hint(&parts, sep, 5), "");
+}
+
+/// The Environments panel's hint used to have no width check at all, so a
+/// narrow panel showed "g go to act" hanging mid-word.
+#[test]
+fn the_environments_hint_is_never_cut_mid_word() {
+    let mut app = TuiApp::default();
+    // Widths from "plenty" down to "nothing fits" — at no point may a partial
+    // word appear on the border.
+    let mut shown = 0;
+    for w in (40u16..=140).step_by(4) {
+        let row = render_env_hint_row(&mut app, w);
+        if row.is_empty() {
+            continue;
+        }
+        assert!(
+            row.contains("a activate/deactivate"),
+            "width {w} clipped the activate hint: {row}"
+        );
+        shown += 1;
+    }
+    assert!(shown > 0, "no width drew the hint at all — test is vacuous");
+}
+
+/// `? help` and `q quit` never change, so they sit in a fixed spot at the
+/// front: hints that jump around as the selection moves are hard to aim at.
+#[test]
+fn the_footer_keeps_the_universal_hints_in_a_fixed_position() {
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("Work".into(), Vec::new()));
+    app.active_tab = 1;
+    let s = Strings::for_language(&Language::English);
+
+    for pane in [Pane::Tabs, Pane::Main, Pane::Response, Pane::GlobalEnv] {
+        app.focus = pane;
+        let foot = render_footer(&mut app);
+        assert!(
+            foot.starts_with(&format!(
+                "Tab {} \u{00b7} ? {} \u{00b7} q {}",
+                s.foot_focus, s.foot_help, s.foot_quit
+            )),
+            "footer prefix moved with focus {pane:?}: {foot}"
+        );
+    }
 }

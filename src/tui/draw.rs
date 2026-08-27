@@ -309,6 +309,31 @@ pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> 
         .style(Style::default().bg(th.panel))
 }
 
+/// Join `parts` — most important first — into a hint that fits on a bordered
+/// panel's top or bottom edge.
+///
+/// Ratatui clips a border title that doesn't fit, which cuts it mid-word ("g go
+/// to act") and reads as a rendering fault rather than a shortage of room.
+/// Dropping whole items from the end instead keeps whatever *is* shown
+/// readable: an undiscovered shortcut costs less than a hint the user can't
+/// parse, and the help overlay (`?`) is the complete list either way.
+///
+/// `width` is the panel's full width; the two border columns are taken off
+/// because the corners aren't text, plus one more so the hint never sits flush
+/// against the corner glyph.
+pub(crate) fn fit_border_hint(parts: &[String], sep: &str, width: u16) -> String {
+    let usable = width.saturating_sub(3) as usize;
+    let mut n = parts.len();
+    while n > 0 {
+        let joined = parts[..n].join(sep);
+        if joined.chars().count() <= usable {
+            return joined;
+        }
+        n -= 1;
+    }
+    String::new()
+}
+
 /// The width of a dialog's label column: the longest label plus a gap.
 ///
 /// Wizards put the label beside its field rather than above it (the request
@@ -2312,15 +2337,12 @@ pub(crate) fn draw_collection_left(
         title.clone(),
         Style::default().fg(th.text).add_modifier(Modifier::BOLD),
     )];
-    let mut title_len = title.chars().count();
     if let Some(env) = col
         .linked_env_id
         .and_then(|id| app.global_envs.iter().find(|e| e.id == id))
     {
         let link_part = format!(" {LINK_ICON} ");
         let env_suffix = " (v)";
-        title_len +=
-            link_part.chars().count() + env.name.chars().count() + env_suffix.chars().count();
         title_spans.push(Span::styled(link_part, Style::default().fg(th.dim)));
         title_spans.push(Span::styled(
             env.name.clone(),
@@ -2328,40 +2350,43 @@ pub(crate) fn draw_collection_left(
         ));
         title_spans.push(Span::styled(env_suffix, Style::default().fg(th.dim)));
     }
-    // A brief "w to browse" reminder right in the title bar, next to the
-    // folder icon — new users are much more likely to notice it here than
-    // in the busier bottom-border hint line below. Only shown when it
-    // actually fits without the title overflowing the panel.
-    if col.workspace_root.is_some() {
-        let workspace_title_hint = format!(" · w {}", s.foot_workspace);
-        if title_len + workspace_title_hint.chars().count() < panes[0].width as usize {
-            title_spans.push(Span::styled(
-                workspace_title_hint,
-                Style::default().fg(th.dim),
-            ));
-        }
-    }
+    // The "w to browse" reminder used to be repeated here in the title bar as
+    // well, on the theory that new users would notice it sooner next to the
+    // folder icon. But the title already carries the collection name, the
+    // folder breadcrumb and any linked environment, so the hint was the first
+    // thing squeezed out — present for a short name, silently absent for a long
+    // one, which is worse than consistently living in one place. It now appears
+    // only on the bottom border below, where it competes with hints instead of
+    // with content.
     // Run/Run All hints live on this panel's bottom border (rather than the
     // global footer, which was getting overcrowded) since they act on
     // whichever collection is shown here regardless of which pane has focus.
     let run_key = if app.enhanced_keys { "^Enter/F5" } else { "F5" };
     let run_primary_hint = format!("{run_key} {}", s.foot_run);
-    let mut run_hint = format!("{run_primary_hint} \u{00b7} Alt+F5 {}", s.foot_run_all);
-    // Append the "p" link/unlink-environment hint too, but only when the
-    // panel is wide enough to actually show it without the bottom border
-    // text overflowing/wrapping onto the panel itself.
-    let link_hint = format!(" · p {}", s.foot_env_link);
-    if (run_hint.chars().count() + link_hint.chars().count()) < panes[0].width as usize {
-        run_hint.push_str(&link_hint);
-    }
-    // Same treatment for the Workspace-browse hint, shown only on tabs
-    // actually bound to a Workspace folder.
-    if col.workspace_root.is_some() {
-        let workspace_hint = format!(" · w {}", s.foot_workspace);
-        if (run_hint.chars().count() + workspace_hint.chars().count()) < panes[0].width as usize {
-            run_hint.push_str(&workspace_hint);
-        }
-    }
+    // In priority order: the last entry is the one dropped first when the panel
+    // is too narrow (see `fit_border_hint`). The Workspace-browse hint is not
+    // here — this border is only ~33 usable columns at the default panel width,
+    // which the two run hints alone very nearly fill, so `w` would be dropped
+    // in the common case. It lives in the footer instead (see `draw_footer`),
+    // which spans the terminal.
+    let hint_parts = [
+        run_primary_hint.clone(),
+        format!("Alt+F5 {}", s.foot_run_all),
+        format!("p {}", s.foot_env_link),
+    ];
+    let run_hint = fit_border_hint(&hint_parts, " \u{00b7} ", panes[0].width);
+    // The "F5 run" words are clickable (see `MouseHitTarget::RunRequest`), so
+    // the hit region has to track whatever `fit_border_hint` actually kept: on
+    // a panel too narrow even for the run hint there is nothing on screen to
+    // click, and a region over blank border would be a trap.
+    let run_hit_w = if run_hint.starts_with(run_primary_hint.as_str()) {
+        (Line::from(run_primary_hint.clone())
+            .width()
+            .min(u16::MAX as usize) as u16)
+            .min(panes[0].width.saturating_sub(2))
+    } else {
+        0
+    };
     // An unfocused border is structure, not text: `line` rather than `dim` so a
     // theme can quieten its panel edges without also dimming the words it uses
     // `dim` for (see `theme::Theme::line`).
@@ -2418,8 +2443,6 @@ pub(crate) fn draw_collection_left(
             MouseHitTarget::SelectListRow(row),
         );
     }
-    let run_hit_w = (Line::from(run_primary_hint).width().min(u16::MAX as usize) as u16)
-        .min(panes[0].width.saturating_sub(2));
     if run_hit_w > 0 {
         app.push_mouse_hit(
             MouseLayer::Base,
@@ -2494,7 +2517,14 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // The activate/deactivate hint lives on this panel's bottom border (same
     // convention as the Requests list's Run/Run All hint) since it acts on
     // whichever row is selected here, regardless of which pane has focus.
-    let mut activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
+    //
+    // Built as a list in priority order and fitted to the border, because this
+    // hint had no width check at all: on a narrow panel ratatui simply clipped
+    // it, leaving "g go to act" hanging mid-word.
+    let mut hint_parts = vec![
+        format!("a {}", s.foot_env_activate),
+        format!("/ {}", s.foot_env_filter),
+    ];
     let source = app.effective_env_source();
     let source_label = match source {
         crate::env_panel::EnvSource::Both => s.env_source_all,
@@ -2505,7 +2535,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // is the one people want back most often. Announced only when something is
     // active, so the key is never advertised with nowhere to go.
     if app.active_env_id.is_some() {
-        activate_hint.push_str(&format!("  g {}", s.foot_env_goto_active));
+        hint_parts.push(format!("g {}", s.foot_env_goto_active));
     }
     let title = if app.has_workspace_env_source() {
         // The panel title says *which* source is showing, but nothing said the
@@ -2514,11 +2544,12 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         // only when there is a workspace to switch between: with global
         // environments alone the key does nothing, and offering it would be a
         // false lead.
-        activate_hint.push_str(&format!("  o {}", s.foot_env_source));
+        hint_parts.push(format!("o {}", s.foot_env_source));
         format!("{} · {}", s.env_heading, source_label)
     } else {
         s.env_heading.to_string()
     };
+    let activate_hint = fit_border_hint(&hint_parts, "  ", area.width);
     let block = panel(title, focused, th)
         .title_bottom(Line::styled(activate_hint, Style::default().fg(th.dim)));
     let rows = app.env_rows();
@@ -3943,7 +3974,18 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     // a single-line footer restating them crowded out the hints that are
     // genuinely PaperBoy-specific and were being truncated off the end at 80
     // columns.
-    let mut hint = vec![format!("Tab {}", s.foot_focus), format!("n {}", s.foot_new)];
+    // The invariant hints lead the row and never move: Tab/?/q/n are present in
+    // every pane and every state, so anything that shifted them — changing tab,
+    // moving focus, painting a selection — made four fixed landmarks appear to
+    // jump about. Everything context-dependent is appended after them, where it
+    // can come and go without disturbing what the eye has already learned to
+    // find on the left.
+    let mut hint = vec![
+        format!("Tab {}", s.foot_focus),
+        format!("? {}", s.foot_help),
+        format!("q {}", s.foot_quit),
+        format!("n {}", s.foot_new),
+    ];
     // F2 renames whatever the focused pane is about — the active tab from the
     // tab bar, the selected environment in the Environments panel — and, like
     // `x`, does nothing elsewhere, so it's only advertised where it bites.
@@ -3984,8 +4026,20 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     if app.focus == Pane::Response {
         hint.push(format!("i {}", s.foot_response_section));
     }
-    hint.push(format!("? {}", s.foot_help));
-    hint.push(format!("q {}", s.foot_quit));
+    // `w` opens the workspace tree, and only Workspace-bound tabs have one.
+    //
+    // This used to sit beside the collection name on the Requests panel's
+    // title, where it was shown only if the name left room for it — so on a
+    // long workspace name it vanished, with nothing to say why. The footer runs
+    // the width of the terminal and is where every other pane-independent
+    // shortcut already is, so the hint has somewhere to be seen.
+    if app
+        .collections
+        .get(app.active_tab)
+        .is_some_and(|c| c.workspace_root.is_some())
+    {
+        hint.push(format!("w {}", s.foot_workspace));
+    }
     let hint = hint.join(" · ");
     f.render_widget(
         Paragraph::new(Line::styled(hint, Style::default().fg(th.dim)))
