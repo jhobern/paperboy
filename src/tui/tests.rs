@@ -30122,6 +30122,16 @@ fn the_help_lists_the_current_quit_and_copy_bindings() {
 }
 
 /// Shared setup: an app whose active request has `body` as its last response.
+/// A bare entry with just a title and a method — enough for the list to show
+/// it and for title-uniquing to have something to work with.
+fn entry_named(title: &str) -> HurlEntry {
+    HurlEntry {
+        title: title.into(),
+        method: "GET".into(),
+        ..Default::default()
+    }
+}
+
 fn app_with_response_body(body: &str) -> TuiApp {
     let mut app = TuiApp::default();
     let ci = app.active_tab;
@@ -30736,4 +30746,105 @@ fn the_footer_keeps_the_universal_hints_in_a_fixed_position() {
             "footer prefix moved with focus {pane:?}: {foot}"
         );
     }
+}
+
+/// A duplicate lands directly beneath its original, with a title of its own.
+///
+/// The name matters more than it looks: a request's title is its identifier —
+/// reports address requests by name — so two entries sharing one makes the
+/// reference ambiguous and breaks it for *both*.
+#[test]
+fn c_duplicates_the_selected_request_beneath_itself_with_a_fresh_title() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("Fetch user"),
+        entry_named("Logout"),
+    ];
+    app.collections[ci].selected_entry = 1;
+    app.collections[ci].list_cursor = 1;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('c'));
+
+    let titles: Vec<&str> = app.collections[ci]
+        .entries
+        .iter()
+        .map(|e| e.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Login", "Fetch user", "Fetch user (2)", "Logout"],
+        "the copy goes in beside its original, not at the end"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 2,
+        "the selection follows the copy, which is the thing to be edited next"
+    );
+
+    // Duplicating the copy counts on rather than nesting suffixes.
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.collections[ci].entries[3].title, "Fetch user (3)");
+}
+
+/// The copy is a request that has never been sent, so it mustn't inherit the
+/// original's response — that would credit it with a result it didn't produce.
+#[test]
+fn a_duplicated_request_starts_with_no_response_of_its_own() {
+    let mut app = app_with_response_body("{\"ok\":true}");
+    let ci = app.active_tab;
+    app.collections[ci].selected_entry = 0;
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+    assert!(app.collections[ci].entries[0].last_response.is_some());
+
+    press(&mut app, KeyCode::Char('c'));
+
+    assert!(
+        app.collections[ci].entries[1].last_response.is_none(),
+        "the copy has no response until it is run"
+    );
+    assert!(
+        app.collections[ci].entries[0].last_response.is_some(),
+        "the original keeps its own"
+    );
+}
+
+/// `c` on a folder or "up" row has nothing to duplicate, and must not reach
+/// past the cursor for some other entry (the guard `x` already uses).
+#[test]
+fn c_does_nothing_when_the_cursor_is_not_on_a_request() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Auth/Login"), entry_named("Auth/Logout")];
+    app.collections[ci].list_cursor = 0; // the "Auth" folder row
+    app.focus = Pane::List;
+    let before = app.collections[ci].entries.len();
+
+    press(&mut app, KeyCode::Char('c'));
+
+    assert_eq!(app.collections[ci].entries.len(), before);
+}
+
+/// Titles are uniqued per folder: the leaf is renamed, the path is kept, and a
+/// same-named request in a *different* folder is not a clash.
+#[test]
+fn a_duplicate_title_keeps_its_folder_and_ignores_namesakes_elsewhere() {
+    use crate::collection::unique_entry_title;
+    let entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Admin/Login"),
+        entry_named("Auth/Login (2)"),
+    ];
+    assert_eq!(
+        unique_entry_title(&entries, "Auth/Login"),
+        "Auth/Login (3)",
+        "(2) is taken in this folder, so count on"
+    );
+    assert_eq!(
+        unique_entry_title(&entries, "Admin/Login"),
+        "Admin/Login (2)",
+        "the other folder's (2) is a different request entirely"
+    );
 }

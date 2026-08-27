@@ -2866,13 +2866,27 @@ impl TuiApp {
                 return;
             }
             // Copy within the loaded file: duplicate in memory, then persist.
+            //
+            // The copy is retitled and inserted beside its original rather than
+            // appended verbatim. Two entries sharing a title makes the name
+            // ambiguous, which breaks any report addressing *either* of them
+            // (`report::validate` says as much: "N requests share that title"),
+            // and an appended clone with the same name is indistinguishable
+            // from the original in the list.
             let Some(col) = self.collections.get_mut(source_ci) else {
                 return;
             };
             let mut clone = entry;
+            clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
             clone.user_added = true;
             clone.modified = true;
-            col.entries.push(clone);
+            // A copy has never been sent; the original's response isn't its own.
+            clone.last_response = None;
+            let dup_title = clone.title.clone();
+            let at = (source_idx + 1).min(col.entries.len());
+            col.entries.insert(at, clone);
+            col.selected_entry = at;
+            col.sync_folder_to_selected();
             let text = crate::hurl::collection_to_hurl(&col.entries);
             if let Err(e) = std::fs::write(&dest_path, text) {
                 self.status = Some(Status::Error(e.to_string()));
@@ -2884,7 +2898,7 @@ impl TuiApp {
                 col.sync_ws_cursor();
             }
             self.save_state();
-            self.status = Some(Status::RequestCopied(method, dest_name));
+            self.status = Some(Status::RequestDuplicated(method, dup_title));
             return;
         }
 

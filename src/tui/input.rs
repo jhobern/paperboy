@@ -1860,7 +1860,16 @@ impl TuiApp {
             // a request row of a workspace tab is highlighted). The workspace
             // picker then chooses the destination and writes it to disk.
             KeyCode::Char('m') if self.focus == Pane::List => self.start_workspace_transfer(true),
-            KeyCode::Char('c') if self.focus == Pane::List => self.start_workspace_transfer(false),
+            // On a plain tab there is no other collection file to choose from,
+            // so `c` means the one case the picker would have offered anyway:
+            // duplicate the request where it stands.
+            KeyCode::Char('c') if self.focus == Pane::List => {
+                if self.collections[self.active_tab].is_workspace() {
+                    self.start_workspace_transfer(false);
+                } else {
+                    self.duplicate_selected_request();
+                }
+            }
             // 'a' toggles activation of the selected Global Environment (at
             // most one may be active — activating one deactivates any other).
             // On an unopened workspace file it loads the file first: activating
@@ -2504,6 +2513,57 @@ impl TuiApp {
         self.list_hscroll = 0;
         self.collections[ci].invalidate_request_json();
         self.status = Some(Status::RequestDeleted(method));
+        self.save_state();
+    }
+
+    /// Duplicate the highlighted request, landing the copy directly beneath
+    /// the original (`c`, List pane, on a non-Workspace tab).
+    ///
+    /// The copy is the quickest way to build a family of near-identical
+    /// requests — the same call with a different header or body per scenario —
+    /// which otherwise means retyping the whole thing in the wizard.
+    ///
+    /// It goes in at `idx + 1` rather than at the end of the collection so it
+    /// arrives where the eye already is; appending would put it out of sight in
+    /// any collection long enough for duplication to be worth the trouble. The
+    /// title is uniqued (see [`crate::collection::unique_entry_title`]) because
+    /// two entries sharing one makes the name ambiguous for reports that
+    /// address either of them.
+    ///
+    /// Workspace tabs keep `c`'s existing meaning — copy to a chosen collection
+    /// file, of which "this one" is a case — see
+    /// [`Self::start_workspace_transfer`].
+    pub(crate) fn duplicate_selected_request(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        // Same guard as `delete_selected_request`: the cursor may be on a
+        // folder or "up" row, which is nothing to duplicate.
+        if !matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Entry(_))
+        ) {
+            return;
+        }
+        let col = &mut self.collections[ci];
+        let idx = col.selected_entry.min(col.entries.len().saturating_sub(1));
+        let Some(mut clone) = col.entries.get(idx).cloned() else {
+            return;
+        };
+        clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
+        clone.user_added = true;
+        clone.modified = true;
+        // A copy has never been sent, so carrying the original's response over
+        // would attribute a result to a request that didn't produce it.
+        clone.last_response = None;
+        let method = clone.method.clone();
+        let title = clone.title.clone();
+        col.entries.insert(idx + 1, clone);
+        col.selected_entry = idx + 1;
+        col.sync_folder_to_selected();
+        col.sync_ws_cursor();
+        self.list_hscroll = 0;
+        self.collections[ci].invalidate_request_json();
+        self.status = Some(Status::RequestDuplicated(method, title));
         self.save_state();
     }
 

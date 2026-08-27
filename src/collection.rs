@@ -220,6 +220,41 @@ impl WsRow {
     }
 }
 
+/// A title for a copy of `title` that no entry in `entries` already carries.
+///
+/// A request's title is its *identifier*: reports address requests by name
+/// (see `report::run::resolve_qualified`), and two entries sharing a title
+/// make the name ambiguous — which breaks the reference for **both** of them,
+/// not just the new one. So a duplicate can't simply reuse the name; it has to
+/// arrive with one of its own.
+///
+/// Folders are derived by splitting the title on `/` (see [`crate::tree`]), so
+/// only the leaf is renamed — a copy belongs in the same folder as its
+/// original. Copying a copy counts on from the existing suffix rather than
+/// stacking them, so repeated duplication gives `Login (2)`, `Login (3)` …
+/// instead of `Login (2) (2)`.
+pub fn unique_entry_title(entries: &[HurlEntry], title: &str) -> String {
+    let (prefix, leaf) = match title.rfind('/') {
+        Some(i) => title.split_at(i + 1),
+        None => ("", title),
+    };
+    // Strip any trailing " (n)" so the counter continues rather than nests.
+    let stem = leaf
+        .rsplit_once(" (")
+        .and_then(|(head, tail)| {
+            tail.strip_suffix(')')
+                .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+                .map(|_| head)
+        })
+        .unwrap_or(leaf);
+    let taken: HashSet<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+    // Starts at 2 because the original is, in effect, number one.
+    (2..)
+        .map(|n| format!("{prefix}{stem} ({n})"))
+        .find(|candidate| !taken.contains(candidate.as_str()))
+        .unwrap_or_else(|| title.to_string())
+}
+
 /// The synthetic `workspace_expanded` key for the virtual folder `folder`
 /// (title segments) inside the collection file at `collection` — see
 /// [`WsRow::RequestFolder`].

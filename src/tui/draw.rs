@@ -4026,6 +4026,22 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     if app.focus == Pane::Response {
         hint.push(format!("i {}", s.foot_response_section));
     }
+    // `c` duplicates the highlighted request — but only where there is a
+    // request under the cursor to duplicate; on a folder or "up" row it does
+    // nothing, and on a Workspace tab it opens the destination picker instead
+    // (advertised in the help overlay, since it needs more words than a footer
+    // slot allows).
+    if app.focus == Pane::List
+        && app.collections.get(app.active_tab).is_some_and(|c| {
+            !c.is_workspace()
+                && matches!(
+                    c.rows().get(c.list_cursor),
+                    Some(crate::tree::Row::Entry(_))
+                )
+        })
+    {
+        hint.push(format!("c {}", s.foot_duplicate));
+    }
     // `w` opens the workspace tree, and only Workspace-bound tabs have one.
     //
     // This used to sit beside the collection name on the Requests panel's
@@ -4436,6 +4452,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
+                            ("c (List pane)", s.help_duplicate_request),
                         ],
                     ),
                     (

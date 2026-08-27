@@ -12,6 +12,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`c` duplicates the highlighted request.** Building a family of
+  near-identical requests — the same call with a different header or body per
+  scenario — previously meant retyping the whole thing in the wizard. The copy
+  is inserted directly beneath its original (not appended out of sight) and the
+  selection follows it, so it is ready to edit. On Workspace tabs `c` keeps its
+  existing meaning of copying to a chosen collection file.
+
 - **The Response pane can now show the response headers.** They were being
   captured all along and shown by the GUI, but the terminal UI drew only the
   body, so anything carried in a header — a `Location` on a redirect, a
@@ -49,6 +56,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   plenty of servers return. Such a response now says so explicitly. The note is
   drawn over the panel rather than through it, so it is never selectable and a
   whole-panel copy still yields an empty body rather than the placeholder text.
+
+### Fixed
+
+- **A copied request no longer takes its original's name.** A request's title
+  is its identifier — reports address requests by name — so two entries sharing
+  one made the reference ambiguous and broke it for *both* of them, not just
+  the copy. Copies are now given a name of their own (`Login` → `Login (2)`,
+  counting on rather than nesting to `Login (2) (2)`), keeping their folder so
+  a namesake elsewhere in the collection isn't treated as a clash. A copy also
+  no longer inherits the original's last response, which credited it with a
+  result it hadn't produced.
 
 ### Changed
 
