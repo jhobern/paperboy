@@ -120,6 +120,10 @@ strings! {
     confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every unsaved edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications non enregistrées seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ikke-gemte ændringer går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
+    wizard_discard_q => "This request has unsaved changes. Save them before closing?", "Cette requête comporte des modifications non enregistrées. Les enregistrer avant de fermer\u{a0}?", "Denne forespørgsel har ugemte ændringer. Vil du gemme dem, før du lukker?";
+    wizard_discard_save => "Save", "Enregistrer", "Gem";
+    wizard_discard_discard => "Discard", "Abandonner", "Kassér";
+    wizard_discard_cancel => "Keep editing", "Continuer l'édition", "Bliv ved med at redigere";
     confirm_yes => "Yes", "Oui", "Ja";
     confirm_no => "No", "Non", "Nej";
     file_menu => "File", "Fichier", "Fil";

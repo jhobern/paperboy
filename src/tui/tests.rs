@@ -1972,8 +1972,16 @@ fn esc_dismisses_dropdown_before_cancelling_the_form() {
         "the dropdown is dismissed"
     );
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]
@@ -6760,6 +6768,364 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
         !app.collections[0].entries[0].user_added,
         "scratch-space requests are not marked"
     );
+}
+
+/// Esc used to throw the whole wizard away on a single keypress — the wizard
+/// has no autosave and F2 is the only thing that persists, so a mistyped Esc
+/// silently cost the user everything they had entered.
+#[test]
+fn esc_on_an_edited_wizard_asks_before_discarding() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // type into the Name field
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_some(), "the wizard must stay open");
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "the prompt opens on 'keep editing', so Enter on reflex costs nothing"
+    );
+    assert_eq!(form_ref(&app).name.text(), "h", "the edits are still there");
+}
+
+/// ...but an untouched form still closes on one Esc. Prompting when there is
+/// nothing to lose would make Esc feel broken and train the user to dismiss the
+/// prompt unread.
+#[test]
+fn esc_on_an_untouched_wizard_closes_immediately() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "an untouched wizard just closes");
+}
+
+/// Opening the wizard on an existing request prefills every section, and none
+/// of that prefill may count as an edit — otherwise editing a request and
+/// backing straight out would always prompt.
+#[test]
+fn esc_on_an_unmodified_edit_closes_immediately() {
+    let mut entry = crate::hurl::HurlEntry {
+        method: "POST".into(),
+        url: "http://h/a".into(),
+        title: "Thing".into(),
+        headers: vec![KvRow::new("X-A", "v")],
+        cookies: vec![KvRow::new("sid", "1")],
+        queries: vec![KvRow::new("q", "2")],
+        options: vec![KvRow::new("variable", "v=1")],
+        body: Some("{\"a\":1}".into()),
+        expected_status: Some(200),
+        ..Default::default()
+    };
+    entry.asserts = vec!["jsonpath \"$.a\" == 1".into()];
+    entry.captures = vec![("tok".into(), "jsonpath \"$.t\"".into())];
+    entry.reports = vec![("r".into(), "jsonpath \"$.r\"".into())];
+
+    let mut app = TuiApp::default();
+    let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+    assert!(
+        !form.is_dirty(),
+        "a freshly prefilled edit form is not an edit"
+    );
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "an unmodified edit just closes");
+}
+
+/// Esc answers the prompt with "keep editing": the reflex that opened it must
+/// not also dismiss it, or holding Esc would discard the form as before.
+#[test]
+fn esc_on_the_discard_prompt_returns_to_the_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_some(), "the wizard is still open");
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        None,
+        "the prompt is dismissed, not answered"
+    );
+    assert_eq!(form_ref(&app).name.text(), "h", "the edits survive");
+}
+
+/// Choosing Discard does what the old bare Esc did.
+#[test]
+fn discard_on_the_prompt_closes_the_wizard() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('d'));
+
+    assert!(app.overlay.is_none(), "the wizard closed");
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "and nothing was saved"
+    );
+}
+
+/// Choosing Save persists the request, so a user who hit Esc meaning to finish
+/// doesn't have to know that F2 is the save key.
+#[test]
+fn save_on_the_prompt_persists_the_request() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(app.overlay.is_none(), "the wizard closed");
+    assert_eq!(app.collections[0].entries.len(), 1, "the request was saved");
+    assert_eq!(app.collections[0].entries[0].url, "http://h/a");
+}
+
+/// Save from the prompt runs the same refusals F2 does — a form F2 would
+/// reject must not slip through just because the user arrived via Esc.
+#[test]
+fn save_on_the_prompt_still_refuses_an_unwritable_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.headers.clear();
+    let mut row = HeaderRow::new();
+    row.key = super::editor::Editor::new("[Body]", false);
+    row.value = super::editor::Editor::new("value", false);
+    form.headers.push(row);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(
+        app.overlay.is_some(),
+        "the wizard stays open on a refused save"
+    );
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        None,
+        "the prompt closes so the offending cell is visible"
+    );
+    assert_eq!(
+        form_ref(&app).focus,
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+        "focus lands on the offending cell"
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "and nothing was saved"
+    );
+}
+
+/// A form with no URL can't be saved at all, so Save from the prompt has to
+/// refuse it the same way F2 does rather than silently dropping the form.
+#[test]
+fn save_on_the_prompt_still_refuses_an_empty_url() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // a name, but no URL
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(app.overlay.is_some(), "the wizard stays open");
+    assert_eq!(
+        form_ref(&app).focus,
+        NewField::Url,
+        "focus lands on the URL"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NewRequestUrlRequired)
+    ));
+    assert!(app.collections[0].entries.is_empty());
+}
+
+/// The prompt is modal: while it is open, keys belong to it and must not also
+/// edit the form behind it.
+#[test]
+fn the_discard_prompt_swallows_keys_meant_for_the_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(
+        form_ref(&app).name.text(),
+        "h",
+        "'x' must not reach the Name field"
+    );
+    assert!(app.overlay.is_some(), "and the wizard is still open");
+}
+
+/// Left/Right move between the three choices, and Enter acts on the highlighted
+/// one — the same interaction the app's other confirmations use.
+#[test]
+fn the_discard_prompt_moves_between_choices() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(form_ref(&app).confirm_discard, Some(2));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+    press(&mut app, KeyCode::Left);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(0),
+        "clamps at the first"
+    );
+    press(&mut app, KeyCode::Right);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+
+    // Enter on "Discard" closes the wizard without saving.
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert!(app.collections[0].entries.is_empty());
+}
+
+/// Enter on the default choice returns to editing, losing nothing.
+#[test]
+fn enter_on_the_default_choice_keeps_editing() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_some(), "the wizard is still open");
+    assert_eq!(form_ref(&app).confirm_discard, None, "the prompt is closed");
+    assert_eq!(form_ref(&app).name.text(), "h");
+}
+
+/// Every field the user can type into must feed the dirty check. This is the
+/// drift guard: a section added to the wizard without being added to
+/// `content_signature` would silently make Esc discard it without asking.
+#[test]
+fn every_editable_field_counts_as_an_edit() {
+    let mutations: Vec<(&str, fn(&mut NewReq))> = vec![
+        ("name", |f| f.name = super::editor::Editor::new("x", false)),
+        ("url", |f| f.url = super::editor::Editor::new("x", false)),
+        ("body", |f| f.body = super::editor::Editor::new("x", true)),
+        ("method", |f| f.method_idx += 1),
+        ("headers", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.headers.rows.push(r);
+        }),
+        ("cookies", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.cookies.rows.push(r);
+        }),
+        ("queries", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.queries.rows.push(r);
+        }),
+        ("options", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.options.rows.push(r);
+        }),
+        ("form_fields", |f| f.form_fields.push(FormRow::new())),
+        ("asserts", |f| f.asserts.push(AssertRow::new())),
+        ("captures", |f| f.captures.push(CaptureRow::new())),
+        ("reports", |f| f.reports.push(ReportRow::new())),
+        ("row enabled", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            r.enabled = false;
+            f.headers.rows.push(r);
+        }),
+        ("row desc", |f| {
+            let mut r = HeaderRow::new();
+            r.desc = super::editor::Editor::new("note", false);
+            f.headers.rows.push(r);
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut app = TuiApp {
+            focus: Pane::List,
+            ..Default::default()
+        };
+        press(&mut app, KeyCode::Char('n'));
+        let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+            panic!("wizard did not open");
+        };
+        assert!(!form.is_dirty(), "{what}: a fresh form is not dirty");
+        mutate(form);
+        assert!(form.is_dirty(), "{what}: editing it must count as an edit");
+    }
+}
+
+/// ...and things that are *not* edits must not trip it, or the prompt fires on
+/// every Esc and gets dismissed unread.
+#[test]
+fn merely_looking_around_is_not_an_edit() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    for key in [
+        KeyCode::Tab,
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::PageDown,
+        KeyCode::PageUp,
+        KeyCode::Right,
+        KeyCode::Left,
+    ] {
+        press(&mut app, key);
+    }
+    assert!(
+        !form_ref(&app).is_dirty(),
+        "navigating a form is not editing it"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "so Esc still closes it outright");
 }
 
 /// The same guard, generalised: a name Hurl can't carry for any other reason —
@@ -11592,8 +11958,16 @@ fn esc_dismisses_the_kind_dropdown_before_cancelling_the_form() {
         "the dropdown is dismissed"
     );
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]
@@ -11982,8 +12356,16 @@ fn esc_dismisses_the_content_type_dropdown_before_cancelling_the_form() {
     assert!(app.overlay.is_some(), "the form stays open");
     assert!(!form_ref(&app).ctype_dropdown_open());
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]

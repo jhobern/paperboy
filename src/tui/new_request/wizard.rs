@@ -411,6 +411,15 @@ const KEY_DROPDOWN: u64 = 1;
 const CTYPE_DROPDOWN: u64 = 2;
 
 /// In-progress New Request / Edit Request form (an overlay while open).
+/// The choices on the wizard's "unsaved changes" prompt, in display order.
+/// Save first (the likeliest intent when Esc was a mistake), then the
+/// destructive option, then the way back — which is also the default, so
+/// Enter on reflex costs nothing.
+pub(crate) const WIZARD_DISCARD_SAVE: usize = 0;
+pub(crate) const WIZARD_DISCARD_DISCARD: usize = 1;
+pub(crate) const WIZARD_DISCARD_CHOICES: usize = 3;
+pub(crate) const WIZARD_DISCARD_DEFAULT: usize = 2;
+
 pub(crate) struct NewReq {
     pub(crate) name: Editor,
     pub(crate) url: Editor,
@@ -511,6 +520,17 @@ pub(crate) struct NewReq {
     /// `Ctrl+Shift+Left/Right`, mirroring how collection tabs are
     /// reordered); `All` is always pinned first and can never move.
     pub(crate) tab_order: Vec<WizardTab>,
+    /// [`content_signature`](Self::content_signature) as it was when the
+    /// wizard opened, so Esc can tell an abandoned form from an edited one and
+    /// only interrupt for the latter.
+    pub(crate) opened_signature: String,
+    /// The "discard your changes?" prompt, when it is open, holding the index
+    /// of the highlighted choice. Like [`ExtractPrompt`] this is a modal over
+    /// the wizard rather than another dropdown — while it is open every key
+    /// belongs to it — but it lives on `NewReq` instead of becoming an
+    /// [`Overlay::Confirm`](crate::tui::app::Overlay) because the whole point
+    /// is to keep the half-finished form alive behind it.
+    pub(crate) confirm_discard: Option<usize>,
 }
 
 /// The "extract to parameter" prompt: a modal over the wizard that names the
@@ -648,6 +668,116 @@ impl NewReq {
             .collect()
     }
 
+    /// A fingerprint of everything the user can type into the wizard.
+    ///
+    /// Compared against [`opened_signature`](Self::opened_signature) to decide
+    /// whether Esc should ask before throwing the form away. Deliberately built
+    /// from the *content* fields only: focus, scroll offsets, the active tab,
+    /// tab order and the transient dropdown state all change constantly while
+    /// someone reads a form without editing it, and treating those as edits
+    /// would make the prompt fire on every Esc and train the user to dismiss it
+    /// unread.
+    ///
+    /// Values are joined with control characters no cell can contain (see
+    /// [`value_problem`](crate::hurl::value_problem), which refuses tabs and
+    /// newlines in a row value), so no combination of typed text can forge a
+    /// separator and make two different forms share a signature.
+    pub(crate) fn content_signature(&self) -> String {
+        use std::fmt::Write as _;
+        // Unit separator between fields, record separator between rows.
+        const F: char = '\x1f';
+        const R: char = '\x1e';
+        let mut sig = String::new();
+        let _ = write!(
+            sig,
+            "{}{F}{}{F}{}{F}{}{F}{}",
+            self.method_idx,
+            self.target_idx,
+            self.name.text(),
+            self.url.text(),
+            self.body.text()
+        );
+        for kind in KvdKind::ALL {
+            sig.push(R);
+            for row in &self.kvd(kind).rows {
+                let _ = write!(
+                    sig,
+                    "{F}{}{F}{}{F}{}{F}{}",
+                    row.key.text(),
+                    row.value.text(),
+                    row.desc.text(),
+                    row.enabled
+                );
+            }
+        }
+        sig.push(R);
+        for row in &self.form_fields {
+            let _ = write!(
+                sig,
+                "{F}{}{F}{}{F}{}{F}{}{F}{}{F}{:?}{F}{}",
+                row.key.text(),
+                row.value.text(),
+                row.ctype.text(),
+                row.base64_prefix.text(),
+                row.desc.text(),
+                row.kind,
+                row.enabled
+            );
+        }
+        sig.push(R);
+        for row in &self.asserts {
+            let _ = write!(sig, "{F}{}", row.expr.text());
+        }
+        sig.push(R);
+        for row in &self.captures {
+            let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
+        }
+        sig.push(R);
+        for row in &self.reports {
+            let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
+        }
+        sig
+    }
+
+    /// What stops this form being saved, if anything: the cell to focus, the
+    /// section tab to reveal it on, and the status explaining why.
+    ///
+    /// Shared by F2 and by the Save choice on the discard prompt, so closing
+    /// the wizard with Esc can't slip a request past the checks that a normal
+    /// save enforces.
+    pub(crate) fn save_blocker(&self) -> Option<(NewField, WizardTab, crate::i18n::Status)> {
+        // A request can't be saved without a URL — that's the one field
+        // `submit_new_request` bails on, silently discarding everything else
+        // the user typed. Every other section is either dropped-if-empty or
+        // stored as-is and only checked at run time.
+        if self.url.text().trim().is_empty() {
+            return Some((
+                NewField::Url,
+                WizardTab::All,
+                crate::i18n::Status::NewRequestUrlRequired,
+            ));
+        }
+        self.first_unwritable_row().map(|(field, status)| {
+            (
+                field,
+                field.wizard_section().unwrap_or(WizardTab::All),
+                status,
+            )
+        })
+    }
+
+    /// Whether anything has been typed since the wizard opened.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.content_signature() != self.opened_signature
+    }
+
+    /// Record the current content as the baseline, so what is on screen now
+    /// counts as "unchanged". Called once each constructor has built the form.
+    fn seal(mut self) -> Self {
+        self.opened_signature = self.content_signature();
+        self
+    }
+
     pub(crate) fn new(
         base_url: String,
         target_names: Vec<String>,
@@ -694,7 +824,10 @@ impl NewReq {
             editing: None,
             view_tab: WizardTab::All,
             tab_order: WizardTab::ALL.to_vec(),
+            opened_signature: String::new(),
+            confirm_discard: None,
         }
+        .seal()
     }
 
     /// Build a form prefilled from an existing entry, for the "Edit Request"
@@ -835,7 +968,10 @@ impl NewReq {
             editing: Some((ci, ei)),
             view_tab: WizardTab::All,
             tab_order: WizardTab::ALL.to_vec(),
+            opened_signature: String::new(),
+            confirm_discard: None,
         }
+        .seal()
     }
 
     /// Display name of the currently selected target collection.
@@ -2322,6 +2458,22 @@ pub(crate) fn draw_new_request_with_hits(
     draw_kind_dropdown(f, form, s, th, app);
     draw_content_type_dropdown(f, form, s, th, app);
     draw_extract_prompt(f, form, s, th);
+    // Last of all: the discard prompt is the outermost modal, so it must cover
+    // the dropdowns and the extract prompt too.
+    if let Some(sel) = form.confirm_discard {
+        crate::tui::draw::draw_confirm_popup(
+            f,
+            s.wizard_discard_q,
+            &[
+                s.wizard_discard_save,
+                s.wizard_discard_discard,
+                s.wizard_discard_cancel,
+            ],
+            sel,
+            th,
+            None,
+        );
+    }
 }
 
 fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &Strings) {

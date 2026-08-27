@@ -5857,6 +5857,60 @@ impl TuiApp {
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
+        // The discard prompt is likewise a modal over the wizard: while it is
+        // open every key belongs to it, so a keystroke aimed at the prompt
+        // can't also edit the form sitting behind it. It is checked first
+        // because it is the outermost layer — Esc only raises it once every
+        // dropdown and the extract prompt have already been dismissed.
+        if let Some(sel) = form.confirm_discard {
+            let choice = match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => Some(WIZARD_DISCARD_SAVE),
+                KeyCode::Char('d') | KeyCode::Char('D') => Some(WIZARD_DISCARD_DISCARD),
+                KeyCode::Enter => Some(sel),
+                _ => None,
+            };
+            match choice {
+                Some(WIZARD_DISCARD_SAVE) => {
+                    // Save behaves exactly as F2 does, refusals included: a
+                    // form F2 would reject is not quietly saved just because
+                    // the user arrived here via Esc. On refusal the prompt
+                    // closes and the wizard stays open on the offending cell.
+                    if let Some((field, tab, status)) = form.save_blocker() {
+                        self.status = Some(status);
+                        form.view_tab = tab;
+                        form.focus = field;
+                        form.confirm_discard = None;
+                        self.overlay = Some(Overlay::NewRequest(form));
+                    } else {
+                        self.submit_new_request(*form);
+                    }
+                    return;
+                }
+                Some(WIZARD_DISCARD_DISCARD) => {
+                    // Drop the form: leave the overlay closed and hand focus
+                    // back to wherever the wizard was opened from.
+                    self.focus = self.wizard_return_focus;
+                    return;
+                }
+                // "Keep editing", by Enter on the third choice.
+                Some(_) => form.confirm_discard = None,
+                None => match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        form.confirm_discard = Some(sel.saturating_sub(1));
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        form.confirm_discard = Some((sel + 1).min(WIZARD_DISCARD_CHOICES - 1));
+                    }
+                    // Esc backs out of the prompt, not the wizard: the reflex
+                    // that opened it must not also answer it, or holding Esc
+                    // would discard the form exactly as before.
+                    KeyCode::Esc => form.confirm_discard = None,
+                    _ => {}
+                },
+            }
+            self.overlay = Some(Overlay::NewRequest(form));
+            return;
+        }
         // The extract-to-parameter prompt is a modal over the wizard, not
         // another dropdown: while it is open every key belongs to it, so the
         // name being typed can contain anything a variable name can without
@@ -5963,32 +6017,24 @@ impl TuiApp {
             } else if ctype_open {
                 form.ctype_dropdown_hidden = true;
                 form.ctype_hi = None;
+            } else if form.is_dirty() {
+                // Esc used to throw the whole form away on one keypress, with
+                // no way back — the wizard has no autosave and F2 is the only
+                // thing that persists. Ask first, but only when there is
+                // something to lose: prompting on an untouched form would make
+                // Esc feel broken and train the user to dismiss the prompt
+                // without reading it.
+                form.confirm_discard = Some(WIZARD_DISCARD_DEFAULT);
             } else {
-                keep = false; // cancel the whole form
+                keep = false; // nothing typed — cancel the whole form
             }
         } else if submit {
-            // A request can't be saved without a URL — that's the one
-            // field `submit_new_request` bails on (silently discarding
-            // everything else the user typed). Every other section
-            // (headers/cookies/form fields/asserts/captures/body) is
-            // either dropped-if-empty or stored as-is and only checked
-            // at run time, so the URL is the sole save-time blocker.
-            // Keep the wizard open, jump focus to the URL field, and
-            // say why instead of closing on an empty URL.
-            if form.url.text().trim().is_empty() {
-                self.status = Some(Status::NewRequestUrlRequired);
-                form.focus = NewField::Url;
-                form.view_tab = WizardTab::All;
-            } else if let Some((field, status)) = form.first_unwritable_row() {
-                // A row Hurl can't carry — a name holding `[`, `:`, `#`, a
-                // space, or a value holding a newline or tab — serialises to a
-                // line that makes the *whole* collection file unparseable, and
-                // `parse_hurl` returns no entries at all for a file that
-                // doesn't parse. Saving this would lose every request in the
-                // tab on the next load. Same treatment as the empty URL: stay
-                // open, point at the offending cell.
+            // Keep the wizard open and point at the offending cell rather than
+            // closing on a form that can't be saved — see `save_blocker` for
+            // what counts and why.
+            if let Some((field, tab, status)) = form.save_blocker() {
                 self.status = Some(status);
-                form.view_tab = field.wizard_section().unwrap_or(WizardTab::All);
+                form.view_tab = tab;
                 form.focus = field;
             } else {
                 do_submit = true;

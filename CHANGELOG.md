@@ -8,7 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.5.1] - 2026-08-25
+## [0.5.1] - 2026-08-27
+
+### Added
+
+- **Escape now asks before throwing away an edited request.** The request wizard
+  has no autosave and F2 is the only thing that persists, so a single mistyped
+  Esc silently discarded everything that had been entered — with no undo and
+  nothing to show it had happened. Esc on a wizard with unsaved changes now
+  offers Save, Discard or Keep editing, defaulting to Keep editing so answering
+  it on reflex costs nothing. Save runs the same checks F2 does, so a request
+  that couldn't be saved normally isn't quietly saved this way either. An
+  untouched form still closes on the first Esc: prompting when there is nothing
+  to lose would only train the habit of dismissing the prompt unread.
 
 ### Changed
 
