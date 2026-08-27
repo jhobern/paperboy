@@ -1834,7 +1834,20 @@ impl TuiApp {
                     }
                 }
             }
-            KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
+            // `x` closes the active tab — but only from the Tabs bar itself.
+            // It used to be the fall-through arm, so it also fired from the
+            // Main and Response panes, where nothing on screen suggests a
+            // keypress is aimed at the tab bar: reading a response, pressing
+            // `x`, and losing the whole collection is a lot of damage for a
+            // stray key. Every other `x` in this match deletes the thing its
+            // own pane is about (a request in the list, an environment in the
+            // Environments panel), so this one is now scoped the same way.
+            // Ctrl+W still closes the active tab from anywhere — that's the
+            // OS-wide convention for "close this", and it isn't a key anyone
+            // hits by accident while reading.
+            KeyCode::Char('x') if self.focus == Pane::Tabs && self.active_tab != 0 => {
+                self.close_active_tab()
+            }
             // 'm' / 'c' move / copy the highlighted request in a Workspace tab
             // to another collection file in the same workspace (a no-op unless
             // a request row of a workspace tab is highlighted). The workspace

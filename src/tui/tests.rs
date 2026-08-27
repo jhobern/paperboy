@@ -30316,6 +30316,17 @@ fn render_screen(app: &mut TuiApp) -> String {
         .collect()
 }
 
+/// Render the whole UI and return just the footer (the bottom row).
+fn render_footer(app: &mut TuiApp) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (w, h) = (160u16, 30u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    (0..w).map(|x| buf[(x, h - 1)].symbol()).collect()
+}
+
 /// `i` steps the Response section ring and Shift+I steps back. A ring rather
 /// than a boolean toggle because more sections are expected (timings, capture
 /// values) and a third one mustn't need a third key.
@@ -30499,4 +30510,91 @@ fn compact_view_is_refused_in_the_headers_section() {
     press(&mut app, KeyCode::Char('i'));
     press(&mut app, KeyCode::Char('c'));
     assert!(app.response_compact, "but it still works on the Body");
+}
+
+/// `x` used to be the fall-through arm, so it closed the active collection tab
+/// from the Main and Response panes too — where nothing on screen suggests a
+/// keypress is aimed at the tab bar. Reading a response and pressing `x` took
+/// the whole collection with it.
+#[test]
+fn x_closes_a_tab_only_from_the_tab_bar() {
+    for pane in [Pane::Main, Pane::Response, Pane::List, Pane::GlobalEnv] {
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("second".into(), Vec::new()));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.collections.len(),
+            2,
+            "x in {pane:?} must not close the collection tab"
+        );
+    }
+
+    // From the tab bar itself it still closes, which is where the key reads as
+    // being about the tab.
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    app.active_tab = 1;
+    app.focus = Pane::Tabs;
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(app.collections.len(), 1, "x on the tab bar closes the tab");
+}
+
+/// Scoping `x` mustn't leave "close this tab" unreachable from the panes it no
+/// longer fires in — Ctrl+W is the OS-wide convention for it and isn't a key
+/// anyone hits by accident while reading.
+#[test]
+fn ctrl_w_still_closes_the_tab_from_any_pane() {
+    for pane in [Pane::Main, Pane::Response, Pane::List, Pane::Tabs] {
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("second".into(), Vec::new()));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        ctrl(&mut app, KeyCode::Char('w'));
+        assert_eq!(
+            app.collections.len(),
+            1,
+            "Ctrl+W must still close the tab from {pane:?}"
+        );
+    }
+}
+
+/// The footer is one line, and at 80 columns it was being truncated before it
+/// reached the PaperBoy-specific hints. Arrow keys moving a highlight and Enter
+/// opening it are the two most universal conventions there are, so they no
+/// longer spend room restating themselves — and `x` is only offered where it
+/// actually does something.
+#[test]
+fn the_footer_drops_the_universal_hints_and_scopes_the_delete_one() {
+    let mut app = app_with_response_headers("{}", &[("a", "b")]);
+    app.focus = Pane::Response;
+    let s = Strings::for_language(&Language::English);
+
+    let foot = render_footer(&mut app);
+    assert!(
+        !foot.contains("\u{2191}\u{2193}") && !foot.contains("Enter"),
+        "the universal arrow/Enter hints are gone: {foot}"
+    );
+    assert!(foot.contains(s.foot_focus), "Tab focus still leads the row");
+    assert!(
+        foot.contains(s.foot_response_section),
+        "the freed room goes to the Response hints: {foot}"
+    );
+    assert!(
+        !foot.contains(&format!("x {}", s.foot_close)),
+        "x does nothing in the Response pane, so it isn't advertised there"
+    );
+
+    app.focus = Pane::List;
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(&format!("x {}", s.foot_close)),
+        "but it is offered in the Requests list, where it deletes a request: {foot}"
+    );
 }

@@ -1713,15 +1713,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     draw_topbar(f, rows[1], app, &s, &th);
     draw_tabs(f, rows[2], app, &s, &th);
     draw_body(f, rows[3], app, &s, &th);
-    draw_footer(
-        f,
-        rows[4],
-        &s,
-        &th,
-        app.can_copy(),
-        app.focus == Pane::Response && app.response_section == ResponseSection::Body,
-        app.focus == Pane::Response,
-    );
+    draw_footer(f, rows[4], app, &s, &th);
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
@@ -3940,41 +3932,49 @@ fn response_panel_block(app: &TuiApp, focused: bool, s: &Strings, th: &Theme) ->
         .style(Style::default().bg(th.panel))
 }
 
-pub(crate) fn draw_footer(
-    f: &mut Frame,
-    area: Rect,
-    s: &Strings,
-    th: &Theme,
-    can_copy: bool,
-    can_compact: bool,
-    can_switch_section: bool,
-) {
+pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     // Run/Run All (F5 / Alt+F5) now live on the Collections panel's bottom
     // border (see draw_collection_left), and the base-URL row above already
     // shows its own "b" hint — kept out of here to leave room for the rest.
+    //
+    // `↑↓ move` and `Enter edit` used to lead this row and have been dropped:
+    // arrow keys moving a highlight and Enter opening the highlighted thing are
+    // the two most universal conventions in any list UI, so spending a third of
+    // a single-line footer restating them crowded out the hints that are
+    // genuinely PaperBoy-specific and were being truncated off the end at 80
+    // columns.
     let mut hint = vec![
         format!("Tab {}", s.foot_focus),
-        format!("↑↓ {}", s.foot_move),
-        format!("Enter {}", s.foot_edit),
         format!("n {}", s.foot_new),
         format!("F2 {}", s.foot_rename),
-        format!("x {}", s.foot_close),
     ];
+    // `x` deletes whatever the focused pane is about — a request, an
+    // environment, or the active tab from the tab bar — and does nothing at
+    // all in the Main/Response panes, so it's only advertised where it bites.
+    let can_delete = match app.focus {
+        Pane::Tabs => app.active_tab != 0,
+        Pane::List => true,
+        Pane::GlobalEnv => !app.env_rows().is_empty(),
+        _ => false,
+    };
+    if can_delete {
+        hint.push(format!("x {}", s.foot_close));
+    }
     // Only shown while `y` would actually do something — the rest of the
     // footer is a fixed set of always-available shortcuts, but `y` copies
     // either the active selection or, with none, the whole Request JSON /
     // Response panel that currently has focus (see `TuiApp::can_copy`).
-    if can_copy {
+    if app.can_copy() {
         hint.push(format!("y {}", s.foot_copy_selection));
     }
     // `c` toggles the Response body's compact overview — only meaningful (and
-    // only shown) while the Response pane holds focus.
-    if can_compact {
+    // only shown) while the Response pane holds focus, on the Body section.
+    if app.focus == Pane::Response && app.response_section == ResponseSection::Body {
         hint.push(format!("c {}", s.foot_compact));
     }
     // `i` steps the Response section tabs — likewise only meaningful (and only
     // shown) while the Response pane holds focus.
-    if can_switch_section {
+    if app.focus == Pane::Response {
         hint.push(format!("i {}", s.foot_response_section));
     }
     hint.push(format!("? {}", s.foot_help));

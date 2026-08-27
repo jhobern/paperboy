@@ -418,8 +418,6 @@ strings! {
     subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
     json_invalid => "⚠ Invalid JSON — fix before running", "⚠ JSON invalide — corrigez avant d'exécuter", "⚠ Ugyldig JSON — ret før kørsel";
     foot_focus => "focus", "focus", "fokus";
-    foot_move => "move", "déplacer", "flyt";
-    foot_edit => "edit", "modifier", "rediger";
     foot_run => "run", "exécuter", "kør";
     foot_run_all => "run all", "tout exécuter", "kør alle";
     foot_env_activate => "activate/deactivate", "activer/désactiver", "aktivér/deaktivér";
