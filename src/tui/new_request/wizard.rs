@@ -279,6 +279,12 @@ pub(crate) enum NewField {
     Target,
     Method,
     Url,
+    /// The section-view tab bar itself. Focusing the bar (rather than diving
+    /// straight into the section) is what lets `[`/`]` keep cycling: landing
+    /// inside a text cell — the Body especially — would otherwise mean the very
+    /// next bracket got typed into it instead of moving on. Down/Enter steps
+    /// into the section proper.
+    TabBar,
     /// A focused cell of one of the three identical Headers/Cookies/Queries
     /// sections (which one is carried by the [`KvdKind`]).
     Kvd(KvdKind, usize, HdrCol),
@@ -304,7 +310,11 @@ impl NewField {
     /// section for navigation-confinement purposes.
     pub(crate) fn wizard_section(self) -> Option<WizardTab> {
         match self {
-            NewField::Name | NewField::Target | NewField::Method | NewField::Url => None,
+            NewField::Name
+            | NewField::Target
+            | NewField::Method
+            | NewField::Url
+            | NewField::TabBar => None,
             NewField::Kvd(kind, ..) => Some(kind.wizard_tab()),
             NewField::AddKvd(kind) => Some(kind.wizard_tab()),
             NewField::FormField(..) | NewField::AddFormField => Some(WizardTab::Form),
@@ -1201,6 +1211,7 @@ impl NewReq {
             NewField::Report(i, col) => self.reports.get_mut(i).map(|r| r.cell_mut(col)),
             NewField::Method
             | NewField::Target
+            | NewField::TabBar
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
@@ -1463,6 +1474,13 @@ impl NewReq {
     }
 
     pub(crate) fn focus_next(&mut self, forward: bool, wrap: bool) {
+        // Moving forward off the tab bar means "into the section the bar is
+        // showing", which isn't necessarily the next stop in document order
+        // once a single section is on view.
+        if forward && self.focus == NewField::TabBar {
+            self.focus = self.first_field_of(self.view_tab);
+            return;
+        }
         self.focus = if forward {
             self.next_forward(wrap)
         } else {
@@ -1520,6 +1538,11 @@ impl NewReq {
             NewField::Target => (1, 0, 0),
             NewField::Method => (2, 0, 0),
             NewField::Url => (3, 0, 0),
+            // Deliberately *not* a Tab stop (it isn't in `tab_stops`) — walking
+            // the form with Tab shouldn't have to pass through the bar. The
+            // ordering key still places it between Url and the first section so
+            // that stepping *off* the bar with Shift+Tab lands on Url.
+            NewField::TabBar => (3, 1, 0),
             NewField::Kvd(KvdKind::Header, i, c) => (4, i, hdr(c)),
             NewField::AddKvd(KvdKind::Header) => (4, usize::MAX, 0),
             NewField::Kvd(KvdKind::Cookie, i, c) => (5, i, hdr(c)),
@@ -1609,12 +1632,17 @@ impl NewReq {
     /// `next_forward`/`next_backward` are just steps along this one list,
     /// they can never disagree about ordering or empty-section skipping.
     fn tab_stops(&self) -> Vec<NewField> {
-        let mut v = vec![
-            NewField::Name,
-            NewField::Target,
-            NewField::Method,
-            NewField::Url,
-        ];
+        let mut v = vec![NewField::Name];
+        // The target-collection cycler is only *drawn* for a brand-new request
+        // (see `draw_new_request`) — when editing, the request already belongs
+        // to a collection. Leaving it in the stop list anyway parked the focus
+        // on a row that renders nothing, so the cursor appeared to vanish and
+        // Down had to be pressed twice to reach Method.
+        if self.editing.is_none() {
+            v.push(NewField::Target);
+        }
+        v.push(NewField::Method);
+        v.push(NewField::Url);
         for kind in KvdKind::ALL {
             if self.kvd_blank(kind) {
                 v.push(self.kvd_entry(kind));
@@ -1712,6 +1740,9 @@ impl NewReq {
             NewField::Name | NewField::Target | NewField::Method | NewField::Url => {
                 self.next_forward(true)
             }
+            // From the bar, the "next section" is whatever the bar is sitting
+            // on — step into it rather than past it.
+            NewField::TabBar => self.first_field_of(self.view_tab),
             NewField::Kvd(KvdKind::Header, ..) | NewField::AddKvd(KvdKind::Header) => {
                 self.kvd_entry(KvdKind::Cookie)
             }
@@ -1740,7 +1771,9 @@ impl NewReq {
             // Wrapping backward past the first field lands on the last section,
             // matching jump_forward's `Report -> Name` wrap.
             NewField::Name => self.report_entry(),
-            NewField::Target | NewField::Method | NewField::Url => self.next_backward(true),
+            NewField::Target | NewField::Method | NewField::Url | NewField::TabBar => {
+                self.next_backward(true)
+            }
             NewField::Kvd(KvdKind::Header, ..) | NewField::AddKvd(KvdKind::Header) => NewField::Url,
             NewField::Kvd(KvdKind::Cookie, ..) | NewField::AddKvd(KvdKind::Cookie) => {
                 self.kvd_entry(KvdKind::Header)
@@ -1783,6 +1816,9 @@ impl NewReq {
     /// tab-cycling shortcuts.
     pub(crate) fn focus_is_text_entry(&self) -> bool {
         match self.focus {
+            // The tab bar is emphatically not a text cell — that is the whole
+            // point of it, so `[`/`]` keep cycling from there.
+            NewField::TabBar => false,
             NewField::Name | NewField::Url | NewField::Body => true,
             NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
@@ -1829,9 +1865,13 @@ impl NewReq {
             (idx + len - 1) % len
         };
         self.view_tab = self.tab_order[next];
-        if self.view_tab != WizardTab::All {
-            self.focus = self.first_field_of(self.view_tab);
-        }
+        // Focus the bar, not the section. Diving into the section's first field
+        // put the cursor inside a text cell for Body (and for any section whose
+        // first row is a text cell), so the next `[`/`]` was typed rather than
+        // cycling — the keys stopped working exactly where a user is most
+        // likely to keep pressing them. Down or Enter steps in when they're
+        // ready.
+        self.focus = NewField::TabBar;
     }
 
     /// Ctrl+Shift+Left/Right: reorder the active tab within `tab_order`,
@@ -2309,7 +2349,15 @@ pub(crate) fn draw_new_request_with_hits(
             MouseHitTarget::NewRequestField(NewField::Url),
         );
     }
-    draw_wizard_tab_bar(f, rows[4], form.view_tab, &form.tab_order, s, th);
+    draw_wizard_tab_bar(
+        f,
+        rows[4],
+        form.view_tab,
+        &form.tab_order,
+        form.focus == NewField::TabBar,
+        s,
+        th,
+    );
     if let Some(app) = app {
         register_wizard_tab_hits(app, rows[4], &form.tab_order, s);
     }
@@ -2504,6 +2552,7 @@ fn draw_wizard_tab_bar(
     area: Rect,
     active: WizardTab,
     order: &[WizardTab],
+    bar_focused: bool,
     s: &Strings,
     th: &Theme,
 ) {
@@ -2513,7 +2562,17 @@ fn draw_wizard_tab_bar(
             spans.push(Span::styled(" ", Style::default().fg(th.dim)));
         }
         let is_active = *tab == active;
-        let style = if is_active {
+        // The bar is a focus stop of its own (see `NewField::TabBar`), so the
+        // active tab has two looks: highlighted-and-underlined when the bar
+        // itself holds the cursor, plain highlight when focus has moved on into
+        // the section. Without the distinction there'd be nothing on screen to
+        // say where the arrow keys will go next.
+        let style = if is_active && bar_focused {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if is_active {
             Style::default()
                 .fg(th.bg)
                 .bg(th.accent)

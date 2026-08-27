@@ -7010,9 +7010,15 @@ fn the_discard_prompt_moves_between_choices() {
     press(&mut app, KeyCode::Left);
     assert_eq!(
         form_ref(&app).confirm_discard,
-        Some(0),
-        "clamps at the first"
+        Some(2),
+        "wraps round to the last, like every other choice popup"
     );
+    press(&mut app, KeyCode::Right);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
     press(&mut app, KeyCode::Right);
     assert_eq!(form_ref(&app).confirm_discard, Some(1));
 
@@ -11722,6 +11728,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddAssert);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Assert(0));
@@ -11734,6 +11741,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     assert!(form_ref(&app).asserts.is_empty());
 
     press(&mut app, KeyCode::PageDown); // -> Captures
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddCapture);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Capture(0, CapCol::Name));
@@ -12078,6 +12086,7 @@ fn ctrl_h_deletes_in_an_assert_cell_instead_of_typing_a_literal_h() {
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     press(&mut app, KeyCode::Enter); // add a blank assert row
     assert_eq!(new_focus(&app), NewField::Assert(0));
 
@@ -12762,6 +12771,7 @@ fn editing_on_a_section_tab_is_reflected_when_switching_back_to_all() {
 
     press(&mut app, KeyCode::PageDown); // -> Headers tab
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     type_str(&mut app, "X-Test");
     assert_eq!(form_ref(&app).headers[0].key.text(), "X-Test");
 
@@ -12781,8 +12791,14 @@ fn section_tab_confines_tab_navigation_to_that_section() {
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
     assert_eq!(
         new_focus(&app),
+        NewField::TabBar,
+        "cycling parks on the bar so `[`/`]` keep working"
+    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        new_focus(&app),
         NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
-        "switching tabs jumps to the first field"
+        "Down steps off the bar into the section's first field"
     );
 
     // Walking forward within the section is unaffected.
@@ -12831,6 +12847,7 @@ fn section_tab_confines_enter_navigation_to_that_section() {
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
     assert_eq!(form_ref(&app).view_tab, WizardTab::Asserts);
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(
         new_focus(&app),
         NewField::AddAssert,
@@ -12904,66 +12921,103 @@ fn ctrl_shift_arrows_reorder_wizard_section_tabs() {
 }
 
 #[test]
-fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
+fn cycling_a_section_tab_parks_on_the_bar_and_down_enters_the_section() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
     // Leave focus somewhere unrelated (Name) before switching tabs.
     assert_eq!(new_focus(&app), NewField::Name);
 
-    press(&mut app, KeyCode::PageDown); // -> Headers
+    // Cycling leaves the cursor on the tab bar itself rather than diving into
+    // the section — that is what keeps `[`/`]` and PageUp/PageDown working on
+    // the next press, whatever the section's first field happens to be.
+    let entries = [
+        (WizardTab::Headers, NewField::AddKvd(KvdKind::Header)),
+        (WizardTab::Cookies, NewField::AddKvd(KvdKind::Cookie)),
+        (WizardTab::Queries, NewField::AddKvd(KvdKind::Query)),
+        (WizardTab::Options, NewField::AddKvd(KvdKind::Options)),
+        (WizardTab::Form, NewField::AddFormField),
+        (WizardTab::Body, NewField::Body),
+        (WizardTab::Asserts, NewField::AddAssert),
+        (WizardTab::Captures, NewField::AddCapture),
+    ];
+    for (tab, first) in entries {
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(form_ref(&app).view_tab, tab);
+        assert_eq!(
+            new_focus(&app),
+            NewField::TabBar,
+            "cycling to {tab:?} parks on the bar"
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(new_focus(&app), first, "Down enters {tab:?}");
+        // Back onto the bar so the next cycle starts from the same place.
+        press(&mut app, KeyCode::Up);
+    }
+}
+
+/// The reported bug: `]` cycled the tabs happily until it reached Body, whose
+/// only field is a text editor — from there every further `]` was typed into
+/// the body instead of moving on. Parking on the bar fixes it for good.
+#[test]
+fn brackets_keep_cycling_all_the_way_past_the_body_tab() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    // Off Name (a text field) so the brackets act as tab keys at all.
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        press(&mut app, KeyCode::Char(']'));
+        seen.push(form_ref(&app).view_tab);
+    }
     assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Header),
-        "headers start empty, so the entry point is the Add row"
+        seen,
+        vec![
+            WizardTab::Headers,
+            WizardTab::Cookies,
+            WizardTab::Queries,
+            WizardTab::Options,
+            WizardTab::Form,
+            WizardTab::Body,
+            WizardTab::Asserts,
+            WizardTab::Captures,
+        ],
+        "`]` must keep cycling straight through Body"
+    );
+    assert!(
+        form_ref(&app).body.text().is_empty(),
+        "and must never have typed a bracket into the body"
     );
 
-    press(&mut app, KeyCode::PageDown); // -> Cookies
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Cookie),
-        "cookies start empty, so the entry point is the Add row"
-    );
+    // `[` walks back the same way, again straight through Body.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Char('['));
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Form);
+    assert!(form_ref(&app).body.text().is_empty());
+}
 
-    press(&mut app, KeyCode::PageDown); // -> Queries
+/// Once the user steps *into* the Body with Down, brackets are text again —
+/// JSON arrays have to be typeable.
+#[test]
+fn brackets_type_into_the_body_once_focus_has_entered_it() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Char(']'));
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Body);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(new_focus(&app), NewField::Body);
+    type_str(&mut app, "[1,2]");
+    assert_eq!(form_ref(&app).body.text(), "[1,2]");
     assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Query),
-        "queries start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Options
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Options),
-        "options start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Form
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddFormField,
-        "form fields start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Body
-    assert_eq!(
-        new_focus(&app),
-        NewField::Body,
-        "Body's only field is the editor itself, so this also puts it into editing mode"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Asserts
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddAssert,
-        "asserts start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Captures
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddCapture,
-        "captures start empty, so the entry point is the Add row"
+        form_ref(&app).view_tab,
+        WizardTab::Body,
+        "and the tab did not move while typing"
     );
 }
 
@@ -22081,6 +22135,8 @@ fn pagedown_cycles_to_the_reports_tab() {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
+    assert_eq!(new_focus(&app), NewField::TabBar);
+    press(&mut app, KeyCode::Down);
     assert_eq!(new_focus(&app), NewField::AddReport);
 }
 
@@ -22122,6 +22178,7 @@ fn deleting_the_last_report_row_leaves_the_section_empty() {
     for _ in 0..9 {
         press(&mut app, KeyCode::PageDown); // -> Reports
     }
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddReport);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Report(0, CapCol::Name));
@@ -29854,4 +29911,322 @@ fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {
         "and that row is still a request, not a file or folder"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ctrl+C used to set `quit` outright — bypassing even the confirmation `q`
+/// goes through — which meant the near-universal "copy" reflex tore the whole
+/// session down mid-drag. With something selected it now copies.
+#[test]
+fn ctrl_c_copies_the_selection_instead_of_quitting() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("{\n  \"tok\": \"abcdef\"\n}");
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    drag_response_line(&mut app, 1);
+    assert!(app.has_any_selection(), "the drag must leave a selection");
+
+    app.status = None;
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C over a selection must not quit");
+    assert!(app.overlay.is_none(), "nor ask about quitting");
+    assert!(matches!(app.status, Some(crate::i18n::Status::Copied)));
+}
+
+/// With nothing selected Ctrl+C always *asks*, even with confirm-on-exit off:
+/// a key that is hit by accident must never be able to end the session.
+#[test]
+fn ctrl_c_with_no_selection_always_asks_before_quitting() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = false;
+    assert!(!app.has_any_selection());
+
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C must never quit outright");
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::Exit,
+                ..
+            })
+        ),
+        "it raises the exit confirmation even though confirm_on_exit is off"
+    );
+    // Bare `q`, by contrast, still honours the setting and goes straight out.
+    app.overlay = None;
+    press(&mut app, KeyCode::Char('q'));
+    assert!(
+        app.quit,
+        "`q` keeps its confirm_on_exit-respecting behaviour"
+    );
+}
+
+/// Ctrl+C is swallowed while an overlay owns the screen: raising the exit
+/// popup there would replace that overlay and bin a half-finished form.
+#[test]
+fn ctrl_c_is_swallowed_while_an_overlay_is_open() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "the wizard must be open"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C must not quit from inside an overlay");
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "and must leave the wizard exactly where it was"
+    );
+}
+
+/// Esc at the top level means the same thing as `q` — backing out of a TUI
+/// with Esc is the near-universal intuition.
+#[test]
+fn esc_at_the_top_level_quits_like_q() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = false;
+    press(&mut app, KeyCode::Esc);
+    assert!(app.quit, "Esc with nothing to dismiss quits");
+
+    // ...and it goes through the same confirmation, so nothing is lost.
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = true;
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.quit);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Confirm {
+            action: ConfirmAction::Exit,
+            ..
+        })
+    ));
+}
+
+/// Esc only quits once it has run out of things to close: a live selection is
+/// dismissed first, and only the *next* press means "quit".
+#[test]
+fn esc_dismisses_a_selection_before_it_means_quit() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("{\n  \"tok\": \"abcdef\"\n}");
+    app.session.confirm_on_exit = false;
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    drag_response_line(&mut app, 1);
+    assert!(app.has_any_selection());
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !app.has_any_selection(),
+        "the first Esc clears the selection"
+    );
+    assert!(!app.quit, "and does not also quit");
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.quit,
+        "the second Esc, with nothing left to clear, quits"
+    );
+}
+
+/// Tab / Shift+Tab walk the buttons of a confirm popup: a row of choices is a
+/// form, and Tab is how everybody expects to move through one.
+#[test]
+fn tab_moves_between_the_choices_of_a_confirm_popup() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = true;
+    press(&mut app, KeyCode::Char('q'));
+    let sel = |app: &TuiApp| match &app.overlay {
+        Some(Overlay::Confirm { sel, .. }) => *sel,
+        _ => panic!("the exit confirmation must be open"),
+    };
+    assert_eq!(sel(&app), 1, "it opens defaulted to No");
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 0, "Tab moves to Yes");
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 1, "and wraps back round to No");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(sel(&app), 0, "Shift+Tab moves the other way");
+
+    press(&mut app, KeyCode::Enter);
+    assert!(app.quit, "Enter still acts on whatever Tab landed on");
+}
+
+/// Every three-choice popup answers to Tab as well, and wraps at both ends.
+#[test]
+fn tab_walks_the_three_choice_popups_too() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+        ci: app.active_tab,
+        target: std::path::PathBuf::from("/tmp/whatever.hurl"),
+        sel: 0,
+    });
+    let sel = |app: &TuiApp| match &app.overlay {
+        Some(Overlay::WorkspaceSwitchUnsaved { sel, .. }) => *sel,
+        _ => panic!("the popup must still be open"),
+    };
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 1);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 2);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 0, "Tab wraps past the last choice");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(sel(&app), 2, "Shift+Tab wraps back past the first");
+}
+
+/// The keys the help lists have to be the keys that actually work, or the
+/// help is worse than nothing — Ctrl+C no longer quits, and Esc now does.
+#[test]
+fn the_help_lists_the_current_quit_and_copy_bindings() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        !text.contains("q, ^C"),
+        "the old 'Ctrl+C quits' claim must be gone: {text}"
+    );
+}
+
+/// Shared setup: an app whose active request has `body` as its last response.
+fn app_with_response_body(body: &str) -> TuiApp {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: body.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+    app
+}
+
+/// Drag-select the whole of rendered Response line `row` (0-based).
+fn drag_response_line(app: &mut TuiApp, row: u16) {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let area = app.resp_text_area;
+    assert!(area.width > 4 && area.height > row, "body must render");
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+}
+
+/// The target-collection cycler isn't drawn when editing an existing request
+/// (it already belongs to one), but it used to stay in the focus ring — so
+/// Down from Name parked the cursor on a row that renders nothing and it took
+/// a second Down to reach Method.
+#[test]
+fn down_from_name_reaches_method_directly_when_editing() {
+    let entry = HurlEntry {
+        title: "edit me".into(),
+        url: "http://example.test/".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+    assert_eq!(new_focus(&app), NewField::Name);
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Method,
+        "the hidden Target row must not be a focus stop while editing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Name,
+        "and back again in one step"
+    );
+}
+
+/// A brand-new request *does* show the target cycler, so it stays in the ring.
+#[test]
+fn down_from_name_still_reaches_target_for_a_new_request() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(new_focus(&app), NewField::Name);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(new_focus(&app), NewField::Target);
+}
+
+/// A response with no body at all left the pane blank, which reads as "PaperBoy
+/// lost the body" rather than "the server sent none" — common for the bare 4xx
+/// plenty of servers return.
+#[test]
+fn an_empty_response_body_says_so_rather_than_rendering_blank() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("");
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.status = 404;
+        r.status_text = "Not Found".into();
+    }
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    let s = Strings::for_language(&Language::English);
+    assert!(text.contains("404"), "the status still shows");
+    assert!(
+        text.contains(s.resp_empty_body),
+        "the empty body is called out: {text}"
+    );
+
+    // A response that *does* have a body must not get the note.
+    let mut app = app_with_response_body("{\n  \"error\": \"nope\"\n}");
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.status = 404;
+        r.status_text = "Not Found".into();
+    }
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("nope"), "a 4xx body renders in full: {text}");
+    assert!(!text.contains(s.resp_empty_body));
 }

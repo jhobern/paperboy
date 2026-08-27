@@ -22,7 +22,49 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   untouched form still closes on the first Esc: prompting when there is nothing
   to lose would only train the habit of dismissing the prompt unread.
 
+- **The Response pane now says when a response had no body.** A response that
+  carried nothing left the Response pane completely blank below the status line,
+  which reads as PaperBoy having lost the body rather than the server never
+  having sent one — an easy conclusion to jump to on the bare `404`s and `500`s
+  plenty of servers return. Such a response now says so explicitly. The note is
+  drawn over the panel rather than through it, so it is never selectable and a
+  whole-panel copy still yields an empty body rather than the placeholder text.
+
 ### Changed
+
+- **Ctrl+C no longer quits.** Every other application treats it as "copy", so it
+  was being pressed by reflex part-way through dragging out a selection — and it
+  quit *harder* than `q` did, setting the exit flag directly and skipping even
+  the unsaved-work confirmation. It now copies the selection when there is one.
+  With nothing selected it always raises the exit confirmation, even when
+  confirm-on-exit is switched off, so a stray Ctrl+C can never end the session
+  outright; while an overlay is open it is swallowed entirely, since raising the
+  exit popup there would replace whatever half-finished form was in it.
+
+- **Esc quits from the top level, like `q`.** Backing out of a terminal
+  application with Esc is close to universal intuition. It still only quits once
+  it has run out of things to close: an open menu, an active text selection or
+  an environment filter is dismissed first, and only the next press means quit —
+  through the same confirmation `q` uses, so nothing unsaved is lost. (Clearing
+  a selection now also clears one made in a report, which previously stayed
+  stuck: Esc reported there was a selection, dropped nothing, and did so
+  forever.)
+
+- **Tab and Shift+Tab move between the buttons of every confirmation popup.** A
+  row of choices is a form, and Tab is how a form is walked; previously only the
+  arrow keys (and `h`/`l`) worked. This covers all of them — the Yes/No
+  confirmations, the workspace storage and reload prompts, the unsaved-changes
+  prompts and the wizard's own discard prompt. The wizard's prompt now wraps at
+  both ends like the other six, instead of clamping.
+
+- **`[` and `]` keep cycling the request wizard's section tabs all the way
+  round.** They used to stop working at Body: cycling moved focus into the
+  section, and the Body section's only field is a text editor, so every further
+  bracket was typed into the body instead of moving on. Cycling now parks on the
+  tab bar itself — which is a focus stop of its own, shown underlined — and Down
+  or Enter steps into the section when you're ready. Brackets still type
+  normally once focus is inside the Body, because JSON arrays have to be
+  typeable.
 
 - **Installation now recommends `cargo install paperboy --locked`.** Without it
   Cargo re-resolves every transitive dependency to whatever is newest at install
@@ -39,6 +81,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   optional dependencies whether or not the feature enabling them is on.
 
 ### Fixed
+
+- **Down from the wizard's Name field no longer stops on an invisible row.**
+  When editing an existing request the target-collection cycler isn't drawn —
+  the request already belongs to a collection — but it stayed in the focus ring,
+  so the cursor appeared to vanish and Down had to be pressed twice to reach
+  Method. It is now skipped whenever it isn't on screen.
 
 - **A Header, Cookie, Query, Options or Form row can no longer destroy the whole
   collection.** Hurl decides what a line inside a request is by its first

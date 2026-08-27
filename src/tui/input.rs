@@ -37,7 +37,7 @@ impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
         self.last_mouse_row = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
+            self.ctrl_c();
             return;
         }
         // Ctrl+Y copies the current status/error line(s) to the clipboard.
@@ -1619,6 +1619,12 @@ impl TuiApp {
                 self.env_query.clear();
                 self.clamp_env_selection();
             }
+            // With nothing left for it to dismiss, Esc quits exactly as `q`
+            // does (confirmation and unsaved-work checks included). Backing out
+            // of a TUI with Esc is the near-universal intuition, and it has to
+            // come after the two arms above so it only ever fires once Esc has
+            // run out of things to close.
+            KeyCode::Esc => self.request_quit(),
             // `y` (vim-style "yank") copies to the clipboard on demand — an
             // explicit fallback for terminals where the automatic
             // copy-on-mouse-release OSC 52 write isn't picked up (e.g. no
@@ -3925,6 +3931,42 @@ impl TuiApp {
         }
     }
 
+    /// Ctrl+C: copy the selection if there is one, otherwise ask about quitting.
+    ///
+    /// Every other application treats Ctrl+C as "copy", so it gets pressed by
+    /// reflex part-way through dragging out a selection — and it used to tear
+    /// the TUI down on the spot, without even the confirmation that `q` goes
+    /// through. It now does the expected thing when something is selected, and
+    /// when nothing is it *always* raises the exit confirmation, even with
+    /// `confirm_on_exit` off, so a stray Ctrl+C can never end the session
+    /// outright. (Ctrl+C isn't a SIGINT here: raw mode delivers it as an
+    /// ordinary key event, so swallowing it is entirely ours to decide.)
+    pub(crate) fn ctrl_c(&mut self) {
+        // While an overlay owns the screen, swallow Ctrl+C completely: opening
+        // the exit popup would replace that overlay and throw away whatever
+        // half-finished form or wizard is in it. Esc is the way out of an
+        // overlay, and every overlay that holds text has its own copy key.
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.copy_report_selection_only() || self.copy_selection_only() {
+            return;
+        }
+        self.confirm_quit();
+    }
+
+    /// Raise the exit confirmation unconditionally.
+    ///
+    /// Split out of [`Self::request_quit`] for the key bindings that can be hit
+    /// by accident (Ctrl+C), which must ask even when the user has turned
+    /// confirm-on-exit off.
+    pub(crate) fn confirm_quit(&mut self) {
+        self.overlay = Some(Overlay::Confirm {
+            action: ConfirmAction::Exit,
+            sel: 1,
+        });
+    }
+
     /// Quit, first asking for confirmation when the setting is enabled — or when
     /// there are unsaved secret or request edits that would be lost (even if the
     /// setting is off), so the user is never silently robbed of changes.
@@ -3933,10 +3975,7 @@ impl TuiApp {
             || self.has_unsaved_secret_changes()
             || self.unsaved_request_edits() > 0
         {
-            self.overlay = Some(Overlay::Confirm {
-                action: ConfirmAction::Exit,
-                sel: 1,
-            });
+            self.confirm_quit();
         } else {
             self.quit = true;
         }
@@ -4671,14 +4710,14 @@ impl TuiApp {
                     sel: (sel + 1) % 3,
                 });
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::CloseGitWorkspace {
                     idx,
                     path,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::CloseGitWorkspace {
                     idx,
                     path,
@@ -4715,13 +4754,13 @@ impl TuiApp {
                     sel: (sel + 1) % 3,
                 });
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
                     ci,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
                     ci,
                     sel: (sel + 1) % 3,
@@ -4756,14 +4795,14 @@ impl TuiApp {
     ) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
                     ci,
                     target,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
                     ci,
                     target,
@@ -4814,7 +4853,9 @@ impl TuiApp {
             | KeyCode::Char('h')
             | KeyCode::Char('l')
             | KeyCode::Char('k')
-            | KeyCode::Char('j') => {
+            | KeyCode::Char('j')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceReloadConfirm {
                     idx,
                     reload,
@@ -4859,7 +4900,9 @@ impl TuiApp {
             | KeyCode::Char('h')
             | KeyCode::Char('l')
             | KeyCode::Char('k')
-            | KeyCode::Char('j') => {
+            | KeyCode::Char('j')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceStorageChoice {
                     repo,
                     name,
@@ -5166,8 +5209,15 @@ impl TuiApp {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
             KeyCode::Char('n') | KeyCode::Char('N') => self.overlay = None,
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                // Two options (Yes = 0, No = 1); toggle between them.
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                // Two options (Yes = 0, No = 1); toggle between them. Tab and
+                // Shift+Tab move too, because a row of buttons is a form and
+                // Tab is how everyone expects to walk one.
                 self.overlay = Some(Overlay::Confirm {
                     action,
                     sel: 1 - sel,
@@ -5895,11 +5945,15 @@ impl TuiApp {
                 // "Keep editing", by Enter on the third choice.
                 Some(_) => form.confirm_discard = None,
                 None => match key.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        form.confirm_discard = Some(sel.saturating_sub(1));
+                    // All the app's choice popups wrap, and Tab/Shift+Tab walk
+                    // the row as well — a row of buttons is a form, and Tab is
+                    // how everyone expects to move through one.
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                        form.confirm_discard =
+                            Some((sel + WIZARD_DISCARD_CHOICES - 1) % WIZARD_DISCARD_CHOICES);
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
-                        form.confirm_discard = Some((sel + 1).min(WIZARD_DISCARD_CHOICES - 1));
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                        form.confirm_discard = Some((sel + 1) % WIZARD_DISCARD_CHOICES);
                     }
                     // Esc backs out of the prompt, not the wizard: the reflex
                     // that opened it must not also answer it, or holding Esc
@@ -6222,6 +6276,19 @@ impl TuiApp {
             form.move_view_tab(key.code == KeyCode::Right);
         } else {
             match form.focus {
+                // The section-view tab bar. `[`/`]` already reach here (the bar
+                // isn't a text cell), and Left/Right do the same thing so the
+                // bar behaves like every other cycler in the form. Down or
+                // Enter drops into the section the bar is showing.
+                NewField::TabBar => match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => form.cycle_view_tab(false),
+                    KeyCode::Right | KeyCode::Char('l') => form.cycle_view_tab(true),
+                    KeyCode::Down | KeyCode::Enter => {
+                        form.focus = form.first_field_of(form.view_tab);
+                    }
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
                 NewField::Method => match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
                         form.method_idx = (form.method_idx + METHODS.len() - 1) % METHODS.len();

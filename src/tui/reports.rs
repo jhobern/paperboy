@@ -2974,7 +2974,16 @@ impl TuiApp {
                     } else if self.reports[idx].view == ReportView::Nodes {
                         self.reports[idx].view = ReportView::Source;
                         self.reports[idx].editor_view = ReportView::Source;
+                    } else if self.has_any_selection() {
+                        self.clear_selections();
+                    } else {
+                        // Nothing left to back out of, so Esc means here what
+                        // it means in the collection view: quit, through the
+                        // same confirmation `q` goes through.
+                        self.request_quit();
                     }
+                } else {
+                    self.request_quit();
                 }
             }
             // Run the report against its bound collection and show the grid.

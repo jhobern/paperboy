@@ -3842,6 +3842,21 @@ pub(crate) fn draw_response(
         Paragraph::new(visible_wrapped).style(Style::default().fg(th.text)),
         body_area,
     );
+    // A response that carries no body at all (common for 204s, and for the
+    // error statuses plenty of servers return bare) would otherwise leave the
+    // pane completely blank — indistinguishable from PaperBoy having lost the
+    // body. Say so instead. Drawn over the panel rather than through it so the
+    // note is never mouse-selectable or picked up by a whole-panel `y`-copy: it
+    // isn't part of the response.
+    if body.trim().is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                s.resp_empty_body.to_string(),
+                Style::default().fg(th.dim),
+            )),
+            body_area,
+        );
+    }
 }
 
 pub(crate) fn draw_footer(
@@ -4312,6 +4327,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("", s.help_row_toggle_delete),
                             ("y", s.help_copy_selection),
+                            ("Ctrl+C", s.help_ctrl_c),
                             ("c (Response pane)", s.help_compact),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
@@ -4348,7 +4364,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("+ / -", s.help_resize),
                             ("< / >", s.help_resize_width),
                             ("Esc", s.help_cancel),
-                            ("q, ^C", s.help_quit),
+                            ("q / Esc", s.help_quit),
                         ],
                     ),
                 ];

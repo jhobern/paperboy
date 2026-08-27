@@ -1615,6 +1615,17 @@ impl TuiApp {
     pub(crate) fn clear_selections(&mut self) {
         self.main_panel.clear();
         self.resp_panel.clear();
+        // The report panels count towards `has_any_selection`, so they have to
+        // be cleared here too. Without this, Esc over a selected report region
+        // reports "there was a selection", drops nothing, and stays wedged in
+        // that state for every later press — which now also means it could
+        // never fall through to quitting.
+        if let Some(idx) = self.active_report_index() {
+            let rt = &mut self.reports[idx];
+            rt.source_panel.clear();
+            rt.validation_panel.clear();
+            rt.results_panel.clear();
+        }
     }
 
     pub(crate) fn begin_request(&mut self) {
