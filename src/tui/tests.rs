@@ -30230,3 +30230,60 @@ fn an_empty_response_body_says_so_rather_than_rendering_blank() {
     assert!(text.contains("nope"), "a 4xx body renders in full: {text}");
     assert!(!text.contains(s.resp_empty_body));
 }
+
+/// A 4xx/5xx body is usually the most useful thing on screen — it is where the
+/// API explains itself — so it has to survive every extra row the Response pane
+/// puts above it. A failed run adds an error line and a list of assert rows,
+/// which is the layout path most likely to squeeze the body out.
+#[test]
+fn error_status_bodies_render_even_with_an_error_line_and_asserts() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for status in [400u16, 401, 404, 422, 500, 502, 503] {
+        let mut app = app_with_response_body("{\n  \"detail\": \"why-it-failed\"\n}");
+        let ci = app.active_tab;
+        let r = app.collections[ci].entries[0]
+            .last_response
+            .as_mut()
+            .expect("a response");
+        r.status = status;
+        r.status_text = "Err".into();
+        r.error = format!("Expected status 200 but got {status}");
+        r.assert_results = vec![
+            crate::hurl::AssertOutcome {
+                expr: format!("status == {status}"),
+                passed: false,
+                detail: "actual value is 200".into(),
+            },
+            crate::hurl::AssertOutcome {
+                expr: "jsonpath \"$.detail\" exists".into(),
+                passed: true,
+                detail: String::new(),
+            },
+        ];
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains(&status.to_string()),
+            "the {status} status shows"
+        );
+        assert!(
+            text.contains("why-it-failed"),
+            "the {status} body must render alongside the error and asserts: {text}"
+        );
+        let s = Strings::for_language(&Language::English);
+        assert!(
+            !text.contains(s.resp_empty_body),
+            "a response that has a body must not be called empty"
+        );
+    }
+}

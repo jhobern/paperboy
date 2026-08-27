@@ -769,4 +769,51 @@ mod tests {
 
         std::fs::remove_dir_all(&staged_dir).ok();
     }
+
+    /// An error-status response must keep its body. A 4xx/5xx payload is
+    /// usually the *most* interesting thing on screen — it carries the API's
+    /// explanation of what went wrong — so losing it would be worse than
+    /// losing a 200's. Checked with and without an `HTTP <code>` expectation
+    /// line, because a failed status assertion takes a different path through
+    /// `map_entry_result` (it fills in `error`) and must not discard the
+    /// response it is complaining about.
+    #[test]
+    fn error_status_responses_keep_their_body() {
+        for status in [400u16, 401, 404, 422, 500, 502, 503] {
+            // No expectation line: the entry passes, and the body is the point.
+            let port = one_shot_server(status, "Err");
+            let content = format!("GET http://127.0.0.1:{port}/\n");
+            let out = run_hurl(&content, &HashMap::new(), None);
+            let e = out.entries.first().expect("one entry");
+            assert_eq!(e.status, status);
+            assert!(e.ok, "no expectation means nothing to fail: {:?}", e.error);
+            assert_eq!(
+                e.raw_body, "{\"ok\":true}",
+                "the {status} body must survive verbatim"
+            );
+            assert!(
+                e.body.contains("\"ok\""),
+                "and be pretty-printed for display: {:?}",
+                e.body
+            );
+
+            // Now with an expectation the response fails: the entry is marked
+            // failed and carries an error, but the body must still be there.
+            let port = one_shot_server(status, "Err");
+            let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+            let out = run_hurl(&content, &HashMap::new(), None);
+            let e = out.entries.first().expect("one entry");
+            assert_eq!(e.status, status);
+            assert!(!e.ok, "expected 200, got {status}");
+            assert!(
+                e.error.as_deref().unwrap_or_default().contains("200"),
+                "the mismatch is reported: {:?}",
+                e.error
+            );
+            assert_eq!(
+                e.raw_body, "{\"ok\":true}",
+                "a failed status assert must not discard the {status} body"
+            );
+        }
+    }
 }
