@@ -426,7 +426,7 @@ strings! {
     // because it shares a one-line border with two other hints.
     foot_env_goto_active => "go to active", "aller à l'actif", "gå til aktivt";
     foot_env_link => "link env", "lier env", "link miljø";
-    foot_new => "New Request/Var", "Nouvelle requête/var", "Ny forespørgsel/var";
+    foot_new => "New Request", "Nouvelle requête", "Ny forespørgsel";
     foot_rename => "rename", "renommer", "omdøb";
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";

@@ -52,23 +52,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
-- **`x` no longer closes the collection tab from anywhere.** It was the
-  fall-through case, so as well as deleting a request in the Requests list and
-  an environment in the Environments panel — where it deletes the thing the
-  focused pane is about — it also closed the whole active tab from the Request
-  and Response panes, where nothing on screen suggests a keypress is aimed at
-  the tab bar. Reading a response and pressing `x` took the collection with it.
-  It now closes a tab only from the tab bar itself. Ctrl+W still closes the
-  active tab from any pane, which is the OS-wide convention for exactly that
-  and isn't a key anyone presses by accident while reading.
+- **`x` and F2 no longer act on the collection tab from anywhere.** Both were
+  fall-through cases, so as well as their scoped uses — `x` deleting a request
+  in the Requests list or an environment in the Environments panel, F2 renaming
+  an environment there — they also closed and renamed the whole active tab from
+  the Request and Response panes, where the thing under the cursor is a request
+  and nothing suggests a keypress is aimed at the tab bar. Reading a response
+  and pressing `x` took the collection with it. Both now act on a tab only from
+  the tab bar itself. Ctrl+W still closes the active tab from any pane, which is
+  the OS-wide convention for exactly that and isn't a key anyone presses by
+  accident while reading.
 
 - **The footer no longer restates the arrow keys and Enter.** `↑↓ move` and
   `Enter edit` led a single-line footer that was being truncated before it
   reached the hints specific to PaperBoy — at 80 columns the Response pane's
   own shortcuts never appeared at all. Arrow keys moving a highlight and Enter
   opening it are the two most universal conventions in a list UI, so the room
-  goes to the keys that aren't guessable instead. `x` is now shown only in the
-  panes where it actually does something.
+  goes to the keys that aren't guessable instead. `x` and F2 are now shown only
+  in the panes where they actually do something, and `n` is labelled "New
+  Request" rather than "New Request/Var" — the variable half of that key
+  belongs to the environment popup, a different context with its own keys, and
+  never applied to the pane the footer is describing.
 
 - **Ctrl+C no longer quits.** Every other application treats it as "copy", so it
   was being pressed by reflex part-way through dragging out a selection — and it

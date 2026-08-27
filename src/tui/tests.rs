@@ -6373,7 +6373,7 @@ fn f2_renames_the_active_non_builtin_tab() {
     let mut app = TuiApp::default();
     app.collections.push(Collection::new("api".into(), vec![]));
     app.active_tab = 1;
-    app.focus = Pane::Main;
+    app.focus = Pane::Tabs;
     press(&mut app, KeyCode::F(2));
     assert!(
         matches!(
@@ -6385,6 +6385,26 @@ fn f2_renames_the_active_non_builtin_tab() {
         ),
         "F2 should open the rename prompt for the active tab"
     );
+}
+
+/// Like `x`, F2 was the fall-through arm, so "rename" fired from the Requests
+/// list and the Request/Response panes too — offering to rename the whole
+/// collection while a *request* was highlighted, which is an easy misread of
+/// what has focus.
+#[test]
+fn f2_renames_the_tab_only_from_the_tab_bar() {
+    for pane in [Pane::Main, Pane::Response, Pane::List] {
+        let mut app = TuiApp::default();
+        app.collections.push(Collection::new("api".into(), vec![]));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        press(&mut app, KeyCode::F(2));
+        assert!(
+            app.overlay.is_none(),
+            "F2 in {pane:?} must not offer to rename the collection tab"
+        );
+    }
 }
 
 #[test]
@@ -30571,7 +30591,7 @@ fn ctrl_w_still_closes_the_tab_from_any_pane() {
 /// longer spend room restating themselves — and `x` is only offered where it
 /// actually does something.
 #[test]
-fn the_footer_drops_the_universal_hints_and_scopes_the_delete_one() {
+fn the_footer_drops_the_universal_hints_and_scopes_the_pane_specific_ones() {
     let mut app = app_with_response_headers("{}", &[("a", "b")]);
     app.focus = Pane::Response;
     let s = Strings::for_language(&Language::English);
@@ -30590,11 +30610,37 @@ fn the_footer_drops_the_universal_hints_and_scopes_the_delete_one() {
         !foot.contains(&format!("x {}", s.foot_close)),
         "x does nothing in the Response pane, so it isn't advertised there"
     );
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "nor does F2, for the same reason"
+    );
 
     app.focus = Pane::List;
     let foot = render_footer(&mut app);
     assert!(
         foot.contains(&format!("x {}", s.foot_close)),
-        "but it is offered in the Requests list, where it deletes a request: {foot}"
+        "but x is offered in the Requests list, where it deletes a request: {foot}"
+    );
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "F2 has nothing to rename in the Requests list yet, so it stays hidden"
+    );
+
+    // The built-in Request tab can't be renamed, so F2 stays hidden even on
+    // the tab bar until there's a closable tab to act on.
+    app.focus = Pane::Tabs;
+    let foot = render_footer(&mut app);
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "the built-in tab has no rename to offer: {foot}"
+    );
+
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    app.active_tab = 1;
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(&format!("F2 {}", s.foot_rename)),
+        "F2 renames a real tab from the tab bar: {foot}"
     );
 }

@@ -3943,11 +3943,18 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     // a single-line footer restating them crowded out the hints that are
     // genuinely PaperBoy-specific and were being truncated off the end at 80
     // columns.
-    let mut hint = vec![
-        format!("Tab {}", s.foot_focus),
-        format!("n {}", s.foot_new),
-        format!("F2 {}", s.foot_rename),
-    ];
+    let mut hint = vec![format!("Tab {}", s.foot_focus), format!("n {}", s.foot_new)];
+    // F2 renames whatever the focused pane is about — the active tab from the
+    // tab bar, the selected environment in the Environments panel — and, like
+    // `x`, does nothing elsewhere, so it's only advertised where it bites.
+    let can_rename = match app.focus {
+        Pane::Tabs => app.active_tab != 0,
+        Pane::GlobalEnv => !app.env_rows().is_empty(),
+        _ => false,
+    };
+    if can_rename {
+        hint.push(format!("F2 {}", s.foot_rename));
+    }
     // `x` deletes whatever the focused pane is about — a request, an
     // environment, or the active tab from the tab bar — and does nothing at
     // all in the Main/Response panes, so it's only advertised where it bites.

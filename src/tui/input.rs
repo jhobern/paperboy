@@ -1813,8 +1813,15 @@ impl TuiApp {
                     self.open_prompt_rename_env(env_id);
                 }
             }
-            // F2 renames the active tab (matches the common OS convention).
-            KeyCode::F(2) if self.active_tab != 0 => self.open_prompt_rename(),
+            // F2 renames the active tab — but, like `x`, only from the tab bar
+            // itself. It used to be the fall-through arm, so it also fired
+            // from the Requests list and the Request/Response panes, where the
+            // thing under the cursor is a request rather than the tab: pressing
+            // rename while a request is highlighted and being asked to rename
+            // the *collection* is a straightforward misread of what has focus.
+            KeyCode::F(2) if self.focus == Pane::Tabs && self.active_tab != 0 => {
+                self.open_prompt_rename()
+            }
             KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
