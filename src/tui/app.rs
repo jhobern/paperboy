@@ -738,6 +738,38 @@ pub(crate) enum Pane {
     Response,
 }
 
+/// Which section of the response the Response pane is currently showing,
+/// mirroring the GUI's `ResponseSection` so the two front-ends agree on what a
+/// response is made of.
+///
+/// Deliberately modelled as a *ring* rather than a boolean toggle even though
+/// there are only two members today: the runner already captures more than
+/// this (per-phase timings, captured `[Captures]` values, the redirect chain)
+/// and none of it is drawn yet. Adding one of those later should be a new
+/// variant and a new draw arm, not a re-negotiation of the key map.
+///
+/// Cycled with `i` / `Shift+I` while the Response pane holds focus. Not `[`/`]`
+/// — those mean "previous/next collection tab" from *every* pane, and quietly
+/// re-pointing them at the response would make them mean different things
+/// depending on which panel happened to have the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResponseSection {
+    Body,
+    Headers,
+}
+
+impl ResponseSection {
+    /// The ring, in tab-bar order. Also the order `i` steps through.
+    pub(crate) const ALL: [ResponseSection; 2] = [ResponseSection::Body, ResponseSection::Headers];
+
+    pub(crate) fn label(self, s: &Strings) -> &'static str {
+        match self {
+            ResponseSection::Body => s.resp_section_body,
+            ResponseSection::Headers => s.resp_section_headers,
+        }
+    }
+}
+
 /// Interaction layers in paint order. Mouse dispatch only considers hits from
 /// the topmost layer drawn in the last frame, so overlays never leak clicks to
 /// the UI underneath them.
@@ -1157,6 +1189,10 @@ pub struct TuiApp {
     /// the Response pane is focused. Display-only: `resp_full_body` keeps the
     /// untruncated text so a whole-panel `y`-copy still yields the full body.
     pub(crate) response_compact: bool,
+    /// Which section of the response the pane is showing (Body / Headers).
+    /// Purely a view choice — it changes what `resp_panel` is fed, never the
+    /// response itself — so it isn't persisted and resets to `Body` on start.
+    pub(crate) response_section: ResponseSection,
     /// The full (untruncated) Response body cached each frame the normal body is
     /// drawn, so the whole-panel copy fallback can return it even while the
     /// panel is showing the compacted overview. Empty when the current frame
@@ -1449,6 +1485,7 @@ impl Default for TuiApp {
             resp_text_area: Rect::default(),
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
+            response_section: ResponseSection::Body,
             resp_full_body: Arc::from(""),
             resp_compact_line_maps: Vec::new(),
             main_scrollbar_area: Rect::default(),
@@ -1626,6 +1663,33 @@ impl TuiApp {
             rt.validation_panel.clear();
             rt.results_panel.clear();
         }
+    }
+
+    /// Step the Response pane's section ring (`i` forward, `Shift+I` back).
+    ///
+    /// Switching section swaps what `resp_panel` holds, so the old scroll
+    /// offset and any painted selection would both be pointing at text that is
+    /// no longer on screen — reset the one and drop the other. Only the
+    /// response panel's selection is dropped: a selection in the Request pane
+    /// is untouched by this and shouldn't be collateral damage.
+    pub(crate) fn cycle_response_section(&mut self, forward: bool) {
+        let all = ResponseSection::ALL;
+        let i = all
+            .iter()
+            .position(|s| *s == self.response_section)
+            .unwrap_or(0);
+        let next = if forward {
+            (i + 1) % all.len()
+        } else {
+            (i + all.len() - 1) % all.len()
+        };
+        if all[next] == self.response_section {
+            return;
+        }
+        self.response_section = all[next];
+        self.resp_panel.clear();
+        self.resp_panel.set_scroll(0);
+        self.resp_max_scroll = 0;
     }
 
     pub(crate) fn begin_request(&mut self) {

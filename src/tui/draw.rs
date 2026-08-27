@@ -1719,6 +1719,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
         &s,
         &th,
         app.can_copy(),
+        app.focus == Pane::Response && app.response_section == ResponseSection::Body,
         app.focus == Pane::Response,
     );
 
@@ -3569,7 +3570,13 @@ pub(crate) fn draw_response(
     th: &Theme,
 ) {
     let focused = app.focus == Pane::Response;
-    let block = panel(s.response_heading.to_string(), focused, th);
+    // The section tabs live *in the panel's top border*, alongside the heading,
+    // rather than on a row of their own. The Response pane is routinely only
+    // three rows tall (at 80×24 with the default split it's exactly that), so a
+    // dedicated tab row would spend a third of the pane on chrome — and the
+    // border row is already being drawn regardless. It also makes them read
+    // more like tabs, sitting on the panel's edge.
+    let block = response_panel_block(app, focused, s, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -3585,7 +3592,7 @@ pub(crate) fn draw_response(
     let loading = entry
         .map(|e| e.last_run == RunStatus::Running)
         .unwrap_or(false);
-    let (status, status_text, body, error, asserts, duration) =
+    let (status, status_text, body, error, asserts, duration, headers) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
                 r.status,
@@ -3594,6 +3601,7 @@ pub(crate) fn draw_response(
                 r.error.clone(),
                 r.assert_results.clone(),
                 r.duration_ms,
+                r.headers.clone(),
             ),
             None => (
                 0,
@@ -3602,6 +3610,7 @@ pub(crate) fn draw_response(
                 String::new(),
                 Vec::new(),
                 None,
+                Vec::new(),
             ),
         };
 
@@ -3733,13 +3742,20 @@ pub(crate) fn draw_response(
         })
         .collect();
 
-    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 body row)
-    // · body (rest). A runner error that *isn't* already spelled out by a
-    // failed assert row — a failed `[Captures]`, a transport oddity that still
-    // returned a response — gets one error-coloured line so it isn't lost now
-    // that a non-empty error no longer replaces the whole response. When an
-    // assert failed (passed < total) that ✗ row already carries the reason, so
-    // the extra line would just be noise and is skipped.
+    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 content
+    // row) · section content (rest). The section tabs are on the top border
+    // (see `response_panel_block`), so they cost no rows here. A runner error
+    // that *isn't* already spelled out by a failed assert row — a failed
+    // `[Captures]`, a transport oddity that still returned a response — gets
+    // one error-coloured line so it isn't lost now that a non-empty error no
+    // longer replaces the whole response. When an assert failed (passed <
+    // total) that ✗ row already carries the reason, so the extra line would
+    // just be noise and is skipped.
+    //
+    // The status/error/assert rows sit above the section content, and outside
+    // the tabs, because they describe the response as a whole rather than any
+    // one section: the status of a request is as relevant while reading its
+    // headers as its body.
     let show_err_line = !error.is_empty() && passed == total;
     let err_h: u16 = u16::from(show_err_line);
     let assert_h =
@@ -3766,6 +3782,22 @@ pub(crate) fn draw_response(
         f.render_widget(Paragraph::new(assert_lines), rows[2]);
     }
 
+    // Feed whichever section is on view through the *same* selectable panel the
+    // body has always used, rather than giving headers a second, half-featured
+    // viewer: scrolling, the scrollbar, mouse drag-selection and `y`-copy all
+    // come along for free and behave identically in both sections.
+    let headers_text: Arc<str> = Arc::from(
+        headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let (content, empty_note) = match app.response_section {
+        ResponseSection::Body => (body.clone(), s.resp_empty_body),
+        ResponseSection::Headers => (headers_text, s.resp_no_headers),
+    };
+
     // Wrap long lines to the body width and clamp scrolling so the user can't
     // scroll past the last line into blank space. The panel caches the
     // wrap/line structure (`set_content` → `rebuild_if_needed`) and reuses it
@@ -3780,13 +3812,17 @@ pub(crate) fn draw_response(
     // Compact view (toggled with `c`) shortens long string literals for
     // skimming. It's display-only: cache the full body so a whole-panel
     // `y`-copy still returns the untruncated text (see `whole_panel_text`).
-    if app.response_compact {
-        app.resp_full_body = body.clone();
-        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&body);
+    // Body-only — `c` is refused in the other sections, and leaving
+    // `resp_full_body`/`resp_compact_line_maps` empty here is what makes the
+    // copy paths fall back to the panel's own text (see
+    // `resp_full_selected_parts`).
+    if app.response_compact && app.response_section == ResponseSection::Body {
+        app.resp_full_body = content.clone();
+        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&content);
         app.resp_compact_line_maps = line_maps;
         app.resp_panel.set_content(Arc::from(compacted), width);
     } else {
-        app.resp_panel.set_content(body.clone(), width);
+        app.resp_panel.set_content(content.clone(), width);
     }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
@@ -3842,21 +3878,66 @@ pub(crate) fn draw_response(
         Paragraph::new(visible_wrapped).style(Style::default().fg(th.text)),
         body_area,
     );
-    // A response that carries no body at all (common for 204s, and for the
-    // error statuses plenty of servers return bare) would otherwise leave the
-    // pane completely blank — indistinguishable from PaperBoy having lost the
-    // body. Say so instead. Drawn over the panel rather than through it so the
-    // note is never mouse-selectable or picked up by a whole-panel `y`-copy: it
-    // isn't part of the response.
-    if body.trim().is_empty() {
+    // A section with nothing in it — a 204 or a bare error status with no body,
+    // a response that carried no headers — would otherwise leave the pane
+    // completely blank, indistinguishable from PaperBoy having lost the
+    // content. Say so instead. Drawn over the panel rather than through it so
+    // the note is never mouse-selectable or picked up by a whole-panel
+    // `y`-copy: it isn't part of the response.
+    if content.trim().is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
-                s.resp_empty_body.to_string(),
+                empty_note.to_string(),
                 Style::default().fg(th.dim),
             )),
             body_area,
         );
     }
+}
+
+/// Build the Response panel's block, with the section tabs (`Body │ Headers`)
+/// rendered into the top border next to the heading.
+///
+/// The tabs go on the border rather than on a row of their own because the
+/// Response pane is often only two or three rows tall, and chrome that eats a
+/// third of the content is worse than no chrome — the border is drawn either
+/// way, so this is free.
+///
+/// Stepped with `i` / `Shift+I` while the Response pane holds focus —
+/// deliberately not `[`/`]` or Ctrl+Left/Right, both of which mean
+/// "previous/next collection tab" from *every* pane and would become
+/// focus-dependent if they were reused here (the collection tab bar stays on
+/// screen just above this one, so there'd be no telling which a press was aimed
+/// at). While the pane is unfocused the active tab is shown in plain accent
+/// rather than reverse video, so it still says which section is on view without
+/// implying the keys will reach it from wherever the cursor actually is.
+fn response_panel_block(app: &TuiApp, focused: bool, s: &Strings, th: &Theme) -> Block<'static> {
+    let border = if focused { th.accent } else { th.line };
+    let mut spans = vec![
+        Span::styled(
+            s.response_heading.to_string(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().fg(border)),
+    ];
+    for sec in ResponseSection::ALL {
+        let style = if sec == app.response_section && focused {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if sec == app.response_section {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        spans.push(Span::styled(format!(" {} ", sec.label(s)), style));
+    }
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(spans))
+        .style(Style::default().bg(th.panel))
 }
 
 pub(crate) fn draw_footer(
@@ -3866,6 +3947,7 @@ pub(crate) fn draw_footer(
     th: &Theme,
     can_copy: bool,
     can_compact: bool,
+    can_switch_section: bool,
 ) {
     // Run/Run All (F5 / Alt+F5) now live on the Collections panel's bottom
     // border (see draw_collection_left), and the base-URL row above already
@@ -3889,6 +3971,11 @@ pub(crate) fn draw_footer(
     // only shown) while the Response pane holds focus.
     if can_compact {
         hint.push(format!("c {}", s.foot_compact));
+    }
+    // `i` steps the Response section tabs — likewise only meaningful (and only
+    // shown) while the Response pane holds focus.
+    if can_switch_section {
+        hint.push(format!("i {}", s.foot_response_section));
     }
     hint.push(format!("? {}", s.foot_help));
     hint.push(format!("q {}", s.foot_quit));
@@ -4329,6 +4416,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("y", s.help_copy_selection),
                             ("Ctrl+C", s.help_ctrl_c),
                             ("c (Response pane)", s.help_compact),
+                            ("i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],

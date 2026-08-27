@@ -48,6 +48,9 @@ strings! {
     response_time_label => "Time:", "Durée :", "Tid:";
     no_response_yet => "Run a request to see the response.", "Exécutez une requête pour voir la réponse.", "Kør en anmodning for at se svaret.";
     resp_empty_body => "(the server returned no body)", "(le serveur n'a renvoyé aucun corps)", "(serveren returnerede ingen brødtekst)";
+    resp_section_body => "Body", "Corps", "Body";
+    resp_section_headers => "Headers", "En-têtes", "Headere";
+    resp_no_headers => "(the server returned no headers)", "(le serveur n'a renvoyé aucun en-tête)", "(serveren returnerede ingen headere)";
     req_error_prefix => "Request error:", "Erreur de requête :", "Anmodningsfejl:";
     options_menu => "Settings", "Paramètres", "Indstillinger";
     options_menu_label => "(S)ettings", "Paramètre(s)", "Ind(s)tillinger";
@@ -430,6 +433,7 @@ strings! {
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
     foot_compact => "compact", "compact", "kompakt";
+    foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
     help_title => "Help", "Aide", "Hjælp";
@@ -513,6 +517,7 @@ strings! {
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
     help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
+    help_response_section => "step the Response section tabs (Body / Headers); Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); Skift+I går tilbage";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";

@@ -12,6 +12,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The Response pane can now show the response headers.** They were being
+  captured all along and shown by the GUI, but the terminal UI drew only the
+  body, so anything carried in a header — a `Location` on a redirect, a
+  `WWW-Authenticate` challenge, rate-limit counters, the `Content-Type` that
+  explains a body that isn't parsing — was invisible. The pane now carries
+  section tabs (`Body` / `Headers`) on its top border, stepped with `i` and
+  back with `Shift+I` while the pane has focus. The headers are drawn through
+  the same panel the body uses, so they scroll, mouse-select and copy
+  identically, and a section with nothing in it says so rather than going
+  blank.
+
+  The tabs are on the border rather than a row of their own because the pane is
+  often only two or three rows tall. `i` was chosen over `[`/`]` or
+  Ctrl+Left/Right — both of which already mean "previous/next collection tab"
+  from every pane — so that no key changes meaning depending on which panel
+  happens to hold the cursor; the collection tab bar is on screen at the same
+  time, so there would be no telling which one a press was aimed at. It is a
+  ring rather than a two-way toggle so that further sections can be added
+  without needing another key.
+
 - **Escape now asks before throwing away an edited request.** The request wizard
   has no autosave and F2 is the only thing that persists, so a single mistyped
   Esc silently discarded everything that had been entered — with no undo and

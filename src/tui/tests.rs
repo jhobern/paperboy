@@ -30287,3 +30287,216 @@ fn error_status_bodies_render_even_with_an_error_line_and_asserts() {
         );
     }
 }
+
+/// Shared setup: a response carrying both a body and headers, for the Response
+/// pane's section tabs.
+fn app_with_response_headers(body: &str, headers: &[(&str, &str)]) -> TuiApp {
+    let mut app = app_with_response_body(body);
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.headers = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+    }
+    app
+}
+
+/// Render the whole UI at a comfortable size and return the screen as text.
+fn render_screen(app: &mut TuiApp) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    term.backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+/// `i` steps the Response section ring and Shift+I steps back. A ring rather
+/// than a boolean toggle because more sections are expected (timings, capture
+/// values) and a third one mustn't need a third key.
+#[test]
+fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
+    let mut app = app_with_response_headers("{}", &[("content-type", "application/json")]);
+    assert_eq!(app.response_section, ResponseSection::Body);
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Headers);
+    // Two members, so forward wraps back round rather than sticking.
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Body);
+
+    press(&mut app, KeyCode::Char('I'));
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Headers,
+        "Shift+I steps the ring backwards"
+    );
+}
+
+/// The section keys are scoped to the Response pane, so `i` stays free for
+/// every other panel — the same rule `c` (compact) already follows.
+#[test]
+fn i_only_switches_sections_while_the_response_pane_has_focus() {
+    for pane in [Pane::List, Pane::Main, Pane::Tabs, Pane::GlobalEnv] {
+        let mut app = app_with_response_headers("{}", &[("x", "y")]);
+        app.focus = pane;
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(
+            app.response_section,
+            ResponseSection::Body,
+            "{pane:?} must not steer the Response pane's tabs"
+        );
+    }
+}
+
+/// `[`/`]` mean "previous/next collection tab" from every pane, and that must
+/// stay true over the Response pane — the whole reason the sections got their
+/// own key instead.
+#[test]
+fn brackets_still_change_collection_tab_from_the_response_pane() {
+    let mut app = app_with_response_headers("{}", &[("x", "y")]);
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    let before = app.active_tab;
+
+    press(&mut app, KeyCode::Char(']'));
+    assert_ne!(app.active_tab, before, "] still cycles the collection tabs");
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Body,
+        "and must not have touched the response sections"
+    );
+}
+
+/// The tabs are drawn on the panel border (the pane is too short to spend a row
+/// on them), and the Headers section shows the captured headers.
+#[test]
+fn the_headers_section_renders_the_response_headers() {
+    let mut app = app_with_response_headers(
+        "{\"ok\":true}",
+        &[
+            ("content-type", "application/json"),
+            ("x-request-id", "abc123"),
+        ],
+    );
+    let s = Strings::for_language(&Language::English);
+
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(s.resp_section_body) && text.contains(s.resp_section_headers),
+        "both section tabs are on the border: {text}"
+    );
+    assert!(text.contains("\"ok\":true"), "the Body section is on view");
+    assert!(
+        !text.contains("x-request-id"),
+        "headers are not shown in the Body section"
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains("content-type: application/json"),
+        "the Headers section lists the headers: {text}"
+    );
+    assert!(text.contains("x-request-id: abc123"));
+    assert!(
+        !text.contains("\"ok\":true"),
+        "and the body has given up the pane"
+    );
+    assert!(
+        text.contains("200"),
+        "the status line describes the whole response, so it stays put"
+    );
+}
+
+/// A blank pane reads as "PaperBoy lost it" whichever section is on view, so
+/// the empty note follows the ring rather than being body-only.
+#[test]
+fn an_empty_headers_section_says_so_rather_than_rendering_blank() {
+    let mut app = app_with_response_headers("{}", &[]);
+    let s = Strings::for_language(&Language::English);
+
+    press(&mut app, KeyCode::Char('i'));
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(s.resp_no_headers),
+        "no headers is called out: {text}"
+    );
+    assert!(
+        !text.contains(s.resp_empty_body),
+        "and it's the headers note, not the body one"
+    );
+}
+
+/// Headers go through the same selectable panel as the body, so a whole-panel
+/// `y`-copy yields the headers while they're the section on view. Getting this
+/// for free is the reason they aren't drawn as a separate widget.
+#[test]
+fn the_headers_section_can_be_copied_like_a_body() {
+    let mut app = app_with_response_headers("{\"ok\":true}", &[("etag", "W/\"9\"")]);
+    render_screen(&mut app);
+    assert_eq!(
+        app.whole_panel_text(Pane::Response).as_deref(),
+        Some("{\"ok\":true}")
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    render_screen(&mut app);
+    assert_eq!(
+        app.whole_panel_text(Pane::Response).as_deref(),
+        Some("etag: W/\"9\""),
+        "the copy follows the section on view"
+    );
+}
+
+/// Switching section swaps what the panel holds, so a scroll offset and any
+/// painted selection are both left pointing at text that has gone.
+#[test]
+fn switching_section_resets_the_scroll_and_drops_a_stale_selection() {
+    let body = (0..200)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = app_with_response_headers(&body, &[("a", "b")]);
+    render_screen(&mut app);
+
+    app.resp_panel.set_scroll(40);
+    drag_response_line(&mut app, 0);
+    assert!(app.resp_panel.has_selection(), "a selection to invalidate");
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(
+        app.resp_panel.scroll(),
+        0,
+        "scroll starts again from the top"
+    );
+    assert!(
+        !app.resp_panel.has_selection(),
+        "the old selection pointed at body text that is no longer on screen"
+    );
+}
+
+/// Compact view shortens long string literals, which a header table has none
+/// of. Toggling a flag with no visible effect that then surprises you back in
+/// the Body is worse than refusing, so `c` is Body-only.
+#[test]
+fn compact_view_is_refused_in_the_headers_section() {
+    let mut app = app_with_response_headers("{}", &[("a", "b")]);
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Headers);
+
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        !app.response_compact,
+        "c must not arm compact view from the Headers section"
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.response_compact, "but it still works on the Body");
+}

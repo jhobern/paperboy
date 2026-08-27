@@ -1641,8 +1641,31 @@ impl TuiApp {
             // skimmed. Display-only — a whole-panel `y`-copy still yields the
             // full body (see `whole_panel_text`). Scoped to the Response pane so
             // it doesn't clash with `c`'s Requests-list "copy to workspace".
-            KeyCode::Char('c') if self.focus == Pane::Response => {
+            // Also scoped to the Body section: there are no long string
+            // literals to shorten in a header table, and toggling a flag with
+            // no visible effect (that then surprises you on the way back to the
+            // Body) is worse than doing nothing.
+            KeyCode::Char('c')
+                if self.focus == Pane::Response
+                    && self.response_section == ResponseSection::Body =>
+            {
                 self.response_compact = !self.response_compact;
+            }
+            // `i` (Response pane) steps the section tab bar — Body → Headers →
+            // Body — and Shift+I steps back. Deliberately *not* `[`/`]`: those
+            // mean "previous/next collection tab" from every pane, and giving
+            // them a second meaning that depends on which panel holds the
+            // cursor is exactly the kind of focus-sensitive rebinding that
+            // makes a key map unlearnable. A ring rather than a toggle because
+            // the runner captures more than Body and Headers (timings, capture
+            // values, the redirect chain) and a third tab shouldn't need a
+            // third key. Scoped to the Response pane so `i` stays free
+            // elsewhere.
+            KeyCode::Char('i') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(true);
+            }
+            KeyCode::Char('I') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(false);
             }
             // Shift+Arrow moves the *end* of an active selection, letting
             // the user fine-tune (or start extending, one line/char at a
