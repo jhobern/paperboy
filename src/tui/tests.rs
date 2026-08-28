@@ -14279,8 +14279,86 @@ fn u_reopens_the_most_recently_closed_tab() {
 #[test]
 fn reopening_with_no_closed_tabs_is_a_no_op() {
     let mut app = TuiApp::default();
+    app.focus = Pane::Tabs;
     app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
     assert_eq!(app.collections.len(), 1);
+}
+
+/// `u` is a per-pane undo, not one time-ordered stack, so it must not reopen a
+/// tab from a pane that had nothing to do with closing one — a user who deleted
+/// a request and drifted out of the List pane would otherwise press `u` and get
+/// an unrelated tab back.
+#[test]
+fn u_outside_the_tab_bar_does_not_reopen_a_closed_tab() {
+    for pane in [Pane::Main, Pane::Response] {
+        let mut app = TuiApp::default();
+        app.collections.push(Collection::new("api".into(), vec![]));
+        app.active_tab = 1;
+        app.close_active_tab();
+        assert_eq!(app.collections.len(), 1);
+
+        app.focus = pane;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.collections.len(),
+            1,
+            "{pane:?} must not reopen the closed tab"
+        );
+    }
+}
+
+/// Ctrl+W closes a tab from any pane, so the scoped `u` would be unreachable
+/// after it if the close didn't move the focus. It does — both close paths land
+/// on the tab bar — which is what keeps the "press (u) to reopen" hint true.
+#[test]
+fn closing_a_tab_from_a_body_pane_leaves_the_undo_key_in_reach() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new("api".into(), vec![]));
+    app.active_tab = 1;
+    app.focus = Pane::Response;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.collections.len(), 1);
+    assert_eq!(
+        app.focus,
+        Pane::Tabs,
+        "the close moves focus to the tab bar"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+    assert_eq!(app.collections.len(), 2, "the closed tab came back");
+}
+
+/// The two undo stacks are independent: a request deleted before a tab was
+/// closed still comes back with `u` in the List pane, rather than `u` walking
+/// one shared history and handing back the tab first.
+#[test]
+fn the_request_and_tab_undo_stacks_do_not_interleave() {
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry_named("alpha"));
+    app.collections.push(Collection::new("api".into(), vec![]));
+
+    app.focus = Pane::List;
+    app.active_tab = 0;
+    app.collections[0].selected_entry = 0;
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.collections[0].entries.is_empty());
+
+    app.active_tab = 1;
+    app.close_active_tab();
+    assert_eq!(app.collections.len(), 1);
+
+    app.active_tab = 0;
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('u'));
+
+    assert_eq!(app.collections.len(), 1, "the tab stayed closed");
+    assert_eq!(
+        app.collections[0].entries.len(),
+        1,
+        "the deleted request came back instead"
+    );
 }
 
 #[test]

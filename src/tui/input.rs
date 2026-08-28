@@ -1702,13 +1702,16 @@ impl TuiApp {
             {
                 self.toggle_workspace_tree_filter(self.active_tab);
             }
-            // Reopens the most recently closed tab. Deliberately a plain
-            // unmodified key rather than a Ctrl+Shift combo: terminal emulators
-            // commonly intercept Ctrl+Shift+T themselves (as "new tab") before
-            // it ever reaches the app. When the Requests list has focus, `u`
-            // instead restores the most recently deleted request in the active
-            // collection (mirroring how `x` deletes a request there instead of
-            // closing the tab) — see `restore_deleted_request`.
+            // `u` undoes the last destructive act *in the focused pane*, and
+            // each arm below pairs with the `x` that does the destroying in
+            // that same pane. Keeping the two on the same axis is what makes
+            // the key predictable: there is no single time-ordered undo stack,
+            // so without the pane to disambiguate, a user who deleted a
+            // request, moved focus, and pressed `u` would get some unrelated
+            // thing back instead — and would have to work out which.
+            // Deliberately a plain unmodified key rather than a Ctrl+Shift
+            // combo: terminal emulators commonly intercept Ctrl+Shift+T
+            // themselves (as "new tab") before it ever reaches the app.
             KeyCode::Char('u') if self.focus == Pane::List => self.restore_deleted_request(),
             // `u` in the Global Environments panel reopens the most recently
             // deleted environment (mirroring how `x` deletes one there).
@@ -1720,7 +1723,15 @@ impl TuiApp {
             KeyCode::Char('g') if self.focus == Pane::GlobalEnv => {
                 self.jump_to_active_env();
             }
-            KeyCode::Char('u') => self.reopen_closed_tab(),
+            // Reopens the most recently closed tab, pairing with the `x` that
+            // closes one on the tab bar. Scoped to `Pane::Tabs` even though
+            // Ctrl+W can close a tab from anywhere, because both close paths
+            // (`finish_close_tab`, `close_active_report_tab`) land the focus on
+            // the tab bar afterwards — so the undo is always reachable straight
+            // after the close, and the "press (u) to reopen" status hint stays
+            // true, without `u` meaning "reopen a tab" in panes that have their
+            // own thing to undo.
+            KeyCode::Char('u') if self.focus == Pane::Tabs => self.reopen_closed_tab(),
             // `s` would be mnemonic for "source" but is already the global
             // Settings menu. `o` is deliberately scoped to the Environments
             // panel and cycles the row origin filter without stealing a common

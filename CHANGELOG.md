@@ -111,6 +111,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **`u` now undoes the last deletion in the pane you are looking at, and only
+  that.** `u` was never a single time-ordered undo: it restores a deleted
+  request in the Requests list, a deleted environment in the Global
+  Environments panel, and — from anywhere else at all — reopened a closed tab.
+  So deleting a request, glancing at the response, and pressing `u` handed back
+  some tab closed ten minutes earlier while the request stayed gone, with no
+  hint as to which stack had been walked. Reopening a tab is now scoped to the
+  tab bar, matching the `x` that closes one there. Nothing becomes harder to
+  reach: closing a tab already moves the focus to the tab bar, whether it was
+  closed with `x` there or `Ctrl+W` from any pane, so the undo is waiting where
+  the status bar's "press (u) to reopen" says it is. A standalone report tab
+  keeps `u` on every pane, having no request or environment list to compete.
+
 - **Panel shortcut hints no longer get cut off mid-word.** A hint that didn't
   fit on a panel's border was simply clipped by the renderer, so the
   Environments panel showed "g go to act" — which reads as a rendering fault

@@ -2935,7 +2935,14 @@ impl TuiApp {
             }
             KeyCode::Left | KeyCode::Right => {}
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
-            KeyCode::Char('u') => self.reopen_closed_tab(),
+            // A *standalone* report is full-screen: it has no Requests list or
+            // Environments panel, so a tab is the only thing `u` could undo the
+            // loss of and the focus (which Tab doesn't even move here) can't
+            // disambiguate anything. An *embedded* report shares its collection
+            // tab and only reaches this handler with `Pane::Main` focused, where
+            // `u` is inert in the collection view too — reopening a tab from a
+            // report body would be the same surprise that scoping cured there.
+            KeyCode::Char('u') if !embedded => self.reopen_closed_tab(),
             // `/` walks the results filters -- the key filters a list in k9s,
             // lazygit and their neighbours, and nothing in the report view
             // wanted it. The same filters the GUI's bar offers and the

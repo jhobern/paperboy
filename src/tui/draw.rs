@@ -4442,7 +4442,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("[ / ], PgUp/PgDn, ^\u{2190}/\u{2192}", s.help_prev_next_tab),
                             ("F2 / x", s.help_rename_close),
-                            ("^W / u", s.help_tab_manage),
+                            ("^W / u (Tab bar)", s.help_tab_manage),
                             ("^Shift+\u{2190} \u{2192}", s.help_tab_reorder),
                         ],
                     ),
