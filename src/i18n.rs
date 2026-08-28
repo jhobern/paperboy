@@ -926,13 +926,16 @@ strings! {
     gui_untitled_request => "(untitled)", "(sans titre)", "(uden titel)";
     gui_run => "Run", "Exécuter", "Kør";
     gui_rename_ellipsis => "Rename…", "Renommer…", "Omdøb…";
+    gui_duplicate => "Duplicate", "Dupliquer", "Dublér";
     gui_edited_request => "Edited — not saved yet", "Modifiée — pas encore enregistrée", "Ændret — endnu ikke gemt";
     gui_edited_collection => "Has unsaved edits", "Contient des modifications non enregistrées", "Har ugemte ændringer";
+    gui_undo_delete_request => "Undo Delete Request", "Annuler la suppression de la requête", "Fortryd sletning af anmodning";
     // Shared widgets.
     gui_add => "+ Add", "+ Ajouter", "+ Tilføj";
     gui_remove => "Remove", "Supprimer", "Fjern";
     // Menu bar.
     gui_menu_file => "File", "Fichier", "Fil";
+    gui_menu_edit => "Edit", "Édition", "Rediger";
     gui_menu_view => "View", "Affichage", "Vis";
     gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
     // The Alt-key mnemonic for each top-level menu: the letter that opens it
@@ -946,6 +949,7 @@ strings! {
     // "Paramètres", Danish I for "Indstillinger"), and the uniqueness test
     // below catches a collision at build time rather than in the field.
     gui_menu_file_key => "F", "F", "F";
+    gui_menu_edit_key => "E", "D", "R";
     gui_menu_view_key => "V", "A", "V";
     gui_menu_settings_key => "S", "P", "I";
     gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";

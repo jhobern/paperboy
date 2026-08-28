@@ -1263,6 +1263,125 @@ impl Collection {
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
     }
+
+    /// Remove the entry at `idx`, recording it (with the index it came from)
+    /// in `deleted_entries` so [`Self::restore_last_deleted`] can bring it
+    /// back. This is the part of "delete a request" both front-ends have to
+    /// agree on — one undo history and one 20-entry cap — everything around it
+    /// differs (the terminal UI also moves its list cursor, sets a status line
+    /// and persists state; the graphical one doesn't), so those stay in each
+    /// front-end's own delete method instead of being forced in here.
+    ///
+    /// Returns `None` for an out-of-range `idx` rather than panicking the way
+    /// `Vec::remove` would: the index reaching here came from a list row or a
+    /// context menu rendered from an earlier borrow of `entries`, so it is
+    /// exactly the kind of index that can go stale between being read and
+    /// being used.
+    pub fn remove_entry_recording_undo(&mut self, idx: usize) -> Option<HurlEntry> {
+        if idx >= self.entries.len() {
+            return None;
+        }
+        let removed = self.entries.remove(idx);
+        self.deleted_entries.push((idx, removed.clone()));
+        if self.deleted_entries.len() > 20 {
+            self.deleted_entries.remove(0);
+        }
+        Some(removed)
+    }
+
+    /// Reopen the most recently deleted entry (if any), re-inserting it as
+    /// close as possible to the index it was removed from, and return that
+    /// index so the caller can select it. `None` when there is nothing to
+    /// restore, which both front-ends treat as a no-op.
+    pub fn restore_last_deleted(&mut self) -> Option<usize> {
+        let (idx, entry) = self.deleted_entries.pop()?;
+        let idx = idx.min(self.entries.len());
+        self.entries.insert(idx, entry);
+        Some(idx)
+    }
+}
+
+#[cfg(test)]
+mod undo_delete_tests {
+    use super::*;
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e
+    }
+
+    #[test]
+    fn remove_entry_recording_undo_records_index_and_entry() {
+        let mut c = Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")]);
+        let removed = c
+            .remove_entry_recording_undo(1)
+            .expect("index 1 is in range");
+        assert_eq!(removed.title, "b");
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        assert_eq!(c.deleted_entries.len(), 1);
+        assert_eq!(c.deleted_entries[0].0, 1);
+        assert_eq!(c.deleted_entries[0].1.title, "b");
+    }
+
+    #[test]
+    fn deleted_entries_cap_holds_at_20() {
+        let mut c = Collection::new(
+            "c".into(),
+            (0..25).map(|i| entry(&format!("r{i}"))).collect(),
+        );
+        for _ in 0..25 {
+            c.remove_entry_recording_undo(0);
+        }
+        // The oldest deletions are dropped so the history never grows without
+        // bound over a long session; only the most recent 20 survive.
+        assert_eq!(c.deleted_entries.len(), 20);
+        assert_eq!(c.deleted_entries.first().unwrap().1.title, "r5");
+        assert_eq!(c.deleted_entries.last().unwrap().1.title, "r24");
+    }
+
+    #[test]
+    fn restore_last_deleted_reinserts_at_recorded_index() {
+        let mut c = Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")]);
+        c.remove_entry_recording_undo(1);
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        let idx = c.restore_last_deleted().unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(c.deleted_entries.is_empty());
+    }
+
+    #[test]
+    fn removing_an_out_of_range_entry_is_a_no_op_rather_than_a_panic() {
+        let mut c = Collection::new("c".into(), vec![entry("a")]);
+        assert!(c.remove_entry_recording_undo(7).is_none());
+        assert_eq!(c.entries.len(), 1, "nothing was removed");
+        assert!(c.deleted_entries.is_empty(), "and nothing was recorded");
+    }
+
+    #[test]
+    fn restore_last_deleted_is_none_when_history_empty() {
+        let mut c = Collection::new("c".into(), vec![entry("a")]);
+        assert!(c.restore_last_deleted().is_none());
+    }
 }
 
 #[cfg(test)]

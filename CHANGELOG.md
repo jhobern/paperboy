@@ -57,6 +57,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   drawn over the panel rather than through it, so it is never selectable and a
   whole-panel copy still yields an empty body rather than the placeholder text.
 
+- **The GUI can now duplicate a request, matching the terminal UI.** Right-click
+  a request in the tree and choose Duplicate (next to Rename) to get a copy
+  beside its original, ready to edit. It shares the terminal UI's rules for
+  what that means: a fresh name of its own (`Login` → `Login (2)`) rather than
+  one that collides with the original and makes both ambiguous to reports, and
+  no inherited response, since a copy that has never been sent hasn't earned
+  one.
+
+- **The GUI can now undo a request delete, matching the terminal UI's `u`.**
+  Deleting a request from the tree used to be final — no confirmation and no
+  way back. Edit ▸ Undo Delete Request reopens the most recently deleted
+  request as close as possible to where it was, and is greyed out when there
+  is nothing to restore. It shares one undo history (and its 20-entry cap)
+  with the terminal UI, so a request deleted from either front-end can be
+  brought back from either.
+
 ### Fixed
 
 - **A copied request no longer takes its original's name.** A request's title

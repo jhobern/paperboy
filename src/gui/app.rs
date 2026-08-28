@@ -691,6 +691,22 @@ impl GuiApp {
         self.session.save();
     }
 
+    /// Reopen the most recently deleted request in the active collection (Edit
+    /// ▸ Undo Delete Request), selecting it once it's back. Shares its history
+    /// and 20-entry cap with the terminal UI's `u` — see
+    /// [`crate::collection::Collection::restore_last_deleted`] — so a request
+    /// deleted from either front-end can be brought back from either.
+    pub fn undo_delete_request(&mut self) {
+        let ci = self.active_ci();
+        let col = &mut self.session.collections[ci];
+        let Some(idx) = col.restore_last_deleted() else {
+            return;
+        };
+        col.selected_entry = idx;
+        col.invalidate_request_json();
+        self.session.save();
+    }
+
     /// Close tab `ci`, first asking what to do with its folder when that folder
     /// is a git download PaperBoy made itself. Every close path in the GUI goes
     /// through here so a downloaded workspace can never be dropped silently,

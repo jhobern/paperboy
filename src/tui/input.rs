@@ -2502,12 +2502,10 @@ impl TuiApp {
         }
         let col = &mut self.collections[ci];
         let idx = col.selected_entry.min(col.entries.len() - 1);
-        let removed = col.entries.remove(idx);
-        let method = removed.method.clone();
-        col.deleted_entries.push((idx, removed));
-        if col.deleted_entries.len() > 20 {
-            col.deleted_entries.remove(0);
-        }
+        let Some(removed) = col.remove_entry_recording_undo(idx) else {
+            return;
+        };
+        let method = removed.method;
         col.selected_entry = idx.min(col.entries.len().saturating_sub(1));
         col.sync_folder_to_selected();
         self.list_hscroll = 0;
@@ -2574,11 +2572,9 @@ impl TuiApp {
     pub(crate) fn restore_deleted_request(&mut self) {
         let ci = self.active_tab;
         let col = &mut self.collections[ci];
-        let Some((idx, entry)) = col.deleted_entries.pop() else {
+        let Some(idx) = col.restore_last_deleted() else {
             return;
         };
-        let idx = idx.min(col.entries.len());
-        col.entries.insert(idx, entry);
         col.selected_entry = idx;
         col.sync_folder_to_selected();
         self.list_hscroll = 0;

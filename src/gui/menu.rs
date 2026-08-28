@@ -193,6 +193,7 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
     handle_menu_mnemonics(app, ui.ctx());
     egui::MenuBar::new().ui(ui, |ui| {
         file_menu(app, ui);
+        edit_menu(app, ui);
         settings_menu(app, ui);
         view_menu(app, ui);
         // No Send button here. There used to be one pinned to the right of this
@@ -219,6 +220,36 @@ fn top_menu<R>(
     let text = menu_title(ui, title, m, armed);
     let resp = ui.menu_button(text, |ui| content(app, ui));
     app.alt_menus.register(m, resp.response.id);
+}
+
+/// The Edit menu. Currently just the one entry — undoing a request delete —
+/// but that action needed a home somewhere more discoverable than "press `u`
+/// in the terminal UI", and there was no existing menu that fit rather than
+/// stretched to accommodate it (File is about whole files; Settings and View
+/// are configuration, not an in-session action). A one-item menu is a fair
+/// trade for that: the alternative was wedging it into the Requests panel's
+/// header, which only the graphical front-end has and which was still less
+/// discoverable than the standard place every editor puts "Undo".
+fn edit_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let (title, mnemonic) = (app.strings.gui_menu_edit, app.strings.gui_menu_edit_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
+        let ci = app.active_ci();
+        // Disabled rather than hidden when there's nothing to restore, so the
+        // menu's shape doesn't shift under a user who opens it out of habit —
+        // and so the one item in it is still there to explain what the
+        // shortcut does even when it currently can't.
+        let has_deleted = !app.session.collections[ci].deleted_entries.is_empty();
+        if ui
+            .add_enabled(
+                has_deleted,
+                egui::Button::new(app.strings.gui_undo_delete_request),
+            )
+            .clicked()
+        {
+            app.undo_delete_request();
+            ui.close();
+        }
+    });
 }
 
 /// The File menu. Grouped into submenus by *verb* (New / Open / Save) rather
@@ -2402,6 +2433,7 @@ mod tests {
             let s = crate::i18n::Strings::for_language(&lang);
             let keys = [
                 s.gui_menu_file_key,
+                s.gui_menu_edit_key,
                 s.gui_menu_view_key,
                 s.gui_menu_settings_key,
             ];

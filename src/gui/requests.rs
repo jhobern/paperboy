@@ -113,7 +113,21 @@ struct Actions {
     select: Option<usize>,
     run: Option<usize>,
     rename: Option<usize>,
+    duplicate: Option<usize>,
     delete: Option<usize>,
+}
+
+/// The row's context-menu / marker labels, bundled so adding one doesn't grow
+/// `render_node`'s parameter list again — it had already picked up a run,
+/// rename, delete and edited-marker label as separate arguments, and
+/// duplicate would have made a fifth.
+struct RowLabels<'a> {
+    untitled: &'a str,
+    run: &'a str,
+    rename: &'a str,
+    duplicate: &'a str,
+    delete: &'a str,
+    edited: &'a str,
 }
 
 fn render_node(
@@ -123,11 +137,7 @@ fn render_node(
     selected: usize,
     theme: &GuiTheme,
     id_prefix: &str,
-    lbl_untitled: &str,
-    lbl_run: &str,
-    lbl_rename: &str,
-    lbl_delete: &str,
-    lbl_edited: &str,
+    labels: &RowLabels<'_>,
     actions: &mut Actions,
 ) {
     for (name, child) in &node.folders {
@@ -138,20 +148,7 @@ fn render_node(
             true,
             RichText::new(format!("{} {name}", super::icons::FOLDER)).color(theme.text),
             |ui| {
-                render_node(
-                    ui,
-                    child,
-                    entries,
-                    selected,
-                    theme,
-                    &salt,
-                    lbl_untitled,
-                    lbl_run,
-                    lbl_rename,
-                    lbl_delete,
-                    lbl_edited,
-                    actions,
-                );
+                render_node(ui, child, entries, selected, theme, &salt, labels, actions);
             },
         );
     }
@@ -160,7 +157,7 @@ fn render_node(
         let leaf = entry_path(&entry.title).pop().unwrap_or_default();
         let label = if leaf.trim().is_empty() {
             if entry.url.trim().is_empty() {
-                lbl_untitled.to_string()
+                labels.untitled.to_string()
             } else {
                 entry.url.clone()
             }
@@ -198,7 +195,7 @@ fn render_node(
                         let mc = if ok { theme.ok } else { theme.err };
                         ui.colored_label(mc, marker);
                     }
-                    edited_marker(ui, entry, theme, lbl_edited);
+                    edited_marker(ui, entry, theme, labels.edited);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         super::widgets::selectable_row(ui, is_sel, text)
                     })
@@ -215,15 +212,22 @@ fn render_node(
             actions.run = Some(i);
         }
         row.context_menu(|ui| {
-            if ui.button(lbl_run).clicked() {
+            if ui.button(labels.run).clicked() {
                 actions.run = Some(i);
                 ui.close();
             }
-            if ui.button(lbl_rename).clicked() {
+            if ui.button(labels.rename).clicked() {
                 actions.rename = Some(i);
                 ui.close();
             }
-            if ui.button(lbl_delete).clicked() {
+            // Duplicate sits next to Rename — both are creative actions on the
+            // row's identity — leaving Delete alone at the bottom as the one
+            // destructive entry.
+            if ui.button(labels.duplicate).clicked() {
+                actions.duplicate = Some(i);
+                ui.close();
+            }
+            if ui.button(labels.delete).clicked() {
                 actions.delete = Some(i);
                 ui.close();
             }
@@ -250,6 +254,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_no_requests,
         lbl_run,
         lbl_rename,
+        lbl_duplicate,
         lbl_delete,
         lbl_edited,
     ) = (
@@ -261,6 +266,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.gui_no_requests_tree,
         s.gui_run,
         s.gui_rename_ellipsis,
+        s.gui_duplicate,
         s.gui_delete,
         s.gui_edited_request,
     );
@@ -341,6 +347,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 return;
             }
             let tree = build_tree(entries);
+            let labels = RowLabels {
+                untitled: lbl_untitled,
+                run: lbl_run,
+                rename: lbl_rename,
+                duplicate: lbl_duplicate,
+                delete: lbl_delete,
+                edited: lbl_edited,
+            };
             render_node(
                 ui,
                 &tree,
@@ -348,15 +362,20 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 selected,
                 &theme,
                 "req",
-                lbl_untitled,
-                lbl_run,
-                lbl_rename,
-                lbl_delete,
-                lbl_edited,
+                &labels,
                 &mut actions,
             );
         });
 
+    apply_actions(app, ci, actions);
+}
+
+/// Apply the actions collected while rendering the request tree
+/// (immutably-borrowed above) to the session. Pulled out of [`ui`] — the same
+/// shape as [`apply_ws_action`] for the workspace tree — so the effect of a
+/// context-menu click can be exercised directly in tests without having to
+/// drive an actual right-click through egui.
+fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
     if let Some(i) = actions.select {
         let col = &mut app.session.collections[ci];
         col.selected_entry = i;
@@ -371,10 +390,29 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             text: title,
         });
     }
+    if let Some(i) = actions.duplicate {
+        let col = &mut app.session.collections[ci];
+        if let Some(mut clone) = col.entries.get(i).cloned() {
+            // The title is the request's identifier (reports resolve requests
+            // by name), so two entries sharing one would make the name
+            // ambiguous for both — the copy needs one of its own.
+            clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
+            clone.user_added = true;
+            clone.modified = true;
+            // A copy has never been sent, so carrying the original's response
+            // over would credit it with a result it did not produce.
+            clone.last_response = None;
+            // Insert right after the original, not at the end, so the copy
+            // lands beside the request it came from rather than out of sight
+            // at the bottom of a long collection.
+            col.entries.insert(i + 1, clone);
+            col.selected_entry = i + 1;
+            col.invalidate_request_json();
+        }
+    }
     if let Some(i) = actions.delete {
         let col = &mut app.session.collections[ci];
-        if i < col.entries.len() {
-            col.entries.remove(i);
+        if col.remove_entry_recording_undo(i).is_some() {
             if col.selected_entry >= col.entries.len() {
                 col.selected_entry = col.entries.len().saturating_sub(1);
             }
@@ -2011,5 +2049,103 @@ pub(crate) mod tests {
             !background,
             "so the background behind it never steals the row's clicks"
         );
+    }
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e.method = "GET".into();
+        e
+    }
+
+    #[test]
+    fn duplicate_gives_the_copy_a_fresh_title_and_lands_it_right_after_the_original() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("Login"), entry("Logout")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                duplicate: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let titles: Vec<&str> = app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Login", "Login (2)", "Logout"]);
+        assert_eq!(app.session.collections[ci].selected_entry, 1);
+    }
+
+    #[test]
+    fn duplicate_never_carries_over_the_originals_last_response() {
+        let mut session = crate::session::Session::default();
+        let mut original = entry("Login");
+        original.last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            ..Default::default()
+        });
+        session.collections[0].entries = vec![original];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                duplicate: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let copy = &app.session.collections[ci].entries[1];
+        assert!(
+            copy.last_response.is_none(),
+            "a copy that has never been sent shouldn't inherit a result it didn't produce"
+        );
+    }
+
+    #[test]
+    fn deleting_a_request_records_it_for_undo_and_restoring_reinserts_it() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                delete: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        assert_eq!(app.session.collections[ci].deleted_entries.len(), 1);
+
+        app.undo_delete_request();
+        assert_eq!(
+            app.session.collections[ci]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(app.session.collections[ci].deleted_entries.is_empty());
+        assert_eq!(app.session.collections[ci].selected_entry, 1);
     }
 }
