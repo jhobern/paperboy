@@ -75,6 +75,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Deleting a request in a Workspace tab no longer un-deletes itself.** A
+  Workspace tab holds its edits in memory and re-reads the file from disk when
+  it switches away and back, so it has to know when there is something worth
+  keeping — and it decided by scanning the requests for edit markers. A
+  deletion leaves no request behind to carry one, so it read as "nothing has
+  changed": delete a request, look at another file in the same tab, come back,
+  and the request was there again. "Save workspace edits" ignored a
+  delete-only change for the same reason, including for files parked when the
+  tab switched away from them. The collection now records a structural change
+  — a request removed or restored — alongside the per-request markers.
+
 - **A copied request no longer takes its original's name.** A request's title
   is its identifier — reports address requests by name — so two entries sharing
   one made the reference ambiguous and broke it for *both* of them, not just

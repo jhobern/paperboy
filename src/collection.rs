@@ -433,6 +433,27 @@ pub struct Collection {
     /// across a restart (see [`crate::persistence`]), so neither are these.
     pub workspace_pending: HashMap<PathBuf, Vec<HurlEntry>>,
 
+    /// Whether the loaded entries differ *structurally* from the file they
+    /// came from — a request removed, restored or reordered.
+    ///
+    /// [`Self::has_unsaved_edits`] otherwise answers by scanning the entries
+    /// for `user_added`/`modified` flags, which only ever say "this request
+    /// was edited". Removing one leaves nothing behind to carry a flag, and
+    /// reordering changes no request at all, so both read as "no edits" — and
+    /// a Workspace tab, whose entries are held in memory and re-read from disk
+    /// when it switches away and back, would then throw the change away
+    /// without a word. Cleared by [`Self::mark_saved`] like any other marker.
+    ///
+    /// Runtime-only, for the same reason `workspace_pending` is.
+    pub structure_modified: bool,
+
+    /// The parked files (see `workspace_pending`) whose entries differ
+    /// structurally from disk — `structure_modified` for a file that isn't the
+    /// loaded one. Kept separately because `workspace_pending` stores only the
+    /// entries, and a deletion is precisely the change that leaves no trace in
+    /// them.
+    pub workspace_structure_modified: HashSet<PathBuf>,
+
     /// Run results for this Workspace tab's files, keyed by file and indexed
     /// the way [`Self::workspace_titles`] is — see [`RunRecord`] for why they
     /// outlive the file being loaded, and why they are runtime-only.
@@ -486,6 +507,8 @@ impl Collection {
             workspace_titles: HashMap::new(),
             workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
+            structure_modified: false,
+            workspace_structure_modified: HashSet::new(),
             workspace_runs: HashMap::new(),
         };
         c.sync_folder_to_selected();
@@ -821,10 +844,14 @@ impl Collection {
             None => crate::postman::parse_collection(&std::fs::read_to_string(&path)?),
         };
         self.workspace_pending.remove(&path);
+        // Park the outgoing file *before* adopting the incoming file's flag,
+        // since parking reads `structure_modified` for the file being left.
         self.park_pending_edits();
+        let incoming_structural = self.workspace_structure_modified.remove(&path);
         self.park_run_results();
         self.snapshot_loaded_titles();
         self.entries = entries;
+        self.structure_modified = incoming_structural;
         self.restore_run_results(&path);
         self.selected_entry = 0;
         self.path = Some(path);
@@ -844,6 +871,9 @@ impl Collection {
             return;
         }
         if let Some(path) = self.path.clone() {
+            if self.structure_modified {
+                self.workspace_structure_modified.insert(path.clone());
+            }
             self.workspace_pending.insert(path, self.entries.clone());
         }
     }
@@ -934,7 +964,7 @@ impl Collection {
     /// `true` when this collection holds requests that have been added or
     /// edited since it was last read from / written to disk.
     pub fn has_unsaved_edits(&self) -> bool {
-        self.entries.iter().any(|e| e.user_added || e.modified)
+        self.structure_modified || self.entries.iter().any(|e| e.user_added || e.modified)
     }
 
     /// How many requests in this tab are added-but-unsaved or edited, counting
@@ -1078,8 +1108,10 @@ impl Collection {
             e.user_added = false;
             e.modified = false;
         }
+        self.structure_modified = false;
         if let Some(path) = &self.path {
             self.workspace_pending.remove(path);
+            self.workspace_structure_modified.remove(path);
         }
     }
 
@@ -1116,13 +1148,21 @@ impl Collection {
             .map(|(p, e)| (p.clone(), e.clone()))
             .collect();
         for (path, entries) in parked {
-            if !entries.iter().any(|e| e.user_added || e.modified) {
+            // A parked file whose only change was a deletion or a reorder has
+            // no flagged entry to find — `workspace_structure_modified` is the
+            // only record that it differs from disk.
+            if !self.workspace_structure_modified.contains(&path)
+                && !entries.iter().any(|e| e.user_added || e.modified)
+            {
                 continue;
             }
             write_hurl(&path, &collection_to_hurl(&entries))?;
             written += 1;
         }
         self.workspace_pending.clear();
+        // Everything parked has just been written, so no file is structurally
+        // ahead of disk any more; `mark_saved` only clears the loaded one.
+        self.workspace_structure_modified.clear();
         self.mark_saved();
         Ok(written)
     }
@@ -1282,6 +1322,7 @@ impl Collection {
             return None;
         }
         let removed = self.entries.remove(idx);
+        self.structure_modified = true;
         self.deleted_entries.push((idx, removed.clone()));
         if self.deleted_entries.len() > 20 {
             self.deleted_entries.remove(0);
@@ -1297,6 +1338,11 @@ impl Collection {
         let (idx, entry) = self.deleted_entries.pop()?;
         let idx = idx.min(self.entries.len());
         self.entries.insert(idx, entry);
+        // Restoring is as much a structural change as removing: putting a
+        // request back can't be assumed to return the list to a saved state,
+        // since it lands at the nearest index rather than necessarily its old
+        // one, and anything else may have moved meanwhile.
+        self.structure_modified = true;
         Some(idx)
     }
 }
@@ -1904,5 +1950,143 @@ mod request_folder_tests {
             !key.components().any(|c| c.as_os_str() == ".."),
             "and never contains a parent hop: {key:?}"
         );
+    }
+}
+
+/// A Workspace tab's edits are held in memory and re-read from disk when the
+/// tab switches away and back, so anything the tab doesn't recognise as an
+/// edit is silently discarded. These pin down that removing or reordering a
+/// request counts — neither touches a *surviving* entry's `user_added` /
+/// `modified` flags, which is all `has_unsaved_edits` used to look at.
+#[cfg(test)]
+mod structure_edit_tests {
+    use super::*;
+
+    fn ws_collection(dir: &std::path::Path, titles: &[&str]) -> (Collection, PathBuf) {
+        let a = dir.join("a.hurl");
+        let b = dir.join("b.hurl");
+        let entries: Vec<HurlEntry> = titles
+            .iter()
+            .map(|t| HurlEntry {
+                title: (*t).to_string(),
+                method: "GET".into(),
+                url: "http://x".into(),
+                ..Default::default()
+            })
+            .collect();
+        std::fs::write(&a, collection_to_hurl(&entries)).unwrap();
+        std::fs::write(&b, "GET http://other\n").unwrap();
+        let mut col = Collection::new("ws".into(), entries);
+        col.workspace_root = Some(dir.to_path_buf());
+        col.path = Some(a.clone());
+        (col, b)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_structedit_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn deleting_a_request_survives_a_workspace_file_switch() {
+        let dir = temp_dir("delete");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+
+        col.remove_entry_recording_undo(0);
+        assert!(
+            col.has_unsaved_edits(),
+            "a deletion is an unsaved edit, even though no surviving entry is flagged"
+        );
+
+        let a = col.path.clone().unwrap();
+        col.load_workspace_file(other).unwrap();
+        col.load_workspace_file(a).unwrap();
+
+        let titles: Vec<&str> = col.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Logout"],
+            "the deleted request must not come back from disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The subtler half: a file whose only change was a deletion, parked when
+    /// the tab switched away from it. `workspace_pending` holds its entries,
+    /// but a deletion leaves no flagged entry among them, so the save-all pass
+    /// had nothing to tell it apart from an untouched file.
+    #[test]
+    fn a_parked_files_structural_edit_is_written_too() {
+        let dir = temp_dir("parked");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        col.remove_entry_recording_undo(0);
+        // Switch away, so the edit is parked rather than loaded.
+        col.load_workspace_file(other).unwrap();
+        assert!(
+            col.workspace_pending.contains_key(&a),
+            "the deletion was parked rather than discarded"
+        );
+
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            1,
+            "the parked file was written"
+        );
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            !on_disk.contains("Login"),
+            "the parked deletion reached the file: {on_disk}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An untouched file must still be left alone — the flag has to be cleared
+    /// on the way through, or every later save would rewrite files needlessly
+    /// (and stamp over changes made outside PaperBoy).
+    #[test]
+    fn saving_clears_the_structural_marks_it_just_wrote() {
+        let dir = temp_dir("clears");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+
+        col.remove_entry_recording_undo(0);
+        col.save_workspace_edits().unwrap();
+        assert!(col.workspace_structure_modified.is_empty());
+        assert!(!col.structure_modified);
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            0,
+            "a second save has nothing left to write"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_structural_edit_is_written_by_save_workspace_edits() {
+        let dir = temp_dir("save");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        col.remove_entry_recording_undo(0);
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            1,
+            "the file was written"
+        );
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            !on_disk.contains("Login"),
+            "the deletion reached the file: {on_disk}"
+        );
+        assert!(
+            !col.has_unsaved_edits(),
+            "and saving clears the structural edit, like any other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
