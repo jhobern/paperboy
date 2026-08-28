@@ -359,6 +359,18 @@ pub struct Collection {
     /// Index into the current folder's rows (see [`crate::tree::rows_for`]),
     /// i.e. which row is highlighted in the Requests list. Not persisted.
     pub list_cursor: usize,
+    /// A typed filter over the Requests list: while non-empty, the list shows
+    /// every request whose title contains this, flattened across folders (see
+    /// [`crate::tree::rows_matching`]) instead of the folder being browsed.
+    ///
+    /// Lives on the collection rather than on either front-end so both show the
+    /// same narrowed list for the same tab, the way `workspace_filter_hurl_json`
+    /// already does — and so switching tabs keeps each tab's own filter.
+    ///
+    /// Runtime-only, deliberately: a filter restored from a previous session
+    /// would present a collection that looks like it has lost most of its
+    /// requests, with the reason parked in a strip nobody has looked at yet.
+    pub list_query: String,
     /// Requests removed with `x` (List pane), most-recently-deleted last, so
     /// `u` (List pane) can bring them back in order — the exact parallel of
     /// [`crate::tui::app::TuiApp::closed_tabs`] for individual requests
@@ -512,6 +524,7 @@ impl Collection {
             captures: HashMap::new(),
             folder: Vec::new(),
             list_cursor: 0,
+            list_query: String::new(),
             deleted_entries: Vec::new(),
             workspace_root: None,
             workspace_filter_hurl_json: true,
@@ -555,10 +568,24 @@ impl Collection {
         self.request_json_for = None;
     }
 
-    /// The rows to show in the Requests list for the folder currently being
-    /// browsed.
+    /// The rows to show in the Requests list: the folder currently being
+    /// browsed, or — while a filter is typed — every match across the whole
+    /// collection.
     pub fn rows(&self) -> Vec<Row> {
-        tree::rows_for(&self.entries, &self.folder)
+        if self.list_filter_active() {
+            tree::rows_matching(&self.entries, &self.list_query)
+        } else {
+            tree::rows_for(&self.entries, &self.folder)
+        }
+    }
+
+    /// Whether the Requests list is currently narrowed by a typed filter.
+    ///
+    /// Trimmed, so a query of nothing but spaces counts as no filter at all —
+    /// it matches every request anyway, and treating it as active would leave
+    /// the list flattened out of its folders for no visible reason.
+    pub fn list_filter_active(&self) -> bool {
+        !self.list_query.trim().is_empty()
     }
 
     /// True when this tab is bound to a Workspace folder (so the list uses the
@@ -1393,6 +1420,30 @@ impl Collection {
         true
     }
 
+    /// Move the entry at `from` so it ends up immediately *before* the entry
+    /// currently at `before` — the drag-and-drop spelling of [`Self::move_entry`],
+    /// where a drop lands in the gap above a row rather than on a slot number.
+    /// `before == entries.len()` means "after the last one". Returns whether
+    /// anything actually moved.
+    ///
+    /// The index has to be adjusted when dragging *downwards*: `move_entry`
+    /// removes before it inserts, so once the dragged request is lifted out
+    /// every row below it slides up by one and the gap the user aimed at is now
+    /// one lower. Without this the request would consistently land one place
+    /// short of where it was dropped, which reads as the drop being ignored.
+    pub fn move_entry_before(&mut self, from: usize, before: usize) -> bool {
+        let len = self.entries.len();
+        if from >= len || before > len {
+            return false;
+        }
+        // Dropping into either gap touching the request is where it already is.
+        if before == from || before == from + 1 {
+            return false;
+        }
+        let to = if from < before { before - 1 } else { before };
+        self.move_entry(from, to)
+    }
+
     /// Reopen the most recently deleted entry (if any), re-inserting it as
     /// close as possible to the index it was removed from, and return that
     /// index so the caller can select it. `None` when there is nothing to
@@ -2124,6 +2175,43 @@ mod structure_edit_tests {
             !c.structure_modified,
             "and a move that did not happen is not an unsaved change"
         );
+    }
+
+    /// Dropping into a gap is the drag-and-drop spelling of a move, and the
+    /// index needs adjusting when the drag goes downwards — the dragged request
+    /// is lifted out before it is put back, so everything below it slides up by
+    /// one first.
+    #[test]
+    fn a_drop_lands_in_the_gap_it_was_aimed_at() {
+        // Downwards: "a" dropped into the gap before "d" must end up between
+        // "c" and "d", not between "b" and "c".
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry_before(0, 3));
+        assert_eq!(titles(&c), vec!["b", "c", "a", "d"]);
+
+        // Upwards needs no adjustment: nothing below the gap has moved.
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry_before(3, 1));
+        assert_eq!(titles(&c), vec!["a", "d", "b", "c"]);
+
+        // Past the last row: the one gap that isn't before any entry.
+        let mut c = plain(&["a", "b", "c"]);
+        assert!(c.move_entry_before(0, 3));
+        assert_eq!(titles(&c), vec!["b", "c", "a"]);
+    }
+
+    /// Both gaps touching a request are where it already is, so a drop there
+    /// must not register as an edit — it would mark the file unsaved for a
+    /// change nobody made.
+    #[test]
+    fn dropping_a_request_back_where_it_started_changes_nothing() {
+        let mut c = plain(&["a", "b", "c"]);
+        assert!(!c.move_entry_before(1, 1), "the gap above it");
+        assert!(!c.move_entry_before(1, 2), "the gap below it");
+        assert!(!c.move_entry_before(9, 0), "from nowhere");
+        assert!(!c.move_entry_before(0, 9), "into nowhere");
+        assert_eq!(titles(&c), vec!["a", "b", "c"]);
+        assert!(!c.structure_modified);
     }
 
     /// The selection is a position, so every move has to re-derive it.

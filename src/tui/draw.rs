@@ -2095,6 +2095,18 @@ pub(crate) fn draw_collection_left(
     let col = &app.collections[ci];
     let view_rows = LeftRow::build(col);
     let sel = col.list_cursor.min(view_rows.len().saturating_sub(1));
+    // An active filter takes a one-line strip below the list, so it's obvious
+    // the list is being narrowed (and by what) rather than mysteriously short —
+    // the same treatment the Environments panel's filter gets. The strip is
+    // kept while typing even with an empty query, so `/` visibly does
+    // something before the first character is typed.
+    let filtering = !col.list_query.is_empty() || (app.list_filter_typing && focused);
+    let (list_area, filter_area) = if filtering {
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(panes[0]);
+        (parts[0], Some(parts[1]))
+    } else {
+        (panes[0], None)
+    };
     // Classify every `{{ VAR }}` the requests reference so the list URLs can be
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
@@ -2104,7 +2116,7 @@ pub(crate) fn draw_collection_left(
     // rather than with a leftmost caret, so no column is reserved for one.
     // Recorded so h-scrolling can be clamped to stop once the URL's end is
     // visible (no blank overscroll).
-    let url_w = panes[0].width.saturating_sub(2 + 2 + 5);
+    let url_w = list_area.width.saturating_sub(2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -2256,7 +2268,15 @@ pub(crate) fn draw_collection_left(
                 // those folders are already rows in the tree, so only the leaf
                 // segment (the request's own name within its folder) is shown
                 // here — never the redundant folder prefix.
-                let name = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                //
+                // Unless the list is filtered: that view is flat, with no
+                // folder rows left to supply the context, and two folders may
+                // well hold a `Login` apiece. Then the whole title is the name.
+                let name = if col.list_filter_active() {
+                    e.title.trim().to_string()
+                } else {
+                    crate::tree::entry_path(&e.title).pop().unwrap_or_default()
+                };
                 if !name.is_empty() {
                     spans.push(Span::styled(name, Style::default().fg(th.text)));
                     ListItem::new(Line::from(spans))
@@ -2300,6 +2320,21 @@ pub(crate) fn draw_collection_left(
                 s.workspace_empty_state.to_string(),
                 Style::default().fg(th.dim),
             ))]
+        } else if items.is_empty() && col.list_filter_active() {
+            // "The filter hid everything" and "this collection is empty" look
+            // identical otherwise, and have completely different fixes. Two
+            // rows rather than one sentence because a list row can't wrap, and
+            // the panel is narrow enough that one line would be cut in half.
+            vec![
+                ListItem::new(Line::styled(
+                    s.list_filter_no_matches.to_string(),
+                    Style::default().fg(th.dim),
+                )),
+                ListItem::new(Line::styled(
+                    s.list_filter_no_matches_hint.to_string(),
+                    Style::default().fg(th.dim),
+                )),
+            ]
         } else {
             items
         };
@@ -2374,7 +2409,7 @@ pub(crate) fn draw_collection_left(
         format!("Alt+F5 {}", s.foot_run_all),
         format!("p {}", s.foot_env_link),
     ];
-    let run_hint = fit_border_hint(&hint_parts, " \u{00b7} ", panes[0].width);
+    let run_hint = fit_border_hint(&hint_parts, " \u{00b7} ", list_area.width);
     // The "F5 run" words are clickable (see `MouseHitTarget::RunRequest`), so
     // the hit region has to track whatever `fit_border_hint` actually kept: on
     // a panel too narrow even for the run hint there is nothing on screen to
@@ -2383,7 +2418,7 @@ pub(crate) fn draw_collection_left(
         (Line::from(run_primary_hint.clone())
             .width()
             .min(u16::MAX as usize) as u16)
-            .min(panes[0].width.saturating_sub(2))
+            .min(list_area.width.saturating_sub(2))
     } else {
         0
     };
@@ -2412,12 +2447,12 @@ pub(crate) fn draw_collection_left(
     };
     let list_offset =
         app.list_scroll
-            .render_ctx(f, panes[0], list, sel, view_rows.len(), ci as u64);
+            .render_ctx(f, list_area, list, sel, view_rows.len(), ci as u64);
     let list_inner = Rect {
-        x: panes[0].x.saturating_add(1),
-        y: panes[0].y.saturating_add(1),
-        width: panes[0].width.saturating_sub(2),
-        height: panes[0].height.saturating_sub(2),
+        x: list_area.x.saturating_add(1),
+        y: list_area.y.saturating_add(1),
+        width: list_area.width.saturating_sub(2),
+        height: list_area.height.saturating_sub(2),
     };
     app.push_mouse_hit(
         MouseLayer::Base,
@@ -2447,12 +2482,40 @@ pub(crate) fn draw_collection_left(
         app.push_mouse_hit(
             MouseLayer::Base,
             Rect::new(
-                panes[0].x.saturating_add(1),
-                panes[0].y + panes[0].height.saturating_sub(1),
+                list_area.x.saturating_add(1),
+                list_area.y + list_area.height.saturating_sub(1),
                 run_hit_w,
                 1,
             ),
             MouseHitTarget::RunRequest,
+        );
+    }
+    if let Some(strip) = filter_area {
+        let mut spans = vec![
+            Span::styled(s.list_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                col.list_query.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        // While typing, a block cursor marks where the next character lands —
+        // the strip is the only thing with focus, so without it there is no
+        // sign the keyboard is being captured.
+        if app.list_filter_typing && focused {
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        // A filter that matches nothing leaves an empty list, which on its own
+        // reads as "this collection is empty" — the list itself says which of
+        // the two it is (see the empty-state rows above), so the strip only has
+        // to carry the query.
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+            strip,
         );
     }
 
@@ -4049,6 +4112,7 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     if app.focus == Pane::List
         && app.collections.get(app.active_tab).is_some_and(|c| {
             c.entries.len() > 1
+                && !c.list_filter_active()
                 && matches!(
                     c.rows().get(c.list_cursor),
                     Some(crate::tree::Row::Entry(_))
@@ -4056,6 +4120,19 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
         })
     {
         hint.push(format!("Alt+\u{2191}\u{2193} {}", s.foot_reorder));
+    }
+    // `/` finds a request anywhere in the collection, not just in the folder
+    // being browsed — which is the part worth advertising, since the list
+    // otherwise shows one folder at a time. Not offered on a Workspace tab
+    // (whose tree is the filesystem, with its own Ctrl+F filter) and not while
+    // the filter is already up, where Esc is the key that matters.
+    if app.focus == Pane::List
+        && app
+            .collections
+            .get(app.active_tab)
+            .is_some_and(|c| !c.is_workspace() && c.entries.len() > 1 && c.list_query.is_empty())
+    {
+        hint.push(format!("/ {}", s.foot_find_request));
     }
     // `w` opens the workspace tree, and only Workspace-bound tabs have one.
     //
@@ -4472,6 +4549,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                                 "Alt+\u{2191} / Alt+\u{2193} (List pane)",
                                 s.help_reorder_request,
                             ),
+                            ("/ (List pane)", s.help_find_request),
                         ],
                     ),
                     (

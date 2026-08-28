@@ -26471,13 +26471,14 @@ fn slash_filters_the_environments_panel_by_name() {
     add_empty_global_env(&mut app, "Westpac Prod");
     add_empty_global_env(&mut app, "Westpac NZ Staging");
     add_empty_global_env(&mut app, "Bendigo Prod");
-    app.focus = Pane::List;
+    app.focus = Pane::Main;
 
     press(&mut app, KeyCode::Char('/'));
     assert_eq!(
         app.focus,
         Pane::GlobalEnv,
-        "`/` finds an environment from wherever you are"
+        "`/` finds an environment from wherever you are — bar the Requests \
+         list, which has its own `/` filter"
     );
     assert!(app.env_filter_typing);
 
@@ -31030,4 +31031,208 @@ fn titles_of(app: &TuiApp, ci: usize) -> Vec<&str> {
         .iter()
         .map(|e| e.title.as_str())
         .collect()
+}
+
+/// Type a query into the Requests list filter, one key at a time, the way a
+/// user does.
+fn type_filter(app: &mut TuiApp, q: &str) {
+    for c in q.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
+/// `/` narrows the Requests list to matching requests from the *whole*
+/// collection. The list normally shows one folder at a time, so reaching
+/// requests the current folder hides is the point of the key.
+#[test]
+fn slash_filters_the_requests_list_across_every_folder() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Users/List"),
+        entry_named("Auth/Logout"),
+    ];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert!(app.list_filter_typing, "the filter is capturing keys");
+    type_filter(&mut app, "log");
+
+    assert_eq!(app.collections[ci].list_query, "log");
+    assert_eq!(
+        app.collections[ci].rows(),
+        vec![crate::tree::Row::Entry(0), crate::tree::Row::Entry(2)],
+        "both Auth requests match, flattened out of their folder"
+    );
+}
+
+/// The letters typed into the filter must not reach the list's own single-key
+/// actions — `u`, `c` and `x` all sit in the alphabet of a request name.
+#[test]
+fn typing_a_filter_does_not_fire_the_lists_letter_shortcuts() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("upload"), entry_named("checkout")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    // `u` would undo a delete, `c` would duplicate, `x` would delete.
+    type_filter(&mut app, "uxc");
+
+    assert_eq!(app.collections[ci].list_query, "uxc");
+    assert_eq!(
+        app.collections[ci].entries.len(),
+        2,
+        "no request was deleted or duplicated"
+    );
+}
+
+/// Esc is the way out of a filter you no longer want, and it must not quit the
+/// app on the way — the quit arm sits directly below it.
+#[test]
+fn esc_clears_the_request_filter_rather_than_quitting() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.collections[ci].list_query.is_empty());
+    assert!(!app.list_filter_typing);
+    assert!(!app.quit, "Esc cleared the filter, it did not quit");
+    assert_eq!(
+        app.collections[ci].rows().len(),
+        2,
+        "the whole list is back"
+    );
+}
+
+/// Enter keeps the filter but hands the keyboard back, so the narrowed list can
+/// be navigated and acted on — the same bargain the Environments filter makes.
+#[test]
+fn enter_leaves_the_filter_box_but_keeps_the_filter() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.list_filter_typing, "the box gave the keyboard back");
+    assert_eq!(
+        app.collections[ci].list_query, "alph",
+        "the filter is still on"
+    );
+    assert_eq!(app.collections[ci].rows().len(), 1);
+}
+
+/// Clearing the filter has to leave the cursor on the request the user went
+/// looking for, including following it into whatever folder it lives in —
+/// otherwise the search ends by throwing away its own result.
+#[test]
+fn clearing_the_filter_follows_the_request_that_was_found() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Users/List"), entry_named("Auth/Logout")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "logout");
+    assert_eq!(app.collections[ci].selected_entry, 1);
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(
+        app.collections[ci].folder,
+        vec!["Auth".to_string()],
+        "the list is now browsing the folder the match lives in"
+    );
+    assert_eq!(app.collections[ci].selected_entry, 1);
+    let cursor = app.collections[ci].list_cursor;
+    assert!(
+        matches!(
+            app.collections[ci].rows().get(cursor),
+            Some(crate::tree::Row::Entry(1))
+        ),
+        "and the cursor is on it"
+    );
+}
+
+/// A filtered list hides the requests a move would step over, so the distance
+/// travelled would be unpredictable and invisible. Refuse, and say why.
+#[test]
+fn reordering_is_refused_while_the_list_is_filtered() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("unrelated"),
+        entry_named("Logout"),
+    ];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "log");
+    press(&mut app, KeyCode::Enter);
+    // The cursor is on "Logout", whose neighbour *in the filtered list* is
+    // "Login" — two places away in the collection.
+    app.collections[ci].list_cursor = 1;
+
+    alt(&mut app, KeyCode::Up);
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Login", "unrelated", "Logout"],
+        "nothing moved"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReorderNeedsUnfilteredList)
+    ));
+}
+
+/// The filter strip has to be on screen saying what is being filtered, or a
+/// short list just looks like a collection that lost its requests.
+#[test]
+fn the_filter_strip_shows_the_query_and_says_when_nothing_matches() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    let text = render_screen(&mut app);
+    assert!(text.contains("alph"), "the query is on screen: {text}");
+
+    type_filter(&mut app, "zzz");
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(crate::i18n::Strings::for_language(&app.language).list_filter_no_matches),
+        "an empty filtered list explains itself: {text}"
+    );
+}
+
+/// `/` on a Workspace tab keeps its Environments meaning: that pane is the
+/// filesystem tree, whose rows don't come from the request filter at all, so
+/// capturing the key there would be a filter that visibly did nothing.
+#[test]
+fn slash_on_a_workspace_tab_still_reaches_the_environments_filter() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].workspace_root = Some(std::path::PathBuf::from("/tmp/ws"));
+    app.collections[ci].workspace_auto_prompt_dismissed = true;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+
+    assert!(!app.list_filter_typing);
+    assert!(app.env_filter_typing);
+    assert_eq!(app.focus, Pane::GlobalEnv);
 }

@@ -1614,6 +1614,22 @@ impl TuiApp {
         if self.env_filter_typing && self.on_key_env_filter(key, ctrl, alt) {
             return;
         }
+        // Type-to-filter for the Requests list, opened with `/`. Same mode
+        // treatment and the same reason: the list binds bare letters too (`x`
+        // delete, `u` undo, `c` duplicate, `n` new), so a name typed without a
+        // mode would set half of them off.
+        //
+        // Also gated on the pane still having focus, so Tab hands the keyboard
+        // back to the rest of the app rather than leaving an invisible capture
+        // running in a pane the user has moved away from. The query survives —
+        // returning to the list resumes typing into the filter that is still on
+        // screen.
+        if self.list_filter_typing
+            && self.focus == Pane::List
+            && self.on_key_list_filter(key, ctrl, alt)
+        {
+            return;
+        }
         match key.code {
             // Esc dismisses every active mouse text selection first (the
             // active one and any additional Alt+Click+Drag regions), so
@@ -1627,6 +1643,15 @@ impl TuiApp {
             KeyCode::Esc if self.focus == Pane::GlobalEnv && !self.env_query.is_empty() => {
                 self.env_query.clear();
                 self.clamp_env_selection();
+            }
+            // The same way out of the Requests list's filter, for the same
+            // reason — and it must come before the quit arm below, or clearing
+            // a filter would close the app.
+            KeyCode::Esc
+                if self.focus == Pane::List
+                    && !self.collections[self.active_tab].list_query.is_empty() =>
+            {
+                self.clear_list_filter(self.active_tab);
             }
             // With nothing left for it to dismiss, Esc quits exactly as `q`
             // does (confirmation and unsaved-work checks included). Backing out
@@ -1764,6 +1789,18 @@ impl TuiApp {
             // also focuses the panel, so it works as "find me an environment"
             // from wherever you are rather than only once the panel is focused
             // — with hundreds of environments that is the whole point of it.
+            // `/` filters the Requests list while that list has focus — the
+            // pane-scoped reading of "find me one of these", matching how `x`
+            // and `u` already mean "the thing in this pane". A Workspace tab is
+            // excluded: its left pane is the filesystem tree, whose rows come
+            // from `ws_rows` and have their own Ctrl+F filter, so `/` there
+            // keeps its environments meaning rather than silently doing nothing.
+            KeyCode::Char('/')
+                if self.focus == Pane::List
+                    && !self.collections[self.active_tab].is_workspace() =>
+            {
+                self.list_filter_typing = true;
+            }
             KeyCode::Char('/') => {
                 self.focus = Pane::GlobalEnv;
                 self.env_filter_typing = true;
@@ -2198,6 +2235,86 @@ impl TuiApp {
         true
     }
 
+    /// Keys for the Requests list's `/` filter, while it is capturing.
+    /// Returns `true` when the key was consumed.
+    ///
+    /// Deliberately the same shape as [`Self::on_key_env_filter`]: printable
+    /// characters extend the query, Backspace trims, Enter keeps the filter but
+    /// hands the keyboard back to the list, Esc clears it outright, and Up/Down
+    /// move the selection without leaving the filter so a name can be typed and
+    /// a match picked in one go. Two filters a Tab apart that behaved
+    /// differently would be worse than either.
+    fn on_key_list_filter(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        let ci = self.active_tab;
+        match key.code {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                self.collections[ci].list_query.push(c);
+                self.clamp_list_selection(ci);
+            }
+            KeyCode::Backspace => {
+                self.collections[ci].list_query.pop();
+                self.clamp_list_selection(ci);
+            }
+            KeyCode::Esc => {
+                self.clear_list_filter(ci);
+            }
+            KeyCode::Enter => self.list_filter_typing = false,
+            KeyCode::Up | KeyCode::Down => {
+                let len = self.collections[ci].rows().len();
+                if len > 0 {
+                    // Wrap the way the list's own j/k navigation does.
+                    let cur = self.collections[ci].list_cursor.min(len - 1) as i32;
+                    let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                    let next = (cur + delta).rem_euclid(len as i32) as usize;
+                    self.select_row_in_pane(Pane::List, next);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Drop the Requests list filter and leave its capture mode, putting the
+    /// cursor back on the request that was highlighted.
+    ///
+    /// Restoring the folder matters: the filtered list is flat, so the match
+    /// the user settled on can live somewhere quite different from the folder
+    /// that was being browsed when they started typing. Clearing the filter
+    /// without following the selection would drop them back where they began,
+    /// having thrown away the thing they just went looking for.
+    pub(crate) fn clear_list_filter(&mut self, ci: usize) {
+        self.list_filter_typing = false;
+        let col = &mut self.collections[ci];
+        col.list_query.clear();
+        col.sync_folder_to_selected();
+        let sel = col.selected_entry;
+        col.list_cursor = col
+            .rows()
+            .iter()
+            .position(|r| matches!(r, crate::tree::Row::Entry(i) if *i == sel))
+            .unwrap_or(0);
+    }
+
+    /// Keep the Requests list selection inside the (possibly just narrowed) row
+    /// list, and follow it with `selected_entry` so the right-hand panes show
+    /// the request the cursor is actually on.
+    fn clamp_list_selection(&mut self, ci: usize) {
+        let rows = self.collections[ci].rows();
+        let cursor = self.collections[ci]
+            .list_cursor
+            .min(rows.len().saturating_sub(1));
+        self.collections[ci].list_cursor = cursor;
+        // Typing narrows the list under the cursor, so the row it lands on is
+        // usually a different request; the panes to the right follow it, the
+        // same as they would if the cursor had been moved by hand.
+        if let Some(idx) = rows.get(cursor).and_then(row_entry) {
+            let col = &mut self.collections[ci];
+            col.selected_entry = idx;
+            col.invalidate_request_json();
+        }
+        self.list_hscroll = 0;
+    }
+
     /// Keep the Environments panel selection inside the (possibly just
     /// narrowed) row list, and reset the name's horizontal scroll since the
     /// selection is now on a different name.
@@ -2561,6 +2678,15 @@ impl TuiApp {
     pub(crate) fn move_selected_request(&mut self, down: bool) {
         let ci = self.active_tab;
         let col = &self.collections[ci];
+        // A filtered list hides the requests a move would step over, so "one
+        // place down" would land the request an unpredictable distance away —
+        // past however many non-matching requests happen to sit in the gap,
+        // none of them on screen. Refuse and say why rather than perform a move
+        // whose result can't be seen.
+        if col.list_filter_active() {
+            self.status = Some(Status::ReorderNeedsUnfilteredList);
+            return;
+        }
         let rows = col.rows();
         let Some(from) = rows.get(col.list_cursor).and_then(row_entry) else {
             return;

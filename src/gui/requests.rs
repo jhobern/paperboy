@@ -48,7 +48,11 @@ fn clickable_row(
     let hit = ui.interact(
         rect,
         drawn.response.id.with("whole_row"),
-        egui::Sense::click(),
+        // Senses drags as well as clicks so a request can be dragged to a new
+        // position in the collection; a click still lands as a click, since
+        // egui only calls it a drag once the pointer actually moves. Same
+        // bargain the workspace tree's rows make (see `ws_row`).
+        egui::Sense::click_and_drag(),
     );
     if hit.hovered() || drawn.inner.hovered() {
         let visuals = ui.visuals().widgets.hovered;
@@ -115,7 +119,18 @@ struct Actions {
     rename: Option<usize>,
     duplicate: Option<usize>,
     delete: Option<usize>,
+    /// A request dragged to a new position: `(from, before)`, where `before` is
+    /// the index of the request it was dropped above (`entries.len()` for the
+    /// gap past the last one). Applied with
+    /// [`crate::collection::Collection::move_entry_before`].
+    reorder: Option<(usize, usize)>,
 }
+
+/// The request being dragged, identified by its index into `entries` — which is
+/// all the drop target needs, since the gap it lands in is decided by whichever
+/// row the pointer is over.
+#[derive(Clone, Debug)]
+struct ReqDrag(usize);
 
 /// The row's context-menu / marker labels, bundled so adding one doesn't grow
 /// `render_node`'s parameter list again — it had already picked up a run,
@@ -153,16 +168,45 @@ fn render_node(
         );
     }
     for &i in &node.entries {
+        let leaf = entry_path(&entries[i].title).pop().unwrap_or_default();
+        render_entry_row(ui, i, entries, leaf, selected, theme, labels, true, actions);
+    }
+}
+
+/// One request row — the shared body of the folder tree and the flat filtered
+/// list, which differ only in the label they show and whether a row can be
+/// dragged.
+///
+/// `label` is the request's own name in the tree (the folder rows above it
+/// supply the rest) but its whole title when filtered, where the tree has been
+/// flattened and two folders may each hold a `Login`.
+///
+/// `reorderable` is false while the list is filtered: the gap between two
+/// matches can span any number of requests that aren't on screen, so a drop
+/// there would move the request an unpredictable distance for reasons the user
+/// can't see.
+#[allow(clippy::too_many_arguments)]
+fn render_entry_row(
+    ui: &mut egui::Ui,
+    i: usize,
+    entries: &[HurlEntry],
+    label: String,
+    selected: usize,
+    theme: &GuiTheme,
+    labels: &RowLabels<'_>,
+    reorderable: bool,
+    actions: &mut Actions,
+) {
+    {
         let entry = &entries[i];
-        let leaf = entry_path(&entry.title).pop().unwrap_or_default();
-        let label = if leaf.trim().is_empty() {
+        let label = if label.trim().is_empty() {
             if entry.url.trim().is_empty() {
                 labels.untitled.to_string()
             } else {
                 entry.url.clone()
             }
         } else {
-            leaf
+            label
         };
         let (marker, ok) = run_marker(entry.last_run);
         let is_sel = i == selected;
@@ -232,6 +276,72 @@ fn render_node(
                 ui.close();
             }
         });
+        if reorderable {
+            if row.drag_started() {
+                egui::DragAndDrop::set_payload(ui.ctx(), ReqDrag(i));
+            }
+            // Something has to follow the pointer, or a drag looks like nothing
+            // is happening — the rows themselves stay put, and the insertion
+            // line only appears once the pointer is over a row.
+            if row.dragged()
+                && let Some(pos) = ui.ctx().pointer_interact_pos()
+            {
+                let layer =
+                    egui::LayerId::new(egui::Order::Tooltip, ui.id().with("req_drag_label"));
+                ui.ctx().layer_painter(layer).text(
+                    pos + egui::vec2(12.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    &label,
+                    egui::TextStyle::Button.resolve(ui.style()),
+                    theme.accent,
+                );
+            }
+            request_drop_zone(ui, &row, theme, i, actions);
+        }
+    }
+}
+
+/// Offer the gap above or below this row as somewhere the dragged request can
+/// land, and draw the line showing which.
+///
+/// A line *between* rows rather than a highlight *on* one: this is a reorder,
+/// so the question is which two requests it will end up between — an outlined
+/// row would say "into here", which is what the workspace tree's folder drop
+/// means and would read as moving the request into another request.
+fn request_drop_zone(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    theme: &GuiTheme,
+    i: usize,
+    actions: &mut Actions,
+) {
+    let Some(dragged) = egui::DragAndDrop::payload::<ReqDrag>(ui.ctx()) else {
+        return;
+    };
+    if !resp.contains_pointer() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let rect = resp.rect;
+    // Which half of the row the pointer is in decides which gap is being aimed
+    // at, so every pixel of the list targets a gap and there is no dead zone
+    // between rows to fall down.
+    let above = pos.y < rect.center().y;
+    let before = if above { i } else { i + 1 };
+    // Both gaps touching the dragged request are where it already is. Drawing a
+    // line there would promise a move that `move_entry_before` correctly
+    // refuses to make.
+    if dragged.0 == before || dragged.0 + 1 == before {
+        return;
+    }
+    let y = if above { rect.top() } else { rect.bottom() };
+    ui.painter()
+        .hline(rect.x_range(), y, egui::Stroke::new(2.0, theme.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        actions.reorder = Some((dragged.0, before));
+        egui::DragAndDrop::clear_payload(ui.ctx());
     }
 }
 
@@ -277,6 +387,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.help_menu_import_file,
         s.help_menu_import_account,
     );
+    let (hint_filter, lbl_filter_no_matches) =
+        (s.gui_request_filter_hint, s.gui_request_filter_no_matches);
 
     // Header: collection name (truncates) + Run All / Add (always visible).
     let name = app.session.collections[ci].name.clone();
@@ -303,7 +415,27 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
     ui.separator();
 
+    // Filter box. Shown whenever there is more than one request, and always
+    // once it is: the same reasoning as the Environments panel's, where an
+    // empty box costs one line and a tree of a few hundred requests is
+    // unusable without one. Hidden for a collection small enough to read at a
+    // glance, where it would be a control with nothing to do.
+    if app.session.collections[ci].entries.len() > 1 {
+        ui.horizontal(|ui| {
+            super::widgets::flat_fields(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.session.collections[ci].list_query)
+                        .hint_text(hint_filter)
+                        .desired_width(f32::INFINITY),
+                )
+            });
+        });
+        ui.separator();
+    }
+
     let selected = app.session.collections[ci].selected_entry;
+    let filtering = app.session.collections[ci].list_filter_active();
+    let query = app.session.collections[ci].list_query.clone();
     let mut actions = Actions::default();
 
     egui::ScrollArea::vertical()
@@ -355,6 +487,38 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 delete: lbl_delete,
                 edited: lbl_edited,
             };
+            // A filtered list is flat and folder-blind (see
+            // `crate::tree::rows_matching`): the tree shows one collapsible
+            // folder per level, and leaving those in would mean hiding matches
+            // inside collapsed folders — a search that can't show you what it
+            // found. Each match carries its whole title instead, since the
+            // folder rows that told two `Login`s apart are gone.
+            if filtering {
+                let matches = crate::tree::rows_matching(entries, &query);
+                if matches.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(theme.dim, lbl_filter_no_matches);
+                    return;
+                }
+                for row in matches {
+                    let crate::tree::Row::Entry(i) = row else {
+                        continue;
+                    };
+                    let title = entries[i].title.trim().to_string();
+                    render_entry_row(
+                        ui,
+                        i,
+                        entries,
+                        title,
+                        selected,
+                        &theme,
+                        &labels,
+                        false,
+                        &mut actions,
+                    );
+                }
+                return;
+            }
             render_node(
                 ui,
                 &tree,
@@ -417,6 +581,15 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
                 col.selected_entry = col.entries.len().saturating_sub(1);
             }
             col.invalidate_request_json();
+        }
+    }
+    if let Some((from, before)) = actions.reorder {
+        // The order is what `run_all_entries` follows, so this is a real edit to
+        // the collection rather than a view preference — `move_entry_before`
+        // marks the file unsaved, and a drop that changed nothing returns false
+        // so it doesn't.
+        if app.session.collections[ci].move_entry_before(from, before) {
+            app.session.save();
         }
     }
     if let Some(i) = actions.run {
@@ -2109,6 +2282,110 @@ pub(crate) mod tests {
             copy.last_response.is_none(),
             "a copy that has never been sent shouldn't inherit a result it didn't produce"
         );
+    }
+
+    /// A drop is aimed at the gap between two rows, so dragging downwards has
+    /// to account for the dragged request being lifted out first — otherwise it
+    /// lands one place short of where it was let go.
+    #[test]
+    fn dragging_a_request_downwards_lands_it_in_the_gap_it_was_dropped_into() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c"), entry("d")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        // "a" dropped into the gap above "d".
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                reorder: Some((0, 3)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(titles(&app, ci), vec!["b", "c", "a", "d"]);
+        assert!(
+            app.session.collections[ci].structure_modified,
+            "the order is what Run All follows, so this is an unsaved edit"
+        );
+    }
+
+    #[test]
+    fn dragging_a_request_upwards_lands_it_in_the_gap_it_was_dropped_into() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c"), entry("d")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        // "d" dropped into the gap above "b".
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                reorder: Some((3, 1)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(titles(&app, ci), vec!["a", "d", "b", "c"]);
+    }
+
+    /// Dropping a request back where it started must not mark the file unsaved
+    /// — an aborted drag would otherwise leave the tab claiming an edit.
+    #[test]
+    fn a_drag_that_goes_nowhere_is_not_an_edit() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        for before in [1, 2] {
+            apply_actions(
+                &mut app,
+                ci,
+                Actions {
+                    reorder: Some((1, before)),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(titles(&app, ci), vec!["a", "b", "c"]);
+        assert!(!app.session.collections[ci].structure_modified);
+    }
+
+    /// The filter is the collection's, not the panel's, so both front-ends
+    /// narrow the same tab the same way and each tab keeps its own.
+    #[test]
+    fn the_request_filter_flattens_the_tree_and_matches_the_whole_title() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        let col = &mut session.collections[0];
+
+        col.list_query = "log".into();
+        assert!(col.list_filter_active());
+        assert_eq!(
+            crate::tree::rows_matching(&col.entries, &col.list_query),
+            vec![crate::tree::Row::Entry(0), crate::tree::Row::Entry(2)],
+        );
+
+        // Whitespace alone is not a filter — it matches everything anyway, and
+        // treating it as one would flatten the tree for no visible reason.
+        col.list_query = "  ".into();
+        assert!(!col.list_filter_active());
+    }
+
+    fn titles(app: &GuiApp, ci: usize) -> Vec<&str> {
+        app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.title.as_str())
+            .collect()
     }
 
     #[test]

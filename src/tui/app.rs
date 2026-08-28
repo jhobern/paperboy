@@ -1140,6 +1140,14 @@ pub struct TuiApp {
     /// Environments panel, so letters type into the query instead of firing the
     /// panel's single-key actions (`a`, `x`, `u`, …).
     pub(crate) env_filter_typing: bool,
+    /// True while `/` filter entry is capturing keys for the Requests list, so
+    /// letters type into [`crate::collection::Collection::list_query`] instead
+    /// of firing the list's single-key actions (`x`, `u`, `c`, `n`, …).
+    ///
+    /// The query itself lives on the collection (each tab keeps its own); only
+    /// the "am I typing right now" mode is app-wide, since only one pane can
+    /// hold the keyboard at a time.
+    pub(crate) list_filter_typing: bool,
     /// Max scroll offset for the Response body (wrapped content rows −
     /// viewport height); cached each frame by `draw_response` from
     /// `resp_panel.clamp_scroll(..)` so a scrollbar drag between frames (and
@@ -1475,6 +1483,7 @@ impl Default for TuiApp {
             global_env_idx: 0,
             env_query: String::new(),
             env_filter_typing: false,
+            list_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
             list_hscroll: 0,

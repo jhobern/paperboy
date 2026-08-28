@@ -193,6 +193,7 @@ strings! {
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
     request_moved_in_list => "Request moved — this is the order Run All follows.", "Requête déplacée — c'est l'ordre suivi par Tout exécuter.", "Forespørgsel flyttet — det er den rækkefølge Kør alle følger.";
+    reorder_needs_unfiltered_list => "Clear the filter (Esc) to reorder — a filtered list hides what the request would move past.", "Effacez le filtre (Échap) pour réordonner — une liste filtrée masque ce que la requête dépasserait.", "Ryd filteret (Esc) for at omarrangere — en filtreret liste skjuler det, forespørgslen ville flytte forbi.";
     request_duplicated => "{m} request duplicated as '{name}'.", "Requête {m} dupliquée sous « {name} ».", "{m}-forespørgsel duplikeret som '{name}'.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
@@ -300,7 +301,10 @@ strings! {
     env_active_label => "Active: ", "Actif : ", "Aktiv: ";
     env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
     env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    list_filter_label => "Find: ", "Chercher : ", "Find: ";
     env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
+    list_filter_no_matches => "No request matches.", "Aucune requête ne correspond.", "Ingen forespørgsel matcher.";
+    list_filter_no_matches_hint => "Esc clears the filter.", "Échap efface le filtre.", "Esc rydder filteret.";
     env_source_label => "Source: ", "Source : ", "Kilde: ";
     env_source_all => "All", "Tous", "Alle";
     env_source_global => "Global", "Global", "Global";
@@ -517,6 +521,8 @@ strings! {
     help_duplicate_request => "duplicate the request in place (List pane)", "dupliquer la requête sur place (volet Liste)", "duplikér anmodningen på stedet (Liste-ruden)";
     foot_duplicate => "duplicate", "dupliquer", "duplikér";
     foot_reorder => "reorder", "réordonner", "omarrangér";
+    foot_find_request => "find request", "chercher requête", "find forespørgsel";
+    help_find_request => "find a request anywhere in the collection, not just this folder (Esc clears it)", "chercher une requête dans toute la collection, pas seulement ce dossier (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen, ikke kun denne mappe (Esc rydder det)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
@@ -897,6 +903,8 @@ strings! {
     gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
     gui_env_filter_hint => "Filter environments…", "Filtrer les environnements…", "Filtrér miljøer…";
     gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
+    gui_request_filter_hint => "Find a request…", "Chercher une requête…", "Find en forespørgsel…";
+    gui_request_filter_no_matches => "No request matches the filter.", "Aucune requête ne correspond au filtre.", "Ingen forespørgsel matcher filteret.";
     gui_env_source_all => "All", "Tous", "Alle";
     gui_env_source_global => "Global", "Global", "Global";
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
@@ -1656,6 +1664,9 @@ pub enum Status {
     /// The selected request was moved a place up or down its collection,
     /// changing the order `Run All` follows.
     RequestMovedInList,
+    /// `Alt+↑`/`Alt+↓` was pressed while the Requests list was filtered, where
+    /// a move would step over requests that aren't on screen.
+    ReorderNeedsUnfilteredList,
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
@@ -1780,6 +1791,7 @@ impl Status {
                     | Status::WorkspaceSaved
                     | Status::RequestMoved(_, _)
                     | Status::RequestMovedInList
+                    | Status::ReorderNeedsUnfilteredList
                     | Status::RequestCopied(_, _)
                     | Status::RequestDuplicated(_, _)
                     | Status::ThemeSaved(_)
@@ -1881,6 +1893,7 @@ impl Status {
             Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
             Status::EnvReopened(name) => s.env_reopened.replace("{n}", name),
             Status::RequestMovedInList => s.request_moved_in_list.to_string(),
+            Status::ReorderNeedsUnfilteredList => s.reorder_needs_unfiltered_list.to_string(),
             Status::RequestMoved(method, dest) => s
                 .request_moved
                 .replace("{m}", method)

@@ -12,6 +12,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The Requests list can be searched — `/` in the terminal UI, a filter box
+  in the graphical one.** The terminal UI's list shows one folder at a time and
+  the GUI's tree keeps folders collapsed, so in a collection of any size the
+  request you want is usually the one you can't see, and the only way to it was
+  to remember which folder you filed it under. Typing narrows the list to
+  matching requests from the *whole* collection, flattened out of their folders
+  — a search that hid its matches inside collapsed folders would be no search
+  at all — and each match shows its full title, since two folders can each hold
+  a `Login` and the folder rows that told them apart are gone. Matching is a
+  case-insensitive substring of the whole title, so `auth/` narrows to a folder
+  just as readily as a name does. The filter belongs to the tab, so each one
+  keeps its own and both front-ends narrow it the same way; it isn't remembered
+  across restarts, where a collection that looked like it had lost most of its
+  requests would be a poor greeting. In the terminal UI, Enter keeps the filter
+  and hands the keyboard back to the list, and Esc clears it — landing the
+  cursor on the request that was found, folder and all, rather than back where
+  the search started.
+
+- **Requests can be dragged into a new order in the graphical UI.** Drag a
+  request and a line shows which two requests it will land between; the drop
+  applies the same reorder `Alt+↑`/`Alt+↓` does in the terminal UI. Reordering
+  is turned off while the list is filtered, in both front-ends: the gap between
+  two matches can span any number of requests that aren't on screen, so a move
+  there would travel an unpredictable distance for reasons nothing on screen
+  explains.
+
 - **Requests can be reordered — `Alt+↑` / `Alt+↓` in the Requests
   list.** A collection's order is not cosmetic: `Run All` follows it, so it
   decides whether a login runs before the request that uses the token it
@@ -110,6 +136,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   result it hadn't produced.
 
 ### Changed
+
+- **`/` now filters the Requests list when that list has focus.** It previously
+  always jumped to the Global Environments panel, wherever you pressed it. It
+  still does from every other pane — the pane you are looking at decides which
+  list "find me one of these" means, the same way `x` and `u` already do. A
+  Workspace tab is the exception: its left pane is the filesystem tree, which
+  has its own `Ctrl+F` filter, so `/` there keeps its environments meaning
+  rather than silently doing nothing.
 
 - **`u` now undoes the last deletion in the pane you are looking at, and only
   that.** `u` was never a single time-ordered undo: it restores a deleted
