@@ -13760,7 +13760,7 @@ fn raw_mode_rejects_invalid_hurl_and_keeps_the_text_editable() {
         "invalid hurl reopens the editor for correction"
     );
     if let Some(Overlay::Prompt { kind, editor, .. }) = &app.overlay {
-        assert!(matches!(kind, PromptKind::Raw(0)));
+        assert!(matches!(kind, PromptKind::Raw { ci: 0, .. }));
         assert_eq!(
             editor.text(),
             "this is not valid hurl {{{",
@@ -31466,4 +31466,171 @@ fn the_requests_view_mentions_stale_body_notes() {
         text.contains(head),
         "the stale-notes hint should be on screen:\n{text}"
     );
+}
+
+// ── Raw Mode: which copy of an annotated body an edit meant ────────────────
+
+/// Open Raw Mode on the first request of tab 0, replace its text wholesale,
+/// and commit — the path a user takes when hand-editing the Hurl.
+fn raw_edit(app: &mut TuiApp, text: &str) {
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new(text, true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert!(app.overlay.is_none(), "the edit should have been accepted");
+}
+
+fn app_with_annotated_body() -> TuiApp {
+    let mut app = TuiApp::default();
+    let mut e = HurlEntry::from_fields("r", "POST", "http://h/a", vec![], "");
+    e.body_src = Some("{\n  \"a\": 1 // mine\n}".into());
+    app.collections[0].entries.push(e);
+    app
+}
+
+/// A note edit that doesn't change what would be sent isn't a disagreement at
+/// all — the block still reconciles with the body below it, so it is claimed
+/// as it always was and there is nothing to tell the user.
+#[test]
+fn raw_mode_takes_a_cosmetic_note_edit_in_its_stride() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    let edited = opened.replace("// mine", "// yours");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // yours\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    assert!(e.stale_body_notes().is_none(), "still the body's own notes");
+    assert!(app.status.is_none(), "no conflict arose, so say nothing");
+}
+
+/// Editing only the notes, so that they no longer describe the body below
+/// them, must apply them. Left to the file's own precedence the sent body
+/// would win and the user's edit would be preserved but never applied — which
+/// reads as being ignored.
+#[test]
+fn raw_mode_applies_an_edit_made_only_to_the_notes() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Change the value inside the notes only, leaving the strict body alone.
+    let edited = opened.replace("#   \"a\": 1 // mine", "#   \"a\": 9 // mine");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 9 // mine\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 9\n}"));
+    assert!(e.stale_body_notes().is_none(), "the notes were applied");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAppliedFromRaw)
+    ));
+}
+
+/// Editing only the body is the case the file's precedence already gets right:
+/// the body is what runs, so it wins, and the notes are kept rather than
+/// deleted — now visibly, as leftover notes.
+#[test]
+fn raw_mode_keeps_the_body_when_only_the_body_was_edited() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Change the strict body only. It appears once outside the `#` block.
+    let edited = opened.replace("\n  \"a\": 1\n}", "\n  \"a\": 2\n}");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 2\n}"),
+        "body wins"
+    );
+    let (_, notes) = e.stale_body_notes().expect("the notes are kept");
+    assert_eq!(notes, "{\n  \"a\": 1 // mine\n}");
+    assert!(
+        !matches!(app.status, Some(crate::i18n::Status::NotesAppliedFromRaw)),
+        "nothing was applied from the notes"
+    );
+}
+
+/// Two edits cannot be merged into one body, so the body wins and the user is
+/// told — rather than left to discover that half of what they typed did
+/// nothing.
+#[test]
+fn raw_mode_says_so_when_the_body_and_its_notes_were_both_edited() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    let edited = opened
+        .replace("// mine", "// yours")
+        .replace("\n  \"a\": 1\n}", "\n  \"a\": 2\n}");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 2\n}"),
+        "body wins"
+    );
+    let (_, notes) = e.stale_body_notes().expect("the notes are kept");
+    assert_eq!(
+        notes, "{\n  \"a\": 1 // yours\n}",
+        "the edited notes survive"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesKeptBodyWon)
+    ));
+}
+
+/// Notes that would not survive being written back as a body are never
+/// adopted, however plain the intent: doing so would put comments in the sent
+/// body, which is not valid Hurl and reads back as an empty collection.
+#[test]
+fn raw_mode_will_not_apply_notes_that_would_not_make_a_valid_body() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Break the notes so that stripping them no longer yields JSON, without
+    // touching the strict body.
+    let edited = opened.replace("#   \"a\": 1 // mine", "#   \"a\": 1 \"b\" // mine");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 1\n}"),
+        "the sent body is untouched and still strict JSON"
+    );
+    assert!(
+        e.stale_body_notes().is_some(),
+        "the notes are kept, not lost"
+    );
+    assert!(!matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAppliedFromRaw)
+    ));
+}
+
+/// A request with no notes at all must be unaffected by any of this.
+#[test]
+fn raw_mode_leaves_a_plain_body_alone() {
+    let mut app = TuiApp::default();
+    let e = HurlEntry::from_fields("r", "POST", "http://h/a", vec![], "{\"a\": 1}");
+    app.collections[0].entries.push(e);
+
+    let opened = app.collections[0].entries[0].to_hurl();
+    raw_edit(&mut app, &opened.replace("http://h/a", "http://h/b"));
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.url, "http://h/b");
+    assert_eq!(e.body_wire().as_deref(), Some("{\"a\": 1}"));
+    assert!(e.stale_body_notes().is_none());
 }

@@ -170,7 +170,17 @@ pub(crate) enum PromptKind {
     RenameNewEnv,
     /// Raw Mode: the selected entry's actual Hurl-text representation,
     /// reparsed back into the entry on commit.
-    Raw(usize),
+    ///
+    /// `before` is the text the editor opened with. Raw Mode shows the file,
+    /// and a file carries an annotated body *twice* — once as the `# [Body]`
+    /// notes and once as the strict JSON that is sent — so it is the one place
+    /// in PaperBoy where the two copies can be edited apart from each other.
+    /// Keeping the original is what lets a save tell which copy the user
+    /// actually changed, instead of guessing.
+    Raw {
+        ci: usize,
+        before: String,
+    },
     /// Raw JSON Mode: the selected entry's [`build_request_json`] preview,
     /// reparsed back into the entry on commit — the JSON-text counterpart to
     /// `Raw`, opened with Shift+J instead of Shift+H.
@@ -1559,6 +1569,63 @@ impl Default for TuiApp {
     }
 }
 
+/// The two copies of a body that a `.hurl` file carries: the `# [Body]` notes,
+/// and the strict text that is actually sent.
+///
+/// A block the parser claimed lives in `body_src` with the sent text derived
+/// from it; one it could not claim sits in the comment list instead. Both are
+/// reported the same way here, because for deciding *what the user edited* it
+/// makes no difference which state the file happened to be in.
+fn body_copies(e: &HurlEntry) -> (Option<String>, Option<String>) {
+    if let Some((_, notes)) = e.stale_body_notes() {
+        return (Some(notes), e.body_src.clone());
+    }
+    match (&e.body_src, e.body_wire()) {
+        (Some(src), Some(wire)) if *src != wire.as_ref() => {
+            (Some(src.clone()), Some(wire.into_owned()))
+        }
+        _ => (None, e.body_src.clone()),
+    }
+}
+
+/// Decide which copy of an annotated body a Raw Mode edit meant to change.
+///
+/// Raw Mode shows the file, and the file spells an annotated body out twice.
+/// Left alone, the file's own precedence applies — the sent body wins and the
+/// notes are kept as prose — which is right when the body is what was edited
+/// and quietly wrong when the notes were: the user's edit would be preserved
+/// but never applied, which reads as being ignored.
+///
+/// Comparing against the text the editor opened with settles it:
+///
+/// * only the notes changed → they are the newer truth, so the body is derived
+///   from them;
+/// * only the body changed → the file's precedence was right all along;
+/// * both changed → there is no honest way to merge two edits into one body, so
+///   the body wins (it is what runs, and what every other tool sees), the notes
+///   are kept, and the user is told rather than left to discover it.
+///
+/// Notes that would not survive being written back as a body are never adopted,
+/// however clear the intent: doing so would put comments in the sent body and
+/// read back as an empty collection.
+fn settle_raw_body_edit(before: &str, parsed: &mut HurlEntry) -> Option<Status> {
+    // Nothing to settle unless the file came back with the two disagreeing.
+    parsed.stale_body_notes()?;
+    let (was_notes, was_body) = crate::hurl::parse_hurl(before)
+        .first()
+        .map(body_copies)
+        .unwrap_or((None, None));
+    let (now_notes, now_body) = body_copies(parsed);
+
+    match (now_notes != was_notes, now_body != was_body) {
+        (true, false) => parsed
+            .adopt_body_notes()
+            .then_some(Status::NotesAppliedFromRaw),
+        (true, true) => Some(Status::NotesKeptBodyWon),
+        _ => None,
+    }
+}
+
 impl TuiApp {
     /// The safe half of [`take_overlay!`]: hand the open overlay to `f`, which
     /// either extracts what it wants from it or gives it back untouched.
@@ -2024,7 +2091,7 @@ impl TuiApp {
                     self.save_state();
                 }
             }
-            PromptKind::Raw(ci) => {
+            PromptKind::Raw { ci, before } => {
                 // Reparse the edited Hurl text back into the entry; on success
                 // this can change any field (Raw Mode exposes everything,
                 // including query_params/form_fields/cookies/basic_auth). On
@@ -2042,7 +2109,7 @@ impl TuiApp {
                         .unwrap_or_else(|| s.invalid_hurl.to_string());
                     self.status = Some(Status::Error(msg));
                     self.overlay = Some(Overlay::Prompt {
-                        kind: PromptKind::Raw(ci),
+                        kind: PromptKind::Raw { ci, before },
                         editor: Editor::new(&text, true),
                         title: s.entry_raw_hurl.to_string(),
                         mask: false,
@@ -2053,6 +2120,11 @@ impl TuiApp {
                     return;
                 }
                 let mut parsed = entries.into_iter().next().unwrap();
+                // Raw Mode is the one surface where the two copies of an
+                // annotated body can be edited apart from each other, so work
+                // out which of them the user actually touched before letting
+                // the file's own precedence decide it for them.
+                let note = settle_raw_body_edit(&before, &mut parsed);
                 if let Some(col) = self.collections.get_mut(ci) {
                     let ei = col.selected_entry;
                     if let Some(entry) = col.entries.get_mut(ei) {
@@ -2079,6 +2151,9 @@ impl TuiApp {
                     }
                     col.invalidate_request_json();
                     col.sync_folder_to_selected();
+                }
+                if let Some(status) = note {
+                    self.status = Some(status);
                 }
                 self.save_state();
             }

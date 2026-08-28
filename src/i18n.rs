@@ -852,6 +852,8 @@ strings! {
     notes_stale_cancel => "Leave them alone", "Ne rien changer", "Lad dem være";
     notes_adopted => "The notes are the body again", "Les notes sont de nouveau le corps", "Noterne er brødteksten igen";
     notes_discarded => "Notes deleted", "Notes supprimées", "Noter slettet";
+    notes_applied_from_raw => "Your edit to the notes became the body", "Votre modification des notes est devenue le corps", "Din ændring af noterne blev til brødteksten";
+    notes_kept_body_won => "The body and its notes were both edited — the body was used, the notes kept", "Le corps et ses notes ont été modifiés tous les deux — le corps a été utilisé, les notes conservées", "Både brødteksten og dens noter blev ændret — brødteksten blev brugt, noterne beholdt";
     gui_notes_stale_headline => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
     gui_notes_stale_detail => "The body was edited without them, so they have been kept as plain comments rather than thrown away. Take them back as the body, or delete them.", "Le corps a été modifié sans elles\u{a0}; elles ont donc été conservées comme simples commentaires plutôt que supprimées. Reprenez-les comme corps, ou supprimez-les.", "Brødteksten blev redigeret uden dem, så de er bevaret som almindelige kommentarer i stedet for at blive smidt væk. Tag dem tilbage som brødtekst, eller slet dem.";
     gui_body_mode_raw => "Raw body", "Corps brut", "Rå brødtekst";
@@ -1780,6 +1782,12 @@ pub enum Status {
     NotesAdopted,
     /// Leftover `# [Body]` notes were deleted, leaving the body as it was.
     NotesDiscarded,
+    /// A Raw Mode edit changed only the `# [Body]` notes, so the body was
+    /// derived from them rather than the file's own copy winning.
+    NotesAppliedFromRaw,
+    /// A Raw Mode edit changed the body *and* its notes. Two edits can't be
+    /// merged into one body, so the body won and the notes were kept.
+    NotesKeptBodyWon,
     /// The Workspace tree's extension filter was toggled (`Ctrl+F`). `true`
     /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
     /// `false` shows every file.
@@ -1981,6 +1989,8 @@ impl Status {
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
             Status::NotesAdopted => s.notes_adopted.to_string(),
             Status::NotesDiscarded => s.notes_discarded.to_string(),
+            Status::NotesAppliedFromRaw => s.notes_applied_from_raw.to_string(),
+            Status::NotesKeptBodyWon => s.notes_kept_body_won.to_string(),
             Status::WorkspaceTreeFilter(on) => {
                 if *on {
                     s.workspace_tree_filter_on.to_string()

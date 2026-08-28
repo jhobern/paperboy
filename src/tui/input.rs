@@ -854,7 +854,7 @@ impl TuiApp {
         matches!(
             self.overlay,
             Some(Overlay::Prompt {
-                kind: PromptKind::Raw(_) | PromptKind::RawJson(_),
+                kind: PromptKind::Raw { .. } | PromptKind::RawJson(_),
                 ..
             })
         )
@@ -3498,7 +3498,10 @@ impl TuiApp {
         };
         let text = entry.to_hurl();
         self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::Raw(ci),
+            kind: PromptKind::Raw {
+                ci,
+                before: text.clone(),
+            },
             editor: Editor::new(&text, true),
             title: s.entry_raw_hurl.to_string(),
             mask: false,

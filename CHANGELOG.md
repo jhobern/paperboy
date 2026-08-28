@@ -50,6 +50,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   they wouldn't, the reason is written on the button rather than left for you to
   find out by pressing it.
 
+  Raw Mode is the one place where a body and its notes can be edited apart,
+  since it shows you both copies at once, so it now works out which one you
+  meant by comparing what you saved against what you were given. Edit only the
+  notes and they become the body — otherwise the copy that gets sent would
+  silently win and your edit would look ignored. Edit only the body and it is
+  kept, as it always was, with the notes preserved beside it. Edit both and
+  there is no honest way to merge two edits into one body, so the body is used,
+  the notes are kept as you left them, and you are told that is what happened
+  instead of being left to find out. Notes that would not survive being written
+  back as a body are never applied, however plain the intent.
+
 
 - **The Requests list can be searched — `/` in the terminal UI, a filter box
   in the graphical one.** The terminal UI's list shows one folder at a time and

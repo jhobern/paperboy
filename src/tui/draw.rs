@@ -5075,7 +5075,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // long titles (e.g. the workspace "New report (path relative to
             // workspace)" prompt — longer still in other languages) were being
             // clipped by the panel border on the fixed-width single-line box.
-            let mut hint = if matches!(kind, PromptKind::Raw(_)) {
+            let mut hint = if matches!(kind, PromptKind::Raw { .. }) {
                 format!("{title}  ({})", s.raw_mode_hint)
             } else if matches!(kind, PromptKind::RawJson(_)) {
                 format!("{title}  ({})", s.raw_json_hint)
@@ -5158,12 +5158,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // this Rect for every other prompt kind would be harmless but
             // meaningless, so it's scoped to the two cases that actually
             // hit-test against it.
-            app.prompt_editor_area = if matches!(kind, PromptKind::Raw(_) | PromptKind::RawJson(_))
-            {
-                editor_area
-            } else {
-                Rect::default()
-            };
+            app.prompt_editor_area =
+                if matches!(kind, PromptKind::Raw { .. } | PromptKind::RawJson(_)) {
+                    editor_area
+                } else {
+                    Rect::default()
+                };
             app.push_mouse_hit(
                 MouseLayer::Overlay,
                 editor_area,
