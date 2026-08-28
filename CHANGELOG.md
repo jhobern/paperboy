@@ -12,6 +12,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A JSON request body can carry comments.** People arriving from Postman
+  bring bodies annotated with what each field is for, and Hurl has nowhere to
+  put them — `hurl_core` rejects `//` outright — so until now they had to be
+  deleted at the door. The body is now kept as you wrote it, comments and all,
+  and stripped on the way out: the request that is sent, and the body that
+  every other Hurl runner reads in the `.hurl` file, are strict JSON. The notes
+  ride along in a `# [Body]` block that Hurl ignores, so the file stays valid
+  and `hurlfmt` leaves it byte-for-byte alone. Both `//` and `/* … */` are
+  understood, and a slash that isn't a comment is left alone — a `"url":
+  "https://example.net"` keeps its slashes, and a body that was never JSON in
+  the first place is never touched at all, since truncating a GraphQL query at
+  a slash would be far worse than not annotating it.
+
+  Because the file carries the body twice, the two can be made to disagree by
+  editing one and not the other outside PaperBoy. The body in the file always
+  wins — it is what runs — and when the notes no longer describe it they are
+  **kept in the file as ordinary comments** rather than quietly deleted, so
+  nothing you wrote is ever thrown away on your behalf. A body that is merely
+  reformatted, or has its keys reordered, still counts as the same body, so
+  running someone else's formatter over a collection doesn't orphan every
+  comment in it.
+
+
 - **The Requests list can be searched — `/` in the terminal UI, a filter box
   in the graphical one.** The terminal UI's list shows one folder at a time and
   the GUI's tree keeps folders collapsed, so in a collection of any size the

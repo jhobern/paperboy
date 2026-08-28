@@ -31284,3 +31284,39 @@ fn returning_to_the_environments_panel_resumes_its_filter() {
 
     assert_eq!(app.env_query, "pr");
 }
+
+/// The whole point of the feature, from the user's side: type a note into the
+/// body field and it is still there next time, while the file on disk — and so
+/// the request that goes out — is strict JSON with no notes in it.
+#[test]
+fn a_note_typed_into_the_body_survives_a_save_and_reload() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    let authored = "{\n  // the caller\n  \"id\": 1\n}";
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.body = super::editor::Editor::new(authored, true);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    let entry = &app.collections[0].entries[0];
+    assert_eq!(entry.body_src.as_deref(), Some(authored));
+    assert_eq!(
+        entry.body_wire().as_deref(),
+        Some("{\n  \"id\": 1\n}"),
+        "the request that goes out carries no commentary"
+    );
+
+    let text = app.collections[0].to_hurl();
+    let reloaded = crate::hurl::parse_hurl(&text);
+    assert_eq!(
+        reloaded[0].body_src.as_deref(),
+        Some(authored),
+        "the note came back:\n{text}"
+    );
+}

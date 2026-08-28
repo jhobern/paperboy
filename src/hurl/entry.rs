@@ -911,6 +911,30 @@ impl HurlEntry {
         // The wire body, never the authored one: what lands in the file has
         // to be strict JSON that every other Hurl runner accepts.
         if let Some(body) = self.body_wire() {
+            // A body authored with comments is written twice — once as a
+            // `# [Body]` block that Hurl ignores and PaperBoy reads back, and
+            // once as the strict JSON that is actually sent. Duplication is the
+            // price of the file staying valid: there is nowhere else in a
+            // `.hurl` for a comment to live.
+            //
+            // The block is claimed by a line *count* rather than closed by an
+            // end marker, so no line of body content can terminate it early
+            // (`[Body]` is legal JSON text) and lines inserted by, say, a merge
+            // are detected as damage instead of silently mis-claimed.
+            if let Some(src) = self.body_src.as_deref().filter(|s| *s != body.as_ref()) {
+                let src_lines: Vec<&str> = src.split('\n').collect();
+                out.push_str(&format!("# [Body] {}\n", src_lines.len()));
+                for l in src_lines {
+                    // An empty line is bare `#`, so nothing in the file carries
+                    // trailing whitespace; decoding drops one space after the
+                    // marker, which is how a body's own indentation survives.
+                    if l.is_empty() {
+                        out.push_str("#\n");
+                    } else {
+                        out.push_str(&format!("# {l}\n"));
+                    }
+                }
+            }
             out.push_str(&body);
             if !body.ends_with('\n') {
                 out.push('\n');
@@ -1470,9 +1494,21 @@ mod tests {
             Some("{\n  \"id\": 1\n}"),
             "the wire body has no commentary in it"
         );
+        // The notes live on `#` lines, which Hurl ignores. Everything Hurl
+        // actually reads must be free of them.
         let text = e.to_hurl();
-        assert!(!text.contains("// who"), "\n{text}");
-        assert!(text.contains("\"id\": 1"), "\n{text}");
+        let hurl_reads: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // (`http://h/a` has its own `//`, so this looks for the notes.)
+        assert!(
+            !hurl_reads.contains("// who") && !hurl_reads.contains("// the caller"),
+            "\n{hurl_reads}"
+        );
+        assert!(hurl_reads.contains("\"id\": 1"), "\n{text}");
+        assert!(text.contains("#   // who"), "the note is kept:\n{text}");
     }
 
     /// A body that was never JSON keeps its slashes — stripping there would

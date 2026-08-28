@@ -11,10 +11,13 @@ use hurl_core::ast::{
 use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
 
+use std::ops::Range;
+
 use super::entry::{
     BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
     RunStatus,
 };
+use super::json_comments;
 
 /// Parse a Hurl-format string into a list of [`HurlEntry`] values. Invalid input
 /// yields an empty list (the UI treats "no entries" as a failed load).
@@ -266,6 +269,30 @@ fn map_entry(
         .iter()
         .any(|f| f.enabled && f.kind.is_multipart());
 
+    // The body as the file carries it, and the `# [Body]` block that still
+    // describes it (if one does). A claimed block replaces the body with the
+    // text it was authored from — comments and all — and its lines are then
+    // spoken for, so neither the header scan below nor the prose-comment scan
+    // may read them again.
+    let file_body = req.body.as_ref().and_then(|b| body_source(b, lines));
+    let claimed = claim_body_block(lines, scan_start, scan_end, file_body.as_deref());
+    let claimed_range = claimed.as_ref().map(|(r, _)| r.clone());
+
+    // A claimed block sits between the headers and the body, inside the window
+    // the header scan would otherwise cover. Its lines can't currently be
+    // mistaken for disabled `# key: value` rows — JSON keys are quoted, and a
+    // quote is not a legal key start — but that is a property of another
+    // module's validation, not of this one, so bound the scan explicitly rather
+    // than rely on it.
+    let url_line = req.url.source_info.start.line;
+    let header_end = match (
+        first_anchor_after(&anchors, url_line),
+        claimed_range.as_ref().map(|r| r.start),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+
     HurlEntry {
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
@@ -274,18 +301,14 @@ fn map_entry(
         // structural anchor (body / section / response). Scanning them (instead
         // of reading the AST) recovers disabled rows kept as `# key: value`
         // comments; the anchor bound keeps the scan inside this request.
-        headers: scan_kv_rows(
-            lines,
-            req.url.source_info.start.line + 1,
-            first_anchor_after(&anchors, req.url.source_info.start.line),
-        ),
+        headers: scan_kv_rows(lines, url_line + 1, header_end),
         basic_auth,
         form_fields,
         is_multipart,
         queries: query_params,
         cookies,
         options,
-        body_src: req.body.as_ref().and_then(|b| body_source(b, lines)),
+        body_src: claimed.map(|(_, text)| text).or(file_body),
         expected_status,
         response_version,
         response_headers,
@@ -297,6 +320,7 @@ fn map_entry(
             lines,
             &landmarks,
             &body_ranges,
+            claimed_range,
             scan_start,
             scan_end,
             is_first,
@@ -371,6 +395,7 @@ fn scan_comments(
     lines: &[&str],
     landmarks: &[(usize, CommentAnchor)],
     body_ranges: &[(usize, usize)],
+    body_block: Option<Range<usize>>,
     method_line: usize,
     scan_end: usize,
     is_first: bool,
@@ -543,6 +568,7 @@ fn scan_comments(
             || in_body(line_no)
             || is_disabled_row(line_no)
             || reports_block.contains(&line_no)
+            || body_block.as_ref().is_some_and(|r| r.contains(&line_no))
             || next_title.contains(&line_no)
         {
             continue;
@@ -1032,6 +1058,91 @@ fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, S
 
 /// `true` when `line` is the `# [Reports]` block marker (leading whitespace and
 /// the comment `#` allowed, case-insensitive on the section name).
+/// Recognise a `# [Body] <n>` marker and return the line count it claims.
+///
+/// The count is what makes the block safe to claim: a body is arbitrary text
+/// and may perfectly well contain a line reading `[Body]`, so a block closed by
+/// an end marker could be terminated early by its own contents. Counting also
+/// means a block whose lines have been added to or removed — by a merge, or by
+/// hand — fails to validate rather than silently claiming the wrong lines.
+fn parse_body_marker(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if !rest.get(..6)?.eq_ignore_ascii_case("[body]") {
+        return None;
+    }
+    rest[6..].trim().parse::<usize>().ok()
+}
+
+/// Undo one line of `# [Body]` encoding: drop the marker and the single space
+/// after it, so the body's own indentation comes back exactly as authored.
+fn decode_body_line(line: &str) -> &str {
+    let rest = line.trim_start().strip_prefix('#').unwrap_or("");
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// Find every well-formed `# [Body]` block in an entry's source window, as
+/// `(claimed line range, decoded body text)`.
+///
+/// A block whose count doesn't describe the lines below it is skipped entirely
+/// rather than repaired. Skipping leaves its lines to the ordinary prose-comment
+/// scan, which round-trips them verbatim — so a damaged block degrades to
+/// exactly what a `.hurl` file did before this feature existed, and the user's
+/// notes survive even when we can no longer tell what they described.
+fn body_blocks(lines: &[&str], from: usize, to: usize) -> Vec<(Range<usize>, String)> {
+    let hi = to.min(lines.len() + 1);
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < hi {
+        if let Some(n) = lines
+            .get(i.wrapping_sub(1))
+            .and_then(|l| parse_body_marker(l))
+        {
+            let end = i + 1 + n;
+            let well_formed = end <= hi
+                && (i + 1..end).all(|j| {
+                    lines
+                        .get(j - 1)
+                        .is_some_and(|l| l.trim_start().starts_with('#'))
+                });
+            if well_formed {
+                let text = (i + 1..end)
+                    .map(|j| decode_body_line(lines[j - 1]))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.push((i..end, text));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The `# [Body]` block that still describes `body`, if any.
+///
+/// A block is only believed when stripping its comments yields the body the
+/// file actually carries. Anything else means something other than PaperBoy
+/// edited one of the two and they no longer agree — in which case the body in
+/// the file wins (it is what runs, and what every other tool sees) and the
+/// block is left unclaimed, surviving as prose comments rather than being
+/// deleted on the user's behalf.
+///
+/// The comparison is semantic rather than byte-for-byte so that a reformat, or
+/// a re-ordering of keys, doesn't orphan every comment in the request over
+/// whitespace that changes nothing about what gets sent.
+fn claim_body_block(
+    lines: &[&str],
+    from: usize,
+    to: usize,
+    body: Option<&str>,
+) -> Option<(Range<usize>, String)> {
+    let body = body?;
+    body_blocks(lines, from, to).into_iter().find(|(_, text)| {
+        json_comments::bodies_equivalent(&json_comments::strip_comments(text), body)
+    })
+}
+
 fn is_reports_marker(line: &str) -> bool {
     line.trim_start()
         .strip_prefix('#')
@@ -2486,5 +2597,117 @@ mod tests {
             "and the line should survive as a comment: {:?}",
             back[0].comments
         );
+    }
+
+    /// The whole feature in one pass: a commented body is written as a block
+    /// plus strict JSON, and comes back as the text it was authored from.
+    #[test]
+    fn a_commented_body_survives_a_save_and_a_reload() {
+        let mut e = HurlEntry {
+            title: "t".into(),
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  // who\n  \"id\": {{user_id}} // the caller\n}";
+        e.body_src = Some(authored.into());
+
+        let text = collection_to_hurl(&[e]);
+        assert!(text.contains("# [Body] 4"), "\n{text}");
+        // What Hurl itself reads has no commentary in it.
+        assert!(
+            text.contains("{\n  \"id\": {{user_id}}\n}"),
+            "the wire body is strict JSON:\n{text}"
+        );
+
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].body_src.as_deref(), Some(authored));
+        // And the block must not also come back as prose, or it would be
+        // written twice on the next save, and again after that.
+        assert!(
+            !back[0].comments.iter().any(|c| c.text.contains("[Body]")),
+            "{:?}",
+            back[0].comments
+        );
+        assert_eq!(collection_to_hurl(&back), text, "a second save is stable");
+    }
+
+    /// The file's body is what runs and what every other tool sees, so when the
+    /// two disagree it wins — but the notes are left in the file rather than
+    /// deleted on the user's behalf.
+    #[test]
+    fn a_block_that_no_longer_describes_the_body_is_kept_as_comments() {
+        let src = "POST http://h/a\n\
+                   # [Body] 3\n\
+                   # {\n\
+                   #   \"id\": 1 // the caller\n\
+                   # }\n\
+                   {\"id\": 999}\n";
+        let e = parse_hurl(src);
+
+        assert_eq!(
+            e[0].body_src.as_deref(),
+            Some("{\"id\": 999}"),
+            "the body in the file wins"
+        );
+        let text = collection_to_hurl(&e);
+        assert!(
+            text.contains("#   \"id\": 1 // the caller"),
+            "the orphaned notes are still there:\n{text}"
+        );
+        assert!(text.contains("{\"id\": 999}"), "\n{text}");
+    }
+
+    /// Reformatting a body outside PaperBoy changes nothing about what is sent,
+    /// so it must not orphan every comment in the request.
+    #[test]
+    fn reformatting_the_body_elsewhere_does_not_orphan_the_comments() {
+        let src = "POST http://h/a\n\
+                   # [Body] 3\n\
+                   # {\n\
+                   #   \"id\": 1, // the caller\n\
+                   #   \"b\": 2\n\
+                   # }\n\
+                   {\"b\":2,\"id\":1}\n";
+        // Four lines of block content, but the marker claims three — so this
+        // also pins that a miscount is refused rather than half-claimed.
+        assert!(parse_hurl(src)[0].body_src.as_deref() == Some("{\"b\":2,\"id\":1}"));
+
+        let ok = src.replace("# [Body] 3", "# [Body] 4");
+        let e = parse_hurl(&ok);
+        assert_eq!(
+            e[0].body_src.as_deref(),
+            Some("{\n  \"id\": 1, // the caller\n  \"b\": 2\n}"),
+            "a reordered, reformatted body still matches"
+        );
+    }
+
+    /// A body may contain a line reading `[Body]`; counting lines rather than
+    /// hunting for an end marker is what stops it closing its own block.
+    #[test]
+    fn body_content_cannot_terminate_its_own_block() {
+        let mut e = HurlEntry {
+            title: "t".into(),
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  // note\n  \"a\": \"[Body] 1\"\n}";
+        e.body_src = Some(authored.into());
+
+        let text = collection_to_hurl(&[e]);
+        assert_eq!(parse_hurl(&text)[0].body_src.as_deref(), Some(authored));
+    }
+
+    /// A body with no comments must be written exactly as it always was — the
+    /// block is pure cost for the requests that don't need it.
+    #[test]
+    fn an_uncommented_body_gains_no_block() {
+        let src = "POST http://h/a\n{\"id\": 1}\n";
+        let e = parse_hurl(src);
+        let text = collection_to_hurl(&e);
+        assert!(!text.contains("[Body]"), "\n{text}");
+        assert_eq!(text, src);
     }
 }

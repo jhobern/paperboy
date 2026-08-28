@@ -216,7 +216,6 @@ fn parses_as_json(src: &str) -> bool {
 /// about text that can't be parsed.
 // Reconciliation itself lands with the `# [Body]` block; this is its other
 // half, kept here beside the scanner it shares.
-#[allow(dead_code)]
 pub fn bodies_equivalent(a: &str, b: &str) -> bool {
     if a == b {
         return true;

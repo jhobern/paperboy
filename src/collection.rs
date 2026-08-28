@@ -1431,6 +1431,10 @@ impl Collection {
     /// every row below it slides up by one and the gap the user aimed at is now
     /// one lower. Without this the request would consistently land one place
     /// short of where it was dropped, which reads as the drop being ignored.
+    ///
+    /// Only the GUI drags requests; the terminal UI reorders with `Alt+↑↓`
+    /// through `move_entry`, so this is dead code without the `gui` feature.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn move_entry_before(&mut self, from: usize, before: usize) -> bool {
         let len = self.entries.len();
         if from >= len || before > len {
