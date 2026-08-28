@@ -746,6 +746,56 @@ fn conflict_notice(ui: &mut egui::Ui, theme: &super::theme::GuiTheme, st: &Strin
     clear
 }
 
+/// Notice for `# [Body]` notes that no longer describe the body they were
+/// written for. Two ways out, because there are genuinely two right answers:
+/// the body is the newer truth (delete the notes), or the notes are (take them
+/// back). Nothing happens on its own — the notes are still here precisely
+/// because they were not thrown away without asking.
+fn stale_notes_notice(
+    ui: &mut egui::Ui,
+    theme: &super::theme::GuiTheme,
+    st: &Strings,
+    can_adopt: bool,
+) -> Option<bool> {
+    let mut choice = None;
+    egui::Frame::new()
+        .fill(theme.panel)
+        // The "not settled yet" orange rather than the error red: the request
+        // runs perfectly well, it is only the notes that have come loose.
+        .stroke(egui::Stroke::new(1.0, theme.pending))
+        .inner_margin(6.0)
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(st.gui_notes_stale_headline)
+                    .color(theme.pending)
+                    .strong(),
+            );
+            ui.label(RichText::new(st.gui_notes_stale_detail).color(theme.text));
+            ui.horizontal(|ui| {
+                // Adopting notes that no longer strip to JSON would write a
+                // body with its comments still in it, so the button says why
+                // it is off rather than failing after the click.
+                let adopt = ui.add_enabled(
+                    can_adopt,
+                    egui::Button::new(if can_adopt {
+                        st.notes_stale_adopt
+                    } else {
+                        st.notes_stale_adopt_blocked
+                    }),
+                );
+                if adopt.clicked() {
+                    choice = Some(true);
+                }
+                if ui.button(st.notes_stale_discard).clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+    choice
+}
+
 /// Human-readable heading for a section, used above each block in the "All"
 /// combined view. Reads the same i18n tab labels as the section tab bar.
 fn section_title(section: EditorSection, s: &Strings) -> &'static str {
@@ -974,6 +1024,17 @@ fn draw_section(
                 if cleared {
                     entry.body_src = None;
                     changed = true;
+                }
+                ui.add_space(4.0);
+            }
+            // Shown next to the body rather than in the comments, because the
+            // body is what the notes disagree with and what the user has to
+            // look at to decide which of the two is right.
+            if entry.stale_body_notes().is_some() {
+                match stale_notes_notice(ui, theme, st, entry.can_adopt_body_notes()) {
+                    Some(true) => changed |= entry.adopt_body_notes(),
+                    Some(false) => changed |= entry.discard_body_notes(),
+                    None => {}
                 }
                 ui.add_space(4.0);
             }
@@ -1383,6 +1444,69 @@ mod tests {
     }
 
     /// Draw the Body section for `entry` and report what it painted.
+    /// A request carrying `# [Body]` notes that no longer describe its body:
+    /// the block still parses, but what it strips down to is not what the file
+    /// actually sends, so the parser leaves it as prose.
+    fn entry_with_stale_notes() -> HurlEntry {
+        let text = "POST http://h/a\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"a\": 1 // mine\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        crate::hurl::parse_hurl(text).remove(0)
+    }
+
+    /// The body section says the notes have come loose, rather than leaving
+    /// the only clue to be comments that quietly stop following the body.
+    #[test]
+    fn the_body_section_says_when_notes_no_longer_match() {
+        let st = Strings::for_language(&Language::English);
+        let mut entry = entry_with_stale_notes();
+        let out = draw_body_section(&mut entry);
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_notes_stale_headline)),
+            "expected the stale-notes notice, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains(st.notes_stale_adopt)),
+            "expected the adopt button, painted: {out:?}"
+        );
+
+        // And nothing of the sort for a request whose body is its own.
+        let mut plain = HurlEntry {
+            body_src: Some("{\"a\": 1}".into()),
+            ..Default::default()
+        };
+        let out = draw_body_section(&mut plain);
+        assert!(!out.iter().any(|t| t.contains(st.gui_notes_stale_headline)));
+    }
+
+    /// Notes that would not survive being written back as a body offer only
+    /// the discard route, and say why the other one is shut.
+    #[test]
+    fn notes_that_cannot_be_adopted_say_so_on_the_button() {
+        let st = Strings::for_language(&Language::English);
+        // Four claimed lines, so the closing brace falls outside the block and
+        // what is left no longer reads as JSON.
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #   //extra\n\
+                    #   \"a\": 1 // mine\n\
+                    #\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        let mut entry = crate::hurl::parse_hurl(text).remove(0);
+        assert!(!entry.can_adopt_body_notes());
+
+        let out = draw_body_section(&mut entry);
+        assert!(
+            out.iter().any(|t| t.contains(st.notes_stale_adopt_blocked)),
+            "the blocked reason should be on the button, painted: {out:?}"
+        );
+    }
+
     fn draw_body_section(entry: &mut HurlEntry) -> Vec<String> {
         let th = GuiTheme::from_spec(&crate::theme::default_preset());
         let st = Strings::for_language(&Language::English);

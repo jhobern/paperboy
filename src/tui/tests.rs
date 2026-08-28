@@ -31320,3 +31320,150 @@ fn a_note_typed_into_the_body_survives_a_save_and_reload() {
         "the note came back:\n{text}"
     );
 }
+
+// ── Body notes that no longer describe their body ──────────────────────────
+
+/// The file that produces a request carrying leftover `# [Body]` notes: the
+/// block's count no longer matches the lines below it, so the parser leaves it
+/// as prose rather than claiming it.
+fn collection_with_stale_notes() -> Collection {
+    let text = "# annotated\n\
+                POST http://h/a\n\
+                # [Body] 3\n\
+                # {\n\
+                #   \"a\": 1 // mine\n\
+                # }\n\
+                {\n  \"b\": 2\n}\n";
+    Collection::new("api".into(), crate::hurl::parse_hurl(text))
+}
+
+/// Ctrl+B offers the two honest answers, and taking the notes back makes them
+/// the body again — comments and all — while what goes on the wire stays
+/// strict JSON.
+#[test]
+fn ctrl_b_can_take_stale_body_notes_back_as_the_body() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+    assert!(
+        app.collections[1].entries[0].stale_body_notes().is_some(),
+        "the fixture should carry leftover notes"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::StaleBodyNotes {
+                ci: 1,
+                ei: 0,
+                sel: 2
+            })
+        ),
+        "Ctrl+B opens the resolve overlay, defaulting to leaving them alone"
+    );
+
+    // Move up from "leave them alone" to "use the notes as the body".
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+
+    let e = &app.collections[1].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // mine\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    assert!(e.stale_body_notes().is_none(), "nothing left over");
+    assert!(e.modified, "the request changed and needs saving");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAdopted)
+    ));
+}
+
+/// Discarding deletes the notes and leaves the body exactly as it was.
+#[test]
+fn stale_body_notes_can_be_deleted_leaving_the_body_alone() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // Down from "leave them alone" wraps to "use the notes"; one more is
+    // "delete the notes".
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    let e = &app.collections[1].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"b\": 2\n}"),
+        "body kept"
+    );
+    assert!(e.stale_body_notes().is_none());
+    assert!(
+        !crate::hurl::collection_to_hurl(&app.collections[1].entries).contains("[Body]"),
+        "the block is gone from the file"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesDiscarded)
+    ));
+}
+
+/// Escaping changes nothing: the notes are kept precisely because they were
+/// never thrown away without being asked about.
+#[test]
+fn leaving_stale_body_notes_alone_changes_nothing() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+    let before = crate::hurl::collection_to_hurl(&app.collections[1].entries);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(
+        crate::hurl::collection_to_hurl(&app.collections[1].entries),
+        before
+    );
+    assert!(app.collections[1].entries[0].stale_body_notes().is_some());
+}
+
+/// A request with nothing stale must not open an overlay that has nothing to
+/// say.
+#[test]
+fn ctrl_b_does_nothing_when_the_notes_still_match() {
+    let mut app = TuiApp::default();
+    let e = HurlEntry::from_fields("plain", "GET", "http://h/a", vec![], "{\"a\": 1}");
+    app.collections.push(Collection::new("api".into(), vec![e]));
+    app.active_tab = 1;
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.overlay.is_none());
+}
+
+/// The Requests view says so, rather than leaving the only clue to be comments
+/// that quietly stop following the body around.
+#[test]
+fn the_requests_view_mentions_stale_body_notes() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    // Only the opening clause: the hint is one line and the terminal is narrow
+    // enough that the tail may wrap out of the pane.
+    let head = s.body_notes_stale_hint.split(" — ").next().unwrap();
+    assert!(
+        text.contains(head),
+        "the stale-notes hint should be on screen:\n{text}"
+    );
+}

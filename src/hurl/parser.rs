@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use super::entry::{
     BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
-    RunStatus,
+    RunStatus, decode_body_line, parse_body_marker,
 };
 use super::json_comments;
 
@@ -1056,71 +1056,53 @@ fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, S
     reports
 }
 
-/// `true` when `line` is the `# [Reports]` block marker (leading whitespace and
-/// the comment `#` allowed, case-insensitive on the section name).
-/// Recognise a `# [Body] <n>` marker and return the line count it claims.
-///
-/// The count is what makes the block safe to claim: a body is arbitrary text
-/// and may perfectly well contain a line reading `[Body]`, so a block closed by
-/// an end marker could be terminated early by its own contents. Counting also
-/// means a block whose lines have been added to or removed — by a merge, or by
-/// hand — fails to validate rather than silently claiming the wrong lines.
-fn parse_body_marker(line: &str) -> Option<usize> {
-    let rest = line.trim_start().strip_prefix('#')?.trim_start();
-    if !rest.get(..6)?.eq_ignore_ascii_case("[body]") {
-        return None;
-    }
-    rest[6..].trim().parse::<usize>().ok()
-}
-
-/// Undo one line of `# [Body]` encoding: drop the marker and the single space
-/// after it, so the body's own indentation comes back exactly as authored.
-fn decode_body_line(line: &str) -> &str {
-    let rest = line.trim_start().strip_prefix('#').unwrap_or("");
-    rest.strip_prefix(' ').unwrap_or(rest)
-}
-
-/// Find every well-formed `# [Body]` block in an entry's source window, as
+/// Find every `# [Body]` block candidate in an entry's source window, as
 /// `(claimed line range, decoded body text)`.
 ///
-/// A block whose count doesn't describe the lines below it is skipped entirely
-/// rather than repaired. Skipping leaves its lines to the ordinary prose-comment
-/// scan, which round-trips them verbatim — so a damaged block degrades to
-/// exactly what a `.hurl` file did before this feature existed, and the user's
-/// notes survive even when we can no longer tell what they described.
+/// Every candidate is offered, including ones nested inside another, and the
+/// cursor advances a line at a time rather than jumping past a block it just
+/// matched. Being *well-formed* only means the count matches the lines below
+/// it; whether a block is the real one is decided later, by reconciling it
+/// against the body. A stale block whose count happens to span the good block
+/// underneath it would otherwise hide it completely — the good block would
+/// never be offered, and a request whose notes were perfectly correct would
+/// quietly stop carrying them.
+///
+/// A block whose count doesn't describe the lines below it is not a candidate
+/// at all. Its lines fall to the ordinary prose-comment scan, which round-trips
+/// them verbatim — so a damaged block degrades to exactly what a `.hurl` file
+/// did before this feature existed, and the user's notes survive even when we
+/// can no longer tell what they described.
 fn body_blocks(lines: &[&str], from: usize, to: usize) -> Vec<(Range<usize>, String)> {
     let hi = to.min(lines.len() + 1);
     let mut out = Vec::new();
-    let mut i = from;
-    while i < hi {
-        if let Some(n) = lines
+    for i in from..hi {
+        let Some(n) = lines
             .get(i.wrapping_sub(1))
             .and_then(|l| parse_body_marker(l))
-        {
-            // The count comes out of a file that may have been hand-edited or
-            // badly merged, so the arithmetic is checked. Left to wrap, a count
-            // near `usize::MAX` produces a range ending before it starts, which
-            // reads as well-formed and leaves `i` exactly where it was: not a
-            // rejected block but a hang.
-            if let Some(end) = i.checked_add(1).and_then(|e| e.checked_add(n)) {
-                let well_formed = end <= hi
-                    && (i + 1..end).all(|j| {
-                        lines
-                            .get(j - 1)
-                            .is_some_and(|l| l.trim_start().starts_with('#'))
-                    });
-                if well_formed {
-                    let text = (i + 1..end)
-                        .map(|j| decode_body_line(lines[j - 1]))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    out.push((i..end, text));
-                    i = end;
-                    continue;
-                }
-            }
+        else {
+            continue;
+        };
+        // The count comes out of a file that may have been hand-edited or
+        // badly merged, so the arithmetic is checked. Left to wrap, a count
+        // near `usize::MAX` produces a range ending before it starts, which
+        // reads as well-formed and claims nothing.
+        let Some(end) = i.checked_add(1).and_then(|e| e.checked_add(n)) else {
+            continue;
+        };
+        let well_formed = end <= hi
+            && (i + 1..end).all(|j| {
+                lines
+                    .get(j - 1)
+                    .is_some_and(|l| l.trim_start().starts_with('#'))
+            });
+        if well_formed {
+            let text = (i + 1..end)
+                .map(|j| decode_body_line(lines[j - 1]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push((i..end, text));
         }
-        i += 1;
     }
     out
 }
@@ -1156,6 +1138,8 @@ fn claim_body_block(
         .find(|(_, text)| json_comments::bodies_equivalent(&json_comments::wire_body(text), body))
 }
 
+/// `true` when `line` is the `# [Reports]` block marker (leading whitespace and
+/// the comment `#` allowed, case-insensitive on the section name).
 fn is_reports_marker(line: &str) -> bool {
     line.trim_start()
         .strip_prefix('#')
@@ -2799,5 +2783,125 @@ mod tests {
         let twice = collection_to_hurl(&parse_hurl(&once));
         assert_eq!(once, twice, "not a fixed point");
         assert!(!once.contains('\r'), "\n{once:?}");
+    }
+
+    /// The notes left behind when a block stops describing its body are found
+    /// without any stored state: a block that still reconciles is claimed by
+    /// the parser and never reaches `comments`, so anything sitting there is
+    /// stale by construction.
+    #[test]
+    fn leftover_notes_are_found_and_can_be_thrown_away() {
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #     //extra comment\n\
+                    #     \"a\": 2 // just a test\n\
+                    #\n\
+                    # }\n\
+                    {\n    \"a\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+
+        let (at, notes) = e.stale_body_notes().expect("the leftover block");
+        assert_eq!(at.len(), 5, "the marker and the four lines it claims");
+        assert_eq!(
+            notes,
+            "{\n    //extra comment\n    \"a\": 2 // just a test\n"
+        );
+        // The count says four, so `# }` is not part of the block: it is an
+        // ordinary comment that happens to sit below it.
+        assert_eq!(e.comments.len(), 6);
+
+        assert!(e.discard_body_notes());
+        assert_eq!(e.comments.len(), 1, "only the unclaimed `# }} ` is left");
+        assert_eq!(e.body_wire().as_deref(), Some("{\n    \"a\": 2\n}"));
+        assert!(e.stale_body_notes().is_none());
+    }
+
+    /// Adopting takes the notes back as the body, which changes what the
+    /// request sends — so it is never automatic, and never offered when the
+    /// notes would not survive the trip.
+    #[test]
+    fn leftover_notes_can_be_taken_back_as_the_body() {
+        let text = "POST http://h/a\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"a\": 1 // mine\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_some(), "the bodies disagree");
+        assert!(e.can_adopt_body_notes());
+        assert!(e.adopt_body_notes());
+
+        assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // mine\n}"));
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert!(
+            e.comments.is_empty(),
+            "the block is the body now, not prose"
+        );
+        // And it round-trips as a live block again.
+        let out = collection_to_hurl(&back);
+        assert_eq!(
+            parse_hurl(&out)[0].body_src.as_deref(),
+            Some("{\n  \"a\": 1 // mine\n}")
+        );
+    }
+
+    /// Notes that no longer strip down to JSON cannot be adopted: writing them
+    /// as a body would put comments in the file and read back as an empty
+    /// collection. Discarding is still allowed — it is the body that is at
+    /// risk, not the notes.
+    #[test]
+    fn notes_that_would_not_survive_being_a_body_cannot_be_adopted() {
+        // Four claimed lines, so the closing brace falls outside the block and
+        // what is left does not parse.
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #     //extra comment\n\
+                    #     \"a\": 2 // just a test\n\
+                    #\n\
+                    # }\n\
+                    {\n    \"a\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_some());
+        assert!(!e.can_adopt_body_notes(), "it would not be valid Hurl");
+        assert!(!e.adopt_body_notes());
+        assert_eq!(
+            e.body_wire().as_deref(),
+            Some("{\n    \"a\": 2\n}"),
+            "body untouched"
+        );
+    }
+
+    /// Deleting a body leaves a stale block behind as prose, and writing a new
+    /// body then puts a second block in the file. The good one must still be
+    /// found: when the stale count happens to span it exactly, jumping past the
+    /// block we matched first hid the real one completely, and a request whose
+    /// notes were perfectly correct quietly stopped carrying them.
+    #[test]
+    fn a_stale_block_cannot_hide_the_good_one_beneath_it() {
+        let text = "POST http://h/a\n\
+                    # [Body] 7\n\
+                    # {\n\
+                    #   \"old\": 1\n\
+                    # }\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"b\": 9 // new note\n\
+                    # }\n\
+                    {\n  \"b\": 9\n}\n";
+        let back = parse_hurl(&text);
+        assert_eq!(
+            back[0].body_src.as_deref(),
+            Some("{\n  \"b\": 9 // new note\n}"),
+            "the good block was hidden by the stale one"
+        );
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\n  \"b\": 9\n}"));
+        // The stale block is still in the file, untouched.
+        assert!(collection_to_hurl(&back).contains("#   \"old\": 1"));
     }
 }

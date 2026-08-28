@@ -844,6 +844,16 @@ strings! {
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
+    body_notes_stale_hint => "✎ Notes here no longer match this body — Ctrl+B to keep or drop them", "✎ Les notes ici ne correspondent plus à ce corps — Ctrl+B pour les garder ou les supprimer", "✎ Noterne her passer ikke længere til denne brødtekst — Ctrl+B for at beholde eller fjerne dem";
+    notes_stale_title => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
+    notes_stale_adopt => "Use the notes as the body", "Utiliser les notes comme corps", "Brug noterne som brødtekst";
+    notes_stale_adopt_blocked => "Use the notes as the body (they no longer read as JSON)", "Utiliser les notes comme corps (elles ne sont plus du JSON)", "Brug noterne som brødtekst (de kan ikke længere læses som JSON)";
+    notes_stale_discard => "Delete the notes, keep the body", "Supprimer les notes, garder le corps", "Slet noterne, behold brødteksten";
+    notes_stale_cancel => "Leave them alone", "Ne rien changer", "Lad dem være";
+    notes_adopted => "The notes are the body again", "Les notes sont de nouveau le corps", "Noterne er brødteksten igen";
+    notes_discarded => "Notes deleted", "Notes supprimées", "Noter slettet";
+    gui_notes_stale_headline => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
+    gui_notes_stale_detail => "The body was edited without them, so they have been kept as plain comments rather than thrown away. Take them back as the body, or delete them.", "Le corps a été modifié sans elles\u{a0}; elles ont donc été conservées comme simples commentaires plutôt que supprimées. Reprenez-les comme corps, ou supprimez-les.", "Brødteksten blev redigeret uden dem, så de er bevaret som almindelige kommentarer i stedet for at blive smidt væk. Tag dem tilbage som brødtekst, eller slet dem.";
     gui_body_mode_raw => "Raw body", "Corps brut", "Rå brødtekst";
     gui_body_mode_form => "Form fields", "Champs de formulaire", "Formularfelter";
     gui_raw_body_hint => "Raw request body (JSON, text, …)", "Corps brut de la requête (JSON, texte, …)", "Rå anmodningstekst (JSON, tekst, …)";
@@ -1766,6 +1776,10 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// Leftover `# [Body]` notes were taken back as the request's body.
+    NotesAdopted,
+    /// Leftover `# [Body]` notes were deleted, leaving the body as it was.
+    NotesDiscarded,
     /// The Workspace tree's extension filter was toggled (`Ctrl+F`). `true`
     /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
     /// `false` shows every file.
@@ -1965,6 +1979,8 @@ impl Status {
             Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::NotesAdopted => s.notes_adopted.to_string(),
+            Status::NotesDiscarded => s.notes_discarded.to_string(),
             Status::WorkspaceTreeFilter(on) => {
                 if *on {
                     s.workspace_tree_filter_on.to_string()

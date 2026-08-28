@@ -648,6 +648,54 @@ pub fn is_variable_name(name: &str) -> bool {
             .any(|c| c.is_whitespace() || c == '{' || c == '}')
 }
 
+/// Recognise a `# [Body] <n>` marker and return the line count it claims.
+///
+/// The count is what makes the block safe to claim: a body is arbitrary text
+/// and may perfectly well contain a line reading `[Body]`, so a block closed by
+/// an end marker could be terminated early by its own contents. Counting also
+/// means a block whose lines have been added to or removed — by a merge, or by
+/// hand — fails to validate rather than silently claiming the wrong lines.
+pub(crate) fn parse_body_marker(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if !rest.get(..6)?.eq_ignore_ascii_case("[body]") {
+        return None;
+    }
+    rest[6..].trim().parse::<usize>().ok()
+}
+
+/// Undo one line of `# [Body]` encoding: drop the marker and the single space
+/// after it, so the body's own indentation comes back exactly as authored.
+pub(crate) fn decode_body_line(line: &str) -> &str {
+    let rest = line.trim_start().strip_prefix('#').unwrap_or("");
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// Write an authored body as the `# [Body]` block that carries it through a
+/// `.hurl` file.
+///
+/// Kept next to [`parse_body_marker`] and [`decode_body_line`] deliberately.
+/// The two halves drifting apart is not a hypothetical: writing the block with
+/// whatever line endings the body happened to have, while the reader threw the
+/// `\r` away, made every save produce different bytes than the last.
+fn encode_body_block(src: &str) -> String {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut out = format!("# [Body] {}\n", lines.len());
+    for l in lines {
+        // Written with the line endings the wire body already has: deriving it
+        // rebuilds the text line by line and so hands back LF regardless.
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        // An empty line is bare `#`, so nothing in the file carries trailing
+        // whitespace; decoding drops one space after the marker, which is how a
+        // body's own indentation survives.
+        if l.is_empty() {
+            out.push_str("#\n");
+        } else {
+            out.push_str(&format!("# {l}\n"));
+        }
+    }
+    out
+}
+
 impl HurlEntry {
     /// The body as it goes on the wire and into a `.hurl` file: [`Self::body_src`]
     /// with its JSON comments stripped.
@@ -658,6 +706,94 @@ impl HurlEntry {
     /// the rename makes the compiler ask each caller which one it meant.
     pub fn body_wire(&self) -> Option<Cow<'_, str>> {
         self.body_src.as_deref().map(json_comments::wire_body)
+    }
+
+    /// The leftover `# [Body]` block this request is carrying as prose, if any:
+    /// the indices of the comment lines it occupies, and the body text it
+    /// describes.
+    ///
+    /// A block that still reconciles with the body never reaches `comments` at
+    /// all — the parser claims it — so anything found here is by definition a
+    /// block that no longer describes what the request sends. That is why this
+    /// needs no stored state and cannot go out of date: staleness is not
+    /// remembered, it is the observable difference between a block the parser
+    /// took and one it left behind.
+    ///
+    /// Nothing is deleted on the user's behalf, so these linger until they say
+    /// otherwise. They are also what is left over when a body is deleted
+    /// outright — the notes are not part of the body once they have come
+    /// unstuck from it, so removing the body cannot take them with it.
+    pub fn stale_body_notes(&self) -> Option<(Vec<usize>, String)> {
+        let at_body: Vec<usize> = self
+            .comments
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.anchor == CommentAnchor::Body)
+            .map(|(i, _)| i)
+            .collect();
+        for (pos, &idx) in at_body.iter().enumerate() {
+            let Some(n) = parse_body_marker(&self.comments[idx].text) else {
+                continue;
+            };
+            let lines = at_body.get(pos + 1..pos + 1 + n)?;
+            if lines.len() != n {
+                continue;
+            }
+            let text = lines
+                .iter()
+                .map(|&i| decode_body_line(&self.comments[i].text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut claimed = vec![idx];
+            claimed.extend_from_slice(lines);
+            return Some((claimed, text));
+        }
+        None
+    }
+
+    /// Whether the leftover notes can be taken back as the body.
+    ///
+    /// Adopting text whose comments can't be stripped would write a body with
+    /// its comments still in it, which is not valid Hurl and reads back as an
+    /// empty collection — so a block that no longer strips cleanly can only be
+    /// discarded, never adopted.
+    pub fn can_adopt_body_notes(&self) -> bool {
+        self.stale_body_notes()
+            .is_some_and(|(_, text)| !json_comments::has_comments(&json_comments::wire_body(&text)))
+    }
+
+    /// Take the leftover notes back as the body, comments and all.
+    ///
+    /// This changes what the request sends — to whatever the notes strip down
+    /// to — which is exactly why it is a deliberate action and never automatic.
+    pub fn adopt_body_notes(&mut self) -> bool {
+        if !self.can_adopt_body_notes() {
+            return false;
+        }
+        let Some((at, text)) = self.stale_body_notes() else {
+            return false;
+        };
+        self.body_src = Some(text);
+        self.drop_comments(&at);
+        true
+    }
+
+    /// Throw the leftover notes away, keeping the body as it is.
+    pub fn discard_body_notes(&mut self) -> bool {
+        let Some((at, _)) = self.stale_body_notes() else {
+            return false;
+        };
+        self.drop_comments(&at);
+        true
+    }
+
+    fn drop_comments(&mut self, at: &[usize]) {
+        let mut i = 0usize;
+        self.comments.retain(|_| {
+            let keep = !at.contains(&i);
+            i += 1;
+            keep
+        });
     }
 
     /// Build an entry from user-entered form fields. Rows with a blank key are
@@ -922,26 +1058,7 @@ impl HurlEntry {
             // (`[Body]` is legal JSON text) and lines inserted by, say, a merge
             // are detected as damage instead of silently mis-claimed.
             if let Some(src) = self.body_src.as_deref().filter(|s| *s != body.as_ref()) {
-                let src_lines: Vec<&str> = src.split('\n').collect();
-                out.push_str(&format!("# [Body] {}\n", src_lines.len()));
-                for l in src_lines {
-                    // Written with the line endings the wire body already has:
-                    // deriving it rebuilds the text line by line and so hands
-                    // back LF regardless. A block still carrying CRLF would be
-                    // read back as LF (the file is parsed line-wise, which eats
-                    // the `\r`), and the next save would write different bytes
-                    // than the last — a file that churns in git every time it
-                    // is opened.
-                    let l = l.strip_suffix('\r').unwrap_or(l);
-                    // An empty line is bare `#`, so nothing in the file carries
-                    // trailing whitespace; decoding drops one space after the
-                    // marker, which is how a body's own indentation survives.
-                    if l.is_empty() {
-                        out.push_str("#\n");
-                    } else {
-                        out.push_str(&format!("# {l}\n"));
-                    }
-                }
+                out.push_str(&encode_body_block(src));
             }
             out.push_str(&body);
             if !body.ends_with('\n') {

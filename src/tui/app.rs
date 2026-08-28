@@ -689,6 +689,15 @@ pub(crate) enum Overlay {
         target: PathBuf,
         sel: usize,
     },
+    /// Shown when a request is carrying `# [Body]` notes that no longer
+    /// describe its body — the block stopped reconciling, so the parser left it
+    /// as prose rather than deleting it. `sel`: 0 = take the notes back as the
+    /// body, 1 = delete the notes and keep the body, 2 = leave them alone.
+    StaleBodyNotes {
+        ci: usize,
+        ei: usize,
+        sel: usize,
+    },
 }
 
 /// Which action a confirmation popup is guarding.

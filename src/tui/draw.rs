@@ -3490,6 +3490,18 @@ pub(crate) fn draw_collection_main(
             Style::default().fg(th.err),
         ));
     }
+    // Notes that came unstuck from their body are kept rather than deleted, so
+    // without a word here the only sign of it is comments that quietly stop
+    // following the body around.
+    if entry.stale_body_notes().is_some() {
+        top_lines.push(Line::styled(
+            s.body_notes_stale_hint.to_string(),
+            // The "not settled yet" orange rather than the error red: the file
+            // is perfectly valid and the request runs, it is only the notes
+            // that have come loose.
+            Style::default().fg(th.pending),
+        ));
+    }
     top_lines.push(if valid {
         Line::styled(
             format!("Enter {}", s.json_enter_to_edit),
@@ -5336,6 +5348,26 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.ws_switch_unsaved_cancel,
             ];
             draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th, Some(app));
+        }
+        Overlay::StaleBodyNotes { ci, ei, sel } => {
+            // The first choice is spelled differently when the notes can't be
+            // taken back, so the reason is on the choice itself rather than
+            // left for the user to discover by picking it.
+            let adopt = app
+                .collections
+                .get(*ci)
+                .and_then(|c| c.entries.get(*ei))
+                .is_some_and(|e| e.can_adopt_body_notes());
+            let choices = [
+                if adopt {
+                    s.notes_stale_adopt
+                } else {
+                    s.notes_stale_adopt_blocked
+                },
+                s.notes_stale_discard,
+                s.notes_stale_cancel,
+            ];
+            draw_confirm_popup(f, s.notes_stale_title, &choices, *sel, th, Some(app));
         }
         // Handled by the early-return above — unreachable in practice.
         Overlay::ReportCellPopup { .. } => unreachable!("ReportCellPopup is drawn above"),

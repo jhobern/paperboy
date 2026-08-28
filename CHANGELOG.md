@@ -39,6 +39,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   body that gets sent, so `// "draft": true` on the final line leaves valid JSON
   behind rather than a body no server will accept.
 
+  When notes do come loose from their body, the request says so rather than
+  leaving you to notice that your comments have quietly stopped following it
+  around. `Ctrl+B` in the terminal UI, or a notice beside the body in the
+  graphical one, offers the two answers that are actually available: take the
+  notes back as the body, or delete them and keep the body as it is. Neither
+  happens on its own, and doing nothing is always the third option — the notes
+  are still there precisely because nothing was thrown away without asking.
+  Taking them back is offered only when they would still make a valid body; when
+  they wouldn't, the reason is written on the button rather than left for you to
+  find out by pressing it.
+
 
 - **The Requests list can be searched — `/` in the terminal UI, a filter box
   in the graphical one.** The terminal UI's list shows one folder at a time and

@@ -576,7 +576,8 @@ impl TuiApp {
             | Some(Overlay::WorkspaceReloadConfirm { sel, .. })
             | Some(Overlay::WorkspaceStorageChoice { sel, .. })
             | Some(Overlay::WorkspaceGitSaveUnsaved { sel, .. })
-            | Some(Overlay::WorkspaceSwitchUnsaved { sel, .. }) => {
+            | Some(Overlay::WorkspaceSwitchUnsaved { sel, .. })
+            | Some(Overlay::StaleBodyNotes { sel, .. }) => {
                 *sel = choice;
                 self.on_key(Self::mouse_key(KeyCode::Enter));
             }
@@ -1494,6 +1495,9 @@ impl TuiApp {
             Overlay::WorkspaceSwitchUnsaved { ci, target, sel } => {
                 self.workspace_switch_unsaved_key_handler(key, ci, target, sel)
             }
+            Overlay::StaleBodyNotes { ci, ei, sel } => {
+                self.stale_body_notes_key_handler(key, ci, ei, sel)
+            }
             Overlay::WorkspaceReloadConfirm { idx, reload, sel } => {
                 self.workspace_reload_confirm_key_handler(key, idx, reload, sel)
             }
@@ -1726,6 +1730,11 @@ impl TuiApp {
             // Ctrl+R (Requests list) reverts the selected request to its saved
             // on-disk version, discarding its in-memory edits (#19).
             KeyCode::Char('r') if ctrl && self.focus == Pane::List => self.begin_revert_request(),
+            // Ctrl+B (Requests list) resolves body notes that no longer match
+            // the body they were written for.
+            KeyCode::Char('b') if ctrl && self.focus == Pane::List => {
+                self.begin_resolve_body_notes()
+            }
             // Ctrl+F (Workspace file-tree) toggles the extension filter that
             // hides non-workspace files (images, build output, …) so the tree
             // shows only `.hurl/.json/.vars/.trail`. Mirrors the picker's Tab
@@ -3929,6 +3938,69 @@ impl TuiApp {
     /// on-disk version, discarding its in-memory edits (#19). Asks to confirm
     /// first (there's no undo); a no-op with a status when there's nothing to
     /// revert (a scratch collection, or an unedited/never-saved request).
+    /// `Ctrl+B` (Requests list): resolve the `# [Body]` notes a request is
+    /// carrying that no longer describe its body. A no-op when there are none
+    /// — the overlay would have nothing to say.
+    pub(crate) fn begin_resolve_body_notes(&mut self) {
+        let ci = self.active_tab;
+        let Some(c) = self.collections.get(ci) else {
+            return;
+        };
+        let ei = c.selected_entry;
+        if c.entries
+            .get(ei)
+            .and_then(|e| e.stale_body_notes())
+            .is_none()
+        {
+            return;
+        }
+        // Defaults to "leave them alone": both other choices throw something
+        // away, and the notes are here precisely because nothing was thrown
+        // away without asking.
+        self.overlay = Some(Overlay::StaleBodyNotes { ci, ei, sel: 2 });
+    }
+
+    fn stale_body_notes_key_handler(&mut self, key: KeyEvent, ci: usize, ei: usize, sel: usize) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::BackTab => {
+                self.overlay = Some(Overlay::StaleBodyNotes {
+                    ci,
+                    ei,
+                    sel: (sel + 2) % 3,
+                });
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Tab => {
+                self.overlay = Some(Overlay::StaleBodyNotes {
+                    ci,
+                    ei,
+                    sel: (sel + 1) % 3,
+                });
+            }
+            KeyCode::Enter => {
+                self.overlay = None;
+                let Some(entry) = self
+                    .collections
+                    .get_mut(ci)
+                    .and_then(|c| c.entries.get_mut(ei))
+                else {
+                    return;
+                };
+                let done = match sel {
+                    0 => entry.adopt_body_notes().then_some(Status::NotesAdopted),
+                    1 => entry.discard_body_notes().then_some(Status::NotesDiscarded),
+                    _ => None,
+                };
+                if done.is_some() {
+                    entry.modified = true;
+                    self.status = done;
+                    self.save_state();
+                }
+            }
+            _ => self.overlay = Some(Overlay::StaleBodyNotes { ci, ei, sel }),
+        }
+    }
+
     pub(crate) fn begin_revert_request(&mut self) {
         let ci = self.active_tab;
         let revertable = self.collections.get(ci).is_some_and(|c| {
