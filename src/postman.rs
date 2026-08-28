@@ -1017,7 +1017,7 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
     for f in &mut entry.form_fields {
         fix(&mut f.value);
     }
-    if let Some(body) = entry.body.as_mut() {
+    if let Some(body) = entry.body_src.as_mut() {
         fix(body);
     }
     if let Some((user, pass)) = entry.basic_auth.as_mut() {
@@ -1496,7 +1496,7 @@ mod tests {
                 ("X-Off".to_string(), "no".to_string(), false),
             ]
         );
-        assert_eq!(e[0].body.as_deref(), Some("{\"u\":\"a\"}"));
+        assert_eq!(e[0].body_src.as_deref(), Some("{\"u\":\"a\"}"));
 
         assert_eq!(e[1].title, "form");
         assert_eq!(
@@ -1831,7 +1831,7 @@ mod body_mode_tests {
                  "variables": "{ \"id\": \"7\" }" } }"#,
         );
         let e = &c.entries[0];
-        let sent: serde_json::Value = serde_json::from_str(e.body.as_deref().unwrap()).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(e.body_src.as_deref().unwrap()).unwrap();
         assert_eq!(sent["query"], "query Q($id: ID){ thing(id: $id) }");
         assert_eq!(
             sent["variables"]["id"], "7",
@@ -1859,7 +1859,7 @@ mod body_mode_tests {
                  "variables": "{ not json" } }"#,
         );
         let sent: serde_json::Value =
-            serde_json::from_str(c.entries[0].body.as_deref().unwrap()).unwrap();
+            serde_json::from_str(c.entries[0].body_src.as_deref().unwrap()).unwrap();
         assert_eq!(sent["query"], "{ ping }");
         assert!(sent.get("variables").is_none());
     }
@@ -1870,7 +1870,7 @@ mod body_mode_tests {
     #[test]
     fn a_file_body_is_reported_rather_than_imported_and_lost() {
         let c = post(r#"{ "mode": "file", "file": { "src": "./payload.bin" } }"#);
-        assert_eq!(c.entries[0].body, None);
+        assert_eq!(c.entries[0].body_src, None);
         assert!(
             c.notes.iter().any(|n| n.detail.contains("./payload.bin")),
             "the path is named so it can be attached by hand: {:?}",
@@ -1883,7 +1883,7 @@ mod body_mode_tests {
     #[test]
     fn a_file_body_with_no_file_is_reported_not_invented() {
         let c = post(r#"{ "mode": "file", "file": { "src": "" } }"#);
-        assert_eq!(c.entries[0].body, None);
+        assert_eq!(c.entries[0].body_src, None);
         assert!(
             c.notes
                 .iter()
@@ -1913,7 +1913,7 @@ mod profile_behavior_tests {
             r#"{ "name": "r", "request": { "method": "GET", "url": "https://h/x",
                  "body": { "mode": "raw", "raw": "{\"stale\":true}" } } }"#,
         );
-        assert_eq!(c.entries[0].body, None);
+        assert_eq!(c.entries[0].body_src, None);
         assert!(
             c.notes.iter().any(|n| n.detail.contains("body pruning")),
             "and it says why, since the text is visibly in the export: {:?}",
@@ -1930,7 +1930,7 @@ mod profile_behavior_tests {
                  "request": { "method": "GET", "url": "https://h/x",
                  "body": { "mode": "raw", "raw": "{}" } } }"#,
         );
-        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+        assert_eq!(c.entries[0].body_src.as_deref(), Some("{}"));
     }
 
     /// A POST body is never pruned, whatever the setting says.
@@ -1940,7 +1940,7 @@ mod profile_behavior_tests {
             r#"{ "name": "r", "request": { "method": "POST", "url": "https://h/x",
                  "body": { "mode": "raw", "raw": "{}" } } }"#,
         );
-        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+        assert_eq!(c.entries[0].body_src.as_deref(), Some("{}"));
     }
 
     /// The setting is inherited, and Postman overrides field by field rather
@@ -1952,7 +1952,7 @@ mod profile_behavior_tests {
                  "item": [ { "name": "r", "request": { "method": "GET", "url": "https://h/x",
                    "body": { "mode": "raw", "raw": "{}" } } } ] }"#,
         );
-        assert_eq!(c.entries[0].body.as_deref(), Some("{}"));
+        assert_eq!(c.entries[0].body_src.as_deref(), Some("{}"));
     }
 
     /// `strictSSL: false` is a real behavioural setting; without it the request

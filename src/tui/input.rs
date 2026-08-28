@@ -3649,7 +3649,7 @@ impl TuiApp {
                 || entry.queries != queries
                 || entry.options != options
                 || entry.form_fields != form_fields
-                || entry.body != body
+                || entry.body_src != body
                 || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
@@ -3663,7 +3663,7 @@ impl TuiApp {
                 entry.queries = queries;
                 entry.options = options;
                 entry.form_fields = form_fields;
-                entry.body = body;
+                entry.body_src = body;
                 entry.expected_status = expected_status;
                 entry.asserts = asserts;
                 entry.captures = captures;

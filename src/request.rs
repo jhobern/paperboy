@@ -416,7 +416,7 @@ pub fn build_request_json(entry: &HurlEntry) -> String {
             pass: TextValue(pass.clone()),
             user: TextValue(user.clone()),
         }),
-        body: entry.body.as_deref().map(|raw| {
+        body: entry.body_src.as_deref().map(|raw| {
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
         }),
         cookies: rows_to_map(&entry.cookies),
@@ -450,7 +450,7 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
     entry.cookies = map_to_rows(dto.cookies);
     entry.queries = map_to_rows(dto.query_params);
     entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
-    entry.body = body;
+    entry.body_src = body;
     Ok(entry)
 }
 
@@ -520,7 +520,9 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
         })
         .collect();
 
-    let body = entry.body.as_deref().map(|b| substitute(b, vars));
+    // Resolving builds the request that actually goes out, so the comments
+    // come off here and never reach the wire.
+    let body = entry.body_wire().as_deref().map(|b| substitute(b, vars));
     ResolvedRequest {
         method,
         url,
@@ -604,7 +606,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         // Per-request `[Options]` (retry, insecure, delay, …) genuinely affect
         // the run, so carry them through to the executed entry.
         options: base.options.clone(),
-        body: resolved.body,
+        body_src: resolved.body,
         expected_status: base.expected_status,
         // Expected response version/headers/body are real (implicit) asserts in
         // the source `.hurl`, so preserve them on the run entry too — dropping
@@ -1095,8 +1097,10 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
         add(u);
         add(p);
     }
-    if let Some(body) = &entry.body {
-        add(body);
+    // A `{{ var }}` written inside a comment is never sent, so it doesn't
+    // count as a use of that variable.
+    if let Some(body) = entry.body_wire() {
+        add(&body);
     }
     keys
 }
@@ -1317,7 +1321,7 @@ mod tests {
                     desc: String::new(),
                 },
             ],
-            body: Some(r#"{"a":1}"#.into()),
+            body_src: Some(r#"{"a":1}"#.into()),
             ..Default::default()
         };
 
@@ -1373,7 +1377,7 @@ mod tests {
         );
         assert_eq!(back.form_fields.len(), 2);
         assert_eq!(back.form_fields[1].kind, FormFieldKind::File);
-        assert_eq!(back.body.as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert_eq!(back.body_src.as_deref(), Some("{\n  \"a\": 1\n}"));
     }
 
     #[test]
@@ -1809,7 +1813,7 @@ mod tests {
             title: "Bad One".into(),
             method: "POST".into(),
             url: "http://192.0.2.1/bad".into(),
-            body: Some("{}".into()),
+            body_src: Some("{}".into()),
             form_fields: vec![FormField {
                 key: "f".into(),
                 value: "v".into(),

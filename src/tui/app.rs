@@ -2055,7 +2055,7 @@ impl TuiApp {
                             || entry.form_fields != parsed.form_fields
                             || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
-                            || entry.body != parsed.body
+                            || entry.body_src != parsed.body_src
                             || entry.expected_status != parsed.expected_status
                             || entry.captures != parsed.captures
                             || entry.asserts != parsed.asserts;
@@ -2114,7 +2114,7 @@ impl TuiApp {
                             || entry.form_fields != parsed.form_fields
                             || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
-                            || entry.body != parsed.body;
+                            || entry.body_src != parsed.body_src;
                         if changed {
                             parsed.modified = true;
                             *entry = parsed;

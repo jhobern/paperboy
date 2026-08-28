@@ -946,7 +946,7 @@ impl NewReq {
             queries,
             options,
             form_fields,
-            body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
+            body: Editor::new(entry.body_src.as_deref().unwrap_or(""), true),
             asserts,
             captures,
             reports,

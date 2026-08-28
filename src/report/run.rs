@@ -1581,7 +1581,7 @@ fn apply_override(
 
     match target {
         OverrideTarget::Url => entry.url = value,
-        OverrideTarget::Body => entry.body = Some(value),
+        OverrideTarget::Body => entry.body_src = Some(value),
         OverrideTarget::Header(k) => upsert(&mut entry.headers, k, value),
         OverrideTarget::Query(k) => upsert(&mut entry.queries, k, value),
         OverrideTarget::Cookie(k) => upsert(&mut entry.cookies, k, value),

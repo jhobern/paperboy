@@ -504,7 +504,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let options_n = entry.options.len();
         let asserts_n = entry.asserts.len();
         let captures_n = entry.captures.len();
-        let has_body = entry.body.as_ref().map(|b| !b.is_empty()).unwrap_or(false)
+        let has_body = entry
+            .body_src
+            .as_ref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
             || !entry.form_fields.is_empty();
         let has_auth = entry.basic_auth.is_some();
         let mut cur = app.editor_section;
@@ -968,7 +972,7 @@ fn draw_section(
             if entry.body_form_conflict() {
                 let cleared = conflict_notice(ui, theme, st);
                 if cleared {
-                    entry.body = None;
+                    entry.body_src = None;
                     changed = true;
                 }
                 ui.add_space(4.0);
@@ -986,7 +990,7 @@ fn draw_section(
                     changed = true;
                 }
             } else {
-                let mut body = entry.body.take().unwrap_or_default();
+                let mut body = entry.body_src.take().unwrap_or_default();
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut body)
                         .code_editor()
@@ -1000,7 +1004,7 @@ fn draw_section(
                 // The body is the one place a *part* of the field is usually
                 // what varies, so a selection narrows the extraction.
                 extract_menu(&resp, ex_label, ExtractTarget::Body, &body, true, extract);
-                entry.body = if body.is_empty() { None } else { Some(body) };
+                entry.body_src = if body.is_empty() { None } else { Some(body) };
             }
         }
         EditorSection::Auth => {
@@ -1456,7 +1460,7 @@ mod tests {
     #[test]
     fn carrying_both_a_body_and_form_fields_is_reported_in_the_section() {
         let mut entry = HurlEntry {
-            body: Some(" ".into()),
+            body_src: Some(" ".into()),
             form_fields: vec![crate::hurl::FormField {
                 key: "grant_type".into(),
                 enabled: true,
@@ -1795,7 +1799,7 @@ pub(super) fn apply_extract_parameter(
     };
     let applied = match target {
         ExtractTarget::Url => replace(&mut e.url),
-        ExtractTarget::Body => match e.body.as_mut() {
+        ExtractTarget::Body => match e.body_src.as_mut() {
             Some(b) => replace(b),
             None => false,
         },

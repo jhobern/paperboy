@@ -1481,7 +1481,7 @@ mod workspace_tests {
             method: "POST".into(),
             url: "https://example.com/token".into(),
             // A single space: the shape of the accident this guards against.
-            body: Some(" ".into()),
+            body_src: Some(" ".into()),
             form_fields: vec![crate::hurl::FormField {
                 key: "grant_type".into(),
                 value: "client_credentials".into(),

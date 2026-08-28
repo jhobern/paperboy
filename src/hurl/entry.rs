@@ -1,6 +1,10 @@
 //! The `HurlEntry` request model and its Hurl-text serializer.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
+
+use super::json_comments;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -461,7 +465,17 @@ pub struct HurlEntry {
     /// header. `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
     pub options: Vec<KvRow>,
-    pub body: Option<String>,
+    /// The request body **as authored** — comments and all, when it is JSON
+    /// that carries them. This is what every editor shows and edits; what goes
+    /// on the wire and into a `.hurl` file is [`HurlEntry::body_wire`].
+    ///
+    /// Deliberately one field rather than an authored copy beside a stripped
+    /// one: two copies means every writer has to remember to update both, and
+    /// the one that forgets produces a body that silently disagrees with the
+    /// comments describing it. `#[serde(rename)]` keeps the saved-state key as
+    /// `body`, so the rename costs no migration.
+    #[serde(rename = "body")]
+    pub body_src: Option<String>,
     pub expected_status: Option<u16>,
     /// Expected response HTTP version prefix, e.g. `HTTP/1.1`, taken from the
     /// `HTTP/1.1 200` status line. `None` means the version-agnostic `HTTP`
@@ -635,6 +649,17 @@ pub fn is_variable_name(name: &str) -> bool {
 }
 
 impl HurlEntry {
+    /// The body as it goes on the wire and into a `.hurl` file: [`Self::body_src`]
+    /// with its JSON comments stripped.
+    ///
+    /// Every path that sends a request or writes a file must go through here
+    /// rather than reading the field, or it will ship the user's notes to their
+    /// server. That is the reason the field is named `body_src` and not `body`:
+    /// the rename makes the compiler ask each caller which one it meant.
+    pub fn body_wire(&self) -> Option<Cow<'_, str>> {
+        self.body_src.as_deref().map(json_comments::wire_body)
+    }
+
     /// Build an entry from user-entered form fields. Rows with a blank key are
     /// dropped and the rest are trimmed. An empty `body` becomes `None`.
     pub fn from_fields(
@@ -664,7 +689,7 @@ impl HurlEntry {
             method: method.to_string(),
             url: url.trim().to_string(),
             headers,
-            body,
+            body_src: body,
             ..Default::default()
         }
     }
@@ -738,7 +763,10 @@ impl HurlEntry {
             "POST" | "PUT" | "PATCH" | "DELETE"
         );
         let has_forms = !self.form_fields.is_empty();
-        let has_body = self.body.as_deref().is_some_and(|b| !b.trim().is_empty())
+        let has_body = self
+            .body_wire()
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty())
             || !self.form_fields.is_empty();
         let has_content_length = self
             .headers
@@ -767,7 +795,7 @@ impl HurlEntry {
     /// *enabled* fields count, since a disabled row is a comment and never
     /// reaches the wire (see the serializer).
     pub fn body_form_conflict(&self) -> bool {
-        self.body.is_some() && self.form_fields.iter().any(|f| f.enabled)
+        self.body_src.is_some() && self.form_fields.iter().any(|f| f.enabled)
     }
 
     /// The key of the first enabled `[Form]`/`[Multipart]` file field with an
@@ -880,8 +908,10 @@ impl HurlEntry {
         // the next entry (a parse error). Keeping the body last here lets a
         // request carry both a body and, say, `[Options]` and still round-trip.
         push_comments(&mut out, Body);
-        if let Some(body) = &self.body {
-            out.push_str(body);
+        // The wire body, never the authored one: what lands in the file has
+        // to be strict JSON that every other Hurl runner accepts.
+        if let Some(body) = self.body_wire() {
+            out.push_str(&body);
             if !body.ends_with('\n') {
                 out.push('\n');
             }
@@ -1064,7 +1094,7 @@ mod tests {
     #[test]
     fn content_length_skipped_when_a_body_is_present() {
         let mut e = entry("POST");
-        e.body = Some("{\"a\":1}".to_string());
+        e.body_src = Some("{\"a\":1}".to_string());
         e.ensure_run_content_length();
         assert!(
             !e.headers
@@ -1087,7 +1117,7 @@ mod tests {
             ..Default::default()
         };
         assert!(!e.body_form_conflict(), "form fields alone are fine");
-        e.body = Some(" ".into());
+        e.body_src = Some(" ".into());
         assert!(e.body_form_conflict(), "a space is still a body");
     }
 
@@ -1096,7 +1126,7 @@ mod tests {
     #[test]
     fn a_disabled_form_field_does_not_conflict_with_a_body() {
         let e = HurlEntry {
-            body: Some("{}".into()),
+            body_src: Some("{}".into()),
             form_fields: vec![FormField {
                 key: "grant_type".into(),
                 enabled: false,
@@ -1420,5 +1450,50 @@ mod tests {
             1,
             "the value must not become a second entry:\n{text}"
         );
+    }
+
+    /// The whole point of the rename: whatever the user authored, the file gets
+    /// strict JSON. A `.hurl` carrying `//` is one no other Hurl runner will
+    /// parse, so this is the invariant everything else rests on.
+    #[test]
+    fn a_commented_body_is_written_out_as_strict_json() {
+        let mut e = HurlEntry {
+            title: "t".into(),
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        e.body_src = Some("{\n  // who\n  \"id\": 1 // the caller\n}".into());
+
+        assert_eq!(
+            e.body_wire().as_deref(),
+            Some("{\n  \"id\": 1\n}"),
+            "the wire body has no commentary in it"
+        );
+        let text = e.to_hurl();
+        assert!(!text.contains("// who"), "\n{text}");
+        assert!(text.contains("\"id\": 1"), "\n{text}");
+    }
+
+    /// A body that was never JSON keeps its slashes — stripping there would
+    /// truncate real content at the first `//`.
+    #[test]
+    fn a_body_that_is_not_json_is_written_out_untouched() {
+        let mut e = HurlEntry::default();
+        e.body_src = Some("query { user // not a comment\n}".into());
+        assert_eq!(e.body_wire().as_deref(), e.body_src.as_deref());
+    }
+
+    /// The field was renamed but the saved-state key must not be, or every
+    /// existing `state.json` would come back with no bodies at all.
+    #[test]
+    fn renaming_the_field_did_not_rename_it_on_disk() {
+        let mut e = HurlEntry::default();
+        e.body_src = Some("{}".into());
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"body\":\"{}\""), "{json}");
+
+        let back: HurlEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.body_src.as_deref(), Some("{}"));
     }
 }

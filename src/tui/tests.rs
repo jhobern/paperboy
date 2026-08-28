@@ -6841,7 +6841,7 @@ fn esc_on_an_unmodified_edit_closes_immediately() {
         cookies: vec![KvRow::new("sid", "1")],
         queries: vec![KvRow::new("q", "2")],
         options: vec![KvRow::new("variable", "v=1")],
-        body: Some("{\"a\":1}".into()),
+        body_src: Some("{\"a\":1}".into()),
         expected_status: Some(200),
         ..Default::default()
     };
@@ -12633,7 +12633,7 @@ fn sending_a_request_with_both_body_and_form_fields_is_refused_and_names_the_req
         title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://127.0.0.1:1/x".to_string(),
-        body: Some("{\"a\":1}".to_string()),
+        body_src: Some("{\"a\":1}".to_string()),
         ..Default::default()
     };
     entry.form_fields.push(crate::hurl::FormField {
@@ -12678,7 +12678,7 @@ fn the_request_panel_warns_about_a_body_and_form_fields_before_anything_is_sent(
         title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://example.com/token".to_string(),
-        body: Some(" ".to_string()),
+        body_src: Some(" ".to_string()),
         ..Default::default()
     };
     entry.form_fields.push(crate::hurl::FormField {

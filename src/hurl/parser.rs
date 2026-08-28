@@ -285,7 +285,7 @@ fn map_entry(
         queries: query_params,
         cookies,
         options,
-        body: req.body.as_ref().and_then(|b| body_source(b, lines)),
+        body_src: req.body.as_ref().and_then(|b| body_source(b, lines)),
         expected_status,
         response_version,
         response_headers,
@@ -1132,9 +1132,9 @@ mod tests {
         let content = "# First\nPOST http://x/a\nContent-Type: application/json\n{\n  \"k\": \"v\"\n}\nHTTP 200\n\n# Second\nGET http://x/b\nAccept: application/json\nHTTP 200\n";
         let e = parse_hurl(content);
         assert_eq!(e.len(), 2, "the body must not swallow the second entry");
-        assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
+        assert_eq!(e[0].body_src.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
         assert_eq!(e[1].method, "GET");
-        assert!(e[1].body.is_none());
+        assert!(e[1].body_src.is_none());
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
             e[0].headers,
             vec![("Accept".into(), "application/json".into(), true)]
         );
-        assert!(e[0].body.is_none());
+        assert!(e[0].body_src.is_none());
     }
 
     #[test]
@@ -1180,7 +1180,7 @@ mod tests {
         let e = parse_hurl(content);
         assert_eq!(e.len(), 1);
         assert!(e[0].headers.is_empty(), "the JSON body is not a header");
-        assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
+        assert_eq!(e[0].body_src.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
     }
 
     #[test]
@@ -1355,7 +1355,7 @@ mod tests {
             assert_eq!(a.method, b.method);
             assert_eq!(a.url, b.url);
             assert_eq!(a.headers, b.headers);
-            assert_eq!(a.body, b.body);
+            assert_eq!(a.body_src, b.body_src);
         }
     }
 
@@ -2011,12 +2011,12 @@ mod tests {
             e[0].comments
         );
         assert!(
-            e[0].body
+            e[0].body_src
                 .as_deref()
                 .unwrap_or_default()
                 .contains("# not a comment"),
             "the body must still contain the # line: {:?}",
-            e[0].body
+            e[0].body_src
         );
     }
 
@@ -2118,7 +2118,7 @@ mod tests {
         let src = "POST http://h/a\n[Options]\nretry: 2\n```\n{\"x\":1}\n```\nHTTP 200\n";
         let e = parse_hurl(src);
         assert_eq!(e[0].options, vec![("retry".into(), "2".into(), true)]);
-        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        assert_eq!(e[0].body_src.as_deref(), Some("```\n{\"x\":1}\n```"));
         let text = e[0].to_hurl();
         assert!(
             text.find("[Options]").unwrap() < text.find("```").unwrap(),
@@ -2181,7 +2181,7 @@ mod tests {
     fn a_file_body_survives_a_save() {
         let src = "POST http://h/a\nContent-Type: application/json\nfile, body.json;\n";
         let e = parse_hurl(src);
-        assert_eq!(e[0].body.as_deref(), Some("file, body.json;"));
+        assert_eq!(e[0].body_src.as_deref(), Some("file, body.json;"));
         let text = collection_to_hurl(&e);
         assert!(text.contains("file, body.json;"), "\n{text}");
         assert_eq!(parse_hurl_error(&text), None, "\n{text}");
@@ -2195,7 +2195,7 @@ mod tests {
     fn a_base64_body_survives_a_save() {
         let src = "POST http://h/a\nbase64,SGVsbG8=;\n";
         let e = parse_hurl(src);
-        assert_eq!(e[0].body.as_deref(), Some("base64,SGVsbG8=;"));
+        assert_eq!(e[0].body_src.as_deref(), Some("base64,SGVsbG8=;"));
         let text = collection_to_hurl(&e);
         assert!(text.contains("base64,SGVsbG8=;"), "\n{text}");
         assert_eq!(parse_hurl_error(&text), None, "\n{text}");
@@ -2323,7 +2323,7 @@ mod tests {
             vec![("X-Trace".into(), "t".into(), true)]
         );
         assert_eq!(e[0].response_body.as_deref(), Some("```\n{\"id\":9}\n```"));
-        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        assert_eq!(e[0].body_src.as_deref(), Some("```\n{\"x\":1}\n```"));
         assert_sections_round_trip(src);
         assert_comments_round_trip(src);
     }

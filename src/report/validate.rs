@@ -1683,7 +1683,7 @@ mod tests {
             title: "req".into(),
             method: "GET".into(),
             url: "http://x/{{alpha}}/{{bravo}}?q={{charlie}}".into(),
-            body: Some("{\"d\":\"{{delta}}\",\"e\":\"{{echo}}\",\"f\":\"{{foxtrot}}\"}".into()),
+            body_src: Some("{\"d\":\"{{delta}}\",\"e\":\"{{echo}}\",\"f\":\"{{foxtrot}}\"}".into()),
             ..Default::default()
         };
         let entries = [entry];
