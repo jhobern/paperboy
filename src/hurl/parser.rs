@@ -1097,21 +1097,27 @@ fn body_blocks(lines: &[&str], from: usize, to: usize) -> Vec<(Range<usize>, Str
             .get(i.wrapping_sub(1))
             .and_then(|l| parse_body_marker(l))
         {
-            let end = i + 1 + n;
-            let well_formed = end <= hi
-                && (i + 1..end).all(|j| {
-                    lines
-                        .get(j - 1)
-                        .is_some_and(|l| l.trim_start().starts_with('#'))
-                });
-            if well_formed {
-                let text = (i + 1..end)
-                    .map(|j| decode_body_line(lines[j - 1]))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                out.push((i..end, text));
-                i = end;
-                continue;
+            // The count comes out of a file that may have been hand-edited or
+            // badly merged, so the arithmetic is checked. Left to wrap, a count
+            // near `usize::MAX` produces a range ending before it starts, which
+            // reads as well-formed and leaves `i` exactly where it was: not a
+            // rejected block but a hang.
+            if let Some(end) = i.checked_add(1).and_then(|e| e.checked_add(n)) {
+                let well_formed = end <= hi
+                    && (i + 1..end).all(|j| {
+                        lines
+                            .get(j - 1)
+                            .is_some_and(|l| l.trim_start().starts_with('#'))
+                    });
+                if well_formed {
+                    let text = (i + 1..end)
+                        .map(|j| decode_body_line(lines[j - 1]))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push((i..end, text));
+                    i = end;
+                    continue;
+                }
             }
         }
         i += 1;
@@ -1128,6 +1134,13 @@ fn body_blocks(lines: &[&str], from: usize, to: usize) -> Vec<(Range<usize>, Str
 /// block is left unclaimed, surviving as prose comments rather than being
 /// deleted on the user's behalf.
 ///
+/// The comparison asks the writer's own question — "does this block derive the
+/// body in the file?" — by running the same `wire_body` the file was written
+/// with, rather than a stripped approximation of it. Anything less and a block
+/// that legitimately produced the body (one that commented out a last field,
+/// say, and so shed a trailing comma) would fail to reconcile and orphan every
+/// comment in it.
+///
 /// The comparison is semantic rather than byte-for-byte so that a reformat, or
 /// a re-ordering of keys, doesn't orphan every comment in the request over
 /// whitespace that changes nothing about what gets sent.
@@ -1138,9 +1151,9 @@ fn claim_body_block(
     body: Option<&str>,
 ) -> Option<(Range<usize>, String)> {
     let body = body?;
-    body_blocks(lines, from, to).into_iter().find(|(_, text)| {
-        json_comments::bodies_equivalent(&json_comments::strip_comments(text), body)
-    })
+    body_blocks(lines, from, to)
+        .into_iter()
+        .find(|(_, text)| json_comments::bodies_equivalent(&json_comments::wire_body(text), body))
 }
 
 fn is_reports_marker(line: &str) -> bool {
@@ -2709,5 +2722,82 @@ mod tests {
         let text = collection_to_hurl(&e);
         assert!(!text.contains("[Body]"), "\n{text}");
         assert_eq!(text, src);
+    }
+
+    /// C1, the whole file at stake: commenting out a last field leaves a comma
+    /// behind, and a body that isn't JSON used to be written out with its
+    /// comments intact. That is invalid Hurl, and because a parse failure
+    /// yields an empty collection it silently deleted every request in the
+    /// file — not just the annotated one.
+    #[test]
+    fn commenting_out_a_last_field_does_not_empty_the_collection() {
+        let mut a = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  \"a\": 1,\n  // \"b\": 2\n}";
+        a.body_src = Some(authored.into());
+        let b = HurlEntry {
+            method: "GET".into(),
+            url: "http://h/b".into(),
+            ..Default::default()
+        };
+
+        let text = collection_to_hurl(&[a, b]);
+        assert!(parse_hurl_error(&text).is_none(), "invalid hurl:\n{text}");
+
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 2, "the other request went with it:\n{text}");
+        assert_eq!(back[0].body_src.as_deref(), Some(authored));
+        // What is sent is strict JSON: no comment, and no stranded comma.
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    }
+
+    /// C2: the count comes from the file, so it can say anything. Unchecked, a
+    /// count near `usize::MAX` wrapped to a range ending before it began, which
+    /// looked well-formed and never advanced the cursor — the app hung on a
+    /// file stock Hurl reads as an ordinary comment.
+    #[test]
+    fn a_body_marker_claiming_the_whole_address_space_is_ignored() {
+        let text = format!(
+            "POST http://h/a\n# [Body] {}\n# {{\"a\":1}}\n{{\"a\":1}}\n",
+            usize::MAX
+        );
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        // Degrades to prose: the note survives and the body is untouched.
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\"a\":1}"));
+        assert!(collection_to_hurl(&back).contains("[Body]"));
+    }
+
+    /// C3: a hand-edit to a non-JSON body must win over the block describing
+    /// it. Comparing loosely let the stale block be claimed, and PaperBoy then
+    /// sent bytes that differed from the ones in the file.
+    #[test]
+    fn an_edit_to_a_non_json_body_beats_the_block_describing_it() {
+        let text = "POST http://h/a\n# [Body] 1\n# <a>x y</a>\n<a>x  y</a>\n";
+        let back = parse_hurl(text);
+        assert_eq!(back[0].body_wire().as_deref(), Some("<a>x  y</a>"));
+        // Unclaimed, but not deleted: the note is still in the file.
+        assert!(collection_to_hurl(&back).contains("# <a>x y</a>"));
+    }
+
+    /// M1: the file is read line-wise, which eats a `\r`, so a block written
+    /// with CRLF came back as LF and the next save wrote different bytes than
+    /// the last — a file that churns in git every time it is opened.
+    #[test]
+    fn a_body_authored_with_windows_line_endings_settles() {
+        let mut e = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        e.body_src = Some("{\r\n  // who\r\n  \"a\": 1\r\n}".into());
+
+        let once = collection_to_hurl(&[e]);
+        let twice = collection_to_hurl(&parse_hurl(&once));
+        assert_eq!(once, twice, "not a fixed point");
+        assert!(!once.contains('\r'), "\n{once:?}");
     }
 }

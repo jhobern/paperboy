@@ -34,6 +34,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   running someone else's formatter over a collection doesn't orphan every
   comment in it.
 
+  Commenting out a field works the way you would expect, including the last one
+  in an object or array: the comma that used to separate it is dropped from the
+  body that gets sent, so `// "draft": true` on the final line leaves valid JSON
+  behind rather than a body no server will accept.
+
 
 - **The Requests list can be searched — `/` in the terminal UI, a filter box
   in the graphical one.** The terminal UI's list shows one folder at a time and

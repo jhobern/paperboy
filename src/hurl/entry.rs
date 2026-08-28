@@ -925,6 +925,14 @@ impl HurlEntry {
                 let src_lines: Vec<&str> = src.split('\n').collect();
                 out.push_str(&format!("# [Body] {}\n", src_lines.len()));
                 for l in src_lines {
+                    // Written with the line endings the wire body already has:
+                    // deriving it rebuilds the text line by line and so hands
+                    // back LF regardless. A block still carrying CRLF would be
+                    // read back as LF (the file is parsed line-wise, which eats
+                    // the `\r`), and the next save would write different bytes
+                    // than the last — a file that churns in git every time it
+                    // is opened.
+                    let l = l.strip_suffix('\r').unwrap_or(l);
                     // An empty line is bare `#`, so nothing in the file carries
                     // trailing whitespace; decoding drops one space after the
                     // marker, which is how a body's own indentation survives.

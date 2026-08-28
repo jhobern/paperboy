@@ -154,6 +154,46 @@ pub fn strip_comments(src: &str) -> String {
     out
 }
 
+/// Drop the commas that only separated something that is no longer there.
+///
+/// Commenting out the last field of an object or array is one of the main
+/// reasons to want comments at all, and it leaves behind the comma that used to
+/// separate it: `{"a": 1,\n// "b": 2\n}` strips to `{"a": 1,\n}`, which no JSON
+/// parser will take. Removing that comma is the difference between the feature
+/// working and it writing a file that cannot be read back.
+///
+/// Only commas in code are candidates — one inside a string or a `{{template}}`
+/// is data — and only when the next thing that isn't whitespace closes the
+/// collection they belong to.
+fn drop_trailing_commas(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut code = vec![false; b.len()];
+    for (kind, a, e) in scan(src) {
+        if kind == Piece::Text {
+            code[a..e].fill(true);
+        }
+    }
+    let mut out = String::with_capacity(src.len());
+    // Only single ASCII commas are ever skipped, so every slice boundary below
+    // lands on a character boundary.
+    let mut copied = 0usize;
+    for i in 0..b.len() {
+        if b[i] != b',' || !code[i] {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && code[j] && matches!(b[j], b'}' | b']') {
+            out.push_str(&src[copied..i]);
+            copied = i + 1;
+        }
+    }
+    out.push_str(&src[copied..]);
+    out
+}
+
 /// Body text as it goes on the wire and into a `.hurl` file: the authored text
 /// with its JSON comments removed.
 ///
@@ -161,16 +201,25 @@ pub fn strip_comments(src: &str) -> String {
 /// GraphQL body containing `//` is data, not commentary, and silently
 /// truncating it at the slash would be far worse than not supporting comments
 /// there at all — so anything that doesn't parse is handed back untouched.
+///
+/// Note what the last branch implies: for a body that isn't JSON, the authored
+/// and wire texts are equal, so no `# [Body]` block is written and the slashes
+/// stay in the body exactly as they were. That is the correct outcome for
+/// GraphQL, and it is also the pre-existing behaviour for a body PaperBoy can't
+/// make sense of.
 pub fn wire_body(src: &str) -> Cow<'_, str> {
     if !has_comments(src) {
         return Cow::Borrowed(src);
     }
     let stripped = strip_comments(src);
     if parses_as_json(&stripped) {
-        Cow::Owned(stripped)
-    } else {
-        Cow::Borrowed(src)
+        return Cow::Owned(stripped);
     }
+    let tidied = drop_trailing_commas(&stripped);
+    if parses_as_json(&tidied) {
+        return Cow::Owned(tidied);
+    }
+    Cow::Borrowed(src)
 }
 
 /// Rewrite body text into something `serde_json` can parse.
@@ -211,9 +260,11 @@ fn parses_as_json(src: &str) -> bool {
 /// sent, and treating it as a divergence would orphan every comment in the
 /// request over pure whitespace.
 ///
-/// When either side isn't JSON there is nothing to compare structurally, so it
-/// falls back to ignoring whitespace — the only claim that can honestly be made
-/// about text that can't be parsed.
+/// When either side isn't JSON there is nothing to compare structurally, and no
+/// honest claim can be made about whitespace either: a space in XML text
+/// content, or an indent in YAML, changes what the request means. So text we
+/// can't parse has to match byte for byte, which the equality above already
+/// covers — anything else and the file's own body wins.
 // Reconciliation itself lands with the `# [Body]` block; this is its other
 // half, kept here beside the scanner it shares.
 pub fn bodies_equivalent(a: &str, b: &str) -> bool {
@@ -226,10 +277,7 @@ pub fn bodies_equivalent(a: &str, b: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(&jb),
     ) {
         (Ok(x), Ok(y)) => x == y,
-        _ => {
-            let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-            squash(a) == squash(b)
-        }
+        _ => false,
     }
 }
 
@@ -334,10 +382,59 @@ mod tests {
         ));
     }
 
+    /// C3: the squash this used to do let a hand-edit to a non-JSON body be
+    /// overridden by a stale block, and PaperBoy then sent different bytes than
+    /// the file did. Whitespace is meaningful in XML text and YAML, so text we
+    /// can't parse has to match exactly.
     #[test]
-    fn bodies_that_are_not_json_fall_back_to_ignoring_whitespace() {
-        assert!(bodies_equivalent("hello   world", "hello world"));
+    fn whitespace_matters_in_a_body_that_is_not_json() {
+        assert!(!bodies_equivalent("<a>x  y</a>", "<a>x y</a>"));
+        assert!(!bodies_equivalent("hello   world", "hello world"));
         assert!(!bodies_equivalent("hello world", "goodbye world"));
+        assert!(bodies_equivalent("<a>x  y</a>", "<a>x  y</a>"));
+    }
+
+    /// Commenting out the last field of a collection is one of the main reasons
+    /// to want comments, and it strands the comma that separated it. Without
+    /// this the body isn't JSON, so it would be written to the file with its
+    /// comments still in it — invalid Hurl, which reads back as an empty
+    /// collection and takes every other request in the file with it.
+    #[test]
+    fn commenting_out_a_last_field_does_not_strand_its_comma() {
+        assert_eq!(
+            wire_body("{\n  \"a\": 1,\n  // \"b\": 2\n}").as_ref(),
+            "{\n  \"a\": 1\n}"
+        );
+        assert_eq!(
+            wire_body("{\n  \"a\": 1, // note\n}").as_ref(),
+            "{\n  \"a\": 1\n}"
+        );
+        assert_eq!(wire_body("[\n  1,\n  // 2\n]").as_ref(), "[\n  1\n]");
+    }
+
+    /// A comma is only punctuation when it's in code — one inside a string or a
+    /// template is somebody's data.
+    #[test]
+    fn a_comma_inside_a_string_is_not_punctuation() {
+        assert_eq!(
+            wire_body("{\n  \"a\": \"x,\", // note\n  \"b\": \"y,}\"\n}").as_ref(),
+            "{\n  \"a\": \"x,\",\n  \"b\": \"y,}\"\n}"
+        );
+        // The `}` that closes a template must not look like a closing brace.
+        assert_eq!(
+            wire_body("{\n  \"a\": [{{x}}, {{y}}] // note\n}").as_ref(),
+            "{\n  \"a\": [{{x}}, {{y}}]\n}"
+        );
+    }
+
+    /// Text that still isn't JSON once the commas are tidied is data, not code,
+    /// and is handed back untouched — the slashes in a GraphQL body are part of
+    /// the query.
+    #[test]
+    fn a_body_that_is_not_json_keeps_its_slashes() {
+        let src = "query { a } // not a comment, this is text";
+        assert_eq!(wire_body(src).as_ref(), src);
+        assert!(matches!(wire_body(src), Cow::Borrowed(_)));
     }
 
     #[test]
