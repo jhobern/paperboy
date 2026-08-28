@@ -61,6 +61,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   instead of being left to find out. Notes that would not survive being written
   back as a body are never applied, however plain the intent.
 
+  Taking notes back as the body now asks the only question that matters —
+  would this survive being saved and reopened — rather than merely whether the
+  comments strip cleanly. Text with no comments in it is not thereby a body,
+  and a file Hurl cannot read comes back as no requests at all, so offering to
+  adopt a stray line of prose was offering to delete a collection. A marker
+  claiming no lines is no longer treated as empty notes that could replace a
+  real body, and a marker with a damaged count no longer hides well-formed
+  notes below it or brings the interface down when the request is drawn.
+
 
 - **The Requests list can be searched — `/` in the terminal UI, a filter box
   in the graphical one.** The terminal UI's list shows one folder at a time and

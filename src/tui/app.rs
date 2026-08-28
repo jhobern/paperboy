@@ -1611,10 +1611,13 @@ fn body_copies(e: &HurlEntry) -> (Option<String>, Option<String>) {
 fn settle_raw_body_edit(before: &str, parsed: &mut HurlEntry) -> Option<Status> {
     // Nothing to settle unless the file came back with the two disagreeing.
     parsed.stale_body_notes()?;
-    let (was_notes, was_body) = crate::hurl::parse_hurl(before)
-        .first()
-        .map(body_copies)
-        .unwrap_or((None, None));
+    // Intent is knowable only by comparison. If the text the editor opened
+    // with isn't a single request — it failed to parse, or the user pasted
+    // something else over it — there is nothing to compare against, so leave
+    // the file's own precedence to it rather than guess.
+    let opened = crate::hurl::parse_hurl(before);
+    let [was] = &opened[..] else { return None };
+    let (was_notes, was_body) = body_copies(was);
     let (now_notes, now_body) = body_copies(parsed);
 
     match (now_notes != was_notes, now_body != was_body) {

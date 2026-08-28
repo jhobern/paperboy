@@ -31634,3 +31634,37 @@ fn raw_mode_leaves_a_plain_body_alone() {
     assert_eq!(e.body_wire().as_deref(), Some("{\"a\": 1}"));
     assert!(e.stale_body_notes().is_none());
 }
+
+/// Raw Mode's notes-only rule must not be a way around the adopt guard: notes
+/// that carry no comments at all still aren't a body, and applying them would
+/// write a file that reads back as no requests at all.
+#[test]
+fn raw_mode_will_not_apply_notes_that_are_not_a_body() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Replace the whole block with prose, leaving the strict body alone.
+    let edited = opened.replace(
+        "# [Body] 3\n# {\n#   \"a\": 1 // mine\n# }\n",
+        "# [Body] 1\n# hello world\n",
+    );
+    assert_ne!(edited, opened, "the block was rewritten");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 1\n}"),
+        "body kept"
+    );
+    assert!(e.stale_body_notes().is_some(), "the prose is kept as notes");
+    assert!(
+        !matches!(app.status, Some(crate::i18n::Status::NotesAppliedFromRaw)),
+        "nothing was applied, so nothing may be reported as applied"
+    );
+    assert_eq!(
+        crate::hurl::parse_hurl(&e.to_hurl()).len(),
+        1,
+        "the file still loads"
+    );
+}

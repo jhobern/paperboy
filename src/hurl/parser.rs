@@ -2877,6 +2877,81 @@ mod tests {
         );
     }
 
+    /// Prose that happens to carry no comments still isn't a body. Adopting it
+    /// would write text Hurl cannot parse, and a file that will not parse
+    /// reads back as *no requests at all* — so one adopt could take a whole
+    /// collection with it. The guard is "would this survive being written",
+    /// not "did the comments strip cleanly".
+    #[test]
+    fn notes_that_are_not_a_body_at_all_cannot_be_adopted() {
+        let text = "POST http://h/a\n\
+                    # [Body] 1\n\
+                    # hello world\n\
+                    {\n  \"real\": 1\n}\n\
+                    HTTP 200\n\n\
+                    GET http://h/keepme\nHTTP 200\n";
+        let mut back = parse_hurl(text);
+        assert_eq!(back.len(), 2);
+        let e = &mut back[0];
+        assert!(
+            e.stale_body_notes().is_some(),
+            "the notes are still offered"
+        );
+        assert!(!e.can_adopt_body_notes(), "prose is not a body");
+        assert!(!e.adopt_body_notes());
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"real\": 1\n}"));
+        // The whole file still loads, which is the thing actually at stake.
+        let out = collection_to_hurl(&back);
+        assert_eq!(parse_hurl(&out).len(), 2, "no request was lost");
+    }
+
+    /// A marker claiming no lines describes no body. Offering it as leftover
+    /// notes would put the indicator up for nothing, and adopting it would
+    /// replace a perfectly good body with emptiness.
+    #[test]
+    fn a_body_marker_claiming_no_lines_is_not_leftover_notes() {
+        let text = "POST http://h/a\n# [Body] 0\n{\n  \"real\": 1\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_none());
+        assert!(!e.can_adopt_body_notes());
+        assert!(!e.adopt_body_notes());
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"real\": 1\n}"));
+    }
+
+    /// The count is read on the draw path, so a damaged one must not be able
+    /// to bring the interface down. `usize::MAX` overflowed the addition that
+    /// finds the end of the block.
+    #[test]
+    fn a_body_marker_claiming_the_whole_address_space_is_not_leftover_notes() {
+        let text = "POST http://h/a\n# [Body] 18446744073709551615\n{\n  \"a\": 1\n}\n";
+        let back = parse_hurl(text);
+        assert!(back[0].stale_body_notes().is_none());
+    }
+
+    /// A block whose count overruns the comments below it is a damaged marker,
+    /// not the end of the search — the same mistake the parser makes when a
+    /// stale block spans a good one, and just as capable of hiding notes the
+    /// user could otherwise resolve.
+    #[test]
+    fn an_overrunning_block_does_not_hide_a_well_formed_one_below_it() {
+        let text = "POST http://h/a\n\
+                    # [Body] 9\n\
+                    # {\n\
+                    #   \"old\": 1\n\
+                    # }\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"b\": 9 // note\n\
+                    # }\n\
+                    {\n  \"real\": 1\n}\n";
+        let back = parse_hurl(text);
+        let (_, notes) = back[0]
+            .stale_body_notes()
+            .expect("the well-formed block is still found");
+        assert_eq!(notes, "{\n  \"b\": 9 // note\n}");
+    }
+
     /// Deleting a body leaves a stale block behind as prose, and writing a new
     /// body then puts a second block in the file. The good one must still be
     /// found: when the stale count happens to span it exactly, jumping past the

@@ -735,7 +735,21 @@ impl HurlEntry {
             let Some(n) = parse_body_marker(&self.comments[idx].text) else {
                 continue;
             };
-            let lines = at_body.get(pos + 1..pos + 1 + n)?;
+            // A marker claiming no lines describes no body; treating it as an
+            // empty block would offer to replace a real body with nothing.
+            if n == 0 {
+                continue;
+            }
+            // A count that overruns what is left is a damaged marker, not the
+            // end of the search: a hand-edited or badly merged block must not
+            // hide a well-formed one below it, and the arithmetic must not
+            // overflow on a count near the top of the range.
+            let Some(end) = pos.checked_add(1).and_then(|s| s.checked_add(n)) else {
+                continue;
+            };
+            let Some(lines) = at_body.get(pos + 1..end) else {
+                continue;
+            };
             if lines.len() != n {
                 continue;
             }
@@ -753,13 +767,34 @@ impl HurlEntry {
 
     /// Whether the leftover notes can be taken back as the body.
     ///
-    /// Adopting text whose comments can't be stripped would write a body with
-    /// its comments still in it, which is not valid Hurl and reads back as an
-    /// empty collection — so a block that no longer strips cleanly can only be
-    /// discarded, never adopted.
+    /// The test is not "do the comments strip cleanly" but "would the result
+    /// survive being written to a file and read back". Those are not the same
+    /// question: text with no comments in it at all — prose, a stray word, a
+    /// half-deleted block — strips to itself and still isn't something Hurl
+    /// will accept as a body. Writing it would make the file unparseable, and
+    /// an unparseable file reads back as an empty collection, so a single
+    /// adopt could take every request in it down. The only honest way to know
+    /// is to do the write and read it back, which is what this does.
     pub fn can_adopt_body_notes(&self) -> bool {
-        self.stale_body_notes()
-            .is_some_and(|(_, text)| !json_comments::has_comments(&json_comments::wire_body(&text)))
+        self.adopted_notes()
+            .is_some_and(|e| e.survives_being_written())
+    }
+
+    /// The entry this one would become if its leftover notes were adopted.
+    fn adopted_notes(&self) -> Option<Self> {
+        let (at, text) = self.stale_body_notes()?;
+        let mut next = self.clone();
+        next.body_src = Some(text);
+        next.drop_comments(&at);
+        Some(next)
+    }
+
+    /// Whether writing this entry out and reading it back gives the same
+    /// request, rather than a parse error (which the parser reports by
+    /// returning no entries at all).
+    fn survives_being_written(&self) -> bool {
+        let back = crate::hurl::parser::parse_hurl(&self.to_hurl());
+        back.len() == 1 && back[0].body_wire() == self.body_wire()
     }
 
     /// Take the leftover notes back as the body, comments and all.
@@ -767,14 +802,13 @@ impl HurlEntry {
     /// This changes what the request sends — to whatever the notes strip down
     /// to — which is exactly why it is a deliberate action and never automatic.
     pub fn adopt_body_notes(&mut self) -> bool {
-        if !self.can_adopt_body_notes() {
-            return false;
-        }
-        let Some((at, text)) = self.stale_body_notes() else {
+        let Some(next) = self.adopted_notes() else {
             return false;
         };
-        self.body_src = Some(text);
-        self.drop_comments(&at);
+        if !next.survives_being_written() {
+            return false;
+        }
+        *self = next;
         true
     }
 
