@@ -110,6 +110,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Filtering the Environments panel and then pressing Tab no longer takes the
+  keyboard hostage.** `/` puts that panel into a typing mode, and Tab is
+  deliberately not consumed by it so the keyboard can leave — but nothing
+  switched the mode off on the way out. It stayed armed in a pane nobody was
+  looking at any more and quietly swallowed every printable key in the
+  application: the Requests list's `x`, `u`, `c` and `n` all stopped working,
+  and so did `q`, which reads as the terminal UI simply having locked up. The
+  mode is now parked when the panel loses focus rather than cancelled, so the
+  query survives and coming back resumes typing where you left off, and the
+  blinking cursor no longer advertises a capture that isn't happening.
+
 - **Deleting a request in a Workspace tab no longer un-deletes itself.** A
   Workspace tab holds its edits in memory and re-reads the file from disk when
   it switches away and back, so it has to know when there is something worth

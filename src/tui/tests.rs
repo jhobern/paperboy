@@ -31236,3 +31236,51 @@ fn slash_on_a_workspace_tab_still_reaches_the_environments_filter() {
     assert!(app.env_filter_typing);
     assert_eq!(app.focus, Pane::GlobalEnv);
 }
+
+/// The Environments filter is a mode, and `Tab` deliberately falls through it
+/// so the keyboard can leave. Without a focus guard the mode stayed armed in
+/// the pane the user walked away from and ate every printable key in the app —
+/// the Requests list's own letter actions, and `q` with it.
+#[test]
+fn tabbing_away_from_the_environments_filter_gives_the_keyboard_back() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("keep"), entry_named("goner")];
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert!(app.env_filter_typing);
+
+    // Tab is not consumed by the filter, so focus moves on.
+    press(&mut app, KeyCode::Tab);
+    assert_ne!(app.focus, Pane::GlobalEnv);
+
+    app.focus = Pane::List;
+    app.collections[ci].selected_entry = 1;
+    app.collections[ci].list_cursor = 1;
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["keep"],
+        "`x` deleted the selected request instead of being typed into the \
+         environments filter"
+    );
+    assert!(app.env_query.is_empty(), "and nothing was typed into it");
+}
+
+/// Coming back to the panel resumes typing into the filter that is still on
+/// screen — the guard parks the mode, it doesn't cancel it.
+#[test]
+fn returning_to_the_environments_panel_resumes_its_filter() {
+    let mut app = TuiApp::default();
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Tab);
+    app.focus = Pane::GlobalEnv;
+    press(&mut app, KeyCode::Char('r'));
+
+    assert_eq!(app.env_query, "pr");
+}

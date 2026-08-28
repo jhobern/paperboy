@@ -2672,7 +2672,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     let show_source_strip =
         app.has_workspace_env_source() && source != crate::env_panel::EnvSource::Both;
     let (list_area, filter_area) =
-        if app.env_query.is_empty() && !app.env_filter_typing && !show_source_strip {
+        if app.env_query.is_empty() && !(app.env_filter_typing && focused) && !show_source_strip {
             (area, None)
         } else {
             let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
@@ -2800,7 +2800,10 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ),
         ];
-        if app.env_filter_typing {
+        // Only while the panel actually holds the keyboard: the mode flag
+        // outlives a Tab away from here, and a cursor blinking in a pane that
+        // no longer captures keys advertises a capture that isn't happening.
+        if app.env_filter_typing && focused {
             spans.push(Span::styled(
                 "\u{2588}",
                 Style::default()

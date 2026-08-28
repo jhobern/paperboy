@@ -1611,7 +1611,17 @@ impl TuiApp {
         // to actions (`a` activate, `x` delete, `u` undo, `q` quit), so typing
         // a name here without a mode would fire half of them. Handled before
         // the main match for the same reason.
-        if self.env_filter_typing && self.on_key_env_filter(key, ctrl, alt) {
+        //
+        // Gated on the pane still having focus: `on_key_env_filter` lets Tab
+        // fall through, so without this the mode would stay armed in a pane the
+        // user has walked away from and quietly eat every printable key in the
+        // app — including the Requests list's own letter actions, and `q`. The
+        // query itself survives, so coming back resumes typing into the filter
+        // that is still on screen.
+        if self.env_filter_typing
+            && self.focus == Pane::GlobalEnv
+            && self.on_key_env_filter(key, ctrl, alt)
+        {
             return;
         }
         // Type-to-filter for the Requests list, opened with `/`. Same mode
