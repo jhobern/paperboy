@@ -192,6 +192,7 @@ strings! {
     env_reopened => "Environment '{n}' reopened.", "Environnement «\u{a0}{n}\u{a0}» rouvert.", "Miljøet '{n}' genåbnet.";
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
+    request_moved_in_list => "Request moved — this is the order Run All follows.", "Requête déplacée — c'est l'ordre suivi par Tout exécuter.", "Forespørgsel flyttet — det er den rækkefølge Kør alle følger.";
     request_duplicated => "{m} request duplicated as '{name}'.", "Requête {m} dupliquée sous « {name} ».", "{m}-forespørgsel duplikeret som '{name}'.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
@@ -512,8 +513,10 @@ strings! {
     help_restore_request => "restore deleted request (List pane)", "restaurer la requête supprimée (volet Liste)", "gendan slettet anmodning (Liste-rude)";
     help_move_request => "move request to another collection (workspace, List pane)", "déplacer la requête vers une autre collection (espace de travail, volet Liste)", "flyt anmodning til en anden samling (arbejdsområde, Liste-rude)";
     help_copy_request => "copy request to another collection (workspace, List pane)", "copier la requête vers une autre collection (espace de travail, volet Liste)", "kopiér anmodning til en anden samling (arbejdsområde, Liste-rude)";
+    help_reorder_request => "move the request up/down the collection — the order Run All follows (List pane)", "déplacer la requête vers le haut/bas — l'ordre suivi par Tout exécuter (volet Liste)", "flyt anmodningen op/ned i samlingen — den rækkefølge Kør alle følger (Liste-ruden)";
     help_duplicate_request => "duplicate the request in place (List pane)", "dupliquer la requête sur place (volet Liste)", "duplikér anmodningen på stedet (Liste-ruden)";
     foot_duplicate => "duplicate", "dupliquer", "duplikér";
+    foot_reorder => "reorder", "réordonner", "omarrangér";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
@@ -1650,6 +1653,9 @@ pub enum Status {
     /// A request was moved to another collection file in the workspace. Holds
     /// the HTTP method and the destination file's display name.
     RequestMoved(String, String),
+    /// The selected request was moved a place up or down its collection,
+    /// changing the order `Run All` follows.
+    RequestMovedInList,
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
@@ -1773,6 +1779,7 @@ impl Status {
                     | Status::WorkspaceReloaded
                     | Status::WorkspaceSaved
                     | Status::RequestMoved(_, _)
+                    | Status::RequestMovedInList
                     | Status::RequestCopied(_, _)
                     | Status::RequestDuplicated(_, _)
                     | Status::ThemeSaved(_)
@@ -1873,6 +1880,7 @@ impl Status {
             Status::TabClosed => s.tab_closed.to_string(),
             Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
             Status::EnvReopened(name) => s.env_reopened.replace("{n}", name),
+            Status::RequestMovedInList => s.request_moved_in_list.to_string(),
             Status::RequestMoved(method, dest) => s
                 .request_moved
                 .replace("{m}", method)

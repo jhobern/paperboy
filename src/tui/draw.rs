@@ -4042,6 +4042,21 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     {
         hint.push(format!("c {}", s.foot_duplicate));
     }
+    // Alt+arrows reorder the highlighted request, and the order is what Run
+    // All follows — worth advertising, since nothing else on screen says the
+    // list order means anything. Only shown when there is more than one
+    // request, since a single one has nowhere to go.
+    if app.focus == Pane::List
+        && app.collections.get(app.active_tab).is_some_and(|c| {
+            c.entries.len() > 1
+                && matches!(
+                    c.rows().get(c.list_cursor),
+                    Some(crate::tree::Row::Entry(_))
+                )
+        })
+    {
+        hint.push(format!("Alt+\u{2191}\u{2193} {}", s.foot_reorder));
+    }
     // `w` opens the workspace tree, and only Workspace-bound tabs have one.
     //
     // This used to sit beside the collection name on the Requests panel's
@@ -4453,6 +4468,10 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
                             ("c (List pane)", s.help_duplicate_request),
+                            (
+                                "Alt+\u{2191} / Alt+\u{2193} (List pane)",
+                                s.help_reorder_request,
+                            ),
                         ],
                     ),
                     (

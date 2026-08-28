@@ -30848,3 +30848,108 @@ fn a_duplicate_title_keeps_its_folder_and_ignores_namesakes_elsewhere() {
         "the other folder's (2) is a different request entirely"
     );
 }
+
+fn alt(app: &mut TuiApp, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::ALT));
+}
+
+/// `Alt+↑`/`Alt+↓` reorder the highlighted request. The order matters: it is
+/// the one `run_all_entries` follows, so it decides which request captures a
+/// token before another uses it.
+#[test]
+fn alt_arrows_move_the_selected_request_up_and_down_the_list() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("Fetch user"),
+        entry_named("Logout"),
+    ];
+    app.collections[ci].selected_entry = 2;
+    app.collections[ci].list_cursor = 2;
+    app.focus = Pane::List;
+
+    alt(&mut app, KeyCode::Up);
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Login", "Logout", "Fetch user"],
+        "Logout moved up one place"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "the selection stays on the request that moved"
+    );
+
+    alt(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["Login", "Fetch user", "Logout"]);
+}
+
+/// The bare arrows must still just move the cursor — the whole reason for
+/// putting the reorder behind Alt.
+#[test]
+fn a_bare_arrow_still_only_moves_the_cursor() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("a"), entry_named("b")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "nothing was reordered");
+    assert_eq!(app.collections[ci].selected_entry, 1);
+}
+
+/// At either end there is nowhere to go, and a folder row is not a request.
+#[test]
+fn a_reorder_with_nowhere_to_go_does_nothing() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("a"), entry_named("b")];
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+    alt(&mut app, KeyCode::Up);
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "already at the top");
+
+    // A folder row: nothing under the cursor to move.
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Auth/Login"), entry_named("Auth/Logout")];
+    app.collections[ci].list_cursor = 0; // the "Auth" folder row
+    app.focus = Pane::List;
+    alt(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["Auth/Login", "Auth/Logout"]);
+}
+
+/// Inside a folder, "one place" means one place *as shown*. The folder's
+/// requests need not be adjacent in the underlying vector, so a naive swap
+/// would drag an unrelated request from another folder across them.
+#[test]
+fn reordering_inside_a_folder_steps_over_requests_from_other_folders() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Users/List"),
+        entry_named("Auth/Logout"),
+    ];
+    // Browse into Auth, where the rows are Up, Login, Logout.
+    app.collections[ci].folder = vec!["Auth".into()];
+    app.collections[ci].list_cursor = 2; // Logout
+    app.collections[ci].selected_entry = 2;
+    app.focus = Pane::List;
+
+    alt(&mut app, KeyCode::Up);
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Auth/Logout", "Auth/Login", "Users/List"],
+        "Logout moved ahead of Login, and Users/List kept its own place after both"
+    );
+}
+
+fn titles_of(app: &TuiApp, ci: usize) -> Vec<&str> {
+    app.collections[ci]
+        .entries
+        .iter()
+        .map(|e| e.title.as_str())
+        .collect()
+}

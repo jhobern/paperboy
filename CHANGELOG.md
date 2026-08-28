@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Requests can be reordered — `Alt+↑` / `Alt+↓` in the Requests
+  list.** A collection's order is not cosmetic: `Run All` follows it, so it
+  decides whether a login runs before the request that uses the token it
+  captures. Until now nothing in either front-end could change that order — the
+  only way was to delete a request and recreate it further down. "One place"
+  means one place *as shown*: folders are derived from request titles, so a
+  folder's requests can sit far apart in the file with other folders' requests
+  in between, and the move steps over those rather than swapping with them.
+
 - **`c` duplicates the highlighted request.** Building a family of
   near-identical requests — the same call with a different header or body per
   scenario — previously meant retyping the whole thing in the wizard. The copy
@@ -85,6 +94,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   delete-only change for the same reason, including for files parked when the
   tab switched away from them. The collection now records a structural change
   — a request removed or restored — alongside the per-request markers.
+
+- **Closing a Workspace tab now warns about a deletion.** The "you have unsaved
+  edits" prompt counted edited requests, and a deleted one leaves nothing to
+  count, so a tab whose only change was a deletion closed without asking and
+  took the change with it.
 
 - **A copied request no longer takes its original's name.** A request's title
   is its identifier — reports address requests by name — so two entries sharing

@@ -255,6 +255,22 @@ pub fn unique_entry_title(entries: &[HurlEntry], title: &str) -> String {
         .unwrap_or_else(|| title.to_string())
 }
 
+/// Where the index `i` ends up after the entry at `from` is moved to `to`.
+///
+/// Only indices *between* the two move, and they all move one step in the
+/// opposite direction to the entry itself; `from` becomes `to` by definition.
+fn shift_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
 /// The synthetic `workspace_expanded` key for the virtual folder `folder`
 /// (title segments) inside the collection file at `collection` — see
 /// [`WsRow::RequestFolder`].
@@ -967,25 +983,34 @@ impl Collection {
         self.structure_modified || self.entries.iter().any(|e| e.user_added || e.modified)
     }
 
-    /// How many requests in this tab are added-but-unsaved or edited, counting
-    /// a Workspace tab's parked files as well as the one it is showing.
+    /// How many unsaved changes this tab is holding, counting a Workspace
+    /// tab's parked files as well as the one it is showing.
+    ///
+    /// Mostly this is the added-but-unsaved and edited requests, one apiece.
+    /// A file that has been changed *structurally* — a request removed,
+    /// restored or reordered — counts one more, because no surviving request
+    /// carries a marker for it and it would otherwise total zero: this number
+    /// gates the "you have unsaved edits" prompt on closing a tab
+    /// ([`crate::gui::app::GuiApp::request_close_tab`]), so a delete-only
+    /// change reading as nothing meant closing the tab threw it away without
+    /// asking. One per file rather than one per removal, because how many
+    /// there were is not recorded — only that the list no longer matches disk.
     pub fn unsaved_edit_count(&self) -> usize {
-        let loaded = self
-            .entries
-            .iter()
-            .filter(|e| e.user_added || e.modified)
-            .count();
+        let edited = |entries: &[HurlEntry]| {
+            entries
+                .iter()
+                .filter(|e| e.user_added || e.modified)
+                .count()
+        };
+        let loaded = edited(&self.entries) + usize::from(self.structure_modified);
         let parked: usize = self
             .workspace_pending
             .iter()
             // The loaded file is parked *and* live while it is being shown, so
             // counting both would double it.
             .filter(|(path, _)| self.path.as_deref() != Some(path.as_path()))
-            .map(|(_, entries)| {
-                entries
-                    .iter()
-                    .filter(|e| e.user_added || e.modified)
-                    .count()
+            .map(|(path, entries)| {
+                edited(entries) + usize::from(self.workspace_structure_modified.contains(path))
             })
             .sum();
         loaded + parked
@@ -1328,6 +1353,44 @@ impl Collection {
             self.deleted_entries.remove(0);
         }
         Some(removed)
+    }
+
+    /// Move the entry at `from` so it sits at index `to`, shifting everything
+    /// between them along. Returns whether anything actually moved.
+    ///
+    /// The order of `entries` is not cosmetic: `run_all_entries` walks it in
+    /// order, so it decides which request captures a token before another one
+    /// uses it. Until this existed the only way to change that was to delete a
+    /// request and recreate it further down.
+    ///
+    /// Remove-and-insert rather than a swap, because the two requests a user
+    /// sees as neighbours need not be neighbours in `entries` at all — folders
+    /// are derived by splitting titles on `/` (see [`crate::tree`]), so a
+    /// folder's requests can be scattered through the vector with other
+    /// folders' requests in between. Swapping would drag whichever unrelated
+    /// request sat at `to` across to `from`; shifting leaves everything else in
+    /// the order it was.
+    ///
+    /// Reordering is safe for reports, which address requests by title rather
+    /// than position (`report::run::resolve_qualified`) — unlike renaming.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> bool {
+        let len = self.entries.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        let entry = self.entries.remove(from);
+        self.entries.insert(to, entry);
+        // The selection is a position, so it has to be re-derived rather than
+        // left pointing at whatever slid into the old index: the moved request
+        // takes its selection with it, and a selection either side of the move
+        // shifts by one only if the move stepped across it.
+        self.selected_entry = shift_index(self.selected_entry, from, to);
+        // A reorder changes no request, so nothing else would record it — see
+        // `structure_modified`.
+        self.structure_modified = true;
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        true
     }
 
     /// Reopen the most recently deleted entry (if any), re-inserting it as
@@ -2018,6 +2081,116 @@ mod structure_edit_tests {
     /// the tab switched away from it. `workspace_pending` holds its entries,
     /// but a deletion leaves no flagged entry among them, so the save-all pass
     /// had nothing to tell it apart from an untouched file.
+    /// The count gates the GUI's "unsaved edits" prompt on closing a tab, so
+    /// a delete-only change reading as zero meant the tab closed silently and
+    /// the deletion went with it.
+    fn titles(c: &Collection) -> Vec<&str> {
+        c.entries.iter().map(|e| e.title.as_str()).collect()
+    }
+
+    fn plain(titles: &[&str]) -> Collection {
+        Collection::new(
+            "c".into(),
+            titles
+                .iter()
+                .map(|t| HurlEntry {
+                    title: (*t).to_string(),
+                    method: "GET".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn moving_an_entry_shifts_the_ones_it_steps_over() {
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry(0, 2), "a moves down past b and c");
+        assert_eq!(titles(&c), vec!["b", "c", "a", "d"]);
+
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry(3, 1), "d moves up past c and b");
+        assert_eq!(titles(&c), vec!["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn a_move_that_cannot_happen_is_a_no_op() {
+        let mut c = plain(&["a", "b"]);
+        assert!(!c.move_entry(1, 1), "nowhere to go");
+        assert!(!c.move_entry(0, 9), "past the end");
+        assert!(!c.move_entry(9, 0), "from nowhere");
+        assert_eq!(titles(&c), vec!["a", "b"]);
+        assert!(
+            !c.structure_modified,
+            "and a move that did not happen is not an unsaved change"
+        );
+    }
+
+    /// The selection is a position, so every move has to re-derive it.
+    #[test]
+    fn the_selection_follows_whatever_it_was_pointing_at() {
+        // The moved entry carries the selection with it.
+        let mut c = plain(&["a", "b", "c"]);
+        c.selected_entry = 0;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 2, "still on 'a'");
+
+        // A selection the move steps across shifts by one.
+        let mut c = plain(&["a", "b", "c"]);
+        c.selected_entry = 1;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 0, "still on 'b', which slid up");
+
+        // A selection outside the moved span is left alone.
+        let mut c = plain(&["a", "b", "c", "d"]);
+        c.selected_entry = 3;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 3, "still on 'd'");
+    }
+
+    /// A reorder is exactly the change no request records, which is what
+    /// `structure_modified` exists for.
+    #[test]
+    fn reordering_counts_as_an_unsaved_change() {
+        let dir = temp_dir("reorder");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        assert!(col.move_entry(0, 1));
+        assert!(col.has_unsaved_edits());
+        assert_eq!(col.unsaved_edit_count(), 1);
+
+        assert_eq!(col.save_workspace_edits().unwrap(), 1);
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            on_disk.find("Logout").unwrap() < on_disk.find("Login").unwrap(),
+            "the new order reached the file: {on_disk}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_structural_edit_counts_as_an_unsaved_change() {
+        let dir = temp_dir("count");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+        assert_eq!(col.unsaved_edit_count(), 0);
+
+        col.remove_entry_recording_undo(0);
+        assert_eq!(
+            col.unsaved_edit_count(),
+            1,
+            "the deletion is a change, even with no request left to flag it"
+        );
+
+        // Once parked, it still counts — and only once.
+        col.load_workspace_file(other).unwrap();
+        assert_eq!(col.unsaved_edit_count(), 1);
+
+        col.save_workspace_edits().unwrap();
+        assert_eq!(col.unsaved_edit_count(), 0, "and saving settles it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_parked_files_structural_edit_is_written_too() {
         let dir = temp_dir("parked");

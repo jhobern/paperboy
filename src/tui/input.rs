@@ -33,6 +33,15 @@ use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
+/// The entry index a Requests-list row addresses, or `None` for a folder or
+/// "up" row.
+fn row_entry(row: &crate::tree::Row) -> Option<usize> {
+    match row {
+        crate::tree::Row::Entry(i) => Some(*i),
+        _ => None,
+    }
+}
+
 impl TuiApp {
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
         self.last_mouse_row = None;
@@ -1997,6 +2006,12 @@ impl TuiApp {
             KeyCode::Down if ctrl && self.focus == Pane::Response => {
                 self.nav(self.resp_text_area.height.max(1) as i32);
             }
+            // Alt+Up/Down reorder the highlighted request. Alt because the
+            // bare arrows move the cursor and the two must not collide; a
+            // modifier turning navigation into dragging is the usual idiom.
+            // Placed above the plain arrow arms so it wins the match.
+            KeyCode::Up if alt && self.focus == Pane::List => self.move_selected_request(false),
+            KeyCode::Down if alt && self.focus == Pane::List => self.move_selected_request(true),
             KeyCode::Up | KeyCode::Char('k') => self.nav(-1),
             KeyCode::Down | KeyCode::Char('j') => self.nav(1),
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::Tabs => self.cycle_tab(false),
@@ -2511,6 +2526,50 @@ impl TuiApp {
         self.list_hscroll = 0;
         self.collections[ci].invalidate_request_json();
         self.status = Some(Status::RequestDeleted(method));
+        self.save_state();
+    }
+
+    /// Move the highlighted request one place up or down the Requests list
+    /// (`Alt+Up` / `Alt+Down`).
+    ///
+    /// The order of a collection's entries is what `run_all_entries` follows,
+    /// so this is how you put a login ahead of the request that uses the token
+    /// it captures. Until this existed the only way was to delete the request
+    /// and recreate it further down.
+    ///
+    /// "One place" means one place *as shown*, which is not the same as one
+    /// index: folders are derived from titles (see [`crate::tree`]), so the
+    /// next request in this folder can be several entries away in the
+    /// underlying vector with other folders' requests in between. The
+    /// displayed neighbour is found first and its real index handed to
+    /// [`crate::collection::Collection::move_entry`], which shifts rather than
+    /// swaps so nothing else is disturbed.
+    ///
+    /// A no-op on a folder or "up" row (nothing there to move) and at either
+    /// end of the list.
+    pub(crate) fn move_selected_request(&mut self, down: bool) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        let rows = col.rows();
+        let Some(from) = rows.get(col.list_cursor).and_then(row_entry) else {
+            return;
+        };
+        // The adjacent *displayed* request, skipping folder rows — a folder is
+        // not something a request can trade places with.
+        let neighbour = if down {
+            rows.iter().skip(col.list_cursor + 1).find_map(row_entry)
+        } else {
+            rows.iter().take(col.list_cursor).rev().find_map(row_entry)
+        };
+        let Some(to) = neighbour else {
+            return;
+        };
+        let col = &mut self.collections[ci];
+        if !col.move_entry(from, to) {
+            return;
+        }
+        self.list_hscroll = 0;
+        self.status = Some(Status::RequestMovedInList);
         self.save_state();
     }
 
