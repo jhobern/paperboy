@@ -64,6 +64,34 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
             .any(|f| f.kind == FormFieldKind::Base64File)
     });
     let mut entries = entries;
+    // A request the file could not be read at is text, not something that can
+    // be sent. Skipping it runs the rest of the collection, which is the whole
+    // point of recovering the file at all — running the raw text instead would
+    // fail every request in it to parse.
+    let unreadable: Vec<String> = entries
+        .iter()
+        .filter(|e| e.is_unreadable())
+        .map(|e| {
+            if e.title.is_empty() {
+                "<unnamed>".to_string()
+            } else {
+                e.title.clone()
+            }
+        })
+        .collect();
+    let skipped = !unreadable.is_empty();
+    if skipped {
+        eprintln!(
+            "warning: {} request(s) in '{collection_path}' could not be read and were skipped: {}",
+            unreadable.len(),
+            unreadable.join(", ")
+        );
+        entries.retain(|e| !e.is_unreadable());
+        if entries.is_empty() {
+            eprintln!("error: nothing in '{collection_path}' could be read as a request");
+            return 1;
+        }
+    }
     if has_base64 {
         let root = std::path::Path::new(&collection_path).parent();
         if let Err(e) = expand_base64_form_fields(&mut entries, root) {
@@ -71,7 +99,7 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
             return 1;
         }
     }
-    let run_content = if looks_like_postman(&col_content) || has_base64 {
+    let run_content = if looks_like_postman(&col_content) || has_base64 || skipped {
         // These paths re-serialize from the entry model, so normalize each
         // entry the same way the TUI runner does: a bodyless POST/PUT/PATCH/
         // DELETE gets an explicit `Content-Length: 0` (Postman/browsers send

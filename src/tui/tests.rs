@@ -26045,12 +26045,15 @@ mod all_view_layout {
         let mut app = TuiApp::default();
         let content = "# upload\nPOST http://h/upload\n[Multipart]\nphoto: file,;\n";
         let ok = app.load_collection_text("bad".to_string(), content, None);
-        assert!(!ok, "an invalid collection does not load");
+        // It loads now — the request is carried as text so it can be repaired
+        // in place — but the reason still has to reach the user.
+        assert!(ok, "the file opens rather than being refused outright");
+        assert!(app.collections[1].entries[0].is_unreadable());
         let s = crate::i18n::Strings::for_language(&Language::English);
         let text = app.status.as_ref().expect("a status is set").text(&s);
         assert!(
-            text.contains(s.file_not_collection_prefix),
-            "the message uses the collection-invalid prefix: {text}"
+            text.contains(s.some_requests_unreadable),
+            "the message says part of the file could not be read: {text}"
         );
         assert!(
             text.contains("line 4") && text.to_lowercase().contains("filename"),
@@ -31666,5 +31669,120 @@ fn raw_mode_will_not_apply_notes_that_are_not_a_body() {
         crate::hurl::parse_hurl(&e.to_hurl()).len(),
         1,
         "the file still loads"
+    );
+}
+
+// ── A file that could only be read in part ────────────────────────────────
+
+const PARTLY_BROKEN: &str = "# one\nGET http://h/1\nHTTP 200\n\n\
+                             # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                             # three\nGET http://h/3\nHTTP 200\n";
+
+/// One damaged request used to cost the user every other request in the file.
+#[test]
+fn a_partly_broken_collection_opens_with_the_rest_of_its_requests() {
+    let mut app = TuiApp::default();
+    assert!(app.load_collection_text("api".into(), PARTLY_BROKEN, None));
+    let col = &app.collections[1];
+    assert_eq!(col.entries.len(), 3);
+    assert!(col.entries[1].is_unreadable());
+    assert_eq!(col.entries[0].url, "http://h/1");
+    assert_eq!(col.entries[2].url, "http://h/3");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::SomeRequestsUnreadable(1, _))
+    ));
+}
+
+/// It has to be visible as something wrong, not as a blank row that looks like
+/// a request which would send.
+#[test]
+fn the_requests_list_marks_what_could_not_be_read() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+    term.draw(|f| super::draw::draw(f, &mut app)).expect("draw");
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains(s.entry_unreadable),
+        "the row says it could not be read:\n{out}"
+    );
+}
+
+/// The wizard edits fields, and text that was never parsed has none — filling
+/// the form in would write over text the user has not seen.
+#[test]
+fn the_wizard_refuses_a_request_that_could_not_be_read() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.collections[1].selected_entry = 1;
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.overlay.is_none(), "no wizard opened");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::CannotEditUnreadable)
+    ));
+}
+
+/// Raw Mode is the surface that repairs it: it opens on the text exactly as it
+/// was read, and a fixed version becomes a real request again.
+#[test]
+fn raw_mode_opens_the_unread_text_and_repairs_it() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.collections[1].selected_entry = 1;
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    match &app.overlay {
+        Some(Overlay::Prompt { editor, .. }) => assert!(
+            editor.text().contains("x: jsonpath \"$.a\""),
+            "the text is shown as it was read: {:?}",
+            editor.text()
+        ),
+        _ => panic!("raw mode should be open"),
+    }
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new(
+            "# two\nPOST http://h/2\nHTTP 200\n[Captures]\nx: jsonpath \"$.a\"",
+            true,
+        );
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "the repair was accepted");
+    let e = &app.collections[1].entries[1];
+    assert!(!e.is_unreadable(), "it is a request again");
+    assert_eq!(e.url, "http://h/2");
+    assert_eq!(e.captures, vec![("x".into(), "jsonpath \"$.a\"".into())]);
+}
+
+/// Recovery must not turn Raw Mode into a way of saving text that doesn't
+/// parse: the user is repairing *this* request, and silently accepting the
+/// mistake would swap the request for a copy of it.
+#[test]
+fn raw_mode_still_refuses_text_that_does_not_parse() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor =
+            super::editor::Editor::new("GET http://h/1\n[Captures]\nx: jsonpath \"$.a\"", true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(
+        app.overlay.is_some(),
+        "the editor stays open to be corrected"
+    );
+    assert!(matches!(app.status, Some(crate::i18n::Status::Error(_))));
+    let e = &app.collections[1].entries[0];
+    assert!(
+        !e.is_unreadable() && e.url == "http://h/1",
+        "entry untouched"
     );
 }

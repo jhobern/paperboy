@@ -852,6 +852,9 @@ strings! {
     notes_stale_cancel => "Leave them alone", "Ne rien changer", "Lad dem være";
     notes_adopted => "The notes are the body again", "Les notes sont de nouveau le corps", "Noterne er brødteksten igen";
     notes_discarded => "Notes deleted", "Notes supprimées", "Noter slettet";
+    some_requests_unreadable => "Opened, but part of the file could not be read as requests — they are kept as text, press Shift+H to repair one", "Ouvert, mais une partie du fichier n’a pas pu être lue comme des requêtes — elle est conservée telle quelle, appuyez sur Maj+H pour la réparer", "Åbnet, men en del af filen kunne ikke læses som anmodninger — den bevares som tekst, tryk Shift+H for at reparere den";
+    cannot_edit_unreadable => "This request was never read from the file, so there are no fields to edit — press Shift+H to repair its Hurl text", "Cette requête n’a jamais été lue depuis le fichier, il n’y a donc aucun champ à modifier — appuyez sur Maj+H pour réparer son texte Hurl", "Denne anmodning blev aldrig læst fra filen, så der er ingen felter at redigere — tryk Shift+H for at reparere dens Hurl-tekst";
+    entry_unreadable => "unreadable", "illisible", "ulæselig";
     notes_applied_from_raw => "Your edit to the notes became the body", "Votre modification des notes est devenue le corps", "Din ændring af noterne blev til brødteksten";
     notes_kept_body_won => "The body and its notes were both edited — the body was used, the notes kept", "Le corps et ses notes ont été modifiés tous les deux — le corps a été utilisé, les notes conservées", "Både brødteksten og dens noter blev ændret — brødteksten blev brugt, noterne beholdt";
     gui_notes_stale_headline => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
@@ -1785,6 +1788,13 @@ pub enum Status {
     /// A Raw Mode edit changed only the `# [Body]` notes, so the body was
     /// derived from them rather than the file's own copy winning.
     NotesAppliedFromRaw,
+    /// A collection opened, but some of it could not be read as requests. The
+    /// count is how many pieces of the file are being carried as text, and the
+    /// reason is the parser's own explanation of the first failure — which is
+    /// the only place the user is told *why* without opening Raw Mode.
+    SomeRequestsUnreadable(usize, Option<String>),
+    /// The user tried to edit, in fields, a request that was never parsed.
+    CannotEditUnreadable,
     /// A Raw Mode edit changed the body *and* its notes. Two edits can't be
     /// merged into one body, so the body won and the notes were kept.
     NotesKeptBodyWon,
@@ -1990,6 +2000,11 @@ impl Status {
             Status::NotesAdopted => s.notes_adopted.to_string(),
             Status::NotesDiscarded => s.notes_discarded.to_string(),
             Status::NotesAppliedFromRaw => s.notes_applied_from_raw.to_string(),
+            Status::SomeRequestsUnreadable(n, why) => match why {
+                Some(why) => format!("{} ({n}): {why}", s.some_requests_unreadable),
+                None => format!("{} ({n})", s.some_requests_unreadable),
+            },
+            Status::CannotEditUnreadable => s.cannot_edit_unreadable.to_string(),
             Status::NotesKeptBodyWon => s.notes_kept_body_won.to_string(),
             Status::WorkspaceTreeFilter(on) => {
                 if *on {

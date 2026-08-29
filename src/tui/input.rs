@@ -3479,6 +3479,12 @@ impl TuiApp {
         let Some(entry) = col.entries.get(col.selected_entry) else {
             return;
         };
+        // The wizard edits fields, and text that was never parsed has none.
+        // Raw Mode is the surface that can actually repair it.
+        if entry.is_unreadable() {
+            self.status = Some(Status::CannotEditUnreadable);
+            return;
+        }
         let ei = col.selected_entry;
         let file_root = col
             .path

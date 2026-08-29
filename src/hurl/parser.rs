@@ -19,11 +19,15 @@ use super::entry::{
 };
 use super::json_comments;
 
-/// Parse a Hurl-format string into a list of [`HurlEntry`] values. Invalid input
-/// yields an empty list (the UI treats "no entries" as a failed load).
+/// Parse a Hurl-format string into a list of [`HurlEntry`] values.
+///
+/// Text that does not parse as a whole is not thrown away: see
+/// [`recover_entries`]. The result is empty only for input with nothing in it
+/// that looks like a request at all, which is how callers still recognise "this
+/// file isn't a collection".
 pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
     let Ok(file) = parse_hurl_file(content) else {
-        return Vec::new();
+        return recover_entries(content);
     };
     let lines: Vec<&str> = content.lines().collect();
     // Each entry's `# [Reports]` comment block is recovered by scanning the raw
@@ -46,6 +50,165 @@ pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
             map_entry(e, &lines, method_lines[i], end, i == 0)
         })
         .collect()
+}
+
+/// Salvage what can be read from a file that does not parse.
+///
+/// A `.hurl` file is parsed as a whole, so one damaged request used to cost the
+/// user every other request in the file: the load failed, the collection opened
+/// as nothing, and the only way back in was a text editor. The damage is often
+/// PaperBoy's own — a bad merge, a half-finished hand-edit, an escaping bug —
+/// which makes "all or nothing" a poor trade.
+///
+/// So the file is cut into pieces at the lines that look like the start of a
+/// request, and the pieces are parsed on their own. What parses becomes real
+/// requests; what doesn't is kept verbatim as an unreadable one (see
+/// [`HurlEntry::unreadable`]) so it is still visible, still saved unchanged,
+/// and still repairable in Raw Mode.
+///
+/// The cut is a guess — a request body may contain a line that reads like a
+/// method — so it is never trusted on its own. A piece that fails to parse is
+/// retried with the piece after it joined on, and again with the one after
+/// that, which is exactly what heals a body that was cut in half. Only when no
+/// amount of joining helps is the piece declared unreadable, and even then only
+/// the first piece is: the rest go back into the queue, so one broken request
+/// cannot swallow the good ones behind it.
+///
+/// Every byte of `content` ends up in exactly one entry, in order. Nothing is
+/// invented and nothing is dropped.
+fn recover_entries(content: &str) -> Vec<HurlEntry> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let starts = request_starts(&lines);
+    if starts.is_empty() {
+        return Vec::new();
+    }
+    // Anything above the first request start is a preamble — a banner comment,
+    // or leading junk. It has no request to belong to, so it rides with the
+    // first piece rather than becoming an unreadable entry of its own.
+    let mut bounds: Vec<usize> = starts;
+    bounds[0] = 0;
+    bounds.push(lines.len());
+
+    // How many pieces may be joined on while trying to heal one. A body would
+    // have to contain this many method-like lines to defeat it, while a file
+    // whose every request is broken still costs only a bounded amount of work
+    // per request rather than a scan of everything that follows it.
+    const JOIN_LIMIT: usize = 32;
+
+    let mut out: Vec<HurlEntry> = Vec::new();
+    let mut i = 0;
+    while i + 1 < bounds.len() {
+        let mut healed = None;
+        // Longest first, not shortest. A request and the things that belong to
+        // it — its response line, its sections, its body — are separate pieces
+        // only because the cut is a guess, and the shortest piece that parses
+        // is very often the request line on its own, which would tear every
+        // request away from its own response. Taking the most text that parses
+        // keeps what belongs together, together.
+        let far = bounds.len().min(i + 1 + JOIN_LIMIT);
+        for j in (i + 1..far).rev() {
+            let text = lines[bounds[i]..bounds[j]].concat();
+            // Reparsing through `parse_hurl` (rather than `parse_hurl_file`)
+            // is what recovers the `# [Reports]` and `# [Body]` blocks, which
+            // are read from the raw source and so need line numbers that
+            // belong to the piece being parsed, not to the whole file.
+            if parse_hurl_file(&text).is_ok() {
+                let entries = parse_hurl(&text);
+                if !entries.is_empty() {
+                    healed = Some((entries, j));
+                    break;
+                }
+            }
+        }
+        match healed {
+            Some((entries, j)) => {
+                out.extend(entries);
+                i = j;
+            }
+            None => {
+                out.push(HurlEntry::unreadable(
+                    &lines[bounds[i]..bounds[i + 1]].concat(),
+                ));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The line indices where a request looks like it begins: the contiguous
+/// comment block above an HTTP method in capitals at the very start of a line,
+/// followed by a URL.
+///
+/// Deliberately shallow. This decides only where to *try* cutting; whether the
+/// cut was right is settled by parsing the result, so the rule can afford to be
+/// generous. It does insist on column zero and on capitals, which is what keeps
+/// it from firing on the indented `"GET /x"` inside a JSON body.
+///
+/// The cut is made above the comment block rather than at the method line
+/// because that block is the request's name. Cutting below it would hand every
+/// request's title to the request before it, and — where the cut lands next to
+/// a piece that could not be read — bury it in text the user is being asked to
+/// repair by hand.
+fn request_starts(lines: &[&str]) -> Vec<usize> {
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !looks_like_a_request_line(l) {
+            continue;
+        }
+        let floor = starts.last().map(|&p| p + 1).unwrap_or(0);
+        starts.push(title_block_top(lines, i, floor));
+    }
+    starts
+}
+
+/// Walk up from a method line over the comment block that names it, stopping at
+/// a blank line, at the previous request, or at either of PaperBoy's own
+/// comment-encoded blocks.
+///
+/// The blocks are the reason this is not a plain walk: `# [Reports]` and
+/// `# [Body]` rows belong to the request *above*, and in a file laid out by
+/// hand they can sit directly against the next method line with no blank
+/// between. Taking them would move them into the following request, where they
+/// would be read as its reports or its body. Where that is even a risk the
+/// whole walk is abandoned and the cut stays at the method line: a misplaced
+/// title is a cosmetic loss, a stolen block is a real one.
+fn title_block_top(lines: &[&str], method: usize, floor: usize) -> usize {
+    let mut top = method;
+    while top > floor {
+        let prev = lines[top - 1].trim();
+        if !prev.starts_with('#') {
+            break;
+        }
+        if is_reports_marker(prev) || parse_body_marker(prev).is_some() {
+            return method;
+        }
+        top -= 1;
+    }
+    top
+}
+
+fn looks_like_a_request_line(line: &str) -> bool {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let Some((method, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    // A response line is never the start of a request, however much it looks
+    // like one — cutting there would separate every request from its own
+    // response.
+    if method == "HTTP" || method.starts_with("HTTP/") {
+        return false;
+    }
+    // Hurl accepts any all-caps token as a method, so no fixed list is used —
+    // a WebDAV or custom verb has to be able to start a request too.
+    !method.is_empty()
+        && method
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '-' || c == '_')
+        && !rest.trim().is_empty()
 }
 
 /// The 1-based line number of an entry's HTTP-method line: the first
@@ -294,6 +457,7 @@ fn map_entry(
     };
 
     HurlEntry {
+        unparsed: None,
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
         url: req.url.to_source().to_string(),
@@ -1215,7 +1379,10 @@ mod tests {
         // request section. The message must name the section and the fix.
         let content =
             "# Get token\nPOST http://h/oauth2\n[Captures]\naccess_token: jsonpath \"$.token\"\n";
-        assert!(parse_hurl(content).is_empty(), "this really is unparseable");
+        // Unparseable, so recovery carries it as text rather than as a
+        // request — the reason below is what tells the user why.
+        let recovered = parse_hurl(content);
+        assert!(recovered.iter().all(|e| e.is_unreadable()));
         let why = parse_hurl_error(content).expect("a reason is produced");
         assert!(
             why.contains("Captures"),
@@ -2978,5 +3145,143 @@ mod tests {
         assert_eq!(back[0].body_wire().as_deref(), Some("{\n  \"b\": 9\n}"));
         // The stale block is still in the file, untouched.
         assert!(collection_to_hurl(&back).contains("#   \"old\": 1"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::hurl::collection_to_hurl;
+
+    /// The whole point: one damaged request used to cost the user every other
+    /// request in the file.
+    #[test]
+    fn a_broken_request_no_longer_takes_the_file_with_it() {
+        let text = "# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                    # three\nGET http://h/3\nHTTP 200\n";
+        assert!(
+            parse_hurl_file(text).is_err(),
+            "this really is an unparseable file"
+        );
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0].url, "http://h/1");
+        assert_eq!(es[2].url, "http://h/3");
+        assert!(!es[0].is_unreadable() && !es[2].is_unreadable());
+        assert!(es[1].is_unreadable(), "only the damaged one is text");
+        assert_eq!(es[1].title, "two", "named, so it can be found again");
+    }
+
+    /// The text of what could not be read is kept exactly, and written back
+    /// out exactly. A file that opens must not be a file that has been
+    /// silently rewritten.
+    #[test]
+    fn unreadable_text_is_kept_and_written_back_unchanged() {
+        let text = "# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        let raw = es[1].unparsed.as_deref().expect("kept verbatim");
+        assert!(raw.contains("[Captures]") && raw.contains("x: jsonpath \"$.a\""));
+        let out = collection_to_hurl(&es);
+        assert!(out.contains("# two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\""));
+        // And it survives being read back in again, still as one piece.
+        let again = parse_hurl(&out);
+        assert_eq!(again.len(), 2);
+        assert!(again[1].is_unreadable());
+        assert_eq!(collection_to_hurl(&again), out, "a second save is a no-op");
+    }
+
+    /// The corruption the JSON-comments feature could produce — comments left
+    /// in a body — is exactly the shape recovery exists for.
+    #[test]
+    fn a_body_with_comments_left_in_it_costs_only_its_own_request() {
+        let text = "GET http://h/1\nHTTP 200\n\n\
+                    POST http://h/2\n{\n  \"a\": 1 // note\n}\n\n\
+                    GET http://h/3\nHTTP 200\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 3);
+        assert!(es[1].is_unreadable());
+        assert!(
+            collection_to_hurl(&es).contains("\"a\": 1 // note"),
+            "the user's own text is still there to repair"
+        );
+    }
+
+    /// The cut is a guess, so it must never be trusted on its own: a body
+    /// containing something that reads like a request line is still one
+    /// request.
+    #[test]
+    fn a_method_like_line_inside_a_body_does_not_split_a_request() {
+        let text = "POST http://h/1\n```\nGET /inside is data\n```\nHTTP 200\n\n\
+                    GET http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2, "the good request was not cut in half");
+        assert_eq!(es[0].url, "http://h/1");
+        assert!(!es[0].is_unreadable());
+        assert!(es[0].body_wire().unwrap().contains("GET /inside is data"));
+    }
+
+    /// A response line looks exactly like a request line. Cutting there would
+    /// tear every request away from its own response.
+    #[test]
+    fn a_response_line_is_not_a_place_to_cut() {
+        let text = "GET http://h/1\nHTTP 200\n[Asserts]\njsonpath \"$.a\" == 1\n\n\
+                    GET http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[0].expected_status, Some(200));
+        assert_eq!(es[0].asserts, vec!["jsonpath \"$.a\" == 1".to_string()]);
+    }
+
+    /// Damage at either end is recovered the same way as damage in the middle.
+    #[test]
+    fn the_first_and_last_requests_are_recovered_too() {
+        let broken_first = "POST http://h/1\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                            GET http://h/2\nHTTP 200\n";
+        let es = parse_hurl(broken_first);
+        assert_eq!(es.len(), 2);
+        assert!(es[0].is_unreadable() && !es[1].is_unreadable());
+
+        let broken_last = "GET http://h/1\nHTTP 200\n\n\
+                           POST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(broken_last);
+        assert_eq!(es.len(), 2);
+        assert!(!es[0].is_unreadable() && es[1].is_unreadable());
+    }
+
+    /// A file with nothing request-shaped in it is still "not a collection",
+    /// which is how every caller recognises a file it should not have opened.
+    #[test]
+    fn text_that_is_not_a_collection_at_all_still_yields_nothing() {
+        assert!(parse_hurl("hello\nworld\n").is_empty());
+        assert!(parse_hurl("").is_empty());
+        assert!(parse_hurl("\n\n   \n").is_empty());
+        assert!(parse_hurl("# just a comment\n").is_empty());
+    }
+
+    /// Recovery may regroup text but must never invent or drop any of it.
+    #[test]
+    fn every_line_of_a_damaged_file_survives_somewhere() {
+        let text = "# banner\n\n# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                    # three\nPUT http://h/3\n{\n  \"b\": 2\n}\nHTTP 201\n";
+        let out = collection_to_hurl(&parse_hurl(text));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(out.contains(line), "lost {line:?} from\n{out}");
+        }
+    }
+
+    /// Damage next to a `# [Reports]` block must not move the block into the
+    /// following request, where it would be read as *its* report fields.
+    #[test]
+    fn a_reports_block_is_not_pulled_into_the_next_request() {
+        let text = "GET http://h/1\nHTTP 200\n# [Reports]\n# code: status\n\
+                    GET http://h/2\nHTTP 200\n\n\
+                    POST http://h/3\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        let with_reports: Vec<_> = es.iter().filter(|e| !e.reports.is_empty()).collect();
+        assert_eq!(with_reports.len(), 1, "exactly one request has reports");
+        assert_eq!(with_reports[0].url, "http://h/1");
     }
 }

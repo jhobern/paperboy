@@ -984,7 +984,14 @@ fn render(
             // collection that cannot be read, keep the JSON, which always
             // opens, and say so.
             let contents = crate::hurl::collection_to_hurl(&converted.entries);
-            if crate::hurl::parse_hurl(&contents).len() != converted.entries.len() {
+            // Reading back is the test, and recovery must not be allowed to
+            // pass it: a request that comes back as unreadable text is exactly
+            // the failure this guard exists to catch. An import should produce
+            // requests, not something the user has to repair by hand.
+            let read_back = crate::hurl::parse_hurl(&contents);
+            if read_back.len() != converted.entries.len()
+                || read_back.iter().any(|e| e.is_unreadable())
+            {
                 let mut out = raw(taken);
                 out.notes.push(ConversionNote {
                     item: display.to_string(),

@@ -2101,7 +2101,15 @@ impl TuiApp {
                 // failure, reopen the overlay with the user's text intact so
                 // they can fix it.
                 let entries = crate::hurl::parse_hurl(&text);
-                if entries.len() != 1 {
+                // Recovery means unparseable text now comes back as an
+                // unreadable entry rather than as nothing. That is right when
+                // *loading a file* — the alternative is losing the rest of it
+                // — but wrong here: the user is editing this request, and
+                // quietly accepting text that does not parse would swap the
+                // request they were repairing for a copy of the mistake. Raw
+                // Mode keeps telling them what is wrong and holding onto what
+                // they typed.
+                if entries.len() != 1 || entries[0].is_unreadable() {
                     let s = Strings::for_language(&self.language);
                     // Prefer the concrete parse reason (line + what's wrong)
                     // over the generic "expected exactly one request" — the
@@ -2635,12 +2643,21 @@ impl TuiApp {
             });
             return false;
         }
+        // Recovery keeps the requests that parsed and carries the rest as
+        // text, so a file with one bad request opens instead of being refused.
+        // Say so, and keep the concrete reason: it is the only place the user
+        // is told why without opening Raw Mode themselves.
+        let unreadable = entries.iter().filter(|e| e.is_unreadable()).count();
         let mut col = Collection::new(name, entries);
         col.path = path;
         self.collections.push(col);
         self.active_tab = self.collections.len() - 1;
         self.focus = Pane::List;
-        self.status = Some(Status::Loaded);
+        self.status = Some(if unreadable > 0 {
+            Status::SomeRequestsUnreadable(unreadable, crate::hurl::parse_hurl_error(content))
+        } else {
+            Status::Loaded
+        });
         self.save_state();
         true
     }

@@ -414,6 +414,43 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         .selected_entry
         .min(app.session.collections[ci].entries.len() - 1);
 
+    // Text the file could not be read at has no fields to edit. Showing the
+    // usual form would invite the user to fill in a method and a URL that
+    // would then be written over text they have not seen — so the text itself
+    // is shown, exactly as it was read, and editing it repairs the request.
+    if app.session.collections[ci].entries[sel].is_unreadable() {
+        let msg = app.strings.cannot_edit_unreadable;
+        ui.add_space(6.0);
+        ui.colored_label(theme.err, msg);
+        ui.add_space(6.0);
+        let mut raw = app.session.collections[ci].entries[sel]
+            .unparsed
+            .clone()
+            .unwrap_or_default();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut raw)
+                .code_editor()
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed() {
+            // Reparsing on every keystroke is what lets a request heal the
+            // moment its text becomes valid, rather than needing a separate
+            // "try again" the user has to know to press.
+            let entries = crate::hurl::parse_hurl(&raw);
+            let col = &mut app.session.collections[ci];
+            match &entries[..] {
+                [only] if !only.is_unreadable() => {
+                    let mut healed = only.clone();
+                    healed.modified = true;
+                    col.entries[sel] = healed;
+                }
+                _ => col.entries[sel].unparsed = Some(raw),
+            }
+            col.invalidate_request_json();
+        }
+        return;
+    }
+
     let mut changed = false;
     let mut send = false;
     // A right-click "Extract to parameter…" anywhere in the editor lands here
@@ -2243,6 +2280,71 @@ mod extract_tests {
             char_range_to_bytes(text, 3..3),
             None,
             "an empty range is no selection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+    use crate::i18n::Language;
+
+    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn app_with_unreadable() -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entries = crate::hurl::parse_hurl("POST http://h/a\n[Captures]\nx: jsonpath \"$.a\"\n");
+        assert!(entries[0].is_unreadable());
+        session
+            .collections
+            .push(crate::collection::Collection::new("api".into(), entries));
+        GuiApp::for_test(session)
+    }
+
+    /// Text the file could not be read at has no fields, so the editor shows
+    /// the text itself and says why — rather than an empty form whose first
+    /// keystroke would overwrite something the user never saw.
+    #[test]
+    fn the_editor_shows_the_text_and_says_it_could_not_be_read() {
+        let mut app = app_with_unreadable();
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.cannot_edit_unreadable)),
+            "expected the explanation, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("[Captures]")),
+            "expected the request's own text, painted: {out:?}"
         );
     }
 }

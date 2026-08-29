@@ -2234,6 +2234,28 @@ pub(crate) fn draw_collection_left(
             }
             LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];
+                // Text the file could not be read at is not a request: it has
+                // no method to colour and no URL to show. It gets a row of its
+                // own so it is visible and repairable rather than silently
+                // missing, and is marked so it is never mistaken for one that
+                // would actually send.
+                if e.is_unreadable() {
+                    let indent = "  ".repeat(*depth);
+                    let name = if e.title.trim().is_empty() {
+                        s.entry_unreadable.to_string()
+                    } else {
+                        e.title.trim().to_string()
+                    };
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled("\u{26a0} ", Style::default().fg(th.err)),
+                        Span::styled(name, Style::default().fg(th.err)),
+                        Span::styled(
+                            format!(" [{}]", s.entry_unreadable),
+                            Style::default().fg(th.dim),
+                        ),
+                    ]));
+                }
                 // A plus marks a request the user added by hand (in a real
                 // collection); a pencil marks one edited away from its loaded
                 // state — matching the environment-panel convention.

@@ -489,11 +489,19 @@ impl Session {
             });
             return false;
         }
+        // Recovery keeps the requests that parsed and carries the rest as
+        // text, so the load succeeds where it used to fail outright. Say so,
+        // rather than letting a partly-readable file look like a clean one.
+        let unreadable = entries.iter().filter(|e| e.is_unreadable()).count();
         let mut col = Collection::new(name, entries);
         col.path = path;
         self.collections.push(col);
         self.active_tab = self.collections.len() - 1;
-        self.status = Some(Status::Loaded);
+        self.status = Some(if unreadable > 0 {
+            Status::SomeRequestsUnreadable(unreadable, crate::hurl::parse_hurl_error(content))
+        } else {
+            Status::Loaded
+        });
         self.save();
         true
     }

@@ -586,6 +586,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         .iter()
         .any(|form| form.kind.is_multipart());
     HurlEntry {
+        unparsed: None,
         title: String::new(),
         method: resolved.method,
         url: resolved.url,
@@ -753,6 +754,15 @@ pub fn run_resolved_entry(
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
     // `stage_out_of_scope_form_files` as a literal filename, fail to stage, and
     // then be rejected by Hurl's file sandbox when it finally did resolve.
+    // Text the file could not be read at has no method, URL or body to send.
+    // Handing it to the runner would produce a parse error naming a line
+    // number in a document the user never sees, so say what is actually wrong.
+    if base.is_unreadable() {
+        return RunOutput {
+            entries: vec![],
+            error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+        };
+    }
     let vars = effective_vars(base, vars);
     let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
@@ -778,6 +788,11 @@ pub fn run_resolved_entry(
     }
     out
 }
+
+/// Why a request that could not be read cannot be sent. Front-end agnostic, so
+/// the terminal, the GUI and the report interpreter all say the same thing.
+pub const UNREADABLE_REQUEST_ERROR: &str = "This request could not be read from the file, so there is nothing to send. \
+     Open it in Raw Mode (Shift+H) to repair the Hurl text.";
 
 /// Human-readable error for the one request shape that must never be sent: a
 /// `[Form]`/`[Multipart]` section together with a raw body.
@@ -915,7 +930,25 @@ pub fn run_all_entries(
         .as_ref()
         .and_then(|p| p.parent().map(std::path::PathBuf::from));
     let total = col.entries.len();
-    let mut run_entries = col.entries.clone();
+    // Requests the file could not be read at are skipped rather than sent.
+    // They are text, not requests, so there is nothing to send — and putting
+    // them in the run document would fail the *whole* run to parse, which is
+    // the all-or-nothing failure recovery exists to end. Their positions are
+    // kept so every result still lands on the request it came from.
+    let run_positions: Vec<usize> = col
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_unreadable())
+        .map(|(i, _)| i)
+        .collect();
+    if run_positions.is_empty() {
+        return None;
+    }
+    let mut run_entries: Vec<HurlEntry> = run_positions
+        .iter()
+        .map(|&i| col.entries[i].clone())
+        .collect();
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -960,10 +993,10 @@ pub fn run_all_entries(
             // to the next in this mode — the caller warns about that.)
             let mut idx = 0usize;
             run_hurl_streaming(&content, &vars, run_root, |eo| {
-                if idx < total {
-                    results[idx] = Some(eo.ok);
+                if let Some(&at) = run_positions.get(idx) {
+                    results[at] = Some(eo.ok);
                     captures.extend(eo.captures.iter().cloned());
-                    responses[idx] = Some(entry_response(eo));
+                    responses[at] = Some(entry_response(eo));
                 }
                 idx += 1;
                 let _ = tx.send(BatchRunUpdate {
@@ -1003,10 +1036,13 @@ pub fn run_all_entries(
         // vectors from the final result set and send a single update.
         // (Streaming already emitted its final cumulative snapshot above.)
         if batch {
-            for (i, eo) in out.entries.iter().enumerate().take(total) {
-                results[i] = Some(eo.ok);
+            for (i, eo) in out.entries.iter().enumerate() {
+                let Some(&at) = run_positions.get(i) else {
+                    break;
+                };
+                results[at] = Some(eo.ok);
                 captures.extend(eo.captures.iter().cloned());
-                responses[i] = Some(entry_response(eo));
+                responses[at] = Some(entry_response(eo));
             }
             let _ = tx.send(BatchRunUpdate {
                 col_id,

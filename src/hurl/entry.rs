@@ -519,6 +519,23 @@ pub struct HurlEntry {
     /// requests (which had no comments field) loadable.
     #[serde(default)]
     pub comments: Vec<EntryComment>,
+    /// The request's source text, held verbatim, when the file it came from
+    /// could not be parsed at that point.
+    ///
+    /// A `.hurl` file that fails to parse used to open as *nothing at all* —
+    /// one damaged request made every other request in the file unreachable,
+    /// and the damage is often PaperBoy's own doing (a bad merge, a
+    /// half-finished hand-edit, an escaping bug). Recovery keeps the requests
+    /// that do parse and parks the text of the ones that don't in here, where
+    /// it is displayed, written back out unchanged, and can be repaired in Raw
+    /// Mode. Nothing is interpreted: an entry carrying this has no meaningful
+    /// method, URL or body, so every path that would send it, edit it as
+    /// fields, or reason about its parts must check
+    /// [`is_unreadable`](HurlEntry::is_unreadable) first.
+    ///
+    /// `#[serde(default)]` keeps older saved states loadable.
+    #[serde(default)]
+    pub unparsed: Option<String>,
     /// `true` when the user created this request by hand in a collection other
     /// than the Scratch Space. UI-only and never written to `.hurl` files (which
     /// use the manual [`to_hurl`](HurlEntry::to_hurl) serializer); persisted in
@@ -697,6 +714,37 @@ fn encode_body_block(src: &str) -> String {
 }
 
 impl HurlEntry {
+    /// A request recovered from text that could not be parsed: kept verbatim,
+    /// shown in the list, and written back out unchanged.
+    ///
+    /// The title is taken from the first comment line, if there is one, and
+    /// otherwise from the first line with anything on it — enough for the user
+    /// to recognise which request went wrong without pretending we understood
+    /// it.
+    pub fn unreadable(text: &str) -> Self {
+        let title = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.trim_start_matches('#').trim())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(80)
+            .collect();
+        Self {
+            title,
+            unparsed: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Whether this is text we could not parse rather than a request we
+    /// understand. Sending it, or editing it as fields, is meaningless.
+    pub fn is_unreadable(&self) -> bool {
+        self.unparsed.is_some()
+    }
+
     /// The body as it goes on the wire and into a `.hurl` file: [`Self::body_src`]
     /// with its JSON comments stripped.
     ///
@@ -986,6 +1034,15 @@ impl HurlEntry {
     /// the response line follow. In practice an entry has either a body or
     /// request sections.
     pub fn to_hurl(&self) -> String {
+        // An unreadable request is text we never understood, so there is
+        // nothing to serialize from — writing it back exactly as it arrived is
+        // both the only honest thing to do and what stops a save from turning
+        // a damaged file into a lost one.
+        if let Some(raw) = &self.unparsed {
+            let mut out = raw.trim_end_matches(['\n', '\r']).to_string();
+            out.push('\n');
+            return out;
+        }
         use CommentAnchor::*;
         let mut out = String::new();
         // Emit every preserved comment anchored to `anchor`, in stored order.

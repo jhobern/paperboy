@@ -61,6 +61,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   instead of being left to find out. Notes that would not survive being written
   back as a body are never applied, however plain the intent.
 
+- **A collection with one broken request no longer opens as nothing.** A
+  `.hurl` file is parsed as a whole, so a single line Hurl rejects failed the
+  entire file: the collection opened empty, every other request in it became
+  unreachable, and the only way back in was a text editor. That is a poor trade
+  at the best of times, and worse given the damage is often PaperBoy's own — a
+  bad merge, a half-finished hand-edit, an escaping bug.
+
+  The file is now read in pieces. What parses becomes requests as before; what
+  doesn't is kept exactly as it was written, shown in the list as an unreadable
+  request, saved back byte for byte, and repairable in Raw Mode, which opens on
+  the offending text and turns it back into a real request the moment it
+  parses. Where the file was cut is only ever a guess — a body may well contain
+  a line that reads like a request — so a piece that fails is retried with its
+  neighbours joined on before anything is declared unreadable, and no request
+  is ever cut away from its own response.
+
+  Such a request is never sent: it has no method or URL to send. "Run All"
+  skips it and runs the rest, and the command-line runner says which requests
+  it skipped and why rather than failing the whole run to parse.
+
   Taking notes back as the body now asks the only question that matters —
   would this survive being saved and reopened — rather than merely whether the
   comments strip cleanly. Text with no comments in it is not thereby a body,
