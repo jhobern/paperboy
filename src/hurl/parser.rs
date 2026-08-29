@@ -89,36 +89,53 @@ fn recover_entries(content: &str) -> Vec<HurlEntry> {
     bounds[0] = 0;
     bounds.push(lines.len());
 
-    // How many pieces may be joined on while trying to heal one. A body would
-    // have to contain this many method-like lines to defeat it, while a file
-    // whose every request is broken still costs only a bounded amount of work
-    // per request rather than a scan of everything that follows it.
-    const JOIN_LIMIT: usize = 32;
+    // How many pieces may be joined on while trying to heal one that was cut
+    // off part-way. Small on purpose: joining is the fallback for a cut made in
+    // the wrong place, and the cuts themselves are now chosen carefully enough
+    // that it is rarely needed.
+    const JOIN_LIMIT: usize = 8;
 
     let mut out: Vec<HurlEntry> = Vec::new();
     let mut i = 0;
     while i + 1 < bounds.len() {
+        let alone = lines[bounds[i]..bounds[i + 1]].concat();
         let mut healed = None;
-        // Longest first, not shortest. A request and the things that belong to
-        // it — its response line, its sections, its body — are separate pieces
-        // only because the cut is a guess, and the shortest piece that parses
-        // is very often the request line on its own, which would tear every
-        // request away from its own response. Taking the most text that parses
-        // keeps what belongs together, together.
-        let far = bounds.len().min(i + 1 + JOIN_LIMIT);
-        for j in (i + 1..far).rev() {
-            let text = lines[bounds[i]..bounds[j]].concat();
-            // Reparsing through `parse_hurl` (rather than `parse_hurl_file`)
-            // is what recovers the `# [Reports]` and `# [Body]` blocks, which
-            // are read from the raw source and so need line numbers that
-            // belong to the piece being parsed, not to the whole file.
-            if parse_hurl_file(&text).is_ok() {
-                let entries = parse_hurl(&text);
+        match parse_hurl_file(&alone) {
+            // A piece is cut so that it holds one whole request — response
+            // line, sections and body included — so a piece that parses on its
+            // own is taken as it stands.
+            Ok(_) => {
+                let entries = parse_hurl(&alone);
                 if !entries.is_empty() {
-                    healed = Some((entries, j));
-                    break;
+                    healed = Some((entries, i + 1));
                 }
             }
+            // Joining the next piece on can only help a piece that was cut off
+            // before it finished. An error anywhere but the last line is a
+            // fault in the text itself, and no amount of text after it will
+            // repair that — trying anyway is what made opening a large damaged
+            // file take minutes rather than moments.
+            Err(e) if e.pos.line >= alone.lines().count() => {
+                // Longest first, so a body cut in several places is put back
+                // together in one piece rather than in the first two.
+                let far = bounds.len().min(i + 1 + JOIN_LIMIT);
+                for j in (i + 2..far).rev() {
+                    let text = lines[bounds[i]..bounds[j]].concat();
+                    // Reparsing through `parse_hurl` (rather than using the
+                    // AST here) is what recovers the `# [Reports]` and
+                    // `# [Body]` blocks, which are read from the raw source and
+                    // so need line numbers belonging to the piece being parsed
+                    // rather than to the whole file.
+                    if parse_hurl_file(&text).is_ok() {
+                        let entries = parse_hurl(&text);
+                        if !entries.is_empty() {
+                            healed = Some((entries, j));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
         }
         match healed {
             Some((entries, j)) => {
@@ -126,9 +143,7 @@ fn recover_entries(content: &str) -> Vec<HurlEntry> {
                 i = j;
             }
             None => {
-                out.push(HurlEntry::unreadable(
-                    &lines[bounds[i]..bounds[i + 1]].concat(),
-                ));
+                out.push(HurlEntry::unreadable(&alone));
                 i += 1;
             }
         }
@@ -152,8 +167,20 @@ fn recover_entries(content: &str) -> Vec<HurlEntry> {
 /// repair by hand.
 fn request_starts(lines: &[&str]) -> Vec<usize> {
     let mut starts: Vec<usize> = Vec::new();
+    let mut in_body = false;
     for (i, l) in lines.iter().enumerate() {
-        if !looks_like_a_request_line(l) {
+        // Inside a multiline body every line is data, and some data reads
+        // exactly like a request: an HTTP log, a fixture, a list of routes.
+        // Cutting there tears a healthy request's body apart, and — far worse —
+        // leaves the fragments looking like requests in their own right, which
+        // a "Run All" would then dutifully send to the server. A multiline body
+        // is the only place in Hurl where arbitrary text can begin at column
+        // zero, so tracking its fences is enough to rule that out.
+        if l.trim_start().starts_with("```") {
+            in_body = !in_body;
+            continue;
+        }
+        if in_body || !looks_like_a_request_line(l) {
             continue;
         }
         let floor = starts.last().map(|&p| p + 1).unwrap_or(0);
@@ -3283,5 +3310,101 @@ mod recovery_tests {
         let with_reports: Vec<_> = es.iter().filter(|e| !e.reports.is_empty()).collect();
         assert_eq!(with_reports.len(), 1, "exactly one request has reports");
         assert_eq!(with_reports[0].url, "http://h/1");
+    }
+}
+
+#[cfg(test)]
+mod recovery_hardening_tests {
+    use super::*;
+    use crate::hurl::collection_to_hurl;
+
+    /// The worst thing recovery could do is invent requests. A multiline body
+    /// full of lines that read like requests — an HTTP log, a list of routes —
+    /// must not be cut into fragments, because each fragment then looks like a
+    /// request of its own and a "Run All" would send it.
+    #[test]
+    fn a_body_full_of_request_like_lines_is_never_cut_into_requests() {
+        let mut body = String::new();
+        for k in 0..40 {
+            body.push_str(&format!("GET /orders/{k}\n"));
+        }
+        let text = format!(
+            "GET http://h/broken\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+             POST http://h/bulk\n```\n{body}```\nHTTP 200\n"
+        );
+        assert!(parse_hurl_file(&text).is_err(), "the file really is broken");
+
+        let es = parse_hurl(&text);
+        assert_eq!(es.len(), 2, "one broken request and one good one: {es:#?}");
+        assert!(es[0].is_unreadable());
+        assert!(!es[1].is_unreadable());
+        assert_eq!(es[1].url, "http://h/bulk");
+        let sent = es[1].body_wire().expect("the body survived");
+        for k in 0..40 {
+            assert!(sent.contains(&format!("GET /orders/{k}")), "lost line {k}");
+        }
+        // Nothing that would be sent was invented.
+        assert!(
+            es.iter()
+                .all(|e| e.is_unreadable() || e.url.starts_with("http"))
+        );
+        // And saving it does not rewrite the body.
+        let once = collection_to_hurl(&es);
+        assert_eq!(collection_to_hurl(&parse_hurl(&once)), once, "stable");
+    }
+
+    /// Recovery runs on the thread that is drawing the interface, so the work
+    /// it does has to stay in proportion to the file. Joining pieces together
+    /// only ever helps a piece that was cut off part-way through; doing it for
+    /// every request in a large damaged file cost minutes.
+    #[test]
+    fn recovering_a_large_damaged_file_is_quick() {
+        let filler: String = (0..120)
+            .map(|i| format!("  \"key_{i}\": \"value {i}\",\n"))
+            .collect();
+        let mut text = String::new();
+        for k in 0..1500 {
+            text.push_str(&format!(
+                "POST http://h/{k}\n[Captures]\nx: jsonpath \"$.a\"\n{filler}\n"
+            ));
+        }
+        let started = std::time::Instant::now();
+        let es = parse_hurl(&text);
+        let took = started.elapsed();
+        assert_eq!(es.len(), 1500);
+        assert!(
+            took < std::time::Duration::from_secs(8),
+            "recovering a 4MB damaged file took {took:?}"
+        );
+    }
+
+    /// Recovery must attribute a comment to the same request the ordinary
+    /// parser would. A block directly above a method line is that request's
+    /// name — that is the rule everywhere else, and recovery disagreeing with
+    /// it would move names around as a file was repaired.
+    #[test]
+    fn a_comment_above_a_method_line_names_the_same_request_either_way() {
+        let healthy = "GET http://h/1\nHTTP 200\n# note\nPOST http://h/2\nHTTP 200\n";
+        let healthy = parse_hurl(healthy);
+        assert_eq!(healthy[1].title, "note", "the ordinary parser's rule");
+
+        let broken = "GET http://h/1\n[Captures]\nx: jsonpath \"$.a\"\n\
+                      # note\nPOST http://h/2\nHTTP 200\n";
+        let broken = parse_hurl(broken);
+        assert!(broken[0].is_unreadable());
+        assert_eq!(broken[1].title, "note", "recovery follows the same rule");
+    }
+
+    /// A fenced body that swallows what follows it must still be recoverable:
+    /// the piece is cut off rather than faulty, so joining the next piece on is
+    /// exactly the case joining exists for.
+    #[test]
+    fn a_body_cut_off_by_a_damaged_fence_is_still_recovered() {
+        let text = "POST http://h/1\n```\nGET /a\nGET /b\n```\nHTTP 200\n\n\
+                    GET http://h/2\nHTTP 200\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2);
+        assert!(es.iter().all(|e| !e.is_unreadable()));
+        assert_eq!(es[1].url, "http://h/2");
     }
 }

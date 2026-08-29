@@ -81,6 +81,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   skips it and runs the rest, and the command-line runner says which requests
   it skipped and why rather than failing the whole run to parse.
 
+  A multiline body is never cut into. Bodies hold data that reads exactly like
+  requests — HTTP logs, fixtures, lists of routes — and cutting one apart would
+  leave the fragments looking like requests in their own right, which a "Run
+  All" would then dutifully send. Recovering a large damaged file is also
+  quick: joining pieces back together only ever helps one that was cut off
+  part-way, so it is no longer attempted for a request that is simply
+  wrong.
+
   Taking notes back as the body now asks the only question that matters —
   would this survive being saved and reopened — rather than merely whether the
   comments strip cleanly. Text with no comments in it is not thereby a body,
