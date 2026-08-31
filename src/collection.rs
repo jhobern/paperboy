@@ -545,32 +545,26 @@ pub struct Collection {
     pub structure_modified: bool,
 
     /// What the entry list looked like when it was last read from or written to
-    /// disk, as the sequence of request titles. Compared against the live list
-    /// to decide [`Self::structure_modified`].
+    /// disk, as the sequence of [`HurlEntry::uid`] stamps. Compared against the
+    /// live list to decide [`Self::structure_modified`].
     ///
-    /// Titles rather than positions because positions are exactly what a
-    /// reorder changes, and titles rather than whole entries because editing a
-    /// request is a *different* kind of change, already carried by its own
-    /// `modified` flag — this one has to answer "is the list still the same
-    /// list, in the same order". A title is a sound identifier here: reports
-    /// address requests by name, so [`unique_entry_title`] already guarantees
-    /// no two entries share one.
-    ///
-    /// The one wrinkle is that renaming a request does register as structural.
-    /// That is a fair reading — the list really is no longer the list that was
-    /// saved — and it costs nothing in practice, since a rename sets the
-    /// entry's own `modified` flag anyway, so the collection was already
-    /// unsaved.
+    /// Identities rather than positions, because positions are exactly what a
+    /// reorder changes; and identities rather than any part of the entry's
+    /// *content*, because editing a request is a different kind of change,
+    /// already carried by its own `modified` flag. This one answers only "is
+    /// this still the same list, in the same order" — so a URL rewritten in
+    /// place must not register, and two identically-named requests swapping
+    /// places must.
     ///
     /// Runtime-only, like the flag it feeds.
-    pub structure_baseline: Vec<String>,
+    pub structure_baseline: Vec<u64>,
 
     /// The baselines ([`Self::structure_baseline`]) of the parked files, so a
     /// file switched away from and back is still measured against the order it
     /// had on disk rather than against whatever it had been dragged into.
     /// Without this, coming back to a reordered file and dragging the request
     /// home again would leave it looking permanently unsaved.
-    pub workspace_baselines: HashMap<PathBuf, Vec<String>>,
+    pub workspace_baselines: HashMap<PathBuf, Vec<u64>>,
 
     /// The parked files (see `workspace_pending`) whose entries differ
     /// structurally from disk — `structure_modified` for a file that isn't the
@@ -586,6 +580,11 @@ pub struct Collection {
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stamps for [`HurlEntry::uid`]. Starts at 1 so that zero keeps its meaning of
+/// "never stamped", and is shared across every collection so two tabs can never
+/// hand out the same identity to different requests.
+static NEXT_ENTRY_UID: AtomicU64 = AtomicU64::new(1);
 
 /// A process-unique id for a new collection.
 pub fn next_collection_id() -> u64 {
@@ -1173,18 +1172,30 @@ impl Collection {
             .unwrap_or(RunStatus::NotRun)
     }
 
-    /// The entry list's structural identity: its titles, in order.
-    fn structure_fingerprint(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.title.clone()).collect()
+    /// The entry list's structural identity: the [`HurlEntry::uid`] of each
+    /// entry, in order.
+    fn structure_fingerprint(&self) -> Vec<u64> {
+        self.entries.iter().map(|e| e.uid).collect()
     }
 
     /// Adopt the current entry list as "what was saved", so nothing that
     /// follows counts as a structural change until the list moves again.
     ///
-    /// Called wherever the two are brought into agreement: reading a file,
-    /// writing one, and constructing a collection from entries that came
-    /// straight off disk.
+    /// Stamps every entry with a fresh identity as it goes, which is what makes
+    /// the comparison work at all: from here on an entry can be edited, moved
+    /// or removed and its stamp goes with it, so the list can always be told
+    /// apart from a rearrangement of itself. Re-stamping (rather than keeping
+    /// the old numbers) is what makes a *duplicated* request — a clone, and so
+    /// initially a second entry carrying the same stamp — settle back down to a
+    /// list of unique identities once it is saved.
+    ///
+    /// Called wherever the list and the file are brought into agreement:
+    /// reading a file, writing one, and constructing a collection from entries
+    /// that came straight off disk.
     pub fn reset_structure_baseline(&mut self) {
+        for e in &mut self.entries {
+            e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);
+        }
         self.structure_baseline = self.structure_fingerprint();
         self.structure_modified = false;
     }
@@ -2596,13 +2607,19 @@ mod structure_baseline_tests {
         // Not just a single undo: any sequence of drags that happens to end in
         // the saved order is, by then, the saved order.
         let mut c = col();
+        let titles = |c: &Collection| {
+            c.entries
+                .iter()
+                .map(|e| e.title.clone())
+                .collect::<Vec<_>>()
+        };
         c.move_entry(0, 2);
         c.move_entry(0, 1);
-        assert_eq!(c.structure_fingerprint(), vec!["c", "b", "a"]);
+        assert_eq!(titles(&c), vec!["c", "b", "a"]);
         assert!(c.structure_modified);
         c.move_entry(0, 2);
         c.move_entry(0, 1);
-        assert_eq!(c.structure_fingerprint(), vec!["a", "b", "c"]);
+        assert_eq!(titles(&c), vec!["a", "b", "c"]);
         assert!(!c.structure_modified);
     }
 
@@ -2627,6 +2644,43 @@ mod structure_baseline_tests {
         c.remove_entry_recording_undo(0);
         c.restore_last_deleted();
         assert!(c.structure_modified);
+    }
+
+    /// The reason the comparison is by identity and not by anything the entry
+    /// *says*. A `.hurl` file whose requests carry no `#` name gives every
+    /// entry the same empty title, so a title-based fingerprint saw a reorder
+    /// of them as no change at all — and a workspace file of unnamed requests
+    /// is the common case, not a corner one.
+    #[test]
+    fn reordering_untitled_requests_is_still_detected() {
+        let mut c = Collection::new("c".into(), vec![entry(""), entry(""), entry("")]);
+        c.entries[0].url = "https://example.test/a".into();
+        c.entries[1].url = "https://example.test/b".into();
+        c.entries[2].url = "https://example.test/c".into();
+        // Re-adopt, so the URLs above are part of the saved state.
+        c.mark_saved();
+        assert!(c.move_entry(0, 1));
+        assert!(c.structure_modified, "the requests really did swap places");
+        assert!(c.move_entry(1, 0));
+        assert!(!c.structure_modified);
+    }
+
+    /// ...and the other half of that reason: editing a request in place is not
+    /// a change to the *list*. It is already reported by the entry's own
+    /// `modified` flag, and counting it twice would inflate the "N unsaved
+    /// edits" warning.
+    #[test]
+    fn editing_a_request_in_place_is_not_a_structural_change() {
+        let mut c = col();
+        c.entries[1].url = "https://example.test/rewritten".into();
+        c.entries[1].title = "renamed".into();
+        c.entries[1].modified = true;
+        assert!(
+            !c.structure_modified,
+            "the list is unchanged; only what one of its entries holds is"
+        );
+        assert!(c.has_unsaved_edits(), "still unsaved, via the entry's flag");
+        assert_eq!(c.unsaved_edit_count(), 1, "counted once, not twice");
     }
 
     #[test]

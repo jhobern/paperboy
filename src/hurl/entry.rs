@@ -576,6 +576,31 @@ pub struct HurlEntry {
     /// UI-only; `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
     pub modified: bool,
+
+    /// A runtime identity for this entry, used only to tell whether the
+    /// collection's entry *list* still matches the one on disk — see
+    /// `Collection::structure_baseline`.
+    ///
+    /// Deliberately not derived from the entry's contents. The obvious
+    /// alternative, fingerprinting each entry by its title (or its method and
+    /// URL), fails at both ends: a `.hurl` file whose requests carry no `#`
+    /// name gives every entry the *same* fingerprint, so reordering two of them
+    /// looks like nothing happened, while editing a URL changes a fingerprint
+    /// and so looks like the list itself was rearranged. A number that is
+    /// stamped once and then just travels with the entry has neither problem —
+    /// it survives every edit and is unique across entries.
+    ///
+    /// Zero means "not stamped yet", which is what a freshly built request has
+    /// and what a `#[serde(default)]` read of an older saved state produces;
+    /// it reads as "this entry was not in the list that was saved", which is
+    /// exactly right for a request the user has just added. Stamps are handed
+    /// out by `Collection::reset_structure_baseline` at the moments the list and
+    /// the file agree.
+    ///
+    /// Runtime-only: `#[serde(skip)]` keeps it out of `state.json`, where it
+    /// would be meaningless across runs.
+    #[serde(skip)]
+    pub uid: u64,
     /// See [`RunStatus`]. `#[serde(skip)]`: transient UI state, not persisted.
     #[serde(skip)]
     pub last_run: RunStatus,

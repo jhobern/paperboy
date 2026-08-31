@@ -484,6 +484,8 @@ fn map_entry(
     };
 
     HurlEntry {
+        // Stamped when the collection adopts these entries as its baseline.
+        uid: 0,
         unparsed: None,
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),

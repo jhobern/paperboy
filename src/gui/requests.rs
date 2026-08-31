@@ -716,12 +716,59 @@ enum WsAction {
         src: PathBuf,
         dest_dir: PathBuf,
     },
+    /// Run/Rename/Duplicate/Delete a request from the workspace tree — the same
+    /// actions the plain request list offers on its rows. Kept as one variant
+    /// carrying the [`ReqEdit`] kind so all of them share the load-then-act
+    /// plumbing below: a `loaded: false` row indexes a cached snapshot, not the
+    /// live `entries`, so it loads that collection first (exactly as
+    /// double-click-to-run does) and only then acts, never on a stale index.
+    RequestAction {
+        collection: PathBuf,
+        idx: usize,
+        loaded: bool,
+        kind: ReqEdit,
+    },
+    /// Reorder a request within the loaded collection: move the request at
+    /// `from` into the gap above `before` (`before == entries.len()` for the
+    /// gap past the last one). Only ever emitted for the loaded file's rows —
+    /// a non-loaded row's index isn't the live one, and a request can only move
+    /// within its own file — so `collection` is carried purely to re-check that
+    /// the loaded file is still the one dragged before touching it.
+    ReorderRequest {
+        collection: PathBuf,
+        from: usize,
+        before: usize,
+    },
+}
+
+/// Which of the plain list's request actions a [`WsAction::RequestAction`]
+/// stands for. Run is not here: it already has its own [`WsAction::RunRequest`]
+/// (shared with double-click), so the menu reuses that rather than a second
+/// path to the same place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReqEdit {
+    Rename,
+    Duplicate,
+    Delete,
 }
 
 /// What's being dragged around the workspace tree: the item's own path is all
 /// the drop target needs, since where it lands is decided by the target.
 #[derive(Clone, Debug)]
 struct WsDrag(PathBuf);
+
+/// A workspace *request* being dragged to a new position within its own
+/// collection file. A distinct payload type from [`WsDrag`] (a *file* being
+/// moved between folders) on purpose: the two gestures share the same tree, so
+/// every drop target checks the payload's type before reacting, and a request
+/// drag can never be mistaken for a file move or vice versa. The `collection`
+/// rides along so the drop zone can refuse a drop onto a different file —
+/// reordering is within one file only.
+#[derive(Clone, Debug)]
+struct WsReqDrag {
+    collection: PathBuf,
+    idx: usize,
+}
 
 /// An indented, clickable tree row: a leading spacer for its depth, then a
 /// static-frame selectable carrying the (already coloured) label. Truncates
@@ -804,6 +851,69 @@ fn ws_drag_and_drop(
     }
 }
 
+/// The workspace-tree twin of [`request_drop_zone`]: offer the gap above or
+/// below a loaded request row as somewhere the dragged request can land, and
+/// draw the insertion line showing which.
+///
+/// A line *between* rows, never a highlight *on* one — the same visual language
+/// the plain list uses, and deliberately unlike [`ws_drag_and_drop`]'s folder
+/// highlight: that one means "drop the file *into* this folder", so a
+/// highlighted request row would read as dropping a request *into* a request,
+/// which is not a thing. Keeping the two distinct is why this paints a line and
+/// that paints an outline.
+///
+/// Refuses a drop whose source is a different collection file — a request only
+/// reorders within its own file, and moving one between files is what the
+/// transfer flow is for — by matching the target's `collection` against the
+/// dragged payload's. It checks for a [`WsReqDrag`] payload specifically, so a
+/// file drag (a [`WsDrag`]) passing over the row is ignored here, just as this
+/// request drag is ignored by the file drop targets.
+fn ws_request_drop_zone(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    theme: &super::theme::GuiTheme,
+    collection: &std::path::Path,
+    i: usize,
+    actions: &mut Vec<WsAction>,
+) {
+    let Some(dragged) = egui::DragAndDrop::payload::<WsReqDrag>(ui.ctx()) else {
+        return;
+    };
+    // A request dragged out of another file only ever passes over this row on
+    // its way somewhere; it must not land here.
+    if dragged.collection.as_path() != collection {
+        return;
+    }
+    if !resp.contains_pointer() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let rect = resp.rect;
+    // Which half of the row the pointer is in decides which gap is aimed at, so
+    // every pixel of the list targets a gap and there is no dead zone to fall
+    // down between rows.
+    let above = pos.y < rect.center().y;
+    let before = if above { i } else { i + 1 };
+    // Both gaps touching the dragged request are where it already is; a line
+    // there would promise a move `move_entry_before` correctly refuses to make.
+    if dragged.idx == before || dragged.idx + 1 == before {
+        return;
+    }
+    let y = if above { rect.top() } else { rect.bottom() };
+    ui.painter()
+        .hline(rect.x_range(), y, egui::Stroke::new(2.0, theme.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        actions.push(WsAction::ReorderRequest {
+            collection: collection.to_path_buf(),
+            from: dragged.idx,
+            before,
+        });
+        egui::DragAndDrop::clear_payload(ui.ctx());
+    }
+}
+
 /// The left-top panel for a Workspace tab: the real filesystem tree under the
 /// workspace root (folders, collection files with inline requests, `.trail`
 /// reports and `.vars` environments), driven by [`WsRow`] exactly like the
@@ -835,6 +945,15 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
     let (lbl_revert_req, lbl_revert_file) = (
         app.strings.gui_ws_revert_request,
         app.strings.gui_ws_revert_file,
+    );
+    // The request row's own actions, borrowed verbatim from the plain request
+    // list so a request in a workspace tree can be Run/Renamed/Duplicated/
+    // Deleted with exactly the same menu it has in a single-collection tab.
+    let (lbl_run, lbl_rename, lbl_duplicate, lbl_delete) = (
+        app.strings.gui_run,
+        app.strings.gui_rename_ellipsis,
+        app.strings.gui_duplicate,
+        app.strings.gui_delete,
     );
     let s_new = new_item_labels(&app.strings);
 
@@ -1108,14 +1227,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 loaded: *loaded,
                             });
                         }
+                        // A row belongs to the loaded file when it says so and
+                        // the tab still holds that file — the test both the
+                        // reorder drag and the single-request revert turn on.
+                        let is_loaded_here =
+                            *loaded && loaded_path.as_deref() == Some(collection.as_path());
                         // Only the loaded file's requests can be reverted one
                         // at a time: another file's edits are parked as a whole,
                         // with no on-disk entry to put back in place of a single
                         // one of them (its file row reverts the lot). An *added*
                         // request has no saved version either, so `modified` is
                         // the test, not the pencil.
-                        let revertable = *loaded
-                            && loaded_path.as_deref() == Some(collection.as_path())
+                        let revertable = is_loaded_here
                             && app.session.collections[ci]
                                 .entries
                                 .get(*idx)
@@ -1127,17 +1250,95 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                if !revertable {
-                                    return None;
+                                // The plain request list's row menu, so a
+                                // workspace request is Run/Renamed/Duplicated/
+                                // Deleted with the very same entries — and the
+                                // very same handlers (see `apply_actions`), so
+                                // the two can't drift apart. Run reuses the
+                                // existing double-click action; the rest carry
+                                // `loaded` so a not-loaded row loads its file
+                                // before acting rather than on a cached index.
+                                if ui.button(lbl_run).clicked() {
+                                    return Some(WsAction::RunRequest {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                    });
                                 }
-                                let hit = ui.button(lbl_revert_req).clicked();
+                                if ui.button(lbl_rename).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Rename,
+                                    });
+                                }
+                                if ui.button(lbl_duplicate).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Duplicate,
+                                    });
+                                }
+                                if ui.button(lbl_delete).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Delete,
+                                    });
+                                }
+                                if revertable && ui.button(lbl_revert_req).clicked() {
+                                    return Some(WsAction::RevertRequest {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                    });
+                                }
                                 ui.separator();
-                                hit.then(|| WsAction::RevertRequest {
-                                    collection: collection.clone(),
-                                    idx: *idx,
-                                })
+                                None
                             },
                         );
+                        // Drag-to-reorder, matching the plain list's rows — but
+                        // only for the loaded file's. A reorder edits `entries`,
+                        // and a non-loaded row indexes a cached snapshot, not
+                        // the live list; loading that file mid-drag to make it
+                        // live would reshape the tree out from under the pointer,
+                        // so those rows simply aren't draggable. A request can
+                        // also only move *within* its own file (a cross-file
+                        // move is what dragging into a folder is for), which the
+                        // payload and `ws_request_drop_zone` enforce together.
+                        if is_loaded_here {
+                            if resp.drag_started() {
+                                egui::DragAndDrop::set_payload(
+                                    ui.ctx(),
+                                    WsReqDrag {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                    },
+                                );
+                            }
+                            // Something has to follow the pointer, or the drag
+                            // reads as nothing happening: the rows stay put and
+                            // the insertion line only shows once the pointer is
+                            // over a row.
+                            if resp.dragged()
+                                && let Some(pos) = ui.ctx().pointer_interact_pos()
+                            {
+                                let layer = egui::LayerId::new(
+                                    egui::Order::Tooltip,
+                                    ui.id().with("ws_req_drag_label"),
+                                );
+                                ui.ctx().layer_painter(layer).text(
+                                    pos + egui::vec2(12.0, 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    name,
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    theme.accent,
+                                );
+                            }
+                            ws_request_drop_zone(ui, &resp, &theme, collection, *idx, &mut actions);
+                        }
                     }
                     WsRow::Report { path, name, depth } => {
                         let is_open = report_path.as_deref() == Some(path.as_path());
@@ -1594,6 +1795,34 @@ fn ws_row_menu_with(
     });
 }
 
+/// Make `collection` the tab's loaded file if it isn't already, and return the
+/// live `entries` index to act on. A not-loaded row's `idx` indexes the cached
+/// title snapshot rather than the live list, so it can only be acted on once
+/// its file is loaded — the same load-then-act the double-click run path uses.
+/// The index is clamped into range and then checked to actually exist, because
+/// a file re-read off disk can be shorter than the cache promised; `None` there
+/// stops a request action from falling onto the wrong request.
+fn resolve_ws_request(
+    app: &mut GuiApp,
+    ci: usize,
+    collection: &std::path::Path,
+    idx: usize,
+    loaded: bool,
+) -> Option<usize> {
+    let already = loaded && app.session.collections[ci].path.as_deref() == Some(collection);
+    if !already
+        && !(app
+            .session
+            .load_workspace_file(ci, collection.to_path_buf())
+            && app.session.collections[ci].path.as_deref() == Some(collection))
+    {
+        return None;
+    }
+    let n = app.session.collections[ci].entries.len();
+    let idx = idx.min(n.saturating_sub(1));
+    app.session.collections[ci].entries.get(idx).map(|_| idx)
+}
+
 /// Apply one collected [`WsAction`] to the session (mutations are deferred out
 /// of the render pass so the tree is read immutably while drawing).
 fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
@@ -1606,6 +1835,12 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             collection: path, ..
         }
         | WsAction::RunRequest {
+            collection: path, ..
+        }
+        | WsAction::RequestAction {
+            collection: path, ..
+        }
+        | WsAction::ReorderRequest {
             collection: path, ..
         }
         | WsAction::OpenReport(path)
@@ -1714,6 +1949,62 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             app.close_report_editor();
             app.session.save();
             app.run_active();
+        }
+        WsAction::RequestAction {
+            collection,
+            idx,
+            loaded,
+            kind,
+        } => {
+            // Resolve the *live* index first: a not-loaded row's index points
+            // into the cached title snapshot, so its file is loaded here (the
+            // same load-then-act the double-click run path uses) to make the
+            // index real before acting. `None` means the file couldn't be
+            // loaded, or the request is gone after a re-read — acting on nothing
+            // beats acting on a stale index.
+            if let Some(idx) = resolve_ws_request(app, ci, &collection, idx, loaded) {
+                // Route through the plain list's own handler, so the workspace
+                // menu and the single-collection menu can never disagree about
+                // what Rename/Duplicate/Delete do (the delete-confirm
+                // preference, the unique-title copy, the rename dialog target).
+                let actions = match kind {
+                    ReqEdit::Rename => Actions {
+                        rename: Some(idx),
+                        ..Default::default()
+                    },
+                    ReqEdit::Duplicate => Actions {
+                        duplicate: Some(idx),
+                        ..Default::default()
+                    },
+                    ReqEdit::Delete => Actions {
+                        delete: Some(idx),
+                        ..Default::default()
+                    },
+                };
+                apply_actions(app, ci, actions);
+            }
+        }
+        WsAction::ReorderRequest {
+            collection,
+            from,
+            before,
+        } => {
+            // Guard on the loaded file still being the one the drag started in:
+            // `from`/`before` index the list that was on screen then, so a
+            // reorder that somehow outlived a tab switch must not land on a
+            // different file's entries. Reuses the plain list's handler, so a
+            // no-op drop (`move_entry_before` returns false) doesn't mark the
+            // file unsaved.
+            if app.session.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                apply_actions(
+                    app,
+                    ci,
+                    Actions {
+                        reorder: Some((from, before)),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         WsAction::OpenReport(path) => match crate::report::Report::load_local(&path) {
             Ok(report) => {
@@ -2604,5 +2895,239 @@ pub(crate) mod tests {
             2,
             "nothing is removed until the prompt is answered"
         );
+    }
+
+    /// Every URL of a workspace tab's loaded file, in order — the shape the
+    /// reorder tests compare against.
+    fn ws_urls(app: &GuiApp, ci: usize) -> Vec<String> {
+        app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.url.clone())
+            .collect()
+    }
+
+    /// A workspace request could be selected and run, but never reordered — the
+    /// tree's rows skipped the drag-to-reorder the plain list's have always had.
+    /// Applying the action the drop zone raises moves the request within its
+    /// file and marks that file unsaved, exactly as the plain list's does.
+    #[test]
+    fn reordering_a_request_within_a_workspace_collection_moves_it_and_marks_the_file_unsaved() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsreorder");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        // one.hurl holds `a` then `a2`, in that order.
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/a", "https://example.com/a2"]
+        );
+
+        // The first request dragged into the gap past the last one.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::ReorderRequest {
+                collection: one.clone(),
+                from: 0,
+                before: 2,
+            },
+        );
+
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/a2", "https://example.com/a"],
+            "the request landed in the gap it was dropped into"
+        );
+        assert!(
+            app.session.collections[ci].structure_modified,
+            "a reorder is an unsaved structural edit, the same as in a plain tab"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request may only be reordered within its own file — moving one between
+    /// files is what the transfer flow is for. The drop zone refuses a drag
+    /// whose payload names a different collection than the row it is over; the
+    /// handler's guard is the backstop, and pinning it proves a stray cross-file
+    /// reorder can't fall onto the loaded file's entries.
+    #[test]
+    fn a_workspace_reorder_addressed_to_a_different_file_leaves_the_loaded_one_untouched() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsreorderxfile");
+        let one = dir.join("api/v1/one.hurl");
+        let two = dir.join("api/v1/two.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        let before = ws_urls(&app, ci);
+
+        // Address a reorder to two.hurl while one.hurl is loaded.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::ReorderRequest {
+                collection: two.clone(),
+                from: 0,
+                before: 2,
+            },
+        );
+
+        assert_eq!(
+            before,
+            ws_urls(&app, ci),
+            "the loaded file's order is unchanged"
+        );
+        assert!(
+            !app.session.collections[ci].structure_modified,
+            "and nothing is marked unsaved"
+        );
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(one.as_path()),
+            "nor is a different file loaded — a reorder never load-then-acts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Right-clicking a workspace request used to offer only the tree's "New…"
+    /// entries — none of the actions that apply to a request. The menu now
+    /// carries Run/Rename/Duplicate/Delete, routed through the very handlers the
+    /// plain list uses, so the two menus can't disagree: Rename raises the
+    /// request rename dialog, Duplicate inserts a uniquely-titled copy, Delete
+    /// (guard off) removes it.
+    #[test]
+    fn the_workspace_request_menu_renames_duplicates_and_deletes_through_the_plain_lists_handlers()
+    {
+        redirect_saved_state();
+        let dir = ws_tmp("wsmenu");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+
+        // Rename raises the same dialog the plain list's Rename does, aimed at
+        // the row it was invoked on.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 1,
+                loaded: true,
+                kind: ReqEdit::Rename,
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::Rename {
+                target: RenameTarget::Request { ci: dci, idx },
+                ..
+            }) => assert_eq!((*dci, *idx), (ci, 1)),
+            _ => panic!("Rename should raise the request rename dialog"),
+        }
+        app.dialog = None;
+
+        // Duplicate inserts a copy right after the original and selects it.
+        let before = app.session.collections[ci].entries.len();
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 0,
+                loaded: true,
+                kind: ReqEdit::Duplicate,
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            before + 1,
+            "a copy was inserted"
+        );
+        assert_eq!(
+            app.session.collections[ci].selected_entry, 1,
+            "and selected, right after the original it came from"
+        );
+
+        // Delete, with the guard off, removes it straight away.
+        app.session.confirm_on_delete_request = false;
+        let n = app.session.collections[ci].entries.len();
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 0,
+                loaded: true,
+                kind: ReqEdit::Delete,
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            n - 1,
+            "the request was deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request row for a collection the tab hasn't loaded indexes a cached
+    /// name/method snapshot, not the live `entries`. A menu action on such a row
+    /// must load that file first (as double-click-to-run already does) and only
+    /// then act — acting on the loaded file's index would hit the wrong request.
+    #[test]
+    fn a_request_action_on_a_not_loaded_row_loads_that_file_before_acting() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsloadact");
+        let one = dir.join("api/v1/one.hurl");
+        let two = dir.join("api/v1/two.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        app.session.confirm_on_delete_request = false;
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(one.as_path()),
+            "one.hurl is the loaded file, two.hurl is not"
+        );
+
+        // Delete the second request of the *other* file. Its row is
+        // `loaded: false`, so this must load two.hurl before acting — deleting
+        // one.hurl's index 1 would remove the wrong request.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: two.clone(),
+                idx: 1,
+                loaded: false,
+                kind: ReqEdit::Delete,
+            },
+        );
+
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(two.as_path()),
+            "the addressed file is now the loaded one"
+        );
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/b"],
+            "and its second request — not one.hurl's — was the one deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

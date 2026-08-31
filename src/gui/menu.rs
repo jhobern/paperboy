@@ -822,9 +822,24 @@ fn shortcuts_dialog(app: &mut GuiApp, ctx: &egui::Context) {
     let theme = app.theme;
     let close_lbl = app.strings.gui_close;
     let mut close = false;
-    let dismissed = super::widgets::dialog_resizable(ctx, title, [420.0, 460.0], |ui| {
+    // Sized to its content rather than resizable. This is a reference card, not
+    // a workspace: there is nothing in it worth dragging bigger, and being
+    // resizable was what let it grow. `egui` remembers a resizable window's
+    // size across runs, so leaving it resizable would also have left anyone who
+    // had already seen the oversized version still looking at it.
+    let list_max_h = (ctx.input(|i| i.content_rect()).height() * 0.65).max(200.0);
+    let dismissed = super::widgets::dialog(ctx, title, Some(420.0), |ui| {
         egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+            // Shrink to the content vertically, but not horizontally: the grid
+            // wants the full dialog width so its two columns line up down the
+            // whole overlay, while its height should be the height of the list.
+            // `false` on this axis made the scroll area claim every pixel it
+            // could be given, so the dialog filled the screen with most of it
+            // blank and ran its heading and Close button off both ends at once.
+            .auto_shrink([false, true])
+            // ...and a ceiling, so a list longer than the screen scrolls inside
+            // the dialog instead of pushing Close out of the bottom of it.
+            .max_height(list_max_h)
             .show(ui, |ui| {
                 for (i, section) in sections.iter().enumerate() {
                     if i > 0 {

@@ -586,6 +586,8 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         .iter()
         .any(|form| form.kind.is_multipart());
     HurlEntry {
+        // Stamped when the collection adopts these entries as its baseline.
+        uid: 0,
         unparsed: None,
         title: String::new(),
         method: resolved.method,

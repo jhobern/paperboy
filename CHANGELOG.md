@@ -281,6 +281,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Requests in a Workspace tab can be dragged to reorder them.** A plain
+  collection tab has always let you drag a request to a new position; the
+  Workspace tab's tree — drawn by different code — left its request rows out of
+  that entirely, so a request in a workspace could be selected and run but never
+  reordered. Its rows now drag exactly like the plain list's, with the same
+  insertion line drawn *between* rows (never a highlight *on* one, which the
+  tree already uses to mean "drop this file into that folder"). A request only
+  ever reorders within its own file: a drag whose source is a different
+  collection than the row under the pointer is refused, since moving a request
+  between files is what the transfer flow is for. Only the loaded file's rows
+  are draggable — a request shown from another file is listed from a cached
+  name/method snapshot, not the live list, and loading that file mid-drag to
+  make it real would reshape the tree out from under the pointer.
+
+- **Right-clicking a request in a Workspace tab offers the actions that apply to
+  a request.** The tree gave every row the *tree's* menu — the "New collection /
+  report / environment in this folder" entries — so right-clicking a request
+  offered only ways to create a *sibling file*, none of the things you actually
+  do to a request. The menu now leads with Run, Rename, Duplicate and Delete,
+  routed through the very same handlers the plain request list uses so the two
+  menus can never disagree (the delete-confirmation preference, the copy's
+  unique title, the rename dialog), and keeps the workspace-only Revert and the
+  "New… in this folder" entries below them. A row for a collection the tab
+  hasn't loaded loads that file first and only then acts — the same
+  load-then-act double-clicking to run one already did — so an action can never
+  land on the wrong request through a stale index.
+
 - **Graphical UI: menu mnemonics are visible without pressing Alt first.** The
   underline under `F`ile, `E`dit and the rest was only drawn once a lone `Alt`
   had armed the menu bar — a Windows convention that assumes you already know
