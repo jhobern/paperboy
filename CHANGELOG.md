@@ -281,6 +281,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The workspace tree says which collection holds unsaved edits.** A Workspace
+  tab shows one file at a time, so an edit to a file you have since switched
+  away from is invisible by construction: its requests are parked in memory and
+  its rows are drawn from a name cache. The tab's own pencil says *something* is
+  unsaved; the tree now says which file, and which of its requests — the same
+  pencil the graphical UI has always drawn there.
+
+- **Copying or moving a request in a workspace starts on the collection it came
+  from.** The destination picker opened on whichever file sorted first, so in a
+  workspace of any size the first move was always scrolling back to where you
+  already were. It now opens on the source file — the row you are already
+  thinking about, and a safe place to land, since confirming it copies the
+  request into its own file or, for a move, does nothing at all.
+
 - **`Alt+↑↓` reordered the wrong requests in a Workspace tab.** A Workspace
   tab's left pane is the filesystem tree — folders, collection files, reports
   and environments, with the open collection's requests nested among them —

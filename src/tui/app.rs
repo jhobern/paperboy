@@ -417,6 +417,22 @@ impl WorkspacePickerState {
         self.scroll = 0;
     }
 
+    /// Highlight the row for `path` if the scan found it as a file, leaving the
+    /// selection alone otherwise (the file may be filtered out, or gone).
+    ///
+    /// Lets a picker open on a file the user is already working in rather than
+    /// at the top of the workspace. The list draws itself around
+    /// `selected`, so this scrolls too.
+    pub(crate) fn select_path(&mut self, path: &std::path::Path) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| !e.is_dir && e.path == path)
+        {
+            self.selected = i;
+        }
+    }
+
     /// Move the selection to the next/previous FILE row (skipping over
     /// directory grouping rows), wrapping neither past the first nor last.
     pub(crate) fn nav(&mut self, delta: i32) {
@@ -2938,6 +2954,8 @@ impl TuiApp {
             return;
         };
         let filter = col.workspace_filter_hurl_json;
+        // The file the request is being moved or copied *out of*.
+        let source = col.path.clone();
         self.active_tab = ci;
         let mut picker = WorkspacePickerState::new(ci, root, filter);
         picker.mode = if is_move {
@@ -2945,6 +2963,17 @@ impl TuiApp {
         } else {
             WsPickerMode::CopyRequest
         };
+        // Open on the collection the request came from rather than at the top
+        // of the workspace. It is the row the user is already thinking about,
+        // and in a workspace of any size the alternative is scrolling back to
+        // where they just were to get their bearings before choosing. It is a
+        // safe place to land, too: confirming it outright copies the request
+        // into its own file (a duplicate) or, for a move, does nothing at all —
+        // neither of which can lose the request, unlike whichever unrelated
+        // file happens to sort first.
+        if let Some(src) = source {
+            picker.select_path(&src);
+        }
         self.overlay = Some(Overlay::WorkspacePicker(picker));
     }
 

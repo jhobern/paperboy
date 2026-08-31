@@ -157,6 +157,15 @@ enum LeftRow {
         /// it's visually obvious which collection the coloured requests belong
         /// to; other collections (and their request names) render dim.
         loaded: bool,
+        /// True when the file holds unsaved edits — either it is the loaded one
+        /// and that has been edited, or it was edited and then switched away
+        /// from, leaving its entries parked in `workspace_pending`.
+        ///
+        /// The parked case is the one that matters: a workspace tab shows one
+        /// file at a time, so edits to the others are invisible by
+        /// construction. The tab's own pencil says *something* is unsaved; this
+        /// says which file, which is the question that follows.
+        edited: bool,
     },
     Report {
         name: String,
@@ -181,6 +190,12 @@ enum LeftRow {
         name: String,
         method: String,
         depth: usize,
+        /// Whether this request of a *parked* collection has unsaved edits.
+        /// The loaded collection's requests are `LeftRow::Entry` and read their
+        /// markers straight off the entry; these come from the entries parked
+        /// in `workspace_pending`, which the cached names were snapshotted
+        /// from, so the indices line up.
+        edited: bool,
         /// How this request last fared. A run's result outlives the file being
         /// loaded (see [`crate::collection::RunRecord`]), so a request that was
         /// run and then switched away from still shows its tick here — it was
@@ -228,11 +243,13 @@ impl LeftRow {
                         open,
                     } => {
                         let loaded = col.path.as_deref() == Some(path.as_path());
+                        let edited = col.workspace_file_edited(&path);
                         LeftRow::Collection {
                             name,
                             depth,
                             open,
                             loaded,
+                            edited,
                         }
                     }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
@@ -269,6 +286,7 @@ impl LeftRow {
                         name,
                         method,
                         depth,
+                        edited: col.workspace_request_edited(&collection, idx),
                         run: col.workspace_run_status(&collection, idx),
                     },
                 })
@@ -2198,6 +2216,7 @@ pub(crate) fn draw_collection_left(
                 depth,
                 open,
                 loaded,
+                edited,
             } => {
                 let indent = "  ".repeat(*depth);
                 let chevron = if *open {
@@ -2210,10 +2229,20 @@ pub(crate) fn draw_collection_left(
                 // focus; every other collection recedes to dim, matching its
                 // dim request names.
                 let colour = if *loaded { th.accent } else { th.dim };
-                ListItem::new(Line::from(Span::styled(
+                // The same pencil the requests use, in the same accent colour,
+                // trailing rather than leading: a leading mark would push the
+                // chevron out of the column its siblings line up in.
+                let mut spans = vec![Span::styled(
                     format!("{indent}{chevron} {name}"),
                     Style::default().fg(colour).add_modifier(Modifier::BOLD),
-                )))
+                )];
+                if *edited {
+                    spans.push(Span::styled(
+                        format!(" {}", s.tab_unsaved_marker),
+                        Style::default().fg(th.accent),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             }
             LeftRow::Report { name, depth } => {
                 let indent = "  ".repeat(*depth);
@@ -2239,11 +2268,25 @@ pub(crate) fn draw_collection_left(
                 name,
                 method,
                 depth,
+                edited,
                 run,
             } => {
                 let indent = "  ".repeat(*depth);
+                // The pencil takes the two-space pad that otherwise lines these
+                // names up under the loaded collection's, so a marked row keeps
+                // the same width as an unmarked one and the methods stay in
+                // their column.
+                let marker = if *edited {
+                    Span::styled(
+                        format!("{} ", s.tab_unsaved_marker),
+                        Style::default().fg(th.accent),
+                    )
+                } else {
+                    Span::raw("  ".to_string())
+                };
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{indent}  ")),
+                    Span::raw(indent),
+                    marker,
                     Span::styled(
                         format!("{method:<5}"),
                         Style::default()

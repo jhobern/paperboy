@@ -1180,7 +1180,6 @@ impl Collection {
     /// either it is the loaded file and that has been edited, or it was edited
     /// and then switched away from (so it lives in `workspace_pending`). Drives
     /// the "edited" pencil in the workspace tree.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn workspace_file_edited(&self, path: &std::path::Path) -> bool {
         if self.workspace_pending.contains_key(path) {
             return true;
@@ -1195,7 +1194,6 @@ impl Collection {
     /// was snapshotted from those same (edited) entries, so the indices line up.
     /// Without this, opening a second collection made the first one's pencils
     /// disappear from its rows even though the edits were still pending.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn workspace_request_edited(&self, path: &std::path::Path, idx: usize) -> bool {
         let entries = if self.path.as_deref() == Some(path) {
             &self.entries

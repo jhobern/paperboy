@@ -32348,3 +32348,96 @@ fn a_reordered_collection_marks_its_tab_unsaved() {
         "and the tab now says so: {bar:?}"
     );
 }
+
+/// The move/copy picker used to open on whichever file sorted first, which in
+/// a workspace of any size means scrolling back to where you already were
+/// before you can get your bearings. It now opens on the file the request is
+/// coming out of.
+#[test]
+fn the_transfer_picker_opens_on_the_collection_the_request_came_from() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("picker", &["a", "b"]);
+    let source = app.collections[ci].path.clone().unwrap();
+
+    // Put the cursor on a real request row, then copy it.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    press(&mut app, KeyCode::Char('c'));
+
+    match &app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.mode, super::app::WsPickerMode::CopyRequest);
+            assert_eq!(
+                p.entries[p.selected].path, source,
+                "the picker starts on the source collection, not the top of the tree"
+            );
+            // Pinning the bug: the source is not simply the first file anyway.
+            let first_file = p
+                .entries
+                .iter()
+                .position(|e| !e.is_dir)
+                .expect("the workspace has files");
+            assert_ne!(
+                p.selected, first_file,
+                "this workspace sorts another file first, so the seeding is what's being tested"
+            );
+        }
+        _ => panic!("expected the workspace picker"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workspace shows one collection at a time, so an edit to a file you have
+/// since switched away from is invisible by construction: its requests are
+/// parked in `workspace_pending` and its rows are drawn from a name cache. The
+/// tab's pencil says *something* is unsaved; the tree has to say which file.
+#[test]
+fn the_workspace_tree_pencils_a_collection_holding_unsaved_edits() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (dir, mut app, ci) = workspace_tab_with_requests("pencil", &["a", "b"]);
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    // The panel *title* also carries the loaded collection's name, so collect
+    // every line mentioning it rather than taking the first.
+    let row_for = |app: &mut TuiApp, needle: &str| -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|line| line.contains(needle))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert!(
+        !row_for(&mut app, "api").contains(s.tab_unsaved_marker),
+        "an untouched collection file is clean"
+    );
+
+    // Reorder its requests — a structural change no single request carries.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { idx: 0, .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert!(app.collections[ci].structure_modified, "the reorder landed");
+
+    assert!(
+        row_for(&mut app, "api").contains(s.tab_unsaved_marker),
+        "the collection row now carries the pencil"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
