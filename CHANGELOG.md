@@ -35,6 +35,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   beside its environment counterpart, so anyone who would rather lean on `u`
   can have the old behaviour back. The deletion stays undoable either way.
 
+- **The footer offers `c` on a Workspace tab.** There `c` copies the
+  highlighted request into another collection file in the workspace — the one
+  place the key reaches outside the collection being viewed — but the footer's
+  `c duplicate` hint is deliberately suppressed on a workspace, which left the
+  workspace meaning advertised nowhere but the help overlay. It now gets its
+  own hint, with its own wording, shown only on a row where it would do
+  something.
+
 - **The wizard's section tabs show which sections have something in them.** The
   request wizard has ten tabs, and with one of them open the bar is the only
   view of the other nine — but the labels alone said nothing about which were
@@ -272,6 +280,40 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   meaningless.
 
 ### Fixed
+
+- **`Alt+↑↓` reordered the wrong requests in a Workspace tab.** A Workspace
+  tab's left pane is the filesystem tree — folders, collection files, reports
+  and environments, with the open collection's requests nested among them —
+  while every other tab's is a plain list of requests. The cursor counts rows
+  of whichever is on screen, but the reorder read that number against the
+  request list, so it moved whichever two requests happened to sit at those
+  offsets: with the cursor on the first request of a tree, the *last* two
+  swapped. Both keys now resolve the cursor against the tree they are actually
+  drawn on, and a request will only trade places with one from the same file at
+  the same depth, since a request can only move within its own collection.
+
+- **`/` searched the wrong panel in a Workspace tab.** Pressed on the Requests
+  panel it jumped the focus to Environments and started filtering *those*
+  instead — in a workspace, which is the commonest way to open a collection and
+  the case where a search is worth most. The exclusion was justified in a
+  comment on the grounds that the tree "has its own Ctrl+F filter", which was
+  never true: Ctrl+F there toggles which file *types* the tree shows and has
+  never searched anything. `/` now filters the workspace tree by name, keeping
+  each match's ancestors so the results still read as a tree rather than as a
+  list of names with nothing to say which file they came from. While a filter
+  is typed every folder counts as expanded — a search that could only find what
+  was already on screen would be no search at all — though collection files are
+  left as they are, since opening every one on each keystroke would stall a
+  large workspace.
+
+- **A reordered collection now says it has unsaved changes.** Every other
+  unsaved edit announces itself where it happened — a `✚` on an added request,
+  a `✎` on an edited one — but reordering, deleting or restoring a request
+  belongs to no single request, so nothing on screen carried it. The quit
+  prompt counted it all the same, which left you told you had unsaved work and
+  given nowhere to look for it. A tab holding unsaved changes now carries a
+  `✎`, counting the files a Workspace tab has parked out of sight as well as
+  the one it is showing.
 
 - **The request wizard keeps its shortcut hint where every other dialog keeps
   it.** The list of keys was appended to the wizard's title, along the *top*

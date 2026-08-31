@@ -621,6 +621,7 @@ up-to-date list. Highlights:
 | `n` | New request (List/Response/Tabs panes) — or add environment variable (Env pane) |
 | `b` | Set the base URL |
 | `f` / `s` | File menu / Settings menu |
+| `/` (other panes) | Filter the Global Environment list |
 | `Ctrl+S` | Save what's on screen back to its own file — the open report if there is one, otherwise the active collection (falls back to "Save As" when it has never been written anywhere) |
 | `[` / `]`, `Ctrl+←`/`→` | Previous / next tab |
 | `PageUp`/`PageDown` | Previous / next tab (same as `[`/`]`) |
@@ -631,6 +632,9 @@ up-to-date list. Highlights:
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
 | `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |
+| `c` (Requests list) | Duplicate the selected request in place, giving the copy a name of its own |
+| `/` (Requests list) | Find a request anywhere in the collection, not just the folder being browsed — on a Workspace tab it searches the whole tree (files, reports, environments, and the requests of collections already open). `Esc` clears it |
+| `Alt+↑`/`↓` (Requests list) | Move the selected request up / down. The order is what `Alt+F5` and the CLI follow. A request only moves within its own collection and folder, and the list must be unfiltered so the move can be seen |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
 | `+` / `-` | Grow / shrink the response pane |
 | `<` / `>` | Grow / shrink the left column |

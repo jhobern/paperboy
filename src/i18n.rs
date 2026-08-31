@@ -523,9 +523,10 @@ strings! {
     help_reorder_request => "move the request up/down the collection — the order Run All follows (List pane)", "déplacer la requête vers le haut/bas — l'ordre suivi par Tout exécuter (volet Liste)", "flyt anmodningen op/ned i samlingen — den rækkefølge Kør alle følger (Liste-ruden)";
     help_duplicate_request => "duplicate the request in place (List pane)", "dupliquer la requête sur place (volet Liste)", "duplikér anmodningen på stedet (Liste-ruden)";
     foot_duplicate => "duplicate", "dupliquer", "duplikér";
+    foot_copy_request => "copy request", "copier la requête", "kopiér anmodning";
     foot_reorder => "reorder", "réordonner", "omarrangér";
     foot_find_request => "find request", "chercher requête", "find forespørgsel";
-    help_find_request => "find a request anywhere in the collection, not just this folder (Esc clears it)", "chercher une requête dans toute la collection, pas seulement ce dossier (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen, ikke kun denne mappe (Esc rydder det)";
+    help_find_request => "find a request anywhere in the collection — or any row of a workspace tree (Esc clears it)", "chercher une requête dans toute la collection — ou n'importe quelle ligne d'un arbre d'espace de travail (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen — eller en vilkårlig række i et arbejdsområdetræ (Esc rydder det)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
@@ -630,6 +631,10 @@ strings! {
     report_hint_run => "r run", "r exécuter", "r kør";
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
+    // A pencil rather than the report tab's dot: it is the glyph the request
+    // list already uses for "edited since it was loaded", so one mark means one
+    // thing wherever it appears.
+    tab_unsaved_marker => "✎", "✎", "✎";
     report_results_heading => "Results", "Résultats", "Resultater";
     report_hint_results => "Enter drill-down · / filter · v source · Ctrl+E export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+E export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+E export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";

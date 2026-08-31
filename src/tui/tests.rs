@@ -31466,16 +31466,17 @@ fn the_filter_strip_shows_the_query_and_says_when_nothing_matches() {
     );
 }
 
-/// `/` on a Workspace tab keeps its Environments meaning: that pane is the
-/// filesystem tree, whose rows don't come from the request filter at all, so
-/// capturing the key there would be a filter that visibly did nothing.
+/// `/` reaches the Environments filter from any pane *except* the list — which
+/// now includes a Workspace tab's tree, where it used to be the only meaning
+/// available (see
+/// `slash_searches_the_tree_instead_of_jumping_to_environments_in_a_workspace`).
 #[test]
-fn slash_on_a_workspace_tab_still_reaches_the_environments_filter() {
+fn slash_outside_the_list_reaches_the_environments_filter() {
     let mut app = TuiApp::default();
     let ci = app.active_tab;
     app.collections[ci].workspace_root = Some(std::path::PathBuf::from("/tmp/ws"));
     app.collections[ci].workspace_auto_prompt_dismissed = true;
-    app.focus = Pane::List;
+    app.focus = Pane::Response;
 
     press(&mut app, KeyCode::Char('/'));
 
@@ -32119,4 +32120,231 @@ fn saving_an_untouched_request_leaves_a_status_assert_where_it_was() {
         "and the asserts are exactly as they were"
     );
     assert_eq!(entry.to_hurl(), before, "the request is byte-identical");
+}
+
+// ── Workspace tabs: the left pane is the tree, not the request list ─────────
+//
+// A Workspace tab draws `ws_rows` (folders, collection files, reports,
+// environments and the requests of any open collection) while every other tab
+// draws `rows` (just the loaded collection's requests). `list_cursor` indexes
+// whichever of the two is on screen, and the keys below all used to read it
+// against the wrong one.
+
+/// Build a real workspace on disk with one collection file, open it in a tab,
+/// and expand the collection so its requests are rows in the tree. Returns the
+/// root (for cleanup) and the tab index.
+fn workspace_tab_with_requests(tag: &str, titles: &[&str]) -> (std::path::PathBuf, TuiApp, usize) {
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_keys_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    let file = dir.join("api.hurl");
+    std::fs::write(&file, "GET https://example.test/\n").unwrap();
+    // A second file and a folder, so the tree has rows that are not requests
+    // sitting above the ones that are — which is exactly what made the cursor
+    // and the request list disagree.
+    std::fs::write(
+        dir.join("nested/other.hurl"),
+        "GET https://example.test/o\n",
+    )
+    .unwrap();
+
+    let mut col = Collection::new("ws".into(), titles.iter().map(|t| entry_named(t)).collect());
+    col.workspace_root = Some(dir.clone());
+    col.path = Some(file.clone());
+    col.workspace_expanded.insert(file.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    (dir, app, ci)
+}
+
+/// The cursor's position in the tree is not a position in `entries`: a
+/// workspace row can be a folder, a file, a report or an environment. Reading
+/// it against `rows()` reordered whichever two requests happened to sit at
+/// those offsets — with the cursor on the first request of a tree, the *last*
+/// two requests swapped, which is what a user reported.
+#[test]
+fn alt_arrows_reorder_the_request_under_the_cursor_in_a_workspace_tree() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("reorder", &["a", "b", "c"]);
+
+    // Find the row the first request is actually on, the way the screen does.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { idx: 0, .. }))
+        .expect("the expanded collection contributes request rows");
+    assert!(
+        first > 0,
+        "the tree has non-request rows above the requests — the whole point of the bug"
+    );
+    app.collections[ci].list_cursor = first;
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["b", "a", "c"],
+        "the request under the cursor moved, not two unrelated ones"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The neighbour has to come from the same collection file. The tree
+/// interleaves several, and a request can only trade places inside its own
+/// `entries` list.
+#[test]
+fn alt_arrows_do_nothing_on_a_workspace_row_that_is_not_a_request() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("nonrequest", &["a", "b"]);
+    // Row 0 of the tree is a folder or a file, never a request.
+    app.collections[ci].list_cursor = 0;
+    assert!(!matches!(
+        app.collections[ci].ws_rows()[0],
+        crate::collection::WsRow::Request { .. }
+    ));
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "nothing moved");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/` on a Workspace tab's list used to fall through to the arm below it and
+/// jump the focus to the Environments panel — so the commonest way to open a
+/// collection was the one place the search key did something else entirely.
+#[test]
+fn slash_searches_the_tree_instead_of_jumping_to_environments_in_a_workspace() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("slash", &["Login", "Logout"]);
+
+    press(&mut app, KeyCode::Char('/'));
+
+    assert!(
+        app.list_filter_typing,
+        "the tree filter is capturing, not the environments one"
+    );
+    assert_eq!(app.focus, Pane::List, "focus stayed on the list");
+    assert!(!app.env_filter_typing);
+
+    type_filter(&mut app, "other");
+    let names: Vec<String> = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .map(|r| r.name().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("other")),
+        "the matching file survived: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "Login"),
+        "a non-matching request was filtered out: {names:?}"
+    );
+    // The match is nested one folder down, and that folder was never expanded —
+    // a search that could only find what was already on screen would be no
+    // search at all.
+    assert!(
+        names.iter().any(|n| n == "nested"),
+        "the ancestor folder is kept so the match reads as a tree: {names:?}"
+    );
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.collections[ci].list_query.is_empty(), "Esc clears it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On a Workspace tab `c` copies the highlighted request into another
+/// collection file, which the footer never mentioned — the `c duplicate` hint
+/// beside it is deliberately suppressed there, so the key was advertised
+/// nowhere but the help overlay.
+#[test]
+fn the_footer_offers_copy_request_on_a_workspace_request_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (dir, mut app, ci) = workspace_tab_with_requests("footer", &["a", "b"]);
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    let footer = |app: &mut TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(200, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+    };
+
+    // On a non-request row there is nothing to copy, so the hint stays away.
+    app.collections[ci].list_cursor = 0;
+    assert!(
+        !footer(&mut app).contains(s.foot_copy_request),
+        "no hint on a folder/file row"
+    );
+
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    assert!(
+        footer(&mut app).contains(s.foot_copy_request),
+        "the hint appears on a request row"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reordering sets `structure_modified`, which no *request* carries a marker
+/// for — so the list looked untouched while the quit prompt insisted there was
+/// unsaved work, with nothing on screen to say where.
+#[test]
+fn a_reordered_collection_marks_its_tab_unsaved() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".into(),
+        vec![entry_named("a"), entry_named("b")],
+    ));
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    // The tab strip sits inside a bordered panel whose exact row depends on the
+    // layout, so find the row the tab name is drawn on rather than pinning one.
+    let tab_bar = |app: &mut TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("api"))
+            .expect("the tab strip shows the collection name")
+    };
+
+    assert!(
+        !tab_bar(&mut app).contains(s.tab_unsaved_marker),
+        "a freshly opened collection is clean"
+    );
+
+    app.collections[ci].list_cursor = 0;
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert_eq!(titles_of(&app, ci), vec!["b", "a"], "the reorder happened");
+
+    assert!(
+        app.collections[ci].structure_modified,
+        "a reorder is a structural change"
+    );
+    let bar = tab_bar(&mut app);
+    assert!(
+        bar.contains(s.tab_unsaved_marker),
+        "and the tab now says so: {bar:?}"
+    );
 }

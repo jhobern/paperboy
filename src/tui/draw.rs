@@ -1903,6 +1903,28 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
     icons
 }
 
+/// The trailing "unsaved" pencil for a collection tab, or an empty string.
+///
+/// Every other unsaved change in the terminal UI announces itself where it
+/// happened — a `✚` on an added request, a `✎` on an edited one, a `●` on a
+/// report tab — but a *structural* change (a request reordered, deleted or
+/// restored) belongs to no single request, so nothing on screen carried it. The
+/// quit prompt still counted it, which left the user told they had unsaved work
+/// and given nowhere to look for it. The tab is the right place: it is the unit
+/// that prompt talks about, and for a Workspace tab it is the only row that
+/// speaks for the files parked out of sight.
+///
+/// `unsaved_edit_count` rather than `has_unsaved_edits` for exactly that
+/// reason — a workspace holding edits in a file it isn't currently showing is
+/// still a tab that would lose something.
+fn tab_dirty_marker(col: &crate::collection::Collection, s: &Strings) -> String {
+    if col.unsaved_edit_count() > 0 {
+        format!(" {}", s.tab_unsaved_marker)
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     // A *standalone* report strip tab always keeps focus on its body (the tab
     // bar is never a focus stop), so its tab-bar highlight is never lit. An
@@ -1940,9 +1962,9 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         // Workspace — only the Requests-list panel title below reflects
         // that (see `draw_collection_left`).
         let name = if i == 0 {
-            s.tab_request.to_string()
+            format!("{}{}", s.tab_request, tab_dirty_marker(col, s))
         } else {
-            format!("{}{}", tab_icons(col), col.name)
+            format!("{}{}{}", tab_icons(col), col.name, tab_dirty_marker(col, s))
         };
         let w = name.chars().count() + 2; // " {name} "
         if app.active_tab == i {
@@ -4142,6 +4164,20 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     {
         hint.push(format!("c {}", s.foot_duplicate));
     }
+    // On a Workspace tab `c` means something else again — copy the highlighted
+    // request into another collection file in the workspace — and the branch
+    // above deliberately skips it. That left the workspace meaning advertised
+    // nowhere but the help overlay, even though it is the one place `c` reaches
+    // outside the open collection, so it gets its own hint with its own wording
+    // rather than borrowing "duplicate", which is not what it does.
+    if app.focus == Pane::List
+        && app
+            .collections
+            .get(app.active_tab)
+            .is_some_and(|c| c.ws_transfer_target().is_some())
+    {
+        hint.push(format!("c {}", s.foot_copy_request));
+    }
     // Alt+arrows reorder the highlighted request, and the order is what Run
     // All follows — worth advertising, since nothing else on screen says the
     // list order means anything. Only shown when there is more than one
@@ -4160,14 +4196,15 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     }
     // `/` finds a request anywhere in the collection, not just in the folder
     // being browsed — which is the part worth advertising, since the list
-    // otherwise shows one folder at a time. Not offered on a Workspace tab
-    // (whose tree is the filesystem, with its own Ctrl+F filter) and not while
-    // the filter is already up, where Esc is the key that matters.
+    // otherwise shows one folder at a time. On a Workspace tab it searches the
+    // whole tree instead (files, reports, environments, and the requests of the
+    // collections already open). Not offered while the filter is already up,
+    // where Esc is the key that matters.
     if app.focus == Pane::List
         && app
             .collections
             .get(app.active_tab)
-            .is_some_and(|c| !c.is_workspace() && c.entries.len() > 1 && c.list_query.is_empty())
+            .is_some_and(|c| c.list_query.is_empty() && (c.is_workspace() || c.entries.len() > 1))
     {
         hint.push(format!("/ {}", s.foot_find_request));
     }

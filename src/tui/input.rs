@@ -42,6 +42,56 @@ fn row_entry(row: &crate::tree::Row) -> Option<usize> {
     }
 }
 
+/// The `(from, to)` entry indices `Alt+↑↓` should swap on a **Workspace** tab.
+///
+/// A Workspace tab's left pane is the filesystem tree (`ws_rows`), not the
+/// loaded collection's request list (`rows`), so `list_cursor` counts folders,
+/// collection files, reports and environments as well as requests. Reading the
+/// cursor against `rows()` therefore picked an unrelated request — or, in a
+/// tree with more rows than the open file has requests, silently nothing — and
+/// reordered two requests the user was not pointing at. Everything here is
+/// resolved against `ws_rows` for that reason.
+///
+/// The neighbour has to be a request of the *same* collection file at the
+/// *same* tree depth: the tree interleaves several files, and a request can
+/// only trade places with one it shares an `entries` list with. Depth keeps a
+/// move inside its own title-folder, matching a plain tab, where `rows()` only
+/// ever offers the folder being browsed. The scan stops on any row shallower
+/// than the cursor, which is the tree's way of saying the folder ended.
+fn ws_reorder_pair(col: &crate::collection::Collection, down: bool) -> Option<(usize, usize)> {
+    use crate::collection::WsRow;
+    let rows = col.ws_rows();
+    let (from, file, depth) = match rows.get(col.list_cursor)? {
+        WsRow::Request {
+            idx,
+            collection,
+            depth,
+            loaded: true,
+            ..
+        } => (*idx, collection.clone(), *depth),
+        _ => return None,
+    };
+    let mut scan: Box<dyn Iterator<Item = &WsRow>> = if down {
+        Box::new(rows.iter().skip(col.list_cursor + 1))
+    } else {
+        Box::new(rows.iter().take(col.list_cursor).rev())
+    };
+    scan.find_map(|row| match row {
+        WsRow::Request {
+            idx,
+            collection,
+            depth: d,
+            loaded: true,
+            ..
+        } if *d == depth && *collection == file => Some((from, *idx)),
+        // A deeper row is inside a subfolder of this one; keep looking past it.
+        r if r.depth() > depth => None,
+        // Anything at or above this depth ends the folder.
+        _ => Some((from, from)),
+    })
+    .filter(|(f, t)| f != t)
+}
+
 impl TuiApp {
     /// What the wizard's clickable rows currently look like: which section is
     /// showing and how many rows each has. Used to notice that a keystroke
@@ -1857,16 +1907,20 @@ impl TuiApp {
             // also focuses the panel, so it works as "find me an environment"
             // from wherever you are rather than only once the panel is focused
             // — with hundreds of environments that is the whole point of it.
-            // `/` filters the Requests list while that list has focus — the
-            // pane-scoped reading of "find me one of these", matching how `x`
-            // and `u` already mean "the thing in this pane". A Workspace tab is
-            // excluded: its left pane is the filesystem tree, whose rows come
-            // from `ws_rows` and have their own Ctrl+F filter, so `/` there
-            // keeps its environments meaning rather than silently doing nothing.
-            KeyCode::Char('/')
-                if self.focus == Pane::List
-                    && !self.collections[self.active_tab].is_workspace() =>
-            {
+            // `/` finds something in the pane that has focus: a request in the
+            // Requests list, a row anywhere in a Workspace tab's tree, and
+            // otherwise an environment variable — the pane-scoped reading of
+            // "find me one of these", matching how `x` and `u` already mean
+            // "the thing in this pane".
+            //
+            // A Workspace tab used to be excluded on the grounds that its tree
+            // "has its own Ctrl+F filter", which was simply wrong: Ctrl+F there
+            // toggles which *file types* the tree shows and has never searched
+            // anything. The result was that `/` on the Requests panel of a
+            // workspace silently jumped the focus to Environments, which is
+            // both the commonest way to open a collection and the case where a
+            // search is worth most.
+            KeyCode::Char('/') if self.focus == Pane::List => {
                 self.list_filter_typing = true;
             }
             KeyCode::Char('/') => {
@@ -2330,7 +2384,7 @@ impl TuiApp {
             }
             KeyCode::Enter => self.list_filter_typing = false,
             KeyCode::Up | KeyCode::Down => {
-                let len = self.collections[ci].rows().len();
+                let len = self.collections[ci].list_row_count();
                 if len > 0 {
                     // Wrap the way the list's own j/k navigation does.
                     let cur = self.collections[ci].list_cursor.min(len - 1) as i32;
@@ -2356,6 +2410,15 @@ impl TuiApp {
         self.list_filter_typing = false;
         let col = &mut self.collections[ci];
         col.list_query.clear();
+        // A Workspace tab's tree is not the loaded collection's request list,
+        // so `selected_entry` says nothing about which *row* was highlighted —
+        // the match could as easily have been a report or another file. Its
+        // rows also come back in the same order once the filter goes, so the
+        // cursor is simply clamped rather than re-derived.
+        if col.is_workspace() {
+            col.list_cursor = col.list_cursor.min(col.ws_rows().len().saturating_sub(1));
+            return;
+        }
         col.sync_folder_to_selected();
         let sel = col.selected_entry;
         col.list_cursor = col
@@ -2369,6 +2432,16 @@ impl TuiApp {
     /// list, and follow it with `selected_entry` so the right-hand panes show
     /// the request the cursor is actually on.
     fn clamp_list_selection(&mut self, ci: usize) {
+        // A Workspace tab's rows are the tree, and its selection is followed by
+        // the tree's own handler (which loads a collection, previews a report,
+        // and so on) rather than by `selected_entry`; clamping the cursor into
+        // the narrowed tree is all that is needed here.
+        if self.collections[ci].is_workspace() {
+            let len = self.collections[ci].ws_rows().len();
+            self.collections[ci].list_cursor =
+                self.collections[ci].list_cursor.min(len.saturating_sub(1));
+            return;
+        }
         let rows = self.collections[ci].rows();
         let cursor = self.collections[ci]
             .list_cursor
@@ -2676,13 +2749,7 @@ impl TuiApp {
     pub(crate) fn start_workspace_transfer(&mut self, is_move: bool) {
         let ci = self.active_tab;
         let col = &self.collections[ci];
-        if !col.is_workspace() || col.workspace_root.is_none() {
-            return;
-        }
-        let Some(crate::collection::WsRow::Request {
-            idx, loaded: true, ..
-        }) = col.ws_rows().into_iter().nth(col.list_cursor)
-        else {
+        let Some(idx) = col.ws_transfer_target() else {
             return;
         };
         let Some(entry) = col.entries.get(idx).cloned() else {
@@ -2784,18 +2851,26 @@ impl TuiApp {
             return;
         }
         let rows = col.rows();
-        let Some(from) = rows.get(col.list_cursor).and_then(row_entry) else {
-            return;
-        };
-        // The adjacent *displayed* request, skipping folder rows — a folder is
-        // not something a request can trade places with.
-        let neighbour = if down {
-            rows.iter().skip(col.list_cursor + 1).find_map(row_entry)
+        let (from, to) = if col.is_workspace() {
+            let Some(pair) = ws_reorder_pair(col, down) else {
+                return;
+            };
+            pair
         } else {
-            rows.iter().take(col.list_cursor).rev().find_map(row_entry)
-        };
-        let Some(to) = neighbour else {
-            return;
+            let Some(from) = rows.get(col.list_cursor).and_then(row_entry) else {
+                return;
+            };
+            // The adjacent *displayed* request, skipping folder rows — a folder
+            // is not something a request can trade places with.
+            let neighbour = if down {
+                rows.iter().skip(col.list_cursor + 1).find_map(row_entry)
+            } else {
+                rows.iter().take(col.list_cursor).rev().find_map(row_entry)
+            };
+            let Some(to) = neighbour else {
+                return;
+            };
+            (from, to)
         };
         let col = &mut self.collections[ci];
         if !col.move_entry(from, to) {

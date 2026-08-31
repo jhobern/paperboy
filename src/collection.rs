@@ -218,6 +218,70 @@ impl WsRow {
             | WsRow::Request { depth, .. } => *depth,
         }
     }
+
+    /// The text shown for the row — what a typed filter matches against.
+    pub fn name(&self) -> &str {
+        match self {
+            WsRow::Folder { name, .. }
+            | WsRow::Collection { name, .. }
+            | WsRow::Report { name, .. }
+            | WsRow::Environment { name, .. }
+            | WsRow::RequestFolder { name, .. }
+            | WsRow::Request { name, .. } => name,
+        }
+    }
+}
+
+/// Narrow an already-built Workspace tree to the rows matching `query`, keeping
+/// every ancestor of a match so the survivors still read as a tree rather than
+/// as a flat list of names with no indication of which file they came from.
+///
+/// A plain collection's filter flattens instead ([`crate::tree::rows_matching`])
+/// because there the only context a match has is its title, which the row
+/// already spells out in full. A workspace row's context is the *file* it lives
+/// in, which the row does not repeat — so dropping the ancestors would leave a
+/// screen of request names with no way to tell two identically-named requests
+/// in different collections apart.
+///
+/// Matching is case-insensitive and on the substring, matching the Requests and
+/// Environments filters; a folder that matches keeps its whole subtree, since
+/// naming a folder is the obvious way to ask for what is in it.
+fn filter_ws_rows(rows: Vec<WsRow>, query: &str) -> Vec<WsRow> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return rows;
+    }
+    let mut keep = vec![false; rows.len()];
+    // The indices of the rows containing the one being looked at, innermost
+    // last — a match marks all of them, which is what keeps the tree readable.
+    let mut ancestors: Vec<usize> = Vec::new();
+    // Set while inside a matched folder's subtree, holding that folder's depth,
+    // so everything under it is kept without having to match on its own.
+    let mut inside: Option<usize> = None;
+    for (i, row) in rows.iter().enumerate() {
+        let d = row.depth();
+        while ancestors.last().is_some_and(|&a| rows[a].depth() >= d) {
+            ancestors.pop();
+        }
+        if inside.is_some_and(|kept| d <= kept) {
+            inside = None;
+        }
+        if inside.is_some() || row.name().to_lowercase().contains(&needle) {
+            keep[i] = true;
+            for &a in &ancestors {
+                keep[a] = true;
+            }
+            if inside.is_none() && matches!(row, WsRow::Folder { .. } | WsRow::RequestFolder { .. })
+            {
+                inside = Some(d);
+            }
+        }
+        ancestors.push(i);
+    }
+    rows.into_iter()
+        .zip(keep)
+        .filter_map(|(r, k)| k.then_some(r))
+        .collect()
 }
 
 /// A title for a copy of `title` that no entry in `entries` already carries.
@@ -579,6 +643,19 @@ impl Collection {
         }
     }
 
+    /// How many rows the left-hand list pane is showing, whichever kind of tab
+    /// it is: a Workspace tab draws its filesystem tree, every other tab draws
+    /// the loaded collection's requests. The two are different lists of
+    /// different lengths, and reading `list_cursor` against the wrong one is
+    /// how `Alt+↑↓` came to reorder requests nobody was pointing at.
+    pub fn list_row_count(&self) -> usize {
+        if self.is_workspace() {
+            self.ws_rows().len()
+        } else {
+            self.rows().len()
+        }
+    }
+
     /// Whether the Requests list is currently narrowed by a typed filter.
     ///
     /// Trimmed, so a query of nothing but spaces counts as no filter at all —
@@ -604,6 +681,26 @@ impl Collection {
     /// report embeds it in the right pane.  Empty for a non-Workspace tab.
     pub fn ws_rows(&self) -> Vec<WsRow> {
         self.ws_rows_at(Instant::now())
+    }
+
+    /// The entry index under the cursor when it is a *loaded* request on a
+    /// Workspace tab — that is, exactly when `m` (move) and `c` (copy) have
+    /// something to transfer to another collection file.
+    ///
+    /// A single predicate shared by the key handler and the footer hint, so the
+    /// footer can never advertise a key that would silently do nothing: a
+    /// folder row, a report, or a collection file whose requests haven't been
+    /// read in yet are all rows where `m`/`c` return without acting.
+    pub(crate) fn ws_transfer_target(&self) -> Option<usize> {
+        if !self.is_workspace() || self.workspace_root.is_none() {
+            return None;
+        }
+        match self.ws_rows().into_iter().nth(self.list_cursor) {
+            Some(WsRow::Request {
+                idx, loaded: true, ..
+            }) => Some(idx),
+            _ => None,
+        }
     }
 
     /// [`Self::ws_rows`] as of a given moment, so the scan cache's expiry can be
@@ -633,6 +730,16 @@ impl Collection {
             .unwrap_or_default();
         let mut out = Vec::new();
 
+        // A typed filter searches the whole workspace, so while one is active
+        // every *folder* counts as expanded: a search that could only find what
+        // was already on screen would be no search at all. Collection files are
+        // deliberately left alone — expanding one reads its requests off disk
+        // (or out of the title cache), and doing that for every file in the
+        // tree on each keystroke would stall a large workspace. So a filter
+        // reaches every file, report and environment in the workspace, and the
+        // requests of the collections already open.
+        let filtering = self.list_filter_active();
+
         // `ancestor_at[d]` holds the absolute path of the most-recently-visited
         // directory at depth d.  A row at depth D is visible iff every slot
         // ancestor_at[0..D] points to a path in `workspace_expanded`.
@@ -647,10 +754,11 @@ impl Collection {
             }
 
             // Visible iff every containing ancestor folder is expanded.
-            let visible = ancestor_at.iter().all(|opt| {
-                opt.as_ref()
-                    .is_some_and(|p| self.workspace_expanded.contains(p))
-            });
+            let visible = filtering
+                || ancestor_at.iter().all(|opt| {
+                    opt.as_ref()
+                        .is_some_and(|p| self.workspace_expanded.contains(p))
+                });
 
             if entry.is_dir {
                 // Record this directory as the current ancestor at depth d,
@@ -662,7 +770,7 @@ impl Collection {
                 }
 
                 if visible {
-                    let expanded = self.workspace_expanded.contains(&entry.path);
+                    let expanded = filtering || self.workspace_expanded.contains(&entry.path);
                     out.push(WsRow::Folder {
                         path: entry.path.clone(),
                         name: entry.display_name.clone(),
@@ -696,6 +804,9 @@ impl Collection {
                     }
                 }
             }
+        }
+        if filtering {
+            return filter_ws_rows(out, &self.list_query);
         }
         out
     }
