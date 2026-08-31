@@ -196,11 +196,32 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
         edit_menu(app, ui);
         settings_menu(app, ui);
         view_menu(app, ui);
+        help_menu(app, ui);
         // No Send button here. There used to be one pinned to the right of this
         // bar, doing exactly what the Send beside the URL does (`run_active`) —
         // but it was drawn unconditionally, so in the report editor or a
         // workspace view it fired at whatever request happened to be selected
         // off-screen. One Send, next to the request it sends.
+    });
+}
+
+/// The Help menu: a home for the keyboard-shortcuts overlay so F1 is not the
+/// only way to find it. Discoverability was the whole complaint — a shortcut no
+/// menu points at is a shortcut nobody knows exists — so the overlay earns a
+/// visible entry, with its F1 accelerator shown the same way Save shows Ctrl+S.
+fn help_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let (title, mnemonic) = (app.strings.gui_menu_help, app.strings.gui_menu_help_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
+        if ui
+            .button(format!(
+                "{}\t{}",
+                app.strings.gui_shortcuts_title, app.strings.gui_shortcut_help
+            ))
+            .clicked()
+        {
+            app.dialog = Some(Dialog::Shortcuts);
+            ui.close();
+        }
     });
 }
 
@@ -242,7 +263,10 @@ fn edit_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         if ui
             .add_enabled(
                 has_deleted,
-                egui::Button::new(app.strings.gui_undo_delete_request),
+                egui::Button::new(format!(
+                    "{}\t{}",
+                    app.strings.gui_undo_delete_request, app.strings.gui_shortcut_undo_delete
+                )),
             )
             .clicked()
         {
@@ -392,64 +416,70 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             close_menu = true;
             ui.close();
         }
-        ui.menu_button(app.strings.gui_menu_save_as, |ui| {
-            ui.menu_button(app.strings.file_kind_collection, |ui| {
-                if ui.button(app.strings.gui_menu_to_file).clicked() {
-                    save_via_picker(app, SaveKind::Collection);
-                    close_menu = true;
-                    ui.close();
-                }
-                if ui.button(app.strings.gui_menu_to_git).clicked() {
-                    app.remote.open_save_collection(app.active_ci());
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            // Only offered where they can work: a report save needs a report in
-            // the editor, and a workspace push needs a tab that came from git.
-            let has_report = app.report_editor.is_some();
-            ui.menu_button(app.strings.file_kind_report, |ui| {
-                if ui
-                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_file))
-                    .clicked()
-                {
-                    save_via_picker(app, SaveKind::Report);
-                    close_menu = true;
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_git))
-                    .clicked()
-                {
-                    app.remote.open_save_report();
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            let ci = app.active_ci();
-            let is_ws = app
-                .session
-                .collections
-                .get(ci)
-                .is_some_and(|c| c.workspace_git_origin.is_some());
-            ui.menu_button(app.strings.file_kind_workspace, |ui| {
-                if ui
-                    .add_enabled(is_ws, egui::Button::new(app.strings.gui_menu_to_git))
-                    .clicked()
-                {
-                    app.remote.open_save_workspace(ci);
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            ui.menu_button(app.strings.gui_menu_kind_response, |ui| {
-                if ui.button(app.strings.gui_menu_to_file).clicked() {
-                    save_via_picker(app, SaveKind::Response);
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-        });
+        ui.menu_button(
+            format!(
+                "{}\t{}",
+                app.strings.gui_menu_save_as, app.strings.gui_shortcut_save_as
+            ),
+            |ui| {
+                ui.menu_button(app.strings.file_kind_collection, |ui| {
+                    if ui.button(app.strings.gui_menu_to_file).clicked() {
+                        save_via_picker(app, SaveKind::Collection);
+                        close_menu = true;
+                        ui.close();
+                    }
+                    if ui.button(app.strings.gui_menu_to_git).clicked() {
+                        app.remote.open_save_collection(app.active_ci());
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                // Only offered where they can work: a report save needs a report in
+                // the editor, and a workspace push needs a tab that came from git.
+                let has_report = app.report_editor.is_some();
+                ui.menu_button(app.strings.file_kind_report, |ui| {
+                    if ui
+                        .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_file))
+                        .clicked()
+                    {
+                        save_via_picker(app, SaveKind::Report);
+                        close_menu = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_git))
+                        .clicked()
+                    {
+                        app.remote.open_save_report();
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                let ci = app.active_ci();
+                let is_ws = app
+                    .session
+                    .collections
+                    .get(ci)
+                    .is_some_and(|c| c.workspace_git_origin.is_some());
+                ui.menu_button(app.strings.file_kind_workspace, |ui| {
+                    if ui
+                        .add_enabled(is_ws, egui::Button::new(app.strings.gui_menu_to_git))
+                        .clicked()
+                    {
+                        app.remote.open_save_workspace(ci);
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                ui.menu_button(app.strings.gui_menu_kind_response, |ui| {
+                    if ui.button(app.strings.gui_menu_to_file).clicked() {
+                        save_via_picker(app, SaveKind::Response);
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+            },
+        );
         ui.separator();
 
         if ui.button(app.strings.gui_set_base_url).clicked() {
@@ -461,7 +491,13 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.separator();
 
-        if ui.button(app.strings.gui_close_tab).clicked() {
+        if ui
+            .button(format!(
+                "{}\t{}",
+                app.strings.gui_close_tab, app.strings.gui_shortcut_close_tab_key
+            ))
+            .clicked()
+        {
             app.request_close_tab(app.active_ci());
             ui.close();
         }
@@ -567,6 +603,15 @@ fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         if ui
             .checkbox(
+                &mut app.session.confirm_on_delete_request,
+                app.strings.gui_confirm_delete_request,
+            )
+            .changed()
+        {
+            app.session.save();
+        }
+        if ui
+            .checkbox(
                 &mut app.session.run_all_batch_mode,
                 app.strings.gui_run_all_batch,
             )
@@ -653,6 +698,148 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             entry,
             name,
         } => revert_to_saved_dialog(app, ctx, ci, path, entry, name),
+        Dialog::ConfirmDeleteRequest { ci, idx, name } => {
+            confirm_delete_request_dialog(app, ctx, ci, idx, name)
+        }
+        Dialog::ConfirmRunAll { ci, total, non_get } => {
+            confirm_run_all_dialog(app, ctx, ci, total, non_get)
+        }
+        Dialog::Shortcuts => shortcuts_dialog(app, ctx),
+    }
+}
+
+/// Confirm deleting a request. Gated on `confirm_on_delete_request`; the delete
+/// records an undo step, so cancelling re-arms the dialog (a click outside must
+/// not be able to lose the request either) while confirming removes it and
+/// leaves it recoverable via Undo Delete Request / Ctrl+Z.
+fn confirm_delete_request_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    idx: usize,
+    name: String,
+) {
+    let title = app.strings.gui_delete_request_title;
+    let (go, cancel, question) = (
+        app.strings.gui_delete,
+        app.strings.gui_cancel,
+        app.strings.confirm_delete_request_q.replace("{r}", &name),
+    );
+    let mut decided = false;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                app.delete_request_now(ci, idx);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    })
+    .dismissed;
+    decided |= dismissed;
+    if !decided {
+        app.dialog = Some(Dialog::ConfirmDeleteRequest { ci, idx, name });
+    }
+}
+
+/// Confirm a "Run All" that would fire non-GET requests. The count of how many
+/// will run — and how many of those are not GET — is the whole point: it turns
+/// "run everything" from a leap into an informed choice, so a collection full
+/// of writes isn't one stray click from executing. Cancelling re-arms nothing
+/// (there is nothing to lose by dismissing); confirming runs the collection.
+fn confirm_run_all_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    total: usize,
+    non_get: usize,
+) {
+    let title = app.strings.gui_run_all_confirm_title;
+    let (go, cancel, question) = (
+        app.strings.gui_run_all,
+        app.strings.gui_cancel,
+        app.strings
+            .confirm_run_all_q
+            .replace("{n}", &total.to_string())
+            .replace("{m}", &non_get.to_string()),
+    );
+    let mut answered: Option<bool> = None;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                answered = Some(true);
+            }
+            if ui.button(cancel).clicked() {
+                answered = Some(false);
+            }
+        });
+    })
+    .dismissed;
+    if dismissed {
+        answered = Some(false);
+    }
+    match answered {
+        Some(true) => {
+            app.session.run_all_entries(ci);
+        }
+        Some(false) => {}
+        // No answer yet (egui drew nothing, or the user hasn't clicked): keep
+        // the dialog armed rather than deciding for them.
+        None => app.dialog = Some(Dialog::ConfirmRunAll { ci, total, non_get }),
+    }
+}
+
+/// The F1 keyboard-shortcuts overlay: every GUI shortcut, grouped, with a short
+/// description. Built from [`super::shortcut_help_sections`] so it can never
+/// drift from the keys the app actually binds, and dismissed with Escape or the
+/// close button like every other modal.
+fn shortcuts_dialog(app: &mut GuiApp, ctx: &egui::Context) {
+    let title = app.strings.gui_shortcuts_title;
+    let sections = super::shortcut_help_sections(&app.strings);
+    let theme = app.theme;
+    let close_lbl = app.strings.gui_close;
+    let mut close = false;
+    let dismissed = super::widgets::dialog_resizable(ctx, title, [420.0, 460.0], |ui| {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, section) in sections.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(8.0);
+                    }
+                    ui.colored_label(theme.accent, section.title);
+                    ui.add_space(2.0);
+                    egui::Grid::new(("shortcuts_grid", i))
+                        .num_columns(2)
+                        .spacing([18.0, 4.0])
+                        .show(ui, |ui| {
+                            for (keys, desc) in &section.rows {
+                                ui.colored_label(theme.text, egui::RichText::new(*keys).strong());
+                                ui.colored_label(theme.dim, *desc);
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(close_lbl).clicked() {
+                close = true;
+            }
+        });
+    })
+    .dismissed;
+    // Not re-armed on close: the overlay is a reference the user is done with,
+    // not a question waiting on an answer.
+    if !(close || dismissed) {
+        app.dialog = Some(Dialog::Shortcuts);
     }
 }
 
@@ -2436,6 +2623,7 @@ mod tests {
                 s.gui_menu_edit_key,
                 s.gui_menu_view_key,
                 s.gui_menu_settings_key,
+                s.gui_menu_help_key,
             ];
             for k in keys {
                 assert_eq!(

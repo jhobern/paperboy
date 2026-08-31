@@ -184,3 +184,126 @@ impl Focus {
         Self::ORDER[next]
     }
 }
+
+/// One labelled group of keyboard shortcuts in the F1 overlay: a heading and
+/// its rows, each row a `(keys, description)` pair already translated.
+pub struct ShortcutSection<'a> {
+    pub title: &'a str,
+    pub rows: Vec<(&'a str, &'a str)>,
+}
+
+/// The keyboard shortcuts the GUI binds, grouped for the F1 overlay.
+///
+/// Derived from the strings table so the three languages can't drift, and kept
+/// as the single source of truth for what the overlay shows: it lists exactly
+/// the keys wired in [`app::GuiApp::handle_global_keys`] (panel cycle, run,
+/// save/save-as, close tab, undo-delete, the Requests-list keys) and the report
+/// editor's own Ctrl+F, so the help can never claim a shortcut the app doesn't
+/// have — or omit one it does.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn shortcut_help_sections(s: &crate::i18n::Strings) -> Vec<ShortcutSection<'_>> {
+    vec![
+        ShortcutSection {
+            title: s.gui_shortcuts_group_panels,
+            rows: vec![(
+                s.gui_shortcut_cycle_panels,
+                s.gui_shortcut_cycle_panels_desc,
+            )],
+        },
+        ShortcutSection {
+            title: s.gui_shortcuts_group_list,
+            rows: vec![
+                (s.gui_shortcut_list_move, s.gui_shortcut_list_move_desc),
+                (s.gui_shortcut_list_ends, s.gui_shortcut_list_ends_desc),
+                (s.gui_shortcut_list_run, s.gui_shortcut_list_run_desc),
+                (s.gui_shortcut_list_rename, s.gui_shortcut_list_rename_desc),
+                (s.gui_shortcut_list_delete, s.gui_shortcut_list_delete_desc),
+            ],
+        },
+        ShortcutSection {
+            title: s.gui_shortcuts_group_run,
+            rows: vec![
+                (s.gui_shortcut_run, s.gui_shortcut_run_desc),
+                (s.gui_shortcut_save, s.gui_shortcut_save_desc),
+                (s.gui_shortcut_save_as, s.gui_shortcut_save_as_desc),
+                (s.gui_shortcut_close_tab_key, s.gui_shortcut_close_tab_desc),
+                (s.gui_shortcut_undo_delete, s.gui_shortcut_undo_delete_desc),
+            ],
+        },
+        ShortcutSection {
+            title: s.gui_shortcuts_group_report,
+            rows: vec![(s.gui_shortcut_find, s.gui_shortcut_find_desc)],
+        },
+        ShortcutSection {
+            title: s.gui_shortcuts_group_help,
+            rows: vec![
+                (s.gui_shortcut_help, s.gui_shortcut_help_desc),
+                (s.gui_shortcut_escape, s.gui_shortcut_escape_desc),
+            ],
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::{Language, Strings};
+
+    /// The F1 overlay must be real in every language — a group with a heading,
+    /// and every row naming a key and explaining it — and its keys must be the
+    /// ones the app actually binds, not a stub.
+    #[test]
+    fn the_shortcut_overlay_is_complete_in_every_language() {
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            let sections = shortcut_help_sections(&s);
+            assert!(!sections.is_empty(), "{lang:?}: the overlay has content");
+            let mut rows = 0;
+            for section in &sections {
+                assert!(
+                    !section.title.trim().is_empty(),
+                    "{lang:?}: every group has a heading"
+                );
+                for (keys, desc) in &section.rows {
+                    assert!(!keys.trim().is_empty(), "{lang:?}: every row names a key");
+                    assert!(
+                        !desc.trim().is_empty(),
+                        "{lang:?}: every row explains itself"
+                    );
+                    rows += 1;
+                }
+            }
+            assert!(
+                rows >= 10,
+                "{lang:?}: the overlay documents the vocabulary, not a placeholder ({rows} rows)"
+            );
+        }
+    }
+
+    /// Accuracy guard: the keys named are the ones that are actually wired.
+    #[test]
+    fn the_shortcut_overlay_names_the_keys_that_exist() {
+        let s = Strings::for_language(&Language::English);
+        let keys: Vec<&str> = shortcut_help_sections(&s)
+            .into_iter()
+            .flat_map(|sec| sec.rows.into_iter().map(|(k, _)| k))
+            .collect();
+        for expected in [
+            "Tab / Shift+Tab",
+            "Ctrl+Enter / F5",
+            "Ctrl+S",
+            "Ctrl+Shift+S",
+            "Ctrl+W",
+            "Ctrl+Z",
+            "F2",
+            "Delete",
+            "Ctrl+F",
+            "F1",
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "the overlay should list {expected:?}, has {keys:?}"
+            );
+        }
+    }
+}

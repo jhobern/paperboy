@@ -44,6 +44,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   count, so that marking a tab costs no width: the bar already has ten labels to
   fit across the dialog.
 
+- **The GUI's request list can be driven from the keyboard.** Tab moved a
+  glowing focus border around the panels, but the Requests panel it landed on
+  answered to nothing: selecting a request meant clicking it, and running,
+  renaming or deleting one was buried in a right-click menu, so a keyboard user
+  could not pick, run or delete a request at all — and F5, which runs the
+  *selected* request, was unreachable because nothing but the mouse could
+  select one. With the panel focused, the arrow keys now move the selection
+  (Home/End jump to the first/last request), Enter runs it, F2 renames it and
+  Delete deletes it; the selected row is scrolled into view so a jump in a long
+  collection doesn't land off-screen. The keys stand down while a dialog is up
+  or a text field (a rename box, the list filter, a URL cell) has the keyboard,
+  so Delete and the arrows edit what you are typing rather than reaching past it
+  to destroy a request. A Workspace tab's list is a filesystem tree of folders,
+  collections, reports and environments rather than a flat list of requests, so
+  its rows are still driven by the mouse.
+
+- **The GUI has an F1 keyboard-shortcuts overlay, a Help menu and visible menu
+  accelerators.** Almost nothing about the GUI's keyboard was discoverable: it
+  had no help overlay at all (the terminal UI has one), and of its menu items
+  only Save admitted to having a shortcut. Pressing F1 — or Help ▸ Keyboard
+  Shortcuts — now opens a grouped, dismissible overlay listing every GUI
+  shortcut with a short description, built from the keys the app actually binds
+  so it can't drift out of date. Save As, Close Tab and Undo Delete Request now
+  show their accelerators (Ctrl+Shift+S, Ctrl+W, Ctrl+Z) next to them the same
+  way Save always showed Ctrl+S. All of it is translated across English, French
+  and Danish.
+
 - **A JSON request body can carry comments.** People arriving from Postman
   bring bodies annotated with what each field is for, and Hurl has nowhere to
   put them — `hurl_core` rejects `//` outright — so until now they had to be
@@ -253,6 +280,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   that hid them somewhere the eye had not been trained to look. It now uses the
   same bottom-border hint as everything else, and drops whole items off the end
   on a narrow terminal instead of letting the last one be clipped mid-word.
+
+- **Deleting a request in the GUI now asks first, and Ctrl+Z takes it back.**
+  A right-click ▸ Delete removed a request the instant it was clicked, with no
+  confirmation and no accelerator; the only way back was a menu item ("Edit ▸
+  Undo Delete Request") that advertised no shortcut and wasn't wired to Ctrl+Z
+  — even though the GUI already had a *Confirm deleting an environment*
+  preference, so the two dangers were inconsistent. There is now a matching
+  *Confirm deleting a request* preference (on by default, persisted alongside
+  the environment one), honoured before every GUI delete — the context menu and
+  the new Delete key alike — and Ctrl+Z now undoes the last request deletion by
+  exactly the code the menu item runs, so the shortcut and the menu can't
+  disagree. The binding stands down while the report editor is on screen, whose
+  own Ctrl+Z (block-structure undo, and the source view's text undoer) keeps
+  winning while it holds the keyboard.
+
+- **"Run All" in the GUI asks before firing a collection full of writes.** The
+  Run All button ran every request the moment it was clicked. Combined with
+  double-click-to-send, a collection of POSTs and DELETEs was one stray click
+  from executing against a real server. Run All now confirms whenever the
+  collection contains any request whose method is not GET, saying how many
+  requests will run and how many of those are writes; a read-only (all-GET)
+  collection still runs with no friction.
 
 - **Two Postman folders that log in as different users no longer share one
   token.** PaperBoy replaces an OAuth 2.0 configuration with a real token

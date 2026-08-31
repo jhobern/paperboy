@@ -93,6 +93,41 @@ struct Node {
     entries: Vec<usize>,
 }
 
+/// The navigable request rows of `col`, in the order they appear on screen, as
+/// flat entry indices. This is what the Requests-panel keyboard steps through:
+/// a filtered list is the flat set of matches (folders are gone), an unfiltered
+/// one is the folder tree walked exactly as [`render_node`] draws it — every
+/// folder's contents before the entries beside it — so Up/Down move to the row
+/// the eye expects rather than jumping around the underlying `entries` order.
+/// Folder rows are not navigable targets (there is no "selected folder"), so
+/// they are absent; the result holds only request indices.
+pub(super) fn nav_entry_order(col: &crate::collection::Collection) -> Vec<usize> {
+    if col.list_filter_active() {
+        crate::tree::rows_matching(&col.entries, &col.list_query)
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::tree::Row::Entry(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    } else {
+        let tree = build_tree(&col.entries);
+        let mut out = Vec::with_capacity(col.entries.len());
+        collect_entry_order(&tree, &mut out);
+        out
+    }
+}
+
+/// Flatten a folder tree into entry indices the way [`render_node`] renders it:
+/// each subfolder's contents first (recursively), then this level's own
+/// entries.
+fn collect_entry_order(node: &Node, out: &mut Vec<usize>) {
+    for child in node.folders.values() {
+        collect_entry_order(child, out);
+    }
+    out.extend(node.entries.iter().copied());
+}
+
 /// Group a collection's entries into a folder tree using their `/`-encoded
 /// titles. The leaf segment is the request's display name; everything before
 /// it is its folder path.
@@ -145,11 +180,13 @@ struct RowLabels<'a> {
     edited: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_node(
     ui: &mut egui::Ui,
     node: &Node,
     entries: &[HurlEntry],
     selected: usize,
+    reveal: bool,
     theme: &GuiTheme,
     id_prefix: &str,
     labels: &RowLabels<'_>,
@@ -163,13 +200,17 @@ fn render_node(
             true,
             RichText::new(format!("{} {name}", super::icons::FOLDER)).color(theme.text),
             |ui| {
-                render_node(ui, child, entries, selected, theme, &salt, labels, actions);
+                render_node(
+                    ui, child, entries, selected, reveal, theme, &salt, labels, actions,
+                );
             },
         );
     }
     for &i in &node.entries {
         let leaf = entry_path(&entries[i].title).pop().unwrap_or_default();
-        render_entry_row(ui, i, entries, leaf, selected, theme, labels, true, actions);
+        render_entry_row(
+            ui, i, entries, leaf, selected, reveal, theme, labels, true, actions,
+        );
     }
 }
 
@@ -192,6 +233,7 @@ fn render_entry_row(
     entries: &[HurlEntry],
     label: String,
     selected: usize,
+    reveal: bool,
     theme: &GuiTheme,
     labels: &RowLabels<'_>,
     reorderable: bool,
@@ -251,6 +293,13 @@ fn render_entry_row(
         });
         if row.clicked() {
             actions.select = Some(i);
+        }
+        // A keyboard move can select a row that is scrolled out of sight (a
+        // long collection, or Home/End jumping to an end); bring it back into
+        // view. Only on the selected row, and only when the move asked for it,
+        // so an ordinary scroll or click isn't yanked back.
+        if reveal && is_sel {
+            row.scroll_to_me(Some(egui::Align::Center));
         }
         if row.double_clicked() {
             actions.run = Some(i);
@@ -345,6 +394,20 @@ fn request_drop_zone(
     }
 }
 
+/// How a "Run All" of these entries should be gated: `(total, non_get)`, where
+/// `total` is how many requests would run and `non_get` how many of them use a
+/// method other than GET. A collection with `non_get == 0` is read-only and
+/// runs with no prompt; any other needs [`GuiApp::request_run_all`] to confirm
+/// first, because a stray click on Run All could otherwise fire a collection
+/// full of writes. GET is matched case-insensitively, the way Hurl treats it.
+pub(super) fn run_all_confirm_counts(entries: &[HurlEntry]) -> (usize, usize) {
+    let non_get = entries
+        .iter()
+        .filter(|e| !e.method.eq_ignore_ascii_case("GET"))
+        .count();
+    (entries.len(), non_get)
+}
+
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let ci = app.active_ci();
     // A Workspace tab shows the real filesystem tree instead of one file's
@@ -395,7 +458,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     super::widgets::panel_header(ui, &theme, name, |ui| {
         let run_all = format!("{} {}", super::icons::PLAY, lbl_run_all);
         if ui.button(run_all).on_hover_text(tip_run_all).clicked() {
-            app.session.run_all_entries(ci);
+            app.request_run_all(ci);
         }
         if ui
             .button(super::icons::PLUS)
@@ -434,6 +497,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     }
 
     let selected = app.session.collections[ci].selected_entry;
+    let reveal = app.reveal_selected;
     let filtering = app.session.collections[ci].list_filter_active();
     let query = app.session.collections[ci].list_query.clone();
     let mut actions = Actions::default();
@@ -511,6 +575,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         entries,
                         title,
                         selected,
+                        reveal,
                         &theme,
                         &labels,
                         false,
@@ -524,6 +589,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 &tree,
                 entries,
                 selected,
+                reveal,
                 &theme,
                 "req",
                 &labels,
@@ -531,6 +597,10 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             );
         });
 
+    // One-shot: the row asked to be revealed has had its frame, so clear the
+    // request whether or not a row honoured it (an empty or filtered-away list
+    // has nothing to scroll to).
+    app.reveal_selected = false;
     apply_actions(app, ci, actions);
 }
 
@@ -575,13 +645,10 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
         }
     }
     if let Some(i) = actions.delete {
-        let col = &mut app.session.collections[ci];
-        if col.remove_entry_recording_undo(i).is_some() {
-            if col.selected_entry >= col.entries.len() {
-                col.selected_entry = col.entries.len().saturating_sub(1);
-            }
-            col.invalidate_request_json();
-        }
+        // Route through the preference-honouring path so the context menu and
+        // the Requests-panel Delete key can't disagree about whether to ask
+        // first (see `GuiApp::request_delete_request`).
+        app.request_delete_request(ci, i);
     }
     if let Some((from, before)) = actions.reorder {
         // The order is what `run_all_entries` follows, so this is a real edit to
@@ -778,7 +845,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
     super::widgets::panel_header(ui, &theme, name, |ui| {
         let run_all = format!("{} {}", super::icons::PLAY, lbl_run_all);
         if ui.button(run_all).on_hover_text(tip_run_all).clicked() {
-            app.session.run_all_entries(ci);
+            app.request_run_all(ci);
         }
         let ftxt =
             RichText::new(lbl_filter).color(if filter_on { theme.accent } else { theme.dim });
@@ -2394,6 +2461,9 @@ pub(crate) mod tests {
         session.collections[0].entries = vec![entry("a"), entry("b"), entry("c")];
         let ci = 0;
         let mut app = GuiApp::for_test(session);
+        // This test is about the undo history, not the confirmation guard, so
+        // delete straight away (the guard has its own test below).
+        app.session.confirm_on_delete_request = false;
 
         apply_actions(
             &mut app,
@@ -2424,5 +2494,115 @@ pub(crate) mod tests {
         );
         assert!(app.session.collections[ci].deleted_entries.is_empty());
         assert_eq!(app.session.collections[ci].selected_entry, 1);
+    }
+
+    /// Only a method other than GET makes Run All worth a prompt; a read-only
+    /// collection should run with no friction. GET is matched the way Hurl
+    /// treats it — case-insensitively.
+    #[test]
+    fn run_all_confirm_counts_flags_only_the_non_get_requests() {
+        let get_only = vec![entry("a"), entry("b")];
+        assert_eq!(run_all_confirm_counts(&get_only), (2, 0));
+
+        let mut mixed = get_only.clone();
+        let mut post = entry("c");
+        post.method = "post".into();
+        mixed.push(post);
+        assert_eq!(run_all_confirm_counts(&mixed), (3, 1));
+
+        assert_eq!(run_all_confirm_counts(&[]), (0, 0));
+    }
+
+    /// An all-GET collection runs immediately; one with a write is held behind
+    /// a confirmation that carries the counts.
+    #[test]
+    fn request_run_all_asks_only_when_a_write_is_in_the_collection() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b")];
+        let mut app = GuiApp::for_test(session);
+        app.request_run_all(0);
+        assert!(
+            app.dialog.is_none(),
+            "a read-only collection runs with no prompt"
+        );
+
+        let mut post = entry("c");
+        post.method = "POST".into();
+        app.session.collections[0].entries.push(post);
+        app.request_run_all(0);
+        match &app.dialog {
+            Some(Dialog::ConfirmRunAll { ci, total, non_get }) => {
+                assert_eq!((*ci, *total, *non_get), (0, 3, 1));
+            }
+            _ => panic!("a collection with a write asks first, and says how many"),
+        }
+    }
+
+    /// The tree keyboard steps through requests in the order they are drawn:
+    /// each folder's contents before the entries beside it, so Up/Down move to
+    /// the row the eye expects rather than the raw `entries` order.
+    #[test]
+    fn nav_entry_order_walks_the_tree_as_it_is_rendered() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Root"),
+            entry("Auth/Login"),
+            entry("Auth/Logout"),
+            entry("Users/List"),
+        ];
+        let col = &session.collections[0];
+        // Auth (0..) then Users, each folder's entries, then the root entry.
+        assert_eq!(nav_entry_order(col), vec![1, 2, 3, 0]);
+    }
+
+    /// While filtered the list is flat — folders are gone — so the keyboard
+    /// steps through exactly the matches, in match order.
+    #[test]
+    fn nav_entry_order_follows_the_filter_when_one_is_typed() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        session.collections[0].list_query = "log".into();
+        let col = &session.collections[0];
+        assert_eq!(nav_entry_order(col), vec![0, 2]);
+    }
+
+    /// The context menu's Delete goes through the same preference-honouring path
+    /// as the Delete key: on by default, it asks first and leaves the request
+    /// in place until the prompt is answered.
+    #[test]
+    fn context_menu_delete_asks_before_removing_when_the_guard_is_on() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+        assert!(
+            app.session.confirm_on_delete_request,
+            "the guard is on by default, like the environment one"
+        );
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                delete: Some(1),
+                ..Default::default()
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::ConfirmDeleteRequest { ci: dci, idx, name }) => {
+                assert_eq!((*dci, *idx), (0, 1));
+                assert_eq!(name, "b");
+            }
+            _ => panic!("a delete confirmation naming the request should be up"),
+        }
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            2,
+            "nothing is removed until the prompt is answered"
+        );
     }
 }

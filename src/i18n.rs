@@ -1496,6 +1496,49 @@ strings! {
     diag_list_arity => "The list elements have inconsistent arity — a mix of scalars and tuples of different sizes.", "Les éléments de la liste ont une arité incohérente — un mélange de scalaires et de tuples de tailles différentes.", "Listens elementer har inkonsistent aritet — en blanding af skalarer og tupler af forskellig størrelse.";
     diag_concat_arity => "The CONCAT inputs have inconsistent arity — every input must yield the same number of values per item.", "Les entrées de CONCAT ont une arité incohérente — chaque entrée doit fournir le même nombre de valeurs par élément.", "CONCAT-inputtene har inkonsistent aritet — hvert input skal give det samme antal værdier pr. element.";
     diag_var_maybe_undefined => "Request '{}' uses {} which may not be set at this point in the flow — add it to the environment, or assign it before this request.", "La requête '{}' utilise {} qui pourrait ne pas être défini à ce stade du flux — ajoutez-le à l'environnement ou affectez-le avant cette requête.", "Forespørgslen '{}' bruger {}, som måske ikke er sat på dette punkt i forløbet — føj den til miljøet, eller tildel den før denne forespørgsel.";
+    // --- GUI keyboard, delete-request confirmation, Run All confirmation and
+    // the F1 shortcuts overlay. Appended together at the end of the table so a
+    // concurrent edit elsewhere in it doesn't collide. ---
+    gui_shortcut_save_as => "Ctrl+Shift+S", "Ctrl+Shift+S", "Ctrl+Shift+S";
+    gui_shortcut_close_tab_key => "Ctrl+W", "Ctrl+W", "Ctrl+W";
+    gui_shortcut_undo_delete => "Ctrl+Z", "Ctrl+Z", "Ctrl+Z";
+    gui_confirm_delete_request => "Confirm deleting a request", "Confirmer la suppression d'une requête", "Bekræft sletning af en anmodning";
+    gui_delete_request_title => "Delete request", "Supprimer la requête", "Slet anmodning";
+    confirm_delete_request_q => "Delete \"{r}\"? You can bring it back with Undo Delete Request (Ctrl+Z).", "Supprimer «\u{a0}{r}\u{a0}»\u{a0}? Vous pouvez la récupérer avec «\u{a0}Annuler la suppression de la requête\u{a0}» (Ctrl+Z).", "Slet «{r}»? Du kan hente den tilbage med Fortryd sletning af anmodning (Ctrl+Z).";
+    gui_run_all_confirm_title => "Run All", "Tout exécuter", "Kør alle";
+    confirm_run_all_q => "Run all {n} requests? {m} of them are not GET and may change data on the server.", "Exécuter les {n} requêtes\u{a0}? {m} d'entre elles ne sont pas des GET et pourraient modifier des données sur le serveur.", "Kør alle {n} anmodninger? {m} af dem er ikke GET og kan ændre data på serveren.";
+    gui_shortcuts_title => "Keyboard Shortcuts", "Raccourcis clavier", "Tastaturgenveje";
+    gui_shortcuts_group_panels => "Panels", "Panneaux", "Paneler";
+    gui_shortcuts_group_list => "Request list", "Liste des requêtes", "Anmodningsliste";
+    gui_shortcuts_group_run => "Requests & files", "Requêtes et fichiers", "Anmodninger og filer";
+    gui_shortcuts_group_report => "Report editor", "Éditeur de rapport", "Rapporteditor";
+    gui_shortcuts_group_help => "Help", "Aide", "Hjælp";
+    gui_shortcut_cycle_panels => "Tab / Shift+Tab", "Tab / Maj+Tab", "Tab / Skift+Tab";
+    gui_shortcut_run => "Ctrl+Enter / F5", "Ctrl+Entrée / F5", "Ctrl+Enter / F5";
+    gui_shortcut_list_move => "\u{2191} / \u{2193}", "\u{2191} / \u{2193}", "\u{2191} / \u{2193}";
+    gui_shortcut_list_ends => "Home / End", "Début / Fin", "Home / End";
+    gui_shortcut_list_run => "Enter", "Entrée", "Enter";
+    gui_shortcut_list_rename => "F2", "F2", "F2";
+    gui_shortcut_list_delete => "Delete", "Suppr", "Delete";
+    gui_shortcut_find => "Ctrl+F", "Ctrl+F", "Ctrl+F";
+    gui_shortcut_help => "F1", "F1", "F1";
+    gui_shortcut_escape => "Esc", "Échap", "Esc";
+    gui_shortcut_cycle_panels_desc => "Move focus between panels", "Déplacer le focus entre les panneaux", "Flyt fokus mellem paneler";
+    gui_shortcut_run_desc => "Run the current request", "Exécuter la requête courante", "Kør den aktuelle anmodning";
+    gui_shortcut_save_desc => "Save the current document", "Enregistrer le document courant", "Gem det aktuelle dokument";
+    gui_shortcut_save_as_desc => "Save to a new file", "Enregistrer dans un nouveau fichier", "Gem i en ny fil";
+    gui_shortcut_close_tab_desc => "Close the active tab", "Fermer l'onglet actif", "Luk den aktive fane";
+    gui_shortcut_undo_delete_desc => "Restore the last deleted request", "Restaurer la dernière requête supprimée", "Gendan den senest slettede anmodning";
+    gui_shortcut_list_move_desc => "Move the selection up or down", "Déplacer la sélection vers le haut ou le bas", "Flyt markeringen op eller ned";
+    gui_shortcut_list_ends_desc => "Jump to the first or last request", "Aller à la première ou à la dernière requête", "Hop til den første eller sidste anmodning";
+    gui_shortcut_list_run_desc => "Run the selected request", "Exécuter la requête sélectionnée", "Kør den valgte anmodning";
+    gui_shortcut_list_rename_desc => "Rename the selected request", "Renommer la requête sélectionnée", "Omdøb den valgte anmodning";
+    gui_shortcut_list_delete_desc => "Delete the selected request", "Supprimer la requête sélectionnée", "Slet den valgte anmodning";
+    gui_shortcut_find_desc => "Find in the report source", "Rechercher dans la source du rapport", "Søg i rapportens kilde";
+    gui_shortcut_help_desc => "Show this shortcuts overlay", "Afficher cet aperçu des raccourcis", "Vis denne genvejsoversigt";
+    gui_shortcut_escape_desc => "Close a dialog or overlay", "Fermer une boîte de dialogue ou un aperçu", "Luk en dialog eller oversigt";
+    gui_menu_help => "Help", "Aide", "Hjælp";
+    gui_menu_help_key => "H", "I", "H";
 }
 
 impl Strings {

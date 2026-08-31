@@ -883,4 +883,35 @@ mod tests {
         assert_eq!(entry.comments.len(), 1, "and the comment is still there");
         assert_eq!(entry.comments[0].anchor, CommentAnchor::default());
     }
+    /// The delete-request confirmation is a new preference, so a `state.json`
+    /// written before it existed has no field for it; that older document must
+    /// default the guard *on* (the safe choice, matching the environment one),
+    /// and an explicit choice must survive a save/load cycle.
+    #[test]
+    fn confirm_on_delete_request_defaults_on_and_round_trips() {
+        // An older state.json simply omits the field.
+        let mut value = serde_json::to_value(PersistedState::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("confirm_on_delete_request");
+        let older: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(
+            older.confirm_on_delete_request,
+            "a document without the field defaults the guard on"
+        );
+
+        // An explicit off survives serialisation and the Session round trip.
+        let mut session = crate::session::Session::default();
+        assert!(session.confirm_on_delete_request, "on by default");
+        session.confirm_on_delete_request = false;
+        let persisted = session.to_persisted();
+        assert!(!persisted.confirm_on_delete_request);
+        let mut restored = crate::session::Session::default();
+        restored.apply_persisted(persisted);
+        assert!(
+            !restored.confirm_on_delete_request,
+            "the choice is preserved across a save/load cycle"
+        );
+    }
 }

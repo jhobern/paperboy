@@ -11,8 +11,9 @@ It ships as a single binary with three front-ends:
 - **Terminal UI** (default) — a full interactive client for building,
   editing, running and organizing requests.
 - **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
-  with the same features and layout as the terminal UI, using mouse gestures
-  (drag to resize panels, click to switch tabs) instead of shortcuts. Opt-in at
+  with the same features and layout as the terminal UI, adding mouse gestures
+  (drag to resize panels, click to switch tabs) alongside keyboard navigation
+  and an F1 shortcuts overlay. Opt-in at
   build time via the `gui` Cargo feature, since it more than doubles the
   dependency tree.
 - **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
@@ -245,13 +246,23 @@ What changes is how you interact with it:
 - **Tab** cycles the focused panel in the same order as the terminal UI
   (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
   backwards.
-- **The single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
-  `n`, `b`, `x`, `u`, `m`/`c` and the `?`/`F1` help overlay are terminal-only:
-  in a desktop window those keys are text you are typing, so the same actions
-  live on the menus, the toolbar and the right-click menus instead. What the
-  keyboard does do globally is **F5** or **Ctrl+Enter** (run the request),
-  **Ctrl+S** / **Ctrl+Shift+S** (save / save as), **Ctrl+W** (close the tab)
-  and **Alt+F** (open the File menu).
+- **The focused request list is keyboard-driven.** With the Requests panel
+  focused, the **arrow keys** move the selection (**Home**/**End** jump to the
+  first/last request), **Enter** runs it, **F2** renames it and **Delete**
+  deletes it (asking first unless you turn the *Confirm deleting a request*
+  preference off; **Ctrl+Z** undoes the deletion). A Workspace tab's list is a
+  filesystem tree of mixed row kinds, so it stays mouse-driven.
+- **Most single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
+  `n`, `b`, `x`, `u` and `m`/`c` are terminal-only: in a desktop window those
+  keys are text you are typing, so the same actions live on the menus, the
+  toolbar and the right-click menus instead (the arrow-key list navigation above
+  covers select/run/rename/delete). What the keyboard *does* do globally is
+  **F5** or **Ctrl+Enter** (run the request), **Ctrl+S** / **Ctrl+Shift+S**
+  (save / save as), **Ctrl+W** (close the tab), **Ctrl+Z** (undo delete
+  request), **Alt+F** (open the File menu) and **F1** (the shortcuts overlay).
+- **Press F1** — or use **Help ▸ Keyboard Shortcuts** — for a grouped overlay
+  of every GUI shortcut, the graphical counterpart to the terminal UI's `?`/`F1`
+  help. Menu items that have a shortcut show it next to their name.
 - **Panels are resized by dragging** their splitters, rather than with keyboard
   shortcuts.
 - **Results columns are resized by dragging** the border between two header
@@ -588,8 +599,10 @@ triggers a load attempt for it, same as on initial file load.
 ## Keyboard shortcuts
 
 These are the **terminal UI's** keys; the graphical front-end uses menus for
-most of them (see [Graphical UI](#graphical-ui)). Open the in-app help
-overlay any time with `?` or `F1` for the full, up-to-date list. Highlights:
+most of them, plus arrow-key navigation in the focused request list and an
+**F1** shortcuts overlay of its own (see [Graphical UI](#graphical-ui)). Open
+the terminal UI's in-app help overlay any time with `?` or `F1` for the full,
+up-to-date list. Highlights:
 
 | Key | Action |
 |---|---|
