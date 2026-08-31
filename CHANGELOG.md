@@ -195,7 +195,95 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   with the terminal UI, so a request deleted from either front-end can be
   brought back from either.
 
+- **A report's Results columns can be resized by dragging their borders.** The
+  grid sizes every column automatically — a wide body or a long file path is
+  cut to fit the window, with the full value on hover or in the cell viewer —
+  which is the right default but leaves no way to say "I want to read *this*
+  column and I don't mind the rest getting narrow". Hovering the border between
+  two header cells now shows a resize cursor, and dragging it sets that column's
+  width by hand; double-clicking the border hands the column back to the
+  automatic fitter. A hand-set column is taken out of the fit entirely — it
+  keeps exactly the width you gave it while the untouched columns go on sharing
+  what is left, so widening one column never quietly reshapes its neighbours —
+  and if the widths you pin add up to more than the window, the table scrolls
+  sideways rather than crushing anything back below a legible minimum. The
+  widths are remembered per report view for as long as the columns stay the
+  same, and are dropped automatically when a different report (or a re-run that
+  produces different columns) makes a width pinned to the old columns
+  meaningless.
+
 ### Fixed
+
+- **Two Postman folders that log in as different users no longer share one
+  token.** PaperBoy replaces an OAuth 2.0 configuration with a real token
+  request and reuses that request wherever the same configuration appears, and
+  it decided "the same" from the token URL, the grant type and the client id
+  only. Two folders hitting one identity provider with different credentials
+  therefore collapsed into a single login: the second folder's requests went
+  out authenticated as the *first* folder's user, which looks like a
+  permissions bug in the API rather than an import bug. The username, password
+  and client secret now count towards a configuration's identity.
+
+- **A generated token no longer overwrites a collection variable.** The token
+  request always captured into `access_token`. If the collection already
+  defined a variable of that name — a hand-managed token, very common in
+  exports that used to do this by hand — the capture quietly replaced it part
+  way through the run. Generated names now skip anything already in use.
+
+- **A Postman request whose name contains a newline no longer imports as two
+  requests.** The name becomes the `# title` comment above the request, and
+  everything after the newline landed on its own line below it, where the Hurl
+  parser read it as the start of a second, runnable request. Titles are now
+  flattened to a single line, which also covers a multi-line name pasted into
+  the request wizard.
+
+- **A commented-out line in a Postman test script no longer creates a
+  capture.** The scan for `pm.environment.set(...)` looked at the script as
+  plain text, so a call inside `//`, inside `/* */` or quoted in a string
+  produced a capture that then rewrote the value later requests were sent
+  with. Comments and string literals are now skipped.
+
+- **GraphQL variables given as an object are no longer dropped.** Postman
+  usually stores them as a JSON string, and the importer insisted on that; an
+  export that stored the real object produced a request with no variables at
+  all, which the server rejects for a reason that points nowhere near the
+  import.
+
+- **URLs are no longer lost or truncated on import.** A URL that Postman kept
+  only as structured pieces (no raw text) imported as an empty URL; an enabled
+  query parameter present in the pieces but missing from the raw text was
+  dropped; and a `#` in the URL silently truncated it, because Hurl reads the
+  rest as a comment. The pieces are now rebuilt into a URL, missing parameters
+  are merged back in once, and a fragment is removed with a note saying so.
+
+- **An imported AWS signature no longer sends an empty region**, and the note
+  on an API key sent as a header no longer describes it as a query parameter.
+
+- **The Postman API key is no longer handed to a redirect target.** Imports
+  followed redirects with libcurl, which strips `Authorization` on a hop to
+  another host but re-sends custom headers — and the key travels in
+  `x-api-key`. Redirects are now followed by hand and a cross-origin hop is
+  refused rather than trusted.
+
+- **A failed Postman API call no longer panics on a non-ASCII error body**, a
+  long non-ASCII request name no longer aborts the whole import with a
+  filename the filesystem refuses, and listing a workspace's items gives up
+  after a bounded number of pages instead of following a broken cursor
+  forever.
+
+- **The headless runner counts a repeated request once.** With
+  `[Options] repeat`, the progress counter ran past the total (`[3/2]`) and the
+  summary reported more results than requests. Each request now contributes one
+  result, and it only passes if every one of its runs passed.
+
+- **A session saved by a newer build loses one field, not the session.** Two
+  fields nested inside a saved request — a form field's kind and a comment's
+  anchor — were not covered by the lenient reader, so an unrecognised value
+  discarded every tab, collection and environment instead of just that field.
+
+- **An error message no longer loses its detail.** The tidy-up that removes a
+  trailing `(os error 2)` matched anywhere in the text, so
+  `load failed (os error 2) for config(prod)` was cut back to `load failed`.
 
 - **Filtering the Environments panel and then pressing Tab no longer takes the
   keyboard hostage.** `/` puts that panel into a typing mode, and Tab is

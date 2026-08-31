@@ -144,6 +144,12 @@ fn de_method<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 #[derive(Default)]
 struct Url {
     raw: String,
+    /// The `#fragment` cut off `raw`, kept only so the import can say it went.
+    /// A fragment is not sent to the server — Postman doesn't send it either —
+    /// and a `#` on a Hurl request line starts a comment, so leaving it in the
+    /// URL meant the rest of the line vanished the next time the file was
+    /// read, taking any query parameters after it with it.
+    fragment: String,
     /// Declared path variables, in declaration order. Empty for the bare-string
     /// form of a URL, which has nowhere to put them.
     variables: Vec<Param>,
@@ -154,21 +160,118 @@ struct Url {
     queries: Vec<Param>,
 }
 
+/// Join a Postman URL part that may be a list (`host: ["api","example","com"]`)
+/// or already a single string (`host: "api.example.com"`).
+fn join_parts(v: Option<&Value>, sep: &str) -> String {
+    match v {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|p| match p {
+                Value::String(s) => s.clone(),
+                // A path segment can be an object carrying a `:variable`.
+                Value::Object(o) => o
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                other => other.as_str().unwrap_or_default().to_string(),
+            })
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(sep),
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Rebuild a URL from the pieces Postman also stores it in.
+///
+/// `raw` is normally present and authoritative, but it is only a *cache* of
+/// `protocol`/`host`/`path`/`port`; an export written by a script, or an older
+/// or hand-edited one, can carry the pieces and no `raw` at all. Reading `raw`
+/// alone then produced a request with **no URL whatsoever** — the whole target
+/// silently gone — so the pieces are the fallback.
+fn url_from_parts(m: &serde_json::Map<String, Value>) -> String {
+    let host = join_parts(m.get("host"), ".");
+    if host.is_empty() {
+        return String::new();
+    }
+    let mut url = String::new();
+    let protocol = m.get("protocol").and_then(Value::as_str).unwrap_or("");
+    if !protocol.is_empty() {
+        url.push_str(protocol);
+        url.push_str("://");
+    }
+    url.push_str(&host);
+    if let Some(port) = m
+        .get("port")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+    {
+        url.push(':');
+        url.push_str(port);
+    }
+    let path = join_parts(m.get("path"), "/");
+    if !path.is_empty() {
+        if !path.starts_with('/') {
+            url.push('/');
+        }
+        url.push_str(&path);
+    }
+    url
+}
+
+/// Add any *enabled* query parameter that `raw` doesn't already carry.
+///
+/// Postman keeps `raw` and `query[]` in step, so normally there is nothing to
+/// do and `raw` wins. When they disagree — a stale or scripted export — the
+/// parameter listed only in `query[]` used to be dropped on the assumption
+/// that `raw` already had it, which silently changed the request. Matching on
+/// the parameter *name* means a parameter that is in both is never duplicated.
+fn merge_enabled_queries(raw: &str, queries: &[Param]) -> String {
+    let existing: Vec<&str> = raw
+        .split_once('?')
+        .map(|(_, q)| {
+            q.split('&')
+                .map(|p| p.split_once('=').map_or(p, |(k, _)| k))
+                .collect()
+        })
+        .unwrap_or_default();
+    let missing: Vec<String> = queries
+        .iter()
+        .filter(|q| !q.disabled && !q.key.trim().is_empty())
+        .filter(|q| !existing.contains(&q.key.as_str()))
+        .map(|q| {
+            if q.value.is_empty() {
+                q.key.clone()
+            } else {
+                format!("{}={}", q.key, q.value)
+            }
+        })
+        .collect();
+    if missing.is_empty() {
+        return raw.to_string();
+    }
+    let sep = if raw.contains('?') { '&' } else { '?' };
+    format!("{raw}{sep}{}", missing.join("&"))
+}
+
 /// A Postman URL is a bare string or an object with a `raw` field; anything
 /// else imports as an empty URL rather than failing the whole collection.
 fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
     Ok(match Value::deserialize(d)? {
-        Value::String(s) => Url {
-            raw: s,
-            variables: Vec::new(),
-            queries: Vec::new(),
-        },
+        Value::String(s) => {
+            let (raw, fragment) = split_fragment(&s);
+            Url {
+                raw,
+                fragment,
+                variables: Vec::new(),
+                queries: Vec::new(),
+            }
+        }
         Value::Object(m) => Url {
-            raw: m
-                .get("raw")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            raw: String::new(),
+            fragment: String::new(),
             variables: m
                 .get("variable")
                 .cloned()
@@ -179,9 +282,38 @@ fn de_url<'de, D: Deserializer<'de>>(d: D) -> Result<Url, D::Error> {
                 .cloned()
                 .and_then(|v| serde_json::from_value::<Vec<Param>>(v).ok())
                 .unwrap_or_default(),
-        },
+        }
+        .with_raw_from(&m),
         _ => Url::default(),
     })
+}
+
+/// Split a URL into the part that is sent and the `#fragment` that isn't.
+/// Only the first `#` counts, and a URL that is nothing but a fragment is left
+/// alone — that is a template, not an address.
+fn split_fragment(url: &str) -> (String, String) {
+    match url.find('#') {
+        Some(0) | None => (url.to_string(), String::new()),
+        Some(i) => (url[..i].to_string(), url[i..].to_string()),
+    }
+}
+
+impl Url {
+    /// Fill in `raw` from the object form: `raw` when it has one, otherwise
+    /// rebuilt from the pieces, then topped up with any enabled query
+    /// parameter the text is missing, then split from its fragment.
+    fn with_raw_from(mut self, m: &serde_json::Map<String, Value>) -> Self {
+        let raw = m.get("raw").and_then(Value::as_str).unwrap_or("").trim();
+        let base = if raw.is_empty() {
+            url_from_parts(m)
+        } else {
+            raw.to_string()
+        };
+        let (kept, fragment) = split_fragment(&merge_enabled_queries(&base, &self.queries));
+        self.raw = kept;
+        self.fragment = fragment;
+        self
+    }
 }
 
 /// `basic` (→ `basic_auth`), `bearer` (→ a `Bearer` header), `apikey` (→ a
@@ -255,8 +387,12 @@ struct FileBody {
 struct GraphQl {
     #[serde(deserialize_with = "de_str")]
     query: String,
-    /// Held as a *string* of JSON, not as JSON.
-    #[serde(deserialize_with = "de_str")]
+    /// Held as a *string* of JSON, not as JSON — but not always: an export
+    /// written by anything other than Postman itself may put the object
+    /// straight in. `de_str` coerced that to an empty string, so the request
+    /// went out with its query and **no variables at all** — an operation with
+    /// unbound arguments, silently. [`de_json_str`] takes either shape.
+    #[serde(deserialize_with = "de_json_str")]
     variables: String,
 }
 
@@ -297,6 +433,18 @@ struct Param {
 /// first type error, and [`convert_postman`] answers a failed parse with an
 /// empty collection, being strict here silently emptied entire workspaces. So
 /// scalars stringify and structures become empty rather than fatal.
+/// A field that is a JSON *string* of JSON, or the JSON itself. An object or
+/// array is re-serialized to the string form the caller expects; anything else
+/// follows [`de_str`].
+fn de_json_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        v @ (Value::Object(_) | Value::Array(_)) => v.to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    })
+}
+
 fn de_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(match Value::deserialize(d)? {
         Value::String(s) => s,
@@ -683,12 +831,24 @@ impl OAuth2 {
     /// configuration rather than referring to a shared one, so without this a
     /// collection with the same credentials on six folders would fetch six
     /// identical tokens.
+    ///
+    /// **Every field the token depends on has to be in here.** The credentials
+    /// were once left out on the grounds that the endpoint and client
+    /// identified the token — but a `password` grant's token *is* the user, and
+    /// one client app with several test users is the normal shape of such a
+    /// collection. Two folders logging in as different people therefore shared
+    /// one token request, and every request in the second folder quietly went
+    /// out as the first folder's user. The same omission merged two
+    /// `client_credentials` blocks that shared a `client_id` but not a secret.
     fn identity(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             self.access_token_url,
             self.grant_type,
             self.client_id,
+            self.client_secret,
+            self.username,
+            self.password,
             self.scope,
             self.client_authentication
         )
@@ -716,10 +876,28 @@ impl OAuthTokens {
     /// the endpoint's own JSON uses and the one anybody reading the collection
     /// will expect; later ones are numbered rather than named after the folder,
     /// because a folder can be renamed and the variable would then lie.
-    fn next_var(&self) -> String {
-        match self.issued.len() {
-            0 => "access_token".to_string(),
-            n => format!("access_token_{}", n + 1),
+    ///
+    /// `taken` is every variable the collection already defines. A capture
+    /// writes its variable at run time, so reusing a name the collection had
+    /// meant the token request silently overwrote the user's own
+    /// `access_token` — a name common enough that the collision is likely
+    /// rather than exotic. Skipping past those names keeps both.
+    fn next_var(&self, taken: &[(String, String)]) -> String {
+        let used = |name: &str| {
+            taken.iter().any(|(k, _)| k == name) || self.issued.iter().any(|(_, v)| v == name)
+        };
+        if self.issued.is_empty() && !used("access_token") {
+            return "access_token".to_string();
+        }
+        // The second token is `access_token_2`, so start from the count (never
+        // below 1) and step forward until the name is free.
+        let mut n = self.issued.len().max(1);
+        loop {
+            n += 1;
+            let candidate = format!("access_token_{n}");
+            if !used(&candidate) {
+                return candidate;
+            }
         }
     }
 }
@@ -801,7 +979,7 @@ fn apply_oauth2(
         match tokens.var_for(&identity) {
             Some(var) => var.to_string(),
             None => {
-                let var = tokens.next_var();
+                let var = tokens.next_var(&out.variables);
                 let (token_entry, missing) = token_request(&cfg, &var, path);
                 if missing {
                     note(
@@ -1086,9 +1264,21 @@ fn note_losses(
                 .into(),
         );
     }
+    if !req.url.fragment.is_empty() {
+        note(format!(
+            "the URL fragment `{}` was left off: a fragment is never sent to the server (Postman \
+             doesn't send it either), and a `#` on the request line would comment out the rest \
+             of the URL",
+            req.url.fragment
+        ));
+    }
+    // Must match `map_request`'s routing exactly: it sends the key to a query
+    // parameter only for `in: "query"` and to a header otherwise, so testing
+    // "anything that isn't a header" here told the user their key was in the
+    // query string when it wasn't.
     if let Some(auth) = auth
         && auth.kind == "apikey"
-        && !matches!(Auth::field(&auth.apikey, "in").as_str(), "" | "header")
+        && Auth::field(&auth.apikey, "in") == "query"
     {
         note("API-key auth is sent in the query string; it was added as a query parameter".into());
     }
@@ -1214,7 +1404,11 @@ fn map_request(
                 // guess would be worse than no guess.
                 let mut provider = "aws:amz".to_string();
                 let (region, service) = (f("region"), f("service"));
-                if !region.trim().is_empty() || !service.trim().is_empty() {
+                // The suffix needs the region: `aws:amz::s3` names an *empty*
+                // region, which is a worse guess than none at all — the point
+                // of leaving it off is to let curl infer both from the
+                // hostname. So a service without a region is dropped too.
+                if !region.trim().is_empty() {
                     provider.push(':');
                     provider.push_str(region.trim());
                     if !service.trim().is_empty() {
@@ -1362,22 +1556,126 @@ fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
     if script.is_empty() {
         return Vec::new();
     }
+    // Read the script as code, not as text: a `pm.environment.set(...)` line
+    // someone commented out is a capture they explicitly turned *off*, and one
+    // quoted inside a string is documentation. Matching those produced a
+    // capture that runs — and because captures feed the variables later
+    // requests interpolate, a spurious `token` capture changes the bytes those
+    // requests send. A wrong capture is far worse than a missing one.
+    let (code, in_string) = strip_js_noise(&script);
+
     // Response-body variable name(s); default to the near-universal `jsonData`
     // when the script assigns the body to nothing we recognise.
     let mut roots: Vec<String> = JSON_VAR_RE
-        .captures_iter(&script)
+        .captures_iter(&code)
         .map(|c| c[1].to_string())
         .collect();
     if roots.is_empty() {
         roots.push("jsonData".to_string());
     }
     SET_RE
-        .captures_iter(&script)
+        .captures_iter(&code)
+        .filter(|c| {
+            // The call itself must be code. Its *arguments* are quoted, so
+            // only the position the match starts at can be judged.
+            c.get(0)
+                .is_some_and(|m| !in_string.get(m.start()).copied().unwrap_or(false))
+        })
         .filter_map(|c| {
             let path = accessor_to_jsonpath(c[2].trim(), &roots)?;
             Some((c[1].to_string(), format!("jsonpath \"{path}\"")))
         })
         .collect()
+}
+
+/// Blank out JavaScript comments and report which bytes sit inside a string
+/// literal.
+///
+/// The returned text is the same length as the input — comments become spaces,
+/// keeping newlines — so a match offset in it means the same thing in the
+/// original. The scanner is deliberately small: it understands `//`, `/* */`,
+/// `'`/`"`/backtick strings and backslash escapes, which is everything needed
+/// to tell "this call is real code" from "this call is text". It does not try
+/// to be a JavaScript parser — a regex over a scripting language is a
+/// heuristic either way, and the point here is only to stop the obvious
+/// false positives.
+///
+/// A regex literal (`/foo/`) is not recognised, so its contents are read as
+/// code; that can only ever cause a `pm...set(...)` *inside a regex* to be
+/// picked up, which is not a thing anybody writes.
+fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
+    #[derive(PartialEq)]
+    enum St {
+        Code,
+        Line,
+        Block,
+        Str(char),
+    }
+    let mut out = String::with_capacity(script.len());
+    let mut in_string = Vec::with_capacity(script.len());
+    let mut st = St::Code;
+    let mut escaped = false;
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        let (keep, quoted) = match st {
+            St::Code => match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    st = St::Line;
+                    (false, false)
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    st = St::Block;
+                    (false, false)
+                }
+                '\'' | '"' | '`' => {
+                    st = St::Str(c);
+                    escaped = false;
+                    (true, true)
+                }
+                _ => (true, false),
+            },
+            St::Line => {
+                if c == '\n' {
+                    st = St::Code;
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+            St::Block => {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    // Consume the `/` too, as a blank.
+                    chars.next();
+                    out.push(' ');
+                    in_string.push(false);
+                    st = St::Code;
+                }
+                (c == '\n', false)
+            }
+            St::Str(delim) => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == delim || (c == '\n' && delim != '`') {
+                    // An unterminated quote at end of line is a typo, not a
+                    // string that swallows the rest of the file.
+                    st = St::Code;
+                }
+                (true, true)
+            }
+        };
+        // A blanked character becomes a single space, which can shorten
+        // `out` — that is fine, because the flags are pushed to match `out`,
+        // and `out` is what the regexes are run over.
+        let ch = if keep { c } else { ' ' };
+        out.push(ch);
+        for _ in 0..ch.len_utf8() {
+            in_string.push(quoted);
+        }
+    }
+    debug_assert_eq!(out.len(), in_string.len());
+    (out, in_string)
 }
 
 /// Convert a JS accessor chain rooted at one of `roots`
@@ -2838,5 +3136,223 @@ mod field_tolerance_tests {
         assert_eq!(out.notes.len(), 1);
         assert!(out.notes[0].item.is_empty());
         assert!(out.notes[0].detail.contains("could not be read"));
+    }
+
+    // ---- regressions found by the Postman-conversion review ---------------
+
+    /// One request carrying `auth`, for the auth-shape regressions below.
+    fn with_auth(auth: &str) -> ConvertedCollection {
+        convert_postman(&format!(
+            r#"{{
+              "info": {{ "name": "d", "schema": "https://schema.getpostman.com/..v2.1.0" }},
+              "item": [ {{ "name": "r", "request": {{ "method": "GET",
+                "url": "https://api.example.com/v1/x", "auth": {auth} }} }} ]
+            }}"#
+        ))
+    }
+
+    /// Two folders that log in as *different users* must not share one token.
+    /// The token identity left the credentials out, so the second folder's
+    /// requests silently went out as the first folder's user.
+    #[test]
+    fn two_users_on_one_client_each_get_their_own_token() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"Alice","auth":{"type":"oauth2","oauth2":[
+            {"key":"accessTokenUrl","value":"https://id/t"},
+            {"key":"grant_type","value":"password"},
+            {"key":"clientId","value":"cli"},
+            {"key":"username","value":"alice"},
+            {"key":"password","value":"alice-pw"}]},
+            "item":[{"name":"me","request":{"method":"GET","url":"https://h/me"}}]},
+          {"name":"Bob","auth":{"type":"oauth2","oauth2":[
+            {"key":"accessTokenUrl","value":"https://id/t"},
+            {"key":"grant_type","value":"password"},
+            {"key":"clientId","value":"cli"},
+            {"key":"username","value":"bob"},
+            {"key":"password","value":"bob-pw"}]},
+            "item":[{"name":"me","request":{"method":"GET","url":"https://h/me"}}]}]}"#;
+        let c = convert_postman(json);
+        let tokens: Vec<_> = c
+            .entries
+            .iter()
+            .filter(|e| e.title.ends_with("Get access token"))
+            .collect();
+        assert_eq!(tokens.len(), 2, "one token request per user");
+        let users: Vec<&str> = tokens
+            .iter()
+            .filter_map(|t| t.form_fields.iter().find(|f| f.key == "username"))
+            .map(|f| f.value.as_str())
+            .collect();
+        assert_eq!(users, vec!["alice", "bob"]);
+        let bob = c.entries.iter().find(|e| e.title == "Bob/me").unwrap();
+        let alice = c.entries.iter().find(|e| e.title == "Alice/me").unwrap();
+        let token_of = |e: &HurlEntry| {
+            e.headers
+                .iter()
+                .find(|h| h.key == "Authorization")
+                .map(|h| h.value.clone())
+                .unwrap_or_default()
+        };
+        assert_ne!(
+            token_of(bob),
+            token_of(alice),
+            "each user's requests use their own captured token"
+        );
+    }
+
+    /// The generated capture must not overwrite a variable the collection
+    /// already defines: a capture is written at run time, so reusing the name
+    /// silently replaced the user's own value.
+    #[test]
+    fn a_generated_token_never_takes_a_variable_name_already_in_use() {
+        let json = r#"{"info":{"name":"d","schema":"x"},
+          "variable":[{"key":"access_token","value":"a-preset-value"}],
+          "item":[{"name":"F","auth":{"type":"oauth2","oauth2":[
+            {"key":"accessTokenUrl","value":"https://id/t"},
+            {"key":"grant_type","value":"client_credentials"},
+            {"key":"clientId","value":"cli"}]},
+            "item":[{"name":"x","request":{"method":"GET","url":"https://h/x"}}]}]}"#;
+        let c = convert_postman(json);
+        let tok = c
+            .entries
+            .iter()
+            .find(|e| e.title.ends_with("Get access token"))
+            .unwrap();
+        let captured = &tok.captures[0].0;
+        assert_ne!(
+            captured, "access_token",
+            "the user's variable is left alone"
+        );
+        assert!(
+            c.variables
+                .iter()
+                .any(|(k, v)| k == "access_token" && v == "a-preset-value"),
+            "and still holds its value"
+        );
+        let req = c.entries.iter().find(|e| e.title == "F/x").unwrap();
+        assert!(
+            req.headers
+                .iter()
+                .any(|h| h.key == "Authorization" && h.value.contains(captured)),
+            "the request uses the generated name"
+        );
+    }
+
+    /// A `pm.environment.set` that was commented out is a capture the script's
+    /// author turned off. Running it anyway changes the variables later
+    /// requests interpolate — a wrong capture is worse than a missing one.
+    #[test]
+    fn a_commented_out_capture_is_not_a_capture() {
+        let script = r#"[
+            "// pm.environment.set(\"token\", jsonData.secret)",
+            "/* pm.environment.set(\"blocked\", jsonData.b) */",
+            "console.log(\"pm.environment.set('quoted', jsonData.c)\")",
+            "pm.environment.set(\"real\", jsonData.ok)"
+        ]"#;
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"t","request":{{"method":"GET","url":"https://h/x"}},
+               "event":[{{"listen":"test","script":{{"exec":{script}}}}}]}}]}}"#
+        );
+        let e = import_postman(&json);
+        let names: Vec<&str> = e[0].captures.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["real"], "only the live call is captured");
+    }
+
+    /// GraphQL variables are normally a string of JSON, but an export can put
+    /// the object straight in — which used to send the operation with no
+    /// variables bound at all.
+    #[test]
+    fn graphql_variables_given_as_an_object_are_kept() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"gql","request":{"method":"POST","url":"https://h/graphql",
+            "body":{"mode":"graphql","graphql":{
+              "query":"query($id:ID!){user(id:$id){name}}",
+              "variables":{"id":"42"}}}}}]}"#;
+        let e = import_postman(json);
+        let body = e[0].body_src.clone().unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(sent["variables"]["id"], "42");
+    }
+
+    /// A URL stored only as its pieces still has to import as a URL; reading
+    /// `raw` alone lost the whole target of the request.
+    #[test]
+    fn a_url_kept_only_as_pieces_is_rebuilt() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"s","request":{"method":"GET","url":{
+            "protocol":"https","host":["api","example","com"],"port":"8443",
+            "path":["v1","users"],"query":[{"key":"page","value":"2"}]}}}]}"#;
+        let e = import_postman(json);
+        assert_eq!(e[0].url, "https://api.example.com:8443/v1/users?page=2");
+    }
+
+    /// When `raw` and `query[]` disagree, an enabled parameter listed only in
+    /// `query[]` used to be dropped on the assumption `raw` already had it.
+    #[test]
+    fn an_enabled_query_missing_from_the_url_text_is_added_once() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"d","request":{"method":"GET","url":{
+            "raw":"https://h/y?page=1",
+            "query":[{"key":"page","value":"1"},{"key":"token","value":"abc"}]}}}]}"#;
+        let e = import_postman(json);
+        assert_eq!(
+            e[0].url, "https://h/y?page=1&token=abc",
+            "the missing one is added, the shared one is not duplicated"
+        );
+    }
+
+    /// A `#` on a Hurl request line starts a comment, so a fragment left in
+    /// the URL took the rest of the line with it on the next read. It is not
+    /// sent to a server anyway — drop it, but say so.
+    #[test]
+    fn a_url_fragment_is_dropped_and_reported() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"h","request":{"method":"GET",
+            "url":"https://h/search?q=hurl#results"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(c.entries[0].url, "https://h/search?q=hurl");
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("#results")),
+            "the loss is reported, not silent: {:?}",
+            c.notes
+        );
+        let back = crate::hurl::parse_hurl(&c.entries[0].to_hurl());
+        assert_eq!(back.len(), 1, "and the file reads back as one request");
+        assert_eq!(back[0].url, "https://h/search?q=hurl");
+    }
+
+    /// `aws:amz::s3` names an *empty* region, which is a worse guess than
+    /// leaving both off and letting curl infer them from the hostname.
+    #[test]
+    fn an_aws_service_without_a_region_is_left_to_curl() {
+        let c = with_auth(
+            r#"{ "type": "awsv4", "awsv4": [
+                 { "key": "accessKey", "value": "AKIA1" },
+                 { "key": "service", "value": "s3" } ] }"#,
+        );
+        let sigv4 = c.entries[0]
+            .options
+            .iter()
+            .find(|o| o.key == "aws-sigv4")
+            .map(|o| o.value.clone());
+        assert_eq!(sigv4.as_deref(), Some("aws:amz"));
+    }
+
+    /// The note has to describe what the conversion actually did: the key only
+    /// goes to the query string for `in: "query"`.
+    #[test]
+    fn an_api_key_sent_as_a_header_is_not_announced_as_a_query_parameter() {
+        let c = with_auth(
+            r#"{ "type": "apikey", "apikey": [
+                 { "key": "key", "value": "X-Api-Key" },
+                 { "key": "value", "value": "secret" },
+                 { "key": "in", "value": "cookie" } ] }"#,
+        );
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("query")),
+            "no query-string claim for a key that went to a header: {:?}",
+            c.notes
+        );
     }
 }

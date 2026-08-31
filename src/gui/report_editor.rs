@@ -165,6 +165,12 @@ pub struct ReportEditor {
     /// that produced it — the keys are row indices, which mean nothing once the
     /// rows change.
     results_textures: std::collections::HashMap<(usize, String), egui::TextureHandle>,
+    /// Manual per-column widths for the results grid: the widths the reader has
+    /// pinned by dragging a column border, keyed by column header name. Empty
+    /// until a border is dragged, and cleared automatically when the set of
+    /// columns changes (see [`ColumnWidths`]). Transient view state, like the
+    /// filter and the open drill-down beside it.
+    results_col_widths: ColumnWidths,
     /// When `Some`, a node-configure wizard (request / envs / files) is open as
     /// a modal over the blocks view.
     pub wizard: Option<super::report_wizard::Wizard>,
@@ -312,6 +318,7 @@ impl ReportEditor {
             source_find: None,
             results_detail: None,
             results_textures: std::collections::HashMap::new(),
+            results_col_widths: ColumnWidths::default(),
             wizard: None,
             diag_h: 132.0,
             summary_h: 240.0,
@@ -2419,11 +2426,14 @@ fn dry_run_body(
         return None;
     }
     // `None` states: a dry run has no streaming progress, so the grid draws
-    // without status icons, exactly like a finished run.
+    // without status icons, exactly like a finished run. `None` overrides too:
+    // a preview is transient and shares no state with the real run's table, so
+    // its columns aren't resizable — there is nothing to keep the widths in.
     let (preview_grid_cols, preview_detail_cols) = crate::report::detail::split_columns(&columns);
     let mut none = None;
     if let Some(ins) = results_grid(
         &th,
+        s,
         ui,
         &preview.result,
         &preview_grid_cols,
@@ -2431,6 +2441,7 @@ fn dry_run_body(
         None,
         &preview_detail_cols,
         &mut none,
+        None,
     ) {
         opened = Some(ins);
     }
@@ -3878,6 +3889,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         ui.allocate_ui(egui::vec2(ui.available_width(), grid_h), |ui| {
             inspector = results_grid(
                 &th,
+                &app.strings,
                 ui,
                 result,
                 &grid_columns,
@@ -3885,6 +3897,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
                 Some(&visible),
                 &detail_columns,
                 &mut open_detail,
+                Some(&mut ed.results_col_widths),
             );
         });
         if let Some(ins) = inspector {
@@ -3922,6 +3935,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
     let mut none = None;
     if let Some(ins) = results_grid(
         &th,
+        &app.strings,
         ui,
         result,
         &grid_columns,
@@ -3929,6 +3943,7 @@ fn results_view(ed: &mut ReportEditor, app: &mut GuiApp, ui: &mut egui::Ui) {
         None,
         &detail_columns,
         &mut none,
+        Some(&mut ed.results_col_widths),
     ) {
         ed.inspector = Some(ins);
     }
@@ -4593,11 +4608,219 @@ fn fit_column_widths(natural: &[f32], avail: f32, spacing: f32) -> Vec<f32> {
     out.iter().map(|w| w.max(MIN_COL_W)).collect()
 }
 
+/// [`fit_column_widths`] with some columns pinned to a manual width.
+///
+/// A pinned column is taken out of the fitting altogether: it is handed exactly
+/// the width the reader dragged its border to (never below [`MIN_COL_W`]), and
+/// only the room that is left over is shared out among the columns that are
+/// still automatic — by the very same grow / water-fill as before. That is the
+/// least surprising rule: pinning `DFA File path` wide should widen *that*
+/// column and leave its neighbours doing exactly what they were, not quietly
+/// resize them to compensate. It is also why a run of huge pins simply overruns
+/// the window into the caller's horizontal scroll bar rather than crushing the
+/// unpinned columns to slivers — the pins are honoured first, and whatever the
+/// auto columns can't fit into what is left overflows, the same honest outcome
+/// a table with too many columns already has.
+///
+/// `pins` is read positionally and may be shorter than `natural` (or empty), in
+/// which case the missing entries — and any `None` — are treated as automatic.
+fn fit_column_widths_pinned(
+    natural: &[f32],
+    pins: &[Option<f32>],
+    avail: f32,
+    spacing: f32,
+) -> Vec<f32> {
+    let pin = |i: usize| pins.get(i).copied().flatten();
+    if (0..natural.len()).all(|i| pin(i).is_none()) {
+        // Nothing pinned — defer to the original fitter unchanged, so an
+        // untouched table lays out byte-for-byte as it always did.
+        return fit_column_widths(natural, avail, spacing);
+    }
+
+    let n = natural.len();
+    // The gaps sit between every column whether it is pinned or not, so they
+    // come off the top of the budget before anything is shared.
+    let gaps = spacing * (n.saturating_sub(1)) as f32;
+    let pinned_total: f32 = (0..n)
+        .filter_map(|i| pin(i).map(|w| w.max(MIN_COL_W)))
+        .sum();
+    // Whatever is left after the pins and the gaps is what the automatic
+    // columns fit into. It floors at zero when the pins are large; the sub-fit
+    // then bottoms every auto column out at MIN_COL_W and the total overflows,
+    // which is exactly what puts the scroll bar there.
+    let auto_budget = (avail - gaps - pinned_total).max(0.0);
+    let auto_natural: Vec<f32> = (0..n)
+        .filter(|&i| pin(i).is_none())
+        .map(|i| natural[i])
+        .collect();
+    // The gaps were charged above, so the sub-fit runs gap-free over the auto
+    // columns alone.
+    let mut auto_fitted = fit_column_widths(&auto_natural, auto_budget, 0.0).into_iter();
+
+    (0..n)
+        .map(|i| match pin(i) {
+            Some(w) => w.max(MIN_COL_W),
+            None => auto_fitted.next().unwrap_or(MIN_COL_W),
+        })
+        .collect()
+}
+
+/// The manual per-column width overrides for one results table — the widths the
+/// reader has pinned by dragging a column border, if any.
+///
+/// Empty by default: every column follows the automatic fitter until one of its
+/// borders is dragged, at which point that column is *pinned* and taken out of
+/// the fitting (see [`fit_column_widths_pinned`]) while its neighbours go on
+/// sharing what is left exactly as before. Double-clicking the border, or
+/// picking the reset in the header's right-click menu, returns it to automatic.
+///
+/// Keyed by column **header name** rather than by position: the columns a report
+/// emits can be re-ordered by an edit without being a different *set* of
+/// columns, and a width pinned to `DFA File path` should follow that column
+/// wherever it lands rather than staying stuck to slot 3. The whole map is
+/// dropped the moment the set of header names changes — a different report, or a
+/// re-run that produces different columns — because a width pinned against a
+/// column that is no longer there means nothing (see [`Self::reconcile`]). This
+/// state is transient per report view; it is deliberately not persisted to
+/// `state.json`, being tied to one run's particular columns.
+#[derive(Default)]
+struct ColumnWidths {
+    /// header name → pinned width (already floored at [`MIN_COL_W`]).
+    pins: std::collections::HashMap<String, f32>,
+    /// Signature of the header-name *set* the pins were made against, so they
+    /// can be dropped the instant that set changes.
+    columns_sig: u64,
+}
+
+impl ColumnWidths {
+    /// Forget every pin if the set of columns is no longer the one the pins
+    /// were made against. Called once per frame before the widths are read, so
+    /// a pin can never outlive the column it named.
+    fn reconcile(&mut self, columns: &[crate::report::model::OutputColumn]) {
+        let sig = Self::signature(columns);
+        if sig != self.columns_sig {
+            self.pins.clear();
+            self.columns_sig = sig;
+        }
+    }
+
+    /// A hash of the *set* of header names, order-independent, so re-ordering
+    /// the same columns keeps the pins while adding, removing or renaming one
+    /// drops them. XOR-combined per header (the same trick the width cache uses
+    /// for hash-map cells) so the order the columns arrive in doesn't matter;
+    /// FNV keeps it cheap enough to run every frame.
+    fn signature(columns: &[crate::report::model::OutputColumn]) -> u64 {
+        let mut sig = 0u64;
+        for col in columns {
+            sig ^= fnv1a(col.header.as_bytes(), FNV_OFFSET);
+        }
+        sig
+    }
+
+    /// The width pinned for `header`, if the reader has dragged that column.
+    fn pinned(&self, header: &str) -> Option<f32> {
+        self.pins.get(header).copied()
+    }
+
+    /// Pin `header` to `w`, floored at [`MIN_COL_W`] — past that a column shows
+    /// nothing useful, so a drag can shrink a column right down to that floor
+    /// but no further.
+    fn set(&mut self, header: &str, w: f32) {
+        self.pins.insert(header.to_string(), w.max(MIN_COL_W));
+    }
+
+    /// Drop `header`'s pin, returning that column to its automatic width.
+    fn clear(&mut self, header: &str) {
+        self.pins.remove(header);
+    }
+
+    /// The pins in column order, ready for the fitter: `None` wherever a column
+    /// is still automatic.
+    fn per_column(&self, columns: &[crate::report::model::OutputColumn]) -> Vec<Option<f32>> {
+        columns.iter().map(|c| self.pinned(&c.header)).collect()
+    }
+}
+
+/// The catch width, in pixels, of the drag handle on a column border. A
+/// one-pixel border is impossible to land a pointer on, so the hit area is
+/// widened to something catchable — but kept narrow enough that, sitting on the
+/// boundary, it never reaches across into the header text on either side.
+const COL_RESIZE_HANDLE_W: f32 = 6.0;
+
+/// Draw and drive the drag handle that resizes the column whose header cell
+/// occupies `cell_rect`. Returns nothing — it writes straight to `overrides`.
+///
+/// The handle is registered *after* the header cell, so in the sliver where the
+/// two meet egui hands the pointer to the handle (it hit-tests in favour of the
+/// later widget) and the resize cursor wins over the header's own hover text.
+/// Header labels carry no click sense, so nothing the header wanted is taken
+/// from it; the handle is also only [`COL_RESIZE_HANDLE_W`] wide and centred on
+/// the border, so even an interactive header would keep all but that thin strip.
+fn column_resize_handle(
+    ui: &mut egui::Ui,
+    th: &GuiTheme,
+    s: &Strings,
+    overrides: &mut ColumnWidths,
+    columns: &[crate::report::model::OutputColumn],
+    c: usize,
+    cell_rect: egui::Rect,
+    w: f32,
+) {
+    // Interior borders have the grid's inter-column gap to sit in, so the handle
+    // goes dead-centre of that gap where it overlaps neither header. The last
+    // column has no gap after it, so its handle straddles the content's right
+    // edge instead — the conventional spot for the final column's border.
+    let boundary_x = if c + 1 < columns.len() {
+        cell_rect.right() + SPACING_X / 2.0
+    } else {
+        cell_rect.right()
+    };
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(boundary_x - COL_RESIZE_HANDLE_W / 2.0, cell_rect.top()),
+        egui::pos2(boundary_x + COL_RESIZE_HANDLE_W / 2.0, cell_rect.bottom()),
+    );
+    let resp = ui
+        .interact(
+            rect,
+            ui.id().with(("pb_col_resize", c)),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_text(s.gui_report_col_resize_hint);
+    let active = resp.hovered() || resp.dragged();
+    if active {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+    }
+    let header = &columns[c].header;
+    if resp.double_clicked() {
+        // Double-click is the "give it back to the layout" gesture: the column
+        // drops its pin and returns to whatever width the fitter chooses for it.
+        overrides.clear(header);
+    } else if resp.dragged() {
+        // A drag moves the border by however far the pointer travelled this
+        // frame. `w` is the width the column is drawn at right now — its pin if
+        // it has one, otherwise the fitted auto width — so adding the delta pins
+        // it to exactly where the edge has been dragged to, and dragging on from
+        // a pin accumulates rather than jumping. `set` floors it at MIN_COL_W.
+        overrides.set(header, w + resp.drag_delta().x);
+    }
+    if active {
+        // Only drawn while the reader is on it, so the header line stays clean at
+        // rest; the colour is the theme's, brighter while actually dragging.
+        let colour = if resp.dragged() { th.accent } else { th.dim };
+        ui.painter().vline(
+            boundary_x,
+            cell_rect.top()..=cell_rect.bottom(),
+            egui::Stroke::new(1.0, colour),
+        );
+    }
+}
+
 /// Render the results as a scrollable table: a header row, one row per data row
 /// (greyed/marked by its streaming [`RowState`]), then any STATISTICS summary
 /// rows. Mirrors the TUI's `report_grid_lines` semantics.
 fn results_grid(
     th: &GuiTheme,
+    s: &Strings,
     ui: &mut egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
@@ -4605,6 +4828,7 @@ fn results_grid(
     visible: Option<&[usize]>,
     detail_columns: &[&crate::report::model::OutputColumn],
     open_detail: &mut Option<usize>,
+    mut overrides: Option<&mut ColumnWidths>,
 ) -> Option<CellInspector> {
     let show_icons = states.is_some();
     // The expander column is offered only when *some* row has something to
@@ -4617,7 +4841,20 @@ fn results_grid(
         .collect();
     let show_expanders = !expandable.is_empty();
     let mut opened: Option<CellInspector> = None;
-    let widths = fitted_column_widths(ui, result, columns, show_icons);
+    // Drop any pins that no longer name a live column before they are read, so a
+    // width pinned against last run's columns can't leak onto this run's.
+    if let Some(ov) = overrides.as_deref_mut() {
+        ov.reconcile(columns);
+    }
+    // The manual widths in column order (empty when this table isn't resizable —
+    // the dry-run preview and the render tests pass `None`). The natural-width
+    // cache is untouched by this: pins change how the naturals are *fitted*,
+    // which is uncached arithmetic, so `widths_fingerprint` needs no new input.
+    let pin_vec: Vec<Option<f32>> = overrides
+        .as_deref()
+        .map(|ov| ov.per_column(columns))
+        .unwrap_or_default();
+    let widths = fitted_column_widths(ui, result, columns, show_icons, &pin_vec);
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
 
     egui::ScrollArea::both()
@@ -4637,7 +4874,7 @@ fn results_grid(
                     }
                     for (c, col) in columns.iter().enumerate() {
                         let w = widths.get(c).copied().unwrap_or(MIN_COL_W);
-                        cell_slot(ui, w, row_h, |ui| {
+                        let cell_rect = cell_slot(ui, w, row_h, |ui| {
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(&col.header).strong().color(th.accent),
@@ -4646,6 +4883,11 @@ fn results_grid(
                             )
                             .on_hover_text(&col.header);
                         });
+                        // A resize handle straddling this column's border, added
+                        // after the cell so it wins the pointer on the boundary.
+                        if let Some(ov) = overrides.as_deref_mut() {
+                            column_resize_handle(ui, th, s, ov, columns, c, cell_rect, w);
+                        }
                     }
                     ui.end_row();
 
@@ -4914,12 +5156,15 @@ fn paint_tether_hover(ui: &egui::Ui, th: &GuiTheme, anchor: egui::Rect, hanger: 
 const SPACING_X: f32 = 14.0;
 
 /// The width to give each data column of `result` in the space `ui` has left:
-/// what the column would like, fitted to the window by [`fit_column_widths`].
+/// what the column would like, fitted to the window by [`fit_column_widths`],
+/// with any columns the reader has pinned in `pins` taken out of the fit and
+/// given exactly their manual width (see [`fit_column_widths_pinned`]).
 fn fitted_column_widths(
     ui: &egui::Ui,
     result: &ReportResult,
     columns: &[crate::report::model::OutputColumn],
     show_icons: bool,
+    pins: &[Option<f32>],
 ) -> Vec<f32> {
     // The status-glyph column is a fixed narrow gutter, not a data column, so
     // it is taken off the top of the budget rather than shared in it.
@@ -4928,7 +5173,7 @@ fn fitted_column_widths(
     let avail = (ui.available_width() - icon_w).max(0.0);
     // Fitting is pure arithmetic over the naturals, so it stays uncached and
     // the grid still follows the window as it is dragged.
-    fit_column_widths(&natural, avail, SPACING_X)
+    fit_column_widths_pinned(&natural, pins, avail, SPACING_X)
 }
 
 /// [`natural_column_widths`], reused between frames while nothing it depends on
@@ -5024,14 +5269,16 @@ fn widths_fingerprint(
     h.finish()
 }
 
-/// Lay a cell's content out in a slot exactly `w` wide.
+/// Lay a cell's content out in a slot exactly `w` wide, returning the screen
+/// rectangle it was given (so the header row can hang a resize handle off a
+/// cell's border).
 ///
 /// `egui::Grid` sizes a column to its widest cell, so pinning every cell in a
 /// column to the same width is what makes the column that width — and it keeps
 /// the grid's striping and row alignment, which hand-rolling the rows would
 /// throw away. `set_min_size` is the part that matters: without it a short
 /// label would allocate only its own width and the column would collapse.
-fn cell_slot(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) {
+fn cell_slot(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     ui.allocate_ui_with_layout(
         egui::vec2(w, h),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -5039,7 +5286,9 @@ fn cell_slot(ui: &mut egui::Ui, w: f32, h: f32, add: impl FnOnce(&mut egui::Ui))
             ui.set_min_size(egui::vec2(w, h));
             add(ui);
         },
-    );
+    )
+    .response
+    .rect
 }
 
 /// How wide each column would like to be: the width of its header or of its
@@ -13200,9 +13449,12 @@ mod results_table_tests {
 
 #[cfg(test)]
 mod results_render_tests {
-    use super::{MIN_COL_W, SPACING_X, fitted_column_widths, results_grid};
+    use super::{
+        ColumnWidths, MIN_COL_W, SPACING_X, fit_column_widths_pinned, fitted_column_widths,
+        results_grid,
+    };
     use crate::gui::theme::GuiTheme;
-    use crate::i18n::Language;
+    use crate::i18n::{Language, Strings};
     use crate::report::model::{OutputColumn, ReportResult, ReportRow};
     use eframe::egui;
 
@@ -13599,7 +13851,7 @@ mod results_render_tests {
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.set_max_width(avail);
                 ui.set_min_width(avail);
-                widths = fitted_column_widths(ui, result, columns, false);
+                widths = fitted_column_widths(ui, result, columns, false, &[]);
             });
         }
         let span = widths.iter().sum::<f32>() + SPACING_X * (widths.len() as f32 - 1.0);
@@ -13688,10 +13940,142 @@ mod results_render_tests {
         let (result, columns) = fixture(&["A", "B", "C"], &["1", "2", "3"], 2);
         let ctx = egui::Context::default();
         let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.set_max_width(1.0);
             let mut none = None;
-            results_grid(&th, ui, &result, &columns, None, None, &[], &mut none);
+            results_grid(
+                &th,
+                &s,
+                ui,
+                &result,
+                &columns,
+                None,
+                None,
+                &[],
+                &mut none,
+                None,
+            );
+        });
+    }
+
+    /// The whole point of pinning: the column the reader sized stays exactly
+    /// that wide, and the untouched columns re-fit into the room that is left
+    /// rather than being dragged along with it.
+    #[test]
+    fn a_pinned_column_keeps_its_width_while_the_others_refit() {
+        // Three equal naturals in a window with room to spare: unpinned they
+        // would each grow to a third of the budget. Pin the first narrow and
+        // the other two must share what is left between just the two of them.
+        let natural = [100.0, 100.0, 100.0];
+        let auto = fit_column_widths_pinned(&natural, &[], 900.0, 0.0);
+        let pinned = fit_column_widths_pinned(&natural, &[Some(60.0), None, None], 900.0, 0.0);
+        assert!(
+            (pinned[0] - 60.0).abs() < 0.01,
+            "the pinned column is exactly its manual width, not its share: {pinned:?}"
+        );
+        assert!(
+            pinned[1] > auto[1] && pinned[2] > auto[2],
+            "the room the pin gave up is handed to the columns still fitting: {pinned:?} vs {auto:?}"
+        );
+        assert!(
+            (pinned[1] - pinned[2]).abs() < 0.01,
+            "and those two, being equal, still share it equally: {pinned:?}"
+        );
+    }
+
+    /// A drag can shrink a column right down to the floor, but a pin below it is
+    /// clamped — past MIN_COL_W a column shows nothing worth showing.
+    #[test]
+    fn a_pin_below_the_minimum_is_clamped() {
+        let natural = [200.0, 200.0];
+        let widths = fit_column_widths_pinned(&natural, &[Some(5.0), None], 800.0, 0.0);
+        assert!(
+            (widths[0] - MIN_COL_W).abs() < 0.01,
+            "the pin is floored at the minimum rather than vanishing: {widths:?}"
+        );
+    }
+
+    /// Pins are keyed to the columns they were made against, so a run that
+    /// produces a different set of columns drops them rather than mapping a
+    /// width onto a column the reader never touched.
+    #[test]
+    fn a_pin_is_dropped_when_the_columns_change() {
+        let (_, first) = fixture(&["A", "B"], &["1", "2"], 1);
+        let (_, reordered) = fixture(&["B", "A"], &["2", "1"], 1);
+        let (_, different) = fixture(&["A", "C"], &["1", "3"], 1);
+
+        let mut overrides = ColumnWidths::default();
+        overrides.reconcile(&first);
+        overrides.set("A", 250.0);
+        assert_eq!(overrides.pinned("A"), Some(250.0), "the pin is recorded");
+
+        // Re-ordering the same set of names keeps the pin: it follows the
+        // column by name, not by slot.
+        overrides.reconcile(&reordered);
+        assert_eq!(
+            overrides.pinned("A"),
+            Some(250.0),
+            "a pure re-order is the same set of columns, so the pin survives"
+        );
+
+        // A genuinely different set of columns drops every pin.
+        overrides.reconcile(&different);
+        assert_eq!(
+            overrides.pinned("A"),
+            None,
+            "the pin is forgotten once its column set is gone"
+        );
+    }
+
+    /// Pinning columns wider than the window is allowed: the honest outcome is
+    /// horizontal scroll, and the grid must draw it without panicking rather
+    /// than trying to squeeze the pins away.
+    #[test]
+    fn huge_pins_overflow_into_scroll_without_panicking() {
+        // The arithmetic first: two enormous pins in a small window overrun it,
+        // and no column is ever squeezed under the floor.
+        let natural = [100.0, 100.0, 100.0];
+        let widths =
+            fit_column_widths_pinned(&natural, &[Some(500.0), Some(500.0), None], 300.0, 10.0);
+        assert!(
+            (widths[0] - 500.0).abs() < 0.01 && (widths[1] - 500.0).abs() < 0.01,
+            "the pins are honoured in full: {widths:?}"
+        );
+        assert!(
+            widths.iter().all(|w| *w >= MIN_COL_W),
+            "and the auto column still keeps a readable minimum: {widths:?}"
+        );
+        let span = widths.iter().sum::<f32>() + 10.0 * (widths.len() as f32 - 1.0);
+        assert!(
+            span > 300.0,
+            "the overflow is what the scroll bar is for: {span}"
+        );
+
+        // And the grid draws that overflow for real without dividing by zero.
+        let (result, columns) = fixture(&["A", "B", "C"], &["1", "2", "3"], 2);
+        let mut overrides = ColumnWidths::default();
+        overrides.reconcile(&columns);
+        overrides.set("A", 5000.0);
+        overrides.set("B", 5000.0);
+        let ctx = egui::Context::default();
+        let th = GuiTheme::from_spec(&crate::theme::preset_for_language(&Language::English));
+        let s = Strings::for_language(&Language::English);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(200.0);
+            let mut none = None;
+            results_grid(
+                &th,
+                &s,
+                ui,
+                &result,
+                &columns,
+                None,
+                None,
+                &[],
+                &mut none,
+                Some(&mut overrides),
+            );
         });
     }
 }

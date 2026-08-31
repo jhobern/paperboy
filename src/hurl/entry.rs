@@ -45,6 +45,9 @@ pub(crate) const BASE64_FILE_CT_MARKER: &str = "x-paperboy-base64;";
 pub struct FormField {
     pub key: String,
     pub value: String,
+    /// Read leniently: a kind invented by a newer build must cost this one
+    /// field, not the whole saved session. See [`crate::persistence::lenient`].
+    #[serde(default, deserialize_with = "crate::persistence::lenient")]
     pub kind: FormFieldKind,
     pub content_type: Option<String>,
     #[serde(default)]
@@ -397,11 +400,15 @@ pub enum RunStatus {
 /// unrelated lines are added or removed above or below them — e.g. a comment
 /// written just before `[Asserts]` stays just before `[Asserts]`. The variants
 /// are listed in the order [`HurlEntry::to_hurl`] emits their blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CommentAnchor {
     /// Above the entry's title / method line (file- or entry-leading comments).
     Lead,
     /// In the header region, between the request line and the first block.
+    /// Also where an anchor this build doesn't recognise lands, so a comment
+    /// written by a newer version stays with its request instead of failing
+    /// the whole state file.
+    #[default]
     Headers,
     BasicAuth,
     Cookies,
@@ -430,10 +437,30 @@ pub enum CommentAnchor {
 /// [`HurlEntry::to_hurl`] re-emits them at their `anchor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryComment {
+    #[serde(default, deserialize_with = "crate::persistence::lenient")]
     pub anchor: CommentAnchor,
     /// The comment line verbatim, including its leading `#` (e.g. `# note` or a
     /// `#####` banner), so decoration round-trips unchanged.
     pub text: String,
+}
+
+/// Force a string onto a single line, for the places where the Hurl file
+/// format has only one.
+///
+/// A title is written as a `# ` comment directly above the method line, and a
+/// comment ends at the newline. A title containing one therefore didn't stay a
+/// title: everything after the newline landed *below* the `#`, where the
+/// parser reads it as another request's method line. A Postman collection with
+/// a multi-line request name (Postman allows it) imported as a valid-looking
+/// file that grew an extra request out of nothing — and "Run All" would send
+/// it. Collapsing here means the name loses its line break, visibly, rather
+/// than the collection quietly gaining a request.
+pub(crate) fn single_line(s: &str) -> String {
+    if s.contains(['\n', '\r']) {
+        s.replace(['\n', '\r'], " ").trim().to_string()
+    } else {
+        s.trim().to_string()
+    }
 }
 
 /// A single request entry from a Hurl file, or a user-created request.
@@ -903,7 +930,7 @@ impl HurlEntry {
             Some(body.to_string())
         };
         Self {
-            title: name.trim().to_string(),
+            title: single_line(name),
             method: method.to_string(),
             url: url.trim().to_string(),
             headers,
@@ -1061,7 +1088,7 @@ impl HurlEntry {
         }
         if !self.title.trim().is_empty() {
             out.push_str("# ");
-            out.push_str(self.title.trim());
+            out.push_str(&single_line(&self.title));
             out.push('\n');
         }
         let method = if self.method.is_empty() {
@@ -1747,5 +1774,41 @@ mod tests {
 
         let back: HurlEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.body_src.as_deref(), Some("{}"));
+    }
+
+    /// Regression: a request *name* containing a newline used to serialize
+    /// into a second line below the `# ` comment, where the parser reads it as
+    /// another request's method line — so the collection silently grew an
+    /// extra, runnable request, and "Run All" would send it. Postman allows
+    /// multi-line names, so importing one was enough to trigger it.
+    #[test]
+    fn a_name_with_a_newline_cannot_invent_a_second_request() {
+        let e = HurlEntry::from_fields(
+            "line one\nGET http://evil.example.net",
+            "POST",
+            "https://x/y",
+            vec![],
+            "",
+        );
+        let text = e.to_hurl();
+        let back = crate::hurl::parse_hurl(&text);
+        assert_eq!(back.len(), 1, "one request in, one request out:\n{text}");
+        assert_eq!(back[0].url, "https://x/y");
+        assert_eq!(back[0].method, "POST");
+        assert_eq!(
+            back[0].title, "line one GET http://evil.example.net",
+            "the name is kept, just flattened onto its one line"
+        );
+    }
+
+    /// The writer defends the file even when the title was set directly rather
+    /// than through `from_fields` — e.g. renamed in the UI with a pasted value.
+    #[test]
+    fn a_pasted_multi_line_title_still_serializes_to_one_comment() {
+        let mut e = HurlEntry::from_fields("ok", "GET", "https://x/y", vec![], "");
+        e.title = "first\r\nDELETE https://x/z".to_string();
+        let back = crate::hurl::parse_hurl(&e.to_hurl());
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].method, "GET");
     }
 }

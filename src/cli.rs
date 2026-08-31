@@ -184,30 +184,49 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     println!("{}", "─".repeat(60));
 
     let total = entries.len();
-    let mut passed = 0usize;
-    let mut failed = 0usize;
     let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
     let file_root = std::path::Path::new(&collection_path).parent();
 
+    // A request carrying `[Options] repeat`/`retry` reports more than once, so
+    // results can't be handed out one request at a time: each outcome says
+    // which request it came from (`entry_index`), and that is what decides the
+    // title, the `[n/total]` label and which request the result counts
+    // towards. Counting per *outcome* instead used to credit a repeat's later
+    // runs to the requests after it and print a position past the end.
+    //
+    // A request is passed only if every one of its runs passed; one that never
+    // reported at all (the run stopped early) stays `None` and is counted
+    // neither way, so the totals never claim more than actually happened.
+    let mut per_request: Vec<Option<bool>> = vec![None; total];
+    let mut record = |eo: &EntryOutcome| credit(&mut per_request, eo);
+
     let out = if batch {
         let out = run_hurl(&run_content, &vars, file_root);
-        for (idx, eo) in out.entries.iter().enumerate() {
-            print_entry(color, idx, total, titles.get(idx).copied(), eo);
-            if eo.ok { passed += 1 } else { failed += 1 }
+        for eo in out.entries.iter() {
+            print_entry(
+                color,
+                eo.entry_index,
+                total,
+                titles.get(eo.entry_index).copied(),
+                eo,
+            );
+            record(eo);
         }
         out
     } else {
-        let mut idx = 0usize;
         run_hurl_streaming(&run_content, &vars, file_root, |eo| {
-            print_entry(color, idx, total, titles.get(idx).copied(), eo);
-            if eo.ok {
-                passed += 1
-            } else {
-                failed += 1
-            }
-            idx += 1;
+            print_entry(
+                color,
+                eo.entry_index,
+                total,
+                titles.get(eo.entry_index).copied(),
+                eo,
+            );
+            record(eo);
         })
     };
+    let passed = per_request.iter().filter(|r| **r == Some(true)).count();
+    let failed = per_request.iter().filter(|r| **r == Some(false)).count();
 
     if out.entries.is_empty() {
         if let Some(e) = &out.error {
@@ -230,6 +249,15 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     println!();
 
     if failed > 0 { 1 } else { 0 }
+}
+
+/// Record one outcome against the request it came from: passed only if every
+/// run of that request passed. Out-of-range indices are ignored rather than
+/// panicking — the runner is the authority on how many entries there were.
+fn credit(per_request: &mut [Option<bool>], eo: &EntryOutcome) {
+    if let Some(slot) = per_request.get_mut(eo.entry_index) {
+        *slot = Some(slot.unwrap_or(true) && eo.ok);
+    }
 }
 
 /// Print one request's result to stdout, coloured if `color` is enabled.
@@ -361,5 +389,49 @@ mod tests {
         assert_eq!(code, 1, "an empty collection is a failure, not a pass");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a request carrying `[Options] repeat` reports more than
+    /// once. Counting per *outcome* credited the extra runs to the requests
+    /// after it, printed a position past the end (`[3/2]`), and could claim
+    /// more passes than there were requests. Results are keyed by the request
+    /// they came from, and a request passes only if all of its runs did.
+    #[test]
+    fn a_repeated_request_counts_once_and_keeps_its_own_result() {
+        use crate::hurl::run::EntryOutcome;
+        let outcome = |entry_index: usize, ok: bool| EntryOutcome {
+            entry_index,
+            ok,
+            ..EntryOutcome::default()
+        };
+        let mut per_request = vec![None; 2];
+        // Request 0 runs twice (the second run fails), then request 1 runs.
+        for eo in [outcome(0, true), outcome(0, false), outcome(1, true)] {
+            super::credit(&mut per_request, &eo);
+        }
+        assert_eq!(
+            per_request,
+            vec![Some(false), Some(true)],
+            "the repeat's failure sticks to request 0, and request 1 keeps its own pass"
+        );
+        let passed = per_request.iter().filter(|r| **r == Some(true)).count();
+        assert_eq!(passed, 1, "never more passes than there are requests");
+    }
+
+    /// An outcome for a request the collection doesn't have is ignored rather
+    /// than panicking: the runner decides how many entries ran.
+    #[test]
+    fn an_out_of_range_result_is_ignored() {
+        use crate::hurl::run::EntryOutcome;
+        let mut per_request = vec![None; 1];
+        super::credit(
+            &mut per_request,
+            &EntryOutcome {
+                entry_index: 9,
+                ok: true,
+                ..EntryOutcome::default()
+            },
+        );
+        assert_eq!(per_request, vec![None]);
     }
 }

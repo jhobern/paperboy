@@ -35,6 +35,10 @@ pub struct AssertOutcome {
 }
 
 /// The mapped result of running one Hurl entry.
+///
+/// `Default` exists for tests, which mostly care about two or three fields and
+/// would otherwise have to spell out a dozen empty ones to say so.
+#[derive(Default)]
 pub struct EntryOutcome {
     /// Which request in the collection this is the result of (0-based).
     ///

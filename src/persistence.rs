@@ -670,7 +670,14 @@ fn state_path() -> Option<PathBuf> {
 /// invented — a new `EnvSource`, a new form-field kind — used to abort the
 /// entire parse, taking every tab, collection and environment with it. One
 /// unrecognised setting is worth losing; a session is not.
-fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+///
+/// **This has to be applied to every enum reachable from the saved state**, not
+/// just the top-level settings: the enums nested inside a saved request
+/// ([`FormFieldKind`](crate::hurl::entry::FormFieldKind),
+/// [`CommentAnchor`](crate::hurl::entry::CommentAnchor)) are exactly the ones a
+/// new feature is likely to extend, and an unknown value in any one of them
+/// fails the document just as hard.
+pub(crate) fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
@@ -812,5 +819,64 @@ mod tests {
         assert_eq!(state.tabs[0].name, "Coll");
         assert_eq!(state.env_source, EnvSource::default());
         assert_eq!(state.default_request_view, RequestView::default());
+    }
+
+    /// The same forward-compatibility has to hold for the enums *nested inside*
+    /// a saved request, which is where a new feature is most likely to add a
+    /// variant. A form-field kind or comment anchor this build doesn't know
+    /// used to fail the whole document, so one new field type in a newer
+    /// PaperBoy still cost every tab, collection and environment.
+    ///
+    /// Built by serializing a real state and then editing the two enum values,
+    /// so the test can't drift out of step with the rest of the shape.
+    #[test]
+    fn a_form_field_kind_from_a_newer_build_costs_only_that_field() {
+        use crate::hurl::{CommentAnchor, EntryComment, FormField, FormFieldKind};
+        let mut entry =
+            crate::hurl::HurlEntry::from_fields("Upload", "POST", "https://h/x", vec![], "");
+        entry.form_fields = vec![
+            FormField {
+                key: "a".into(),
+                value: "1".into(),
+                kind: FormFieldKind::Text,
+                enabled: true,
+                ..FormField::default()
+            },
+            FormField {
+                key: "b".into(),
+                value: "/tmp/x".into(),
+                kind: FormFieldKind::File,
+                enabled: true,
+                ..FormField::default()
+            },
+        ];
+        entry.comments = vec![EntryComment {
+            anchor: CommentAnchor::Body,
+            text: "# note".into(),
+        }];
+        let state = PersistedState {
+            tabs: vec![PersistedTab {
+                name: "Coll".into(),
+                entries: vec![entry],
+                ..PersistedTab::default()
+            }],
+            ..PersistedState::default()
+        };
+        let json = serde_json::to_string(&state)
+            .unwrap()
+            .replace("\"File\"", "\"Directory\"")
+            .replace("\"Body\"", "\"SomewhereNew\"");
+
+        let back: PersistedState = serde_json::from_str(&json).expect("the document still parses");
+        let entry = &back.tabs[0].entries[0];
+        assert_eq!(entry.title, "Upload", "the request survives");
+        assert_eq!(entry.form_fields.len(), 2, "both rows survive");
+        assert_eq!(
+            entry.form_fields[1].kind,
+            FormFieldKind::default(),
+            "only the unknown kind falls back"
+        );
+        assert_eq!(entry.comments.len(), 1, "and the comment is still there");
+        assert_eq!(entry.comments[0].anchor, CommentAnchor::default());
     }
 }

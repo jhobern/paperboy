@@ -1214,6 +1214,10 @@ strings! {
     // triangle written here is not in -- it came out as a tofu box.
     gui_report_cell_hint => "Click a row marked {c} to open its details, or any other cell to inspect its full value", "Cliquez sur une ligne marquée {c} pour ouvrir ses détails, ou sur toute autre cellule pour voir sa valeur complète", "Klik på en række markeret med {c} for at åbne dens detaljer, eller på en anden celle for at se dens fulde værdi";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
+    // The tooltip on a results column's drag handle. Both gestures are named
+    // because the reset — double-click to hand the column back to the automatic
+    // fitter — is not something a reader would guess from the handle alone.
+    gui_report_col_resize_hint => "Drag to resize this column · double-click to auto-fit", "Glissez pour redimensionner cette colonne · double-cliquez pour l'ajuster automatiquement", "Træk for at ændre kolonnens bredde · dobbeltklik for automatisk tilpasning";
     // The results view's filter bar and metric cards. `RowFilter::label` is
     // deliberately English -- it names buttons in an exported document that has
     // no language -- so the in-app bar labels its own buttons from here.

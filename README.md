@@ -102,8 +102,7 @@ cargo build --release
   those asserts (`status == 200`), so it can be changed or removed there like
   any other. `Shift+R` opens **Raw Mode** instead, a direct editor for the
   request's real Hurl text (for anything the form doesn't expose, such as
-  Basic Auth or `[Options]`); saving reparses the text and applies it back to
-  the request,
+  Basic Auth); saving reparses the text and applies it back to the request,
   keeping invalid text open for correction rather than discarding it.
 - **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
   add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
@@ -255,6 +254,12 @@ What changes is how you interact with it:
   and **Alt+F** (open the File menu).
 - **Panels are resized by dragging** their splitters, rather than with keyboard
   shortcuts.
+- **Results columns are resized by dragging** the border between two header
+  cells (double-click it to hand the column back to the automatic fit). A
+  hand-set column keeps exactly the width you gave it while the rest go on
+  sharing what is left, and pinning columns wider than the window scrolls the
+  table sideways rather than crushing the others. The widths last as long as the
+  report keeps producing the same columns.
 - **Selection, scrolling and the clipboard** use the platform's native
   handling; **collection tabs switch by clicking**; folders collapse/expand by
   clicking their header.

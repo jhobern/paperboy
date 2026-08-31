@@ -9,12 +9,23 @@ use std::path::Path;
 /// crash. The reason before it is the part worth showing. Anything that
 /// doesn't end that way is passed through unchanged, so this is safe to apply
 /// to any error on its way to the status line.
+///
+/// The suffix has to be matched *anchored at the end*, digits and all:
+/// checking only that the text contains `" (os error "` somewhere and happens
+/// to end in `)` truncated a composed message like
+/// `load failed (os error 2) for config(prod)` down to `load failed`, throwing
+/// away the part that said which file.
 pub(crate) fn friendly_error(e: &impl std::fmt::Display) -> String {
     let text = e.to_string();
-    match text.rfind(" (os error ") {
-        Some(i) if text.ends_with(')') => text[..i].to_string(),
-        _ => text,
-    }
+    let stripped = text
+        .strip_suffix(')')
+        .and_then(|head| head.rfind(" (os error ").map(|i| (head, i)))
+        .filter(|(head, i)| {
+            let digits = &head[i + " (os error ".len()..];
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+        .map(|(head, i)| head[..i].to_string());
+    stripped.unwrap_or(text)
 }
 
 /// The file stem of `path` (its name without an extension), or `fallback` when
@@ -425,5 +436,24 @@ mod key_tests {
             line.windows(2).all(|w| w[0] <= w[1]),
             "and the map is still monotonic across the compacted value"
         );
+    }
+
+    /// Regression: the errno suffix has to be matched at the *end*. Searching
+    /// for it anywhere and only checking the text ends in some `)` truncated a
+    /// composed message at the earlier paren, throwing away the part that said
+    /// which file the failure was about.
+    #[test]
+    fn only_a_trailing_errno_is_stripped() {
+        let strip = |t: &str| super::friendly_error(&t.to_string());
+        assert_eq!(
+            strip("No such file or directory (os error 2)"),
+            "No such file or directory"
+        );
+        assert_eq!(
+            strip("load failed (os error 2) for config(prod)"),
+            "load failed (os error 2) for config(prod)"
+        );
+        assert_eq!(strip("plain failure"), "plain failure");
+        assert_eq!(strip("weird (os error two)"), "weird (os error two)");
     }
 }
