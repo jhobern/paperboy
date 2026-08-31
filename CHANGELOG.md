@@ -281,6 +281,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Graphical UI: a request that hasn't been sent no longer describes a reply.**
+  The response panel's three sections each fell back to their own "nothing here"
+  note — `(empty body)`, `(no headers)`, `(no assertions)` — regardless of
+  whether a response had ever arrived. Every one of those is a statement about a
+  reply that was received, so an untouched request appeared to report that the
+  server had answered and sent nothing back. All three now say the request has
+  not been run yet, while a request that genuinely came back empty (a `204`, say)
+  still says so.
+
 - **Requests in a Workspace tab can be dragged to reorder them.** A plain
   collection tab has always let you drag a request to a new position; the
   Workspace tab's tree — drawn by different code — left its request rows out of
