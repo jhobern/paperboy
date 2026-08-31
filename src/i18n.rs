@@ -1520,7 +1520,11 @@ strings! {
     gui_shortcuts_group_help => "Help", "Aide", "Hjælp";
     gui_shortcut_cycle_panels => "Tab / Shift+Tab", "Tab / Maj+Tab", "Tab / Skift+Tab";
     gui_shortcut_run => "Ctrl+Enter / F5", "Ctrl+Entrée / F5", "Ctrl+Enter / F5";
-    gui_shortcut_list_move => "\u{2191} / \u{2193}", "\u{2191} / \u{2193}", "\u{2191} / \u{2193}";
+    // Spelled out rather than "↑ / ↓": egui ships Ubuntu-Light plus two emoji
+    // fonts, none of which covers U+2191/U+2193, so the arrows rendered as
+    // tofu boxes. Words also match the rest of this table, which names its keys
+    // ("Tab", "Home / End") rather than drawing them.
+    gui_shortcut_list_move => "Up / Down", "Haut / Bas", "Op / Ned";
     gui_shortcut_list_ends => "Home / End", "Début / Fin", "Home / End";
     gui_shortcut_list_run => "Enter", "Entrée", "Enter";
     gui_shortcut_list_rename => "F2", "F2", "F2";

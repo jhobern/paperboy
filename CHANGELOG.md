@@ -281,6 +281,36 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Graphical UI: menu mnemonics are visible without pressing Alt first.** The
+  underline under `F`ile, `E`dit and the rest was only drawn once a lone `Alt`
+  had armed the menu bar — a Windows convention that assumes you already know
+  the mnemonics are there. Since the underline is the only thing that advertises
+  them, the menus simply looked as though they had none. Also fixed a latent
+  off-by-one that could underline the wrong character in a translated title.
+
+- **Graphical UI: resizing a report column no longer resizes the others.**
+  Dragging one border widened that column by taking the room out of every other
+  column on screen, so fixing one truncated heading started truncating the rest.
+  The automatic columns now keep the width they would have had regardless, and
+  the table grows into its horizontal scroll bar instead.
+
+- **Graphical UI: report column borders are visible at rest.** The divider was
+  drawn only while the pointer was on it, so nothing said the columns could be
+  resized or where the handle was. It is now a faint rule at all times, firming
+  up under the pointer and taking the accent colour while dragging.
+
+- **Graphical UI: dialogs can no longer grow taller than the window.** The
+  keyboard-shortcuts overlay ran off the top and bottom at once, putting both its
+  heading and its Close button out of reach. Dialogs are now capped to the
+  viewport, which hands the overflow to the scroll bar that was meant to take it.
+
+- **Undoing a reorder clears the unsaved marker again.** Dragging a request out
+  of place and back — or deleting one and undoing the delete — used to leave the
+  collection marked unsaved with nothing left to save, in both the terminal UI
+  and the GUI. Reordering, deleting and restoring are now measured against the
+  order the file was last read from or written to disk, so a collection that
+  ends up back where it started says so.
+
 - **The workspace tree says which collection holds unsaved edits.** A Workspace
   tab shows one file at a time, so an edit to a file you have since switched
   away from is invisible by construction: its requests are parked in memory and

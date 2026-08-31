@@ -537,7 +537,40 @@ pub struct Collection {
     /// without a word. Cleared by [`Self::mark_saved`] like any other marker.
     ///
     /// Runtime-only, for the same reason `workspace_pending` is.
+    ///
+    /// Derived rather than latched: see [`Self::refresh_structure_modified`].
+    /// A flag that only ever went *true* meant undoing a reorder — dragging a
+    /// request back where it started, or restoring the one just deleted — left
+    /// the collection marked unsaved with nothing left to save.
     pub structure_modified: bool,
+
+    /// What the entry list looked like when it was last read from or written to
+    /// disk, as the sequence of request titles. Compared against the live list
+    /// to decide [`Self::structure_modified`].
+    ///
+    /// Titles rather than positions because positions are exactly what a
+    /// reorder changes, and titles rather than whole entries because editing a
+    /// request is a *different* kind of change, already carried by its own
+    /// `modified` flag — this one has to answer "is the list still the same
+    /// list, in the same order". A title is a sound identifier here: reports
+    /// address requests by name, so [`unique_entry_title`] already guarantees
+    /// no two entries share one.
+    ///
+    /// The one wrinkle is that renaming a request does register as structural.
+    /// That is a fair reading — the list really is no longer the list that was
+    /// saved — and it costs nothing in practice, since a rename sets the
+    /// entry's own `modified` flag anyway, so the collection was already
+    /// unsaved.
+    ///
+    /// Runtime-only, like the flag it feeds.
+    pub structure_baseline: Vec<String>,
+
+    /// The baselines ([`Self::structure_baseline`]) of the parked files, so a
+    /// file switched away from and back is still measured against the order it
+    /// had on disk rather than against whatever it had been dragged into.
+    /// Without this, coming back to a reordered file and dragging the request
+    /// home again would leave it looking permanently unsaved.
+    pub workspace_baselines: HashMap<PathBuf, Vec<String>>,
 
     /// The parked files (see `workspace_pending`) whose entries differ
     /// structurally from disk — `structure_modified` for a file that isn't the
@@ -601,9 +634,15 @@ impl Collection {
             workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
             structure_modified: false,
+            structure_baseline: Vec::new(),
+            workspace_baselines: HashMap::new(),
             workspace_structure_modified: HashSet::new(),
             workspace_runs: HashMap::new(),
         };
+        // Whatever a collection is built from is, by definition, what it
+        // currently agrees with — a file just read, a Postman import, or an
+        // empty scratch tab. Later structural edits are measured against this.
+        c.reset_structure_baseline();
         c.sync_folder_to_selected();
         c
     }
@@ -1001,11 +1040,25 @@ impl Collection {
         // Park the outgoing file *before* adopting the incoming file's flag,
         // since parking reads `structure_modified` for the file being left.
         self.park_pending_edits();
-        let incoming_structural = self.workspace_structure_modified.remove(&path);
+        // The incoming file's structural flag is about to be re-derived from its
+        // baseline, so the parked copy has done its job (it existed only to
+        // answer "is this parked file dirty" while the file was away).
+        self.workspace_structure_modified.remove(&path);
         self.park_run_results();
         self.snapshot_loaded_titles();
         self.entries = entries;
-        self.structure_modified = incoming_structural;
+        // A file coming back out of the park keeps the baseline it was parked
+        // with, because that baseline still describes the file on disk; one read
+        // fresh off disk simply *is* its own baseline. Either way the flag is
+        // derived from the comparison, so a file whose reorder has since been
+        // undone comes back clean instead of staying marked for the session.
+        match self.workspace_baselines.remove(&path) {
+            Some(baseline) => {
+                self.structure_baseline = baseline;
+                self.refresh_structure_modified();
+            }
+            None => self.reset_structure_baseline(),
+        }
         self.restore_run_results(&path);
         self.selected_entry = 0;
         self.path = Some(path);
@@ -1028,6 +1081,11 @@ impl Collection {
             if self.structure_modified {
                 self.workspace_structure_modified.insert(path.clone());
             }
+            // The baseline travels with the parked entries: it describes the
+            // file on disk, which is still what this file will have to be
+            // compared against when it comes back.
+            self.workspace_baselines
+                .insert(path.clone(), self.structure_baseline.clone());
             self.workspace_pending.insert(path, self.entries.clone());
         }
     }
@@ -1113,6 +1171,35 @@ impl Collection {
             .and_then(|r| r.get(idx))
             .map(|r| r.last_run)
             .unwrap_or(RunStatus::NotRun)
+    }
+
+    /// The entry list's structural identity: its titles, in order.
+    fn structure_fingerprint(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.title.clone()).collect()
+    }
+
+    /// Adopt the current entry list as "what was saved", so nothing that
+    /// follows counts as a structural change until the list moves again.
+    ///
+    /// Called wherever the two are brought into agreement: reading a file,
+    /// writing one, and constructing a collection from entries that came
+    /// straight off disk.
+    pub fn reset_structure_baseline(&mut self) {
+        self.structure_baseline = self.structure_fingerprint();
+        self.structure_modified = false;
+    }
+
+    /// Recompute [`Self::structure_modified`] by comparing the entry list
+    /// against the baseline.
+    ///
+    /// Every structural edit routes through here rather than setting the flag,
+    /// so that undoing one clears it: putting a dragged request back where it
+    /// started, or restoring the request just deleted, returns the list to the
+    /// one that was saved and there is then genuinely nothing to save. A latched
+    /// flag left the pencil on with nothing behind it, which teaches people to
+    /// ignore the pencil.
+    fn refresh_structure_modified(&mut self) {
+        self.structure_modified = self.structure_fingerprint() != self.structure_baseline;
     }
 
     /// `true` when this collection holds requests that have been added or
@@ -1269,7 +1356,9 @@ impl Collection {
             e.user_added = false;
             e.modified = false;
         }
-        self.structure_modified = false;
+        // The file on disk now *is* the entry list, so it becomes the baseline
+        // every later structural edit is measured against.
+        self.reset_structure_baseline();
         if let Some(path) = &self.path {
             self.workspace_pending.remove(path);
             self.workspace_structure_modified.remove(path);
@@ -1483,7 +1572,7 @@ impl Collection {
             return None;
         }
         let removed = self.entries.remove(idx);
-        self.structure_modified = true;
+        self.refresh_structure_modified();
         self.deleted_entries.push((idx, removed.clone()));
         if self.deleted_entries.len() > 20 {
             self.deleted_entries.remove(0);
@@ -1522,8 +1611,9 @@ impl Collection {
         // shifts by one only if the move stepped across it.
         self.selected_entry = shift_index(self.selected_entry, from, to);
         // A reorder changes no request, so nothing else would record it — see
-        // `structure_modified`.
-        self.structure_modified = true;
+        // `structure_modified`. Recomputed rather than latched, so dragging a
+        // request back where it started clears the marker again.
+        self.refresh_structure_modified();
         self.invalidate_request_json();
         self.sync_folder_to_selected();
         true
@@ -1565,11 +1655,13 @@ impl Collection {
         let (idx, entry) = self.deleted_entries.pop()?;
         let idx = idx.min(self.entries.len());
         self.entries.insert(idx, entry);
-        // Restoring is as much a structural change as removing: putting a
-        // request back can't be assumed to return the list to a saved state,
-        // since it lands at the nearest index rather than necessarily its old
-        // one, and anything else may have moved meanwhile.
-        self.structure_modified = true;
+        // Restoring is as much a structural change as removing — and it is not
+        // assumed to *undo* one either, since the request lands at the nearest
+        // surviving index rather than necessarily its old one, and anything
+        // else may have moved meanwhile. So this is recomputed like the rest:
+        // when it does land back where it was, the collection is once again the
+        // one on disk and says so.
+        self.refresh_structure_modified();
         Some(idx)
     }
 }
@@ -2462,5 +2554,90 @@ mod structure_edit_tests {
             "and saving clears the structural edit, like any other"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod structure_baseline_tests {
+    use super::*;
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e
+    }
+
+    fn col() -> Collection {
+        Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")])
+    }
+
+    #[test]
+    fn a_freshly_built_collection_is_not_structurally_modified() {
+        assert!(!col().structure_modified);
+    }
+
+    #[test]
+    fn reordering_marks_the_collection_and_reordering_back_clears_it() {
+        let mut c = col();
+        assert!(c.move_entry(0, 1));
+        assert!(
+            c.structure_modified,
+            "a reorder has to register — nothing else records it"
+        );
+        assert!(c.move_entry(1, 0));
+        assert!(
+            !c.structure_modified,
+            "putting the request back leaves nothing to save, so the marker must clear"
+        );
+    }
+
+    #[test]
+    fn a_longer_walk_back_to_the_original_order_also_clears_it() {
+        // Not just a single undo: any sequence of drags that happens to end in
+        // the saved order is, by then, the saved order.
+        let mut c = col();
+        c.move_entry(0, 2);
+        c.move_entry(0, 1);
+        assert_eq!(c.structure_fingerprint(), vec!["c", "b", "a"]);
+        assert!(c.structure_modified);
+        c.move_entry(0, 2);
+        c.move_entry(0, 1);
+        assert_eq!(c.structure_fingerprint(), vec!["a", "b", "c"]);
+        assert!(!c.structure_modified);
+    }
+
+    #[test]
+    fn deleting_marks_the_collection_and_undoing_the_delete_clears_it() {
+        let mut c = col();
+        c.remove_entry_recording_undo(1);
+        assert!(c.structure_modified);
+        c.restore_last_deleted();
+        assert!(
+            !c.structure_modified,
+            "the restored request landed back where it was, so the list matches disk again"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_lands_somewhere_else_stays_marked() {
+        // `restore_last_deleted` reinserts at the *nearest* surviving index, so
+        // deleting two and restoring one need not undo anything.
+        let mut c = col();
+        c.remove_entry_recording_undo(0);
+        c.remove_entry_recording_undo(0);
+        c.restore_last_deleted();
+        assert!(c.structure_modified);
+    }
+
+    #[test]
+    fn saving_adopts_the_current_order_as_the_new_baseline() {
+        let mut c = col();
+        c.move_entry(0, 2);
+        c.mark_saved();
+        assert!(!c.structure_modified);
+        // Going back to the *old* order is now itself a change, because the
+        // file on disk holds the new one.
+        c.move_entry(2, 0);
+        assert!(c.structure_modified);
     }
 }

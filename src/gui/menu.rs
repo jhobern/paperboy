@@ -48,6 +48,11 @@ pub struct AltMenus {
 }
 
 impl AltMenus {
+    /// Whether a lone `Alt` has put the bar into "waiting for a letter" mode.
+    ///
+    /// The underlines no longer depend on this — they are always drawn — so
+    /// this is now only read by the tests that pin the arming state machine.
+    #[cfg(test)]
     pub fn is_armed(&self) -> bool {
         self.armed
     }
@@ -145,17 +150,30 @@ fn handle_menu_mnemonics(app: &mut GuiApp, ctx: &egui::Context) {
     app.alt_menus.alt_was_down = f.alt_down;
 }
 
-/// A menu title with its mnemonic underlined while the bar is armed.
+/// A menu title with its mnemonic underlined.
+///
+/// Drawn always, not only once `Alt` has armed the bar. Hiding the underlines
+/// until Alt is tapped is a Windows convention that assumes you already know
+/// the mnemonics are there — and here it left the menus looking as though they
+/// had none, so nobody would think to press Alt to find out. The underline is
+/// the only thing that advertises the feature, so it has to be visible before
+/// the feature is used.
 ///
 /// Falls back to the plain title when the mnemonic doesn't occur in the
 /// translated title at all — a translator is free to pick a letter that isn't in
 /// the word (Danish "Indstillinger" happens to start with its own), and an
 /// underline drawn under the wrong character would be worse than none.
-fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char, armed: bool) -> egui::WidgetText {
-    if !armed {
-        return title.into();
-    }
-    let Some(pos) = title.to_uppercase().find(mnemonic) else {
+fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char) -> egui::WidgetText {
+    // Matched case-insensitively over the *original* title, so `pos` is a byte
+    // index into the string actually being sliced below. Searching an
+    // uppercased copy instead would drift the moment a language's uppercase
+    // form has a different byte length from its lowercase one (German "ß" is
+    // the classic; Turkish dotted "i" is the near miss), silently underlining
+    // the wrong character.
+    let Some((pos, matched)) = title
+        .char_indices()
+        .find(|(_, c)| c.to_uppercase().eq(mnemonic.to_uppercase()))
+    else {
         return title.into();
     };
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -180,7 +198,7 @@ fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char, armed: bool) -> egui::
             },
         );
     };
-    let end = pos + title[pos..].chars().next().map_or(0, |c| c.len_utf8());
+    let end = pos + matched.len_utf8();
     push(&title[..pos], false);
     push(&title[pos..end], true);
     push(&title[end..], false);
@@ -226,7 +244,7 @@ fn help_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 /// Draw one top-level menu button, registering its mnemonic so `Alt`+letter can
-/// open it and underlining that letter while the bar is armed.
+/// open it and underlining that letter.
 fn top_menu<R>(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
@@ -234,11 +252,10 @@ fn top_menu<R>(
     mnemonic: &str,
     content: impl FnOnce(&mut GuiApp, &mut egui::Ui) -> R,
 ) {
-    let armed = app.alt_menus.is_armed();
     let Some(m) = mnemonic_char(mnemonic) else {
         return;
     };
-    let text = menu_title(ui, title, m, armed);
+    let text = menu_title(ui, title, m);
     let resp = ui.menu_button(text, |ui| content(app, ui));
     app.alt_menus.register(m, resp.response.id);
 }
@@ -2736,12 +2753,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mnemonic_is_underlined_only_while_the_bar_is_armed() {
+    fn the_mnemonic_is_underlined_without_waiting_for_alt() {
         let ctx = egui::Context::default();
-        let underlined = |armed: bool| {
+        let underlined = |title: &str, m: char| {
             let mut found = Vec::new();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let text = menu_title(ui, "Settings", 'S', armed);
+                let text = menu_title(ui, title, m);
                 found = match text {
                     egui::WidgetText::LayoutJob(job) => job
                         .sections
@@ -2752,14 +2769,48 @@ mod tests {
                                 .to_string()
                         })
                         .collect::<Vec<_>>(),
-                    // A plain string carries no formatting at all, which is the
-                    // unarmed case.
+                    // A plain string carries no formatting at all, which is how
+                    // the "mnemonic isn't in the title" fallback comes back.
                     _ => Vec::new(),
                 };
             });
             found
         };
-        assert_eq!(underlined(false), Vec::<String>::new());
-        assert_eq!(underlined(true), vec!["S".to_string()]);
+        // The underline is what advertises the mnemonic, so it is there from the
+        // first frame rather than only after the user has already found Alt.
+        assert_eq!(underlined("Settings", 'S'), vec!["S".to_string()]);
+        // Matched case-insensitively, and under the letter as the title spells
+        // it rather than an uppercased copy of it.
+        assert_eq!(underlined("File", 'F'), vec!["F".to_string()]);
+        assert_eq!(underlined("edit", 'E'), vec!["e".to_string()]);
+        // A mnemonic that isn't in the translated title underlines nothing at
+        // all, rather than guessing at a character.
+        assert_eq!(underlined("Aide", 'H'), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_multibyte_title_underlines_the_right_character() {
+        // The byte index came from searching an uppercased copy of the title,
+        // which is only the same string when uppercasing preserves every byte
+        // length. The "\u{fb00}" ligature is three bytes and uppercases to the
+        // two bytes "FF", so every index past it was off by one: searching the
+        // copy finds 'E' at byte 5, which in the original is the hyphen.
+        let ctx = egui::Context::default();
+        let mut found = Vec::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let text = menu_title(ui, "A\u{fb00}x-End", 'E');
+            if let egui::WidgetText::LayoutJob(job) = text {
+                found = job
+                    .sections
+                    .iter()
+                    .filter(|s| s.format.underline != egui::Stroke::NONE)
+                    .map(|s| {
+                        job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)]
+                            .to_string()
+                    })
+                    .collect();
+            }
+        });
+        assert_eq!(found, vec!["E".to_string()], "underlined the wrong glyph");
     }
 }

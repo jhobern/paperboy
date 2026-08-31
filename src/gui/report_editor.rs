@@ -4611,16 +4611,28 @@ fn fit_column_widths(natural: &[f32], avail: f32, spacing: f32) -> Vec<f32> {
 /// [`fit_column_widths`] with some columns pinned to a manual width.
 ///
 /// A pinned column is taken out of the fitting altogether: it is handed exactly
-/// the width the reader dragged its border to (never below [`MIN_COL_W`]), and
-/// only the room that is left over is shared out among the columns that are
-/// still automatic — by the very same grow / water-fill as before. That is the
-/// least surprising rule: pinning `DFA File path` wide should widen *that*
-/// column and leave its neighbours doing exactly what they were, not quietly
-/// resize them to compensate. It is also why a run of huge pins simply overruns
-/// the window into the caller's horizontal scroll bar rather than crushing the
-/// unpinned columns to slivers — the pins are honoured first, and whatever the
-/// auto columns can't fit into what is left overflows, the same honest outcome
-/// a table with too many columns already has.
+/// the width the reader dragged its border to (never below [`MIN_COL_W`]).
+/// Every other column keeps the width it would have had if nothing were pinned
+/// at all — the automatic layout is computed against the *full* available width,
+/// exactly as on an untouched table, and the pins are then substituted in.
+///
+/// So dragging one border moves one border. The table as a whole grows past the
+/// window and the caller's horizontal scroll bar takes up the difference, which
+/// is the trade the reader asked for by widening the column: they want to see
+/// more of `DFA File path` and are willing to scroll for the rest.
+///
+/// The obvious alternative — give the pins what they want and share what is
+/// left among the automatic columns — reads much worse in practice. Widening
+/// one column visibly narrows every other column on screen, so the reader is
+/// paid for the column they were fixing by having the columns they were not
+/// fixing start truncating; and the amount each one shrinks depends on the
+/// water-fill, so it is neither predictable nor undoable by eye. Nothing should
+/// move except the thing under the pointer.
+///
+/// The cost is that pinning a column *narrower* than its automatic width leaves
+/// slack at the right edge rather than reflowing to close it. That is the same
+/// bargain: it is the reader's width, and a table that silently re-flowed to
+/// take the space back would be undoing what they just did.
 ///
 /// `pins` is read positionally and may be shorter than `natural` (or empty), in
 /// which case the missing entries — and any `None` — are treated as automatic.
@@ -4637,30 +4649,17 @@ fn fit_column_widths_pinned(
         return fit_column_widths(natural, avail, spacing);
     }
 
-    let n = natural.len();
-    // The gaps sit between every column whether it is pinned or not, so they
-    // come off the top of the budget before anything is shared.
-    let gaps = spacing * (n.saturating_sub(1)) as f32;
-    let pinned_total: f32 = (0..n)
-        .filter_map(|i| pin(i).map(|w| w.max(MIN_COL_W)))
-        .sum();
-    // Whatever is left after the pins and the gaps is what the automatic
-    // columns fit into. It floors at zero when the pins are large; the sub-fit
-    // then bottoms every auto column out at MIN_COL_W and the total overflows,
-    // which is exactly what puts the scroll bar there.
-    let auto_budget = (avail - gaps - pinned_total).max(0.0);
-    let auto_natural: Vec<f32> = (0..n)
-        .filter(|&i| pin(i).is_none())
-        .map(|i| natural[i])
-        .collect();
-    // The gaps were charged above, so the sub-fit runs gap-free over the auto
-    // columns alone.
-    let mut auto_fitted = fit_column_widths(&auto_natural, auto_budget, 0.0).into_iter();
-
-    (0..n)
+    // Lay the whole table out as though nothing were pinned, then swap the
+    // pinned columns' widths in. Running the fitter over *every* column against
+    // the full width — rather than over the automatic ones against what the pins
+    // left behind — is what keeps the automatic columns still: their input is
+    // the same on the frame before a drag and the frame after it, so they cannot
+    // move in response to one.
+    let base = fit_column_widths(natural, avail, spacing);
+    (0..natural.len())
         .map(|i| match pin(i) {
             Some(w) => w.max(MIN_COL_W),
-            None => auto_fitted.next().unwrap_or(MIN_COL_W),
+            None => base.get(i).copied().unwrap_or(MIN_COL_W),
         })
         .collect()
 }
@@ -4803,16 +4802,25 @@ fn column_resize_handle(
         // a pin accumulates rather than jumping. `set` floors it at MIN_COL_W.
         overrides.set(header, w + resp.drag_delta().x);
     }
-    if active {
-        // Only drawn while the reader is on it, so the header line stays clean at
-        // rest; the colour is the theme's, brighter while actually dragging.
-        let colour = if resp.dragged() { th.accent } else { th.dim };
-        ui.painter().vline(
-            boundary_x,
-            cell_rect.top()..=cell_rect.bottom(),
-            egui::Stroke::new(1.0, colour),
-        );
-    }
+    // Always drawn, in three strengths. Showing the divider only on hover kept
+    // the header line clean, but a handle you cannot see is a handle nobody
+    // finds: there was nothing to tell a reader the columns could be resized at
+    // all, and nothing to say *where* the narrow strip that resizes them is. At
+    // rest it is faint enough to read as a table rule rather than a control,
+    // which is what a spreadsheet does with the same affordance; it firms up
+    // under the pointer and takes the accent while the drag is live.
+    let colour = if resp.dragged() {
+        th.accent
+    } else if resp.hovered() {
+        th.dim
+    } else {
+        th.dim.gamma_multiply(0.4)
+    };
+    ui.painter().vline(
+        boundary_x,
+        cell_rect.top()..=cell_rect.bottom(),
+        egui::Stroke::new(1.0, colour),
+    );
 }
 
 /// Render the results as a scrollable table: a header row, one row per data row
@@ -13960,27 +13968,43 @@ mod results_render_tests {
     }
 
     /// The whole point of pinning: the column the reader sized stays exactly
-    /// that wide, and the untouched columns re-fit into the room that is left
-    /// rather than being dragged along with it.
+    /// that wide, and every other column stays exactly where it was. Dragging
+    /// one border moves one border.
     #[test]
-    fn a_pinned_column_keeps_its_width_while_the_others_refit() {
-        // Three equal naturals in a window with room to spare: unpinned they
-        // would each grow to a third of the budget. Pin the first narrow and
-        // the other two must share what is left between just the two of them.
+    fn a_pinned_column_keeps_its_width_and_the_others_do_not_move() {
         let natural = [100.0, 100.0, 100.0];
         let auto = fit_column_widths_pinned(&natural, &[], 900.0, 0.0);
-        let pinned = fit_column_widths_pinned(&natural, &[Some(60.0), None, None], 900.0, 0.0);
+
+        for pin in [60.0, 400.0] {
+            let pinned = fit_column_widths_pinned(&natural, &[Some(pin), None, None], 900.0, 0.0);
+            assert!(
+                (pinned[0] - pin).abs() < 0.01,
+                "the pinned column is exactly its manual width: {pinned:?}"
+            );
+            // Narrowing used to hand the slack to the neighbours and widening
+            // used to take it from them; both made columns the reader was not
+            // touching start moving and truncating.
+            assert!(
+                (pinned[1] - auto[1]).abs() < 0.01 && (pinned[2] - auto[2]).abs() < 0.01,
+                "pin={pin}: the untouched columns must not move: {pinned:?} vs {auto:?}"
+            );
+        }
+    }
+
+    /// Widening a column past the window is the reader asking to scroll, not
+    /// asking for the other columns to be crushed.
+    #[test]
+    fn widening_a_column_grows_the_table_rather_than_shrinking_its_neighbours() {
+        let natural = [100.0, 100.0, 100.0];
+        let auto = fit_column_widths_pinned(&natural, &[], 900.0, 0.0);
+        let wide = fit_column_widths_pinned(&natural, &[None, Some(700.0), None], 900.0, 0.0);
         assert!(
-            (pinned[0] - 60.0).abs() < 0.01,
-            "the pinned column is exactly its manual width, not its share: {pinned:?}"
+            wide.iter().sum::<f32>() > auto.iter().sum::<f32>(),
+            "the table got wider by the amount the column did: {wide:?}"
         );
         assert!(
-            pinned[1] > auto[1] && pinned[2] > auto[2],
-            "the room the pin gave up is handed to the columns still fitting: {pinned:?} vs {auto:?}"
-        );
-        assert!(
-            (pinned[1] - pinned[2]).abs() < 0.01,
-            "and those two, being equal, still share it equally: {pinned:?}"
+            (wide[0] - auto[0]).abs() < 0.01 && (wide[2] - auto[2]).abs() < 0.01,
+            "and paid for it with scroll, not with its neighbours: {wide:?}"
         );
     }
 

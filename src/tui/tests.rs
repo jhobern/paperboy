@@ -32441,3 +32441,44 @@ fn the_workspace_tree_pencils_a_collection_holding_unsaved_edits() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A Workspace tab shows one file at a time and parks the others in memory, so
+/// the "was this reordered" question has to survive a round trip through the
+/// park. It is answered by comparing against the order the file had on disk —
+/// and that baseline is parked alongside the entries, so coming back to a
+/// reordered file and dragging the request home again clears the marker rather
+/// than leaving the file looking unsaved for the rest of the session.
+#[test]
+fn a_reorder_undone_after_switching_workspace_files_away_and_back_clears_the_marker() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("baseline", &["one", "two", "three"]);
+    let other = dir.join("nested/other.hurl");
+
+    assert!(app.collections[ci].move_entry(0, 1));
+    assert!(app.collections[ci].structure_modified);
+
+    app.collections[ci].load_workspace_file(other).unwrap();
+    assert!(
+        !app.collections[ci].structure_modified,
+        "the file just switched to is untouched"
+    );
+    assert!(
+        app.collections[ci].unsaved_edit_count() > 0,
+        "but the parked file it left behind is still unsaved"
+    );
+
+    app.collections[ci]
+        .load_workspace_file(dir.join("api.hurl"))
+        .unwrap();
+    assert!(
+        app.collections[ci].structure_modified,
+        "coming back, the reorder is still there"
+    );
+    assert!(app.collections[ci].move_entry(1, 0));
+    assert!(
+        !app.collections[ci].structure_modified,
+        "and undoing it now returns the file to the order on disk"
+    );
+    assert_eq!(app.collections[ci].unsaved_edit_count(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
