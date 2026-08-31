@@ -725,6 +725,12 @@ pub(crate) enum ConfirmAction {
     /// the Global Environments panel) — any collections linked to it become
     /// unlinked.
     DeleteEnv(usize),
+    /// Delete the request the Requests list is sitting on (`x` in that pane).
+    /// It carries no index: the confirmation owns the keyboard while it is up,
+    /// so the selection cannot move underneath it, and re-reading the selection
+    /// on confirm keeps this on exactly the one code path that deletes a
+    /// request.
+    DeleteRequest,
     /// Discard a request's in-memory edits, reloading it from the collection's
     /// on-disk file. Holds `(collection index, entry index)`. Raised by `Ctrl+R`
     /// in the Requests list only when that entry has unsaved changes.

@@ -4359,6 +4359,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 mark(app.confirm_on_delete_env),
                 s.pref_item_confirm_delete_env
             );
+            let delete_request_item = format!(
+                "{} {}",
+                mark(app.confirm_on_delete_request),
+                s.pref_item_confirm_delete_request
+            );
             let view_label = match app.default_request_view {
                 request::RequestView::Json => "JSON",
                 request::RequestView::Hurl => "Hurl",
@@ -4378,6 +4383,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 exit_item.as_str(),
                 clear_item.as_str(),
                 delete_env_item.as_str(),
+                delete_request_item.as_str(),
                 always_save_item.as_str(),
                 run_all_batch_item.as_str(),
                 view_item.as_str(),
@@ -4417,6 +4423,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::DeleteRequest => s.request_delete_confirm.to_string(),
                 ConfirmAction::RevertWorkspaceFile(_, path) => {
                     let name = path
                         .file_name()
@@ -4593,6 +4600,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_menus,
                         &[
                             ("f / s", s.help_menus),
+                            ("Ctrl+S", s.help_save_active),
                             ("\u{2190} / \u{2192} (File menu)", s.help_menu_submenu_nav),
                             ("w", s.help_workspace_browse),
                             ("\u{2192} / Enter (Workspace)", s.help_workspace_open),
@@ -4647,7 +4655,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                             ("/ (report)", s.help_report_filter),
-                            ("Ctrl+S (report)", s.help_report_export),
+                            ("Ctrl+E (report)", s.help_report_export),
                             ("Ctrl+O (report)", s.help_report_open_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
@@ -4865,7 +4873,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                         ("/", s.help_report_filter),
-                        ("Ctrl+S", s.help_report_export),
+                        ("Ctrl+E", s.help_report_export),
                         ("Ctrl+O", s.help_report_open_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),

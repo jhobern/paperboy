@@ -12,6 +12,38 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`Ctrl+S` saves in the terminal UI.** It is the one shortcut every user
+  arrives already knowing, and until now the terminal UI did not bind it at
+  all: saving lived under `f` ▸ Save, and the keypress fell through to the
+  bare-`s` Settings arm, so the save reflex opened a menu. In the report view it
+  meant something else again — "export the results as CSV" — so the same chord
+  wrote a file nobody asked for. It now means one thing everywhere, and the same
+  thing the GUI has always meant by it: write what is in front of you back to
+  the file it came from — the open report if there is one, otherwise the active
+  collection — falling back to "Save As" when that document has never been
+  written anywhere, because a save shortcut that does nothing on an unsaved file
+  is no use on exactly the files most likely to need it. A bare `s` still opens
+  Settings. Report CSV export moves to **`Ctrl+E`**.
+
+- **Deleting a request asks first.** `x` in the Requests list removed the
+  highlighted request on the spot, while deleting an *environment* one pane over
+  has always been gated by a confirmation — the inconsistent half being the one
+  that throws away more work, since a request carries a body, headers, asserts
+  and captures that took longer to write than an environment row, and `x` sits
+  one key away from the list navigation. There is now a
+  "Confirm before deleting a request" preference, on by default and sitting
+  beside its environment counterpart, so anyone who would rather lean on `u`
+  can have the old behaviour back. The deletion stays undoable either way.
+
+- **The wizard's section tabs show which sections have something in them.** The
+  request wizard has ten tabs, and with one of them open the bar is the only
+  view of the other nine — but the labels alone said nothing about which were
+  populated, so the only way to find out was to visit each one or switch to the
+  "All" tab and read the whole stack. A section holding content is now drawn on
+  a filled background rather than dimmed. A background rather than a dot or a
+  count, so that marking a tab costs no width: the bar already has ten labels to
+  fit across the dialog.
+
 - **A JSON request body can carry comments.** People arriving from Postman
   bring bodies annotated with what each field is for, and Hurl has nowhere to
   put them — `hurl_core` rejects `//` outright — so until now they had to be
@@ -213,6 +245,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   meaningless.
 
 ### Fixed
+
+- **The request wizard keeps its shortcut hint where every other dialog keeps
+  it.** The list of keys was appended to the wizard's title, along the *top*
+  border, while every other panel in the app puts its hint along the bottom
+  edge — so the one mode with the most bindings to discover was also the one
+  that hid them somewhere the eye had not been trained to look. It now uses the
+  same bottom-border hint as everything else, and drops whole items off the end
+  on a narrow terminal instead of letting the last one be clipped mid-word.
 
 - **Two Postman folders that log in as different users no longer share one
   token.** PaperBoy replaces an OAuth 2.0 configuration with a real token

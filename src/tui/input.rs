@@ -1837,6 +1837,13 @@ impl TuiApp {
             KeyCode::Tab => self.cycle_focus(true),
             KeyCode::BackTab => self.cycle_focus(false),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
+            // Ctrl+S saves whatever is in front of the user, by the same code
+            // File ▸ Save runs — the shortcut everybody's fingers reach for
+            // before they look for a menu. It has to be matched ahead of the
+            // bare `s` below, which opens Settings: the two are one modifier
+            // apart, and a save reflex landing in the Settings menu is a
+            // silent no-op on the keystroke people trust most.
+            KeyCode::Char('s') if ctrl => self.save_active(),
             KeyCode::Char('s') => {
                 self.overlay = Some(Overlay::Options(0));
             }
@@ -1940,7 +1947,9 @@ impl TuiApp {
             KeyCode::F(2) if self.focus == Pane::Tabs && self.active_tab != 0 => {
                 self.open_prompt_rename()
             }
-            KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
+            KeyCode::Char('x') if self.focus == Pane::List => {
+                self.request_delete_selected_request()
+            }
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
             // Guarded by the confirm-on-delete-env preference; when it's off,
@@ -2695,6 +2704,32 @@ impl TuiApp {
     /// unrelated, not-currently-visible entry). Remembers the removed entry
     /// (with the index it was removed from) so `u` can restore it — see
     /// [`Self::restore_deleted_request`].
+    /// `x` in the Requests list: delete the highlighted request, asking first
+    /// unless the user has turned the confirmation off.
+    ///
+    /// The row is checked *before* the popup goes up, so `x` on a folder or an
+    /// "up" row stays the no-op it always was rather than raising a question
+    /// about a request that isn't there. When the preference is off the delete
+    /// happens immediately — it stays undoable with `u` either way, which is
+    /// what makes turning it off reasonable.
+    pub(crate) fn request_delete_selected_request(&mut self) {
+        let col = &self.collections[self.active_tab];
+        if !matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Entry(_))
+        ) {
+            return;
+        }
+        if self.confirm_on_delete_request {
+            self.overlay = Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteRequest,
+                sel: 1,
+            });
+        } else {
+            self.delete_selected_request();
+        }
+    }
+
     pub(crate) fn delete_selected_request(&mut self) {
         let ci = self.active_tab;
         let col = &self.collections[ci];
@@ -3964,6 +3999,7 @@ impl TuiApp {
                 }
             }
             ConfirmAction::DeleteEnv(idx) => self.delete_global_env(idx),
+            ConfirmAction::DeleteRequest => self.delete_selected_request(),
             ConfirmAction::RevertRequest(ci, ei) => match self.revert_request_to_saved(ci, ei) {
                 Some(method) => self.status = Some(Status::RequestReverted(method)),
                 None => self.status = Some(Status::NothingToRevert),
@@ -4124,6 +4160,26 @@ impl TuiApp {
     /// user to confirm the thing they had just asked for. "Save As" still
     /// confirms before overwriting a *different* file, which is a genuine
     /// surprise — that one is about the file you didn't choose to change.
+    /// Save what is in front of the user, straight back to the file it came
+    /// from — the target of `Ctrl+S` in both front-ends.
+    ///
+    /// An open report wins when there is one: it is the thing being edited, and
+    /// it is drawn over the request view. Otherwise it is the active collection
+    /// tab. [`Self::begin_save`] falls back to "Save As" when the target has
+    /// never been written anywhere, so the shortcut still does something useful
+    /// on exactly the documents most likely to need saving; an item that *does*
+    /// know its file is written without a dialog, because a save shortcut that
+    /// always asks where is no shortcut. Deliberately the same decision the
+    /// GUI's `menu::active_save_kind` makes, so `Ctrl+S` cannot come to mean
+    /// two different things in the two front-ends.
+    pub(crate) fn save_active(&mut self) {
+        if self.active_report_index().is_some() {
+            self.begin_save(FileAction::SaveReport);
+        } else if self.collections.get(self.active_tab).is_some() {
+            self.begin_save(FileAction::SaveCollection);
+        }
+    }
+
     pub(crate) fn begin_save(&mut self, action: FileAction) {
         if action == FileAction::SaveEnv && self.current_env_id().is_none() {
             self.status = Some(Status::NotEnvironment);
@@ -5579,6 +5635,7 @@ impl TuiApp {
             s.pref_item_confirm_exit,
             s.pref_item_confirm_clear,
             s.pref_item_confirm_delete_env,
+            s.pref_item_confirm_delete_request,
             s.pref_item_always_save,
             s.pref_item_run_all_batch,
             s.pref_item_default_view,
@@ -5589,7 +5646,7 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::Preferences((sel + 1).min(5)));
+                self.overlay = Some(Overlay::Preferences((sel + 1).min(6)));
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_preference_item(sel),
             KeyCode::Char(c) => match mnemonic_index(&items, c) {
@@ -5619,11 +5676,16 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Preferences(sel));
             }
             3 => {
-                self.always_save_when_prompted = !self.always_save_when_prompted;
+                self.confirm_on_delete_request = !self.confirm_on_delete_request;
                 self.save_state();
                 self.overlay = Some(Overlay::Preferences(sel));
             }
             4 => {
+                self.always_save_when_prompted = !self.always_save_when_prompted;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            5 => {
                 self.run_all_batch_mode = !self.run_all_batch_mode;
                 self.save_state();
                 self.overlay = Some(Overlay::Preferences(sel));
@@ -5701,7 +5763,7 @@ impl TuiApp {
             // to Preferences afterwards; there's nothing left to
             // "confirm" or "cancel" since the value's already applied.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                self.overlay = Some(Overlay::Preferences(5))
+                self.overlay = Some(Overlay::Preferences(6))
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let new_sel = sel.saturating_sub(1);

@@ -537,6 +537,9 @@ pub struct PersistedState {
     /// Ask for confirmation before deleting a Global Environment.
     #[serde(default = "yes")]
     pub confirm_on_delete_env: bool,
+    /// Ask for confirmation before deleting a request.
+    #[serde(default = "yes")]
+    pub confirm_on_delete_request: bool,
     /// When set, auto-pick "Save" on a Save/Discard/Cancel unsaved-changes
     /// prompt (Workspace collection switch or git push) instead of showing it.
     #[serde(default)]
@@ -632,6 +635,7 @@ impl Default for PersistedState {
             confirm_on_exit: true,
             confirm_on_clear: true,
             confirm_on_delete_env: true,
+            confirm_on_delete_request: true,
             always_save_when_prompted: false,
             list_width: default_list_width(),
             response_pct: default_response_pct(),

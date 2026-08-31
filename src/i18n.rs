@@ -61,6 +61,7 @@ strings! {
     pref_item_confirm_exit => "Confirm on e(x)it", "Confirmer à la (s)ortie", "Bekræft ved (a)fslutning";
     pref_item_confirm_clear => "Confirm on (c)lear", "Confirmer avant de (f)ermer", "Bekræft ved (l)ukning";
     pref_item_confirm_delete_env => "Confirm before (d)eleting an environment", "Confirmer avant de supprimer un (e)nvironnement", "Bekræft før (s)letning af et miljø";
+    pref_item_confirm_delete_request => "Confirm before deleting a (r)equest", "Confirmer avant de supprimer une (r)equête", "Bekræft før sletning af en anmod(n)ing";
     pref_item_always_save => "(A)lways save unsaved changes when prompted", "(T)oujours enregistrer les modifications non enregistrées lorsque demandé", "(G)em altid ugemte ændringer, når du bliver spurgt";
     pref_item_default_view => "Default Request (V)iew", "(V)ue de requête par défaut", "Standard anmodnings(v)isning";
     pref_item_run_all_batch => "Run All in (b)atch mode (chains cookies & captures)", "Tout exécuter en mode (b)atch (chaîne cookies et captures)", "Kør alle i (b)atch-tilstand (kæder cookies og optagelser)";
@@ -297,6 +298,7 @@ strings! {
     env_link_picker_title => "Link Environment", "Lier un environnement", "Tilknyt miljø";
     env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
+    request_delete_confirm => "Delete this request?", "Supprimer cette requête\u{a0}?", "Slet denne anmodning?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
     env_active_label => "Active: ", "Actif : ", "Aktiv: ";
     env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
@@ -489,6 +491,7 @@ strings! {
     help_new => "new request (or add variable, in the environment popup)", "nouvelle requête (ou ajouter une variable, dans la popup d'environnement)", "ny anmodning (eller tilføj variabel, i miljø-popup'en)";
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
+    help_save_active => "save what's on screen (report, else collection)", "enregistrer ce qui est à l'écran (rapport, sinon collection)", "gem det viste (rapport, ellers samling)";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
     help_workspace_new_item => "new collection / report / environment in the workspace (name it .hurl, .trail or .vars)", "nouvelle collection / rapport / environnement dans l'espace de travail (nommez-le .hurl, .trail ou .vars)", "ny samling / rapport / miljø i arbejdsområdet (navngiv den .hurl, .trail eller .vars)";
     help_workspace_move_item => "move the highlighted workspace file or folder to another folder", "déplacer le fichier ou dossier d'espace de travail en surbrillance vers un autre dossier", "flyt den fremhævede workspace-fil eller -mappe til en anden mappe";
@@ -628,7 +631,7 @@ strings! {
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+S export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+S export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+S export · Ctrl+O åbn · B basislinje";
+    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+E export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+E export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+E export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -644,7 +647,7 @@ strings! {
     report_opened_prefix => "Opened", "Ouvert", "Åbnede";
     // Ctrl+O on a run that hasn't been written anywhere: there is no file for
     // the desktop to open, and saying so is more use than doing nothing.
-    report_open_no_export => "Export the run first (Ctrl+S), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+S), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+S); derefter åbner Ctrl+O filen.";
+    report_open_no_export => "Export the run first (Ctrl+E), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+E), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+E); derefter åbner Ctrl+O filen.";
     help_report_open_export => "open the exported file in the desktop's default application", "ouvrir le fichier exporté dans l'application par défaut du bureau", "åbn den eksporterede fil i skrivebordets standardprogram";
     report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
     // "Nothing to save" is true but unhelpful for an export: the reader knows

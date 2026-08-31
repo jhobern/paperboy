@@ -200,6 +200,12 @@ pub struct Session {
     /// Confirm before deleting a Global Environment. On by default; turn it off
     /// to always delete immediately (the deletion stays undoable).
     pub confirm_on_delete_env: bool,
+    /// Confirm before deleting a request. On by default, for the same reason
+    /// its environment counterpart is: `x` (terminal UI) and Delete (GUI) sit
+    /// one key away from navigation, and a request holds work — a body, asserts,
+    /// captures — that took longer to write than an environment row. The
+    /// deletion stays undoable either way.
+    pub confirm_on_delete_request: bool,
     /// When set, a "Save / Discard / Cancel" prompt for unsaved in-memory edits
     /// (switching collections in a Workspace, or pushing one to git) is skipped
     /// and the "Save" action taken automatically. Off by default, so the prompt
@@ -286,6 +292,7 @@ impl Default for Session {
             confirm_on_exit: true,
             confirm_on_clear: true,
             confirm_on_delete_env: true,
+            confirm_on_delete_request: true,
             always_save_when_prompted: false,
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
@@ -1024,6 +1031,7 @@ impl Session {
             confirm_on_exit: self.confirm_on_exit,
             confirm_on_clear: self.confirm_on_clear,
             confirm_on_delete_env: self.confirm_on_delete_env,
+            confirm_on_delete_request: self.confirm_on_delete_request,
             always_save_when_prompted: self.always_save_when_prompted,
             list_width: self.list_width,
             response_pct: self.response_pct,
@@ -1130,6 +1138,7 @@ impl Session {
         self.confirm_on_exit = state.confirm_on_exit;
         self.confirm_on_clear = state.confirm_on_clear;
         self.confirm_on_delete_env = state.confirm_on_delete_env;
+        self.confirm_on_delete_request = state.confirm_on_delete_request;
         self.always_save_when_prompted = state.always_save_when_prompted;
         self.list_width = state.list_width;
         self.response_pct = state.response_pct;

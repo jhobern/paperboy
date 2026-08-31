@@ -674,6 +674,38 @@ impl NewReq {
             .collect()
     }
 
+    /// Whether a section-view tab holds anything the user has typed, read live
+    /// from the editors so the tab bar reacts as a row is filled in.
+    ///
+    /// The tab bar is how the wizard's ten sections are navigated, and its
+    /// labels alone say nothing about which ones are populated: with focus in
+    /// Body there is no way to tell that Headers has three rows and Asserts is
+    /// empty without visiting them, or switching to the "All" tab to see
+    /// everything stacked. The bar shades the tabs that answer "yes" here (see
+    /// `draw_wizard_tab_bar`), which is the same affordance Postman's green dot
+    /// on Params/Headers/Body provides.
+    ///
+    /// "All" is never marked: it shows every section, so it is populated
+    /// whenever anything else is and the mark would carry no information.
+    /// Blank rows don't count — a section the user tabbed through but never
+    /// filled in has no content, which is exactly what
+    /// [`KvdSection::is_blank`] and the row-level `is_blank` helpers already
+    /// mean everywhere else in the wizard.
+    pub(crate) fn tab_has_content(&self, tab: WizardTab) -> bool {
+        match tab {
+            WizardTab::All => false,
+            WizardTab::Headers => !self.headers.is_blank(),
+            WizardTab::Cookies => !self.cookies.is_blank(),
+            WizardTab::Queries => !self.queries.is_blank(),
+            WizardTab::Options => !self.options.is_blank(),
+            WizardTab::Form => self.form_fields.iter().any(|r| !r.is_blank()),
+            WizardTab::Body => !self.body.text().trim().is_empty(),
+            WizardTab::Asserts => self.asserts.iter().any(|r| !r.is_blank()),
+            WizardTab::Captures => self.captures.iter().any(|r| !r.is_blank()),
+            WizardTab::Reports => self.reports.iter().any(|r| !r.is_blank()),
+        }
+    }
+
     /// The parameters this request declares — the names of its enabled
     /// `[Options] variable: NAME=value` rows, read live from the editors so the
     /// section band updates as the row is typed.
@@ -2204,6 +2236,16 @@ pub(crate) fn draw_new_request_with_hits(
     let h = 36u16.min(f.area().height);
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
+    // The wizard's shortcut hint sits on the *bottom* border, like every other
+    // dialog in the app (see `panel_hinted`): keys belong on the frame, and the
+    // one place users have learned to look for them is the bottom edge. It used
+    // to be appended to the title, which put the wizard's keys somewhere no
+    // other panel keeps them.
+    //
+    // Built as parts rather than one string so `fit_border_hint` can drop whole
+    // items off the end on a narrow terminal instead of letting ratatui clip
+    // the last one mid-word.
+    //
     // Drop the Ctrl+Enter submit shortcut from the hint on terminals that can't
     // report it distinctly (F2 stays as the universal trigger).
     let hint_str = if form.editing.is_some() {
@@ -2211,11 +2253,11 @@ pub(crate) fn draw_new_request_with_hits(
     } else {
         s.new_request_hint
     };
-    let mut hint = if enhanced {
+    let mut parts: Vec<String> = vec![if enhanced {
         hint_str.to_string()
     } else {
         hint_str.replace(&format!("{}/F2", s.ctrl_enter_key), "F2")
-    };
+    }];
     // Contextual addition: only shown while a `File`- or `Base64 File`-kind
     // Form row's Value cell is focused (both pick a file), so the
     // always-visible hint bar stays short otherwise.
@@ -2226,7 +2268,7 @@ pub(crate) fn draw_new_request_with_hits(
             .map(|r| r.kind)
             .is_some_and(|v| v.is_multipart())
     {
-        hint = format!("{hint} · {}", s.hint_pick_file);
+        parts.push(s.hint_pick_file.to_string());
     }
     // Contextual addition: only shown while focus is on an existing
     // Header/Cookie/Form row (the row kinds that actually have an enabled
@@ -2243,7 +2285,7 @@ pub(crate) fn draw_new_request_with_hits(
         NewField::FormField(i, _) if i < form.form_fields.len()
     );
     if on_toggleable_row {
-        hint = format!("{hint} · {}", s.hint_toggle_enabled);
+        parts.push(s.hint_toggle_enabled.to_string());
     }
     // Contextual addition: only shown while focus is on an existing
     // Header/Cookie/Form/Assert/Capture row, so users can discover the
@@ -2259,14 +2301,14 @@ pub(crate) fn draw_new_request_with_hits(
             NewField::Capture(i, _) if i < form.captures.len()
         );
     if on_deletable_row {
-        hint = format!("{hint} · {}", s.hint_delete_row);
+        parts.push(s.hint_delete_row.to_string());
     }
     // Contextual addition: only where there is something to extract, i.e. on a
     // text cell that holds a value. Extracting is the one way to declare a
     // parameter without knowing the `variable:` syntax, so it has to be
     // findable from the field it applies to rather than only in the docs.
     if form.extractable_hint() {
-        hint = format!("{hint} · {}", s.hint_extract_parameter);
+        parts.push(s.hint_extract_parameter.to_string());
     }
     // Contextual addition: only in the Options section, where the way to
     // declare a report-steerable parameter is a `variable:` row and there is
@@ -2274,15 +2316,15 @@ pub(crate) fn draw_new_request_with_hits(
     if matches!(form.focus, NewField::Kvd(KvdKind::Options, ..))
         || form.focus == KvdKind::Options.add_field()
     {
-        hint = format!("{hint} · {}", s.hint_declare_parameter);
+        parts.push(s.hint_declare_parameter.to_string());
     }
     let title_text = if form.editing.is_some() {
         s.edit_request
     } else {
         s.new_request
     };
-    let title = format!("{}   ({})", title_text, hint);
-    let block = panel(title, true, th);
+    let hint = fit_border_hint(&parts, " \u{b7} ", area.width);
+    let block = panel_hinted(title_text.to_string(), &hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2384,6 +2426,7 @@ pub(crate) fn draw_new_request_with_hits(
     draw_wizard_tab_bar(
         f,
         rows[4],
+        form,
         form.view_tab,
         &form.tab_order,
         form.focus == NewField::TabBar,
@@ -2582,6 +2625,7 @@ fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &S
 fn draw_wizard_tab_bar(
     f: &mut Frame,
     area: Rect,
+    form: &NewReq,
     active: WizardTab,
     order: &[WizardTab],
     bar_focused: bool,
@@ -2609,6 +2653,14 @@ fn draw_wizard_tab_bar(
                 .fg(th.bg)
                 .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
+        } else if form.tab_has_content(*tab) {
+            // A section with something in it reads as a filled surface rather
+            // than a dim label: the tab bar is the only view of the other nine
+            // sections while one is open, and without this nothing on screen
+            // says which of them are populated (see `NewReq::tab_has_content`).
+            // A background rather than a badge character, so the marking costs
+            // no width -- the bar already has ten labels to fit.
+            Style::default().fg(th.text).bg(th.line)
         } else {
             Style::default().fg(th.dim)
         };

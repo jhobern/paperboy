@@ -608,10 +608,11 @@ overlay any time with `?` or `F1` for the full, up-to-date list. Highlights:
 | `n` | New request (List/Response/Tabs panes) — or add environment variable (Env pane) |
 | `b` | Set the base URL |
 | `f` / `s` | File menu / Settings menu |
+| `Ctrl+S` | Save what's on screen back to its own file — the open report if there is one, otherwise the active collection (falls back to "Save As" when it has never been written anywhere) |
 | `[` / `]`, `Ctrl+←`/`→` | Previous / next tab |
 | `PageUp`/`PageDown` | Previous / next tab (same as `[`/`]`) |
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |
-| `x` | Delete request / close collection tab |
+| `x` | Delete request / close collection tab (deleting a request asks first; the confirmation can be turned off in Preferences, and `u` undoes it either way) |
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
 | `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |

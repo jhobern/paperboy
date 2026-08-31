@@ -902,6 +902,112 @@ fn the_confirm_on_delete_env_preference_toggles_and_persists() {
     );
 }
 
+/// A request holds more work than an environment row — a body, asserts,
+/// captures — and `x` sits one key away from the list navigation, so the
+/// deletion asks first by default. The preference turns that off for people who
+/// would rather lean on `u`.
+#[test]
+fn the_confirm_on_delete_request_preference_toggles_and_persists() {
+    let mut app = TuiApp::default();
+    assert!(
+        app.confirm_on_delete_request,
+        "confirmation is on by default (safe)"
+    );
+
+    app.overlay = Some(Overlay::Preferences(3));
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.confirm_on_delete_request, "Enter toggles it off");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        "the highlight stays on the toggle row"
+    );
+
+    let persisted = app.to_persisted();
+    assert!(!persisted.confirm_on_delete_request);
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(persisted);
+    assert!(
+        !restored.confirm_on_delete_request,
+        "the preference survives a save/load cycle"
+    );
+}
+
+/// Declining the confirmation must leave the request exactly where it was —
+/// the whole point of being asked.
+#[test]
+fn declining_the_delete_confirmation_keeps_the_request() {
+    let mut app = TuiApp::default();
+    app.collections[0]
+        .entries
+        .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
+    app.collections[0].selected_entry = 0;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('n'));
+
+    assert!(app.overlay.is_none(), "the popup closes");
+    assert_eq!(
+        app.collections[0].entries.len(),
+        1,
+        "declining keeps the request"
+    );
+}
+
+/// `x` on a folder or an "up" row has always been a no-op; it must not become a
+/// question about a request that isn't there.
+#[test]
+fn the_delete_confirmation_is_not_raised_on_a_folder_row() {
+    let mut app = TuiApp::default();
+    app.collections[0] = collection_with_folders();
+    app.focus = Pane::List;
+    // Row 0 at the root of a foldered collection is a folder, not an entry.
+    app.collections[0].list_cursor = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation for a row that holds no request"
+    );
+}
+
+/// Ctrl+S is the one shortcut every user arrives already knowing. It used to
+/// land on the bare-`s` Settings arm in the collection view (a silent no-op on
+/// the keystroke people trust most) and to mean "export CSV" in the report
+/// view; now it means the same thing in both: write what is on screen back to
+/// its own file, exactly as the GUI's Ctrl+S does.
+#[test]
+fn ctrl_s_saves_the_collection_rather_than_opening_settings() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let mut app = TuiApp::default();
+    app.collections[0]
+        .entries
+        .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
+
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+    assert!(
+        !matches!(app.overlay, Some(Overlay::Options(_))),
+        "Ctrl+S is a save, not the Settings menu"
+    );
+    // The built-in tab has never been written anywhere, so a save falls back to
+    // asking where — which is still a save, not nothing.
+    assert!(
+        app.overlay.is_some(),
+        "an unsaved collection falls back to Save As rather than doing nothing"
+    );
+
+    // A bare `s` still opens Settings.
+    app.overlay = None;
+    press(&mut app, KeyCode::Char('s'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Options(_))),
+        "plain `s` still opens Settings"
+    );
+}
+
 #[test]
 fn f2_on_the_environments_panel_renames_the_selected_environment() {
     let mut app = TuiApp::default();
@@ -2231,12 +2337,12 @@ fn run_all_batch_mode_toggles_from_preferences_and_round_trips() {
         "Run All streams by default (batch mode off)"
     );
 
-    // Row 4 of the Preferences menu toggles it (Enter and Space both work).
-    app.overlay = Some(Overlay::Preferences(4));
+    // Row 5 of the Preferences menu toggles it (Enter and Space both work).
+    app.overlay = Some(Overlay::Preferences(5));
     press(&mut app, KeyCode::Enter);
     assert!(app.run_all_batch_mode, "Enter toggles batch mode on");
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        matches!(app.overlay, Some(Overlay::Preferences(5))),
         "the highlight stays on the toggle row"
     );
     press(&mut app, KeyCode::Char(' '));
@@ -2588,11 +2694,12 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Enter); // open Preferences (sel 0)
     press(&mut app, KeyCode::Down); // -> sel 1 (Confirm on clear)
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
-    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Down moves to the last item without wrapping past it"
     );
 
@@ -2620,7 +2727,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
         "selecting JSON in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -2628,14 +2735,14 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(5)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(6)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
         "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -2657,9 +2764,10 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down); // -> sel 1
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
-    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
     assert_eq!(app.default_request_view, RequestView::Hurl);
 
@@ -2679,7 +2787,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(5))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(6))));
     assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
@@ -6635,7 +6743,19 @@ fn x_deletes_the_selected_request_when_the_list_is_focused() {
     app.collections[0].selected_entry = 0;
     app.focus = Pane::List;
 
+    // The default is to ask first, so the delete takes `x` and then an answer.
     press(&mut app, KeyCode::Char('x'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteRequest,
+                ..
+            })
+        ),
+        "`x` asks before deleting a request"
+    );
+    press(&mut app, KeyCode::Char('y'));
 
     assert_eq!(
         app.collections[0].entries.len(),
@@ -6659,6 +6779,9 @@ fn u_restores_the_most_recently_deleted_request_when_the_list_is_focused() {
         .push(HurlEntry::from_fields("b", "GET", "http://h/b", vec![], ""));
     app.collections[0].selected_entry = 0;
     app.focus = Pane::List;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x')); // deletes "a"
     assert_eq!(app.collections[0].entries.len(), 1);
 
@@ -6730,6 +6853,9 @@ fn u_reopens_the_closed_tab_instead_when_not_on_the_list_pane() {
         .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
     app.focus = Pane::List;
     app.collections[0].selected_entry = 0;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x')); // deletes "a" from the built-in tab
     assert!(app.collections[0].entries.is_empty());
 
@@ -12728,6 +12854,113 @@ fn wizard_tab_bar_renders_every_section_label() {
     }
 }
 
+/// The tab bar is the only view of the wizard's other nine sections while one
+/// of them is open, so a populated section is shaded rather than dim: with
+/// focus in Body there is otherwise nothing on screen saying that Headers has
+/// rows in it. A background rather than a badge character, because the bar
+/// already has ten labels to fit.
+#[test]
+fn a_wizard_tab_with_content_is_shaded_and_an_empty_one_is_not() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut form = NewReq::new(String::new(), vec!["Scratch".to_string()], 0, None);
+    // Headers gets a real row; Cookies gets a blank one, which is not content.
+    form.headers.rows.push(HeaderRow::new());
+    form.headers.rows[0].key = Editor::new("Authorization", false);
+    form.cookies.rows.push(HeaderRow::new());
+
+    assert!(form.tab_has_content(WizardTab::Headers));
+    assert!(!form.tab_has_content(WizardTab::Cookies));
+    assert!(
+        !form.tab_has_content(WizardTab::All),
+        "the All tab shows everything, so marking it says nothing"
+    );
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::new_request::draw_new_request(f, &form, &s, &th, true))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+
+    let bg_of = |label: &str| -> ratatui::style::Color {
+        let area = *buf.area();
+        for y in area.y..area.bottom() {
+            let row: String = (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            // Only the tab bar draws these labels side by side on one line.
+            if row.contains("All")
+                && row.contains("Headers")
+                && row.contains("Cookies")
+                && let Some(col) = row.find(label)
+            {
+                return buf.cell((area.x + col as u16, y)).unwrap().bg;
+            }
+        }
+        panic!("no tab bar row found");
+    };
+
+    assert_eq!(
+        bg_of("Headers"),
+        th.line,
+        "a populated section is shaded so it stands out from the empty ones"
+    );
+    assert_ne!(
+        bg_of("Cookies"),
+        th.line,
+        "a section holding only a blank row is not shaded"
+    );
+}
+
+/// Every other dialog keeps its shortcut hint on the bottom border
+/// (`panel_hinted`); the wizard used to append it to the title instead, which
+/// put its keys in the one place nothing else does.
+#[test]
+fn the_wizard_hint_sits_on_the_bottom_border_not_in_the_title() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let form = NewReq::new(String::new(), vec!["Scratch".to_string()], 0, None);
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::new_request::draw_new_request(f, &form, &s, &th, true))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let area = *buf.area();
+    let rows: Vec<String> = (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        })
+        .collect();
+
+    let hint_row = rows
+        .iter()
+        .position(|r| r.contains("Esc"))
+        .expect("the hint should be on screen somewhere");
+    // Matched without the leading full-width "＋" of `s.new_request`: a
+    // double-width glyph occupies two buffer cells, so the title never appears
+    // verbatim in a cell-by-cell readback of the row.
+    let title_row = rows
+        .iter()
+        .position(|r| r.contains("New Request"))
+        .expect("the wizard is titled");
+    assert!(
+        hint_row > title_row,
+        "the hint belongs on the bottom border, below the title:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows[title_row].contains("Esc"),
+        "the title no longer carries the shortcut list:\n{}",
+        rows[title_row]
+    );
+}
+
 #[test]
 fn page_down_and_page_up_cycle_the_wizard_view_tab() {
     let mut app = TuiApp::default();
@@ -14342,6 +14575,9 @@ fn the_request_and_tab_undo_stacks_do_not_interleave() {
     app.focus = Pane::List;
     app.active_tab = 0;
     app.collections[0].selected_entry = 0;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x'));
     assert!(app.collections[0].entries.is_empty());
 
@@ -14803,6 +15039,10 @@ fn delete_removes_a_request_row_while_browsing_a_folder() {
         .iter()
         .position(|e| e.title == "A/one")
         .unwrap();
+
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
 
     press(&mut app, KeyCode::Char('x'));
     assert!(
@@ -16007,6 +16247,8 @@ fn deleting_a_request_reports_the_undo_hint_in_the_status_bar() {
     app.active_tab = ci;
     app.focus = Pane::List;
     app.collections[ci].sync_folder_to_selected();
+    // The subject here is the status line, not the confirmation.
+    app.confirm_on_delete_request = false;
 
     press(&mut app, KeyCode::Char('x'));
 
@@ -17544,11 +17786,11 @@ fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_de
         "the preference is off by default"
     );
 
-    app.overlay = Some(Overlay::Preferences(3));
+    app.overlay = Some(Overlay::Preferences(4));
     press(&mut app, KeyCode::Enter);
     assert!(app.always_save_when_prompted, "Enter toggles it on");
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "the highlight stays on the toggle row"
     );
 
@@ -20706,7 +20948,7 @@ fn report_export_writes_a_csv_next_to_the_report() {
 /// environment/request one pane away in the collection view). `Ctrl+S` opens
 /// the export folder picker; a plain `x` in a report view does nothing.
 #[test]
-fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
+fn ctrl_e_exports_the_report_and_plain_x_is_inert() {
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
     let mut app = TuiApp::default();
@@ -20737,14 +20979,15 @@ fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
         "a plain `x` should be inert in a report view, not export"
     );
 
-    // Ctrl+S opens the report-CSV export folder picker.
-    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    // Ctrl+E opens the report-CSV export folder picker. (It is not Ctrl+S:
+    // that chord saves the report itself, here as everywhere else.)
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     assert!(
         matches!(
             app.overlay,
             Some(Overlay::Browser(FileAction::SaveReportCsvChooseFolder, _))
         ),
-        "Ctrl+S should open the report-CSV export picker"
+        "Ctrl+E should open the report-CSV export picker"
     );
 }
 
@@ -31262,6 +31505,8 @@ fn tabbing_away_from_the_environments_filter_gives_the_keyboard_back() {
     app.focus = Pane::List;
     app.collections[ci].selected_entry = 1;
     app.collections[ci].list_cursor = 1;
+    // The point is that `x` reaches the Requests list at all, not that it asks.
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x'));
 
     assert_eq!(
