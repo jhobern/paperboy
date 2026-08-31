@@ -723,13 +723,17 @@ pub fn render_editor(f: &mut Frame, area: Rect, ed: &Editor, style: &EditorTheme
         .skip(row_off)
         .take(h)
         .map(|l| {
-            let visible = l.chars().skip(col_off).take(w + 1);
-
             let text: String = if masked {
                 // Mask each character so a secret is never shown while editing.
-                visible.map(|_| '\u{2022}').collect()
+                // Every mask glyph is one column wide, so the character window
+                // and the column window coincide here.
+                l.chars()
+                    .skip(col_off)
+                    .take(w)
+                    .map(|_| '\u{2022}')
+                    .collect()
             } else {
-                visible.collect()
+                clip_to_width(l, col_off, w)
             };
 
             Line::from(text)
@@ -791,12 +795,68 @@ pub fn render_editor_highlighted(
 fn scroll_offsets(ed: &Editor, area: Rect) -> (usize, usize, usize, usize) {
     let h = area.height as usize;
     let w = area.width as usize;
+    let cols = display_cols(ed.lines.get(ed.row).map_or("", |l| l.as_str()));
     (
-        ed.row.saturating_sub(h - 1),
-        ed.col.saturating_sub(w - 1),
+        ed.row.saturating_sub(h.saturating_sub(1)),
+        scroll_start(&cols, ed.col, w),
         h,
         w,
     )
+}
+
+/// The display column *before* each character of `line`, plus a final entry
+/// holding the line's whole width — so `cols[i]` is where character `i` starts
+/// on screen, and `cols[line.chars().count()]` is the width of the line.
+///
+/// The editor addresses text by character index, but a terminal is addressed
+/// in columns, and the two only agree for plain ASCII. A CJK ideograph or an
+/// emoji occupies two columns and a combining mark none, so measuring the
+/// caret, the horizontal scroll window or a selection in characters puts them
+/// visibly in the wrong place — the caret inside the right half of a glyph,
+/// the highlight covering the wrong cells. Everything on the render path goes
+/// through this table, measured exactly the way `ratatui` measures the spans
+/// it is about to draw.
+fn display_cols(line: &str) -> Vec<usize> {
+    let mut cols = Vec::with_capacity(line.chars().count() + 1);
+    let mut at = 0usize;
+    for ch in line.chars() {
+        cols.push(at);
+        at += Span::raw(ch.to_string()).width();
+    }
+    cols.push(at);
+    cols
+}
+
+/// The first character index to draw so that the character at `cursor` still
+/// falls inside a `w`-column window. Returns a *character* index, since that is
+/// what the slicing on the render path works in.
+fn scroll_start(cols: &[usize], cursor: usize, w: usize) -> usize {
+    let caret = cols.get(cursor).copied().unwrap_or(0);
+    let budget = w.saturating_sub(1);
+    // `cols` is non-decreasing, so the first index whose column is within
+    // `budget` of the caret is the leftmost one that keeps the caret visible.
+    let mut start = 0usize;
+    while start < cursor && caret - cols[start] > budget {
+        start += 1;
+    }
+    start
+}
+
+/// The characters of `line` from character index `from` that fit in `w`
+/// columns, as a string. A wide glyph that would straddle the right edge is
+/// left out rather than half-drawn.
+fn clip_to_width(line: &str, from: usize, w: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in line.chars().skip(from) {
+        let cw = Span::raw(ch.to_string()).width();
+        if used + cw > w {
+            break;
+        }
+        used += cw;
+        out.push(ch);
+    }
+    out
 }
 
 /// Repaint the cells covered by the active selection with the theme's selection
@@ -822,12 +882,20 @@ fn paint_selection(f: &mut Frame, area: Rect, ed: &Editor, style: &EditorTheme) 
         } else {
             (0, len)
         };
-        for col in from.max(col_off)..to.min(col_off + w) {
-            let screen_col = col - col_off;
-            if let Some(cell) =
-                buf.cell_mut((area.x + screen_col as u16, area.y + screen_row as u16))
-            {
-                cell.set_style(Style::default().bg(style.select_bg).fg(style.select_fg));
+        // Character positions become screen columns here: a selected wide
+        // glyph has to have both of its cells repainted, or the highlight
+        // tears down the middle of it.
+        let cols = display_cols(&ed.lines[line_idx]);
+        let origin = cols.get(col_off).copied().unwrap_or(0);
+        for col in from.max(col_off)..to {
+            let start = cols[col].saturating_sub(origin);
+            let end = cols[col + 1].saturating_sub(origin);
+            for screen_col in start..end.min(w) {
+                if let Some(cell) =
+                    buf.cell_mut((area.x + screen_col as u16, area.y + screen_row as u16))
+                {
+                    cell.set_style(Style::default().bg(style.select_bg).fg(style.select_fg));
+                }
             }
         }
     }
@@ -835,7 +903,10 @@ fn paint_selection(f: &mut Frame, area: Rect, ed: &Editor, style: &EditorTheme) 
 
 /// Place the terminal cursor at the editor's cursor within `area`.
 fn place_cursor(f: &mut Frame, area: Rect, ed: &Editor, row_off: usize, col_off: usize) {
-    let cx = area.x + (ed.col - col_off) as u16;
+    let cols = display_cols(ed.lines.get(ed.row).map_or("", |l| l.as_str()));
+    let caret = cols.get(ed.col).copied().unwrap_or(0);
+    let origin = cols.get(col_off).copied().unwrap_or(0);
+    let cx = area.x + caret.saturating_sub(origin) as u16;
     let cy = area.y + (ed.row - row_off) as u16;
     f.set_cursor_position(Position::new(cx, cy));
 }
@@ -888,8 +959,17 @@ pub fn render_line_field(
         text
     };
 
-    let col_off = ed.col.saturating_sub(w.saturating_sub(1));
-    let vis: String = shown.chars().skip(col_off).take(w).collect();
+    let col_off = if mask {
+        // Masked text is one column per character, so the two agree.
+        ed.col.saturating_sub(w.saturating_sub(1))
+    } else {
+        scroll_start(&display_cols(&shown), ed.col, w)
+    };
+    let vis: String = if mask {
+        shown.chars().skip(col_off).take(w).collect()
+    } else {
+        clip_to_width(&shown, col_off, w)
+    };
     let cell_style = if focused {
         Style::default().fg(style.text).bg(style.panel)
     } else {
@@ -897,7 +977,16 @@ pub fn render_line_field(
     };
     f.render_widget(Paragraph::new(vis).style(cell_style), area);
     if focused {
-        f.set_cursor_position(Position::new(area.x + (ed.col - col_off) as u16, area.y));
+        let caret = if mask {
+            ed.col.saturating_sub(col_off)
+        } else {
+            let cols = display_cols(&shown);
+            cols.get(ed.col)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(cols.get(col_off).copied().unwrap_or(0))
+        };
+        f.set_cursor_position(Position::new(area.x + caret as u16, area.y));
     }
 }
 
@@ -943,9 +1032,9 @@ pub fn render_line_field_placeholder(
 /// Unlike [`render_line_field`], this takes a plain string and an explicit
 /// colour rather than an [`Editor`] and focus state, so the host controls the
 /// colour (e.g. a validity highlight) — it is intended for non-focused,
-/// read-only cells such as table columns. Width is measured in characters, so
-/// multi-byte text is handled correctly. Pass `marker: None` to render without
-/// any truncation indicator.
+/// read-only cells such as table columns. Width is measured in terminal
+/// columns, so wide glyphs (CJK, emoji) are counted the way they are drawn.
+/// Pass `marker: None` to render without any truncation indicator.
 pub fn render_clipped_line(
     f: &mut Frame,
     area: Rect,
@@ -957,12 +1046,23 @@ pub fn render_clipped_line(
         return;
     }
     let w = area.width as usize;
+    let truncated = marker.is_some() && Span::raw(text).width() > w;
+    // When a marker is going in the last column, clip the text ourselves so
+    // that column is free. Letting `ratatui` truncate and then overwriting the
+    // last cell works only for single-column text: if a wide glyph lands
+    // astride the edge, the marker would go in that glyph's continuation cell,
+    // which the terminal is never sent — the marker simply wouldn't appear.
+    let shown = if truncated {
+        clip_to_width(text, 0, w.saturating_sub(1))
+    } else {
+        text.to_string()
+    };
     f.render_widget(
-        Paragraph::new(text.to_string()).style(Style::default().fg(color)),
+        Paragraph::new(shown).style(Style::default().fg(color)),
         area,
     );
     if let Some(marker) = marker
-        && text.chars().count() > w
+        && truncated
     {
         let last = Rect {
             x: area.x + w as u16 - 1,
@@ -1424,5 +1524,77 @@ mod tests {
         assert_eq!(buffer.cell((0, 0)).unwrap().fg, Color::Green);
         assert_eq!(buffer.cell((6, 0)).unwrap().fg, Color::Green);
         assert_eq!(buffer.cell((8, 0)).unwrap().fg, Color::White);
+    }
+
+    fn wide_theme() -> EditorTheme {
+        EditorTheme {
+            text: Color::White,
+            panel: Color::Black,
+            dim: Color::Gray,
+            select_fg: Color::Black,
+            select_bg: Color::Cyan,
+        }
+    }
+
+    /// Where the terminal cursor ended up after rendering `f`.
+    fn cursor_after<F: FnOnce(&mut Frame)>(w: u16, h: u16, f: F) -> Option<u16> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| f(frame)).unwrap();
+        terminal.get_cursor_position().ok().map(|p| p.x)
+    }
+
+    /// Regression: the caret is placed in terminal columns, not characters.
+    /// A CJK ideograph occupies two columns, so measuring in characters put
+    /// the caret inside the right half of a glyph instead of after the text.
+    #[test]
+    fn the_caret_sits_past_wide_glyphs_not_inside_them() {
+        let ed = Editor::new("\u{65e5}\u{672c}\u{8a9e}", false);
+        let at = cursor_after(20, 1, |f| {
+            render_line_field(f, Rect::new(0, 0, 20, 1), &ed, &wide_theme(), true, false)
+        });
+        assert_eq!(at, Some(6), "three two-column glyphs put the caret at 6");
+    }
+
+    /// Regression: the horizontal scroll window is a column budget too, so
+    /// typing past the right edge of a narrow field keeps the caret — and the
+    /// text just typed — on screen.
+    #[test]
+    fn a_narrow_field_scrolls_wide_text_far_enough_to_show_the_caret() {
+        let ed = Editor::new("\u{65e5}\u{672c}\u{8a9e}\u{4e2d}\u{6587}", false);
+        let at = cursor_after(6, 1, |f| {
+            render_line_field(f, Rect::new(0, 0, 6, 1), &ed, &wide_theme(), true, false)
+        });
+        assert!(
+            at.is_some_and(|x| x < 6),
+            "the caret stays inside the field, was {at:?}"
+        );
+        let shown = render_to_string(6, 1, |f| {
+            render_line_field(f, Rect::new(0, 0, 6, 1), &ed, &wide_theme(), true, false)
+        });
+        assert!(
+            shown.contains('\u{6587}'),
+            "and the character at the caret is visible, showed {shown:?}"
+        );
+    }
+
+    /// Regression: the truncation marker is driven by display width, so text
+    /// that overflows only because its glyphs are wide is still marked.
+    #[test]
+    fn wide_text_that_overflows_is_marked_as_truncated() {
+        let shown = render_to_string(4, 1, |f| {
+            render_clipped_line(
+                f,
+                Rect::new(0, 0, 4, 1),
+                "\u{65e5}\u{672c}\u{8a9e}",
+                Color::White,
+                Some(TruncationMarker::default()),
+            )
+        });
+        assert!(
+            shown.ends_with('\u{2026}'),
+            "six columns in a four-column cell is truncated, showed {shown:?}"
+        );
     }
 }

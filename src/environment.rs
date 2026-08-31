@@ -61,10 +61,28 @@ pub struct EnvVar {
 /// Fixed-width mask shown in place of a secret value (does not leak length).
 pub const SECRET_MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
 
+/// Flatten a value to something the `.vars` line format can actually hold.
+///
+/// A `.vars` file is one `KEY=value` per line, and the parser drops any line
+/// without an `=`. A value containing a newline — a pasted PEM private key or
+/// certificate is the realistic case — therefore came back from disk as its
+/// first line alone, losing the rest silently, on save and again on every
+/// restart. The format can't represent it, so collapse it here, where the user
+/// can see what was stored, instead of appearing to accept it and truncating
+/// it later. (The Postman importer has always done the same on the way in.)
+pub fn flatten_value(v: &str) -> String {
+    if v.contains(['\n', '\r']) {
+        v.replace(['\n', '\r'], " ")
+    } else {
+        v.to_string()
+    }
+}
+
 impl EnvVar {
     /// A variable added by the user by hand: a concrete literal value that is
     /// immediately "resolved" and flagged [`user_added`](EnvVar::user_added).
     pub fn user(key: String, value: String) -> Self {
+        let value = flatten_value(&value);
         EnvVar {
             key,
             original_value: value.clone(),
@@ -172,6 +190,7 @@ impl EnvVar {
         keep_secret: bool,
         index: usize,
     ) -> Option<PendingSecret> {
+        let v = flatten_value(&v);
         self.modified = v != self.original_value;
         let was_secret_source = self.is_secret_source();
         let rewrite_raw = !was_secret_source || !keep_secret;
@@ -1366,5 +1385,27 @@ mod tests {
           "item": [ { "name": "a", "request": { "method": "GET", "url": "http://x" } } ]
         }}"#;
         assert!(!looks_like_env(json));
+    }
+
+    /// Regression: a `.vars` line cannot carry a newline, and the reader drops
+    /// any line without an `=`, so a pasted multi-line secret used to come back
+    /// as its first line alone — losing the rest on save and on every restart.
+    /// Flattening at entry keeps what is stored and what is shown the same.
+    #[test]
+    fn a_multi_line_value_survives_a_save_and_reload_intact() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nAAAA\nBBBB\n-----END PRIVATE KEY-----";
+        let mut env = parse_vars("dev".into(), "");
+        env.vars.push(EnvVar::user("TLS_KEY".into(), pem.into()));
+        let stored = env.vars[0].value.clone();
+        assert!(
+            !stored.contains('\n'),
+            "the value is flattened as it is taken"
+        );
+
+        let reloaded = parse_vars("dev".into(), &env.to_vars_text());
+        assert_eq!(
+            reloaded.vars[0].value, stored,
+            "and what comes back is what was shown, not a truncation of it"
+        );
     }
 }

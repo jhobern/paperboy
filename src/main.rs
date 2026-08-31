@@ -105,7 +105,7 @@ struct Cli {
 
     /// With `-r`: expand the report and show what it would do without sending
     /// any request (no HTTP). Handy before a large run.
-    #[arg(long)]
+    #[arg(long, requires = "report")]
     dry_run: bool,
 
     /// With `-r`: where to write the report output. `-` writes CSV to stdout
@@ -113,7 +113,7 @@ struct Cli {
     /// `.html` or `.xlsx`); omitted derives the file from the report's
     /// `# output:`/`# name:` headers (next to the report file, honouring the
     /// `{time}` token).
-    #[arg(short = 'o', long, value_name = "FILE")]
+    #[arg(short = 'o', long, value_name = "FILE", requires = "report")]
     output: Option<String>,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.

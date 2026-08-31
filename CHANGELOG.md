@@ -233,7 +233,87 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   no longer inherits the original's last response, which credited it with a
   result it hadn't produced.
 
+- **A multipart request no longer sends the wrong file.** Files sent from
+  outside the collection's folder are copied in beside it so Hurl's sandbox
+  will accept them, and two fields sending different files that share a name
+  had the second one renamed to `photo_1.png`. Nothing checked whether the
+  request already had a real file called `photo_1.png` — if it did, one field
+  overwrote the other's copy and both fields uploaded the same bytes, silently
+  and with the right names on the wire. Generated names are now checked against
+  every name already claimed.
+
+- **A repeated request no longer credits its results to the wrong requests.**
+  `[Options] repeat` and `retry` make a single request report more than once,
+  and results were handed out one request at a time regardless: every result
+  after the repeat landed on the request before it, and the last request's
+  result was dropped entirely, leaving it looking like it had never run. Each
+  result now says which request it came from.
+
+- **A request title containing `-` or `=` no longer loses it.** Titles are
+  written as `# ` comments, and comment banners (`# ----`) are stripped when
+  reading them back — but the stripping ran over the whole line rather than its
+  ends, so `# Get user-profile` came back as `Get userprofile` and was written
+  back that way on the next save, breaking every report that addressed the
+  request by name.
+
+- **A multi-line environment value is no longer truncated to its first line.**
+  Pasting a PEM key or a JSON blob into a variable kept only the text before
+  the first newline, both in the saved `.vars` file and in the session restored
+  on the next start — and the value on screen still looked complete until then.
+  The `.vars` format is one `KEY=value` per line and cannot hold a newline, so
+  the newlines are now folded to spaces as the value is entered, where you can
+  see it happen, rather than silently at the point of writing.
+
+- **A setting written by a newer PaperBoy no longer costs you the whole
+  session.** One unrecognised value — a language, or a view this build doesn't
+  have — made the entire `state.json` unreadable, so every tab, collection and
+  environment was silently dropped and the next save overwrote the file that
+  still held them. Unknown values now fall back to the default and cost only
+  that one setting, and a state file that genuinely cannot be read is moved
+  aside to `state.json.unreadable` instead of being overwritten.
+
+- **Wide characters no longer displace the text cursor.** Single-line fields
+  measured text in characters rather than terminal columns, so CJK text, emoji
+  and box-drawing glyphs put the caret, the horizontal scroll and the selection
+  highlight progressively further from where they belonged — the caret could
+  sit inside a glyph, a narrow field could scroll too little to bring the caret
+  into view at all, and the "text continues" marker could land in a wide
+  glyph's second cell, where terminals never draw it.
+
+- **Clicking where a deleted wizard row used to be no longer crashes.** The map
+  of what is where on screen is built as the wizard is drawn and reused until
+  the next frame; deleting a row with the keyboard changed the rows without
+  rebuilding it, so a click on the stale rectangle could focus a row that was
+  no longer there and the next keystroke ended the program.
+
+- **Saving a request without changing it no longer rewrites it.** A status
+  check can live either on the `HTTP` response line or as a `status ==` assert;
+  the wizard shows both the same way, and on save it always wrote the first one
+  back onto the `HTTP` line. Opening a request that used the assert form and
+  saving it unchanged therefore moved the check and marked the request edited.
+  Requests now keep their status check where they had it.
+
+- **`--dry-run` and `--output` are no longer accepted and ignored.** Both only
+  mean anything alongside `--report`, and without it they were parsed happily
+  and did nothing — a scheduled run asking for a report file exited 0 having
+  written none. They now require `--report` and say so.
+
+- **A collection with nothing to run, and a report with failing rows, now exit
+  non-zero.** Both printed their complaint and exited 0, so a collection that
+  had failed to parse — or a report whose checks had failed — passed CI
+  silently.
+
+- **Two validation messages no longer print `{0}` instead of the name they are
+  about.** The alias diagnostics used a placeholder the formatter doesn't
+  understand, in all three languages.
+
 ### Changed
+
+- **Errors no longer end in `(os error 2)`.** The operating system's error
+  number is repeated after a message that already says what went wrong, and
+  means nothing to the person reading it. It is now dropped from what is shown
+  in the status line.
+
 
 - **`/` now filters the Requests list when that list has focus.** It previously
   always jumped to the Global Environments panel, wherever you pressed it. It

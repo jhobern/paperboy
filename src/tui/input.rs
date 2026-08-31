@@ -43,7 +43,46 @@ fn row_entry(row: &crate::tree::Row) -> Option<usize> {
 }
 
 impl TuiApp {
+    /// What the wizard's clickable rows currently look like: which section is
+    /// showing and how many rows each has. Used to notice that a keystroke
+    /// moved the furniture, so a click queued behind it isn't resolved against
+    /// rects that no longer describe the same cells.
+    fn wizard_layout_signature(&self) -> Option<(usize, [usize; 8])> {
+        let Some(Overlay::NewRequest(form)) = self.overlay.as_ref() else {
+            return None;
+        };
+        Some((
+            form.view_tab as usize,
+            [
+                form.headers.rows.len(),
+                form.cookies.rows.len(),
+                form.queries.rows.len(),
+                form.options.rows.len(),
+                form.form_fields.len(),
+                form.asserts.len(),
+                form.captures.len(),
+                form.reports.len(),
+            ],
+        ))
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        // The mouse hit map describes the frame last drawn, and the event loop
+        // drains every queued event before drawing again. A keystroke that
+        // deletes a wizard row therefore leaves hits pointing at cells that
+        // have moved or gone, and a click arriving behind it would land on the
+        // wrong one. Retire the map when that has happened and let the next
+        // draw rebuild it. (Only when it *has*: the second click of an
+        // activation pair has to survive a harmless keystroke, and clicks are
+        // paired without a redraw in between.)
+        let before = self.wizard_layout_signature();
+        self.on_key_dispatch(key);
+        if before.is_some() && self.wizard_layout_signature() != before {
+            self.invalidate_mouse_hits();
+        }
+    }
+
+    fn on_key_dispatch(&mut self, key: KeyEvent) {
         self.last_mouse_row = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.ctrl_c();
@@ -638,6 +677,9 @@ impl TuiApp {
 
     fn focus_new_request_field(&mut self, field: NewField) {
         if let Some(Overlay::NewRequest(form)) = self.overlay.as_mut() {
+            if !form.field_exists(field) {
+                return;
+            }
             let prev_focus = form.focus;
             form.focus = field;
             if form.focus != prev_focus {
@@ -3622,7 +3664,12 @@ impl TuiApp {
             .filter(|e| !e.is_empty())
         {
             match crate::hurl::status_eq_code(&expr) {
-                Some(code) if expected_status.is_none() => expected_status = Some(code),
+                // A request that kept its status check in `[Asserts]` keeps it
+                // there: folding it onto the `HTTP` line would rewrite a
+                // request the user only looked at.
+                Some(code) if expected_status.is_none() && !form.status_in_asserts => {
+                    expected_status = Some(code)
+                }
                 _ => asserts.push(expr),
             }
         }
@@ -3931,7 +3978,9 @@ impl TuiApp {
                         self.status = Some(Status::FileReverted(name));
                         self.save_state();
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             ConfirmAction::RevertEnv(env_id) => match self.revert_env_to_saved(env_id) {
@@ -4994,7 +5043,7 @@ impl TuiApp {
                 }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
-            Err(e) => self.status = Some(Status::Error(e.to_string())),
+            Err(e) => self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e))),
         }
     }
 

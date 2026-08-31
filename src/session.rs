@@ -783,7 +783,7 @@ impl Session {
                 true
             }
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 false
             }
         }
@@ -796,7 +796,7 @@ impl Session {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 return None;
             }
         };

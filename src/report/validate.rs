@@ -794,7 +794,10 @@ fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec
         let Some(alias) = c.alias else {
             diags.push(Diagnostic::error(fill(
                 s.diag_collection_alias_missing,
-                &[c.reference],
+                // The reference appears twice: once naming the collection,
+                // once inside the `# collection: … AS name` line being
+                // suggested.
+                &[c.reference, c.reference],
             )));
             continue;
         };
@@ -824,7 +827,7 @@ fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec
         {
             diags.push(Diagnostic::error(fill(
                 s.diag_collection_alias_shadows_folder,
-                &[alias],
+                &[alias, alias],
             )));
         }
     }

@@ -1361,7 +1361,11 @@ fn parse_report_row(line: &str) -> Option<(String, String)> {
 }
 
 /// Title = the `#` comment lines immediately above the request's method line
-/// (reset by a blank line), with `#` and `-`/`=` decoration stripped. The
+/// (reset by a blank line), with `#` and surrounding `-`/`=` decoration
+/// stripped — `# ---- Login ----` is titled "Login". Only the leading and
+/// trailing runs go: a hyphen or `=` *inside* the text is part of the name
+/// ("Get user-profile"), and stripping those made our own output unreadable
+/// by our own parser, permanently corrupting the name on the next save. The
 /// entry's `source_info.start` is sometimes the leading comment and sometimes
 /// the method line (depending on how `hurl_core` attaches inter-entry
 /// comments), so we first locate the method line, then scan back for its block.
@@ -1383,9 +1387,8 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
         .iter()
         .map(|l| {
             l.trim_start_matches('#')
-                .chars()
-                .filter(|c| !matches!(c, '-' | '='))
-                .collect::<String>()
+                .trim()
+                .trim_matches(|c| matches!(c, '-' | '='))
                 .trim()
                 .to_string()
         })
@@ -3406,5 +3409,27 @@ mod recovery_hardening_tests {
         assert_eq!(es.len(), 2);
         assert!(es.iter().all(|e| !e.is_unreadable()));
         assert_eq!(es[1].url, "http://h/2");
+    }
+
+    /// Regression: `-` and `=` are stripped only as surrounding decoration.
+    /// Stripping them everywhere meant our own serializer wrote a name our own
+    /// parser could not read back, so "Get user-profile" became "Get
+    /// userprofile" on load and was written back that way on the next save.
+    #[test]
+    fn a_hyphen_or_equals_inside_a_title_survives_a_round_trip() {
+        let entry =
+            HurlEntry::from_fields("Get user-profile v2=beta", "GET", "http://h/x", vec![], "");
+        let text = collection_to_hurl(&[entry]);
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].title, "Get user-profile v2=beta");
+    }
+
+    /// ...while a banner drawn around a name is still decoration, and goes.
+    #[test]
+    fn a_banner_around_a_title_is_still_stripped() {
+        let entries = parse_hurl("# ==== Login ====\nGET http://h/x\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Login");
     }
 }

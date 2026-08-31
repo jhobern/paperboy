@@ -49,10 +49,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
             .then(|| parse_hurl_error(&col_content))
             .flatten()
         {
-            Some(why) => eprintln!("warning: no requests found in '{collection_path}' — {why}"),
-            None => eprintln!("warning: no requests found in '{collection_path}'"),
+            Some(why) => eprintln!("error: no requests found in '{collection_path}' — {why}"),
+            None => eprintln!("error: no requests found in '{collection_path}'"),
         }
-        return 0;
+        // Nothing ran, so nothing passed. Exiting 0 here let a typo'd path, an
+        // empty file or one malformed line pass a CI pipeline green, which is
+        // the opposite of what `-c` is for.
+        return 1;
     }
     // A Base64File field is a PaperBoy concept Hurl can't run directly: expand
     // each into the plain `key: prefix+base64` text it's actually sent as
@@ -339,5 +342,24 @@ fn paint(on: bool, hue: Hue, s: &str) -> String {
         Hue::Cyan => s.cyan().to_string(),
         Hue::Dim => s.dark_grey().to_string(),
         Hue::Bold => s.bold().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression: nothing ran, so nothing passed. Exiting 0 here let a
+    /// mistyped path, an empty file, or a collection whose every request was
+    /// unreadable pass a CI pipeline green — the opposite of what `-c` is for.
+    #[test]
+    fn a_collection_with_nothing_to_run_exits_non_zero() {
+        let dir = std::env::temp_dir().join(format!("paperboy_cli_empty_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.hurl");
+        std::fs::write(&path, "\n\n").unwrap();
+
+        let code = super::run(path.to_string_lossy().into_owned(), None, false);
+        assert_eq!(code, 1, "an empty collection is a failure, not a pass");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

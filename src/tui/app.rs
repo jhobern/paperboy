@@ -2417,7 +2417,9 @@ impl TuiApp {
                     let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             // Sorted by what the export holds rather than by what the user
             // said it was: knowing whether a `.json` is a collection or an
@@ -2434,7 +2436,9 @@ impl TuiApp {
                     }
                     None => self.status = Some(Status::NotCollection),
                 },
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
@@ -2459,7 +2463,9 @@ impl TuiApp {
                         self.save_state();
                         self.status = Some(Status::Saved);
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
@@ -2467,7 +2473,9 @@ impl TuiApp {
                     let name = env_name_from_path(path, "environment");
                     self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
                 }
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             FileAction::SaveEnv => {
                 let Some(env_id) = self.current_env_id() else {
@@ -2499,7 +2507,9 @@ impl TuiApp {
                         self.save_state();
                         self.status = Some(Status::Saved);
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             FileAction::SaveResponse => {
@@ -2860,7 +2870,7 @@ impl TuiApp {
                 self.status = Some(Status::Loaded);
                 self.save_state();
             }
-            Err(e) => self.status = Some(Status::Error(e.to_string())),
+            Err(e) => self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e))),
         }
     }
 
@@ -3002,7 +3012,7 @@ impl TuiApp {
             col.sync_folder_to_selected();
             let text = crate::hurl::collection_to_hurl(&col.entries);
             if let Err(e) = std::fs::write(&dest_path, text) {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 return;
             }
             self.mark_collection_saved(source_ci);
@@ -3020,7 +3030,7 @@ impl TuiApp {
             Ok(text) => crate::postman::parse_collection(&text),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 return;
             }
         };
@@ -3031,12 +3041,12 @@ impl TuiApp {
         if let Some(parent) = dest_path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            self.status = Some(Status::Error(e.to_string()));
+            self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
             return;
         }
         let dest_text = crate::hurl::collection_to_hurl(&dest_entries);
         if let Err(e) = std::fs::write(&dest_path, dest_text) {
-            self.status = Some(Status::Error(e.to_string()));
+            self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
             return;
         }
 
@@ -3052,7 +3062,7 @@ impl TuiApp {
                 if let Some(path) = col.path.clone() {
                     let text = crate::hurl::collection_to_hurl(&col.entries);
                     if let Err(e) = std::fs::write(&path, text) {
-                        self.status = Some(Status::Error(e.to_string()));
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                         return;
                     }
                 }
@@ -4382,7 +4392,7 @@ impl TuiApp {
                 true
             }
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 false
             }
         }

@@ -20009,6 +20009,7 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
     ) -> crate::hurl::RunOutput {
         crate::hurl::RunOutput {
             entries: vec![crate::hurl::EntryOutcome {
+                entry_index: 0,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 200,
@@ -31785,4 +31786,92 @@ fn raw_mode_still_refuses_text_that_does_not_parse() {
         !e.is_unreadable() && e.url == "http://h/1",
         "entry untouched"
     );
+}
+
+/// Regression: a click queued behind a keystroke that deleted a wizard row
+/// used to be resolved against the frame the row was still in, dropping focus
+/// past the end of the row list — and the *next* keystroke then indexed that
+/// list and panicked, taking the whole terminal UI with it.
+#[test]
+fn a_click_landing_where_a_deleted_wizard_row_used_to_be_never_crashes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    // A few more rows, so there is one below the row that gets deleted.
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => {
+            for i in 1..4 {
+                let mut row = crate::tui::new_request::FormRow::new();
+                row.key = crate::tui::line_editor::Editor::new(&format!("k{i}"), false);
+                f.form_fields.push(row);
+            }
+        }
+        _ => panic!("New Request overlay not open"),
+    }
+    let rows = form_ref(&app).form_fields.len();
+    assert!(rows >= 2, "need rows to delete, had {rows}");
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let last = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestField(NewField::FormField(rows - 1, FormCol::Value)),
+    );
+
+    // Delete a row without redrawing — exactly what happens when input arrives
+    // faster than frames — then click where the last row was.
+    ctrl(&mut app, KeyCode::Char('d'));
+    app.on_mouse(mouse_down(last.x + last.width / 2, last.y));
+
+    // The click must not have parked focus on a row that no longer exists...
+    let f = form_ref(&app);
+    if let NewField::FormField(i, _) = f.focus {
+        assert!(
+            i < f.form_fields.len(),
+            "focus {i} is past the {} remaining rows",
+            f.form_fields.len()
+        );
+    }
+    // ...and typing afterwards must not panic.
+    type_str(&mut app, "x");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+}
+
+/// Regression: opening Edit on a request whose status check lives in
+/// `[Asserts]` (under an `HTTP *` line) and saving without touching anything
+/// used to move the check onto the `HTTP` line and flag the request modified —
+/// a rewrite nobody asked for. A no-op save is a no-op.
+#[test]
+fn saving_an_untouched_request_leaves_a_status_assert_where_it_was() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("Check", "GET", "http://h/x", vec![], "");
+    entry.expected_status = None;
+    entry.asserts = vec![
+        "status == 201".to_string(),
+        "jsonpath \"$.ok\" == true".to_string(),
+    ];
+    let before = entry.to_hurl();
+    app.collections
+        .push(Collection::new("Coll".to_string(), vec![entry]));
+    app.active_tab = 1;
+
+    press(&mut app, KeyCode::Enter); // open Edit on the request
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "the edit wizard opens"
+    );
+    ctrl(&mut app, KeyCode::Char('s')); // save, having changed nothing
+
+    let entry = &app.collections[1].entries[0];
+    assert_eq!(entry.expected_status, None, "the HTTP line is untouched");
+    assert_eq!(
+        entry.asserts,
+        vec![
+            "status == 201".to_string(),
+            "jsonpath \"$.ok\" == true".to_string()
+        ],
+        "and the asserts are exactly as they were"
+    );
+    assert_eq!(entry.to_hurl(), before, "the request is byte-identical");
 }

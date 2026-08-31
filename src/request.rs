@@ -991,14 +991,16 @@ pub fn run_all_entries(
             // queued message per frame, so the intermediate snapshots simply
             // supersede one another. (Cookies set by one request don't carry
             // to the next in this mode — the caller warns about that.)
-            let mut idx = 0usize;
+            // Hurl reports which request each outcome belongs to, and that is
+            // not the outcome's ordinal: `[Options] repeat`/`retry` make one
+            // request produce several. Trusting the ordinal slid every later
+            // result up and dropped the last one off the end.
             run_hurl_streaming(&content, &vars, run_root, |eo| {
-                if let Some(&at) = run_positions.get(idx) {
+                if let Some(&at) = run_positions.get(eo.entry_index) {
                     results[at] = Some(eo.ok);
                     captures.extend(eo.captures.iter().cloned());
                     responses[at] = Some(entry_response(eo));
                 }
-                idx += 1;
                 let _ = tx.send(BatchRunUpdate {
                     col_id,
                     results: results.clone(),
@@ -1036,9 +1038,11 @@ pub fn run_all_entries(
         // vectors from the final result set and send a single update.
         // (Streaming already emitted its final cumulative snapshot above.)
         if batch {
-            for (i, eo) in out.entries.iter().enumerate() {
-                let Some(&at) = run_positions.get(i) else {
-                    break;
+            for eo in out.entries.iter() {
+                // Keyed by the request Hurl says produced this outcome, not by
+                // the outcome's position: see the streaming path above.
+                let Some(&at) = run_positions.get(eo.entry_index) else {
+                    continue;
                 };
                 results[at] = Some(eo.ok);
                 captures.extend(eo.captures.iter().cloned());

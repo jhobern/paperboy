@@ -541,6 +541,16 @@ pub(crate) struct NewReq {
     /// [`Overlay::Confirm`](crate::tui::app::Overlay) because the whole point
     /// is to keep the half-finished form alive behind it.
     pub(crate) confirm_discard: Option<usize>,
+    /// The edited request kept its status check in `[Asserts]` (under an
+    /// `HTTP *` response line) rather than on the response line itself.
+    ///
+    /// Both spellings mean the same thing, and the wizard shows either as a
+    /// `status == <code>` row, so on save it can't tell them apart by looking
+    /// at the rows. Without remembering, saving a request that used the
+    /// `[Asserts]` form — even with nothing changed — moved the check onto the
+    /// `HTTP` line and marked the request modified: a rewrite the user never
+    /// asked for. A request opened this way keeps it where it was.
+    pub(crate) status_in_asserts: bool,
 }
 
 /// The "extract to parameter" prompt: a modal over the wizard that names the
@@ -836,8 +846,29 @@ impl NewReq {
             tab_order: WizardTab::ALL.to_vec(),
             opened_signature: String::new(),
             confirm_discard: None,
+            status_in_asserts: false,
         }
         .seal()
+    }
+
+    /// Whether `field` addresses a cell that currently exists.
+    ///
+    /// Focus is a *position*, and the row-bearing positions carry an index
+    /// into a `Vec` that later key handlers index directly. A mouse hit is
+    /// resolved against the rects of the last frame drawn, so a keystroke
+    /// that shrinks a section (deleting a row) between the draw and the click
+    /// can otherwise land focus past the end — and the next keystroke panics.
+    /// Every route that sets focus from outside the wizard's own navigation
+    /// checks here first.
+    pub(crate) fn field_exists(&self, field: NewField) -> bool {
+        match field {
+            NewField::Kvd(kind, i, _) => i < self.kvd(kind).rows.len(),
+            NewField::FormField(i, _) => i < self.form_fields.len(),
+            NewField::Assert(i) => i < self.asserts.len(),
+            NewField::Capture(i, _) => i < self.captures.len(),
+            NewField::Report(i, _) => i < self.reports.len(),
+            _ => true,
+        }
     }
 
     /// Build a form prefilled from an existing entry, for the "Edit Request"
@@ -980,6 +1011,7 @@ impl NewReq {
             tab_order: WizardTab::ALL.to_vec(),
             opened_signature: String::new(),
             confirm_discard: None,
+            status_in_asserts: entry.expected_status.is_none(),
         }
         .seal()
     }

@@ -2,6 +2,21 @@
 
 use std::path::Path;
 
+/// An error's message with the C errno stripped, ready to show a person.
+///
+/// `std::io::Error`'s own text ends in the raw errno — "No such file or
+/// directory (os error 2)" — which tells a user nothing and reads like a
+/// crash. The reason before it is the part worth showing. Anything that
+/// doesn't end that way is passed through unchanged, so this is safe to apply
+/// to any error on its way to the status line.
+pub(crate) fn friendly_error(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(i) if text.ends_with(')') => text[..i].to_string(),
+        _ => text,
+    }
+}
+
 /// The file stem of `path` (its name without an extension), or `fallback` when
 /// the path has no usable stem. Accepts anything path-like (`&str`, `&Path`, …).
 pub(crate) fn stem(path: impl AsRef<Path>, fallback: &str) -> String {

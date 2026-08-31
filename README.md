@@ -98,10 +98,12 @@ cargo build --release
 - **Edit Request wizard**: pressing `Enter` on a request opens the same
   form used for "New Request", prefilled with its current method, URL,
   headers, cookies, body, form fields, `[Captures]`, and `[Asserts]` — no
-  manual JSON or Hurl syntax required. `Shift+R` opens **Raw Mode** instead,
-  a direct editor for the request's real Hurl text (for anything the form
-  doesn't expose, such as query params, Basic Auth, or the expected
-  status); saving reparses the text and applies it back to the request,
+  manual JSON or Hurl syntax required. The expected response status is one of
+  those asserts (`status == 200`), so it can be changed or removed there like
+  any other. `Shift+R` opens **Raw Mode** instead, a direct editor for the
+  request's real Hurl text (for anything the form doesn't expose, such as
+  Basic Auth or `[Options]`); saving reparses the text and applies it back to
+  the request,
   keeping invalid text open for correction rather than discarding it.
 - **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
   add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
@@ -243,7 +245,14 @@ What changes is how you interact with it:
 
 - **Tab** cycles the focused panel in the same order as the terminal UI
   (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
-  backwards — so the muscle memory carries over.
+  backwards.
+- **The single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
+  `n`, `b`, `x`, `u`, `m`/`c` and the `?`/`F1` help overlay are terminal-only:
+  in a desktop window those keys are text you are typing, so the same actions
+  live on the menus, the toolbar and the right-click menus instead. What the
+  keyboard does do globally is **F5** or **Ctrl+Enter** (run the request),
+  **Ctrl+S** / **Ctrl+Shift+S** (save / save as), **Ctrl+W** (close the tab)
+  and **Alt+F** (open the File menu).
 - **Panels are resized by dragging** their splitters, rather than with keyboard
   shortcuts.
 - **Selection, scrolling and the clipboard** use the platform's native
@@ -573,8 +582,9 @@ triggers a load attempt for it, same as on initial file load.
 
 ## Keyboard shortcuts
 
-Open the in-app help overlay any time with `?` or `F1` for the full,
-up-to-date list. Highlights:
+These are the **terminal UI's** keys; the graphical front-end uses menus for
+most of them (see [Graphical UI](#graphical-ui)). Open the in-app help
+overlay any time with `?` or `F1` for the full, up-to-date list. Highlights:
 
 | Key | Action |
 |---|---|

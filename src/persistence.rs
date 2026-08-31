@@ -74,7 +74,11 @@ impl PersistedEnv {
         let content = self
             .vars
             .iter()
-            .map(|v| format!("{}={}", v.key, v.raw))
+            // A `.vars` line can't carry a newline, and JSON can, so a state
+            // file written before values were flattened may still hold one.
+            // Flatten on the way back in rather than letting the re-parse drop
+            // everything after the first line.
+            .map(|v| format!("{}={}", v.key, crate::environment::flatten_value(&v.raw)))
             .collect::<Vec<_>>()
             .join("\n");
         let (mut env, pending) = parse_vars_pending(self.name.clone(), &content);
@@ -498,7 +502,7 @@ pub struct GuiLayout {
 /// written to disk; they are re-resolved on load.
 #[derive(Serialize, Deserialize)]
 pub struct PersistedState {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub language: Language,
     #[serde(default)]
     pub base_url: String,
@@ -569,7 +573,7 @@ pub struct PersistedState {
     pub report_params: Vec<PersistedReportParams>,
     /// Which of JSON / Hurl text the Main (Request) panel shows by default for
     /// every request (Settings → Preferences → Default Request View).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub default_request_view: RequestView,
     /// Run "Run All" in batch mode (whole collection in one Hurl execution)
     /// rather than streaming per-entry. Off by default (streaming).
@@ -593,12 +597,12 @@ pub struct PersistedState {
     pub active_global_env: Option<usize>,
     /// Which source(s) the Environments panel lists. Shared by both front-ends
     /// because they share the same row model and saved state file.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub env_source: EnvSource,
     /// GUI-only window/panel geometry and last-open view (see [`GuiLayout`]).
     /// Ignored by the terminal UI, which round-trips it untouched so using one
     /// front-end never discards the other's layout.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub gui: GuiLayout,
 }
 
@@ -659,10 +663,43 @@ fn state_path() -> Option<PathBuf> {
     Some(base.join("paperboy").join("state.json"))
 }
 
+/// Deserialize a field, falling back to its default rather than failing the
+/// whole document when the value isn't one this build understands.
+///
+/// State is written by whichever version ran last, and a value a newer build
+/// invented — a new `EnvSource`, a new form-field kind — used to abort the
+/// entire parse, taking every tab, collection and environment with it. One
+/// unrecognised setting is worth losing; a session is not.
+fn lenient<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// Load the saved state, or `None` if there is no readable/parsable state file.
+///
+/// A file that exists but doesn't parse is moved aside rather than left in
+/// place, because the app saves continuously: leaving it would mean the next
+/// keystroke overwrote the only copy of a session we merely failed to read.
 pub fn load_state() -> Option<PersistedState> {
-    let text = fs::read_to_string(state_path()?).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = state_path()?;
+    let text = fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            let aside = path.with_extension("json.unreadable");
+            let _ = fs::rename(&path, &aside);
+            eprintln!(
+                "paperboy: could not read {} ({e}); it has been kept as {} and a fresh session started",
+                path.display(),
+                aside.display()
+            );
+            None
+        }
+    }
 }
 
 /// Write the given state to disk, creating the config directory if needed.
@@ -755,5 +792,25 @@ mod tests {
     fn persisted_state_defaults_have_no_reports() {
         let state = PersistedState::default();
         assert!(state.reports.is_empty());
+    }
+
+    /// Regression: a value a newer build invented must cost that one setting,
+    /// not the session. A strict parse failed the whole document, `load_state`
+    /// turned that into "no state", and the next save wrote the empty default
+    /// over a file that still held every tab the user had open.
+    #[test]
+    fn an_unknown_setting_written_by_a_newer_build_costs_only_that_setting() {
+        let json = r#"{
+            "language": "English",
+            "base_url": "",
+            "tabs": [{"name": "Coll", "entries": [], "selected_entry": 0}],
+            "env_source": "OnlyRemote",
+            "default_request_view": "SomethingNewer"
+        }"#;
+        let state: PersistedState = serde_json::from_str(json).expect("the document still parses");
+        assert_eq!(state.tabs.len(), 1, "the open tab survives");
+        assert_eq!(state.tabs[0].name, "Coll");
+        assert_eq!(state.env_source, EnvSource::default());
+        assert_eq!(state.default_request_view, RequestView::default());
     }
 }
