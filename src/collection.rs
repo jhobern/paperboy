@@ -1285,6 +1285,24 @@ impl Collection {
         self.path.as_deref() == Some(path) && self.has_unsaved_edits()
     }
 
+    /// Whether anything at or under `prefix` has unsaved in-memory edits — the
+    /// generalisation of [`Self::workspace_file_edited`] to a whole subtree, so
+    /// a delete confirmation can warn that removing a folder is about to throw
+    /// away edits parked in files inside it. Covers the loaded file, the files
+    /// parked in `workspace_pending`, and structural-only changes
+    /// (`workspace_structure_modified`) that leave no per-request marker.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn workspace_unsaved_under(&self, prefix: &std::path::Path) -> bool {
+        if self.path.as_deref().is_some_and(|p| p.starts_with(prefix)) && self.has_unsaved_edits() {
+            return true;
+        }
+        self.workspace_pending.keys().any(|p| p.starts_with(prefix))
+            || self
+                .workspace_structure_modified
+                .iter()
+                .any(|p| p.starts_with(prefix))
+    }
+
     /// Whether request `idx` of the workspace collection file at `path` has
     /// unsaved edits. Answers for a file that isn't the loaded one too, by
     /// reading the entries parked in `workspace_pending` — the tree lists a
@@ -1356,6 +1374,93 @@ impl Collection {
             self.workspace_titles.insert(path.to_path_buf(), titles);
         }
         Ok(())
+    }
+
+    /// Repoint everything this tab holds about a workspace item that has just
+    /// been renamed or moved on disk from `from` to `to` — the loaded file, the
+    /// remembered selection, the expand/collapse set, and every by-path cache
+    /// keyed on it — so nothing goes on pointing at a path that no longer
+    /// exists. [`crate::workspace::repoint`] matches the item itself *and*
+    /// anything that was inside it, so renaming or moving a folder carries its
+    /// children's state along too.
+    ///
+    /// Every by-path map is rewritten, not just the visible ones: the parked
+    /// edits, structure baselines and run results are exactly the state that
+    /// makes "edit a file, look at another, come back" work, and leaving them
+    /// keyed on the old path would silently drop a renamed file's unsaved work.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn repoint_workspace_paths(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        use crate::workspace::repoint;
+        let moved = |p: &std::path::Path| repoint(p, from, to);
+        if let Some(p) = self.path.as_deref().and_then(moved) {
+            self.path = Some(p);
+        }
+        if let Some(p) = self.workspace_selected.as_deref().and_then(moved) {
+            self.workspace_selected = Some(p);
+        }
+        self.workspace_expanded = self
+            .workspace_expanded
+            .drain()
+            .map(|p| moved(&p).unwrap_or(p))
+            .collect();
+        self.workspace_titles = self
+            .workspace_titles
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_pending = self
+            .workspace_pending
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_baselines = self
+            .workspace_baselines
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_structure_modified = self
+            .workspace_structure_modified
+            .drain()
+            .map(|p| moved(&p).unwrap_or(p))
+            .collect();
+        self.workspace_runs = self
+            .workspace_runs
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+    }
+
+    /// Drop everything this tab was holding about the workspace item at
+    /// `deleted` — and, when it is a folder, everything that was inside it —
+    /// because the item has just been removed from disk.
+    ///
+    /// If the *loaded* file was under the deletion, the tab is reset to the
+    /// file-less state a fresh Workspace tab starts in: leaving `entries`
+    /// showing the requests of a file that no longer exists would be a phantom
+    /// the user could keep editing and try to save into thin air. Every by-path
+    /// cache is pruned of the deleted subtree so no stale pencil, run marker or
+    /// parked edit survives — and so a later, same-named file can't inherit the
+    /// dead one's state.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn prune_workspace_paths(&mut self, deleted: &std::path::Path) {
+        let under = |p: &std::path::Path| p.starts_with(deleted);
+        if self.path.as_deref().is_some_and(under) {
+            self.path = None;
+            self.entries.clear();
+            self.selected_entry = 0;
+            self.structure_modified = false;
+            self.structure_baseline.clear();
+            self.invalidate_request_json();
+        }
+        if self.workspace_selected.as_deref().is_some_and(under) {
+            self.workspace_selected = None;
+        }
+        self.workspace_expanded.retain(|p| !under(p));
+        self.workspace_titles.retain(|p, _| !under(p));
+        self.workspace_pending.retain(|p, _| !under(p));
+        self.workspace_baselines.retain(|p, _| !under(p));
+        self.workspace_structure_modified.retain(|p| !under(p));
+        self.workspace_runs.retain(|p, _| !under(p));
     }
 
     /// Clear this collection's "new"/"edited" request markers, and drop any

@@ -716,6 +716,22 @@ enum WsAction {
         src: PathBuf,
         dest_dir: PathBuf,
     },
+    /// Rename a workspace file or folder (its own name on disk). Raises the
+    /// rename dialog seeded with the current name; the filesystem rename runs
+    /// only once that is confirmed. Distinct from a *request* rename
+    /// ([`ReqEdit::Rename`]), which edits a `# name` comment inside a `.hurl`
+    /// file rather than the file's own name.
+    RenameItem {
+        path: PathBuf,
+    },
+    /// Delete a workspace file or folder from disk. Always raises a
+    /// confirmation first (a disk delete has no undo, so unlike a request
+    /// delete it can't be turned off), then removes it and prunes everything
+    /// the tab was holding about it.
+    DeleteItem {
+        path: PathBuf,
+        is_dir: bool,
+    },
     /// Run/Rename/Duplicate/Delete a request from the workspace tree — the same
     /// actions the plain request list offers on its rows. Kept as one variant
     /// carrying the [`ReqEdit`] kind so all of them share the load-then-act
@@ -946,6 +962,11 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         app.strings.gui_ws_revert_request,
         app.strings.gui_ws_revert_file,
     );
+    // Rename / Delete of a file or folder on disk — shared by every real
+    // file/folder row (a folder, a collection, a report, an environment), and
+    // pulled out here once so the closures can be built while the tree is
+    // borrowed immutably below.
+    let ws_rd = (app.strings.gui_ws_rename, app.strings.gui_ws_delete);
     // The request row's own actions, borrowed verbatim from the plain request
     // list so a request in a workspace tree can be Run/Renamed/Duplicated/
     // Deleted with exactly the same menu it has in a single-collection tab.
@@ -1052,7 +1073,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::ToggleFolder(path.clone()));
                         }
-                        ws_row_menu(&resp, path.clone(), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            path.clone(),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let chosen = ws_rename_delete_entries(ui, path, true, ws_rd);
+                                ui.separator();
+                                chosen
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, true, &mut actions);
                         folder_rects.push(resp.rect);
                     }
@@ -1094,9 +1126,6 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 open: *open,
                             });
                         }
-                        // A file with edits only in memory can be put back to
-                        // what is on disk; a clean one has nothing to offer, so
-                        // the entry isn't shown at all rather than shown greyed.
                         let edited_file = app.session.collections[ci].workspace_file_edited(path);
                         ws_row_menu_with(
                             &resp,
@@ -1105,12 +1134,16 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                if !edited_file {
-                                    return None;
+                                let mut chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                // A file with edits only in memory can be put
+                                // back to what is on disk; a clean one has
+                                // nothing to offer, so the entry isn't shown at
+                                // all rather than shown greyed.
+                                if edited_file && ui.button(lbl_revert_file).clicked() {
+                                    chosen = chosen.or(Some(WsAction::RevertFile(path.clone())));
                                 }
-                                let hit = ui.button(lbl_revert_file).clicked();
                                 ui.separator();
-                                hit.then(|| WsAction::RevertFile(path.clone()))
+                                chosen
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
@@ -1355,7 +1388,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::OpenReport(path.clone()));
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                ui.separator();
+                                chosen
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
                     }
                     WsRow::Environment { path, name, depth } => {
@@ -1375,9 +1419,12 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                let hit = ui.button(lbl_set_active_env).clicked();
+                                let mut chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                if ui.button(lbl_set_active_env).clicked() {
+                                    chosen = chosen.or(Some(WsAction::ActivateEnv(path.clone())));
+                                }
                                 ui.separator();
-                                hit.then(|| WsAction::ActivateEnv(path.clone()))
+                                chosen
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
@@ -1626,7 +1673,7 @@ fn move_workspace_item(
     src: &std::path::Path,
     dest_dir: &std::path::Path,
 ) {
-    use crate::workspace::{MoveError, move_item, repoint};
+    use crate::workspace::{MoveError, move_item};
 
     let Some(root) = app.session.collections[ci].workspace_root.clone() else {
         return;
@@ -1654,40 +1701,127 @@ fn move_workspace_item(
         return;
     }
 
-    // Every tab can be showing the moved file, not just the one dragged in:
-    // two workspace tabs may be open on the same root.
-    for col in &mut app.session.collections {
-        if let Some(p) = col.path.clone().and_then(|p| repoint(&p, src, &dest)) {
-            col.path = Some(p);
-        }
-        if let Some(p) = col
-            .workspace_selected
-            .clone()
-            .and_then(|p| repoint(&p, src, &dest))
-        {
-            col.workspace_selected = Some(p);
-        }
-        col.workspace_expanded = col
-            .workspace_expanded
-            .iter()
-            .map(|p| repoint(p, src, &dest).unwrap_or_else(|| p.clone()))
-            .collect();
-        col.workspace_titles = col
-            .workspace_titles
-            .drain()
-            .map(|(p, v)| (repoint(&p, src, &dest).unwrap_or(p), v))
-            .collect();
-    }
-    if let Some(ed) = app.report_editor.as_mut()
-        && let Some(p) = ed.path().and_then(|p| repoint(p, src, &dest))
-    {
-        ed.report.path = Some(p);
-    }
-
+    repoint_workspace_holdings(app, src, &dest);
     reveal_in_tree(app, ci, &dest, &root);
     app.session.status = Some(crate::i18n::Status::WsItemMoved(
         crate::workspace::display_name(&root, &dest),
     ));
+}
+
+/// Rename a workspace file or folder on disk, then fix up everything the app was
+/// holding it by — the exact same repointing a move needs, because to the app a
+/// rename *is* a move (the item's path changes), just within its own folder.
+///
+/// The safety — no path separators, no clobbering, keeping a file's extension
+/// so it doesn't drop out of the tree — all lives in
+/// [`crate::workspace::rename_item`]; this only translates its result into the
+/// session's held paths and a status line. A rename to the name it already has
+/// comes back unchanged and is silently nothing, exactly as a drop onto a file's
+/// own folder is.
+pub(super) fn rename_workspace_item(
+    app: &mut GuiApp,
+    ci: usize,
+    src: &std::path::Path,
+    new_name: &str,
+) {
+    use crate::workspace::{RenameError, rename_item};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    let dest = match rename_item(&root, src, new_name) {
+        Ok(dest) => dest,
+        Err(RenameError::EmptyName) => return,
+        Err(RenameError::Exists(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemRenameExists(what));
+            return;
+        }
+        Err(RenameError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+            return;
+        }
+        Err(RenameError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+            return;
+        }
+    };
+    if dest == src {
+        return;
+    }
+
+    repoint_workspace_holdings(app, src, &dest);
+    reveal_in_tree(app, ci, &dest, &root);
+    app.session.status = Some(crate::i18n::Status::WsItemRenamed(
+        crate::workspace::display_name(&root, &dest),
+    ));
+}
+
+/// Delete a workspace file or folder from disk, then drop everything the app was
+/// holding it by.
+///
+/// The removal itself is [`crate::workspace::delete_item`], which alone decides
+/// what is safe to delete (never outside the root, never the root itself); this
+/// handles the *aftermath* — the mirror image of a move's repointing. A move
+/// gives every held path a new home; a delete has none to give, so each tab
+/// forgets the item and, if the deleted thing was the file it had loaded, falls
+/// back to the file-less state a fresh Workspace tab starts in rather than
+/// showing a phantom of a file that no longer exists. The open report is closed
+/// if it was the one deleted (or lived under a deleted folder).
+pub(super) fn delete_workspace_item(app: &mut GuiApp, ci: usize, path: &std::path::Path) {
+    use crate::workspace::{DeleteError, delete_item};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    match delete_item(&root, path) {
+        Ok(()) => {}
+        Err(DeleteError::IsRoot) => {
+            app.session.status = Some(crate::i18n::Status::WsItemDeleteRoot);
+            return;
+        }
+        Err(DeleteError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+            return;
+        }
+        Err(DeleteError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+            return;
+        }
+    }
+
+    let name = crate::workspace::display_name(&root, path);
+    // Every tab on this root has to forget it, not just the active one — two
+    // workspace tabs can be open on the same folder.
+    for col in &mut app.session.collections {
+        col.prune_workspace_paths(path);
+    }
+    // A report open in the editor from under the deleted item has nowhere to
+    // save back to; close it rather than leave it editing a deleted file.
+    if let Some(ed) = app.report_editor.as_ref()
+        && ed.path().is_some_and(|p| p.starts_with(path))
+    {
+        app.close_report_editor();
+    }
+    app.session.status = Some(crate::i18n::Status::WsItemDeleted(name));
+    app.session.save();
+}
+
+/// Repoint every held path from `src` to `dest` after a workspace item has been
+/// moved or renamed on disk — across *all* tabs (two may be open on one root)
+/// and the open report editor. Each collection's own by-path state is repointed
+/// by [`crate::collection::Collection::repoint_workspace_paths`]; the report
+/// editor lives on the app, so it is handled here.
+fn repoint_workspace_holdings(app: &mut GuiApp, src: &std::path::Path, dest: &std::path::Path) {
+    for col in &mut app.session.collections {
+        col.repoint_workspace_paths(src, dest);
+    }
+    if let Some(ed) = app.report_editor.as_mut()
+        && let Some(p) = ed
+            .path()
+            .and_then(|p| crate::workspace::repoint(p, src, dest))
+    {
+        ed.report.path = Some(p);
+    }
 }
 
 /// Expand every folder between the workspace root and `path`, so a newly
@@ -1795,6 +1929,34 @@ fn ws_row_menu_with(
     });
 }
 
+/// The Rename / Delete entries every real file/folder row's menu leads with,
+/// returning whichever was clicked. Kept in one place so the four row kinds
+/// that draw it (folder, collection, report, environment) can't drift apart,
+/// and deliberately *not* baked into [`ws_row_menu_with`]: the tree's
+/// background stands in for the workspace root, which can be neither renamed nor
+/// deleted, and a *request* row's menu already has its own Rename/Delete that
+/// mean something else (a title inside a file, an undoable in-memory removal).
+fn ws_rename_delete_entries(
+    ui: &mut egui::Ui,
+    path: &std::path::Path,
+    is_dir: bool,
+    labels: (&'static str, &'static str),
+) -> Option<WsAction> {
+    let (lbl_rename, lbl_delete) = labels;
+    if ui.button(lbl_rename).clicked() {
+        return Some(WsAction::RenameItem {
+            path: path.to_path_buf(),
+        });
+    }
+    if ui.button(lbl_delete).clicked() {
+        return Some(WsAction::DeleteItem {
+            path: path.to_path_buf(),
+            is_dir,
+        });
+    }
+    None
+}
+
 /// Make `collection` the tab's loaded file if it isn't already, and return the
 /// live `entries` index to act on. A not-loaded row's `idx` indexes the cached
 /// title snapshot rather than the live list, so it can only be acted on once
@@ -1851,10 +2013,14 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         // Opening or closing a folder isn't "working on" anything; a new or
         // moved file records itself once it is actually there.
         // A revert isn't "working on" the file either — it undoes work — and
-        // the dialog it raises names its own target.
+        // the dialog it raises names its own target. Rename/Delete only raise a
+        // dialog here; the rename records the item's new path once it lands, and
+        // a delete has no selection to remember.
         WsAction::ToggleFolder(_)
         | WsAction::NewItem { .. }
         | WsAction::MoveItem { .. }
+        | WsAction::RenameItem { .. }
+        | WsAction::DeleteItem { .. }
         | WsAction::RevertRequest { .. }
         | WsAction::RevertFile(_) => {}
     }
@@ -2018,6 +2184,48 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         },
         WsAction::NewItem { dir, kind } => new_workspace_item(app, ci, &dir, kind),
         WsAction::MoveItem { src, dest_dir } => move_workspace_item(app, ci, &src, &dest_dir),
+        // Rename and Delete both raise a dialog first; the filesystem change
+        // happens when it is confirmed (see `rename_workspace_item` /
+        // `delete_workspace_item`). Rename reuses the request rename dialog via
+        // its own `RenameTarget`; Delete has a dedicated confirmation because it
+        // must always ask and needs to say how much is about to go.
+        WsAction::RenameItem { path } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::Rename {
+                target: super::app::RenameTarget::WorkspaceItem { ci, path },
+                text: name,
+            });
+        }
+        WsAction::DeleteItem { path, is_dir } => {
+            let name = app.session.collections[ci]
+                .workspace_root
+                .as_deref()
+                .map(|root| crate::workspace::display_name(root, &path))
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            // A folder delete takes everything under it, so the count is what
+            // turns "delete" into an informed choice; a file is just itself.
+            let file_count = if is_dir {
+                crate::workspace::descendant_file_count(&path)
+            } else {
+                1
+            };
+            let unsaved = app.session.collections[ci].workspace_unsaved_under(&path);
+            app.dialog = Some(super::app::Dialog::DeleteWorkspaceItem {
+                ci,
+                path,
+                is_dir,
+                name,
+                file_count,
+                unsaved,
+            });
+        }
         WsAction::OpenEnv { path, reveal } => {
             let id = app.session.open_workspace_environment(&path);
             if reveal {
@@ -3128,6 +3336,208 @@ pub(crate) mod tests {
             vec!["https://example.com/b"],
             "and its second request — not one.hurl's — was the one deleted"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Renaming the file a tab has loaded moves it on disk *and* keeps the tab
+    /// pointing at it — the whole reason a rename needs the same repointing a
+    /// move does. Without it the tab would hold a path that no longer exists and
+    /// look as though its contents had vanished.
+    #[test]
+    fn renaming_the_loaded_workspace_file_repoints_the_tab_that_had_it_open() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsrenload");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+
+        rename_workspace_item(&mut app, ci, &one, "renamed");
+
+        let dest = dir.join("api/v1/renamed.hurl");
+        assert!(dest.exists(), "the file is at its new name on disk");
+        assert!(!one.exists(), "and gone from the old one");
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(dest.as_path()),
+            "the tab follows the file it had loaded"
+        );
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::WsItemRenamed(_))
+            ),
+            "and it reports the rename"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename of a request row is a different thing from a rename of the file:
+    /// the menu's file Rename raises a `WorkspaceItem` target, not a `Request`
+    /// one, so the two can't be confused.
+    #[test]
+    fn the_file_rename_menu_entry_targets_the_file_not_a_request() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsrenmenu");
+        let health = dir.join("health.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RenameItem {
+                path: health.clone(),
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::Rename {
+                target: RenameTarget::WorkspaceItem { ci: dci, path },
+                text,
+            }) => {
+                assert_eq!(*dci, ci);
+                assert_eq!(path, &health);
+                assert_eq!(text, "health.hurl", "seeded with the current name");
+            }
+            _ => panic!("file Rename should raise a WorkspaceItem rename dialog"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting the file a tab has loaded removes it from disk and leaves the
+    /// tab in the file-less state a fresh Workspace tab starts in, rather than
+    /// showing a phantom of a file that is gone.
+    #[test]
+    fn deleting_the_loaded_workspace_file_unloads_the_tab() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelload");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        assert!(!app.session.collections[ci].entries.is_empty());
+
+        delete_workspace_item(&mut app, ci, &one);
+
+        assert!(!one.exists(), "the file is gone from disk");
+        assert_eq!(
+            app.session.collections[ci].path, None,
+            "the tab no longer has a loaded file"
+        );
+        assert!(
+            app.session.collections[ci].entries.is_empty(),
+            "and isn't left showing the deleted file's requests"
+        );
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::WsItemDeleted(_))
+            ),
+            "and it reports the delete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a folder takes its whole subtree with it, and the tab forgets
+    /// everything it was holding under it: the loaded file (which was inside),
+    /// the expanded rows, the remembered selection.
+    #[test]
+    fn deleting_a_workspace_folder_removes_it_and_forgets_its_children() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelfolder");
+        let api = dir.join("api");
+        let v1 = dir.join("api/v1");
+        let one = v1.join("one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        app.session.collections[ci]
+            .workspace_expanded
+            .insert(api.clone());
+        app.session.collections[ci]
+            .workspace_expanded
+            .insert(v1.clone());
+        app.session.collections[ci].workspace_selected = Some(one.clone());
+
+        delete_workspace_item(&mut app, ci, &api);
+
+        assert!(
+            !api.exists(),
+            "the folder and its subtree are gone from disk"
+        );
+        assert_eq!(
+            app.session.collections[ci].path, None,
+            "the loaded file, which was inside, is unloaded"
+        );
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .iter()
+                .any(|p| p.starts_with(&api)),
+            "no expanded row under the deleted folder survives"
+        );
+        assert_eq!(
+            app.session.collections[ci].workspace_selected, None,
+            "and the remembered selection, which was inside, is cleared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delete menu entry always raises a confirmation — never acting on the
+    /// spot — and the confirmation carries what is about to go: a folder's file
+    /// count, so a folder delete says how much it will take.
+    #[test]
+    fn the_file_delete_menu_entry_always_confirms_and_counts_a_folder() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelconfirm");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        // Even with the request-delete guard off, a disk delete still confirms.
+        app.session.confirm_on_delete_request = false;
+
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::DeleteItem {
+                path: api.clone(),
+                is_dir: true,
+            },
+        );
+
+        match &app.dialog {
+            Some(Dialog::DeleteWorkspaceItem {
+                path,
+                is_dir,
+                file_count,
+                ..
+            }) => {
+                assert_eq!(path, &api);
+                assert!(*is_dir, "api is a folder");
+                assert_eq!(
+                    *file_count, 4,
+                    "api/v1 holds two collections, an env and a report — four files"
+                );
+            }
+            _ => panic!("Delete should always raise the confirmation dialog"),
+        }
+        // Nothing was deleted just by opening the dialog.
+        assert!(api.exists(), "the folder is still there until confirmed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

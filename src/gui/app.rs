@@ -104,6 +104,23 @@ pub enum Dialog {
     /// so the prompt is a guard against a stray keypress, not a point of no
     /// return. `idx` is the entry's position in `collections[ci].entries`.
     ConfirmDeleteRequest { ci: usize, idx: usize, name: String },
+    /// Confirm deleting a workspace file or folder *from disk*.
+    ///
+    /// Always shown — it deliberately ignores the `confirm_on_delete_request`
+    /// preference, because that preference guards an *undoable* request delete
+    /// (Ctrl+Z brings it back), whereas removing a file or a whole folder from
+    /// disk has no undo at all. `file_count` is how many files a folder delete
+    /// would take (`1` for a file), so the prompt can say how much is at stake;
+    /// `unsaved` warns that in-memory edits under the item would be lost with
+    /// it.
+    DeleteWorkspaceItem {
+        ci: usize,
+        path: std::path::PathBuf,
+        is_dir: bool,
+        name: String,
+        file_count: usize,
+        unsaved: bool,
+    },
     /// Confirm a "Run All" that would fire requests which may change server
     /// state. Only raised when the collection holds at least one non-GET
     /// request; a read-only collection runs with no friction. `total` is how
@@ -152,8 +169,23 @@ pub enum SaveKind {
 
 #[derive(Clone)]
 pub enum RenameTarget {
-    Request { ci: usize, idx: usize },
-    Tab { ci: usize },
+    Request {
+        ci: usize,
+        idx: usize,
+    },
+    Tab {
+        ci: usize,
+    },
+    /// A workspace file or folder — its own name on disk, not a request inside
+    /// it. Reuses the rename dialog but is applied through the workspace's own
+    /// rename (a filesystem rename plus repointing everything that held the old
+    /// path), rather than by editing an in-memory title. The item's kind isn't
+    /// carried: renaming reads it off disk, and the dialog looks the same for a
+    /// file or a folder.
+    WorkspaceItem {
+        ci: usize,
+        path: std::path::PathBuf,
+    },
 }
 
 // Not `Copy`: `NewWorkspaceFolder` carries the folder the new one goes inside.

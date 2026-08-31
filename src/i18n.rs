@@ -1548,6 +1548,20 @@ strings! {
     gui_shortcut_escape_desc => "Close a dialog or overlay", "Fermer une boîte de dialogue ou un aperçu", "Luk en dialog eller oversigt";
     gui_menu_help => "Help", "Aide", "Hjælp";
     gui_menu_help_key => "H", "I", "H";
+    // Workspace-tree Rename / Delete of a file or folder (graphical UI). Kept
+    // apart from the request Rename/Delete labels because these act on a file on
+    // disk, not on a request inside one, and both raise a dialog first (a rename
+    // box, a delete confirmation), hence the ellipsis on each.
+    gui_ws_rename => "Rename…", "Renommer…", "Omdøb…";
+    gui_ws_delete => "Delete…", "Supprimer…", "Slet…";
+    gui_ws_delete_title => "Delete from disk", "Supprimer du disque", "Slet fra disken";
+    confirm_delete_ws_file_q => "Delete '{name}' from disk? Deleting a file from disk can't be undone.", "Supprimer «\u{a0}{name}\u{a0}» du disque\u{a0}? La suppression d'un fichier du disque est irréversible.", "Slet '{name}' fra disken? Sletning af en fil fra disken kan ikke fortrydes.";
+    confirm_delete_ws_folder_q => "Delete the folder '{name}' and the {n} files inside it from disk? Deleting a folder from disk can't be undone.", "Supprimer le dossier «\u{a0}{name}\u{a0}» et les {n} fichiers qu'il contient du disque\u{a0}? La suppression d'un dossier du disque est irréversible.", "Slet mappen '{name}' og de {n} filer i den fra disken? Sletning af en mappe fra disken kan ikke fortrydes.";
+    confirm_delete_ws_unsaved => "There are unsaved edits here that will be lost.", "Des modifications non enregistrées ici seront perdues.", "Der er ugemte ændringer her, som vil gå tabt.";
+    ws_item_renamed => "Renamed to '{name}'.", "Renommé en «\u{a0}{name}\u{a0}».", "Omdøbt til '{name}'.";
+    ws_item_rename_exists => "There is already a '{name}' — nothing renamed.", "Il y a déjà un «\u{a0}{name}\u{a0}» — rien n'a été renommé.", "Der er allerede en '{name}' — intet omdøbt.";
+    ws_item_deleted => "Deleted '{name}'.", "«\u{a0}{name}\u{a0}» supprimé.", "'{name}' slettet.";
+    ws_item_delete_root => "The workspace folder itself can't be deleted.", "Le dossier de l'espace de travail lui-même ne peut pas être supprimé.", "Selve arbejdsområdemappen kan ikke slettes.";
 }
 
 impl Strings {
@@ -1701,6 +1715,18 @@ pub enum Status {
     WsItemMoveExists(String),
     /// A folder was dropped on itself or one of its own descendants.
     WsItemMoveIntoItself,
+    /// A workspace file or folder was renamed. Holds its new relative path.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemRenamed(String),
+    /// A rename was refused because the new name is already taken.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemRenameExists(String),
+    /// A workspace file or folder was deleted. Holds the relative path that was.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemDeleted(String),
+    /// A delete was refused because the target resolved to the workspace root.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemDeleteRoot,
     /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
     /// URL, which is the one field a request can't be saved without — the
     /// wizard is kept open (focused on the URL field) instead of silently
@@ -1968,6 +1994,10 @@ impl Status {
             Status::WsItemMoved(name) => s.ws_item_moved.replace("{name}", name),
             Status::WsItemMoveExists(name) => s.ws_item_move_exists.replace("{name}", name),
             Status::WsItemMoveIntoItself => s.ws_item_move_into_itself.to_string(),
+            Status::WsItemRenamed(name) => s.ws_item_renamed.replace("{name}", name),
+            Status::WsItemRenameExists(name) => s.ws_item_rename_exists.replace("{name}", name),
+            Status::WsItemDeleted(name) => s.ws_item_deleted.replace("{name}", name),
+            Status::WsItemDeleteRoot => s.ws_item_delete_root.to_string(),
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
             Status::NewRequestBracketKey(k) => s.new_request_bracket_key.replace("{name}", k),
             Status::NewRequestKeyEmpty => s.new_request_key_empty.to_string(),

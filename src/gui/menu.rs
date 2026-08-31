@@ -718,6 +718,16 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         Dialog::ConfirmDeleteRequest { ci, idx, name } => {
             confirm_delete_request_dialog(app, ctx, ci, idx, name)
         }
+        Dialog::DeleteWorkspaceItem {
+            ci,
+            path,
+            is_dir,
+            name,
+            file_count,
+            unsaved,
+        } => confirm_delete_workspace_item_dialog(
+            app, ctx, ci, path, is_dir, name, file_count, unsaved,
+        ),
         Dialog::ConfirmRunAll { ci, total, non_get } => {
             confirm_run_all_dialog(app, ctx, ci, total, non_get)
         }
@@ -760,6 +770,74 @@ fn confirm_delete_request_dialog(
     decided |= dismissed;
     if !decided {
         app.dialog = Some(Dialog::ConfirmDeleteRequest { ci, idx, name });
+    }
+}
+
+/// Confirm deleting a workspace file or folder from disk.
+///
+/// Unlike the request delete above, this is *not* gated on the
+/// `confirm_on_delete_request` preference and can never be turned off: that
+/// preference guards an undoable in-memory delete, whereas this removes a file
+/// — or a whole folder's worth of them — from disk with no undo, so it must
+/// always ask. The prompt says what is about to go: a folder's file count so
+/// the size of the loss is visible, and a warning when there are unsaved edits
+/// under the item that the delete would take with it. Cancelling (or dismissing)
+/// re-arms the dialog so a stray click outside can't delete by default;
+/// confirming performs the delete and its fix-up.
+#[allow(clippy::too_many_arguments)]
+fn confirm_delete_workspace_item_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    path: std::path::PathBuf,
+    is_dir: bool,
+    name: String,
+    file_count: usize,
+    unsaved: bool,
+) {
+    let title = app.strings.gui_ws_delete_title;
+    let go = app.strings.gui_delete;
+    let cancel = app.strings.gui_cancel;
+    let question = if is_dir {
+        app.strings
+            .confirm_delete_ws_folder_q
+            .replace("{name}", &name)
+            .replace("{n}", &file_count.to_string())
+    } else {
+        app.strings
+            .confirm_delete_ws_file_q
+            .replace("{name}", &name)
+    };
+    let unsaved_note = unsaved.then_some(app.strings.confirm_delete_ws_unsaved);
+    let mut decided = false;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        if let Some(note) = unsaved_note {
+            ui.add_space(4.0);
+            ui.colored_label(app.theme.err, note);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                super::requests::delete_workspace_item(app, ci, &path);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    })
+    .dismissed;
+    decided |= dismissed;
+    if !decided {
+        app.dialog = Some(Dialog::DeleteWorkspaceItem {
+            ci,
+            path,
+            is_dir,
+            name,
+            file_count,
+            unsaved,
+        });
     }
 }
 
@@ -1944,6 +2022,12 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
                     if let Some(col) = app.session.collections.get_mut(ci) {
                         col.name = text.clone();
                     }
+                }
+                // A workspace file/folder is renamed on disk (and everything
+                // holding its old path repointed), rather than by editing an
+                // in-memory title — see `rename_workspace_item`.
+                RenameTarget::WorkspaceItem { ci, path } => {
+                    super::requests::rename_workspace_item(app, ci, &path, text.trim());
                 }
             }
             app.session.save();

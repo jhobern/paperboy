@@ -290,6 +290,33 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   not been run yet, while a request that genuinely came back empty (a `204`, say)
   still says so.
 
+- **A file or folder in a Workspace tree can be renamed.** The tree let you
+  *create* collections, reports, environments and folders, and drag them
+  between folders, but never rename one — the only recourse was to make a fresh
+  copy under the new name and delete the original. Right-clicking any file or
+  folder row now offers Rename, seeded with its current name. A file keeps the
+  extension that says what it *is*: rename `orders.hurl` to "invoices" and it
+  becomes `invoices.hurl`, not a nameless file the tree no longer recognises and
+  silently stops drawing — the extension is how a collection is told from a
+  report from an environment, so a rename changes a file's name without ever
+  changing (or losing) its kind. The name is refused if it is really a path (a
+  separator or a `..`, which would move the item elsewhere on disk rather than
+  rename it) or is already taken, and everything the tab was holding the file by
+  — the loaded collection, the open report, the expanded rows, the remembered
+  selection — follows it to its new name.
+
+- **A file or folder in a Workspace tree can be deleted.** The same gap: items
+  could be created and moved but never removed from the tree. Right-clicking a
+  file or folder now offers Delete, always behind a confirmation that cannot be
+  switched off — deleting from disk has no undo, unlike deleting a *request*
+  (which Ctrl+Z brings back), so the preference that can silence the
+  request-delete prompt deliberately doesn't reach this one. The confirmation
+  says what is about to go: for a folder, how many files it will take with it,
+  and, whenever there are unsaved in-memory edits under the item, that those
+  will be lost with it. Deleting the file a tab had loaded leaves the tab on its
+  tree rather than showing a phantom of a file that is gone, and deleting a
+  folder forgets every expanded row and selection that lived inside it.
+
 - **Requests in a Workspace tab can be dragged to reorder them.** A plain
   collection tab has always let you drag a request to a new position; the
   Workspace tab's tree — drawn by different code — left its request rows out of
