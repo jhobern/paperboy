@@ -306,6 +306,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Stepping through a list with the arrow keys no longer drags the scrollbar
+  with it.** Both of the graphical UI's Requests lists — a collection's requests
+  and a Workspace tab's file tree — asked to re-*centre* the row under the
+  cursor on every keyboard move. The effect was that the cursor appeared to
+  stand still in the middle of the panel while the whole list slid past beneath
+  it, and even a step between two rows already plainly on screen scrolled the
+  view. They now scroll the least they can to bring the row into sight, and
+  nothing at all when it is already visible, which is how a list behaves
+  everywhere else.
+
 - **Graphical UI: a request that hasn't been sent no longer describes a reply.**
   The response panel's three sections each fell back to their own "nothing here"
   note — `(empty body)`, `(no headers)`, `(no assertions)` — regardless of

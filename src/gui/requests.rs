@@ -298,8 +298,15 @@ fn render_entry_row(
         // long collection, or Home/End jumping to an end); bring it back into
         // view. Only on the selected row, and only when the move asked for it,
         // so an ordinary scroll or click isn't yanked back.
+        //
+        // `None` rather than an alignment: it scrolls the least it can to get
+        // the row on screen, and does nothing at all when the row is already
+        // visible. Asking for `Align::Center` instead re-centres the list on
+        // *every* step, so a row-by-row walk drags the whole scrollbar along
+        // under a cursor that never appears to move — which is not how a list
+        // behaves anywhere else.
         if reveal && is_sel {
-            row.scroll_to_me(Some(egui::Align::Center));
+            row.scroll_to_me(None);
         }
         if row.double_clicked() {
             actions.run = Some(i);
@@ -843,7 +850,12 @@ fn ws_cursor_decoration(
         );
     }
     if reveal {
-        resp.scroll_to_me(Some(egui::Align::Center));
+        // The least scrolling that puts the row on screen, and none at all when
+        // it is already there: stepping through a tree should move the cursor
+        // against a still list, not haul the scrollbar along to keep the cursor
+        // pinned mid-panel. See the plain list's copy of this for the full
+        // reasoning.
+        resp.scroll_to_me(None);
     }
 }
 
