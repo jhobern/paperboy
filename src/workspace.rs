@@ -236,6 +236,215 @@ pub enum MoveError {
     Io(String),
 }
 
+/// Rename the workspace file or folder at `src` to `new_name`, keeping it in
+/// the same folder.
+///
+/// `new_name` is a *name*, not a path: a separator or a `..` in it is refused
+/// outright, because "rename" must not become "move anywhere on disk" — moving
+/// an item between folders is [`move_item`]'s job, and it alone carries the
+/// checks that a move needs (into-itself, cross-folder collisions). This mirrors
+/// the lexical guard [`create_item`] puts on the leaf it is about to write, and
+/// is deliberately stricter: a rename target is a single path component, full
+/// stop.
+///
+/// Renaming to the name it already has is a no-op success rather than a
+/// self-collision error — the item is returned unchanged. Renaming onto a name
+/// something else already holds fails instead of clobbering it, for the same
+/// reason [`create_item`] won't overwrite: workspace names are short and
+/// repetitive, so an accidental collision is easy and losing the other file to
+/// it would be silent.
+///
+/// ## What happens to a file's extension
+///
+/// A file **keeps the extension it had**. The extension is not decoration on
+/// the name — it is how the tree decides what the file *is*: `scan_workspace`
+/// (via [`is_workspace_file`]) only surfaces `.hurl`/`.json`/`.vars`/`.trail`,
+/// and [`is_report_file`]/[`is_env_file`] tell a report from an environment
+/// from a collection by it. So a rename that dropped or changed the extension
+/// would quietly change the file's *kind*, or — worse — make it a kind the
+/// scanner doesn't recognise at all, at which point the file simply vanishes
+/// from the tree the next time it is drawn. That looks exactly like the rename
+/// deleted it. Renaming is renaming; it must not be able to do that. Concretely:
+///
+/// - a typed name with no extension regains the source's (`billing.hurl` →
+///   "invoices" ⇒ `invoices.hurl`), exactly as [`create_item`] fills one in;
+/// - a typed name already ending in the source's extension is taken as-is
+///   (`report.trail` → "nightly.trail" ⇒ `nightly.trail`);
+/// - a typed name ending in some *other* extension has the source's re-appended
+///   rather than substituted (`report.trail` → "nightly.bak" ⇒
+///   `nightly.bak.trail`). Appending rather than replacing so that neither the
+///   text the user typed (a bare `set_extension` would turn "data.v2" into
+///   "data.hurl", losing the "v2") nor the file's kind is lost.
+///
+/// A folder has no extension and never gains one, so its typed name is used
+/// verbatim — the same rule [`create_item`] applies to a new folder.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn rename_item(root: &Path, src: &Path, new_name: &str) -> Result<PathBuf, RenameError> {
+    if !src.starts_with(root) || escapes_root(root, src) {
+        return Err(RenameError::Escapes(src.display().to_string()));
+    }
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(RenameError::EmptyName);
+    }
+    // A rename target is exactly one path component: no separators, no `..`, no
+    // absolute prefix. Anything else is an attempt to move the item elsewhere
+    // under the guise of renaming it.
+    let candidate = Path::new(new_name);
+    let mut comps = candidate.components();
+    let single_component =
+        matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none();
+    if !single_component {
+        return Err(RenameError::Escapes(new_name.to_string()));
+    }
+
+    let is_dir = src.is_dir();
+    let final_name = if is_dir {
+        new_name.to_string()
+    } else {
+        preserve_extension(src, new_name)
+    };
+
+    let Some(parent) = src.parent() else {
+        return Err(RenameError::Escapes(src.display().to_string()));
+    };
+    let dest = parent.join(&final_name);
+
+    // Renaming to the name it already has: nothing to do, and reporting a
+    // collision against itself would be nonsense.
+    if dest == src {
+        return Ok(src.to_path_buf());
+    }
+    if escapes_root(root, &dest) {
+        return Err(RenameError::Escapes(dest.display().to_string()));
+    }
+    if dest.exists() {
+        return Err(RenameError::Exists(display_name(root, &dest)));
+    }
+    std::fs::rename(src, &dest).map_err(|e| RenameError::Io(format!("{}: {e}", dest.display())))?;
+    note_tree_changed();
+    Ok(dest)
+}
+
+/// Fold the source file's extension back into a typed rename `name` (see
+/// [`rename_item`] for why the file's kind must survive a rename). Returns the
+/// name unchanged when the source has no extension to preserve.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn preserve_extension(src: &Path, name: &str) -> String {
+    let Some(src_ext) = src.extension().and_then(|e| e.to_str()) else {
+        return name.to_string();
+    };
+    let already = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(src_ext));
+    if already {
+        name.to_string()
+    } else {
+        format!("{name}.{src_ext}")
+    }
+}
+
+/// Why an item couldn't be renamed. A dedicated enum, like [`MoveError`] and
+/// [`NewItemError`]: "there's already one of those there" and "that name would
+/// leave the workspace" are different things to tell someone, and each
+/// front-end phrases them itself.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RenameError {
+    /// Nothing was typed (or the dialog was dismissed): not worth reporting.
+    EmptyName,
+    Escapes(String),
+    Exists(String),
+    Io(String),
+}
+
+/// Delete the workspace file or folder at `path`. A folder is removed with
+/// everything inside it; a file is removed on its own.
+///
+/// Refuses to touch anything outside `root` — both lexically and once symlinks
+/// are resolved, exactly as [`create_item`] and [`move_item`] do — because a
+/// recursive delete pointed even slightly wrong is the most destructive thing
+/// this module can do. It also refuses to delete `root` itself: "delete this
+/// item" must never be able to become "delete the whole workspace" (an empty
+/// or root-equal `path` slipping through would do precisely that).
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn delete_item(root: &Path, path: &Path) -> Result<(), DeleteError> {
+    if !path.starts_with(root) || escapes_root(root, path) {
+        return Err(DeleteError::Escapes(path.display().to_string()));
+    }
+    // Compare canonicalised where possible so a differently-spelled but
+    // equivalent path (a trailing slash, a `.` component, a symlink to the
+    // root) can't sneak the root itself past the guard; fall back to a lexical
+    // compare when either can't be canonicalised.
+    let is_root = match (root.canonicalize(), path.canonicalize()) {
+        (Ok(r), Ok(p)) => r == p,
+        _ => path == root,
+    };
+    if is_root {
+        return Err(DeleteError::IsRoot);
+    }
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|e| DeleteError::Io(format!("{}: {e}", path.display())))?;
+    note_tree_changed();
+    Ok(())
+}
+
+/// How many files live under `path` (recursively) — or `1` for a file. Used by
+/// the delete confirmation to say *how much* a folder delete is about to
+/// destroy, since a folder can take many files with it and a count is the
+/// difference between an informed "yes" and a leap. Counts every file, not just
+/// the workspace's own kinds, because the recursive delete removes all of them;
+/// hidden entries and depth are bounded exactly as [`scan_workspace`] bounds
+/// them.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn descendant_file_count(path: &Path) -> usize {
+    if !path.is_dir() {
+        return 1;
+    }
+    fn count(dir: &Path, depth: usize) -> usize {
+        if depth >= MAX_DEPTH {
+            return 0;
+        }
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in read.flatten() {
+            let p = entry.path();
+            let hidden = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            if hidden {
+                continue;
+            }
+            if p.is_dir() {
+                total += count(&p, depth + 1);
+            } else {
+                total += 1;
+            }
+        }
+        total
+    }
+    count(path, 0)
+}
+
+/// Why an item couldn't be deleted. A dedicated enum for the same reason the
+/// other write operations have one — each refusal wants its own words.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeleteError {
+    Escapes(String),
+    /// The path resolved to the workspace root itself.
+    IsRoot,
+    Io(String),
+}
+
 /// Rewrite `path` for an item that has just moved from `from` to `to`.
 ///
 /// Used to keep everything the app is *holding* — the loaded collection, the
@@ -750,6 +959,162 @@ mod tests {
         assert!(
             root.join("a.hurl").exists(),
             "and every refusal leaves the original exactly where it was"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Renaming a file gives it the typed name but keeps its kind: the
+    /// extension is regained when omitted, and can't be dropped or swapped for
+    /// one that would take the file out of the tree.
+    #[test]
+    fn renaming_a_file_keeps_the_extension_that_says_what_it_is() {
+        let root = tmp_dir("rename_ext");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("billing.hurl"), "GET https://x\n").expect("collection");
+        fs::write(root.join("nightly.trail"), "{\"nodes\":[]}\n").expect("report");
+
+        // A name with no extension regains the source's.
+        let renamed = rename_item(&root, &root.join("billing.hurl"), "invoices")
+            .expect("the collection is renamed");
+        assert_eq!(renamed, root.join("invoices.hurl"), "extension regained");
+        assert!(!root.join("billing.hurl").exists(), "old name is gone");
+        assert!(renamed.exists(), "new name is on disk");
+
+        // A name ending in some *other* extension keeps the report a report
+        // rather than letting it vanish from the tree.
+        let kept = rename_item(&root, &root.join("nightly.trail"), "archive.bak")
+            .expect("the report is renamed");
+        assert_eq!(
+            kept,
+            root.join("archive.bak.trail"),
+            "the .trail is preserved so the report stays visible"
+        );
+        assert!(
+            is_report_file(&kept),
+            "and it is still recognised as a report"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A folder takes the typed name verbatim, and renaming to the name it
+    /// already has is a no-op success rather than a self-collision error.
+    #[test]
+    fn renaming_a_folder_uses_the_name_verbatim_and_a_same_name_rename_is_a_no_op() {
+        let root = tmp_dir("rename_folder");
+        fs::create_dir_all(root.join("apis")).expect("subfolder");
+        fs::write(root.join("apis/a.hurl"), "GET https://x\n").expect("file inside");
+
+        let renamed =
+            rename_item(&root, &root.join("apis"), "services").expect("the folder is renamed");
+        assert_eq!(renamed, root.join("services"), "no extension is added");
+        assert!(
+            root.join("services/a.hurl").exists(),
+            "its contents came with it"
+        );
+
+        // Same name: nothing changes, and it is not reported as a clash.
+        let same = rename_item(&root, &root.join("services"), "services")
+            .expect("a same-name rename is a no-op success");
+        assert_eq!(same, root.join("services"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The rename guards: a name that already exists is never clobbered, and a
+    /// name that is really a path (a separator or a `..`) is refused rather than
+    /// used to move the item somewhere else.
+    #[test]
+    fn renaming_refuses_a_collision_or_a_name_that_is_really_a_path() {
+        let root = tmp_dir("rename_guard");
+        fs::write(root.join("a.hurl"), "GET https://x\n").expect("collection");
+        fs::write(root.join("b.hurl"), "GET https://y\n").expect("other collection");
+
+        assert!(
+            matches!(
+                rename_item(&root, &root.join("a.hurl"), "b.hurl"),
+                Err(RenameError::Exists(_))
+            ),
+            "a rename onto an existing name is refused"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("b.hurl")).expect("still there"),
+            "GET https://y\n",
+            "and the file it would have replaced is untouched"
+        );
+        for path_like in ["../escape", "sub/nested", "/etc/passwd"] {
+            assert!(
+                matches!(
+                    rename_item(&root, &root.join("a.hurl"), path_like),
+                    Err(RenameError::Escapes(_))
+                ),
+                "a name containing a path ({path_like}) is refused"
+            );
+        }
+        assert!(
+            root.join("a.hurl").exists(),
+            "every refusal leaves the original exactly where it was"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Deleting a file removes just it; deleting a folder takes its whole
+    /// subtree with it, and the count reported beforehand says how much.
+    #[test]
+    fn deleting_removes_a_file_or_a_whole_folder() {
+        let root = tmp_dir("delete_ok");
+        fs::create_dir_all(root.join("apis/deep")).expect("subfolders");
+        fs::write(root.join("keep.hurl"), "GET https://x\n").expect("survivor");
+        fs::write(root.join("apis/a.hurl"), "GET https://a\n").expect("nested file");
+        fs::write(root.join("apis/deep/b.hurl"), "GET https://b\n").expect("deeper file");
+
+        assert_eq!(
+            descendant_file_count(&root.join("apis")),
+            2,
+            "the folder holds two files, at any depth"
+        );
+        assert_eq!(
+            descendant_file_count(&root.join("keep.hurl")),
+            1,
+            "a file counts as one"
+        );
+
+        delete_item(&root, &root.join("keep.hurl")).expect("the file is deleted");
+        assert!(!root.join("keep.hurl").exists(), "the file is gone");
+
+        delete_item(&root, &root.join("apis")).expect("the folder is deleted");
+        assert!(
+            !root.join("apis").exists(),
+            "the folder and everything under it is gone"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Delete refuses to reach outside the workspace, and refuses to delete the
+    /// workspace root itself — "delete this item" must never become "delete
+    /// everything".
+    #[test]
+    fn deleting_refuses_to_escape_the_root_or_delete_the_root() {
+        let root = tmp_dir("delete_guard");
+        fs::write(root.join("a.hurl"), "GET https://x\n").expect("collection");
+
+        assert!(
+            matches!(
+                delete_item(&root, Path::new("/tmp")),
+                Err(DeleteError::Escapes(_))
+            ),
+            "nothing outside the workspace may be deleted"
+        );
+        assert!(
+            matches!(delete_item(&root, &root), Err(DeleteError::IsRoot)),
+            "the workspace root itself is never deleted"
+        );
+        assert!(
+            root.join("a.hurl").exists() && root.exists(),
+            "and every refusal leaves the workspace untouched"
         );
 
         let _ = fs::remove_dir_all(&root);

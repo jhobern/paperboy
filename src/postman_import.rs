@@ -984,7 +984,14 @@ fn render(
             // collection that cannot be read, keep the JSON, which always
             // opens, and say so.
             let contents = crate::hurl::collection_to_hurl(&converted.entries);
-            if crate::hurl::parse_hurl(&contents).len() != converted.entries.len() {
+            // Reading back is the test, and recovery must not be allowed to
+            // pass it: a request that comes back as unreadable text is exactly
+            // the failure this guard exists to catch. An import should produce
+            // requests, not something the user has to repair by hand.
+            let read_back = crate::hurl::parse_hurl(&contents);
+            if read_back.len() != converted.entries.len()
+                || read_back.iter().any(|e| e.is_unreadable())
+            {
                 let mut out = raw(taken);
                 out.notes.push(ConversionNote {
                     item: display.to_string(),
@@ -1032,9 +1039,23 @@ fn render(
 fn vars_text(values: &[(String, String)]) -> String {
     let mut out = String::new();
     for (k, v) in values {
-        out.push_str(k);
+        // Enforce the line format here rather than trusting the caller to have
+        // done it. A `.vars` file is one `KEY=value` per line: a newline in
+        // either half invents a second variable (or a line the reader drops),
+        // and an `=` in the *name* moves the split point, so `a=b` would read
+        // back as `a` with the rest folded into its value. The converter
+        // already cleans values on the way in; the writer that owns the format
+        // shouldn't depend on that.
+        let key: String = k
+            .chars()
+            .filter(|c| *c != '=' && *c != '\n' && *c != '\r')
+            .collect();
+        if key.trim().is_empty() {
+            continue;
+        }
+        out.push_str(key.trim());
         out.push('=');
-        out.push_str(v);
+        out.push_str(&crate::environment::flatten_value(v));
         out.push('\n');
     }
     out
@@ -2399,5 +2420,21 @@ mod tests {
         assert!(!summary.converted_with_notes);
         assert!(!dest.join(NOTES_FILE).exists());
         std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// The `.vars` writer owns the line format, so it enforces it: one
+    /// `KEY=value` per line. An `=` in a *name* moves the split point and a
+    /// newline in either half invents a second variable — neither should
+    /// depend on the converter having cleaned up first.
+    #[test]
+    fn the_vars_writer_keeps_one_variable_per_line() {
+        let text = vars_text(&[
+            ("a=b".to_string(), "one".to_string()),
+            ("key".to_string(), "line one\nline two".to_string()),
+            ("  ".to_string(), "dropped".to_string()),
+        ]);
+        assert_eq!(text.lines().count(), 2, "no line was invented: {text:?}");
+        assert!(text.contains("ab=one"), "{text:?}");
+        assert!(text.contains("key=line one line two"), "{text:?}");
     }
 }

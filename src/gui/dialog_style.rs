@@ -145,6 +145,30 @@ mod tests {
                 }),
             ),
             (
+                "ConfirmDeleteRequest",
+                Box::new(|a: &mut GuiApp| {
+                    a.dialog = Some(Dialog::ConfirmDeleteRequest {
+                        ci: 0,
+                        idx: 0,
+                        name: "Login".into(),
+                    })
+                }),
+            ),
+            (
+                "ConfirmRunAll",
+                Box::new(|a: &mut GuiApp| {
+                    a.dialog = Some(Dialog::ConfirmRunAll {
+                        ci: 0,
+                        total: 8,
+                        non_get: 3,
+                    })
+                }),
+            ),
+            (
+                "Shortcuts",
+                Box::new(|a: &mut GuiApp| a.dialog = Some(Dialog::Shortcuts)),
+            ),
+            (
                 "Theme",
                 Box::new(|a: &mut GuiApp| {
                     let spec = a.session.active_theme_spec();

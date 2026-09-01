@@ -14,7 +14,7 @@
 //! run's `file_root` for that one run — invisible to the user, and skipped
 //! entirely when every referenced file is already in scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,7 @@ pub fn stage_out_of_scope_form_files(
     // than one field (or entry) is only copied once, and every reference
     // ends up pointing at the same staged copy.
     let mut staged: HashMap<PathBuf, String> = HashMap::new();
-    let mut used_names: HashMap<String, u32> = HashMap::new();
+    let mut used_names: HashSet<String> = HashSet::new();
 
     for entry in entries.iter_mut() {
         for f in entry.form_fields.iter_mut() {
@@ -178,18 +178,28 @@ pub fn expand_base64_form_fields(
 /// collision, inserts a `_N` counter before the extension (or at the end,
 /// if there isn't one) so two different source files that happen to share
 /// a name don't overwrite each other in the staging directory.
-fn unique_name(base: &str, used: &mut HashMap<String, u32>) -> String {
-    let count = used.entry(base.to_string()).or_insert(0);
-    let name = if *count == 0 {
-        base.to_string()
-    } else {
-        match base.rsplit_once('.') {
-            Some((stem, ext)) => format!("{stem}_{count}.{ext}"),
-            None => format!("{base}_{count}"),
+///
+/// A bare counter isn't enough, because the name it invents can itself be
+/// the real name of another source file: two `report.csv`s produce
+/// `report_1.csv`, and a third field may genuinely reference a file called
+/// `report_1.csv`. Both would be copied to the same staged path and one
+/// field would silently send the other's bytes, so we keep counting until
+/// we land on a name nothing else has claimed.
+fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
+    if used.insert(base.to_string()) {
+        return base.to_string();
+    }
+    let mut n: u32 = 1;
+    loop {
+        let candidate = match base.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}_{n}.{ext}"),
+            None => format!("{base}_{n}"),
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
         }
-    };
-    *count += 1;
-    name
+        n += 1;
+    }
 }
 
 #[cfg(test)]
@@ -549,5 +559,48 @@ mod tests {
             expand_base64_form_fields(&mut entries, None).is_err(),
             "an unreadable Base64File must surface as an error, not a silent send"
         );
+    }
+
+    /// Regression: the `_N` name invented for a clash must not be allowed to
+    /// clash in turn. Two `report.csv`s produce `report_1.csv`, and a third
+    /// field genuinely referencing a file called `report_1.csv` used to be
+    /// copied over it — so that field silently sent the other file's bytes.
+    #[test]
+    fn a_generated_name_never_overwrites_a_file_that_is_really_called_that() {
+        let dirs: Vec<std::path::PathBuf> = (0..3)
+            .map(|i| {
+                let d = std::env::temp_dir().join(format!(
+                    "paperboy_stage_collide_{i}_{}",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            })
+            .collect();
+        std::fs::write(dirs[0].join("report.csv"), b"AAA-first").unwrap();
+        std::fs::write(dirs[1].join("report.csv"), b"BBB-second").unwrap();
+        std::fs::write(dirs[2].join("report_1.csv"), b"CCC-third").unwrap();
+
+        let mut entries = vec![entry_with_form(vec![
+            file_field("a", dirs[0].join("report.csv").to_str().unwrap()),
+            file_field("b", dirs[1].join("report.csv").to_str().unwrap()),
+            file_field("c", dirs[2].join("report_1.csv").to_str().unwrap()),
+        ])];
+        let staged_dir = stage_out_of_scope_form_files(&mut entries, None)
+            .unwrap()
+            .unwrap();
+
+        let sent = |i: usize| {
+            let name = &entries[0].form_fields[i].value;
+            std::fs::read_to_string(staged_dir.join(name)).unwrap()
+        };
+        assert_eq!(sent(0), "AAA-first");
+        assert_eq!(sent(1), "BBB-second", "each field sends its own file");
+        assert_eq!(sent(2), "CCC-third");
+
+        for d in &dirs {
+            std::fs::remove_dir_all(d).ok();
+        }
+        std::fs::remove_dir_all(&staged_dir).ok();
     }
 }

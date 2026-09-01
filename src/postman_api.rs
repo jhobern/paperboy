@@ -135,13 +135,98 @@ impl Default for CurlTransport {
     }
 }
 
+/// How many redirects to follow before giving up. The real API doesn't
+/// redirect at all; this exists only so a misconfigured self-hosted base URL
+/// that bounces between two paths can't spin forever.
+const MAX_REDIRECTS: usize = 5;
+
 impl Transport for CurlTransport {
+    /// Fetch `url`, following redirects **only while they stay on the same
+    /// origin**.
+    ///
+    /// The API key rides in an `x-api-key` header, and libcurl re-sends custom
+    /// headers on a followed redirect no matter where it points — it strips
+    /// only `Authorization` and cookies when the host changes. With
+    /// `follow_location` on, a single `302` from a compromised endpoint, a
+    /// meddling proxy, or a hostile `base_url` (self-hosted tenants are
+    /// supported, so the base URL is not always Postman's) was enough to hand
+    /// the user's live `PMAK-…` credential to somebody else's server. Every
+    /// error message in this module is carefully `redact`ed; sending the key
+    /// itself to an unknown host undoes all of that.
+    ///
+    /// So redirects are followed here instead, one at a time, and a hop to
+    /// another origin is refused rather than obeyed.
     fn get(&self, url: &str, api_key: &str) -> Result<HttpResponse, String> {
+        let mut current = url.to_string();
+        for _ in 0..MAX_REDIRECTS {
+            let res = self.fetch_once(&current, api_key)?;
+            if !matches!(res.status, 301 | 302 | 303 | 307 | 308) {
+                return Ok(res);
+            }
+            let Some(location) = res
+                .headers
+                .iter()
+                .find(|(n, _)| n == "location")
+                .map(|(_, v)| v.clone())
+            else {
+                // A redirect with nowhere to go: hand it back and let the
+                // status-code mapping report it as the error it is.
+                return Ok(res);
+            };
+            current = resolve_redirect(&current, &location)?;
+        }
+        Err(format!(
+            "the server kept redirecting (more than {MAX_REDIRECTS} times)"
+        ))
+    }
+}
+
+/// Work out where a `Location` header points, refusing any hop that leaves the
+/// origin the request was sent to — see [`CurlTransport::get`] for why.
+fn resolve_redirect(current: &str, location: &str) -> Result<String, String> {
+    let here = origin_of(current).ok_or_else(|| format!("cannot read the url '{current}'"))?;
+    let loc = location.trim();
+    if loc.is_empty() {
+        return Err("the server redirected to an empty address".to_string());
+    }
+    if loc.contains("://") {
+        let there = origin_of(loc).ok_or_else(|| format!("cannot read the redirect '{loc}'"))?;
+        if !there.eq_ignore_ascii_case(here) {
+            return Err(format!(
+                "the server redirected to {there}, which is not where the request was sent;                  the API key was not passed on"
+            ));
+        }
+        return Ok(loc.to_string());
+    }
+    if let Some(path) = loc.strip_prefix('/') {
+        return Ok(format!("{here}/{path}"));
+    }
+    // A relative hop resolves against the directory of the current path, and
+    // stays on this origin by construction.
+    let base = match current.rfind('/') {
+        Some(i) if i >= here.len() => &current[..=i],
+        _ => return Ok(format!("{here}/{loc}")),
+    };
+    Ok(format!("{base}{loc}"))
+}
+
+/// The `scheme://host[:port]` of a url, or `None` if it has no `://`.
+fn origin_of(url: &str) -> Option<&str> {
+    let after = url.find("://")? + 3;
+    let end = url[after..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| after + i);
+    Some(&url[..end])
+}
+
+impl CurlTransport {
+    /// One HTTP GET, with no redirect following of its own.
+    fn fetch_once(&self, url: &str, api_key: &str) -> Result<HttpResponse, String> {
         use curl::easy::{Easy, List};
 
         let mut easy = Easy::new();
         easy.url(url).map_err(|e| e.to_string())?;
-        easy.follow_location(true).map_err(|e| e.to_string())?;
+        easy.follow_location(false).map_err(|e| e.to_string())?;
         easy.timeout(self.timeout).map_err(|e| e.to_string())?;
         easy.connect_timeout(Duration::from_secs(20))
             .map_err(|e| e.to_string())?;
@@ -599,7 +684,13 @@ impl PostmanClient {
         let mut out: Vec<ItemSummary> = Vec::new();
         let mut offset = 0usize;
         let mut last_rate;
+        // Bounded like `list_workspaces`: a server that reports a `meta.total`
+        // it never delivers (a bug, or malice) would otherwise leave this
+        // asking for page after page forever, growing `out` without limit.
+        const MAX_PAGES: usize = 100;
+        let mut pages = 0usize;
         loop {
+            pages += 1;
             let res = self.call(&format!(
                 "/{field}?workspace={}&limit={PAGE}&offset={offset}",
                 percent_encode(workspace_id)
@@ -618,7 +709,9 @@ impl PostmanClient {
                 .map(|t| t as usize);
 
             match total {
-                Some(total) if out.len() < total && page_len > 0 => offset += PAGE,
+                Some(total) if out.len() < total && page_len > 0 && pages < MAX_PAGES => {
+                    offset += PAGE
+                }
                 _ => break,
             }
         }
@@ -666,10 +759,13 @@ fn extract_error_message(body: &str) -> String {
         }
     }
     let trimmed = body.trim();
-    if trimmed.len() > 200 {
-        format!("{}…", &trimmed[..200])
-    } else {
-        trimmed.to_string()
+    // Count characters, not bytes: the body is whatever the server sent — an
+    // error page, a proxy's captive portal — and slicing at byte 200 lands
+    // inside a multi-byte character often enough to panic, which in the
+    // headless CLI killed the whole import instead of reporting the failure.
+    match trimmed.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &trimmed[..cut]),
+        None => trimmed.to_string(),
     }
 }
 
@@ -772,7 +868,20 @@ pub fn sanitize_file_name(name: &str) -> String {
     // Collapse whitespace runs so "Orders   API" doesn't become a filename
     // with a stretch of spaces in it.
     let collapsed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut out: String = collapsed.trim().chars().take(180).collect();
+    // Cap by *bytes*: filesystems limit a name to 255 bytes, so counting
+    // characters let a name of 86 CJK characters through at 258 bytes, and the
+    // write failed with ENAMETOOLONG — which aborted the whole import, not
+    // just that one collection. Kept well short of the limit so the ` (2)`
+    // de-duplication suffix and an extension still fit.
+    const MAX_NAME_BYTES: usize = 180;
+    let mut out: String = collapsed.trim().to_string();
+    if out.len() > MAX_NAME_BYTES {
+        let cut = (0..=MAX_NAME_BYTES)
+            .rev()
+            .find(|&i| out.is_char_boundary(i))
+            .unwrap_or(0);
+        out.truncate(cut);
+    }
     // A leading dot would make the file hidden (and invisible to the workspace
     // scanner, which skips dotfiles).
     while out.starts_with('.') {
@@ -1288,5 +1397,99 @@ mod tests {
     #[test]
     fn redaction_leaves_a_message_alone_when_there_is_no_key_to_remove() {
         assert_eq!(redact("plain message", ""), "plain message");
+    }
+
+    // ---- regressions found by the import-pipeline review -------------------
+
+    /// The error body is whatever the server sent — an error page, a proxy's
+    /// captive portal. Truncating it by *bytes* sliced through a multi-byte
+    /// character and panicked, which in the headless CLI killed the import
+    /// instead of reporting the failure.
+    #[test]
+    fn a_long_non_ascii_error_body_is_reported_not_panicked_on() {
+        let body = format!("{}{}", "x".repeat(199), "€".repeat(20));
+        let (c, _) = client(vec![fail(500, &body)]);
+        let err = c.get_collection("u1").unwrap_err();
+        assert!(
+            format!("{err:?}").contains('€') || format!("{err:?}").contains('x'),
+            "the body is reported: {err:?}"
+        );
+    }
+
+    /// The API key rides in a custom header, and libcurl re-sends custom
+    /// headers to wherever a redirect points. A hop to another origin must be
+    /// refused rather than followed, or the user's credential is handed to
+    /// somebody else's server.
+    #[test]
+    fn a_redirect_to_another_host_is_refused_rather_than_handed_the_key() {
+        let err = resolve_redirect(
+            "https://api.getpostman.com/collections/1",
+            "https://evil.example.net/collections/1",
+        )
+        .unwrap_err();
+        assert!(err.contains("evil.example.net"), "{err}");
+        assert!(
+            err.contains("API key was not passed on"),
+            "and says the key was withheld: {err}"
+        );
+    }
+
+    /// Redirects that stay put are still followed, including the relative
+    /// forms, so a base URL that merely normalises a path keeps working.
+    #[test]
+    fn a_redirect_within_the_same_origin_is_followed() {
+        let base = "https://api.getpostman.com/collections/1";
+        assert_eq!(
+            resolve_redirect(base, "https://api.getpostman.com/v2/collections/1").unwrap(),
+            "https://api.getpostman.com/v2/collections/1"
+        );
+        assert_eq!(
+            resolve_redirect(base, "/v2/collections/1").unwrap(),
+            "https://api.getpostman.com/v2/collections/1"
+        );
+        assert_eq!(
+            resolve_redirect(base, "2").unwrap(),
+            "https://api.getpostman.com/collections/2"
+        );
+        // A different port is a different origin.
+        assert!(resolve_redirect(base, "https://api.getpostman.com:8443/x").is_err());
+    }
+
+    /// Filesystems limit a name to 255 *bytes*; counting characters let a
+    /// non-ASCII name through at over 255 and the write failed, which aborted
+    /// the whole import rather than one collection.
+    #[test]
+    fn a_long_non_ascii_name_is_capped_to_something_the_filesystem_accepts() {
+        let name = sanitize_file_name(&"中".repeat(100));
+        assert!(
+            name.len() <= 200,
+            "capped by bytes, not characters: {} bytes",
+            name.len()
+        );
+        assert!(!name.is_empty());
+        assert!(
+            "中".repeat(100).starts_with(&name),
+            "and cut on a character boundary"
+        );
+    }
+
+    /// A server that reports a `meta.total` it never delivers must not be able
+    /// to keep this asking for pages forever.
+    #[test]
+    fn pagination_gives_up_rather_than_asking_for_pages_forever() {
+        let page = format!(
+            r#"{{"collections":[{}],"meta":{{"total":1000000000}}}}"#,
+            (0..100)
+                .map(|i| format!(r#"{{"uid":"u{i}","name":"c{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (c, recorder) = client((0..500).map(|_| ok(&page)).collect());
+        let _ = c.list_collections("w1");
+        assert!(
+            recorder.urls().len() <= 100,
+            "bounded like list_workspaces, asked {} times",
+            recorder.urls().len()
+        );
     }
 }

@@ -33,11 +33,109 @@ use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
 use tui_panel_select::{Motion, MultiSelectPanel};
 
+/// The entry index a Requests-list row addresses, or `None` for a folder or
+/// "up" row.
+fn row_entry(row: &crate::tree::Row) -> Option<usize> {
+    match row {
+        crate::tree::Row::Entry(i) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The `(from, to)` entry indices `Alt+↑↓` should swap on a **Workspace** tab.
+///
+/// A Workspace tab's left pane is the filesystem tree (`ws_rows`), not the
+/// loaded collection's request list (`rows`), so `list_cursor` counts folders,
+/// collection files, reports and environments as well as requests. Reading the
+/// cursor against `rows()` therefore picked an unrelated request — or, in a
+/// tree with more rows than the open file has requests, silently nothing — and
+/// reordered two requests the user was not pointing at. Everything here is
+/// resolved against `ws_rows` for that reason.
+///
+/// The neighbour has to be a request of the *same* collection file at the
+/// *same* tree depth: the tree interleaves several files, and a request can
+/// only trade places with one it shares an `entries` list with. Depth keeps a
+/// move inside its own title-folder, matching a plain tab, where `rows()` only
+/// ever offers the folder being browsed. The scan stops on any row shallower
+/// than the cursor, which is the tree's way of saying the folder ended.
+fn ws_reorder_pair(col: &crate::collection::Collection, down: bool) -> Option<(usize, usize)> {
+    use crate::collection::WsRow;
+    let rows = col.ws_rows();
+    let (from, file, depth) = match rows.get(col.list_cursor)? {
+        WsRow::Request {
+            idx,
+            collection,
+            depth,
+            loaded: true,
+            ..
+        } => (*idx, collection.clone(), *depth),
+        _ => return None,
+    };
+    let mut scan: Box<dyn Iterator<Item = &WsRow>> = if down {
+        Box::new(rows.iter().skip(col.list_cursor + 1))
+    } else {
+        Box::new(rows.iter().take(col.list_cursor).rev())
+    };
+    scan.find_map(|row| match row {
+        WsRow::Request {
+            idx,
+            collection,
+            depth: d,
+            loaded: true,
+            ..
+        } if *d == depth && *collection == file => Some((from, *idx)),
+        // A deeper row is inside a subfolder of this one; keep looking past it.
+        r if r.depth() > depth => None,
+        // Anything at or above this depth ends the folder.
+        _ => Some((from, from)),
+    })
+    .filter(|(f, t)| f != t)
+}
+
 impl TuiApp {
+    /// What the wizard's clickable rows currently look like: which section is
+    /// showing and how many rows each has. Used to notice that a keystroke
+    /// moved the furniture, so a click queued behind it isn't resolved against
+    /// rects that no longer describe the same cells.
+    fn wizard_layout_signature(&self) -> Option<(usize, [usize; 8])> {
+        let Some(Overlay::NewRequest(form)) = self.overlay.as_ref() else {
+            return None;
+        };
+        Some((
+            form.view_tab as usize,
+            [
+                form.headers.rows.len(),
+                form.cookies.rows.len(),
+                form.queries.rows.len(),
+                form.options.rows.len(),
+                form.form_fields.len(),
+                form.asserts.len(),
+                form.captures.len(),
+                form.reports.len(),
+            ],
+        ))
+    }
+
     pub(crate) fn on_key(&mut self, key: KeyEvent) {
+        // The mouse hit map describes the frame last drawn, and the event loop
+        // drains every queued event before drawing again. A keystroke that
+        // deletes a wizard row therefore leaves hits pointing at cells that
+        // have moved or gone, and a click arriving behind it would land on the
+        // wrong one. Retire the map when that has happened and let the next
+        // draw rebuild it. (Only when it *has*: the second click of an
+        // activation pair has to survive a harmless keystroke, and clicks are
+        // paired without a redraw in between.)
+        let before = self.wizard_layout_signature();
+        self.on_key_dispatch(key);
+        if before.is_some() && self.wizard_layout_signature() != before {
+            self.invalidate_mouse_hits();
+        }
+    }
+
+    fn on_key_dispatch(&mut self, key: KeyEvent) {
         self.last_mouse_row = None;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
+            self.ctrl_c();
             return;
         }
         // Ctrl+Y copies the current status/error line(s) to the clipboard.
@@ -567,7 +665,8 @@ impl TuiApp {
             | Some(Overlay::WorkspaceReloadConfirm { sel, .. })
             | Some(Overlay::WorkspaceStorageChoice { sel, .. })
             | Some(Overlay::WorkspaceGitSaveUnsaved { sel, .. })
-            | Some(Overlay::WorkspaceSwitchUnsaved { sel, .. }) => {
+            | Some(Overlay::WorkspaceSwitchUnsaved { sel, .. })
+            | Some(Overlay::StaleBodyNotes { sel, .. }) => {
                 *sel = choice;
                 self.on_key(Self::mouse_key(KeyCode::Enter));
             }
@@ -628,6 +727,9 @@ impl TuiApp {
 
     fn focus_new_request_field(&mut self, field: NewField) {
         if let Some(Overlay::NewRequest(form)) = self.overlay.as_mut() {
+            if !form.field_exists(field) {
+                return;
+            }
             let prev_focus = form.focus;
             form.focus = field;
             if form.focus != prev_focus {
@@ -844,7 +946,7 @@ impl TuiApp {
         matches!(
             self.overlay,
             Some(Overlay::Prompt {
-                kind: PromptKind::Raw(_) | PromptKind::RawJson(_),
+                kind: PromptKind::Raw { .. } | PromptKind::RawJson(_),
                 ..
             })
         )
@@ -1485,6 +1587,9 @@ impl TuiApp {
             Overlay::WorkspaceSwitchUnsaved { ci, target, sel } => {
                 self.workspace_switch_unsaved_key_handler(key, ci, target, sel)
             }
+            Overlay::StaleBodyNotes { ci, ei, sel } => {
+                self.stale_body_notes_key_handler(key, ci, ei, sel)
+            }
             Overlay::WorkspaceReloadConfirm { idx, reload, sel } => {
                 self.workspace_reload_confirm_key_handler(key, idx, reload, sel)
             }
@@ -1602,7 +1707,33 @@ impl TuiApp {
         // to actions (`a` activate, `x` delete, `u` undo, `q` quit), so typing
         // a name here without a mode would fire half of them. Handled before
         // the main match for the same reason.
-        if self.env_filter_typing && self.on_key_env_filter(key, ctrl, alt) {
+        //
+        // Gated on the pane still having focus: `on_key_env_filter` lets Tab
+        // fall through, so without this the mode would stay armed in a pane the
+        // user has walked away from and quietly eat every printable key in the
+        // app — including the Requests list's own letter actions, and `q`. The
+        // query itself survives, so coming back resumes typing into the filter
+        // that is still on screen.
+        if self.env_filter_typing
+            && self.focus == Pane::GlobalEnv
+            && self.on_key_env_filter(key, ctrl, alt)
+        {
+            return;
+        }
+        // Type-to-filter for the Requests list, opened with `/`. Same mode
+        // treatment and the same reason: the list binds bare letters too (`x`
+        // delete, `u` undo, `c` duplicate, `n` new), so a name typed without a
+        // mode would set half of them off.
+        //
+        // Also gated on the pane still having focus, so Tab hands the keyboard
+        // back to the rest of the app rather than leaving an invisible capture
+        // running in a pane the user has moved away from. The query survives —
+        // returning to the list resumes typing into the filter that is still on
+        // screen.
+        if self.list_filter_typing
+            && self.focus == Pane::List
+            && self.on_key_list_filter(key, ctrl, alt)
+        {
             return;
         }
         match key.code {
@@ -1619,6 +1750,21 @@ impl TuiApp {
                 self.env_query.clear();
                 self.clamp_env_selection();
             }
+            // The same way out of the Requests list's filter, for the same
+            // reason — and it must come before the quit arm below, or clearing
+            // a filter would close the app.
+            KeyCode::Esc
+                if self.focus == Pane::List
+                    && !self.collections[self.active_tab].list_query.is_empty() =>
+            {
+                self.clear_list_filter(self.active_tab);
+            }
+            // With nothing left for it to dismiss, Esc quits exactly as `q`
+            // does (confirmation and unsaved-work checks included). Backing out
+            // of a TUI with Esc is the near-universal intuition, and it has to
+            // come after the two arms above so it only ever fires once Esc has
+            // run out of things to close.
+            KeyCode::Esc => self.request_quit(),
             // `y` (vim-style "yank") copies to the clipboard on demand — an
             // explicit fallback for terminals where the automatic
             // copy-on-mouse-release OSC 52 write isn't picked up (e.g. no
@@ -1635,8 +1781,31 @@ impl TuiApp {
             // skimmed. Display-only — a whole-panel `y`-copy still yields the
             // full body (see `whole_panel_text`). Scoped to the Response pane so
             // it doesn't clash with `c`'s Requests-list "copy to workspace".
-            KeyCode::Char('c') if self.focus == Pane::Response => {
+            // Also scoped to the Body section: there are no long string
+            // literals to shorten in a header table, and toggling a flag with
+            // no visible effect (that then surprises you on the way back to the
+            // Body) is worse than doing nothing.
+            KeyCode::Char('c')
+                if self.focus == Pane::Response
+                    && self.response_section == ResponseSection::Body =>
+            {
                 self.response_compact = !self.response_compact;
+            }
+            // `i` (Response pane) steps the section tab bar — Body → Headers →
+            // Body — and Shift+I steps back. Deliberately *not* `[`/`]`: those
+            // mean "previous/next collection tab" from every pane, and giving
+            // them a second meaning that depends on which panel holds the
+            // cursor is exactly the kind of focus-sensitive rebinding that
+            // makes a key map unlearnable. A ring rather than a toggle because
+            // the runner captures more than Body and Headers (timings, capture
+            // values, the redirect chain) and a third tab shouldn't need a
+            // third key. Scoped to the Response pane so `i` stays free
+            // elsewhere.
+            KeyCode::Char('i') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(true);
+            }
+            KeyCode::Char('I') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(false);
             }
             // Shift+Arrow moves the *end* of an active selection, letting
             // the user fine-tune (or start extending, one line/char at a
@@ -1653,6 +1822,11 @@ impl TuiApp {
             // Ctrl+R (Requests list) reverts the selected request to its saved
             // on-disk version, discarding its in-memory edits (#19).
             KeyCode::Char('r') if ctrl && self.focus == Pane::List => self.begin_revert_request(),
+            // Ctrl+B (Requests list) resolves body notes that no longer match
+            // the body they were written for.
+            KeyCode::Char('b') if ctrl && self.focus == Pane::List => {
+                self.begin_resolve_body_notes()
+            }
             // Ctrl+F (Workspace file-tree) toggles the extension filter that
             // hides non-workspace files (images, build output, …) so the tree
             // shows only `.hurl/.json/.vars/.trail`. Mirrors the picker's Tab
@@ -1664,13 +1838,16 @@ impl TuiApp {
             {
                 self.toggle_workspace_tree_filter(self.active_tab);
             }
-            // Reopens the most recently closed tab. Deliberately a plain
-            // unmodified key rather than a Ctrl+Shift combo: terminal emulators
-            // commonly intercept Ctrl+Shift+T themselves (as "new tab") before
-            // it ever reaches the app. When the Requests list has focus, `u`
-            // instead restores the most recently deleted request in the active
-            // collection (mirroring how `x` deletes a request there instead of
-            // closing the tab) — see `restore_deleted_request`.
+            // `u` undoes the last destructive act *in the focused pane*, and
+            // each arm below pairs with the `x` that does the destroying in
+            // that same pane. Keeping the two on the same axis is what makes
+            // the key predictable: there is no single time-ordered undo stack,
+            // so without the pane to disambiguate, a user who deleted a
+            // request, moved focus, and pressed `u` would get some unrelated
+            // thing back instead — and would have to work out which.
+            // Deliberately a plain unmodified key rather than a Ctrl+Shift
+            // combo: terminal emulators commonly intercept Ctrl+Shift+T
+            // themselves (as "new tab") before it ever reaches the app.
             KeyCode::Char('u') if self.focus == Pane::List => self.restore_deleted_request(),
             // `u` in the Global Environments panel reopens the most recently
             // deleted environment (mirroring how `x` deletes one there).
@@ -1682,7 +1859,15 @@ impl TuiApp {
             KeyCode::Char('g') if self.focus == Pane::GlobalEnv => {
                 self.jump_to_active_env();
             }
-            KeyCode::Char('u') => self.reopen_closed_tab(),
+            // Reopens the most recently closed tab, pairing with the `x` that
+            // closes one on the tab bar. Scoped to `Pane::Tabs` even though
+            // Ctrl+W can close a tab from anywhere, because both close paths
+            // (`finish_close_tab`, `close_active_report_tab`) land the focus on
+            // the tab bar afterwards — so the undo is always reachable straight
+            // after the close, and the "press (u) to reopen" status hint stays
+            // true, without `u` meaning "reopen a tab" in panes that have their
+            // own thing to undo.
+            KeyCode::Char('u') if self.focus == Pane::Tabs => self.reopen_closed_tab(),
             // `s` would be mnemonic for "source" but is already the global
             // Settings menu. `o` is deliberately scoped to the Environments
             // panel and cycles the row origin filter without stealing a common
@@ -1702,6 +1887,13 @@ impl TuiApp {
             KeyCode::Tab => self.cycle_focus(true),
             KeyCode::BackTab => self.cycle_focus(false),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
+            // Ctrl+S saves whatever is in front of the user, by the same code
+            // File ▸ Save runs — the shortcut everybody's fingers reach for
+            // before they look for a menu. It has to be matched ahead of the
+            // bare `s` below, which opens Settings: the two are one modifier
+            // apart, and a save reflex landing in the Settings menu is a
+            // silent no-op on the keystroke people trust most.
+            KeyCode::Char('s') if ctrl => self.save_active(),
             KeyCode::Char('s') => {
                 self.overlay = Some(Overlay::Options(0));
             }
@@ -1715,6 +1907,22 @@ impl TuiApp {
             // also focuses the panel, so it works as "find me an environment"
             // from wherever you are rather than only once the panel is focused
             // — with hundreds of environments that is the whole point of it.
+            // `/` finds something in the pane that has focus: a request in the
+            // Requests list, a row anywhere in a Workspace tab's tree, and
+            // otherwise an environment variable — the pane-scoped reading of
+            // "find me one of these", matching how `x` and `u` already mean
+            // "the thing in this pane".
+            //
+            // A Workspace tab used to be excluded on the grounds that its tree
+            // "has its own Ctrl+F filter", which was simply wrong: Ctrl+F there
+            // toggles which *file types* the tree shows and has never searched
+            // anything. The result was that `/` on the Requests panel of a
+            // workspace silently jumped the focus to Environments, which is
+            // both the commonest way to open a collection and the case where a
+            // search is worth most.
+            KeyCode::Char('/') if self.focus == Pane::List => {
+                self.list_filter_typing = true;
+            }
             KeyCode::Char('/') => {
                 self.focus = Pane::GlobalEnv;
                 self.env_filter_typing = true;
@@ -1784,9 +1992,18 @@ impl TuiApp {
                     self.open_prompt_rename_env(env_id);
                 }
             }
-            // F2 renames the active tab (matches the common OS convention).
-            KeyCode::F(2) if self.active_tab != 0 => self.open_prompt_rename(),
-            KeyCode::Char('x') if self.focus == Pane::List => self.delete_selected_request(),
+            // F2 renames the active tab — but, like `x`, only from the tab bar
+            // itself. It used to be the fall-through arm, so it also fired
+            // from the Requests list and the Request/Response panes, where the
+            // thing under the cursor is a request rather than the tab: pressing
+            // rename while a request is highlighted and being asked to rename
+            // the *collection* is a straightforward misread of what has focus.
+            KeyCode::F(2) if self.focus == Pane::Tabs && self.active_tab != 0 => {
+                self.open_prompt_rename()
+            }
+            KeyCode::Char('x') if self.focus == Pane::List => {
+                self.request_delete_selected_request()
+            }
             // 'x' in the Global Environments panel deletes the selected
             // environment (any collections linked to it become unlinked).
             // Guarded by the confirm-on-delete-env preference; when it's off,
@@ -1805,13 +2022,35 @@ impl TuiApp {
                     }
                 }
             }
-            KeyCode::Char('x') if self.active_tab != 0 => self.close_active_tab(),
+            // `x` closes the active tab — but only from the Tabs bar itself.
+            // It used to be the fall-through arm, so it also fired from the
+            // Main and Response panes, where nothing on screen suggests a
+            // keypress is aimed at the tab bar: reading a response, pressing
+            // `x`, and losing the whole collection is a lot of damage for a
+            // stray key. Every other `x` in this match deletes the thing its
+            // own pane is about (a request in the list, an environment in the
+            // Environments panel), so this one is now scoped the same way.
+            // Ctrl+W still closes the active tab from anywhere — that's the
+            // OS-wide convention for "close this", and it isn't a key anyone
+            // hits by accident while reading.
+            KeyCode::Char('x') if self.focus == Pane::Tabs && self.active_tab != 0 => {
+                self.close_active_tab()
+            }
             // 'm' / 'c' move / copy the highlighted request in a Workspace tab
             // to another collection file in the same workspace (a no-op unless
             // a request row of a workspace tab is highlighted). The workspace
             // picker then chooses the destination and writes it to disk.
             KeyCode::Char('m') if self.focus == Pane::List => self.start_workspace_transfer(true),
-            KeyCode::Char('c') if self.focus == Pane::List => self.start_workspace_transfer(false),
+            // On a plain tab there is no other collection file to choose from,
+            // so `c` means the one case the picker would have offered anyway:
+            // duplicate the request where it stands.
+            KeyCode::Char('c') if self.focus == Pane::List => {
+                if self.collections[self.active_tab].is_workspace() {
+                    self.start_workspace_transfer(false);
+                } else {
+                    self.duplicate_selected_request();
+                }
+            }
             // 'a' toggles activation of the selected Global Environment (at
             // most one may be active — activating one deactivates any other).
             // On an unopened workspace file it loads the file first: activating
@@ -1939,6 +2178,12 @@ impl TuiApp {
             KeyCode::Down if ctrl && self.focus == Pane::Response => {
                 self.nav(self.resp_text_area.height.max(1) as i32);
             }
+            // Alt+Up/Down reorder the highlighted request. Alt because the
+            // bare arrows move the cursor and the two must not collide; a
+            // modifier turning navigation into dragging is the usual idiom.
+            // Placed above the plain arrow arms so it wins the match.
+            KeyCode::Up if alt && self.focus == Pane::List => self.move_selected_request(false),
+            KeyCode::Down if alt && self.focus == Pane::List => self.move_selected_request(true),
             KeyCode::Up | KeyCode::Char('k') => self.nav(-1),
             KeyCode::Down | KeyCode::Char('j') => self.nav(1),
             KeyCode::Left | KeyCode::Char('h') if self.focus == Pane::Tabs => self.cycle_tab(false),
@@ -2112,6 +2357,105 @@ impl TuiApp {
             _ => return false,
         }
         true
+    }
+
+    /// Keys for the Requests list's `/` filter, while it is capturing.
+    /// Returns `true` when the key was consumed.
+    ///
+    /// Deliberately the same shape as [`Self::on_key_env_filter`]: printable
+    /// characters extend the query, Backspace trims, Enter keeps the filter but
+    /// hands the keyboard back to the list, Esc clears it outright, and Up/Down
+    /// move the selection without leaving the filter so a name can be typed and
+    /// a match picked in one go. Two filters a Tab apart that behaved
+    /// differently would be worse than either.
+    fn on_key_list_filter(&mut self, key: KeyEvent, ctrl: bool, alt: bool) -> bool {
+        let ci = self.active_tab;
+        match key.code {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                self.collections[ci].list_query.push(c);
+                self.clamp_list_selection(ci);
+            }
+            KeyCode::Backspace => {
+                self.collections[ci].list_query.pop();
+                self.clamp_list_selection(ci);
+            }
+            KeyCode::Esc => {
+                self.clear_list_filter(ci);
+            }
+            KeyCode::Enter => self.list_filter_typing = false,
+            KeyCode::Up | KeyCode::Down => {
+                let len = self.collections[ci].list_row_count();
+                if len > 0 {
+                    // Wrap the way the list's own j/k navigation does.
+                    let cur = self.collections[ci].list_cursor.min(len - 1) as i32;
+                    let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                    let next = (cur + delta).rem_euclid(len as i32) as usize;
+                    self.select_row_in_pane(Pane::List, next);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Drop the Requests list filter and leave its capture mode, putting the
+    /// cursor back on the request that was highlighted.
+    ///
+    /// Restoring the folder matters: the filtered list is flat, so the match
+    /// the user settled on can live somewhere quite different from the folder
+    /// that was being browsed when they started typing. Clearing the filter
+    /// without following the selection would drop them back where they began,
+    /// having thrown away the thing they just went looking for.
+    pub(crate) fn clear_list_filter(&mut self, ci: usize) {
+        self.list_filter_typing = false;
+        let col = &mut self.collections[ci];
+        col.list_query.clear();
+        // A Workspace tab's tree is not the loaded collection's request list,
+        // so `selected_entry` says nothing about which *row* was highlighted —
+        // the match could as easily have been a report or another file. Its
+        // rows also come back in the same order once the filter goes, so the
+        // cursor is simply clamped rather than re-derived.
+        if col.is_workspace() {
+            col.list_cursor = col.list_cursor.min(col.ws_rows().len().saturating_sub(1));
+            return;
+        }
+        col.sync_folder_to_selected();
+        let sel = col.selected_entry;
+        col.list_cursor = col
+            .rows()
+            .iter()
+            .position(|r| matches!(r, crate::tree::Row::Entry(i) if *i == sel))
+            .unwrap_or(0);
+    }
+
+    /// Keep the Requests list selection inside the (possibly just narrowed) row
+    /// list, and follow it with `selected_entry` so the right-hand panes show
+    /// the request the cursor is actually on.
+    fn clamp_list_selection(&mut self, ci: usize) {
+        // A Workspace tab's rows are the tree, and its selection is followed by
+        // the tree's own handler (which loads a collection, previews a report,
+        // and so on) rather than by `selected_entry`; clamping the cursor into
+        // the narrowed tree is all that is needed here.
+        if self.collections[ci].is_workspace() {
+            let len = self.collections[ci].ws_rows().len();
+            self.collections[ci].list_cursor =
+                self.collections[ci].list_cursor.min(len.saturating_sub(1));
+            return;
+        }
+        let rows = self.collections[ci].rows();
+        let cursor = self.collections[ci]
+            .list_cursor
+            .min(rows.len().saturating_sub(1));
+        self.collections[ci].list_cursor = cursor;
+        // Typing narrows the list under the cursor, so the row it lands on is
+        // usually a different request; the panes to the right follow it, the
+        // same as they would if the cursor had been moved by hand.
+        if let Some(idx) = rows.get(cursor).and_then(row_entry) {
+            let col = &mut self.collections[ci];
+            col.selected_entry = idx;
+            col.invalidate_request_json();
+        }
+        self.list_hscroll = 0;
     }
 
     /// Keep the Environments panel selection inside the (possibly just
@@ -2405,13 +2749,7 @@ impl TuiApp {
     pub(crate) fn start_workspace_transfer(&mut self, is_move: bool) {
         let ci = self.active_tab;
         let col = &self.collections[ci];
-        if !col.is_workspace() || col.workspace_root.is_none() {
-            return;
-        }
-        let Some(crate::collection::WsRow::Request {
-            idx, loaded: true, ..
-        }) = col.ws_rows().into_iter().nth(col.list_cursor)
-        else {
+        let Some(idx) = col.ws_transfer_target() else {
             return;
         };
         let Some(entry) = col.entries.get(idx).cloned() else {
@@ -2433,6 +2771,32 @@ impl TuiApp {
     /// unrelated, not-currently-visible entry). Remembers the removed entry
     /// (with the index it was removed from) so `u` can restore it — see
     /// [`Self::restore_deleted_request`].
+    /// `x` in the Requests list: delete the highlighted request, asking first
+    /// unless the user has turned the confirmation off.
+    ///
+    /// The row is checked *before* the popup goes up, so `x` on a folder or an
+    /// "up" row stays the no-op it always was rather than raising a question
+    /// about a request that isn't there. When the preference is off the delete
+    /// happens immediately — it stays undoable with `u` either way, which is
+    /// what makes turning it off reasonable.
+    pub(crate) fn request_delete_selected_request(&mut self) {
+        let col = &self.collections[self.active_tab];
+        if !matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Entry(_))
+        ) {
+            return;
+        }
+        if self.confirm_on_delete_request {
+            self.overlay = Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteRequest,
+                sel: 1,
+            });
+        } else {
+            self.delete_selected_request();
+        }
+    }
+
     pub(crate) fn delete_selected_request(&mut self) {
         let ci = self.active_tab;
         let col = &self.collections[ci];
@@ -2444,17 +2808,127 @@ impl TuiApp {
         }
         let col = &mut self.collections[ci];
         let idx = col.selected_entry.min(col.entries.len() - 1);
-        let removed = col.entries.remove(idx);
-        let method = removed.method.clone();
-        col.deleted_entries.push((idx, removed));
-        if col.deleted_entries.len() > 20 {
-            col.deleted_entries.remove(0);
-        }
+        let Some(removed) = col.remove_entry_recording_undo(idx) else {
+            return;
+        };
+        let method = removed.method;
         col.selected_entry = idx.min(col.entries.len().saturating_sub(1));
         col.sync_folder_to_selected();
         self.list_hscroll = 0;
         self.collections[ci].invalidate_request_json();
         self.status = Some(Status::RequestDeleted(method));
+        self.save_state();
+    }
+
+    /// Move the highlighted request one place up or down the Requests list
+    /// (`Alt+Up` / `Alt+Down`).
+    ///
+    /// The order of a collection's entries is what `run_all_entries` follows,
+    /// so this is how you put a login ahead of the request that uses the token
+    /// it captures. Until this existed the only way was to delete the request
+    /// and recreate it further down.
+    ///
+    /// "One place" means one place *as shown*, which is not the same as one
+    /// index: folders are derived from titles (see [`crate::tree`]), so the
+    /// next request in this folder can be several entries away in the
+    /// underlying vector with other folders' requests in between. The
+    /// displayed neighbour is found first and its real index handed to
+    /// [`crate::collection::Collection::move_entry`], which shifts rather than
+    /// swaps so nothing else is disturbed.
+    ///
+    /// A no-op on a folder or "up" row (nothing there to move) and at either
+    /// end of the list.
+    pub(crate) fn move_selected_request(&mut self, down: bool) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        // A filtered list hides the requests a move would step over, so "one
+        // place down" would land the request an unpredictable distance away —
+        // past however many non-matching requests happen to sit in the gap,
+        // none of them on screen. Refuse and say why rather than perform a move
+        // whose result can't be seen.
+        if col.list_filter_active() {
+            self.status = Some(Status::ReorderNeedsUnfilteredList);
+            return;
+        }
+        let rows = col.rows();
+        let (from, to) = if col.is_workspace() {
+            let Some(pair) = ws_reorder_pair(col, down) else {
+                return;
+            };
+            pair
+        } else {
+            let Some(from) = rows.get(col.list_cursor).and_then(row_entry) else {
+                return;
+            };
+            // The adjacent *displayed* request, skipping folder rows — a folder
+            // is not something a request can trade places with.
+            let neighbour = if down {
+                rows.iter().skip(col.list_cursor + 1).find_map(row_entry)
+            } else {
+                rows.iter().take(col.list_cursor).rev().find_map(row_entry)
+            };
+            let Some(to) = neighbour else {
+                return;
+            };
+            (from, to)
+        };
+        let col = &mut self.collections[ci];
+        if !col.move_entry(from, to) {
+            return;
+        }
+        self.list_hscroll = 0;
+        self.status = Some(Status::RequestMovedInList);
+        self.save_state();
+    }
+
+    /// Duplicate the highlighted request, landing the copy directly beneath
+    /// the original (`c`, List pane, on a non-Workspace tab).
+    ///
+    /// The copy is the quickest way to build a family of near-identical
+    /// requests — the same call with a different header or body per scenario —
+    /// which otherwise means retyping the whole thing in the wizard.
+    ///
+    /// It goes in at `idx + 1` rather than at the end of the collection so it
+    /// arrives where the eye already is; appending would put it out of sight in
+    /// any collection long enough for duplication to be worth the trouble. The
+    /// title is uniqued (see [`crate::collection::unique_entry_title`]) because
+    /// two entries sharing one makes the name ambiguous for reports that
+    /// address either of them.
+    ///
+    /// Workspace tabs keep `c`'s existing meaning — copy to a chosen collection
+    /// file, of which "this one" is a case — see
+    /// [`Self::start_workspace_transfer`].
+    pub(crate) fn duplicate_selected_request(&mut self) {
+        let ci = self.active_tab;
+        let col = &self.collections[ci];
+        // Same guard as `delete_selected_request`: the cursor may be on a
+        // folder or "up" row, which is nothing to duplicate.
+        if !matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Entry(_))
+        ) {
+            return;
+        }
+        let col = &mut self.collections[ci];
+        let idx = col.selected_entry.min(col.entries.len().saturating_sub(1));
+        let Some(mut clone) = col.entries.get(idx).cloned() else {
+            return;
+        };
+        clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
+        clone.user_added = true;
+        clone.modified = true;
+        // A copy has never been sent, so carrying the original's response over
+        // would attribute a result to a request that didn't produce it.
+        clone.last_response = None;
+        let method = clone.method.clone();
+        let title = clone.title.clone();
+        col.entries.insert(idx + 1, clone);
+        col.selected_entry = idx + 1;
+        col.sync_folder_to_selected();
+        col.sync_ws_cursor();
+        self.list_hscroll = 0;
+        self.collections[ci].invalidate_request_json();
+        self.status = Some(Status::RequestDuplicated(method, title));
         self.save_state();
     }
 
@@ -2465,11 +2939,9 @@ impl TuiApp {
     pub(crate) fn restore_deleted_request(&mut self) {
         let ci = self.active_tab;
         let col = &mut self.collections[ci];
-        let Some((idx, entry)) = col.deleted_entries.pop() else {
+        let Some(idx) = col.restore_last_deleted() else {
             return;
         };
-        let idx = idx.min(col.entries.len());
-        col.entries.insert(idx, entry);
         col.selected_entry = idx;
         col.sync_folder_to_selected();
         self.list_hscroll = 0;
@@ -3159,6 +3631,12 @@ impl TuiApp {
         let Some(entry) = col.entries.get(col.selected_entry) else {
             return;
         };
+        // The wizard edits fields, and text that was never parsed has none.
+        // Raw Mode is the surface that can actually repair it.
+        if entry.is_unreadable() {
+            self.status = Some(Status::CannotEditUnreadable);
+            return;
+        }
         let ei = col.selected_entry;
         let file_root = col
             .path
@@ -3178,7 +3656,10 @@ impl TuiApp {
         };
         let text = entry.to_hurl();
         self.overlay = Some(Overlay::Prompt {
-            kind: PromptKind::Raw(ci),
+            kind: PromptKind::Raw {
+                ci,
+                before: text.clone(),
+            },
             editor: Editor::new(&text, true),
             title: s.entry_raw_hurl.to_string(),
             mask: false,
@@ -3293,7 +3774,12 @@ impl TuiApp {
             .filter(|e| !e.is_empty())
         {
             match crate::hurl::status_eq_code(&expr) {
-                Some(code) if expected_status.is_none() => expected_status = Some(code),
+                // A request that kept its status check in `[Asserts]` keeps it
+                // there: folding it onto the `HTTP` line would rewrite a
+                // request the user only looked at.
+                Some(code) if expected_status.is_none() && !form.status_in_asserts => {
+                    expected_status = Some(code)
+                }
                 _ => asserts.push(expr),
             }
         }
@@ -3338,7 +3824,7 @@ impl TuiApp {
                 || entry.queries != queries
                 || entry.options != options
                 || entry.form_fields != form_fields
-                || entry.body != body
+                || entry.body_src != body
                 || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
@@ -3352,7 +3838,7 @@ impl TuiApp {
                 entry.queries = queries;
                 entry.options = options;
                 entry.form_fields = form_fields;
-                entry.body = body;
+                entry.body_src = body;
                 entry.expected_status = expected_status;
                 entry.asserts = asserts;
                 entry.captures = captures;
@@ -3588,6 +4074,7 @@ impl TuiApp {
                 }
             }
             ConfirmAction::DeleteEnv(idx) => self.delete_global_env(idx),
+            ConfirmAction::DeleteRequest => self.delete_selected_request(),
             ConfirmAction::RevertRequest(ci, ei) => match self.revert_request_to_saved(ci, ei) {
                 Some(method) => self.status = Some(Status::RequestReverted(method)),
                 None => self.status = Some(Status::NothingToRevert),
@@ -3602,7 +4089,9 @@ impl TuiApp {
                         self.status = Some(Status::FileReverted(name));
                         self.save_state();
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             ConfirmAction::RevertEnv(env_id) => match self.revert_env_to_saved(env_id) {
@@ -3618,6 +4107,69 @@ impl TuiApp {
     /// on-disk version, discarding its in-memory edits (#19). Asks to confirm
     /// first (there's no undo); a no-op with a status when there's nothing to
     /// revert (a scratch collection, or an unedited/never-saved request).
+    /// `Ctrl+B` (Requests list): resolve the `# [Body]` notes a request is
+    /// carrying that no longer describe its body. A no-op when there are none
+    /// — the overlay would have nothing to say.
+    pub(crate) fn begin_resolve_body_notes(&mut self) {
+        let ci = self.active_tab;
+        let Some(c) = self.collections.get(ci) else {
+            return;
+        };
+        let ei = c.selected_entry;
+        if c.entries
+            .get(ei)
+            .and_then(|e| e.stale_body_notes())
+            .is_none()
+        {
+            return;
+        }
+        // Defaults to "leave them alone": both other choices throw something
+        // away, and the notes are here precisely because nothing was thrown
+        // away without asking.
+        self.overlay = Some(Overlay::StaleBodyNotes { ci, ei, sel: 2 });
+    }
+
+    fn stale_body_notes_key_handler(&mut self, key: KeyEvent, ci: usize, ei: usize, sel: usize) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::BackTab => {
+                self.overlay = Some(Overlay::StaleBodyNotes {
+                    ci,
+                    ei,
+                    sel: (sel + 2) % 3,
+                });
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Tab => {
+                self.overlay = Some(Overlay::StaleBodyNotes {
+                    ci,
+                    ei,
+                    sel: (sel + 1) % 3,
+                });
+            }
+            KeyCode::Enter => {
+                self.overlay = None;
+                let Some(entry) = self
+                    .collections
+                    .get_mut(ci)
+                    .and_then(|c| c.entries.get_mut(ei))
+                else {
+                    return;
+                };
+                let done = match sel {
+                    0 => entry.adopt_body_notes().then_some(Status::NotesAdopted),
+                    1 => entry.discard_body_notes().then_some(Status::NotesDiscarded),
+                    _ => None,
+                };
+                if done.is_some() {
+                    entry.modified = true;
+                    self.status = done;
+                    self.save_state();
+                }
+            }
+            _ => self.overlay = Some(Overlay::StaleBodyNotes { ci, ei, sel }),
+        }
+    }
+
     pub(crate) fn begin_revert_request(&mut self) {
         let ci = self.active_tab;
         let revertable = self.collections.get(ci).is_some_and(|c| {
@@ -3683,6 +4235,26 @@ impl TuiApp {
     /// user to confirm the thing they had just asked for. "Save As" still
     /// confirms before overwriting a *different* file, which is a genuine
     /// surprise — that one is about the file you didn't choose to change.
+    /// Save what is in front of the user, straight back to the file it came
+    /// from — the target of `Ctrl+S` in both front-ends.
+    ///
+    /// An open report wins when there is one: it is the thing being edited, and
+    /// it is drawn over the request view. Otherwise it is the active collection
+    /// tab. [`Self::begin_save`] falls back to "Save As" when the target has
+    /// never been written anywhere, so the shortcut still does something useful
+    /// on exactly the documents most likely to need saving; an item that *does*
+    /// know its file is written without a dialog, because a save shortcut that
+    /// always asks where is no shortcut. Deliberately the same decision the
+    /// GUI's `menu::active_save_kind` makes, so `Ctrl+S` cannot come to mean
+    /// two different things in the two front-ends.
+    pub(crate) fn save_active(&mut self) {
+        if self.active_report_index().is_some() {
+            self.begin_save(FileAction::SaveReport);
+        } else if self.collections.get(self.active_tab).is_some() {
+            self.begin_save(FileAction::SaveCollection);
+        }
+    }
+
     pub(crate) fn begin_save(&mut self, action: FileAction) {
         if action == FileAction::SaveEnv && self.current_env_id().is_none() {
             self.status = Some(Status::NotEnvironment);
@@ -3925,6 +4497,42 @@ impl TuiApp {
         }
     }
 
+    /// Ctrl+C: copy the selection if there is one, otherwise ask about quitting.
+    ///
+    /// Every other application treats Ctrl+C as "copy", so it gets pressed by
+    /// reflex part-way through dragging out a selection — and it used to tear
+    /// the TUI down on the spot, without even the confirmation that `q` goes
+    /// through. It now does the expected thing when something is selected, and
+    /// when nothing is it *always* raises the exit confirmation, even with
+    /// `confirm_on_exit` off, so a stray Ctrl+C can never end the session
+    /// outright. (Ctrl+C isn't a SIGINT here: raw mode delivers it as an
+    /// ordinary key event, so swallowing it is entirely ours to decide.)
+    pub(crate) fn ctrl_c(&mut self) {
+        // While an overlay owns the screen, swallow Ctrl+C completely: opening
+        // the exit popup would replace that overlay and throw away whatever
+        // half-finished form or wizard is in it. Esc is the way out of an
+        // overlay, and every overlay that holds text has its own copy key.
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.copy_report_selection_only() || self.copy_selection_only() {
+            return;
+        }
+        self.confirm_quit();
+    }
+
+    /// Raise the exit confirmation unconditionally.
+    ///
+    /// Split out of [`Self::request_quit`] for the key bindings that can be hit
+    /// by accident (Ctrl+C), which must ask even when the user has turned
+    /// confirm-on-exit off.
+    pub(crate) fn confirm_quit(&mut self) {
+        self.overlay = Some(Overlay::Confirm {
+            action: ConfirmAction::Exit,
+            sel: 1,
+        });
+    }
+
     /// Quit, first asking for confirmation when the setting is enabled — or when
     /// there are unsaved secret or request edits that would be lost (even if the
     /// setting is off), so the user is never silently robbed of changes.
@@ -3933,10 +4541,7 @@ impl TuiApp {
             || self.has_unsaved_secret_changes()
             || self.unsaved_request_edits() > 0
         {
-            self.overlay = Some(Overlay::Confirm {
-                action: ConfirmAction::Exit,
-                sel: 1,
-            });
+            self.confirm_quit();
         } else {
             self.quit = true;
         }
@@ -4569,7 +5174,7 @@ impl TuiApp {
                 }
                 self.overlay = Some(Overlay::Browser(action, Box::new(ex)));
             }
-            Err(e) => self.status = Some(Status::Error(e.to_string())),
+            Err(e) => self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e))),
         }
     }
 
@@ -4671,14 +5276,14 @@ impl TuiApp {
                     sel: (sel + 1) % 3,
                 });
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::CloseGitWorkspace {
                     idx,
                     path,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::CloseGitWorkspace {
                     idx,
                     path,
@@ -4715,13 +5320,13 @@ impl TuiApp {
                     sel: (sel + 1) % 3,
                 });
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
                     ci,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::WorkspaceGitSaveUnsaved {
                     ci,
                     sel: (sel + 1) % 3,
@@ -4756,14 +5361,14 @@ impl TuiApp {
     ) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
                     ci,
                     target,
                     sel: (sel + 2) % 3,
                 });
             }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Tab => {
                 self.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
                     ci,
                     target,
@@ -4814,7 +5419,9 @@ impl TuiApp {
             | KeyCode::Char('h')
             | KeyCode::Char('l')
             | KeyCode::Char('k')
-            | KeyCode::Char('j') => {
+            | KeyCode::Char('j')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceReloadConfirm {
                     idx,
                     reload,
@@ -4859,7 +5466,9 @@ impl TuiApp {
             | KeyCode::Char('h')
             | KeyCode::Char('l')
             | KeyCode::Char('k')
-            | KeyCode::Char('j') => {
+            | KeyCode::Char('j')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
                 self.overlay = Some(Overlay::WorkspaceStorageChoice {
                     repo,
                     name,
@@ -5101,6 +5710,7 @@ impl TuiApp {
             s.pref_item_confirm_exit,
             s.pref_item_confirm_clear,
             s.pref_item_confirm_delete_env,
+            s.pref_item_confirm_delete_request,
             s.pref_item_always_save,
             s.pref_item_run_all_batch,
             s.pref_item_default_view,
@@ -5111,7 +5721,7 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::Preferences((sel + 1).min(5)));
+                self.overlay = Some(Overlay::Preferences((sel + 1).min(6)));
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_preference_item(sel),
             KeyCode::Char(c) => match mnemonic_index(&items, c) {
@@ -5141,11 +5751,16 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Preferences(sel));
             }
             3 => {
-                self.always_save_when_prompted = !self.always_save_when_prompted;
+                self.confirm_on_delete_request = !self.confirm_on_delete_request;
                 self.save_state();
                 self.overlay = Some(Overlay::Preferences(sel));
             }
             4 => {
+                self.always_save_when_prompted = !self.always_save_when_prompted;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            5 => {
                 self.run_all_batch_mode = !self.run_all_batch_mode;
                 self.save_state();
                 self.overlay = Some(Overlay::Preferences(sel));
@@ -5166,8 +5781,15 @@ impl TuiApp {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
             KeyCode::Char('n') | KeyCode::Char('N') => self.overlay = None,
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                // Two options (Yes = 0, No = 1); toggle between them.
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                // Two options (Yes = 0, No = 1); toggle between them. Tab and
+                // Shift+Tab move too, because a row of buttons is a form and
+                // Tab is how everyone expects to walk one.
                 self.overlay = Some(Overlay::Confirm {
                     action,
                     sel: 1 - sel,
@@ -5216,7 +5838,7 @@ impl TuiApp {
             // to Preferences afterwards; there's nothing left to
             // "confirm" or "cancel" since the value's already applied.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                self.overlay = Some(Overlay::Preferences(5))
+                self.overlay = Some(Overlay::Preferences(6))
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let new_sel = sel.saturating_sub(1);
@@ -5857,6 +6479,64 @@ impl TuiApp {
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let s = Strings::for_language(&self.language);
+        // The discard prompt is likewise a modal over the wizard: while it is
+        // open every key belongs to it, so a keystroke aimed at the prompt
+        // can't also edit the form sitting behind it. It is checked first
+        // because it is the outermost layer — Esc only raises it once every
+        // dropdown and the extract prompt have already been dismissed.
+        if let Some(sel) = form.confirm_discard {
+            let choice = match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => Some(WIZARD_DISCARD_SAVE),
+                KeyCode::Char('d') | KeyCode::Char('D') => Some(WIZARD_DISCARD_DISCARD),
+                KeyCode::Enter => Some(sel),
+                _ => None,
+            };
+            match choice {
+                Some(WIZARD_DISCARD_SAVE) => {
+                    // Save behaves exactly as F2 does, refusals included: a
+                    // form F2 would reject is not quietly saved just because
+                    // the user arrived here via Esc. On refusal the prompt
+                    // closes and the wizard stays open on the offending cell.
+                    if let Some((field, tab, status)) = form.save_blocker() {
+                        self.status = Some(status);
+                        form.view_tab = tab;
+                        form.focus = field;
+                        form.confirm_discard = None;
+                        self.overlay = Some(Overlay::NewRequest(form));
+                    } else {
+                        self.submit_new_request(*form);
+                    }
+                    return;
+                }
+                Some(WIZARD_DISCARD_DISCARD) => {
+                    // Drop the form: leave the overlay closed and hand focus
+                    // back to wherever the wizard was opened from.
+                    self.focus = self.wizard_return_focus;
+                    return;
+                }
+                // "Keep editing", by Enter on the third choice.
+                Some(_) => form.confirm_discard = None,
+                None => match key.code {
+                    // All the app's choice popups wrap, and Tab/Shift+Tab walk
+                    // the row as well — a row of buttons is a form, and Tab is
+                    // how everyone expects to move through one.
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+                        form.confirm_discard =
+                            Some((sel + WIZARD_DISCARD_CHOICES - 1) % WIZARD_DISCARD_CHOICES);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                        form.confirm_discard = Some((sel + 1) % WIZARD_DISCARD_CHOICES);
+                    }
+                    // Esc backs out of the prompt, not the wizard: the reflex
+                    // that opened it must not also answer it, or holding Esc
+                    // would discard the form exactly as before.
+                    KeyCode::Esc => form.confirm_discard = None,
+                    _ => {}
+                },
+            }
+            self.overlay = Some(Overlay::NewRequest(form));
+            return;
+        }
         // The extract-to-parameter prompt is a modal over the wizard, not
         // another dropdown: while it is open every key belongs to it, so the
         // name being typed can contain anything a variable name can without
@@ -5963,22 +6643,25 @@ impl TuiApp {
             } else if ctype_open {
                 form.ctype_dropdown_hidden = true;
                 form.ctype_hi = None;
+            } else if form.is_dirty() {
+                // Esc used to throw the whole form away on one keypress, with
+                // no way back — the wizard has no autosave and F2 is the only
+                // thing that persists. Ask first, but only when there is
+                // something to lose: prompting on an untouched form would make
+                // Esc feel broken and train the user to dismiss the prompt
+                // without reading it.
+                form.confirm_discard = Some(WIZARD_DISCARD_DEFAULT);
             } else {
-                keep = false; // cancel the whole form
+                keep = false; // nothing typed — cancel the whole form
             }
         } else if submit {
-            // A request can't be saved without a URL — that's the one
-            // field `submit_new_request` bails on (silently discarding
-            // everything else the user typed). Every other section
-            // (headers/cookies/form fields/asserts/captures/body) is
-            // either dropped-if-empty or stored as-is and only checked
-            // at run time, so the URL is the sole save-time blocker.
-            // Keep the wizard open, jump focus to the URL field, and
-            // say why instead of closing on an empty URL.
-            if form.url.text().trim().is_empty() {
-                self.status = Some(Status::NewRequestUrlRequired);
-                form.focus = NewField::Url;
-                form.view_tab = WizardTab::All;
+            // Keep the wizard open and point at the offending cell rather than
+            // closing on a form that can't be saved — see `save_blocker` for
+            // what counts and why.
+            if let Some((field, tab, status)) = form.save_blocker() {
+                self.status = Some(status);
+                form.view_tab = tab;
+                form.focus = field;
             } else {
                 do_submit = true;
                 keep = false;
@@ -6165,6 +6848,19 @@ impl TuiApp {
             form.move_view_tab(key.code == KeyCode::Right);
         } else {
             match form.focus {
+                // The section-view tab bar. `[`/`]` already reach here (the bar
+                // isn't a text cell), and Left/Right do the same thing so the
+                // bar behaves like every other cycler in the form. Down or
+                // Enter drops into the section the bar is showing.
+                NewField::TabBar => match key.code {
+                    KeyCode::Left | KeyCode::Char('h') => form.cycle_view_tab(false),
+                    KeyCode::Right | KeyCode::Char('l') => form.cycle_view_tab(true),
+                    KeyCode::Down | KeyCode::Enter => {
+                        form.focus = form.first_field_of(form.view_tab);
+                    }
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
                 NewField::Method => match key.code {
                     KeyCode::Left | KeyCode::Char('h') => {
                         form.method_idx = (form.method_idx + METHODS.len() - 1) % METHODS.len();

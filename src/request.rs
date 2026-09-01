@@ -416,7 +416,7 @@ pub fn build_request_json(entry: &HurlEntry) -> String {
             pass: TextValue(pass.clone()),
             user: TextValue(user.clone()),
         }),
-        body: entry.body.as_deref().map(|raw| {
+        body: entry.body_src.as_deref().map(|raw| {
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
         }),
         cookies: rows_to_map(&entry.cookies),
@@ -450,7 +450,7 @@ pub fn apply_request_json(base: &HurlEntry, text: &str) -> Result<HurlEntry, Str
     entry.cookies = map_to_rows(dto.cookies);
     entry.queries = map_to_rows(dto.query_params);
     entry.form_fields = dto.form_fields.into_iter().map(FormField::from).collect();
-    entry.body = body;
+    entry.body_src = body;
     Ok(entry)
 }
 
@@ -520,7 +520,9 @@ pub fn resolve_entry(entry: &HurlEntry, vars: &HashMap<String, String>) -> Resol
         })
         .collect();
 
-    let body = entry.body.as_deref().map(|b| substitute(b, vars));
+    // Resolving builds the request that actually goes out, so the comments
+    // come off here and never reach the wire.
+    let body = entry.body_wire().as_deref().map(|b| substitute(b, vars));
     ResolvedRequest {
         method,
         url,
@@ -584,6 +586,9 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         .iter()
         .any(|form| form.kind.is_multipart());
     HurlEntry {
+        // Stamped when the collection adopts these entries as its baseline.
+        uid: 0,
+        unparsed: None,
         title: String::new(),
         method: resolved.method,
         url: resolved.url,
@@ -604,7 +609,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         // Per-request `[Options]` (retry, insecure, delay, …) genuinely affect
         // the run, so carry them through to the executed entry.
         options: base.options.clone(),
-        body: resolved.body,
+        body_src: resolved.body,
         expected_status: base.expected_status,
         // Expected response version/headers/body are real (implicit) asserts in
         // the source `.hurl`, so preserve them on the run entry too — dropping
@@ -751,6 +756,15 @@ pub fn run_resolved_entry(
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
     // `stage_out_of_scope_form_files` as a literal filename, fail to stage, and
     // then be rejected by Hurl's file sandbox when it finally did resolve.
+    // Text the file could not be read at has no method, URL or body to send.
+    // Handing it to the runner would produce a parse error naming a line
+    // number in a document the user never sees, so say what is actually wrong.
+    if base.is_unreadable() {
+        return RunOutput {
+            entries: vec![],
+            error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+        };
+    }
     let vars = effective_vars(base, vars);
     let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
@@ -776,6 +790,11 @@ pub fn run_resolved_entry(
     }
     out
 }
+
+/// Why a request that could not be read cannot be sent. Front-end agnostic, so
+/// the terminal, the GUI and the report interpreter all say the same thing.
+pub const UNREADABLE_REQUEST_ERROR: &str = "This request could not be read from the file, so there is nothing to send. \
+     Open it in Raw Mode (Shift+H) to repair the Hurl text.";
 
 /// Human-readable error for the one request shape that must never be sent: a
 /// `[Form]`/`[Multipart]` section together with a raw body.
@@ -913,7 +932,25 @@ pub fn run_all_entries(
         .as_ref()
         .and_then(|p| p.parent().map(std::path::PathBuf::from));
     let total = col.entries.len();
-    let mut run_entries = col.entries.clone();
+    // Requests the file could not be read at are skipped rather than sent.
+    // They are text, not requests, so there is nothing to send — and putting
+    // them in the run document would fail the *whole* run to parse, which is
+    // the all-or-nothing failure recovery exists to end. Their positions are
+    // kept so every result still lands on the request it came from.
+    let run_positions: Vec<usize> = col
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_unreadable())
+        .map(|(i, _)| i)
+        .collect();
+    if run_positions.is_empty() {
+        return None;
+    }
+    let mut run_entries: Vec<HurlEntry> = run_positions
+        .iter()
+        .map(|&i| col.entries[i].clone())
+        .collect();
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -956,14 +993,16 @@ pub fn run_all_entries(
             // queued message per frame, so the intermediate snapshots simply
             // supersede one another. (Cookies set by one request don't carry
             // to the next in this mode — the caller warns about that.)
-            let mut idx = 0usize;
+            // Hurl reports which request each outcome belongs to, and that is
+            // not the outcome's ordinal: `[Options] repeat`/`retry` make one
+            // request produce several. Trusting the ordinal slid every later
+            // result up and dropped the last one off the end.
             run_hurl_streaming(&content, &vars, run_root, |eo| {
-                if idx < total {
-                    results[idx] = Some(eo.ok);
+                if let Some(&at) = run_positions.get(eo.entry_index) {
+                    results[at] = Some(eo.ok);
                     captures.extend(eo.captures.iter().cloned());
-                    responses[idx] = Some(entry_response(eo));
+                    responses[at] = Some(entry_response(eo));
                 }
-                idx += 1;
                 let _ = tx.send(BatchRunUpdate {
                     col_id,
                     results: results.clone(),
@@ -1001,10 +1040,15 @@ pub fn run_all_entries(
         // vectors from the final result set and send a single update.
         // (Streaming already emitted its final cumulative snapshot above.)
         if batch {
-            for (i, eo) in out.entries.iter().enumerate().take(total) {
-                results[i] = Some(eo.ok);
+            for eo in out.entries.iter() {
+                // Keyed by the request Hurl says produced this outcome, not by
+                // the outcome's position: see the streaming path above.
+                let Some(&at) = run_positions.get(eo.entry_index) else {
+                    continue;
+                };
+                results[at] = Some(eo.ok);
                 captures.extend(eo.captures.iter().cloned());
-                responses[i] = Some(entry_response(eo));
+                responses[at] = Some(entry_response(eo));
             }
             let _ = tx.send(BatchRunUpdate {
                 col_id,
@@ -1095,8 +1139,10 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
         add(u);
         add(p);
     }
-    if let Some(body) = &entry.body {
-        add(body);
+    // A `{{ var }}` written inside a comment is never sent, so it doesn't
+    // count as a use of that variable.
+    if let Some(body) = entry.body_wire() {
+        add(&body);
     }
     keys
 }
@@ -1317,7 +1363,7 @@ mod tests {
                     desc: String::new(),
                 },
             ],
-            body: Some(r#"{"a":1}"#.into()),
+            body_src: Some(r#"{"a":1}"#.into()),
             ..Default::default()
         };
 
@@ -1373,7 +1419,7 @@ mod tests {
         );
         assert_eq!(back.form_fields.len(), 2);
         assert_eq!(back.form_fields[1].kind, FormFieldKind::File);
-        assert_eq!(back.body.as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert_eq!(back.body_src.as_deref(), Some("{\n  \"a\": 1\n}"));
     }
 
     #[test]
@@ -1809,7 +1855,7 @@ mod tests {
             title: "Bad One".into(),
             method: "POST".into(),
             url: "http://192.0.2.1/bad".into(),
-            body: Some("{}".into()),
+            body_src: Some("{}".into()),
             form_fields: vec![FormField {
                 key: "f".into(),
                 value: "v".into(),

@@ -515,6 +515,10 @@ fn var_editor(
                         )
                         .changed()
                         {
+                            // `.vars` is a line-per-variable format, so a
+                            // pasted multi-line secret has to be flattened
+                            // here rather than truncated on the way to disk.
+                            vars[i].value = crate::environment::flatten_value(&vars[i].value);
                             vars[i].raw = vars[i].value.clone();
                             vars[i].modified = true;
                             changed = true;

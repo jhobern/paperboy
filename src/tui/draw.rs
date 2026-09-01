@@ -157,6 +157,15 @@ enum LeftRow {
         /// it's visually obvious which collection the coloured requests belong
         /// to; other collections (and their request names) render dim.
         loaded: bool,
+        /// True when the file holds unsaved edits — either it is the loaded one
+        /// and that has been edited, or it was edited and then switched away
+        /// from, leaving its entries parked in `workspace_pending`.
+        ///
+        /// The parked case is the one that matters: a workspace tab shows one
+        /// file at a time, so edits to the others are invisible by
+        /// construction. The tab's own pencil says *something* is unsaved; this
+        /// says which file, which is the question that follows.
+        edited: bool,
     },
     Report {
         name: String,
@@ -181,6 +190,12 @@ enum LeftRow {
         name: String,
         method: String,
         depth: usize,
+        /// Whether this request of a *parked* collection has unsaved edits.
+        /// The loaded collection's requests are `LeftRow::Entry` and read their
+        /// markers straight off the entry; these come from the entries parked
+        /// in `workspace_pending`, which the cached names were snapshotted
+        /// from, so the indices line up.
+        edited: bool,
         /// How this request last fared. A run's result outlives the file being
         /// loaded (see [`crate::collection::RunRecord`]), so a request that was
         /// run and then switched away from still shows its tick here — it was
@@ -228,11 +243,13 @@ impl LeftRow {
                         open,
                     } => {
                         let loaded = col.path.as_deref() == Some(path.as_path());
+                        let edited = col.workspace_file_edited(&path);
                         LeftRow::Collection {
                             name,
                             depth,
                             open,
                             loaded,
+                            edited,
                         }
                     }
                     WsRow::Report { name, depth, .. } => LeftRow::Report { name, depth },
@@ -269,6 +286,7 @@ impl LeftRow {
                         name,
                         method,
                         depth,
+                        edited: col.workspace_request_edited(&collection, idx),
                         run: col.workspace_run_status(&collection, idx),
                     },
                 })
@@ -307,6 +325,31 @@ pub(crate) fn panel(title: String, focused: bool, th: &Theme) -> Block<'static> 
             Style::default().fg(th.text).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(th.panel))
+}
+
+/// Join `parts` — most important first — into a hint that fits on a bordered
+/// panel's top or bottom edge.
+///
+/// Ratatui clips a border title that doesn't fit, which cuts it mid-word ("g go
+/// to act") and reads as a rendering fault rather than a shortage of room.
+/// Dropping whole items from the end instead keeps whatever *is* shown
+/// readable: an undiscovered shortcut costs less than a hint the user can't
+/// parse, and the help overlay (`?`) is the complete list either way.
+///
+/// `width` is the panel's full width; the two border columns are taken off
+/// because the corners aren't text, plus one more so the hint never sits flush
+/// against the corner glyph.
+pub(crate) fn fit_border_hint(parts: &[String], sep: &str, width: u16) -> String {
+    let usable = width.saturating_sub(3) as usize;
+    let mut n = parts.len();
+    while n > 0 {
+        let joined = parts[..n].join(sep);
+        if joined.chars().count() <= usable {
+            return joined;
+        }
+        n -= 1;
+    }
+    String::new()
 }
 
 /// The width of a dialog's label column: the longest label plus a gap.
@@ -1713,14 +1756,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     draw_topbar(f, rows[1], app, &s, &th);
     draw_tabs(f, rows[2], app, &s, &th);
     draw_body(f, rows[3], app, &s, &th);
-    draw_footer(
-        f,
-        rows[4],
-        &s,
-        &th,
-        app.can_copy(),
-        app.focus == Pane::Response,
-    );
+    draw_footer(f, rows[4], app, &s, &th);
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
@@ -1885,6 +1921,28 @@ fn tab_icons(col: &crate::collection::Collection) -> String {
     icons
 }
 
+/// The trailing "unsaved" pencil for a collection tab, or an empty string.
+///
+/// Every other unsaved change in the terminal UI announces itself where it
+/// happened — a `✚` on an added request, a `✎` on an edited one, a `●` on a
+/// report tab — but a *structural* change (a request reordered, deleted or
+/// restored) belongs to no single request, so nothing on screen carried it. The
+/// quit prompt still counted it, which left the user told they had unsaved work
+/// and given nowhere to look for it. The tab is the right place: it is the unit
+/// that prompt talks about, and for a Workspace tab it is the only row that
+/// speaks for the files parked out of sight.
+///
+/// `unsaved_edit_count` rather than `has_unsaved_edits` for exactly that
+/// reason — a workspace holding edits in a file it isn't currently showing is
+/// still a tab that would lose something.
+fn tab_dirty_marker(col: &crate::collection::Collection, s: &Strings) -> String {
+    if col.unsaved_edit_count() > 0 {
+        format!(" {}", s.tab_unsaved_marker)
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     // A *standalone* report strip tab always keeps focus on its body (the tab
     // bar is never a focus stop), so its tab-bar highlight is never lit. An
@@ -1922,9 +1980,9 @@ pub(crate) fn draw_tabs(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
         // Workspace — only the Requests-list panel title below reflects
         // that (see `draw_collection_left`).
         let name = if i == 0 {
-            s.tab_request.to_string()
+            format!("{}{}", s.tab_request, tab_dirty_marker(col, s))
         } else {
-            format!("{}{}", tab_icons(col), col.name)
+            format!("{}{}{}", tab_icons(col), col.name, tab_dirty_marker(col, s))
         };
         let w = name.chars().count() + 2; // " {name} "
         if app.active_tab == i {
@@ -2077,6 +2135,18 @@ pub(crate) fn draw_collection_left(
     let col = &app.collections[ci];
     let view_rows = LeftRow::build(col);
     let sel = col.list_cursor.min(view_rows.len().saturating_sub(1));
+    // An active filter takes a one-line strip below the list, so it's obvious
+    // the list is being narrowed (and by what) rather than mysteriously short —
+    // the same treatment the Environments panel's filter gets. The strip is
+    // kept while typing even with an empty query, so `/` visibly does
+    // something before the first character is typed.
+    let filtering = !col.list_query.is_empty() || (app.list_filter_typing && focused);
+    let (list_area, filter_area) = if filtering {
+        let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(panes[0]);
+        (parts[0], Some(parts[1]))
+    } else {
+        (panes[0], None)
+    };
     // Classify every `{{ VAR }}` the requests reference so the list URLs can be
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
@@ -2086,7 +2156,7 @@ pub(crate) fn draw_collection_left(
     // rather than with a leftmost caret, so no column is reserved for one.
     // Recorded so h-scrolling can be clamped to stop once the URL's end is
     // visible (no blank overscroll).
-    let url_w = panes[0].width.saturating_sub(2 + 2 + 5);
+    let url_w = list_area.width.saturating_sub(2 + 2 + 5);
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -2146,6 +2216,7 @@ pub(crate) fn draw_collection_left(
                 depth,
                 open,
                 loaded,
+                edited,
             } => {
                 let indent = "  ".repeat(*depth);
                 let chevron = if *open {
@@ -2158,10 +2229,20 @@ pub(crate) fn draw_collection_left(
                 // focus; every other collection recedes to dim, matching its
                 // dim request names.
                 let colour = if *loaded { th.accent } else { th.dim };
-                ListItem::new(Line::from(Span::styled(
+                // The same pencil the requests use, in the same accent colour,
+                // trailing rather than leading: a leading mark would push the
+                // chevron out of the column its siblings line up in.
+                let mut spans = vec![Span::styled(
                     format!("{indent}{chevron} {name}"),
                     Style::default().fg(colour).add_modifier(Modifier::BOLD),
-                )))
+                )];
+                if *edited {
+                    spans.push(Span::styled(
+                        format!(" {}", s.tab_unsaved_marker),
+                        Style::default().fg(th.accent),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             }
             LeftRow::Report { name, depth } => {
                 let indent = "  ".repeat(*depth);
@@ -2187,11 +2268,25 @@ pub(crate) fn draw_collection_left(
                 name,
                 method,
                 depth,
+                edited,
                 run,
             } => {
                 let indent = "  ".repeat(*depth);
+                // The pencil takes the two-space pad that otherwise lines these
+                // names up under the loaded collection's, so a marked row keeps
+                // the same width as an unmarked one and the methods stay in
+                // their column.
+                let marker = if *edited {
+                    Span::styled(
+                        format!("{} ", s.tab_unsaved_marker),
+                        Style::default().fg(th.accent),
+                    )
+                } else {
+                    Span::raw("  ".to_string())
+                };
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{indent}  ")),
+                    Span::raw(indent),
+                    marker,
                     Span::styled(
                         format!("{method:<5}"),
                         Style::default()
@@ -2204,6 +2299,28 @@ pub(crate) fn draw_collection_left(
             }
             LeftRow::Entry { idx, depth } => {
                 let e = &col.entries[*idx];
+                // Text the file could not be read at is not a request: it has
+                // no method to colour and no URL to show. It gets a row of its
+                // own so it is visible and repairable rather than silently
+                // missing, and is marked so it is never mistaken for one that
+                // would actually send.
+                if e.is_unreadable() {
+                    let indent = "  ".repeat(*depth);
+                    let name = if e.title.trim().is_empty() {
+                        s.entry_unreadable.to_string()
+                    } else {
+                        e.title.trim().to_string()
+                    };
+                    return ListItem::new(Line::from(vec![
+                        Span::raw(indent),
+                        Span::styled("\u{26a0} ", Style::default().fg(th.err)),
+                        Span::styled(name, Style::default().fg(th.err)),
+                        Span::styled(
+                            format!(" [{}]", s.entry_unreadable),
+                            Style::default().fg(th.dim),
+                        ),
+                    ]));
+                }
                 // A plus marks a request the user added by hand (in a real
                 // collection); a pencil marks one edited away from its loaded
                 // state — matching the environment-panel convention.
@@ -2238,7 +2355,15 @@ pub(crate) fn draw_collection_left(
                 // those folders are already rows in the tree, so only the leaf
                 // segment (the request's own name within its folder) is shown
                 // here — never the redundant folder prefix.
-                let name = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                //
+                // Unless the list is filtered: that view is flat, with no
+                // folder rows left to supply the context, and two folders may
+                // well hold a `Login` apiece. Then the whole title is the name.
+                let name = if col.list_filter_active() {
+                    e.title.trim().to_string()
+                } else {
+                    crate::tree::entry_path(&e.title).pop().unwrap_or_default()
+                };
                 if !name.is_empty() {
                     spans.push(Span::styled(name, Style::default().fg(th.text)));
                     ListItem::new(Line::from(spans))
@@ -2282,6 +2407,21 @@ pub(crate) fn draw_collection_left(
                 s.workspace_empty_state.to_string(),
                 Style::default().fg(th.dim),
             ))]
+        } else if items.is_empty() && col.list_filter_active() {
+            // "The filter hid everything" and "this collection is empty" look
+            // identical otherwise, and have completely different fixes. Two
+            // rows rather than one sentence because a list row can't wrap, and
+            // the panel is narrow enough that one line would be cut in half.
+            vec![
+                ListItem::new(Line::styled(
+                    s.list_filter_no_matches.to_string(),
+                    Style::default().fg(th.dim),
+                )),
+                ListItem::new(Line::styled(
+                    s.list_filter_no_matches_hint.to_string(),
+                    Style::default().fg(th.dim),
+                )),
+            ]
         } else {
             items
         };
@@ -2319,15 +2459,12 @@ pub(crate) fn draw_collection_left(
         title.clone(),
         Style::default().fg(th.text).add_modifier(Modifier::BOLD),
     )];
-    let mut title_len = title.chars().count();
     if let Some(env) = col
         .linked_env_id
         .and_then(|id| app.global_envs.iter().find(|e| e.id == id))
     {
         let link_part = format!(" {LINK_ICON} ");
         let env_suffix = " (v)";
-        title_len +=
-            link_part.chars().count() + env.name.chars().count() + env_suffix.chars().count();
         title_spans.push(Span::styled(link_part, Style::default().fg(th.dim)));
         title_spans.push(Span::styled(
             env.name.clone(),
@@ -2335,40 +2472,43 @@ pub(crate) fn draw_collection_left(
         ));
         title_spans.push(Span::styled(env_suffix, Style::default().fg(th.dim)));
     }
-    // A brief "w to browse" reminder right in the title bar, next to the
-    // folder icon — new users are much more likely to notice it here than
-    // in the busier bottom-border hint line below. Only shown when it
-    // actually fits without the title overflowing the panel.
-    if col.workspace_root.is_some() {
-        let workspace_title_hint = format!(" · w {}", s.foot_workspace);
-        if title_len + workspace_title_hint.chars().count() < panes[0].width as usize {
-            title_spans.push(Span::styled(
-                workspace_title_hint,
-                Style::default().fg(th.dim),
-            ));
-        }
-    }
+    // The "w to browse" reminder used to be repeated here in the title bar as
+    // well, on the theory that new users would notice it sooner next to the
+    // folder icon. But the title already carries the collection name, the
+    // folder breadcrumb and any linked environment, so the hint was the first
+    // thing squeezed out — present for a short name, silently absent for a long
+    // one, which is worse than consistently living in one place. It now appears
+    // only on the bottom border below, where it competes with hints instead of
+    // with content.
     // Run/Run All hints live on this panel's bottom border (rather than the
     // global footer, which was getting overcrowded) since they act on
     // whichever collection is shown here regardless of which pane has focus.
     let run_key = if app.enhanced_keys { "^Enter/F5" } else { "F5" };
     let run_primary_hint = format!("{run_key} {}", s.foot_run);
-    let mut run_hint = format!("{run_primary_hint} \u{00b7} Alt+F5 {}", s.foot_run_all);
-    // Append the "p" link/unlink-environment hint too, but only when the
-    // panel is wide enough to actually show it without the bottom border
-    // text overflowing/wrapping onto the panel itself.
-    let link_hint = format!(" · p {}", s.foot_env_link);
-    if (run_hint.chars().count() + link_hint.chars().count()) < panes[0].width as usize {
-        run_hint.push_str(&link_hint);
-    }
-    // Same treatment for the Workspace-browse hint, shown only on tabs
-    // actually bound to a Workspace folder.
-    if col.workspace_root.is_some() {
-        let workspace_hint = format!(" · w {}", s.foot_workspace);
-        if (run_hint.chars().count() + workspace_hint.chars().count()) < panes[0].width as usize {
-            run_hint.push_str(&workspace_hint);
-        }
-    }
+    // In priority order: the last entry is the one dropped first when the panel
+    // is too narrow (see `fit_border_hint`). The Workspace-browse hint is not
+    // here — this border is only ~33 usable columns at the default panel width,
+    // which the two run hints alone very nearly fill, so `w` would be dropped
+    // in the common case. It lives in the footer instead (see `draw_footer`),
+    // which spans the terminal.
+    let hint_parts = [
+        run_primary_hint.clone(),
+        format!("Alt+F5 {}", s.foot_run_all),
+        format!("p {}", s.foot_env_link),
+    ];
+    let run_hint = fit_border_hint(&hint_parts, " \u{00b7} ", list_area.width);
+    // The "F5 run" words are clickable (see `MouseHitTarget::RunRequest`), so
+    // the hit region has to track whatever `fit_border_hint` actually kept: on
+    // a panel too narrow even for the run hint there is nothing on screen to
+    // click, and a region over blank border would be a trap.
+    let run_hit_w = if run_hint.starts_with(run_primary_hint.as_str()) {
+        (Line::from(run_primary_hint.clone())
+            .width()
+            .min(u16::MAX as usize) as u16)
+            .min(list_area.width.saturating_sub(2))
+    } else {
+        0
+    };
     // An unfocused border is structure, not text: `line` rather than `dim` so a
     // theme can quieten its panel edges without also dimming the words it uses
     // `dim` for (see `theme::Theme::line`).
@@ -2394,12 +2534,12 @@ pub(crate) fn draw_collection_left(
     };
     let list_offset =
         app.list_scroll
-            .render_ctx(f, panes[0], list, sel, view_rows.len(), ci as u64);
+            .render_ctx(f, list_area, list, sel, view_rows.len(), ci as u64);
     let list_inner = Rect {
-        x: panes[0].x.saturating_add(1),
-        y: panes[0].y.saturating_add(1),
-        width: panes[0].width.saturating_sub(2),
-        height: panes[0].height.saturating_sub(2),
+        x: list_area.x.saturating_add(1),
+        y: list_area.y.saturating_add(1),
+        width: list_area.width.saturating_sub(2),
+        height: list_area.height.saturating_sub(2),
     };
     app.push_mouse_hit(
         MouseLayer::Base,
@@ -2425,18 +2565,44 @@ pub(crate) fn draw_collection_left(
             MouseHitTarget::SelectListRow(row),
         );
     }
-    let run_hit_w = (Line::from(run_primary_hint).width().min(u16::MAX as usize) as u16)
-        .min(panes[0].width.saturating_sub(2));
     if run_hit_w > 0 {
         app.push_mouse_hit(
             MouseLayer::Base,
             Rect::new(
-                panes[0].x.saturating_add(1),
-                panes[0].y + panes[0].height.saturating_sub(1),
+                list_area.x.saturating_add(1),
+                list_area.y + list_area.height.saturating_sub(1),
                 run_hit_w,
                 1,
             ),
             MouseHitTarget::RunRequest,
+        );
+    }
+    if let Some(strip) = filter_area {
+        let mut spans = vec![
+            Span::styled(s.list_filter_label, Style::default().fg(th.dim)),
+            Span::styled(
+                col.list_query.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        // While typing, a block cursor marks where the next character lands —
+        // the strip is the only thing with focus, so without it there is no
+        // sign the keyboard is being captured.
+        if app.list_filter_typing && focused {
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(th.accent)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ));
+        }
+        // A filter that matches nothing leaves an empty list, which on its own
+        // reads as "this collection is empty" — the list itself says which of
+        // the two it is (see the empty-state rows above), so the strip only has
+        // to carry the query.
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
+            strip,
         );
     }
 
@@ -2501,7 +2667,14 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // The activate/deactivate hint lives on this panel's bottom border (same
     // convention as the Requests list's Run/Run All hint) since it acts on
     // whichever row is selected here, regardless of which pane has focus.
-    let mut activate_hint = format!("a {}  / {}", s.foot_env_activate, s.foot_env_filter);
+    //
+    // Built as a list in priority order and fitted to the border, because this
+    // hint had no width check at all: on a narrow panel ratatui simply clipped
+    // it, leaving "g go to act" hanging mid-word.
+    let mut hint_parts = vec![
+        format!("a {}", s.foot_env_activate),
+        format!("/ {}", s.foot_env_filter),
+    ];
     let source = app.effective_env_source();
     let source_label = match source {
         crate::env_panel::EnvSource::Both => s.env_source_all,
@@ -2512,7 +2685,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // is the one people want back most often. Announced only when something is
     // active, so the key is never advertised with nowhere to go.
     if app.active_env_id.is_some() {
-        activate_hint.push_str(&format!("  g {}", s.foot_env_goto_active));
+        hint_parts.push(format!("g {}", s.foot_env_goto_active));
     }
     let title = if app.has_workspace_env_source() {
         // The panel title says *which* source is showing, but nothing said the
@@ -2521,11 +2694,12 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
         // only when there is a workspace to switch between: with global
         // environments alone the key does nothing, and offering it would be a
         // false lead.
-        activate_hint.push_str(&format!("  o {}", s.foot_env_source));
+        hint_parts.push(format!("o {}", s.foot_env_source));
         format!("{} · {}", s.env_heading, source_label)
     } else {
         s.env_heading.to_string()
     };
+    let activate_hint = fit_border_hint(&hint_parts, "  ", area.width);
     let block = panel(title, focused, th)
         .title_bottom(Line::styled(activate_hint, Style::default().fg(th.dim)));
     let rows = app.env_rows();
@@ -2585,7 +2759,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     let show_source_strip =
         app.has_workspace_env_source() && source != crate::env_panel::EnvSource::Both;
     let (list_area, filter_area) =
-        if app.env_query.is_empty() && !app.env_filter_typing && !show_source_strip {
+        if app.env_query.is_empty() && !(app.env_filter_typing && focused) && !show_source_strip {
             (area, None)
         } else {
             let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
@@ -2713,7 +2887,10 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
                 Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ),
         ];
-        if app.env_filter_typing {
+        // Only while the panel actually holds the keyboard: the mode flag
+        // outlives a Tab away from here, and a cursor blinking in a pane that
+        // no longer captures keys advertises a capture that isn't happening.
+        if app.env_filter_typing && focused {
             spans.push(Span::styled(
                 "\u{2588}",
                 Style::default()
@@ -3400,6 +3577,18 @@ pub(crate) fn draw_collection_main(
             Style::default().fg(th.err),
         ));
     }
+    // Notes that came unstuck from their body are kept rather than deleted, so
+    // without a word here the only sign of it is comments that quietly stop
+    // following the body around.
+    if entry.stale_body_notes().is_some() {
+        top_lines.push(Line::styled(
+            s.body_notes_stale_hint.to_string(),
+            // The "not settled yet" orange rather than the error red: the file
+            // is perfectly valid and the request runs, it is only the notes
+            // that have come loose.
+            Style::default().fg(th.pending),
+        ));
+    }
     top_lines.push(if valid {
         Line::styled(
             format!("Enter {}", s.json_enter_to_edit),
@@ -3569,7 +3758,13 @@ pub(crate) fn draw_response(
     th: &Theme,
 ) {
     let focused = app.focus == Pane::Response;
-    let block = panel(s.response_heading.to_string(), focused, th);
+    // The section tabs live *in the panel's top border*, alongside the heading,
+    // rather than on a row of their own. The Response pane is routinely only
+    // three rows tall (at 80×24 with the default split it's exactly that), so a
+    // dedicated tab row would spend a third of the pane on chrome — and the
+    // border row is already being drawn regardless. It also makes them read
+    // more like tabs, sitting on the panel's edge.
+    let block = response_panel_block(app, focused, s, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -3585,7 +3780,7 @@ pub(crate) fn draw_response(
     let loading = entry
         .map(|e| e.last_run == RunStatus::Running)
         .unwrap_or(false);
-    let (status, status_text, body, error, asserts, duration) =
+    let (status, status_text, body, error, asserts, duration, headers) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
                 r.status,
@@ -3594,6 +3789,7 @@ pub(crate) fn draw_response(
                 r.error.clone(),
                 r.assert_results.clone(),
                 r.duration_ms,
+                r.headers.clone(),
             ),
             None => (
                 0,
@@ -3602,6 +3798,7 @@ pub(crate) fn draw_response(
                 String::new(),
                 Vec::new(),
                 None,
+                Vec::new(),
             ),
         };
 
@@ -3733,13 +3930,20 @@ pub(crate) fn draw_response(
         })
         .collect();
 
-    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 body row)
-    // · body (rest). A runner error that *isn't* already spelled out by a
-    // failed assert row — a failed `[Captures]`, a transport oddity that still
-    // returned a response — gets one error-coloured line so it isn't lost now
-    // that a non-empty error no longer replaces the whole response. When an
-    // assert failed (passed < total) that ✗ row already carries the reason, so
-    // the extra line would just be noise and is skipped.
+    // Layout: status (1) · error (0/1) · asserts (capped, keeping ≥1 content
+    // row) · section content (rest). The section tabs are on the top border
+    // (see `response_panel_block`), so they cost no rows here. A runner error
+    // that *isn't* already spelled out by a failed assert row — a failed
+    // `[Captures]`, a transport oddity that still returned a response — gets
+    // one error-coloured line so it isn't lost now that a non-empty error no
+    // longer replaces the whole response. When an assert failed (passed <
+    // total) that ✗ row already carries the reason, so the extra line would
+    // just be noise and is skipped.
+    //
+    // The status/error/assert rows sit above the section content, and outside
+    // the tabs, because they describe the response as a whole rather than any
+    // one section: the status of a request is as relevant while reading its
+    // headers as its body.
     let show_err_line = !error.is_empty() && passed == total;
     let err_h: u16 = u16::from(show_err_line);
     let assert_h =
@@ -3766,6 +3970,22 @@ pub(crate) fn draw_response(
         f.render_widget(Paragraph::new(assert_lines), rows[2]);
     }
 
+    // Feed whichever section is on view through the *same* selectable panel the
+    // body has always used, rather than giving headers a second, half-featured
+    // viewer: scrolling, the scrollbar, mouse drag-selection and `y`-copy all
+    // come along for free and behave identically in both sections.
+    let headers_text: Arc<str> = Arc::from(
+        headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let (content, empty_note) = match app.response_section {
+        ResponseSection::Body => (body.clone(), s.resp_empty_body),
+        ResponseSection::Headers => (headers_text, s.resp_no_headers),
+    };
+
     // Wrap long lines to the body width and clamp scrolling so the user can't
     // scroll past the last line into blank space. The panel caches the
     // wrap/line structure (`set_content` → `rebuild_if_needed`) and reuses it
@@ -3780,13 +4000,17 @@ pub(crate) fn draw_response(
     // Compact view (toggled with `c`) shortens long string literals for
     // skimming. It's display-only: cache the full body so a whole-panel
     // `y`-copy still returns the untruncated text (see `whole_panel_text`).
-    if app.response_compact {
-        app.resp_full_body = body.clone();
-        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&body);
+    // Body-only — `c` is refused in the other sections, and leaving
+    // `resp_full_body`/`resp_compact_line_maps` empty here is what makes the
+    // copy paths fall back to the panel's own text (see
+    // `resp_full_selected_parts`).
+    if app.response_compact && app.response_section == ResponseSection::Body {
+        app.resp_full_body = content.clone();
+        let (compacted, line_maps) = crate::shared_utils::compact_long_strings_mapped(&content);
         app.resp_compact_line_maps = line_maps;
         app.resp_panel.set_content(Arc::from(compacted), width);
     } else {
-        app.resp_panel.set_content(body.clone(), width);
+        app.resp_panel.set_content(content.clone(), width);
     }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
@@ -3842,41 +4066,205 @@ pub(crate) fn draw_response(
         Paragraph::new(visible_wrapped).style(Style::default().fg(th.text)),
         body_area,
     );
+    // A section with nothing in it — a 204 or a bare error status with no body,
+    // a response that carried no headers — would otherwise leave the pane
+    // completely blank, indistinguishable from PaperBoy having lost the
+    // content. Say so instead. Drawn over the panel rather than through it so
+    // the note is never mouse-selectable or picked up by a whole-panel
+    // `y`-copy: it isn't part of the response.
+    if content.trim().is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                empty_note.to_string(),
+                Style::default().fg(th.dim),
+            )),
+            body_area,
+        );
+    }
 }
 
-pub(crate) fn draw_footer(
-    f: &mut Frame,
-    area: Rect,
-    s: &Strings,
-    th: &Theme,
-    can_copy: bool,
-    can_compact: bool,
-) {
+/// Build the Response panel's block, with the section tabs (`Body │ Headers`)
+/// rendered into the top border next to the heading.
+///
+/// The tabs go on the border rather than on a row of their own because the
+/// Response pane is often only two or three rows tall, and chrome that eats a
+/// third of the content is worse than no chrome — the border is drawn either
+/// way, so this is free.
+///
+/// Stepped with `i` / `Shift+I` while the Response pane holds focus —
+/// deliberately not `[`/`]` or Ctrl+Left/Right, both of which mean
+/// "previous/next collection tab" from *every* pane and would become
+/// focus-dependent if they were reused here (the collection tab bar stays on
+/// screen just above this one, so there'd be no telling which a press was aimed
+/// at). While the pane is unfocused the active tab is shown in plain accent
+/// rather than reverse video, so it still says which section is on view without
+/// implying the keys will reach it from wherever the cursor actually is.
+fn response_panel_block(app: &TuiApp, focused: bool, s: &Strings, th: &Theme) -> Block<'static> {
+    let border = if focused { th.accent } else { th.line };
+    let mut spans = vec![
+        Span::styled(
+            s.response_heading.to_string(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().fg(border)),
+    ];
+    for sec in ResponseSection::ALL {
+        let style = if sec == app.response_section && focused {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if sec == app.response_section {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.dim)
+        };
+        spans.push(Span::styled(format!(" {} ", sec.label(s)), style));
+    }
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(spans))
+        .style(Style::default().bg(th.panel))
+}
+
+pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
     // Run/Run All (F5 / Alt+F5) now live on the Collections panel's bottom
     // border (see draw_collection_left), and the base-URL row above already
     // shows its own "b" hint — kept out of here to leave room for the rest.
+    //
+    // `↑↓ move` and `Enter edit` used to lead this row and have been dropped:
+    // arrow keys moving a highlight and Enter opening the highlighted thing are
+    // the two most universal conventions in any list UI, so spending a third of
+    // a single-line footer restating them crowded out the hints that are
+    // genuinely PaperBoy-specific and were being truncated off the end at 80
+    // columns.
+    // The invariant hints lead the row and never move: Tab/?/q/n are present in
+    // every pane and every state, so anything that shifted them — changing tab,
+    // moving focus, painting a selection — made four fixed landmarks appear to
+    // jump about. Everything context-dependent is appended after them, where it
+    // can come and go without disturbing what the eye has already learned to
+    // find on the left.
     let mut hint = vec![
         format!("Tab {}", s.foot_focus),
-        format!("↑↓ {}", s.foot_move),
-        format!("Enter {}", s.foot_edit),
+        format!("? {}", s.foot_help),
+        format!("q {}", s.foot_quit),
         format!("n {}", s.foot_new),
-        format!("F2 {}", s.foot_rename),
-        format!("x {}", s.foot_close),
     ];
+    // F2 renames whatever the focused pane is about — the active tab from the
+    // tab bar, the selected environment in the Environments panel — and, like
+    // `x`, does nothing elsewhere, so it's only advertised where it bites.
+    let can_rename = match app.focus {
+        Pane::Tabs => app.active_tab != 0,
+        Pane::GlobalEnv => !app.env_rows().is_empty(),
+        _ => false,
+    };
+    if can_rename {
+        hint.push(format!("F2 {}", s.foot_rename));
+    }
+    // `x` deletes whatever the focused pane is about — a request, an
+    // environment, or the active tab from the tab bar — and does nothing at
+    // all in the Main/Response panes, so it's only advertised where it bites.
+    let can_delete = match app.focus {
+        Pane::Tabs => app.active_tab != 0,
+        Pane::List => true,
+        Pane::GlobalEnv => !app.env_rows().is_empty(),
+        _ => false,
+    };
+    if can_delete {
+        hint.push(format!("x {}", s.foot_close));
+    }
     // Only shown while `y` would actually do something — the rest of the
     // footer is a fixed set of always-available shortcuts, but `y` copies
     // either the active selection or, with none, the whole Request JSON /
     // Response panel that currently has focus (see `TuiApp::can_copy`).
-    if can_copy {
+    if app.can_copy() {
         hint.push(format!("y {}", s.foot_copy_selection));
     }
     // `c` toggles the Response body's compact overview — only meaningful (and
-    // only shown) while the Response pane holds focus.
-    if can_compact {
+    // only shown) while the Response pane holds focus, on the Body section.
+    if app.focus == Pane::Response && app.response_section == ResponseSection::Body {
         hint.push(format!("c {}", s.foot_compact));
     }
-    hint.push(format!("? {}", s.foot_help));
-    hint.push(format!("q {}", s.foot_quit));
+    // `i` steps the Response section tabs — likewise only meaningful (and only
+    // shown) while the Response pane holds focus.
+    if app.focus == Pane::Response {
+        hint.push(format!("i {}", s.foot_response_section));
+    }
+    // `c` duplicates the highlighted request — but only where there is a
+    // request under the cursor to duplicate; on a folder or "up" row it does
+    // nothing, and on a Workspace tab it opens the destination picker instead
+    // (advertised in the help overlay, since it needs more words than a footer
+    // slot allows).
+    if app.focus == Pane::List
+        && app.collections.get(app.active_tab).is_some_and(|c| {
+            !c.is_workspace()
+                && matches!(
+                    c.rows().get(c.list_cursor),
+                    Some(crate::tree::Row::Entry(_))
+                )
+        })
+    {
+        hint.push(format!("c {}", s.foot_duplicate));
+    }
+    // On a Workspace tab `c` means something else again — copy the highlighted
+    // request into another collection file in the workspace — and the branch
+    // above deliberately skips it. That left the workspace meaning advertised
+    // nowhere but the help overlay, even though it is the one place `c` reaches
+    // outside the open collection, so it gets its own hint with its own wording
+    // rather than borrowing "duplicate", which is not what it does.
+    if app.focus == Pane::List
+        && app
+            .collections
+            .get(app.active_tab)
+            .is_some_and(|c| c.ws_transfer_target().is_some())
+    {
+        hint.push(format!("c {}", s.foot_copy_request));
+    }
+    // Alt+arrows reorder the highlighted request, and the order is what Run
+    // All follows — worth advertising, since nothing else on screen says the
+    // list order means anything. Only shown when there is more than one
+    // request, since a single one has nowhere to go.
+    if app.focus == Pane::List
+        && app.collections.get(app.active_tab).is_some_and(|c| {
+            c.entries.len() > 1
+                && !c.list_filter_active()
+                && matches!(
+                    c.rows().get(c.list_cursor),
+                    Some(crate::tree::Row::Entry(_))
+                )
+        })
+    {
+        hint.push(format!("Alt+\u{2191}\u{2193} {}", s.foot_reorder));
+    }
+    // `/` finds a request anywhere in the collection, not just in the folder
+    // being browsed — which is the part worth advertising, since the list
+    // otherwise shows one folder at a time. On a Workspace tab it searches the
+    // whole tree instead (files, reports, environments, and the requests of the
+    // collections already open). Not offered while the filter is already up,
+    // where Esc is the key that matters.
+    if app.focus == Pane::List
+        && app
+            .collections
+            .get(app.active_tab)
+            .is_some_and(|c| c.list_query.is_empty() && (c.is_workspace() || c.entries.len() > 1))
+    {
+        hint.push(format!("/ {}", s.foot_find_request));
+    }
+    // `w` opens the workspace tree, and only Workspace-bound tabs have one.
+    //
+    // This used to sit beside the collection name on the Requests panel's
+    // title, where it was shown only if the name left room for it — so on a
+    // long workspace name it vanished, with nothing to say why. The footer runs
+    // the width of the terminal and is where every other pane-independent
+    // shortcut already is, so the hint has somewhere to be seen.
+    if app
+        .collections
+        .get(app.active_tab)
+        .is_some_and(|c| c.workspace_root.is_some())
+    {
+        hint.push(format!("w {}", s.foot_workspace));
+    }
     let hint = hint.join(" · ");
     f.render_widget(
         Paragraph::new(Line::styled(hint, Style::default().fg(th.dim)))
@@ -4051,6 +4439,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 mark(app.confirm_on_delete_env),
                 s.pref_item_confirm_delete_env
             );
+            let delete_request_item = format!(
+                "{} {}",
+                mark(app.confirm_on_delete_request),
+                s.pref_item_confirm_delete_request
+            );
             let view_label = match app.default_request_view {
                 request::RequestView::Json => "JSON",
                 request::RequestView::Hurl => "Hurl",
@@ -4070,6 +4463,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 exit_item.as_str(),
                 clear_item.as_str(),
                 delete_env_item.as_str(),
+                delete_request_item.as_str(),
                 always_save_item.as_str(),
                 run_all_batch_item.as_str(),
                 view_item.as_str(),
@@ -4109,6 +4503,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     s.confirm_overwrite_q.replace("{f}", &name)
                 }
                 ConfirmAction::DeleteEnv(_) => s.env_delete_confirm.to_string(),
+                ConfirmAction::DeleteRequest => s.request_delete_confirm.to_string(),
                 ConfirmAction::RevertWorkspaceFile(_, path) => {
                     let name = path
                         .file_name()
@@ -4248,7 +4643,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("[ / ], PgUp/PgDn, ^\u{2190}/\u{2192}", s.help_prev_next_tab),
                             ("F2 / x", s.help_rename_close),
-                            ("^W / u", s.help_tab_manage),
+                            ("^W / u (Tab bar)", s.help_tab_manage),
                             ("^Shift+\u{2190} \u{2192}", s.help_tab_reorder),
                         ],
                     ),
@@ -4273,12 +4668,19 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
+                            ("c (List pane)", s.help_duplicate_request),
+                            (
+                                "Alt+\u{2191} / Alt+\u{2193} (List pane)",
+                                s.help_reorder_request,
+                            ),
+                            ("/ (List pane)", s.help_find_request),
                         ],
                     ),
                     (
                         s.help_group_menus,
                         &[
                             ("f / s", s.help_menus),
+                            ("Ctrl+S", s.help_save_active),
                             ("\u{2190} / \u{2192} (File menu)", s.help_menu_submenu_nav),
                             ("w", s.help_workspace_browse),
                             ("\u{2192} / Enter (Workspace)", s.help_workspace_open),
@@ -4312,7 +4714,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         &[
                             ("", s.help_row_toggle_delete),
                             ("y", s.help_copy_selection),
+                            ("Ctrl+C", s.help_ctrl_c),
                             ("c (Response pane)", s.help_compact),
+                            ("i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],
@@ -4331,7 +4735,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Tab / Shift+Tab (report)", s.help_report_focus_cycle),
                             ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                             ("/ (report)", s.help_report_filter),
-                            ("Ctrl+S (report)", s.help_report_export),
+                            ("Ctrl+E (report)", s.help_report_export),
                             ("Ctrl+O (report)", s.help_report_open_export),
                             ("B (report)", s.help_report_baseline),
                             ("c (report)", s.help_report_columns),
@@ -4348,7 +4752,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("+ / -", s.help_resize),
                             ("< / >", s.help_resize_width),
                             ("Esc", s.help_cancel),
-                            ("q, ^C", s.help_quit),
+                            ("q / Esc", s.help_quit),
                         ],
                     ),
                 ];
@@ -4549,7 +4953,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         ("Tab / Shift+Tab", s.help_report_focus_cycle),
                         ("↑↓ / Enter (ws tree)", s.help_report_workspace_tree),
                         ("/", s.help_report_filter),
-                        ("Ctrl+S", s.help_report_export),
+                        ("Ctrl+E", s.help_report_export),
                         ("Ctrl+O", s.help_report_open_export),
                         ("B", s.help_report_baseline),
                         ("c", s.help_report_columns),
@@ -4781,7 +5185,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // long titles (e.g. the workspace "New report (path relative to
             // workspace)" prompt — longer still in other languages) were being
             // clipped by the panel border on the fixed-width single-line box.
-            let mut hint = if matches!(kind, PromptKind::Raw(_)) {
+            let mut hint = if matches!(kind, PromptKind::Raw { .. }) {
                 format!("{title}  ({})", s.raw_mode_hint)
             } else if matches!(kind, PromptKind::RawJson(_)) {
                 format!("{title}  ({})", s.raw_json_hint)
@@ -4864,12 +5268,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             // this Rect for every other prompt kind would be harmless but
             // meaningless, so it's scoped to the two cases that actually
             // hit-test against it.
-            app.prompt_editor_area = if matches!(kind, PromptKind::Raw(_) | PromptKind::RawJson(_))
-            {
-                editor_area
-            } else {
-                Rect::default()
-            };
+            app.prompt_editor_area =
+                if matches!(kind, PromptKind::Raw { .. } | PromptKind::RawJson(_)) {
+                    editor_area
+                } else {
+                    Rect::default()
+                };
             app.push_mouse_hit(
                 MouseLayer::Overlay,
                 editor_area,
@@ -5054,6 +5458,26 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 s.ws_switch_unsaved_cancel,
             ];
             draw_confirm_popup(f, s.ws_switch_unsaved_q, &choices, *sel, th, Some(app));
+        }
+        Overlay::StaleBodyNotes { ci, ei, sel } => {
+            // The first choice is spelled differently when the notes can't be
+            // taken back, so the reason is on the choice itself rather than
+            // left for the user to discover by picking it.
+            let adopt = app
+                .collections
+                .get(*ci)
+                .and_then(|c| c.entries.get(*ei))
+                .is_some_and(|e| e.can_adopt_body_notes());
+            let choices = [
+                if adopt {
+                    s.notes_stale_adopt
+                } else {
+                    s.notes_stale_adopt_blocked
+                },
+                s.notes_stale_discard,
+                s.notes_stale_cancel,
+            ];
+            draw_confirm_popup(f, s.notes_stale_title, &choices, *sel, th, Some(app));
         }
         // Handled by the early-return above — unreachable in practice.
         Overlay::ReportCellPopup { .. } => unreachable!("ReportCellPopup is drawn above"),

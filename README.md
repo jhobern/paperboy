@@ -11,8 +11,9 @@ It ships as a single binary with three front-ends:
 - **Terminal UI** (default) — a full interactive client for building,
   editing, running and organizing requests.
 - **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
-  with the same features and layout as the terminal UI, using mouse gestures
-  (drag to resize panels, click to switch tabs) instead of shortcuts. Opt-in at
+  with the same features and layout as the terminal UI, adding mouse gestures
+  (drag to resize panels, click to switch tabs) alongside keyboard navigation
+  and an F1 shortcuts overlay. Opt-in at
   build time via the `gui` Cargo feature, since it more than doubles the
   dependency tree.
 - **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
@@ -37,9 +38,29 @@ git-remote workflows behave identically across them.
 ## Installing & running
 
 ```sh
-cargo install paperboy                 # terminal UI + headless runner
-cargo install paperboy --features gui  # …and the graphical UI
+cargo install paperboy --locked                 # terminal UI + headless runner
+cargo install paperboy --locked --features gui  # …and the graphical UI
 ```
+
+`--locked` is a deliberate recommendation, not a workaround. It builds the exact
+dependency versions PaperBoy was published and tested against, from the lockfile
+shipped inside the package, instead of letting Cargo re-resolve every transitive
+dependency to whatever is newest at install time. That makes the build
+reproducible, and it means a freshly published — or freshly compromised —
+semver-compatible release of some crate five levels down doesn't silently end up
+in your binary.
+
+The trade-off is the honest one: pinned dependencies don't pick up their own
+patch releases either, security fixes included, so the pin is only as current as
+the last PaperBoy release. Dropping `--locked` is a reasonable choice if you'd
+rather have the newer transitive versions.
+
+This isn't hypothetical. `arrayref` — a transitive dependency of `winit`, and so
+of the GUI — had releases yanked on 2026-08-20 following a supply-chain attack on
+the crate (since resolved). While the yank stood, a plain `cargo install
+paperboy` failed outright on `arrayref = "^0.3.6"` while `--locked` kept
+building. Note that it took the terminal-only build down with it: Cargo resolves
+optional dependencies whether or not the feature enabling them is switched on.
 
 The graphical UI is behind the `gui` feature because it pulls in
 eframe/winit/wgpu — roughly twice as many crates as everything else combined —
@@ -78,10 +99,11 @@ cargo build --release
 - **Edit Request wizard**: pressing `Enter` on a request opens the same
   form used for "New Request", prefilled with its current method, URL,
   headers, cookies, body, form fields, `[Captures]`, and `[Asserts]` — no
-  manual JSON or Hurl syntax required. `Shift+R` opens **Raw Mode** instead,
-  a direct editor for the request's real Hurl text (for anything the form
-  doesn't expose, such as query params, Basic Auth, or the expected
-  status); saving reparses the text and applies it back to the request,
+  manual JSON or Hurl syntax required. The expected response status is one of
+  those asserts (`status == 200`), so it can be changed or removed there like
+  any other. `Shift+R` opens **Raw Mode** instead, a direct editor for the
+  request's real Hurl text (for anything the form doesn't expose, such as
+  Basic Auth); saving reparses the text and applies it back to the request,
   keeping invalid text open for correction rather than discarding it.
 - **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
   add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
@@ -223,9 +245,38 @@ What changes is how you interact with it:
 
 - **Tab** cycles the focused panel in the same order as the terminal UI
   (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
-  backwards — so the muscle memory carries over.
+  backwards.
+- **The focused request list is keyboard-driven.** With the Requests panel
+  focused, the **arrow keys** move the selection (**Home**/**End** jump to the
+  first/last request), **Enter** runs it, **F2** renames it and **Delete**
+  deletes it (asking first unless you turn the *Confirm deleting a request*
+  preference off; **Ctrl+Z** undoes the deletion). A Workspace tab's list is a
+  filesystem tree of mixed row kinds rather than a flat request list, so it has
+  a keyboard of its own: the same up/down/Home/End/Enter/F2/Delete, plus
+  **Right**/**Left** to expand and collapse folders and collections (or step in
+  to a child and out to a parent), and **PageUp**/**PageDown** to move ten rows
+  at a time. Each key does exactly what the mouse does on that row kind, and a
+  keyboard cursor — a quiet focus outline, distinct from the highlight on the
+  loaded file — follows the arrows and jumps to whichever row you click.
+- **Most single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
+  `n`, `b`, `x`, `u` and `m`/`c` are terminal-only: in a desktop window those
+  keys are text you are typing, so the same actions live on the menus, the
+  toolbar and the right-click menus instead (the arrow-key list navigation above
+  covers select/run/rename/delete). What the keyboard *does* do globally is
+  **F5** or **Ctrl+Enter** (run the request), **Ctrl+S** / **Ctrl+Shift+S**
+  (save / save as), **Ctrl+W** (close the tab), **Ctrl+Z** (undo delete
+  request), **Alt+F** (open the File menu) and **F1** (the shortcuts overlay).
+- **Press F1** — or use **Help ▸ Keyboard Shortcuts** — for a grouped overlay
+  of every GUI shortcut, the graphical counterpart to the terminal UI's `?`/`F1`
+  help. Menu items that have a shortcut show it next to their name.
 - **Panels are resized by dragging** their splitters, rather than with keyboard
   shortcuts.
+- **Results columns are resized by dragging** the border between two header
+  cells (double-click it to hand the column back to the automatic fit). A
+  hand-set column keeps exactly the width you gave it while the rest go on
+  sharing what is left, and pinning columns wider than the window scrolls the
+  table sideways rather than crushing the others. The widths last as long as the
+  report keeps producing the same columns.
 - **Selection, scrolling and the clipboard** use the platform's native
   handling; **collection tabs switch by clicking**; folders collapse/expand by
   clicking their header.
@@ -553,7 +604,10 @@ triggers a load attempt for it, same as on initial file load.
 
 ## Keyboard shortcuts
 
-Open the in-app help overlay any time with `?` or `F1` for the full,
+These are the **terminal UI's** keys; the graphical front-end uses menus for
+most of them, plus arrow-key navigation in the focused request list and an
+**F1** shortcuts overlay of its own (see [Graphical UI](#graphical-ui)). Open
+the terminal UI's in-app help overlay any time with `?` or `F1` for the full,
 up-to-date list. Highlights:
 
 | Key | Action |
@@ -573,15 +627,20 @@ up-to-date list. Highlights:
 | `n` | New request (List/Response/Tabs panes) — or add environment variable (Env pane) |
 | `b` | Set the base URL |
 | `f` / `s` | File menu / Settings menu |
+| `/` (other panes) | Filter the Global Environment list |
+| `Ctrl+S` | Save what's on screen back to its own file — the open report if there is one, otherwise the active collection (falls back to "Save As" when it has never been written anywhere) |
 | `[` / `]`, `Ctrl+←`/`→` | Previous / next tab |
 | `PageUp`/`PageDown` | Previous / next tab (same as `[`/`]`) |
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |
-| `x` | Delete request / close collection tab |
+| `x` | Delete request / close collection tab (deleting a request asks first; the confirmation can be turned off in Preferences, and `u` undoes it either way) |
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
 | `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
 | `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |
+| `c` (Requests list) | Duplicate the selected request in place, giving the copy a name of its own |
+| `/` (Requests list) | Find a request anywhere in the collection, not just the folder being browsed — on a Workspace tab it searches the whole tree (files, reports, environments, and the requests of collections already open). `Esc` clears it |
+| `Alt+↑`/`↓` (Requests list) | Move the selected request up / down. The order is what `Alt+F5` and the CLI follow. A request only moves within its own collection and folder, and the list must be unfiltered so the move can be seen |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
 | `+` / `-` | Grow / shrink the response pane |
 | `<` / `>` | Grow / shrink the left column |

@@ -99,6 +99,41 @@ pub enum Dialog {
         entry: Option<usize>,
         name: String,
     },
+    /// Confirm deleting a request (context menu or the Delete key). Gated on the
+    /// `confirm_on_delete_request` preference; the delete itself stays undoable,
+    /// so the prompt is a guard against a stray keypress, not a point of no
+    /// return. `idx` is the entry's position in `collections[ci].entries`.
+    ConfirmDeleteRequest { ci: usize, idx: usize, name: String },
+    /// Confirm deleting a workspace file or folder *from disk*.
+    ///
+    /// Always shown — it deliberately ignores the `confirm_on_delete_request`
+    /// preference, because that preference guards an *undoable* request delete
+    /// (Ctrl+Z brings it back), whereas removing a file or a whole folder from
+    /// disk has no undo at all. `file_count` is how many files a folder delete
+    /// would take (`1` for a file), so the prompt can say how much is at stake;
+    /// `unsaved` warns that in-memory edits under the item would be lost with
+    /// it.
+    DeleteWorkspaceItem {
+        ci: usize,
+        path: std::path::PathBuf,
+        is_dir: bool,
+        name: String,
+        file_count: usize,
+        unsaved: bool,
+    },
+    /// Confirm a "Run All" that would fire requests which may change server
+    /// state. Only raised when the collection holds at least one non-GET
+    /// request; a read-only collection runs with no friction. `total` is how
+    /// many requests will run, `non_get` how many of them are not GET.
+    ConfirmRunAll {
+        ci: usize,
+        total: usize,
+        non_get: usize,
+    },
+    /// The F1 keyboard-shortcuts overlay. Carries no state — its content is
+    /// derived from the shortcuts that exist — and is dismissed with Escape or
+    /// its close button like any other modal.
+    Shortcuts,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,8 +169,23 @@ pub enum SaveKind {
 
 #[derive(Clone)]
 pub enum RenameTarget {
-    Request { ci: usize, idx: usize },
-    Tab { ci: usize },
+    Request {
+        ci: usize,
+        idx: usize,
+    },
+    Tab {
+        ci: usize,
+    },
+    /// A workspace file or folder — its own name on disk, not a request inside
+    /// it. Reuses the rename dialog but is applied through the workspace's own
+    /// rename (a filesystem rename plus repointing everything that held the old
+    /// path), rather than by editing an in-memory title. The item's kind isn't
+    /// carried: renaming reads it off disk, and the dialog looks the same for a
+    /// file or a folder.
+    WorkspaceItem {
+        ci: usize,
+        path: std::path::PathBuf,
+    },
 }
 
 // Not `Copy`: `NewWorkspaceFolder` carries the folder the new one goes inside.
@@ -202,6 +252,12 @@ pub struct GuiApp {
     /// row that was clicked is nowhere near the panel that ends up holding it.
     /// Cleared once the panel has had its chance to honour it.
     pub reveal_env: Option<u64>,
+    /// Set when the Requests list's selection was moved by the keyboard, asking
+    /// the next render to scroll the newly selected row into view. One-shot:
+    /// cleared the frame the list honours it, so a later manual scroll isn't
+    /// yanked back. A keyboard move can land on a row that is off-screen (a long
+    /// collection, or a jump to first/last), where a mouse click never can.
+    pub reveal_selected: bool,
     /// Filter text for the Environments panel's search box (a case-insensitive
     /// substring of the environment name). Runtime-only, like the terminal
     /// UI's — a filter is a way of finding something now, not a setting.
@@ -320,6 +376,7 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            reveal_selected: false,
             env_query: String::new(),
             dialog: None,
             pending_pick: None,
@@ -358,6 +415,7 @@ impl GuiApp {
             response_section: ResponseSection::Body,
             response_compact: false,
             reveal_env: None,
+            reveal_selected: false,
             env_query: String::new(),
             dialog: None,
             pending_pick: None,
@@ -691,6 +749,90 @@ impl GuiApp {
         self.session.save();
     }
 
+    /// Run every request of collection `ci` ("Run All"), asking first when the
+    /// collection holds any non-GET request. A read-only (all-GET) collection
+    /// runs with no friction; anything that might change server state raises a
+    /// confirmation that says how many requests will run and how many of them
+    /// are not GET, so double-click-to-send isn't the only thing standing
+    /// between a stray click and a collection full of writes.
+    pub fn request_run_all(&mut self, ci: usize) {
+        let (total, non_get) = self
+            .session
+            .collections
+            .get(ci)
+            .map(|c| super::requests::run_all_confirm_counts(&c.entries))
+            .unwrap_or((0, 0));
+        if non_get == 0 {
+            self.session.run_all_entries(ci);
+        } else {
+            self.dialog = Some(Dialog::ConfirmRunAll { ci, total, non_get });
+        }
+    }
+
+    /// Reopen the most recently deleted request in the active collection (Edit
+    /// ▸ Undo Delete Request), selecting it once it's back. Shares its history
+    /// and 20-entry cap with the terminal UI's `u` — see
+    /// [`crate::collection::Collection::restore_last_deleted`] — so a request
+    /// deleted from either front-end can be brought back from either.
+    pub fn undo_delete_request(&mut self) {
+        let ci = self.active_ci();
+        let col = &mut self.session.collections[ci];
+        let Some(idx) = col.restore_last_deleted() else {
+            return;
+        };
+        col.selected_entry = idx;
+        col.invalidate_request_json();
+        self.session.save();
+    }
+
+    /// Delete request `idx` of collection `ci`, honouring the
+    /// `confirm_on_delete_request` preference: raise the confirmation when it is
+    /// on, delete straight away when it is off. Every GUI delete path (the row's
+    /// context menu and the Requests-panel Delete key) goes through here so the
+    /// preference can't be respected by one and skipped by the other.
+    pub fn request_delete_request(&mut self, ci: usize, idx: usize) {
+        if self.session.confirm_on_delete_request {
+            let name = self.entry_display_name(ci, idx);
+            self.dialog = Some(Dialog::ConfirmDeleteRequest { ci, idx, name });
+        } else {
+            self.delete_request_now(ci, idx);
+        }
+    }
+
+    /// Remove request `idx` of collection `ci`, recording it for Undo Delete
+    /// Request, and keep the selection in range. The one place the actual
+    /// deletion happens, so the confirmed and unconfirmed paths behave alike.
+    pub fn delete_request_now(&mut self, ci: usize, idx: usize) {
+        let Some(col) = self.session.collections.get_mut(ci) else {
+            return;
+        };
+        if col.remove_entry_recording_undo(idx).is_some() {
+            if col.selected_entry >= col.entries.len() {
+                col.selected_entry = col.entries.len().saturating_sub(1);
+            }
+            col.invalidate_request_json();
+            self.session.save();
+        }
+    }
+
+    /// The name to show for request `idx` of collection `ci` in a prompt: its
+    /// leaf title, or its URL when it has no title yet.
+    fn entry_display_name(&self, ci: usize, idx: usize) -> String {
+        self.session
+            .collections
+            .get(ci)
+            .and_then(|c| c.entries.get(idx))
+            .map(|e| {
+                let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+                if leaf.trim().is_empty() {
+                    e.url.clone()
+                } else {
+                    leaf
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Close tab `ci`, first asking what to do with its folder when that folder
     /// is a git download PaperBoy made itself. Every close path in the GUI goes
     /// through here so a downloaded workspace can never be dropped silently,
@@ -932,6 +1074,11 @@ impl GuiApp {
         if self.dialog_is_open() {
             return; // let the modal own the keyboard
         }
+        // Whether a widget (a text field, most importantly) held the keyboard at
+        // the end of the previous frame. The list keys and the `?` help key must
+        // stand down while something is being typed into, or Delete/arrows/`?`
+        // would edit that text instead of driving the panel behind it.
+        let no_widget_focus = ctx.memory(|m| m.focused().is_none());
         // Tab / Shift+Tab cycle the focused *panel*, exactly like the terminal
         // UI. We pull Tab key-presses straight out of the event queue rather
         // than using `consume_key`: its `Modifiers::NONE` pattern also matches
@@ -985,6 +1132,125 @@ impl GuiApp {
         // Ctrl+W closes the active tab.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) {
             self.request_close_tab(self.active_ci());
+        }
+        // Ctrl+Z undoes the last request delete, by the exact code the Edit ▸
+        // Undo Delete Request menu item runs so the two can't disagree.
+        //
+        // Gated on the report editor not being on screen: it has its own Ctrl+Z
+        // (block-structure undo, and egui's own text undoer in the source view),
+        // handled later in the frame inside `report_editor::ui`. Consuming the
+        // key here would take it away from that editor while it is the surface
+        // the keyboard is aimed at, so the global binding stands down whenever
+        // the report editor is up and only claims Ctrl+Z otherwise.
+        if self.report_editor.is_none()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z))
+        {
+            self.undo_delete_request();
+        }
+        // F1 opens the keyboard-shortcuts overlay. `dialog_is_open` gated this
+        // whole handler, so it can't fire while another modal is up — which is
+        // what keeps the overlay from fighting the other dialogs.
+        let help = ctx.input_mut(|i| {
+            i.consume_key(Modifiers::NONE, Key::F1)
+                // `?` is the other conventional help key, but it is also a
+                // character someone may be typing into a URL or body, so only
+                // honour it when no widget owns the keyboard.
+                || (no_widget_focus && i.consume_key(Modifiers::SHIFT, Key::Questionmark))
+        });
+        if help {
+            self.dialog = Some(Dialog::Shortcuts);
+        }
+        // Requests-panel keys, but only when that panel holds focus and nothing
+        // is being typed into: Delete or an arrow while a rename field, the
+        // list filter or a URL cell has the keyboard must edit that text, not
+        // reach past it to move or destroy a request. egui reports the focus
+        // held at the end of the previous frame, which is exactly the state
+        // these keys should answer to.
+        if self.focus == Focus::List && no_widget_focus {
+            self.handle_list_keys(ctx);
+        }
+    }
+
+    /// Keyboard for the Requests panel: move the selection (Up/Down, Home/End),
+    /// run it (Enter), rename it (F2) or delete it (Delete). Only reached when
+    /// the panel holds focus and no widget owns the keyboard (see the call site
+    /// in [`Self::handle_global_keys`]).
+    ///
+    /// A Workspace tab's list is not an ordinary request list but a filesystem
+    /// tree of folders, collection files, reports and environments with no
+    /// single "selected request" — so it has a keyboard of its own, one that
+    /// also has to expand and collapse rows and act on whichever kind the cursor
+    /// is on. That lives in [`super::requests::handle_ws_tree_keys`], and this
+    /// hands straight over to it; everything below is for an ordinary
+    /// collection.
+    fn handle_list_keys(&mut self, ctx: &egui::Context) {
+        let ci = self.active_ci();
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        if col.is_workspace() {
+            super::requests::handle_ws_tree_keys(self, ctx, ci);
+            return;
+        }
+        let order = super::requests::nav_entry_order(&self.session.collections[ci]);
+        if order.is_empty() {
+            return; // nothing to select, run, rename or delete
+        }
+        let (up, down, home, end, enter, f2, del) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(Modifiers::NONE, Key::Home),
+                i.consume_key(Modifiers::NONE, Key::End),
+                i.consume_key(Modifiers::NONE, Key::Enter),
+                i.consume_key(Modifiers::NONE, Key::F2),
+                i.consume_key(Modifiers::NONE, Key::Delete),
+            )
+        });
+
+        // Where the current selection sits in the on-screen order, so a move is
+        // relative to what the user sees rather than the raw `entries` order.
+        let sel = self.session.collections[ci].selected_entry;
+        let pos = order.iter().position(|&i| i == sel).unwrap_or(0);
+        let last = order.len() - 1;
+        let target = if up {
+            Some(pos.saturating_sub(1))
+        } else if down {
+            Some((pos + 1).min(last))
+        } else if home {
+            Some(0)
+        } else if end {
+            Some(last)
+        } else {
+            None
+        };
+        if let Some(p) = target {
+            let idx = order[p];
+            let col = &mut self.session.collections[ci];
+            col.selected_entry = idx;
+            col.list_cursor = idx;
+            col.invalidate_request_json();
+            // Ask the next render to bring the row into view (see
+            // `reveal_selected`); a jump to first/last, or a step in a long
+            // collection, can land off-screen.
+            self.reveal_selected = true;
+        }
+        if enter {
+            self.run_active();
+        }
+        if f2 {
+            let idx = self.session.collections[ci].selected_entry;
+            if let Some(entry) = self.session.collections[ci].entries.get(idx) {
+                let text = entry.title.clone();
+                self.dialog = Some(Dialog::Rename {
+                    target: RenameTarget::Request { ci, idx },
+                    text,
+                });
+            }
+        }
+        if del {
+            let idx = self.session.collections[ci].selected_entry;
+            self.request_delete_request(ci, idx);
         }
     }
 
@@ -1835,6 +2101,228 @@ mod tests {
             "a clean session must never have its quit interrupted"
         );
         assert!(app.dialog.is_none());
+    }
+
+    // --- Keyboard for the Requests panel, Ctrl+Z undo, and the F1 overlay. ---
+
+    fn req(title: &str) -> crate::hurl::HurlEntry {
+        let mut e = crate::hurl::HurlEntry::default();
+        e.title = title.into();
+        e.method = "GET".into();
+        e.url = "https://example.com".into();
+        e
+    }
+
+    /// Feed one key press through the global key handler exactly as a frame
+    /// would, so `consume_key` and the previous-frame focus read the real
+    /// input path rather than a hand-poked flag.
+    fn press(app: &mut GuiApp, ctx: &egui::Context, key: Key, modifiers: Modifiers) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        input.modifiers = modifiers;
+        let _ = ctx.run_ui(input, |ui| app.handle_global_keys(ui.ctx()));
+    }
+
+    #[test]
+    fn the_requests_panel_moves_its_selection_with_the_arrow_and_end_keys() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b"), req("c")];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.focus = Focus::List;
+        let ctx = egui::Context::default();
+
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(app.session.collections[0].selected_entry, 1);
+        assert!(
+            app.reveal_selected,
+            "a keyboard move asks the row into view for the next render"
+        );
+
+        press(&mut app, &ctx, Key::End, Modifiers::NONE);
+        assert_eq!(app.session.collections[0].selected_entry, 2);
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            app.session.collections[0].selected_entry, 2,
+            "Down at the bottom clamps rather than wrapping"
+        );
+
+        press(&mut app, &ctx, Key::Home, Modifiers::NONE);
+        assert_eq!(app.session.collections[0].selected_entry, 0);
+    }
+
+    #[test]
+    fn the_requests_panel_keys_stand_down_unless_it_holds_focus() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        let mut app = GuiApp::for_test(session);
+        app.focus = Focus::Main; // some other panel has focus
+        let ctx = egui::Context::default();
+
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            app.session.collections[0].selected_entry, 0,
+            "arrows belong to whatever panel is focused, not always the list"
+        );
+    }
+
+    #[test]
+    fn f2_renames_and_delete_asks_first_from_the_requests_panel() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        session.collections[0].selected_entry = 1;
+        let mut app = GuiApp::for_test(session);
+        app.focus = Focus::List;
+        let ctx = egui::Context::default();
+
+        press(&mut app, &ctx, Key::F2, Modifiers::NONE);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Rename { .. })),
+            "F2 opens the rename dialog for the selection"
+        );
+        app.dialog = None;
+
+        press(&mut app, &ctx, Key::Delete, Modifiers::NONE);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::ConfirmDeleteRequest { idx: 1, .. })
+            ),
+            "Delete asks before removing anything"
+        );
+        assert_eq!(
+            app.session.collections[0].entries.len(),
+            2,
+            "and nothing is gone until the prompt is answered"
+        );
+    }
+
+    #[test]
+    fn delete_from_the_requests_panel_is_immediate_when_the_preference_is_off() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        session.collections[0].selected_entry = 0;
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        app.focus = Focus::List;
+        let ctx = egui::Context::default();
+
+        press(&mut app, &ctx, Key::Delete, Modifiers::NONE);
+        assert!(app.dialog.is_none(), "no prompt when the guard is off");
+        assert_eq!(
+            app.session.collections[0]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "the selected request is gone straight away"
+        );
+    }
+
+    #[test]
+    fn a_workspace_tree_is_keyboard_driven_but_stands_down_for_dialogs() {
+        // A real workspace fixture (the plain-list tests use hand-built
+        // collections, but the tree scans the filesystem), so its rows are the
+        // ones the keyboard actually steps through.
+        crate::gui::requests::tests::redirect_saved_state();
+        let dir = crate::gui::requests::tests::ws_tmp("appkeyws");
+        let mut session = Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        app.focus = Focus::List;
+        let ctx = egui::Context::default();
+
+        assert!(
+            app.session.collections[ci].ws_rows().len() >= 2,
+            "the fixture lists at least two top-level rows for Down to move between"
+        );
+        app.session.collections[ci].list_cursor = 0;
+
+        // The tree now has a keyboard: through the real global-key path the
+        // arrows move its cursor, the same as the plain list's.
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 1,
+            "a workspace tree steps its cursor with the arrows now"
+        );
+
+        // With a dialog up, the whole handler stands down, so the cursor holds
+        // still. This is the guarantee that keeps a Delete keystroke from
+        // reaching past a dialog the user is typing in to the file behind it.
+        app.dialog = Some(Dialog::Prompt {
+            kind: PromptKind::BaseUrl,
+            text: String::new(),
+        });
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 1,
+            "an open dialog freezes the tree keys entirely"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_z_undoes_a_request_delete_but_stands_down_for_the_report_editor() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        app.delete_request_now(0, 1);
+        assert_eq!(app.session.collections[0].entries.len(), 1, "\"b\" is gone");
+
+        // While the report editor owns the surface, Ctrl+Z is its own (block
+        // undo / the source view's text undoer), so the global binding must not
+        // steal it — the delete stays undone.
+        app.open_report_editor(ReportOrigin::Workspace, crate::report::Report::scratch("r"));
+        let ctx = egui::Context::default();
+        press(&mut app, &ctx, Key::Z, Modifiers::COMMAND);
+        assert_eq!(
+            app.session.collections[0].entries.len(),
+            1,
+            "Ctrl+Z belongs to the report editor while it is up"
+        );
+
+        // With the report editor closed, Ctrl+Z restores the deleted request.
+        app.close_report_editor();
+        press(&mut app, &ctx, Key::Z, Modifiers::COMMAND);
+        assert_eq!(
+            app.session.collections[0].entries.len(),
+            2,
+            "Ctrl+Z brings the request back once the editor is gone"
+        );
+    }
+
+    #[test]
+    fn f1_opens_the_shortcuts_overlay_and_respects_open_dialogs() {
+        let mut app = GuiApp::for_test(Session::default());
+        let ctx = egui::Context::default();
+
+        press(&mut app, &ctx, Key::F1, Modifiers::NONE);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Shortcuts)),
+            "F1 raises the shortcuts overlay"
+        );
+
+        // With a modal already up, the handler stands down entirely, so F1
+        // can't stack a second one on top of it.
+        app.dialog = Some(Dialog::Prompt {
+            kind: PromptKind::BaseUrl,
+            text: String::new(),
+        });
+        press(&mut app, &ctx, Key::F1, Modifiers::NONE);
+        assert!(
+            matches!(app.dialog, Some(Dialog::Prompt { .. })),
+            "F1 doesn't fight an open dialog"
+        );
     }
 }
 

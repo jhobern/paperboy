@@ -47,6 +47,10 @@ strings! {
     status_label => "Status:", "Statut :", "Status:";
     response_time_label => "Time:", "Durée :", "Tid:";
     no_response_yet => "Run a request to see the response.", "Exécutez une requête pour voir la réponse.", "Kør en anmodning for at se svaret.";
+    resp_empty_body => "(the server returned no body)", "(le serveur n'a renvoyé aucun corps)", "(serveren returnerede ingen brødtekst)";
+    resp_section_body => "Body", "Corps", "Body";
+    resp_section_headers => "Headers", "En-têtes", "Headere";
+    resp_no_headers => "(the server returned no headers)", "(le serveur n'a renvoyé aucun en-tête)", "(serveren returnerede ingen headere)";
     req_error_prefix => "Request error:", "Erreur de requête :", "Anmodningsfejl:";
     options_menu => "Settings", "Paramètres", "Indstillinger";
     options_menu_label => "(S)ettings", "Paramètre(s)", "Ind(s)tillinger";
@@ -57,6 +61,7 @@ strings! {
     pref_item_confirm_exit => "Confirm on e(x)it", "Confirmer à la (s)ortie", "Bekræft ved (a)fslutning";
     pref_item_confirm_clear => "Confirm on (c)lear", "Confirmer avant de (f)ermer", "Bekræft ved (l)ukning";
     pref_item_confirm_delete_env => "Confirm before (d)eleting an environment", "Confirmer avant de supprimer un (e)nvironnement", "Bekræft før (s)letning af et miljø";
+    pref_item_confirm_delete_request => "Confirm before deleting a (r)equest", "Confirmer avant de supprimer une (r)equête", "Bekræft før sletning af en anmod(n)ing";
     pref_item_always_save => "(A)lways save unsaved changes when prompted", "(T)oujours enregistrer les modifications non enregistrées lorsque demandé", "(G)em altid ugemte ændringer, når du bliver spurgt";
     pref_item_default_view => "Default Request (V)iew", "(V)ue de requête par défaut", "Standard anmodnings(v)isning";
     pref_item_run_all_batch => "Run All in (b)atch mode (chains cookies & captures)", "Tout exécuter en mode (b)atch (chaîne cookies et captures)", "Kør alle i (b)atch-tilstand (kæder cookies og optagelser)";
@@ -120,6 +125,10 @@ strings! {
     confirm_revert_file_q => "Revert \"{f}\" to its last saved version? Every unsaved edit to it will be discarded.", "Rétablir «\u{a0}{f}\u{a0}» à sa dernière version enregistrée\u{a0}? Toutes les modifications non enregistrées seront perdues.", "Gendan «{f}» til sidst gemte version? Alle ikke-gemte ændringer går tabt.";
     confirm_revert_env_q => "Revert {n} change(s) in \"{e}\" to the last saved values?", "Rétablir {n} modification(s) dans «\u{a0}{e}\u{a0}» aux dernières valeurs enregistrées\u{a0}?", "Gendan {n} ændring(er) i «{e}» til de sidst gemte værdier?";
     confirm_rerun_report_q => "This will replace the current results, which you haven't exported. Rerun anyway?", "Cela remplacera les résultats actuels, que vous n'avez pas exportés. Relancer quand même\u{a0}?", "Dette erstatter de nuværende resultater, som du ikke har eksporteret. Kør igen alligevel?";
+    wizard_discard_q => "This request has unsaved changes. Save them before closing?", "Cette requête comporte des modifications non enregistrées. Les enregistrer avant de fermer\u{a0}?", "Denne forespørgsel har ugemte ændringer. Vil du gemme dem, før du lukker?";
+    wizard_discard_save => "Save", "Enregistrer", "Gem";
+    wizard_discard_discard => "Discard", "Abandonner", "Kassér";
+    wizard_discard_cancel => "Keep editing", "Continuer l'édition", "Bliv ved med at redigere";
     confirm_yes => "Yes", "Oui", "Ja";
     confirm_no => "No", "Non", "Nej";
     file_menu => "File", "Fichier", "Fil";
@@ -184,6 +193,9 @@ strings! {
     env_reopened => "Environment '{n}' reopened.", "Environnement «\u{a0}{n}\u{a0}» rouvert.", "Miljøet '{n}' genåbnet.";
     request_moved => "{m} request moved to {dest}.", "Requête {m} déplacée vers {dest}.", "{m}-forespørgsel flyttet til {dest}.";
     request_copied => "{m} request copied to {dest}.", "Requête {m} copiée vers {dest}.", "{m}-forespørgsel kopieret til {dest}.";
+    request_moved_in_list => "Request moved — this is the order Run All follows.", "Requête déplacée — c'est l'ordre suivi par Tout exécuter.", "Forespørgsel flyttet — det er den rækkefølge Kør alle følger.";
+    reorder_needs_unfiltered_list => "Clear the filter (Esc) to reorder — a filtered list hides what the request would move past.", "Effacez le filtre (Échap) pour réordonner — une liste filtrée masque ce que la requête dépasserait.", "Ryd filteret (Esc) for at omarrangere — en filtreret liste skjuler det, forespørgslen ville flytte forbi.";
+    request_duplicated => "{m} request duplicated as '{name}'.", "Requête {m} dupliquée sous « {name} ».", "{m}-forespørgsel duplikeret som '{name}'.";
     workspace_new_collection_title => "New collection (path relative to workspace)", "Nouvelle collection (chemin relatif au workspace)", "Ny samling (sti relativ til workspace)";
     workspace_collection_created => "New collection '{name}' created — Ctrl+S to save.", "Nouvelle collection « {name} » créée — Ctrl+S pour enregistrer.", "Ny samling '{name}' oprettet — Ctrl+S for at gemme.";
     workspace_report_created => "New report '{name}' created.", "Nouveau rapport « {name} » créé.", "Ny rapport '{name}' oprettet.";
@@ -197,6 +209,10 @@ strings! {
     ws_item_exists => "'{name}' already exists — nothing created.", "« {name} » existe déjà — rien n'a été créé.", "'{name}' findes allerede — intet oprettet.";
     workspace_report_escaped => "Destination '{name}' resolves outside the workspace — report not created.", "La destination « {name} » pointe hors du workspace — rapport non créé.", "Destinationen '{name}' peger uden for workspacet — rapport ikke oprettet.";
     new_request_url_required => "Can't save: the request needs a URL.", "Impossible d'enregistrer : la requête nécessite une URL.", "Kan ikke gemme: forespørgslen kræver en URL.";
+    new_request_bracket_key => "Can't save: a name can't start with '[' (Hurl would read it as a section) — rename '{name}'.", "Impossible d'enregistrer : un nom ne peut pas commencer par « [ » (Hurl y verrait une section) — renommez « {name} ».", "Kan ikke gemme: et navn må ikke starte med '[' (Hurl ville læse det som en sektion) — omdøb '{name}'.";
+    new_request_key_empty => "Can't save: a row needs a name.", "Impossible d'enregistrer : une ligne doit avoir un nom.", "Kan ikke gemme: en række skal have et navn.";
+    new_request_key_char => "Can't save: Hurl can't carry '{char}' in a name — rename '{name}'.", "Impossible d'enregistrer : Hurl ne peut pas contenir « {char} » dans un nom — renommez « {name} ».", "Kan ikke gemme: Hurl kan ikke bære '{char}' i et navn — omdøb '{name}'.";
+    new_request_value_char => "Can't save: the value of '{name}' contains '{char}', which Hurl can't carry on a row.", "Impossible d'enregistrer : la valeur de « {name} » contient « {char} », que Hurl ne peut pas porter sur une ligne.", "Kan ikke gemme: værdien af '{name}' indeholder '{char}', som Hurl ikke kan bære på en række.";
     workspace_filter_on => "Filter: .hurl/.json/.vars/.trail", "Filtre : .hurl/.json/.vars/.trail", "Filter: .hurl/.json/.vars/.trail";
     workspace_filter_off => "Filter: All files", "Filtre : tous les fichiers", "Filter: Alle filer";
     workspace_tree_filter_on => "Tree filter on: .hurl/.json/.vars/.trail only", "Filtre de l'arbre activé : .hurl/.json/.vars/.trail uniquement", "Træfilter til: kun .hurl/.json/.vars/.trail";
@@ -213,7 +229,7 @@ strings! {
     status_copy_key => "^y", "^y", "^y";
     status_copy_hint => "copy", "copier", "kopiér";
     invalid_request_json => "Not valid Request JSON (expected an object with at least \"method\" and \"url\"); edit and try again.", "JSON de requête invalide (un objet avec au moins « method » et « url » est attendu) ; modifiez et réessayez.", "Ikke gyldig anmodnings-JSON (forventede et objekt med mindst \"method\" og \"url\"); ret og prøv igen.";
-    no_requests_hint => "No requests yet. Use \u{FF0B} New Request to create one.", "Aucune requête. Utilisez \u{FF0B} Nouvelle requête pour en créer une.", "Ingen anmodninger endnu. Brug \u{FF0B} Ny anmodning for at oprette en.";
+    no_requests_hint => "No requests yet \u{2014} press n to create one.", "Aucune requête \u{2014} appuyez sur n pour en créer une.", "Ingen anmodninger endnu \u{2014} tryk på n for at oprette en.";
     list_up_row => "‹ .. (up a folder)", "‹ .. (dossier parent)", "‹ .. (mappe op)";
     new_request => "\u{FF0B} New Request", "\u{FF0B} Nouvelle requête", "\u{FF0B} Ny anmodning";
     edit_request => "\u{270E} Edit Request", "\u{270E} Modifier la requête", "\u{270E} Rediger anmodning";
@@ -282,11 +298,15 @@ strings! {
     env_link_picker_title => "Link Environment", "Lier un environnement", "Tilknyt miljø";
     env_link_none => "(none)", "(aucun)", "(ingen)";
     env_delete_confirm => "Delete this environment?", "Supprimer cet environnement\u{a0}?", "Slet dette miljø?";
+    request_delete_confirm => "Delete this request?", "Supprimer cette requête\u{a0}?", "Slet denne anmodning?";
     env_no_envs => "(no environments — Load Environment… to add one)", "(aucun environnement — Charger l'environnement… pour en ajouter un)", "(ingen miljøer — Indlæs miljø… for at tilføje et)";
     env_active_label => "Active: ", "Actif : ", "Aktiv: ";
     env_active_none => "(none active)", "(aucun actif)", "(intet aktivt)";
     env_filter_label => "Filter: ", "Filtre : ", "Filter: ";
+    list_filter_label => "Find: ", "Chercher : ", "Find: ";
     env_filter_no_matches => "No environment matches — Esc clears the filter.", "Aucun environnement ne correspond — Échap efface le filtre.", "Intet miljø matcher — Esc rydder filteret.";
+    list_filter_no_matches => "No request matches.", "Aucune requête ne correspond.", "Ingen forespørgsel matcher.";
+    list_filter_no_matches_hint => "Esc clears the filter.", "Échap efface le filtre.", "Esc rydder filteret.";
     env_source_label => "Source: ", "Source : ", "Kilde: ";
     env_source_all => "All", "Tous", "Alle";
     env_source_global => "Global", "Global", "Global";
@@ -406,8 +426,6 @@ strings! {
     subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
     json_invalid => "⚠ Invalid JSON — fix before running", "⚠ JSON invalide — corrigez avant d'exécuter", "⚠ Ugyldig JSON — ret før kørsel";
     foot_focus => "focus", "focus", "fokus";
-    foot_move => "move", "déplacer", "flyt";
-    foot_edit => "edit", "modifier", "rediger";
     foot_run => "run", "exécuter", "kør";
     foot_run_all => "run all", "tout exécuter", "kør alle";
     foot_env_activate => "activate/deactivate", "activer/désactiver", "aktivér/deaktivér";
@@ -416,11 +434,12 @@ strings! {
     // because it shares a one-line border with two other hints.
     foot_env_goto_active => "go to active", "aller à l'actif", "gå til aktivt";
     foot_env_link => "link env", "lier env", "link miljø";
-    foot_new => "New Request/Var", "Nouvelle requête/var", "Ny forespørgsel/var";
+    foot_new => "New Request", "Nouvelle requête", "Ny forespørgsel";
     foot_rename => "rename", "renommer", "omdøb";
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
     foot_compact => "compact", "compact", "kompakt";
+    foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
     help_title => "Help", "Aide", "Hjælp";
@@ -472,6 +491,7 @@ strings! {
     help_new => "new request (or add variable, in the environment popup)", "nouvelle requête (ou ajouter une variable, dans la popup d'environnement)", "ny anmodning (eller tilføj variabel, i miljø-popup'en)";
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
+    help_save_active => "save what's on screen (report, else collection)", "enregistrer ce qui est à l'écran (rapport, sinon collection)", "gem det viste (rapport, ellers samling)";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
     help_workspace_new_item => "new collection / report / environment in the workspace (name it .hurl, .trail or .vars)", "nouvelle collection / rapport / environnement dans l'espace de travail (nommez-le .hurl, .trail ou .vars)", "ny samling / rapport / miljø i arbejdsområdet (navngiv den .hurl, .trail eller .vars)";
     help_workspace_move_item => "move the highlighted workspace file or folder to another folder", "déplacer le fichier ou dossier d'espace de travail en surbrillance vers un autre dossier", "flyt den fremhævede workspace-fil eller -mappe til en anden mappe";
@@ -500,9 +520,18 @@ strings! {
     help_restore_request => "restore deleted request (List pane)", "restaurer la requête supprimée (volet Liste)", "gendan slettet anmodning (Liste-rude)";
     help_move_request => "move request to another collection (workspace, List pane)", "déplacer la requête vers une autre collection (espace de travail, volet Liste)", "flyt anmodning til en anden samling (arbejdsområde, Liste-rude)";
     help_copy_request => "copy request to another collection (workspace, List pane)", "copier la requête vers une autre collection (espace de travail, volet Liste)", "kopiér anmodning til en anden samling (arbejdsområde, Liste-rude)";
+    help_reorder_request => "move the request up/down the collection — the order Run All follows (List pane)", "déplacer la requête vers le haut/bas — l'ordre suivi par Tout exécuter (volet Liste)", "flyt anmodningen op/ned i samlingen — den rækkefølge Kør alle følger (Liste-ruden)";
+    help_duplicate_request => "duplicate the request in place (List pane)", "dupliquer la requête sur place (volet Liste)", "duplikér anmodningen på stedet (Liste-ruden)";
+    foot_duplicate => "duplicate", "dupliquer", "duplikér";
+    foot_copy_request => "copy request", "copier la requête", "kopiér anmodning";
+    foot_reorder => "reorder", "réordonner", "omarrangér";
+    foot_find_request => "find request", "chercher requête", "find forespørgsel";
+    help_find_request => "find a request anywhere in the collection — or any row of a workspace tree (Esc clears it)", "chercher une requête dans toute la collection — ou n'importe quelle ligne d'un arbre d'espace de travail (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen — eller en vilkårlig række i et arbejdsområdetræ (Esc rydder det)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
+    help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
     help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
+    help_response_section => "step the Response section tabs (Body / Headers); Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); Skift+I går tilbage";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";
@@ -602,8 +631,12 @@ strings! {
     report_hint_run => "r run", "r exécuter", "r kør";
     report_hint_leave => "Esc done", "Échap terminé", "Esc færdig";
     report_dirty_marker => "●", "●", "●";
+    // A pencil rather than the report tab's dot: it is the glyph the request
+    // list already uses for "edited since it was loaded", so one mark means one
+    // thing wherever it appears.
+    tab_unsaved_marker => "✎", "✎", "✎";
     report_results_heading => "Results", "Résultats", "Resultater";
-    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+S export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+S export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+S export · Ctrl+O åbn · B basislinje";
+    report_hint_results => "Enter drill-down · / filter · v source · Ctrl+E export · Ctrl+O open · B baseline", "Entrée exploration · / filtre · v source · Ctrl+E export · Ctrl+O ouvrir · B référence", "Enter udforsk · / filter · v kilde · Ctrl+E export · Ctrl+O åbn · B basislinje";
     report_results_empty => "No results yet — press r to run the report.", "Aucun résultat — appuyez sur r pour exécuter le rapport.", "Ingen resultater endnu — tryk r for at køre rapporten.";
     report_run_parse_error => "Can't run — the source has a parse error:", "Exécution impossible — la source a une erreur d'analyse :", "Kan ikke køre — kilden har en parsefejl:";
     report_run_unbound => "Bind a collection before running (edit the '# collection:' header).", "Liez une collection avant l'exécution (modifiez l'en-tête « # collection: »).", "Bind en samling før kørsel (rediger « # collection: »-headeren).";
@@ -619,7 +652,7 @@ strings! {
     report_opened_prefix => "Opened", "Ouvert", "Åbnede";
     // Ctrl+O on a run that hasn't been written anywhere: there is no file for
     // the desktop to open, and saying so is more use than doing nothing.
-    report_open_no_export => "Export the run first (Ctrl+S), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+S), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+S); derefter åbner Ctrl+O filen.";
+    report_open_no_export => "Export the run first (Ctrl+E), then Ctrl+O opens the file.", "Exportez d'abord l'exécution (Ctrl+E), puis Ctrl+O ouvre le fichier.", "Eksportér kørslen først (Ctrl+E); derefter åbner Ctrl+O filen.";
     help_report_open_export => "open the exported file in the desktop's default application", "ouvrir le fichier exporté dans l'application par défaut du bureau", "åbn den eksporterede fil i skrivebordets standardprogram";
     report_baseline_saved_prefix => "Baseline saved to", "Référence enregistrée dans", "Basislinje gemt i";
     // "Nothing to save" is true but unhelpful for an export: the reader knows
@@ -819,6 +852,21 @@ strings! {
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
+    body_notes_stale_hint => "✎ Notes here no longer match this body — Ctrl+B to keep or drop them", "✎ Les notes ici ne correspondent plus à ce corps — Ctrl+B pour les garder ou les supprimer", "✎ Noterne her passer ikke længere til denne brødtekst — Ctrl+B for at beholde eller fjerne dem";
+    notes_stale_title => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
+    notes_stale_adopt => "Use the notes as the body", "Utiliser les notes comme corps", "Brug noterne som brødtekst";
+    notes_stale_adopt_blocked => "Use the notes as the body (they no longer read as JSON)", "Utiliser les notes comme corps (elles ne sont plus du JSON)", "Brug noterne som brødtekst (de kan ikke længere læses som JSON)";
+    notes_stale_discard => "Delete the notes, keep the body", "Supprimer les notes, garder le corps", "Slet noterne, behold brødteksten";
+    notes_stale_cancel => "Leave them alone", "Ne rien changer", "Lad dem være";
+    notes_adopted => "The notes are the body again", "Les notes sont de nouveau le corps", "Noterne er brødteksten igen";
+    notes_discarded => "Notes deleted", "Notes supprimées", "Noter slettet";
+    some_requests_unreadable => "Opened, but part of the file could not be read as requests — they are kept as text, press Shift+H to repair one", "Ouvert, mais une partie du fichier n’a pas pu être lue comme des requêtes — elle est conservée telle quelle, appuyez sur Maj+H pour la réparer", "Åbnet, men en del af filen kunne ikke læses som anmodninger — den bevares som tekst, tryk Shift+H for at reparere den";
+    cannot_edit_unreadable => "This request was never read from the file, so there are no fields to edit — press Shift+H to repair its Hurl text", "Cette requête n’a jamais été lue depuis le fichier, il n’y a donc aucun champ à modifier — appuyez sur Maj+H pour réparer son texte Hurl", "Denne anmodning blev aldrig læst fra filen, så der er ingen felter at redigere — tryk Shift+H for at reparere dens Hurl-tekst";
+    entry_unreadable => "unreadable", "illisible", "ulæselig";
+    notes_applied_from_raw => "Your edit to the notes became the body", "Votre modification des notes est devenue le corps", "Din ændring af noterne blev til brødteksten";
+    notes_kept_body_won => "The body and its notes were both edited — the body was used, the notes kept", "Le corps et ses notes ont été modifiés tous les deux — le corps a été utilisé, les notes conservées", "Både brødteksten og dens noter blev ændret — brødteksten blev brugt, noterne beholdt";
+    gui_notes_stale_headline => "These notes no longer describe this body", "Ces notes ne décrivent plus ce corps", "Disse noter beskriver ikke længere denne brødtekst";
+    gui_notes_stale_detail => "The body was edited without them, so they have been kept as plain comments rather than thrown away. Take them back as the body, or delete them.", "Le corps a été modifié sans elles\u{a0}; elles ont donc été conservées comme simples commentaires plutôt que supprimées. Reprenez-les comme corps, ou supprimez-les.", "Brødteksten blev redigeret uden dem, så de er bevaret som almindelige kommentarer i stedet for at blive smidt væk. Tag dem tilbage som brødtekst, eller slet dem.";
     gui_body_mode_raw => "Raw body", "Corps brut", "Rå brødtekst";
     gui_body_mode_form => "Form fields", "Champs de formulaire", "Formularfelter";
     gui_raw_body_hint => "Raw request body (JSON, text, …)", "Corps brut de la requête (JSON, texte, …)", "Rå anmodningstekst (JSON, tekst, …)";
@@ -845,6 +893,8 @@ strings! {
     gui_hint_key => "key", "clé", "nøgle";
     gui_hint_value => "value", "valeur", "værdi";
     gui_hint_header => "Header", "En-tête", "Header";
+    gui_bad_key_warning => "Hurl can't carry this character in a name — the whole collection would fail to load. This row won't be sent until it's renamed.", "Hurl ne peut pas porter ce caractère dans un nom — toute la collection ne se chargerait plus. Cette ligne ne sera pas envoyée tant qu'elle n'est pas renommée.", "Hurl kan ikke bære dette tegn i et navn — hele samlingen ville ikke kunne indlæses. Denne række sendes ikke, før den omdøbes.";
+    gui_bad_value_warning => "Hurl can't carry a newline, tab or backslash in a value. This row won't be sent until it's edited.", "Hurl ne peut pas porter de saut de ligne, de tabulation ni de barre oblique inverse dans une valeur. Cette ligne ne sera pas envoyée tant qu'elle n'est pas modifiée.", "Hurl kan ikke bære linjeskift, tabulator eller omvendt skråstreg i en værdi. Denne række sendes ikke, før den redigeres.";
     gui_hint_name => "name", "nom", "navn";
     gui_hint_query => "query", "requête", "forespørgsel";
     gui_hint_description => "note", "note", "note";
@@ -876,6 +926,8 @@ strings! {
     gui_no_environments => "No environments. Load a .vars file or add one.", "Aucun environnement. Chargez un fichier .vars ou ajoutez-en un.", "Ingen miljøer. Indlæs en .vars-fil eller tilføj et.";
     gui_env_filter_hint => "Filter environments…", "Filtrer les environnements…", "Filtrér miljøer…";
     gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
+    gui_request_filter_hint => "Find a request…", "Chercher une requête…", "Find en forespørgsel…";
+    gui_request_filter_no_matches => "No request matches the filter.", "Aucune requête ne correspond au filtre.", "Ingen forespørgsel matcher filteret.";
     gui_env_source_all => "All", "Tous", "Alle";
     gui_env_source_global => "Global", "Global", "Global";
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";
@@ -908,13 +960,16 @@ strings! {
     gui_untitled_request => "(untitled)", "(sans titre)", "(uden titel)";
     gui_run => "Run", "Exécuter", "Kør";
     gui_rename_ellipsis => "Rename…", "Renommer…", "Omdøb…";
+    gui_duplicate => "Duplicate", "Dupliquer", "Dublér";
     gui_edited_request => "Edited — not saved yet", "Modifiée — pas encore enregistrée", "Ændret — endnu ikke gemt";
     gui_edited_collection => "Has unsaved edits", "Contient des modifications non enregistrées", "Har ugemte ændringer";
+    gui_undo_delete_request => "Undo Delete Request", "Annuler la suppression de la requête", "Fortryd sletning af anmodning";
     // Shared widgets.
     gui_add => "+ Add", "+ Ajouter", "+ Tilføj";
     gui_remove => "Remove", "Supprimer", "Fjern";
     // Menu bar.
     gui_menu_file => "File", "Fichier", "Fil";
+    gui_menu_edit => "Edit", "Édition", "Rediger";
     gui_menu_view => "View", "Affichage", "Vis";
     gui_menu_settings => "Settings", "Paramètres", "Indstillinger";
     // The Alt-key mnemonic for each top-level menu: the letter that opens it
@@ -928,6 +983,7 @@ strings! {
     // "Paramètres", Danish I for "Indstillinger"), and the uniqueness test
     // below catches a collision at build time rather than in the field.
     gui_menu_file_key => "F", "F", "F";
+    gui_menu_edit_key => "E", "D", "R";
     gui_menu_view_key => "V", "A", "V";
     gui_menu_settings_key => "S", "P", "I";
     gui_new_collection_ellipsis => "New collection…", "Nouvelle collection…", "Ny samling…";
@@ -1166,6 +1222,10 @@ strings! {
     // triangle written here is not in -- it came out as a tofu box.
     gui_report_cell_hint => "Click a row marked {c} to open its details, or any other cell to inspect its full value", "Cliquez sur une ligne marquée {c} pour ouvrir ses détails, ou sur toute autre cellule pour voir sa valeur complète", "Klik på en række markeret med {c} for at åbne dens detaljer, eller på en anden celle for at se dens fulde værdi";
     gui_report_cell_copy_full => "Copy full value", "Copier la valeur complète", "Kopiér fuld værdi";
+    // The tooltip on a results column's drag handle. Both gestures are named
+    // because the reset — double-click to hand the column back to the automatic
+    // fitter — is not something a reader would guess from the handle alone.
+    gui_report_col_resize_hint => "Drag to resize this column · double-click to auto-fit", "Glissez pour redimensionner cette colonne · double-cliquez pour l'ajuster automatiquement", "Træk for at ændre kolonnens bredde · dobbeltklik for automatisk tilpasning";
     // The results view's filter bar and metric cards. `RowFilter::label` is
     // deliberately English -- it names buttons in an exported document that has
     // no language -- so the in-app bar labels its own buttons from here.
@@ -1417,10 +1477,10 @@ strings! {
     report_label_synonyms_help => "Other spellings that mean this label. A truth of \"real\" and a response of \"Low Risk\" score as a match when both are listed here.", "Autres formulations qui désignent cette étiquette. Une vérité « real » et une réponse « Low Risk » comptent comme identiques si les deux figurent ici.", "Andre stavemåder, der betyder denne etiket. En sandhed \"real\" og et svar \"Low Risk\" tæller som ens, når begge står her.";
     report_helper_collection_help => "Another collection whose requests this report can call, written 'path AS alias'. Its requests are then used as 'alias/request'. Handy for a request that supports the report but isn't part of the API being tested — it stays out of Run All.", "Une autre collection dont ce rapport peut appeler les requêtes, écrite 'chemin AS alias'. Ses requêtes s'utilisent alors comme 'alias/requête'. Pratique pour une requête qui sert au rapport sans faire partie de l'API testée : elle reste hors de « Tout exécuter ».", "En anden samling, hvis forespørgsler denne rapport kan kalde, skrevet 'sti AS alias'. Dens forespørgsler bruges så som 'alias/forespørgsel'. Nyttigt til en forespørgsel, der understøtter rapporten uden at være en del af den API, der testes — den holdes uden for Kør alle.";
     diag_collection_primary_alias => "The first '# collection:' is the report's own collection, so it takes no 'AS' alias. Aliases name the extra helper collections below it.", "La première '# collection:' est la collection du rapport : elle ne prend pas d'alias 'AS'. Les alias nomment les collections d'appoint qui la suivent.", "Den første '# collection:' er rapportens egen samling og tager derfor ikke et 'AS'-alias. Aliasser navngiver de ekstra hjælpesamlinger under den.";
-    diag_collection_alias_missing => "Helper collection '{}' needs an alias: write '# collection: {0} AS name'. Its requests are then used as 'name/request'.", "La collection d'appoint '{}' a besoin d'un alias : écrivez '# collection: {0} AS nom'. Ses requêtes s'utilisent alors comme 'nom/requête'.", "Hjælpesamlingen '{}' mangler et alias: skriv '# collection: {0} AS navn'. Dens forespørgsler bruges så som 'navn/forespørgsel'.";
+    diag_collection_alias_missing => "Helper collection '{}' needs an alias: write '# collection: {} AS name'. Its requests are then used as 'name/request'.", "La collection d'appoint '{}' a besoin d'un alias : écrivez '# collection: {} AS nom'. Ses requêtes s'utilisent alors comme 'nom/requête'.", "Hjælpesamlingen '{}' mangler et alias: skriv '# collection: {} AS navn'. Dens forespørgsler bruges så som 'navn/forespørgsel'.";
     diag_collection_alias_invalid => "'{}' is not a usable collection alias. Use letters, digits and underscores, starting with a letter or underscore.", "'{}' n'est pas un alias de collection utilisable. Utilisez des lettres, des chiffres et des tirets bas, en commençant par une lettre ou un tiret bas.", "'{}' kan ikke bruges som samlingsalias. Brug bogstaver, tal og understregninger, og begynd med et bogstav eller en understregning.";
     diag_collection_alias_duplicate => "Two helper collections are both called '{}'. Give each one its own alias so 'alias/request' names exactly one request.", "Deux collections d'appoint s'appellent '{}'. Donnez à chacune son propre alias pour que 'alias/requête' désigne une seule requête.", "To hjælpesamlinger hedder begge '{}'. Giv hver sit eget alias, så 'alias/forespørgsel' peger på præcis én forespørgsel.";
-    diag_collection_alias_shadows_folder => "The alias '{}' is also a folder in the bound collection, so '{0}/…' could mean either. Rename the alias.", "L'alias '{}' est aussi un dossier de la collection liée : '{0}/…' devient ambigu. Renommez l'alias.", "Aliasset '{}' er også en mappe i den bundne samling, så '{0}/…' kan betyde begge dele. Omdøb aliasset.";
+    diag_collection_alias_shadows_folder => "The alias '{}' is also a folder in the bound collection, so '{}/…' could mean either. Rename the alias.", "L'alias '{}' est aussi un dossier de la collection liée : '{}/…' devient ambigu. Renommez l'alias.", "Aliasset '{}' er også en mappe i den bundne samling, så '{}/…' kan betyde begge dele. Omdøb aliasset.";
     diag_collection_helper_not_open => "it lives on a git remote, so open it as a collection first", "elle se trouve sur un dépôt git distant : ouvrez-la d'abord comme collection", "den ligger på en git-fjernserver, så åbn den som samling først";
     diag_collection_helper_unreadable => "Helper collection '{}' could not be read: {}", "Impossible de lire la collection d'appoint '{}' : {}", "Hjælpesamlingen '{}' kunne ikke læses: {}";
     diag_request_not_found => "Request '{}' was not found in the bound collection.", "La requête '{}' est introuvable dans la collection liée.", "Forespørgslen '{}' blev ikke fundet i den bundne samling.";
@@ -1441,6 +1501,67 @@ strings! {
     diag_list_arity => "The list elements have inconsistent arity — a mix of scalars and tuples of different sizes.", "Les éléments de la liste ont une arité incohérente — un mélange de scalaires et de tuples de tailles différentes.", "Listens elementer har inkonsistent aritet — en blanding af skalarer og tupler af forskellig størrelse.";
     diag_concat_arity => "The CONCAT inputs have inconsistent arity — every input must yield the same number of values per item.", "Les entrées de CONCAT ont une arité incohérente — chaque entrée doit fournir le même nombre de valeurs par élément.", "CONCAT-inputtene har inkonsistent aritet — hvert input skal give det samme antal værdier pr. element.";
     diag_var_maybe_undefined => "Request '{}' uses {} which may not be set at this point in the flow — add it to the environment, or assign it before this request.", "La requête '{}' utilise {} qui pourrait ne pas être défini à ce stade du flux — ajoutez-le à l'environnement ou affectez-le avant cette requête.", "Forespørgslen '{}' bruger {}, som måske ikke er sat på dette punkt i forløbet — føj den til miljøet, eller tildel den før denne forespørgsel.";
+    // --- GUI keyboard, delete-request confirmation, Run All confirmation and
+    // the F1 shortcuts overlay. Appended together at the end of the table so a
+    // concurrent edit elsewhere in it doesn't collide. ---
+    gui_shortcut_save_as => "Ctrl+Shift+S", "Ctrl+Shift+S", "Ctrl+Shift+S";
+    gui_shortcut_close_tab_key => "Ctrl+W", "Ctrl+W", "Ctrl+W";
+    gui_shortcut_undo_delete => "Ctrl+Z", "Ctrl+Z", "Ctrl+Z";
+    gui_confirm_delete_request => "Confirm deleting a request", "Confirmer la suppression d'une requête", "Bekræft sletning af en anmodning";
+    gui_delete_request_title => "Delete request", "Supprimer la requête", "Slet anmodning";
+    confirm_delete_request_q => "Delete \"{r}\"? You can bring it back with Undo Delete Request (Ctrl+Z).", "Supprimer «\u{a0}{r}\u{a0}»\u{a0}? Vous pouvez la récupérer avec «\u{a0}Annuler la suppression de la requête\u{a0}» (Ctrl+Z).", "Slet «{r}»? Du kan hente den tilbage med Fortryd sletning af anmodning (Ctrl+Z).";
+    gui_run_all_confirm_title => "Run All", "Tout exécuter", "Kør alle";
+    confirm_run_all_q => "Run all {n} requests? {m} of them are not GET and may change data on the server.", "Exécuter les {n} requêtes\u{a0}? {m} d'entre elles ne sont pas des GET et pourraient modifier des données sur le serveur.", "Kør alle {n} anmodninger? {m} af dem er ikke GET og kan ændre data på serveren.";
+    gui_shortcuts_title => "Keyboard Shortcuts", "Raccourcis clavier", "Tastaturgenveje";
+    gui_shortcuts_group_panels => "Panels", "Panneaux", "Paneler";
+    gui_shortcuts_group_list => "Request list", "Liste des requêtes", "Anmodningsliste";
+    gui_shortcuts_group_run => "Requests & files", "Requêtes et fichiers", "Anmodninger og filer";
+    gui_shortcuts_group_report => "Report editor", "Éditeur de rapport", "Rapporteditor";
+    gui_shortcuts_group_help => "Help", "Aide", "Hjælp";
+    gui_shortcut_cycle_panels => "Tab / Shift+Tab", "Tab / Maj+Tab", "Tab / Skift+Tab";
+    gui_shortcut_run => "Ctrl+Enter / F5", "Ctrl+Entrée / F5", "Ctrl+Enter / F5";
+    // Spelled out rather than "↑ / ↓": egui ships Ubuntu-Light plus two emoji
+    // fonts, none of which covers U+2191/U+2193, so the arrows rendered as
+    // tofu boxes. Words also match the rest of this table, which names its keys
+    // ("Tab", "Home / End") rather than drawing them.
+    gui_shortcut_list_move => "Up / Down", "Haut / Bas", "Op / Ned";
+    gui_shortcut_list_ends => "Home / End", "Début / Fin", "Home / End";
+    gui_shortcut_list_run => "Enter", "Entrée", "Enter";
+    gui_shortcut_list_rename => "F2", "F2", "F2";
+    gui_shortcut_list_delete => "Delete", "Suppr", "Delete";
+    gui_shortcut_find => "Ctrl+F", "Ctrl+F", "Ctrl+F";
+    gui_shortcut_help => "F1", "F1", "F1";
+    gui_shortcut_escape => "Esc", "Échap", "Esc";
+    gui_shortcut_cycle_panels_desc => "Move focus between panels", "Déplacer le focus entre les panneaux", "Flyt fokus mellem paneler";
+    gui_shortcut_run_desc => "Run the current request", "Exécuter la requête courante", "Kør den aktuelle anmodning";
+    gui_shortcut_save_desc => "Save the current document", "Enregistrer le document courant", "Gem det aktuelle dokument";
+    gui_shortcut_save_as_desc => "Save to a new file", "Enregistrer dans un nouveau fichier", "Gem i en ny fil";
+    gui_shortcut_close_tab_desc => "Close the active tab", "Fermer l'onglet actif", "Luk den aktive fane";
+    gui_shortcut_undo_delete_desc => "Restore the last deleted request", "Restaurer la dernière requête supprimée", "Gendan den senest slettede anmodning";
+    gui_shortcut_list_move_desc => "Move the selection up or down", "Déplacer la sélection vers le haut ou le bas", "Flyt markeringen op eller ned";
+    gui_shortcut_list_ends_desc => "Jump to the first or last request", "Aller à la première ou à la dernière requête", "Hop til den første eller sidste anmodning";
+    gui_shortcut_list_run_desc => "Run the selected request", "Exécuter la requête sélectionnée", "Kør den valgte anmodning";
+    gui_shortcut_list_rename_desc => "Rename the selected request", "Renommer la requête sélectionnée", "Omdøb den valgte anmodning";
+    gui_shortcut_list_delete_desc => "Delete the selected request", "Supprimer la requête sélectionnée", "Slet den valgte anmodning";
+    gui_shortcut_find_desc => "Find in the report source", "Rechercher dans la source du rapport", "Søg i rapportens kilde";
+    gui_shortcut_help_desc => "Show this shortcuts overlay", "Afficher cet aperçu des raccourcis", "Vis denne genvejsoversigt";
+    gui_shortcut_escape_desc => "Close a dialog or overlay", "Fermer une boîte de dialogue ou un aperçu", "Luk en dialog eller oversigt";
+    gui_menu_help => "Help", "Aide", "Hjælp";
+    gui_menu_help_key => "H", "I", "H";
+    // Workspace-tree Rename / Delete of a file or folder (graphical UI). Kept
+    // apart from the request Rename/Delete labels because these act on a file on
+    // disk, not on a request inside one, and both raise a dialog first (a rename
+    // box, a delete confirmation), hence the ellipsis on each.
+    gui_ws_rename => "Rename…", "Renommer…", "Omdøb…";
+    gui_ws_delete => "Delete…", "Supprimer…", "Slet…";
+    gui_ws_delete_title => "Delete from disk", "Supprimer du disque", "Slet fra disken";
+    confirm_delete_ws_file_q => "Delete '{name}' from disk? Deleting a file from disk can't be undone.", "Supprimer «\u{a0}{name}\u{a0}» du disque\u{a0}? La suppression d'un fichier du disque est irréversible.", "Slet '{name}' fra disken? Sletning af en fil fra disken kan ikke fortrydes.";
+    confirm_delete_ws_folder_q => "Delete the folder '{name}' and the {n} files inside it from disk? Deleting a folder from disk can't be undone.", "Supprimer le dossier «\u{a0}{name}\u{a0}» et les {n} fichiers qu'il contient du disque\u{a0}? La suppression d'un dossier du disque est irréversible.", "Slet mappen '{name}' og de {n} filer i den fra disken? Sletning af en mappe fra disken kan ikke fortrydes.";
+    confirm_delete_ws_unsaved => "There are unsaved edits here that will be lost.", "Des modifications non enregistrées ici seront perdues.", "Der er ugemte ændringer her, som vil gå tabt.";
+    ws_item_renamed => "Renamed to '{name}'.", "Renommé en «\u{a0}{name}\u{a0}».", "Omdøbt til '{name}'.";
+    ws_item_rename_exists => "There is already a '{name}' — nothing renamed.", "Il y a déjà un «\u{a0}{name}\u{a0}» — rien n'a été renommé.", "Der er allerede en '{name}' — intet omdøbt.";
+    ws_item_deleted => "Deleted '{name}'.", "«\u{a0}{name}\u{a0}» supprimé.", "'{name}' slettet.";
+    ws_item_delete_root => "The workspace folder itself can't be deleted.", "Le dossier de l'espace de travail lui-même ne peut pas être supprimé.", "Selve arbejdsområdemappen kan ikke slettes.";
 }
 
 impl Strings {
@@ -1594,11 +1715,37 @@ pub enum Status {
     WsItemMoveExists(String),
     /// A folder was dropped on itself or one of its own descendants.
     WsItemMoveIntoItself,
+    /// A workspace file or folder was renamed. Holds its new relative path.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemRenamed(String),
+    /// A rename was refused because the new name is already taken.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemRenameExists(String),
+    /// A workspace file or folder was deleted. Holds the relative path that was.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemDeleted(String),
+    /// A delete was refused because the target resolved to the workspace root.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    WsItemDeleteRoot,
     /// The "New Request" wizard was submitted (F2 / Ctrl+Enter) with an empty
     /// URL, which is the one field a request can't be saved without — the
     /// wizard is kept open (focused on the URL field) instead of silently
     /// discarding everything the user typed.
     NewRequestUrlRequired,
+    /// The wizard was submitted with a Headers/Cookies/Queries/Options/Form row
+    /// whose name starts with `[`. Such a row serialises to a line Hurl reads
+    /// as a section header, which makes the *whole file* unparseable (see
+    /// [`key_breaks_hurl_parsing`](crate::hurl::key_breaks_hurl_parsing)), so
+    /// the wizard stays open focused on the offending cell. Holds the key.
+    NewRequestBracketKey(String),
+    /// The wizard was submitted with a row that has no name at all.
+    NewRequestKeyEmpty,
+    /// …or whose name holds a character Hurl's row grammar can't carry. Holds
+    /// the name and the offending character.
+    NewRequestKeyChar(String, char),
+    /// …or whose *value* holds one (a newline, tab or backslash). Holds the
+    /// row's name and the offending character.
+    NewRequestValueChar(String, char),
     /// A request was deleted from a collection (`x` / delete). Holds the HTTP
     /// method so the message can name it, and always pairs with the "press u
     /// to restore" hint since deletions are easy to trigger by accident.
@@ -1614,9 +1761,20 @@ pub enum Status {
     /// A request was moved to another collection file in the workspace. Holds
     /// the HTTP method and the destination file's display name.
     RequestMoved(String, String),
+    /// The selected request was moved a place up or down its collection,
+    /// changing the order `Run All` follows.
+    RequestMovedInList,
+    /// `Alt+↑`/`Alt+↓` was pressed while the Requests list was filtered, where
+    /// a move would step over requests that aren't on screen.
+    ReorderNeedsUnfilteredList,
     /// A request was copied to another collection file in the workspace (as
     /// [`Status::RequestMoved`], but the original is left in place).
     RequestCopied(String, String),
+    /// A request was duplicated in place. Holds the HTTP method and the title
+    /// the copy was given — which is never the original's (see
+    /// [`crate::collection::unique_entry_title`]), so saying it is the only
+    /// way to know what to look for in the list.
+    RequestDuplicated(String, String),
     /// A collection save was refused because a `[Multipart]` file field has no
     /// file path: it would serialize to an invalid `file,;` line that
     /// PaperBoy's own parser rejects, so the file couldn't be reloaded. Holds
@@ -1708,6 +1866,23 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// Leftover `# [Body]` notes were taken back as the request's body.
+    NotesAdopted,
+    /// Leftover `# [Body]` notes were deleted, leaving the body as it was.
+    NotesDiscarded,
+    /// A Raw Mode edit changed only the `# [Body]` notes, so the body was
+    /// derived from them rather than the file's own copy winning.
+    NotesAppliedFromRaw,
+    /// A collection opened, but some of it could not be read as requests. The
+    /// count is how many pieces of the file are being carried as text, and the
+    /// reason is the parser's own explanation of the first failure — which is
+    /// the only place the user is told *why* without opening Raw Mode.
+    SomeRequestsUnreadable(usize, Option<String>),
+    /// The user tried to edit, in fields, a request that was never parsed.
+    CannotEditUnreadable,
+    /// A Raw Mode edit changed the body *and* its notes. Two edits can't be
+    /// merged into one body, so the body won and the notes were kept.
+    NotesKeptBodyWon,
     /// The Workspace tree's extension filter was toggled (`Ctrl+F`). `true`
     /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
     /// `false` shows every file.
@@ -1732,7 +1907,10 @@ impl Status {
                     | Status::WorkspaceReloaded
                     | Status::WorkspaceSaved
                     | Status::RequestMoved(_, _)
+                    | Status::RequestMovedInList
+                    | Status::ReorderNeedsUnfilteredList
                     | Status::RequestCopied(_, _)
+                    | Status::RequestDuplicated(_, _)
                     | Status::ThemeSaved(_)
                     | Status::ThemeDeleted(_)
                     | Status::EnvReopened(_)
@@ -1816,11 +1994,27 @@ impl Status {
             Status::WsItemMoved(name) => s.ws_item_moved.replace("{name}", name),
             Status::WsItemMoveExists(name) => s.ws_item_move_exists.replace("{name}", name),
             Status::WsItemMoveIntoItself => s.ws_item_move_into_itself.to_string(),
+            Status::WsItemRenamed(name) => s.ws_item_renamed.replace("{name}", name),
+            Status::WsItemRenameExists(name) => s.ws_item_rename_exists.replace("{name}", name),
+            Status::WsItemDeleted(name) => s.ws_item_deleted.replace("{name}", name),
+            Status::WsItemDeleteRoot => s.ws_item_delete_root.to_string(),
             Status::NewRequestUrlRequired => s.new_request_url_required.to_string(),
+            Status::NewRequestBracketKey(k) => s.new_request_bracket_key.replace("{name}", k),
+            Status::NewRequestKeyEmpty => s.new_request_key_empty.to_string(),
+            Status::NewRequestKeyChar(k, c) => s
+                .new_request_key_char
+                .replace("{char}", &c.escape_debug().to_string())
+                .replace("{name}", k),
+            Status::NewRequestValueChar(k, c) => s
+                .new_request_value_char
+                .replace("{char}", &c.escape_debug().to_string())
+                .replace("{name}", k),
             Status::RequestDeleted(method) => s.request_deleted.replace("{m}", method),
             Status::TabClosed => s.tab_closed.to_string(),
             Status::EnvDeleted(name) => s.env_deleted.replace("{n}", name),
             Status::EnvReopened(name) => s.env_reopened.replace("{n}", name),
+            Status::RequestMovedInList => s.request_moved_in_list.to_string(),
+            Status::ReorderNeedsUnfilteredList => s.reorder_needs_unfiltered_list.to_string(),
             Status::RequestMoved(method, dest) => s
                 .request_moved
                 .replace("{m}", method)
@@ -1829,6 +2023,10 @@ impl Status {
                 .request_copied
                 .replace("{m}", method)
                 .replace("{dest}", dest),
+            Status::RequestDuplicated(method, name) => s
+                .request_duplicated
+                .replace("{m}", method)
+                .replace("{name}", name),
             Status::SaveUnreadableEmptyFile { req, field } => s
                 .save_unreadable_empty_file
                 .replace("{field}", field)
@@ -1888,6 +2086,15 @@ impl Status {
             Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::NotesAdopted => s.notes_adopted.to_string(),
+            Status::NotesDiscarded => s.notes_discarded.to_string(),
+            Status::NotesAppliedFromRaw => s.notes_applied_from_raw.to_string(),
+            Status::SomeRequestsUnreadable(n, why) => match why {
+                Some(why) => format!("{} ({n}): {why}", s.some_requests_unreadable),
+                None => format!("{} ({n})", s.some_requests_unreadable),
+            },
+            Status::CannotEditUnreadable => s.cannot_edit_unreadable.to_string(),
+            Status::NotesKeptBodyWon => s.notes_kept_body_won.to_string(),
             Status::WorkspaceTreeFilter(on) => {
                 if *on {
                     s.workspace_tree_filter_on.to_string()

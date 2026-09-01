@@ -16,6 +16,7 @@ use crate::persistence::PersistedState;
 use crate::request::RequestView;
 
 use super::app::*;
+use super::draw::fit_border_hint;
 use super::editor::Editor;
 use super::git_save::*;
 use super::new_request::*;
@@ -898,6 +899,112 @@ fn the_confirm_on_delete_env_preference_toggles_and_persists() {
     assert!(
         !restored.confirm_on_delete_env,
         "the preference survives a save/load cycle"
+    );
+}
+
+/// A request holds more work than an environment row — a body, asserts,
+/// captures — and `x` sits one key away from the list navigation, so the
+/// deletion asks first by default. The preference turns that off for people who
+/// would rather lean on `u`.
+#[test]
+fn the_confirm_on_delete_request_preference_toggles_and_persists() {
+    let mut app = TuiApp::default();
+    assert!(
+        app.confirm_on_delete_request,
+        "confirmation is on by default (safe)"
+    );
+
+    app.overlay = Some(Overlay::Preferences(3));
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.confirm_on_delete_request, "Enter toggles it off");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        "the highlight stays on the toggle row"
+    );
+
+    let persisted = app.to_persisted();
+    assert!(!persisted.confirm_on_delete_request);
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(persisted);
+    assert!(
+        !restored.confirm_on_delete_request,
+        "the preference survives a save/load cycle"
+    );
+}
+
+/// Declining the confirmation must leave the request exactly where it was —
+/// the whole point of being asked.
+#[test]
+fn declining_the_delete_confirmation_keeps_the_request() {
+    let mut app = TuiApp::default();
+    app.collections[0]
+        .entries
+        .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
+    app.collections[0].selected_entry = 0;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('n'));
+
+    assert!(app.overlay.is_none(), "the popup closes");
+    assert_eq!(
+        app.collections[0].entries.len(),
+        1,
+        "declining keeps the request"
+    );
+}
+
+/// `x` on a folder or an "up" row has always been a no-op; it must not become a
+/// question about a request that isn't there.
+#[test]
+fn the_delete_confirmation_is_not_raised_on_a_folder_row() {
+    let mut app = TuiApp::default();
+    app.collections[0] = collection_with_folders();
+    app.focus = Pane::List;
+    // Row 0 at the root of a foldered collection is a folder, not an entry.
+    app.collections[0].list_cursor = 0;
+
+    press(&mut app, KeyCode::Char('x'));
+
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation for a row that holds no request"
+    );
+}
+
+/// Ctrl+S is the one shortcut every user arrives already knowing. It used to
+/// land on the bare-`s` Settings arm in the collection view (a silent no-op on
+/// the keystroke people trust most) and to mean "export CSV" in the report
+/// view; now it means the same thing in both: write what is on screen back to
+/// its own file, exactly as the GUI's Ctrl+S does.
+#[test]
+fn ctrl_s_saves_the_collection_rather_than_opening_settings() {
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+
+    let mut app = TuiApp::default();
+    app.collections[0]
+        .entries
+        .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
+
+    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+    assert!(
+        !matches!(app.overlay, Some(Overlay::Options(_))),
+        "Ctrl+S is a save, not the Settings menu"
+    );
+    // The built-in tab has never been written anywhere, so a save falls back to
+    // asking where — which is still a save, not nothing.
+    assert!(
+        app.overlay.is_some(),
+        "an unsaved collection falls back to Save As rather than doing nothing"
+    );
+
+    // A bare `s` still opens Settings.
+    app.overlay = None;
+    press(&mut app, KeyCode::Char('s'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::Options(_))),
+        "plain `s` still opens Settings"
     );
 }
 
@@ -1972,8 +2079,16 @@ fn esc_dismisses_dropdown_before_cancelling_the_form() {
         "the dropdown is dismissed"
     );
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]
@@ -2222,12 +2337,12 @@ fn run_all_batch_mode_toggles_from_preferences_and_round_trips() {
         "Run All streams by default (batch mode off)"
     );
 
-    // Row 4 of the Preferences menu toggles it (Enter and Space both work).
-    app.overlay = Some(Overlay::Preferences(4));
+    // Row 5 of the Preferences menu toggles it (Enter and Space both work).
+    app.overlay = Some(Overlay::Preferences(5));
     press(&mut app, KeyCode::Enter);
     assert!(app.run_all_batch_mode, "Enter toggles batch mode on");
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(4))),
+        matches!(app.overlay, Some(Overlay::Preferences(5))),
         "the highlight stays on the toggle row"
     );
     press(&mut app, KeyCode::Char(' '));
@@ -2579,11 +2694,12 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Enter); // open Preferences (sel 0)
     press(&mut app, KeyCode::Down); // -> sel 1 (Confirm on clear)
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
-    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Down moves to the last item without wrapping past it"
     );
 
@@ -2611,7 +2727,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
         "selecting JSON in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -2619,14 +2735,14 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(5)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(6)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
         "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(5))),
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -2648,9 +2764,10 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Down); // -> sel 1
     press(&mut app, KeyCode::Down); // -> sel 2 (Confirm before deleting an environment)
-    press(&mut app, KeyCode::Down); // -> sel 3 (Always save when prompted)
-    press(&mut app, KeyCode::Down); // -> sel 4 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 5 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
+    press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
+    press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
     assert_eq!(app.default_request_view, RequestView::Hurl);
 
@@ -2670,7 +2787,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(5))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(6))));
     assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
@@ -6365,7 +6482,7 @@ fn f2_renames_the_active_non_builtin_tab() {
     let mut app = TuiApp::default();
     app.collections.push(Collection::new("api".into(), vec![]));
     app.active_tab = 1;
-    app.focus = Pane::Main;
+    app.focus = Pane::Tabs;
     press(&mut app, KeyCode::F(2));
     assert!(
         matches!(
@@ -6377,6 +6494,26 @@ fn f2_renames_the_active_non_builtin_tab() {
         ),
         "F2 should open the rename prompt for the active tab"
     );
+}
+
+/// Like `x`, F2 was the fall-through arm, so "rename" fired from the Requests
+/// list and the Request/Response panes too — offering to rename the whole
+/// collection while a *request* was highlighted, which is an easy misread of
+/// what has focus.
+#[test]
+fn f2_renames_the_tab_only_from_the_tab_bar() {
+    for pane in [Pane::Main, Pane::Response, Pane::List] {
+        let mut app = TuiApp::default();
+        app.collections.push(Collection::new("api".into(), vec![]));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        press(&mut app, KeyCode::F(2));
+        assert!(
+            app.overlay.is_none(),
+            "F2 in {pane:?} must not offer to rename the collection tab"
+        );
+    }
 }
 
 #[test]
@@ -6606,7 +6743,19 @@ fn x_deletes_the_selected_request_when_the_list_is_focused() {
     app.collections[0].selected_entry = 0;
     app.focus = Pane::List;
 
+    // The default is to ask first, so the delete takes `x` and then an answer.
     press(&mut app, KeyCode::Char('x'));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::DeleteRequest,
+                ..
+            })
+        ),
+        "`x` asks before deleting a request"
+    );
+    press(&mut app, KeyCode::Char('y'));
 
     assert_eq!(
         app.collections[0].entries.len(),
@@ -6630,6 +6779,9 @@ fn u_restores_the_most_recently_deleted_request_when_the_list_is_focused() {
         .push(HurlEntry::from_fields("b", "GET", "http://h/b", vec![], ""));
     app.collections[0].selected_entry = 0;
     app.focus = Pane::List;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x')); // deletes "a"
     assert_eq!(app.collections[0].entries.len(), 1);
 
@@ -6701,6 +6853,9 @@ fn u_reopens_the_closed_tab_instead_when_not_on_the_list_pane() {
         .push(HurlEntry::from_fields("a", "GET", "http://h/a", vec![], ""));
     app.focus = Pane::List;
     app.collections[0].selected_entry = 0;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
     press(&mut app, KeyCode::Char('x')); // deletes "a" from the built-in tab
     assert!(app.collections[0].entries.is_empty());
 
@@ -6759,6 +6914,506 @@ fn a_request_added_to_a_real_collection_is_marked_user_added() {
     assert!(
         !app.collections[0].entries[0].user_added,
         "scratch-space requests are not marked"
+    );
+}
+
+/// Esc used to throw the whole wizard away on a single keypress — the wizard
+/// has no autosave and F2 is the only thing that persists, so a mistyped Esc
+/// silently cost the user everything they had entered.
+#[test]
+fn esc_on_an_edited_wizard_asks_before_discarding() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // type into the Name field
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_some(), "the wizard must stay open");
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "the prompt opens on 'keep editing', so Enter on reflex costs nothing"
+    );
+    assert_eq!(form_ref(&app).name.text(), "h", "the edits are still there");
+}
+
+/// ...but an untouched form still closes on one Esc. Prompting when there is
+/// nothing to lose would make Esc feel broken and train the user to dismiss the
+/// prompt unread.
+#[test]
+fn esc_on_an_untouched_wizard_closes_immediately() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "an untouched wizard just closes");
+}
+
+/// Opening the wizard on an existing request prefills every section, and none
+/// of that prefill may count as an edit — otherwise editing a request and
+/// backing straight out would always prompt.
+#[test]
+fn esc_on_an_unmodified_edit_closes_immediately() {
+    let mut entry = crate::hurl::HurlEntry {
+        method: "POST".into(),
+        url: "http://h/a".into(),
+        title: "Thing".into(),
+        headers: vec![KvRow::new("X-A", "v")],
+        cookies: vec![KvRow::new("sid", "1")],
+        queries: vec![KvRow::new("q", "2")],
+        options: vec![KvRow::new("variable", "v=1")],
+        body_src: Some("{\"a\":1}".into()),
+        expected_status: Some(200),
+        ..Default::default()
+    };
+    entry.asserts = vec!["jsonpath \"$.a\" == 1".into()];
+    entry.captures = vec![("tok".into(), "jsonpath \"$.t\"".into())];
+    entry.reports = vec![("r".into(), "jsonpath \"$.r\"".into())];
+
+    let mut app = TuiApp::default();
+    let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+    assert!(
+        !form.is_dirty(),
+        "a freshly prefilled edit form is not an edit"
+    );
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "an unmodified edit just closes");
+}
+
+/// Esc answers the prompt with "keep editing": the reflex that opened it must
+/// not also dismiss it, or holding Esc would discard the form as before.
+#[test]
+fn esc_on_the_discard_prompt_returns_to_the_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_some(), "the wizard is still open");
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        None,
+        "the prompt is dismissed, not answered"
+    );
+    assert_eq!(form_ref(&app).name.text(), "h", "the edits survive");
+}
+
+/// Choosing Discard does what the old bare Esc did.
+#[test]
+fn discard_on_the_prompt_closes_the_wizard() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('d'));
+
+    assert!(app.overlay.is_none(), "the wizard closed");
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "and nothing was saved"
+    );
+}
+
+/// Choosing Save persists the request, so a user who hit Esc meaning to finish
+/// doesn't have to know that F2 is the save key.
+#[test]
+fn save_on_the_prompt_persists_the_request() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(app.overlay.is_none(), "the wizard closed");
+    assert_eq!(app.collections[0].entries.len(), 1, "the request was saved");
+    assert_eq!(app.collections[0].entries[0].url, "http://h/a");
+}
+
+/// Save from the prompt runs the same refusals F2 does — a form F2 would
+/// reject must not slip through just because the user arrived via Esc.
+#[test]
+fn save_on_the_prompt_still_refuses_an_unwritable_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.headers.clear();
+    let mut row = HeaderRow::new();
+    row.key = super::editor::Editor::new("[Body]", false);
+    row.value = super::editor::Editor::new("value", false);
+    form.headers.push(row);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(
+        app.overlay.is_some(),
+        "the wizard stays open on a refused save"
+    );
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        None,
+        "the prompt closes so the offending cell is visible"
+    );
+    assert_eq!(
+        form_ref(&app).focus,
+        NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+        "focus lands on the offending cell"
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "and nothing was saved"
+    );
+}
+
+/// A form with no URL can't be saved at all, so Save from the prompt has to
+/// refuse it the same way F2 does rather than silently dropping the form.
+#[test]
+fn save_on_the_prompt_still_refuses_an_empty_url() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // a name, but no URL
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    assert!(app.overlay.is_some(), "the wizard stays open");
+    assert_eq!(
+        form_ref(&app).focus,
+        NewField::Url,
+        "focus lands on the URL"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NewRequestUrlRequired)
+    ));
+    assert!(app.collections[0].entries.is_empty());
+}
+
+/// The prompt is modal: while it is open, keys belong to it and must not also
+/// edit the form behind it.
+#[test]
+fn the_discard_prompt_swallows_keys_meant_for_the_form() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(
+        form_ref(&app).name.text(),
+        "h",
+        "'x' must not reach the Name field"
+    );
+    assert!(app.overlay.is_some(), "and the wizard is still open");
+}
+
+/// Left/Right move between the three choices, and Enter acts on the highlighted
+/// one — the same interaction the app's other confirmations use.
+#[test]
+fn the_discard_prompt_moves_between_choices() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(form_ref(&app).confirm_discard, Some(2));
+
+    press(&mut app, KeyCode::Left);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+    press(&mut app, KeyCode::Left);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(2),
+        "wraps round to the last, like every other choice popup"
+    );
+    press(&mut app, KeyCode::Right);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(form_ref(&app).confirm_discard, Some(0));
+    press(&mut app, KeyCode::Right);
+    assert_eq!(form_ref(&app).confirm_discard, Some(1));
+
+    // Enter on "Discard" closes the wizard without saving.
+    press(&mut app, KeyCode::Enter);
+    assert!(app.overlay.is_none());
+    assert!(app.collections[0].entries.is_empty());
+}
+
+/// Enter on the default choice returns to editing, losing nothing.
+#[test]
+fn enter_on_the_default_choice_keeps_editing() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h'));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.overlay.is_some(), "the wizard is still open");
+    assert_eq!(form_ref(&app).confirm_discard, None, "the prompt is closed");
+    assert_eq!(form_ref(&app).name.text(), "h");
+}
+
+/// Every field the user can type into must feed the dirty check. This is the
+/// drift guard: a section added to the wizard without being added to
+/// `content_signature` would silently make Esc discard it without asking.
+#[test]
+fn every_editable_field_counts_as_an_edit() {
+    let mutations: Vec<(&str, fn(&mut NewReq))> = vec![
+        ("name", |f| f.name = super::editor::Editor::new("x", false)),
+        ("url", |f| f.url = super::editor::Editor::new("x", false)),
+        ("body", |f| f.body = super::editor::Editor::new("x", true)),
+        ("method", |f| f.method_idx += 1),
+        ("headers", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.headers.rows.push(r);
+        }),
+        ("cookies", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.cookies.rows.push(r);
+        }),
+        ("queries", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.queries.rows.push(r);
+        }),
+        ("options", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            f.options.rows.push(r);
+        }),
+        ("form_fields", |f| f.form_fields.push(FormRow::new())),
+        ("asserts", |f| f.asserts.push(AssertRow::new())),
+        ("captures", |f| f.captures.push(CaptureRow::new())),
+        ("reports", |f| f.reports.push(ReportRow::new())),
+        ("row enabled", |f| {
+            let mut r = HeaderRow::new();
+            r.key = super::editor::Editor::new("k", false);
+            r.enabled = false;
+            f.headers.rows.push(r);
+        }),
+        ("row desc", |f| {
+            let mut r = HeaderRow::new();
+            r.desc = super::editor::Editor::new("note", false);
+            f.headers.rows.push(r);
+        }),
+    ];
+    for (what, mutate) in mutations {
+        let mut app = TuiApp {
+            focus: Pane::List,
+            ..Default::default()
+        };
+        press(&mut app, KeyCode::Char('n'));
+        let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+            panic!("wizard did not open");
+        };
+        assert!(!form.is_dirty(), "{what}: a fresh form is not dirty");
+        mutate(form);
+        assert!(form.is_dirty(), "{what}: editing it must count as an edit");
+    }
+}
+
+/// ...and things that are *not* edits must not trip it, or the prompt fires on
+/// every Esc and gets dismissed unread.
+#[test]
+fn merely_looking_around_is_not_an_edit() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    for key in [
+        KeyCode::Tab,
+        KeyCode::Down,
+        KeyCode::Up,
+        KeyCode::PageDown,
+        KeyCode::PageUp,
+        KeyCode::Right,
+        KeyCode::Left,
+    ] {
+        press(&mut app, key);
+    }
+    assert!(
+        !form_ref(&app).is_dirty(),
+        "navigating a form is not editing it"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(app.overlay.is_none(), "so Esc still closes it outright");
+}
+
+/// The same guard, generalised: a name Hurl can't carry for any other reason —
+/// a colon, a `#`, a space — and a *value* holding a newline or a tab. Each
+/// would make the collection file unparseable, which costs every request in it.
+#[test]
+fn f2_with_an_unwritable_row_keeps_the_wizard_open_and_warns() {
+    use crate::i18n::Status;
+    let cases: [(&str, &str, fn(&Status) -> bool); 5] = [
+        (
+            "X-A:B",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X-A:B" && *c == ':'),
+        ),
+        (
+            "X-A#B",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X-A#B" && *c == '#'),
+        ),
+        (
+            "X A",
+            "v",
+            |st| matches!(st, Status::NewRequestKeyChar(k, c) if k == "X A" && *c == ' '),
+        ),
+        (
+            "X-A",
+            "one\ntwo",
+            |st| matches!(st, Status::NewRequestValueChar(k, c) if k == "X-A" && *c == '\n'),
+        ),
+        (
+            "X-A",
+            "one\ttwo",
+            |st| matches!(st, Status::NewRequestValueChar(k, c) if k == "X-A" && *c == '\t'),
+        ),
+    ];
+    for (key, value, expected) in cases {
+        let mut app = TuiApp {
+            focus: Pane::List,
+            ..Default::default()
+        };
+        press(&mut app, KeyCode::Char('n'));
+        let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+            panic!("wizard did not open");
+        };
+        form.url = super::editor::Editor::new("http://h/a", false);
+        form.headers.clear();
+        let mut row = HeaderRow::new();
+        row.key = super::editor::Editor::new(key, false);
+        row.value = super::editor::Editor::new(value, false);
+        form.headers.push(row);
+
+        press(&mut app, KeyCode::F(2));
+
+        match &app.overlay {
+            Some(Overlay::NewRequest(form)) => assert_eq!(
+                form.focus,
+                NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+                "{key:?}/{value:?}: focus jumps to the offending row"
+            ),
+            _ => panic!("{key:?}/{value:?}: the wizard must stay open"),
+        }
+        let status = app.status.as_ref().expect("a status hint is set");
+        assert!(
+            expected(status),
+            "{key:?}/{value:?}: unexpected status {status:?}"
+        );
+        assert!(
+            app.collections[0].entries.is_empty(),
+            "{key:?}/{value:?}: nothing was saved"
+        );
+    }
+}
+
+/// A wholly blank row is the wizard's own trailing placeholder, not something
+/// the user asked to save, so it must not trip the empty-name guard.
+#[test]
+fn f2_with_a_blank_placeholder_row_still_saves() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    press(&mut app, KeyCode::F(2));
+    assert!(app.overlay.is_none(), "the wizard closed: {:?}", app.status);
+    assert_eq!(app.collections[0].entries.len(), 1);
+}
+
+#[test]
+fn f2_with_a_bracket_row_key_keeps_the_wizard_open_and_warns() {
+    // A row named `[Body]` serialises to `[Body]: value`, which Hurl reads as
+    // a section header. Because `parse_hurl` yields no entries at all for a
+    // file that doesn't parse, saving one used to cost the user every request
+    // in the collection on the next load — so the wizard blocks it, exactly as
+    // it blocks an empty URL.
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.headers.clear();
+    let mut row = HeaderRow::new();
+    row.key = super::editor::Editor::new("[Body]", false);
+    row.value = super::editor::Editor::new("value", false);
+    form.headers.push(row);
+
+    press(&mut app, KeyCode::F(2));
+
+    match &app.overlay {
+        Some(Overlay::NewRequest(form)) => {
+            assert_eq!(
+                form.focus,
+                NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
+                "focus jumps to the offending Key cell"
+            );
+            assert_eq!(form.view_tab, WizardTab::Headers, "and to its section");
+            assert_eq!(form.url.text(), "http://h/a", "typed fields are preserved");
+        }
+        _ => panic!("the wizard must stay open on a bracket-key submit"),
+    }
+    assert!(
+        matches!(app.status, Some(crate::i18n::Status::NewRequestBracketKey(ref k)) if k == "[Body]"),
+        "a status hint names the offending key, got {:?}",
+        app.status
+    );
+    assert!(
+        app.collections[0].entries.is_empty(),
+        "nothing was saved to any collection"
     );
 }
 
@@ -11220,6 +11875,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddAssert);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Assert(0));
@@ -11232,6 +11888,7 @@ fn deleting_the_last_assert_or_capture_row_leaves_the_section_empty() {
     assert!(form_ref(&app).asserts.is_empty());
 
     press(&mut app, KeyCode::PageDown); // -> Captures
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddCapture);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Capture(0, CapCol::Name));
@@ -11456,8 +12113,16 @@ fn esc_dismisses_the_kind_dropdown_before_cancelling_the_form() {
         "the dropdown is dismissed"
     );
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]
@@ -11568,6 +12233,7 @@ fn ctrl_h_deletes_in_an_assert_cell_instead_of_typing_a_literal_h() {
     press(&mut app, KeyCode::PageDown); // -> Form
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     press(&mut app, KeyCode::Enter); // add a blank assert row
     assert_eq!(new_focus(&app), NewField::Assert(0));
 
@@ -11846,8 +12512,16 @@ fn esc_dismisses_the_content_type_dropdown_before_cancelling_the_form() {
     assert!(app.overlay.is_some(), "the form stays open");
     assert!(!form_ref(&app).ctype_dropdown_open());
 
-    press(&mut app, KeyCode::Esc); // second Esc: cancel the form
-    assert!(app.overlay.is_none(), "the form is cancelled");
+    // Second Esc: now the dropdown is gone, Esc reaches the form itself. These
+    // helpers type into the form, so it is dirty and Esc raises the discard
+    // prompt rather than throwing the edits away — the point here is only that
+    // the dropdown got first refusal.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        form_ref(&app).confirm_discard,
+        Some(WIZARD_DISCARD_DEFAULT),
+        "Esc reaches the form once the dropdown has been dismissed"
+    );
 }
 
 #[test]
@@ -12085,7 +12759,7 @@ fn sending_a_request_with_both_body_and_form_fields_is_refused_and_names_the_req
         title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://127.0.0.1:1/x".to_string(),
-        body: Some("{\"a\":1}".to_string()),
+        body_src: Some("{\"a\":1}".to_string()),
         ..Default::default()
     };
     entry.form_fields.push(crate::hurl::FormField {
@@ -12130,7 +12804,7 @@ fn the_request_panel_warns_about_a_body_and_form_fields_before_anything_is_sent(
         title: "Token".to_string(),
         method: "POST".to_string(),
         url: "http://example.com/token".to_string(),
-        body: Some(" ".to_string()),
+        body_src: Some(" ".to_string()),
         ..Default::default()
     };
     entry.form_fields.push(crate::hurl::FormField {
@@ -12178,6 +12852,113 @@ fn wizard_tab_bar_renders_every_section_label() {
     ] {
         assert!(out.contains(label), "tab bar should show '{label}':\n{out}");
     }
+}
+
+/// The tab bar is the only view of the wizard's other nine sections while one
+/// of them is open, so a populated section is shaded rather than dim: with
+/// focus in Body there is otherwise nothing on screen saying that Headers has
+/// rows in it. A background rather than a badge character, because the bar
+/// already has ten labels to fit.
+#[test]
+fn a_wizard_tab_with_content_is_shaded_and_an_empty_one_is_not() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut form = NewReq::new(String::new(), vec!["Scratch".to_string()], 0, None);
+    // Headers gets a real row; Cookies gets a blank one, which is not content.
+    form.headers.rows.push(HeaderRow::new());
+    form.headers.rows[0].key = Editor::new("Authorization", false);
+    form.cookies.rows.push(HeaderRow::new());
+
+    assert!(form.tab_has_content(WizardTab::Headers));
+    assert!(!form.tab_has_content(WizardTab::Cookies));
+    assert!(
+        !form.tab_has_content(WizardTab::All),
+        "the All tab shows everything, so marking it says nothing"
+    );
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::new_request::draw_new_request(f, &form, &s, &th, true))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+
+    let bg_of = |label: &str| -> ratatui::style::Color {
+        let area = *buf.area();
+        for y in area.y..area.bottom() {
+            let row: String = (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            // Only the tab bar draws these labels side by side on one line.
+            if row.contains("All")
+                && row.contains("Headers")
+                && row.contains("Cookies")
+                && let Some(col) = row.find(label)
+            {
+                return buf.cell((area.x + col as u16, y)).unwrap().bg;
+            }
+        }
+        panic!("no tab bar row found");
+    };
+
+    assert_eq!(
+        bg_of("Headers"),
+        th.line,
+        "a populated section is shaded so it stands out from the empty ones"
+    );
+    assert_ne!(
+        bg_of("Cookies"),
+        th.line,
+        "a section holding only a blank row is not shaded"
+    );
+}
+
+/// Every other dialog keeps its shortcut hint on the bottom border
+/// (`panel_hinted`); the wizard used to append it to the title instead, which
+/// put its keys in the one place nothing else does.
+#[test]
+fn the_wizard_hint_sits_on_the_bottom_border_not_in_the_title() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let form = NewReq::new(String::new(), vec!["Scratch".to_string()], 0, None);
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::new_request::draw_new_request(f, &form, &s, &th, true))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let area = *buf.area();
+    let rows: Vec<String> = (area.y..area.bottom())
+        .map(|y| {
+            (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        })
+        .collect();
+
+    let hint_row = rows
+        .iter()
+        .position(|r| r.contains("Esc"))
+        .expect("the hint should be on screen somewhere");
+    // Matched without the leading full-width "＋" of `s.new_request`: a
+    // double-width glyph occupies two buffer cells, so the title never appears
+    // verbatim in a cell-by-cell readback of the row.
+    let title_row = rows
+        .iter()
+        .position(|r| r.contains("New Request"))
+        .expect("the wizard is titled");
+    assert!(
+        hint_row > title_row,
+        "the hint belongs on the bottom border, below the title:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows[title_row].contains("Esc"),
+        "the title no longer carries the shortcut list:\n{}",
+        rows[title_row]
+    );
 }
 
 #[test]
@@ -12244,6 +13025,7 @@ fn editing_on_a_section_tab_is_reflected_when_switching_back_to_all() {
 
     press(&mut app, KeyCode::PageDown); // -> Headers tab
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     type_str(&mut app, "X-Test");
     assert_eq!(form_ref(&app).headers[0].key.text(), "X-Test");
 
@@ -12263,8 +13045,14 @@ fn section_tab_confines_tab_navigation_to_that_section() {
     assert_eq!(form_ref(&app).view_tab, WizardTab::Headers);
     assert_eq!(
         new_focus(&app),
+        NewField::TabBar,
+        "cycling parks on the bar so `[`/`]` keep working"
+    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        new_focus(&app),
         NewField::Kvd(KvdKind::Header, 0, HdrCol::Key),
-        "switching tabs jumps to the first field"
+        "Down steps off the bar into the section's first field"
     );
 
     // Walking forward within the section is unaffected.
@@ -12313,6 +13101,7 @@ fn section_tab_confines_enter_navigation_to_that_section() {
     press(&mut app, KeyCode::PageDown); // -> Body
     press(&mut app, KeyCode::PageDown); // -> Asserts
     assert_eq!(form_ref(&app).view_tab, WizardTab::Asserts);
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(
         new_focus(&app),
         NewField::AddAssert,
@@ -12386,66 +13175,103 @@ fn ctrl_shift_arrows_reorder_wizard_section_tabs() {
 }
 
 #[test]
-fn switching_to_a_section_tab_jumps_focus_to_its_first_field() {
+fn cycling_a_section_tab_parks_on_the_bar_and_down_enters_the_section() {
     let mut app = TuiApp::default();
     press(&mut app, KeyCode::Char('n'));
     // Leave focus somewhere unrelated (Name) before switching tabs.
     assert_eq!(new_focus(&app), NewField::Name);
 
-    press(&mut app, KeyCode::PageDown); // -> Headers
+    // Cycling leaves the cursor on the tab bar itself rather than diving into
+    // the section — that is what keeps `[`/`]` and PageUp/PageDown working on
+    // the next press, whatever the section's first field happens to be.
+    let entries = [
+        (WizardTab::Headers, NewField::AddKvd(KvdKind::Header)),
+        (WizardTab::Cookies, NewField::AddKvd(KvdKind::Cookie)),
+        (WizardTab::Queries, NewField::AddKvd(KvdKind::Query)),
+        (WizardTab::Options, NewField::AddKvd(KvdKind::Options)),
+        (WizardTab::Form, NewField::AddFormField),
+        (WizardTab::Body, NewField::Body),
+        (WizardTab::Asserts, NewField::AddAssert),
+        (WizardTab::Captures, NewField::AddCapture),
+    ];
+    for (tab, first) in entries {
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(form_ref(&app).view_tab, tab);
+        assert_eq!(
+            new_focus(&app),
+            NewField::TabBar,
+            "cycling to {tab:?} parks on the bar"
+        );
+        press(&mut app, KeyCode::Down);
+        assert_eq!(new_focus(&app), first, "Down enters {tab:?}");
+        // Back onto the bar so the next cycle starts from the same place.
+        press(&mut app, KeyCode::Up);
+    }
+}
+
+/// The reported bug: `]` cycled the tabs happily until it reached Body, whose
+/// only field is a text editor — from there every further `]` was typed into
+/// the body instead of moving on. Parking on the bar fixes it for good.
+#[test]
+fn brackets_keep_cycling_all_the_way_past_the_body_tab() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    // Off Name (a text field) so the brackets act as tab keys at all.
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        press(&mut app, KeyCode::Char(']'));
+        seen.push(form_ref(&app).view_tab);
+    }
     assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Header),
-        "headers start empty, so the entry point is the Add row"
+        seen,
+        vec![
+            WizardTab::Headers,
+            WizardTab::Cookies,
+            WizardTab::Queries,
+            WizardTab::Options,
+            WizardTab::Form,
+            WizardTab::Body,
+            WizardTab::Asserts,
+            WizardTab::Captures,
+        ],
+        "`]` must keep cycling straight through Body"
+    );
+    assert!(
+        form_ref(&app).body.text().is_empty(),
+        "and must never have typed a bracket into the body"
     );
 
-    press(&mut app, KeyCode::PageDown); // -> Cookies
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Cookie),
-        "cookies start empty, so the entry point is the Add row"
-    );
+    // `[` walks back the same way, again straight through Body.
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Char('['));
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Form);
+    assert!(form_ref(&app).body.text().is_empty());
+}
 
-    press(&mut app, KeyCode::PageDown); // -> Queries
+/// Once the user steps *into* the Body with Down, brackets are text again —
+/// JSON arrays have to be typeable.
+#[test]
+fn brackets_type_into_the_body_once_focus_has_entered_it() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    for _ in 0..6 {
+        press(&mut app, KeyCode::Char(']'));
+    }
+    assert_eq!(form_ref(&app).view_tab, WizardTab::Body);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(new_focus(&app), NewField::Body);
+    type_str(&mut app, "[1,2]");
+    assert_eq!(form_ref(&app).body.text(), "[1,2]");
     assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Query),
-        "queries start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Options
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddKvd(KvdKind::Options),
-        "options start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Form
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddFormField,
-        "form fields start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Body
-    assert_eq!(
-        new_focus(&app),
-        NewField::Body,
-        "Body's only field is the editor itself, so this also puts it into editing mode"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Asserts
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddAssert,
-        "asserts start empty, so the entry point is the Add row"
-    );
-
-    press(&mut app, KeyCode::PageDown); // -> Captures
-    assert_eq!(
-        new_focus(&app),
-        NewField::AddCapture,
-        "captures start empty, so the entry point is the Add row"
+        form_ref(&app).view_tab,
+        WizardTab::Body,
+        "and the tab did not move while typing"
     );
 }
 
@@ -13167,7 +13993,7 @@ fn raw_mode_rejects_invalid_hurl_and_keeps_the_text_editable() {
         "invalid hurl reopens the editor for correction"
     );
     if let Some(Overlay::Prompt { kind, editor, .. }) = &app.overlay {
-        assert!(matches!(kind, PromptKind::Raw(0)));
+        assert!(matches!(kind, PromptKind::Raw { ci: 0, .. }));
         assert_eq!(
             editor.text(),
             "this is not valid hurl {{{",
@@ -13686,8 +14512,89 @@ fn u_reopens_the_most_recently_closed_tab() {
 #[test]
 fn reopening_with_no_closed_tabs_is_a_no_op() {
     let mut app = TuiApp::default();
+    app.focus = Pane::Tabs;
     app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
     assert_eq!(app.collections.len(), 1);
+}
+
+/// `u` is a per-pane undo, not one time-ordered stack, so it must not reopen a
+/// tab from a pane that had nothing to do with closing one — a user who deleted
+/// a request and drifted out of the List pane would otherwise press `u` and get
+/// an unrelated tab back.
+#[test]
+fn u_outside_the_tab_bar_does_not_reopen_a_closed_tab() {
+    for pane in [Pane::Main, Pane::Response] {
+        let mut app = TuiApp::default();
+        app.collections.push(Collection::new("api".into(), vec![]));
+        app.active_tab = 1;
+        app.close_active_tab();
+        assert_eq!(app.collections.len(), 1);
+
+        app.focus = pane;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.collections.len(),
+            1,
+            "{pane:?} must not reopen the closed tab"
+        );
+    }
+}
+
+/// Ctrl+W closes a tab from any pane, so the scoped `u` would be unreachable
+/// after it if the close didn't move the focus. It does — both close paths land
+/// on the tab bar — which is what keeps the "press (u) to reopen" hint true.
+#[test]
+fn closing_a_tab_from_a_body_pane_leaves_the_undo_key_in_reach() {
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new("api".into(), vec![]));
+    app.active_tab = 1;
+    app.focus = Pane::Response;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(app.collections.len(), 1);
+    assert_eq!(
+        app.focus,
+        Pane::Tabs,
+        "the close moves focus to the tab bar"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+    assert_eq!(app.collections.len(), 2, "the closed tab came back");
+}
+
+/// The two undo stacks are independent: a request deleted before a tab was
+/// closed still comes back with `u` in the List pane, rather than `u` walking
+/// one shared history and handing back the tab first.
+#[test]
+fn the_request_and_tab_undo_stacks_do_not_interleave() {
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry_named("alpha"));
+    app.collections.push(Collection::new("api".into(), vec![]));
+
+    app.focus = Pane::List;
+    app.active_tab = 0;
+    app.collections[0].selected_entry = 0;
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.collections[0].entries.is_empty());
+
+    app.active_tab = 1;
+    app.close_active_tab();
+    assert_eq!(app.collections.len(), 1);
+
+    app.active_tab = 0;
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Char('u'));
+
+    assert_eq!(app.collections.len(), 1, "the tab stayed closed");
+    assert_eq!(
+        app.collections[0].entries.len(),
+        1,
+        "the deleted request came back instead"
+    );
 }
 
 #[test]
@@ -14132,6 +15039,10 @@ fn delete_removes_a_request_row_while_browsing_a_folder() {
         .iter()
         .position(|e| e.title == "A/one")
         .unwrap();
+
+    // This test is about what a delete does, not about being asked first:
+    // turn the confirmation off so `x` acts immediately (it stays undoable).
+    app.confirm_on_delete_request = false;
 
     press(&mut app, KeyCode::Char('x'));
     assert!(
@@ -15336,6 +16247,8 @@ fn deleting_a_request_reports_the_undo_hint_in_the_status_bar() {
     app.active_tab = ci;
     app.focus = Pane::List;
     app.collections[ci].sync_folder_to_selected();
+    // The subject here is the status line, not the confirmation.
+    app.confirm_on_delete_request = false;
 
     press(&mut app, KeyCode::Char('x'));
 
@@ -15611,54 +16524,49 @@ fn workspace_bound_tabs_show_the_folder_icon_in_the_tab_bar_and_list_title() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The "w browse workspace" hint lives in the footer, and appears there for
+/// every Workspace-bound tab regardless of how long its name is.
+///
+/// It used to sit beside the collection name on the Requests panel's title,
+/// shown only when the name left room for it — so on a long workspace name it
+/// vanished with nothing to say why. The Requests panel's *bottom* border is
+/// no better: at the default panel width the two run hints alone very nearly
+/// fill it. The footer spans the terminal, so there is room.
 #[test]
-fn workspace_bound_list_title_hints_the_w_shortcut_when_there_is_room_but_not_on_a_narrow_terminal()
-{
+fn a_workspace_tab_advertises_the_w_shortcut_in_the_footer() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let s = Strings::for_language(&Language::English);
     let dir = workspace_temp_dir("title_hint");
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
     col.workspace_root = Some(dir.clone());
-    // Dismiss the auto-opened picker prompt so it doesn't cover the
-    // List panel's title bar in this render.
+    // Dismiss the auto-opened picker prompt so it doesn't cover the panel.
     col.workspace_auto_prompt_dismissed = true;
     let mut app = TuiApp::default();
     app.collections.push(col);
     app.active_tab = app.collections.len() - 1;
 
-    // A spacious terminal has room in the List panel's title bar for
-    // the "w to browse" reminder, right next to the folder icon —
-    // easier for new users to spot than the busier bottom-border hint.
-    let mut wide_term = Terminal::new(TestBackend::new(160, 40)).unwrap();
-    wide_term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let wide_text = buffer_text(wide_term.backend().buffer());
+    let hint = format!("w {}", s.foot_workspace);
+
+    // It's in the footer — the bottom row — not the Requests panel.
     assert!(
-        wide_text.contains(&format!("w {}", s.foot_workspace)),
-        "the title bar shows the w-to-browse hint on a wide terminal"
+        render_footer(&mut app).contains(&hint),
+        "the footer carries the w-to-browse hint"
     );
 
-    // A narrow terminal shrinks the List panel below the hint's width
-    // requirement, so it's dropped rather than clipped mid-word.
-    let mut narrow_term = Terminal::new(TestBackend::new(40, 40)).unwrap();
-    narrow_term
-        .draw(|f| super::draw::draw(f, &mut app))
-        .unwrap();
-    let narrow_text = buffer_text(narrow_term.backend().buffer());
+    // And it survives a name long enough that the old title-bar placement
+    // would have dropped it.
+    let ci = app.active_tab;
+    app.collections[ci].name = "EngineAPIClientPostmanExportv4_3".to_string();
     assert!(
-        !narrow_text.contains(&format!("w {}", s.foot_workspace)),
-        "the title bar hides the w-to-browse hint on a narrow terminal"
+        render_footer(&mut app).contains(&hint),
+        "a long collection name no longer costs the hint its place"
     );
 
-    // A non-Workspace tab never shows this hint even with plenty of room.
+    // A non-Workspace tab never shows it.
     let mut plain_app = TuiApp::default();
-    let mut plain_term = Terminal::new(TestBackend::new(160, 40)).unwrap();
-    plain_term
-        .draw(|f| super::draw::draw(f, &mut plain_app))
-        .unwrap();
-    let plain_text = buffer_text(plain_term.backend().buffer());
     assert!(
-        !plain_text.contains(&format!("w {}", s.foot_workspace)),
+        !render_footer(&mut plain_app).contains(&hint),
         "a plain (non-Workspace) tab never shows the workspace hint"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -16878,11 +17786,11 @@ fn the_always_save_preference_toggles_from_the_preferences_menu_and_is_off_by_de
         "the preference is off by default"
     );
 
-    app.overlay = Some(Overlay::Preferences(3));
+    app.overlay = Some(Overlay::Preferences(4));
     press(&mut app, KeyCode::Enter);
     assert!(app.always_save_when_prompted, "Enter toggles it on");
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(3))),
+        matches!(app.overlay, Some(Overlay::Preferences(4))),
         "the highlight stays on the toggle row"
     );
 
@@ -19343,6 +20251,7 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
     ) -> crate::hurl::RunOutput {
         crate::hurl::RunOutput {
             entries: vec![crate::hurl::EntryOutcome {
+                entry_index: 0,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 200,
@@ -20039,7 +20948,7 @@ fn report_export_writes_a_csv_next_to_the_report() {
 /// environment/request one pane away in the collection view). `Ctrl+S` opens
 /// the export folder picker; a plain `x` in a report view does nothing.
 #[test]
-fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
+fn ctrl_e_exports_the_report_and_plain_x_is_inert() {
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
     let mut app = TuiApp::default();
@@ -20070,14 +20979,15 @@ fn ctrl_s_exports_the_report_and_plain_x_is_inert() {
         "a plain `x` should be inert in a report view, not export"
     );
 
-    // Ctrl+S opens the report-CSV export folder picker.
-    app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    // Ctrl+E opens the report-CSV export folder picker. (It is not Ctrl+S:
+    // that chord saves the report itself, here as everywhere else.)
+    app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
     assert!(
         matches!(
             app.overlay,
             Some(Overlay::Browser(FileAction::SaveReportCsvChooseFolder, _))
         ),
-        "Ctrl+S should open the report-CSV export picker"
+        "Ctrl+E should open the report-CSV export picker"
     );
 }
 
@@ -21563,6 +22473,8 @@ fn pagedown_cycles_to_the_reports_tab() {
         press(&mut app, KeyCode::PageDown);
     }
     assert_eq!(form_ref(&app).view_tab, WizardTab::Reports);
+    assert_eq!(new_focus(&app), NewField::TabBar);
+    press(&mut app, KeyCode::Down);
     assert_eq!(new_focus(&app), NewField::AddReport);
 }
 
@@ -21604,6 +22516,7 @@ fn deleting_the_last_report_row_leaves_the_section_empty() {
     for _ in 0..9 {
         press(&mut app, KeyCode::PageDown); // -> Reports
     }
+    press(&mut app, KeyCode::Down); // off the tab bar, into the section
     assert_eq!(new_focus(&app), NewField::AddReport);
     press(&mut app, KeyCode::Enter); // adds a blank row
     assert_eq!(new_focus(&app), NewField::Report(0, CapCol::Name));
@@ -25376,12 +26289,15 @@ mod all_view_layout {
         let mut app = TuiApp::default();
         let content = "# upload\nPOST http://h/upload\n[Multipart]\nphoto: file,;\n";
         let ok = app.load_collection_text("bad".to_string(), content, None);
-        assert!(!ok, "an invalid collection does not load");
+        // It loads now — the request is carried as text so it can be repaired
+        // in place — but the reason still has to reach the user.
+        assert!(ok, "the file opens rather than being refused outright");
+        assert!(app.collections[1].entries[0].is_unreadable());
         let s = crate::i18n::Strings::for_language(&Language::English);
         let text = app.status.as_ref().expect("a status is set").text(&s);
         assert!(
-            text.contains(s.file_not_collection_prefix),
-            "the message uses the collection-invalid prefix: {text}"
+            text.contains(s.some_requests_unreadable),
+            "the message says part of the file could not be read: {text}"
         );
         assert!(
             text.contains("line 4") && text.to_lowercase().contains("filename"),
@@ -25802,13 +26718,14 @@ fn slash_filters_the_environments_panel_by_name() {
     add_empty_global_env(&mut app, "Westpac Prod");
     add_empty_global_env(&mut app, "Westpac NZ Staging");
     add_empty_global_env(&mut app, "Bendigo Prod");
-    app.focus = Pane::List;
+    app.focus = Pane::Main;
 
     press(&mut app, KeyCode::Char('/'));
     assert_eq!(
         app.focus,
         Pane::GlobalEnv,
-        "`/` finds an environment from wherever you are"
+        "`/` finds an environment from wherever you are — bar the Requests \
+         list, which has its own `/` filter"
     );
     assert!(app.env_filter_typing);
 
@@ -29335,5 +30252,2233 @@ fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {
         ),
         "and that row is still a request, not a file or folder"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ctrl+C used to set `quit` outright — bypassing even the confirmation `q`
+/// goes through — which meant the near-universal "copy" reflex tore the whole
+/// session down mid-drag. With something selected it now copies.
+#[test]
+fn ctrl_c_copies_the_selection_instead_of_quitting() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("{\n  \"tok\": \"abcdef\"\n}");
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    drag_response_line(&mut app, 1);
+    assert!(app.has_any_selection(), "the drag must leave a selection");
+
+    app.status = None;
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C over a selection must not quit");
+    assert!(app.overlay.is_none(), "nor ask about quitting");
+    assert!(matches!(app.status, Some(crate::i18n::Status::Copied)));
+}
+
+/// With nothing selected Ctrl+C always *asks*, even with confirm-on-exit off:
+/// a key that is hit by accident must never be able to end the session.
+#[test]
+fn ctrl_c_with_no_selection_always_asks_before_quitting() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = false;
+    assert!(!app.has_any_selection());
+
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C must never quit outright");
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::Confirm {
+                action: ConfirmAction::Exit,
+                ..
+            })
+        ),
+        "it raises the exit confirmation even though confirm_on_exit is off"
+    );
+    // Bare `q`, by contrast, still honours the setting and goes straight out.
+    app.overlay = None;
+    press(&mut app, KeyCode::Char('q'));
+    assert!(
+        app.quit,
+        "`q` keeps its confirm_on_exit-respecting behaviour"
+    );
+}
+
+/// Ctrl+C is swallowed while an overlay owns the screen: raising the exit
+/// popup there would replace that overlay and bin a half-finished form.
+#[test]
+fn ctrl_c_is_swallowed_while_an_overlay_is_open() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "the wizard must be open"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.quit, "Ctrl+C must not quit from inside an overlay");
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "and must leave the wizard exactly where it was"
+    );
+}
+
+/// Esc at the top level means the same thing as `q` — backing out of a TUI
+/// with Esc is the near-universal intuition.
+#[test]
+fn esc_at_the_top_level_quits_like_q() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = false;
+    press(&mut app, KeyCode::Esc);
+    assert!(app.quit, "Esc with nothing to dismiss quits");
+
+    // ...and it goes through the same confirmation, so nothing is lost.
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = true;
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.quit);
+    assert!(matches!(
+        app.overlay,
+        Some(Overlay::Confirm {
+            action: ConfirmAction::Exit,
+            ..
+        })
+    ));
+}
+
+/// Esc only quits once it has run out of things to close: a live selection is
+/// dismissed first, and only the *next* press means "quit".
+#[test]
+fn esc_dismisses_a_selection_before_it_means_quit() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("{\n  \"tok\": \"abcdef\"\n}");
+    app.session.confirm_on_exit = false;
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    drag_response_line(&mut app, 1);
+    assert!(app.has_any_selection());
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        !app.has_any_selection(),
+        "the first Esc clears the selection"
+    );
+    assert!(!app.quit, "and does not also quit");
+
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.quit,
+        "the second Esc, with nothing left to clear, quits"
+    );
+}
+
+/// Tab / Shift+Tab walk the buttons of a confirm popup: a row of choices is a
+/// form, and Tab is how everybody expects to move through one.
+#[test]
+fn tab_moves_between_the_choices_of_a_confirm_popup() {
+    let mut app = TuiApp::default();
+    app.session.confirm_on_exit = true;
+    press(&mut app, KeyCode::Char('q'));
+    let sel = |app: &TuiApp| match &app.overlay {
+        Some(Overlay::Confirm { sel, .. }) => *sel,
+        _ => panic!("the exit confirmation must be open"),
+    };
+    assert_eq!(sel(&app), 1, "it opens defaulted to No");
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 0, "Tab moves to Yes");
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 1, "and wraps back round to No");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(sel(&app), 0, "Shift+Tab moves the other way");
+
+    press(&mut app, KeyCode::Enter);
+    assert!(app.quit, "Enter still acts on whatever Tab landed on");
+}
+
+/// Every three-choice popup answers to Tab as well, and wraps at both ends.
+#[test]
+fn tab_walks_the_three_choice_popups_too() {
+    let mut app = TuiApp::default();
+    app.overlay = Some(Overlay::WorkspaceSwitchUnsaved {
+        ci: app.active_tab,
+        target: std::path::PathBuf::from("/tmp/whatever.hurl"),
+        sel: 0,
+    });
+    let sel = |app: &TuiApp| match &app.overlay {
+        Some(Overlay::WorkspaceSwitchUnsaved { sel, .. }) => *sel,
+        _ => panic!("the popup must still be open"),
+    };
+
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 1);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 2);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(sel(&app), 0, "Tab wraps past the last choice");
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(sel(&app), 2, "Shift+Tab wraps back past the first");
+}
+
+/// The keys the help lists have to be the keys that actually work, or the
+/// help is worse than nothing — Ctrl+C no longer quits, and Esc now does.
+#[test]
+fn the_help_lists_the_current_quit_and_copy_bindings() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('?'));
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        !text.contains("q, ^C"),
+        "the old 'Ctrl+C quits' claim must be gone: {text}"
+    );
+}
+
+/// Shared setup: an app whose active request has `body` as its last response.
+/// A bare entry with just a title and a method — enough for the list to show
+/// it and for title-uniquing to have something to work with.
+fn entry_named(title: &str) -> HurlEntry {
+    HurlEntry {
+        title: title.into(),
+        method: "GET".into(),
+        ..Default::default()
+    }
+}
+
+fn app_with_response_body(body: &str) -> TuiApp {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        title: "sel".into(),
+        last_response: Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: body.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    app.focus = Pane::Response;
+    app
+}
+
+/// Drag-select the whole of rendered Response line `row` (0-based).
+fn drag_response_line(app: &mut TuiApp, row: u16) {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    let area = app.resp_text_area;
+    assert!(area.width > 4 && area.height > row, "body must render");
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+}
+
+/// The target-collection cycler isn't drawn when editing an existing request
+/// (it already belongs to one), but it used to stay in the focus ring — so
+/// Down from Name parked the cursor on a row that renders nothing and it took
+/// a second Down to reach Method.
+#[test]
+fn down_from_name_reaches_method_directly_when_editing() {
+    let entry = HurlEntry {
+        title: "edit me".into(),
+        url: "http://example.test/".into(),
+        ..Default::default()
+    };
+    let mut app = TuiApp::default();
+    let form = NewReq::from_entry(0, 0, &entry, String::new(), vec!["Scratch".into()], None);
+    app.overlay = Some(Overlay::NewRequest(Box::new(form)));
+    assert_eq!(new_focus(&app), NewField::Name);
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Method,
+        "the hidden Target row must not be a focus stop while editing"
+    );
+    press(&mut app, KeyCode::Up);
+    assert_eq!(
+        new_focus(&app),
+        NewField::Name,
+        "and back again in one step"
+    );
+}
+
+/// A brand-new request *does* show the target cycler, so it stays in the ring.
+#[test]
+fn down_from_name_still_reaches_target_for_a_new_request() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(new_focus(&app), NewField::Name);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(new_focus(&app), NewField::Target);
+}
+
+/// A response with no body at all left the pane blank, which reads as "PaperBoy
+/// lost the body" rather than "the server sent none" — common for the bare 4xx
+/// plenty of servers return.
+#[test]
+fn an_empty_response_body_says_so_rather_than_rendering_blank() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_response_body("");
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.status = 404;
+        r.status_text = "Not Found".into();
+    }
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    let s = Strings::for_language(&Language::English);
+    assert!(text.contains("404"), "the status still shows");
+    assert!(
+        text.contains(s.resp_empty_body),
+        "the empty body is called out: {text}"
+    );
+
+    // A response that *does* have a body must not get the note.
+    let mut app = app_with_response_body("{\n  \"error\": \"nope\"\n}");
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.status = 404;
+        r.status_text = "Not Found".into();
+    }
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("nope"), "a 4xx body renders in full: {text}");
+    assert!(!text.contains(s.resp_empty_body));
+}
+
+/// A 4xx/5xx body is usually the most useful thing on screen — it is where the
+/// API explains itself — so it has to survive every extra row the Response pane
+/// puts above it. A failed run adds an error line and a list of assert rows,
+/// which is the layout path most likely to squeeze the body out.
+#[test]
+fn error_status_bodies_render_even_with_an_error_line_and_asserts() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    for status in [400u16, 401, 404, 422, 500, 502, 503] {
+        let mut app = app_with_response_body("{\n  \"detail\": \"why-it-failed\"\n}");
+        let ci = app.active_tab;
+        let r = app.collections[ci].entries[0]
+            .last_response
+            .as_mut()
+            .expect("a response");
+        r.status = status;
+        r.status_text = "Err".into();
+        r.error = format!("Expected status 200 but got {status}");
+        r.assert_results = vec![
+            crate::hurl::AssertOutcome {
+                expr: format!("status == {status}"),
+                passed: false,
+                detail: "actual value is 200".into(),
+            },
+            crate::hurl::AssertOutcome {
+                expr: "jsonpath \"$.detail\" exists".into(),
+                passed: true,
+                detail: String::new(),
+            },
+        ];
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains(&status.to_string()),
+            "the {status} status shows"
+        );
+        assert!(
+            text.contains("why-it-failed"),
+            "the {status} body must render alongside the error and asserts: {text}"
+        );
+        let s = Strings::for_language(&Language::English);
+        assert!(
+            !text.contains(s.resp_empty_body),
+            "a response that has a body must not be called empty"
+        );
+    }
+}
+
+/// Shared setup: a response carrying both a body and headers, for the Response
+/// pane's section tabs.
+fn app_with_response_headers(body: &str, headers: &[(&str, &str)]) -> TuiApp {
+    let mut app = app_with_response_body(body);
+    let ci = app.active_tab;
+    if let Some(r) = app.collections[ci].entries[0].last_response.as_mut() {
+        r.headers = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+    }
+    app
+}
+
+/// Render the whole UI at a comfortable size and return the screen as text.
+fn render_screen(app: &mut TuiApp) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    term.backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+/// Render the whole UI and return just the footer (the bottom row).
+fn render_footer(app: &mut TuiApp) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (w, h) = (160u16, 30u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    (0..w).map(|x| buf[(x, h - 1)].symbol()).collect()
+}
+
+/// `i` steps the Response section ring and Shift+I steps back. A ring rather
+/// than a boolean toggle because more sections are expected (timings, capture
+/// values) and a third one mustn't need a third key.
+#[test]
+fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
+    let mut app = app_with_response_headers("{}", &[("content-type", "application/json")]);
+    assert_eq!(app.response_section, ResponseSection::Body);
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Headers);
+    // Two members, so forward wraps back round rather than sticking.
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Body);
+
+    press(&mut app, KeyCode::Char('I'));
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Headers,
+        "Shift+I steps the ring backwards"
+    );
+}
+
+/// The section keys are scoped to the Response pane, so `i` stays free for
+/// every other panel — the same rule `c` (compact) already follows.
+#[test]
+fn i_only_switches_sections_while_the_response_pane_has_focus() {
+    for pane in [Pane::List, Pane::Main, Pane::Tabs, Pane::GlobalEnv] {
+        let mut app = app_with_response_headers("{}", &[("x", "y")]);
+        app.focus = pane;
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(
+            app.response_section,
+            ResponseSection::Body,
+            "{pane:?} must not steer the Response pane's tabs"
+        );
+    }
+}
+
+/// `[`/`]` mean "previous/next collection tab" from every pane, and that must
+/// stay true over the Response pane — the whole reason the sections got their
+/// own key instead.
+#[test]
+fn brackets_still_change_collection_tab_from_the_response_pane() {
+    let mut app = app_with_response_headers("{}", &[("x", "y")]);
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    let before = app.active_tab;
+
+    press(&mut app, KeyCode::Char(']'));
+    assert_ne!(app.active_tab, before, "] still cycles the collection tabs");
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Body,
+        "and must not have touched the response sections"
+    );
+}
+
+/// The tabs are drawn on the panel border (the pane is too short to spend a row
+/// on them), and the Headers section shows the captured headers.
+#[test]
+fn the_headers_section_renders_the_response_headers() {
+    let mut app = app_with_response_headers(
+        "{\"ok\":true}",
+        &[
+            ("content-type", "application/json"),
+            ("x-request-id", "abc123"),
+        ],
+    );
+    let s = Strings::for_language(&Language::English);
+
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(s.resp_section_body) && text.contains(s.resp_section_headers),
+        "both section tabs are on the border: {text}"
+    );
+    assert!(text.contains("\"ok\":true"), "the Body section is on view");
+    assert!(
+        !text.contains("x-request-id"),
+        "headers are not shown in the Body section"
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains("content-type: application/json"),
+        "the Headers section lists the headers: {text}"
+    );
+    assert!(text.contains("x-request-id: abc123"));
+    assert!(
+        !text.contains("\"ok\":true"),
+        "and the body has given up the pane"
+    );
+    assert!(
+        text.contains("200"),
+        "the status line describes the whole response, so it stays put"
+    );
+}
+
+/// A blank pane reads as "PaperBoy lost it" whichever section is on view, so
+/// the empty note follows the ring rather than being body-only.
+#[test]
+fn an_empty_headers_section_says_so_rather_than_rendering_blank() {
+    let mut app = app_with_response_headers("{}", &[]);
+    let s = Strings::for_language(&Language::English);
+
+    press(&mut app, KeyCode::Char('i'));
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(s.resp_no_headers),
+        "no headers is called out: {text}"
+    );
+    assert!(
+        !text.contains(s.resp_empty_body),
+        "and it's the headers note, not the body one"
+    );
+}
+
+/// Headers go through the same selectable panel as the body, so a whole-panel
+/// `y`-copy yields the headers while they're the section on view. Getting this
+/// for free is the reason they aren't drawn as a separate widget.
+#[test]
+fn the_headers_section_can_be_copied_like_a_body() {
+    let mut app = app_with_response_headers("{\"ok\":true}", &[("etag", "W/\"9\"")]);
+    render_screen(&mut app);
+    assert_eq!(
+        app.whole_panel_text(Pane::Response).as_deref(),
+        Some("{\"ok\":true}")
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    render_screen(&mut app);
+    assert_eq!(
+        app.whole_panel_text(Pane::Response).as_deref(),
+        Some("etag: W/\"9\""),
+        "the copy follows the section on view"
+    );
+}
+
+/// Switching section swaps what the panel holds, so a scroll offset and any
+/// painted selection are both left pointing at text that has gone.
+#[test]
+fn switching_section_resets_the_scroll_and_drops_a_stale_selection() {
+    let body = (0..200)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = app_with_response_headers(&body, &[("a", "b")]);
+    render_screen(&mut app);
+
+    app.resp_panel.set_scroll(40);
+    drag_response_line(&mut app, 0);
+    assert!(app.resp_panel.has_selection(), "a selection to invalidate");
+
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(
+        app.resp_panel.scroll(),
+        0,
+        "scroll starts again from the top"
+    );
+    assert!(
+        !app.resp_panel.has_selection(),
+        "the old selection pointed at body text that is no longer on screen"
+    );
+}
+
+/// Compact view shortens long string literals, which a header table has none
+/// of. Toggling a flag with no visible effect that then surprises you back in
+/// the Body is worse than refusing, so `c` is Body-only.
+#[test]
+fn compact_view_is_refused_in_the_headers_section() {
+    let mut app = app_with_response_headers("{}", &[("a", "b")]);
+    press(&mut app, KeyCode::Char('i'));
+    assert_eq!(app.response_section, ResponseSection::Headers);
+
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        !app.response_compact,
+        "c must not arm compact view from the Headers section"
+    );
+
+    press(&mut app, KeyCode::Char('i'));
+    press(&mut app, KeyCode::Char('c'));
+    assert!(app.response_compact, "but it still works on the Body");
+}
+
+/// `x` used to be the fall-through arm, so it closed the active collection tab
+/// from the Main and Response panes too — where nothing on screen suggests a
+/// keypress is aimed at the tab bar. Reading a response and pressing `x` took
+/// the whole collection with it.
+#[test]
+fn x_closes_a_tab_only_from_the_tab_bar() {
+    for pane in [Pane::Main, Pane::Response, Pane::List, Pane::GlobalEnv] {
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("second".into(), Vec::new()));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.collections.len(),
+            2,
+            "x in {pane:?} must not close the collection tab"
+        );
+    }
+
+    // From the tab bar itself it still closes, which is where the key reads as
+    // being about the tab.
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    app.active_tab = 1;
+    app.focus = Pane::Tabs;
+    press(&mut app, KeyCode::Char('x'));
+    assert_eq!(app.collections.len(), 1, "x on the tab bar closes the tab");
+}
+
+/// Scoping `x` mustn't leave "close this tab" unreachable from the panes it no
+/// longer fires in — Ctrl+W is the OS-wide convention for it and isn't a key
+/// anyone hits by accident while reading.
+#[test]
+fn ctrl_w_still_closes_the_tab_from_any_pane() {
+    for pane in [Pane::Main, Pane::Response, Pane::List, Pane::Tabs] {
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("second".into(), Vec::new()));
+        app.active_tab = 1;
+        app.focus = pane;
+
+        ctrl(&mut app, KeyCode::Char('w'));
+        assert_eq!(
+            app.collections.len(),
+            1,
+            "Ctrl+W must still close the tab from {pane:?}"
+        );
+    }
+}
+
+/// The footer is one line, and at 80 columns it was being truncated before it
+/// reached the PaperBoy-specific hints. Arrow keys moving a highlight and Enter
+/// opening it are the two most universal conventions there are, so they no
+/// longer spend room restating themselves — and `x` is only offered where it
+/// actually does something.
+#[test]
+fn the_footer_drops_the_universal_hints_and_scopes_the_pane_specific_ones() {
+    let mut app = app_with_response_headers("{}", &[("a", "b")]);
+    app.focus = Pane::Response;
+    let s = Strings::for_language(&Language::English);
+
+    let foot = render_footer(&mut app);
+    assert!(
+        !foot.contains("\u{2191}\u{2193}") && !foot.contains("Enter"),
+        "the universal arrow/Enter hints are gone: {foot}"
+    );
+    assert!(foot.contains(s.foot_focus), "Tab focus still leads the row");
+    assert!(
+        foot.contains(s.foot_response_section),
+        "the freed room goes to the Response hints: {foot}"
+    );
+    assert!(
+        !foot.contains(&format!("x {}", s.foot_close)),
+        "x does nothing in the Response pane, so it isn't advertised there"
+    );
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "nor does F2, for the same reason"
+    );
+
+    app.focus = Pane::List;
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(&format!("x {}", s.foot_close)),
+        "but x is offered in the Requests list, where it deletes a request: {foot}"
+    );
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "F2 has nothing to rename in the Requests list yet, so it stays hidden"
+    );
+
+    // The built-in Request tab can't be renamed, so F2 stays hidden even on
+    // the tab bar until there's a closable tab to act on.
+    app.focus = Pane::Tabs;
+    let foot = render_footer(&mut app);
+    assert!(
+        !foot.contains(&format!("F2 {}", s.foot_rename)),
+        "the built-in tab has no rename to offer: {foot}"
+    );
+
+    app.collections
+        .push(Collection::new("second".into(), Vec::new()));
+    app.active_tab = 1;
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains(&format!("F2 {}", s.foot_rename)),
+        "F2 renames a real tab from the tab bar: {foot}"
+    );
+}
+
+/// Render the whole UI at `width` and return the row holding the Environments
+/// panel's bottom border (the one carrying its shortcut hint).
+fn render_env_hint_row(app: &mut TuiApp, width: u16) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (w, h) = (width, 30u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .find(|row| row.contains("activate"))
+        .unwrap_or_default()
+}
+
+/// A border hint drops whole items rather than letting ratatui clip the last
+/// one mid-word. Half a shortcut reads as a rendering fault; a missing one just
+/// sends people to the help overlay.
+#[test]
+fn a_border_hint_drops_whole_items_instead_of_clipping_one() {
+    let parts = [
+        "F5 run".to_string(),
+        "Alt+F5 run all".to_string(),
+        "p link env".to_string(),
+    ];
+    let sep = " \u{00b7} ";
+    let all = parts.join(sep);
+
+    // Wide enough for everything (the helper reserves 3 columns for the two
+    // border cells plus a gap, so ask for 3 more than the text needs).
+    assert_eq!(
+        fit_border_hint(&parts, sep, all.chars().count() as u16 + 3),
+        all
+    );
+
+    // One column short of the whole thing loses the *last* item outright,
+    // never a fragment of it.
+    let two = parts[..2].join(sep);
+    assert_eq!(
+        fit_border_hint(&parts, sep, all.chars().count() as u16 + 2),
+        two
+    );
+
+    // Likewise down to a single item, and then to nothing at all rather than a
+    // stub of the highest-priority hint.
+    assert_eq!(
+        fit_border_hint(&parts, sep, two.chars().count() as u16 + 2),
+        parts[0]
+    );
+    assert_eq!(fit_border_hint(&parts, sep, 5), "");
+}
+
+/// The Environments panel's hint used to have no width check at all, so a
+/// narrow panel showed "g go to act" hanging mid-word.
+#[test]
+fn the_environments_hint_is_never_cut_mid_word() {
+    let mut app = TuiApp::default();
+    // Widths from "plenty" down to "nothing fits" — at no point may a partial
+    // word appear on the border.
+    let mut shown = 0;
+    for w in (40u16..=140).step_by(4) {
+        let row = render_env_hint_row(&mut app, w);
+        if row.is_empty() {
+            continue;
+        }
+        assert!(
+            row.contains("a activate/deactivate"),
+            "width {w} clipped the activate hint: {row}"
+        );
+        shown += 1;
+    }
+    assert!(shown > 0, "no width drew the hint at all — test is vacuous");
+}
+
+/// `? help` and `q quit` never change, so they sit in a fixed spot at the
+/// front: hints that jump around as the selection moves are hard to aim at.
+#[test]
+fn the_footer_keeps_the_universal_hints_in_a_fixed_position() {
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("Work".into(), Vec::new()));
+    app.active_tab = 1;
+    let s = Strings::for_language(&Language::English);
+
+    for pane in [Pane::Tabs, Pane::Main, Pane::Response, Pane::GlobalEnv] {
+        app.focus = pane;
+        let foot = render_footer(&mut app);
+        assert!(
+            foot.starts_with(&format!(
+                "Tab {} \u{00b7} ? {} \u{00b7} q {}",
+                s.foot_focus, s.foot_help, s.foot_quit
+            )),
+            "footer prefix moved with focus {pane:?}: {foot}"
+        );
+    }
+}
+
+/// A duplicate lands directly beneath its original, with a title of its own.
+///
+/// The name matters more than it looks: a request's title is its identifier —
+/// reports address requests by name — so two entries sharing one makes the
+/// reference ambiguous and breaks it for *both*.
+#[test]
+fn c_duplicates_the_selected_request_beneath_itself_with_a_fresh_title() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("Fetch user"),
+        entry_named("Logout"),
+    ];
+    app.collections[ci].selected_entry = 1;
+    app.collections[ci].list_cursor = 1;
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('c'));
+
+    let titles: Vec<&str> = app.collections[ci]
+        .entries
+        .iter()
+        .map(|e| e.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Login", "Fetch user", "Fetch user (2)", "Logout"],
+        "the copy goes in beside its original, not at the end"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 2,
+        "the selection follows the copy, which is the thing to be edited next"
+    );
+
+    // Duplicating the copy counts on rather than nesting suffixes.
+    press(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.collections[ci].entries[3].title, "Fetch user (3)");
+}
+
+/// The copy is a request that has never been sent, so it mustn't inherit the
+/// original's response — that would credit it with a result it didn't produce.
+#[test]
+fn a_duplicated_request_starts_with_no_response_of_its_own() {
+    let mut app = app_with_response_body("{\"ok\":true}");
+    let ci = app.active_tab;
+    app.collections[ci].selected_entry = 0;
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+    assert!(app.collections[ci].entries[0].last_response.is_some());
+
+    press(&mut app, KeyCode::Char('c'));
+
+    assert!(
+        app.collections[ci].entries[1].last_response.is_none(),
+        "the copy has no response until it is run"
+    );
+    assert!(
+        app.collections[ci].entries[0].last_response.is_some(),
+        "the original keeps its own"
+    );
+}
+
+/// `c` on a folder or "up" row has nothing to duplicate, and must not reach
+/// past the cursor for some other entry (the guard `x` already uses).
+#[test]
+fn c_does_nothing_when_the_cursor_is_not_on_a_request() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Auth/Login"), entry_named("Auth/Logout")];
+    app.collections[ci].list_cursor = 0; // the "Auth" folder row
+    app.focus = Pane::List;
+    let before = app.collections[ci].entries.len();
+
+    press(&mut app, KeyCode::Char('c'));
+
+    assert_eq!(app.collections[ci].entries.len(), before);
+}
+
+/// Titles are uniqued per folder: the leaf is renamed, the path is kept, and a
+/// same-named request in a *different* folder is not a clash.
+#[test]
+fn a_duplicate_title_keeps_its_folder_and_ignores_namesakes_elsewhere() {
+    use crate::collection::unique_entry_title;
+    let entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Admin/Login"),
+        entry_named("Auth/Login (2)"),
+    ];
+    assert_eq!(
+        unique_entry_title(&entries, "Auth/Login"),
+        "Auth/Login (3)",
+        "(2) is taken in this folder, so count on"
+    );
+    assert_eq!(
+        unique_entry_title(&entries, "Admin/Login"),
+        "Admin/Login (2)",
+        "the other folder's (2) is a different request entirely"
+    );
+}
+
+fn alt(app: &mut TuiApp, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::ALT));
+}
+
+/// `Alt+↑`/`Alt+↓` reorder the highlighted request. The order matters: it is
+/// the one `run_all_entries` follows, so it decides which request captures a
+/// token before another uses it.
+#[test]
+fn alt_arrows_move_the_selected_request_up_and_down_the_list() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("Fetch user"),
+        entry_named("Logout"),
+    ];
+    app.collections[ci].selected_entry = 2;
+    app.collections[ci].list_cursor = 2;
+    app.focus = Pane::List;
+
+    alt(&mut app, KeyCode::Up);
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Login", "Logout", "Fetch user"],
+        "Logout moved up one place"
+    );
+    assert_eq!(
+        app.collections[ci].selected_entry, 1,
+        "the selection stays on the request that moved"
+    );
+
+    alt(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["Login", "Fetch user", "Logout"]);
+}
+
+/// The bare arrows must still just move the cursor — the whole reason for
+/// putting the reorder behind Alt.
+#[test]
+fn a_bare_arrow_still_only_moves_the_cursor() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("a"), entry_named("b")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "nothing was reordered");
+    assert_eq!(app.collections[ci].selected_entry, 1);
+}
+
+/// At either end there is nowhere to go, and a folder row is not a request.
+#[test]
+fn a_reorder_with_nowhere_to_go_does_nothing() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("a"), entry_named("b")];
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+    alt(&mut app, KeyCode::Up);
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "already at the top");
+
+    // A folder row: nothing under the cursor to move.
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Auth/Login"), entry_named("Auth/Logout")];
+    app.collections[ci].list_cursor = 0; // the "Auth" folder row
+    app.focus = Pane::List;
+    alt(&mut app, KeyCode::Down);
+    assert_eq!(titles_of(&app, ci), vec!["Auth/Login", "Auth/Logout"]);
+}
+
+/// Inside a folder, "one place" means one place *as shown*. The folder's
+/// requests need not be adjacent in the underlying vector, so a naive swap
+/// would drag an unrelated request from another folder across them.
+#[test]
+fn reordering_inside_a_folder_steps_over_requests_from_other_folders() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Users/List"),
+        entry_named("Auth/Logout"),
+    ];
+    // Browse into Auth, where the rows are Up, Login, Logout.
+    app.collections[ci].folder = vec!["Auth".into()];
+    app.collections[ci].list_cursor = 2; // Logout
+    app.collections[ci].selected_entry = 2;
+    app.focus = Pane::List;
+
+    alt(&mut app, KeyCode::Up);
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Auth/Logout", "Auth/Login", "Users/List"],
+        "Logout moved ahead of Login, and Users/List kept its own place after both"
+    );
+}
+
+fn titles_of(app: &TuiApp, ci: usize) -> Vec<&str> {
+    app.collections[ci]
+        .entries
+        .iter()
+        .map(|e| e.title.as_str())
+        .collect()
+}
+
+/// Type a query into the Requests list filter, one key at a time, the way a
+/// user does.
+fn type_filter(app: &mut TuiApp, q: &str) {
+    for c in q.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
+/// `/` narrows the Requests list to matching requests from the *whole*
+/// collection. The list normally shows one folder at a time, so reaching
+/// requests the current folder hides is the point of the key.
+#[test]
+fn slash_filters_the_requests_list_across_every_folder() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Auth/Login"),
+        entry_named("Users/List"),
+        entry_named("Auth/Logout"),
+    ];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert!(app.list_filter_typing, "the filter is capturing keys");
+    type_filter(&mut app, "log");
+
+    assert_eq!(app.collections[ci].list_query, "log");
+    assert_eq!(
+        app.collections[ci].rows(),
+        vec![crate::tree::Row::Entry(0), crate::tree::Row::Entry(2)],
+        "both Auth requests match, flattened out of their folder"
+    );
+}
+
+/// The letters typed into the filter must not reach the list's own single-key
+/// actions — `u`, `c` and `x` all sit in the alphabet of a request name.
+#[test]
+fn typing_a_filter_does_not_fire_the_lists_letter_shortcuts() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("upload"), entry_named("checkout")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    // `u` would undo a delete, `c` would duplicate, `x` would delete.
+    type_filter(&mut app, "uxc");
+
+    assert_eq!(app.collections[ci].list_query, "uxc");
+    assert_eq!(
+        app.collections[ci].entries.len(),
+        2,
+        "no request was deleted or duplicated"
+    );
+}
+
+/// Esc is the way out of a filter you no longer want, and it must not quit the
+/// app on the way — the quit arm sits directly below it.
+#[test]
+fn esc_clears_the_request_filter_rather_than_quitting() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.collections[ci].list_query.is_empty());
+    assert!(!app.list_filter_typing);
+    assert!(!app.quit, "Esc cleared the filter, it did not quit");
+    assert_eq!(
+        app.collections[ci].rows().len(),
+        2,
+        "the whole list is back"
+    );
+}
+
+/// Enter keeps the filter but hands the keyboard back, so the narrowed list can
+/// be navigated and acted on — the same bargain the Environments filter makes.
+#[test]
+fn enter_leaves_the_filter_box_but_keeps_the_filter() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.list_filter_typing, "the box gave the keyboard back");
+    assert_eq!(
+        app.collections[ci].list_query, "alph",
+        "the filter is still on"
+    );
+    assert_eq!(app.collections[ci].rows().len(), 1);
+}
+
+/// Clearing the filter has to leave the cursor on the request the user went
+/// looking for, including following it into whatever folder it lives in —
+/// otherwise the search ends by throwing away its own result.
+#[test]
+fn clearing_the_filter_follows_the_request_that_was_found() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("Users/List"), entry_named("Auth/Logout")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "logout");
+    assert_eq!(app.collections[ci].selected_entry, 1);
+
+    press(&mut app, KeyCode::Esc);
+
+    assert_eq!(
+        app.collections[ci].folder,
+        vec!["Auth".to_string()],
+        "the list is now browsing the folder the match lives in"
+    );
+    assert_eq!(app.collections[ci].selected_entry, 1);
+    let cursor = app.collections[ci].list_cursor;
+    assert!(
+        matches!(
+            app.collections[ci].rows().get(cursor),
+            Some(crate::tree::Row::Entry(1))
+        ),
+        "and the cursor is on it"
+    );
+}
+
+/// A filtered list hides the requests a move would step over, so the distance
+/// travelled would be unpredictable and invisible. Refuse, and say why.
+#[test]
+fn reordering_is_refused_while_the_list_is_filtered() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![
+        entry_named("Login"),
+        entry_named("unrelated"),
+        entry_named("Logout"),
+    ];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "log");
+    press(&mut app, KeyCode::Enter);
+    // The cursor is on "Logout", whose neighbour *in the filtered list* is
+    // "Login" — two places away in the collection.
+    app.collections[ci].list_cursor = 1;
+
+    alt(&mut app, KeyCode::Up);
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["Login", "unrelated", "Logout"],
+        "nothing moved"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::ReorderNeedsUnfilteredList)
+    ));
+}
+
+/// The filter strip has to be on screen saying what is being filtered, or a
+/// short list just looks like a collection that lost its requests.
+#[test]
+fn the_filter_strip_shows_the_query_and_says_when_nothing_matches() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("alpha"), entry_named("beta")];
+    app.focus = Pane::List;
+
+    press(&mut app, KeyCode::Char('/'));
+    type_filter(&mut app, "alph");
+    let text = render_screen(&mut app);
+    assert!(text.contains("alph"), "the query is on screen: {text}");
+
+    type_filter(&mut app, "zzz");
+    let text = render_screen(&mut app);
+    assert!(
+        text.contains(crate::i18n::Strings::for_language(&app.language).list_filter_no_matches),
+        "an empty filtered list explains itself: {text}"
+    );
+}
+
+/// `/` reaches the Environments filter from any pane *except* the list — which
+/// now includes a Workspace tab's tree, where it used to be the only meaning
+/// available (see
+/// `slash_searches_the_tree_instead_of_jumping_to_environments_in_a_workspace`).
+#[test]
+fn slash_outside_the_list_reaches_the_environments_filter() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].workspace_root = Some(std::path::PathBuf::from("/tmp/ws"));
+    app.collections[ci].workspace_auto_prompt_dismissed = true;
+    app.focus = Pane::Response;
+
+    press(&mut app, KeyCode::Char('/'));
+
+    assert!(!app.list_filter_typing);
+    assert!(app.env_filter_typing);
+    assert_eq!(app.focus, Pane::GlobalEnv);
+}
+
+/// The Environments filter is a mode, and `Tab` deliberately falls through it
+/// so the keyboard can leave. Without a focus guard the mode stayed armed in
+/// the pane the user walked away from and ate every printable key in the app —
+/// the Requests list's own letter actions, and `q` with it.
+#[test]
+fn tabbing_away_from_the_environments_filter_gives_the_keyboard_back() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![entry_named("keep"), entry_named("goner")];
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    assert!(app.env_filter_typing);
+
+    // Tab is not consumed by the filter, so focus moves on.
+    press(&mut app, KeyCode::Tab);
+    assert_ne!(app.focus, Pane::GlobalEnv);
+
+    app.focus = Pane::List;
+    app.collections[ci].selected_entry = 1;
+    app.collections[ci].list_cursor = 1;
+    // The point is that `x` reaches the Requests list at all, not that it asks.
+    app.confirm_on_delete_request = false;
+    press(&mut app, KeyCode::Char('x'));
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["keep"],
+        "`x` deleted the selected request instead of being typed into the \
+         environments filter"
+    );
+    assert!(app.env_query.is_empty(), "and nothing was typed into it");
+}
+
+/// Coming back to the panel resumes typing into the filter that is still on
+/// screen — the guard parks the mode, it doesn't cancel it.
+#[test]
+fn returning_to_the_environments_panel_resumes_its_filter() {
+    let mut app = TuiApp::default();
+    app.focus = Pane::GlobalEnv;
+
+    press(&mut app, KeyCode::Char('/'));
+    press(&mut app, KeyCode::Char('p'));
+    press(&mut app, KeyCode::Tab);
+    app.focus = Pane::GlobalEnv;
+    press(&mut app, KeyCode::Char('r'));
+
+    assert_eq!(app.env_query, "pr");
+}
+
+/// The whole point of the feature, from the user's side: type a note into the
+/// body field and it is still there next time, while the file on disk — and so
+/// the request that goes out — is strict JSON with no notes in it.
+#[test]
+fn a_note_typed_into_the_body_survives_a_save_and_reload() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    press(&mut app, KeyCode::Char('n'));
+    let Some(Overlay::NewRequest(form)) = &mut app.overlay else {
+        panic!("wizard did not open");
+    };
+    let authored = "{\n  // the caller\n  \"id\": 1\n}";
+    form.url = super::editor::Editor::new("http://h/a", false);
+    form.body = super::editor::Editor::new(authored, true);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('s'));
+
+    let entry = &app.collections[0].entries[0];
+    assert_eq!(entry.body_src.as_deref(), Some(authored));
+    assert_eq!(
+        entry.body_wire().as_deref(),
+        Some("{\n  \"id\": 1\n}"),
+        "the request that goes out carries no commentary"
+    );
+
+    let text = app.collections[0].to_hurl();
+    let reloaded = crate::hurl::parse_hurl(&text);
+    assert_eq!(
+        reloaded[0].body_src.as_deref(),
+        Some(authored),
+        "the note came back:\n{text}"
+    );
+}
+
+// ── Body notes that no longer describe their body ──────────────────────────
+
+/// The file that produces a request carrying leftover `# [Body]` notes: the
+/// block's count no longer matches the lines below it, so the parser leaves it
+/// as prose rather than claiming it.
+fn collection_with_stale_notes() -> Collection {
+    let text = "# annotated\n\
+                POST http://h/a\n\
+                # [Body] 3\n\
+                # {\n\
+                #   \"a\": 1 // mine\n\
+                # }\n\
+                {\n  \"b\": 2\n}\n";
+    Collection::new("api".into(), crate::hurl::parse_hurl(text))
+}
+
+/// Ctrl+B offers the two honest answers, and taking the notes back makes them
+/// the body again — comments and all — while what goes on the wire stays
+/// strict JSON.
+#[test]
+fn ctrl_b_can_take_stale_body_notes_back_as_the_body() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+    assert!(
+        app.collections[1].entries[0].stale_body_notes().is_some(),
+        "the fixture should carry leftover notes"
+    );
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(
+        matches!(
+            app.overlay,
+            Some(Overlay::StaleBodyNotes {
+                ci: 1,
+                ei: 0,
+                sel: 2
+            })
+        ),
+        "Ctrl+B opens the resolve overlay, defaulting to leaving them alone"
+    );
+
+    // Move up from "leave them alone" to "use the notes as the body".
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Up);
+    press(&mut app, KeyCode::Enter);
+
+    let e = &app.collections[1].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // mine\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    assert!(e.stale_body_notes().is_none(), "nothing left over");
+    assert!(e.modified, "the request changed and needs saving");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAdopted)
+    ));
+}
+
+/// Discarding deletes the notes and leaves the body exactly as it was.
+#[test]
+fn stale_body_notes_can_be_deleted_leaving_the_body_alone() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    // Down from "leave them alone" wraps to "use the notes"; one more is
+    // "delete the notes".
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+
+    let e = &app.collections[1].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"b\": 2\n}"),
+        "body kept"
+    );
+    assert!(e.stale_body_notes().is_none());
+    assert!(
+        !crate::hurl::collection_to_hurl(&app.collections[1].entries).contains("[Body]"),
+        "the block is gone from the file"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesDiscarded)
+    ));
+}
+
+/// Escaping changes nothing: the notes are kept precisely because they were
+/// never thrown away without being asked about.
+#[test]
+fn leaving_stale_body_notes_alone_changes_nothing() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    app.focus = Pane::List;
+    let before = crate::hurl::collection_to_hurl(&app.collections[1].entries);
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.overlay.is_none());
+    assert_eq!(
+        crate::hurl::collection_to_hurl(&app.collections[1].entries),
+        before
+    );
+    assert!(app.collections[1].entries[0].stale_body_notes().is_some());
+}
+
+/// A request with nothing stale must not open an overlay that has nothing to
+/// say.
+#[test]
+fn ctrl_b_does_nothing_when_the_notes_still_match() {
+    let mut app = TuiApp::default();
+    let e = HurlEntry::from_fields("plain", "GET", "http://h/a", vec![], "{\"a\": 1}");
+    app.collections.push(Collection::new("api".into(), vec![e]));
+    app.active_tab = 1;
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.overlay.is_none());
+}
+
+/// The Requests view says so, rather than leaving the only clue to be comments
+/// that quietly stop following the body around.
+#[test]
+fn the_requests_view_mentions_stale_body_notes() {
+    let mut app = TuiApp::default();
+    app.collections.push(collection_with_stale_notes());
+    app.active_tab = 1;
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+    // Only the opening clause: the hint is one line and the terminal is narrow
+    // enough that the tail may wrap out of the pane.
+    let head = s.body_notes_stale_hint.split(" — ").next().unwrap();
+    assert!(
+        text.contains(head),
+        "the stale-notes hint should be on screen:\n{text}"
+    );
+}
+
+// ── Raw Mode: which copy of an annotated body an edit meant ────────────────
+
+/// Open Raw Mode on the first request of tab 0, replace its text wholesale,
+/// and commit — the path a user takes when hand-editing the Hurl.
+fn raw_edit(app: &mut TuiApp, text: &str) {
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new(text, true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert!(app.overlay.is_none(), "the edit should have been accepted");
+}
+
+fn app_with_annotated_body() -> TuiApp {
+    let mut app = TuiApp::default();
+    let mut e = HurlEntry::from_fields("r", "POST", "http://h/a", vec![], "");
+    e.body_src = Some("{\n  \"a\": 1 // mine\n}".into());
+    app.collections[0].entries.push(e);
+    app
+}
+
+/// A note edit that doesn't change what would be sent isn't a disagreement at
+/// all — the block still reconciles with the body below it, so it is claimed
+/// as it always was and there is nothing to tell the user.
+#[test]
+fn raw_mode_takes_a_cosmetic_note_edit_in_its_stride() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    let edited = opened.replace("// mine", "// yours");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // yours\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    assert!(e.stale_body_notes().is_none(), "still the body's own notes");
+    assert!(app.status.is_none(), "no conflict arose, so say nothing");
+}
+
+/// Editing only the notes, so that they no longer describe the body below
+/// them, must apply them. Left to the file's own precedence the sent body
+/// would win and the user's edit would be preserved but never applied — which
+/// reads as being ignored.
+#[test]
+fn raw_mode_applies_an_edit_made_only_to_the_notes() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Change the value inside the notes only, leaving the strict body alone.
+    let edited = opened.replace("#   \"a\": 1 // mine", "#   \"a\": 9 // mine");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 9 // mine\n}"));
+    assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 9\n}"));
+    assert!(e.stale_body_notes().is_none(), "the notes were applied");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAppliedFromRaw)
+    ));
+}
+
+/// Editing only the body is the case the file's precedence already gets right:
+/// the body is what runs, so it wins, and the notes are kept rather than
+/// deleted — now visibly, as leftover notes.
+#[test]
+fn raw_mode_keeps_the_body_when_only_the_body_was_edited() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Change the strict body only. It appears once outside the `#` block.
+    let edited = opened.replace("\n  \"a\": 1\n}", "\n  \"a\": 2\n}");
+    assert_ne!(edited, opened);
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 2\n}"),
+        "body wins"
+    );
+    let (_, notes) = e.stale_body_notes().expect("the notes are kept");
+    assert_eq!(notes, "{\n  \"a\": 1 // mine\n}");
+    assert!(
+        !matches!(app.status, Some(crate::i18n::Status::NotesAppliedFromRaw)),
+        "nothing was applied from the notes"
+    );
+}
+
+/// Two edits cannot be merged into one body, so the body wins and the user is
+/// told — rather than left to discover that half of what they typed did
+/// nothing.
+#[test]
+fn raw_mode_says_so_when_the_body_and_its_notes_were_both_edited() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    let edited = opened
+        .replace("// mine", "// yours")
+        .replace("\n  \"a\": 1\n}", "\n  \"a\": 2\n}");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 2\n}"),
+        "body wins"
+    );
+    let (_, notes) = e.stale_body_notes().expect("the notes are kept");
+    assert_eq!(
+        notes, "{\n  \"a\": 1 // yours\n}",
+        "the edited notes survive"
+    );
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesKeptBodyWon)
+    ));
+}
+
+/// Notes that would not survive being written back as a body are never
+/// adopted, however plain the intent: doing so would put comments in the sent
+/// body, which is not valid Hurl and reads back as an empty collection.
+#[test]
+fn raw_mode_will_not_apply_notes_that_would_not_make_a_valid_body() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Break the notes so that stripping them no longer yields JSON, without
+    // touching the strict body.
+    let edited = opened.replace("#   \"a\": 1 // mine", "#   \"a\": 1 \"b\" // mine");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 1\n}"),
+        "the sent body is untouched and still strict JSON"
+    );
+    assert!(
+        e.stale_body_notes().is_some(),
+        "the notes are kept, not lost"
+    );
+    assert!(!matches!(
+        app.status,
+        Some(crate::i18n::Status::NotesAppliedFromRaw)
+    ));
+}
+
+/// A request with no notes at all must be unaffected by any of this.
+#[test]
+fn raw_mode_leaves_a_plain_body_alone() {
+    let mut app = TuiApp::default();
+    let e = HurlEntry::from_fields("r", "POST", "http://h/a", vec![], "{\"a\": 1}");
+    app.collections[0].entries.push(e);
+
+    let opened = app.collections[0].entries[0].to_hurl();
+    raw_edit(&mut app, &opened.replace("http://h/a", "http://h/b"));
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(e.url, "http://h/b");
+    assert_eq!(e.body_wire().as_deref(), Some("{\"a\": 1}"));
+    assert!(e.stale_body_notes().is_none());
+}
+
+/// Raw Mode's notes-only rule must not be a way around the adopt guard: notes
+/// that carry no comments at all still aren't a body, and applying them would
+/// write a file that reads back as no requests at all.
+#[test]
+fn raw_mode_will_not_apply_notes_that_are_not_a_body() {
+    let mut app = app_with_annotated_body();
+    let opened = app.collections[0].entries[0].to_hurl();
+    // Replace the whole block with prose, leaving the strict body alone.
+    let edited = opened.replace(
+        "# [Body] 3\n# {\n#   \"a\": 1 // mine\n# }\n",
+        "# [Body] 1\n# hello world\n",
+    );
+    assert_ne!(edited, opened, "the block was rewritten");
+
+    raw_edit(&mut app, &edited);
+
+    let e = &app.collections[0].entries[0];
+    assert_eq!(
+        e.body_wire().as_deref(),
+        Some("{\n  \"a\": 1\n}"),
+        "body kept"
+    );
+    assert!(e.stale_body_notes().is_some(), "the prose is kept as notes");
+    assert!(
+        !matches!(app.status, Some(crate::i18n::Status::NotesAppliedFromRaw)),
+        "nothing was applied, so nothing may be reported as applied"
+    );
+    assert_eq!(
+        crate::hurl::parse_hurl(&e.to_hurl()).len(),
+        1,
+        "the file still loads"
+    );
+}
+
+// ── A file that could only be read in part ────────────────────────────────
+
+const PARTLY_BROKEN: &str = "# one\nGET http://h/1\nHTTP 200\n\n\
+                             # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                             # three\nGET http://h/3\nHTTP 200\n";
+
+/// One damaged request used to cost the user every other request in the file.
+#[test]
+fn a_partly_broken_collection_opens_with_the_rest_of_its_requests() {
+    let mut app = TuiApp::default();
+    assert!(app.load_collection_text("api".into(), PARTLY_BROKEN, None));
+    let col = &app.collections[1];
+    assert_eq!(col.entries.len(), 3);
+    assert!(col.entries[1].is_unreadable());
+    assert_eq!(col.entries[0].url, "http://h/1");
+    assert_eq!(col.entries[2].url, "http://h/3");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::SomeRequestsUnreadable(1, _))
+    ));
+}
+
+/// It has to be visible as something wrong, not as a blank row that looks like
+/// a request which would send.
+#[test]
+fn the_requests_list_marks_what_could_not_be_read() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    let s = crate::i18n::Strings::for_language(&app.language);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+    term.draw(|f| super::draw::draw(f, &mut app)).expect("draw");
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains(s.entry_unreadable),
+        "the row says it could not be read:\n{out}"
+    );
+}
+
+/// The wizard edits fields, and text that was never parsed has none — filling
+/// the form in would write over text the user has not seen.
+#[test]
+fn the_wizard_refuses_a_request_that_could_not_be_read() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.collections[1].selected_entry = 1;
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.overlay.is_none(), "no wizard opened");
+    assert!(matches!(
+        app.status,
+        Some(crate::i18n::Status::CannotEditUnreadable)
+    ));
+}
+
+/// Raw Mode is the surface that repairs it: it opens on the text exactly as it
+/// was read, and a fixed version becomes a real request again.
+#[test]
+fn raw_mode_opens_the_unread_text_and_repairs_it() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.collections[1].selected_entry = 1;
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    match &app.overlay {
+        Some(Overlay::Prompt { editor, .. }) => assert!(
+            editor.text().contains("x: jsonpath \"$.a\""),
+            "the text is shown as it was read: {:?}",
+            editor.text()
+        ),
+        _ => panic!("raw mode should be open"),
+    }
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor = super::editor::Editor::new(
+            "# two\nPOST http://h/2\nHTTP 200\n[Captures]\nx: jsonpath \"$.a\"",
+            true,
+        );
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "the repair was accepted");
+    let e = &app.collections[1].entries[1];
+    assert!(!e.is_unreadable(), "it is a request again");
+    assert_eq!(e.url, "http://h/2");
+    assert_eq!(e.captures, vec![("x".into(), "jsonpath \"$.a\"".into())]);
+}
+
+/// Recovery must not turn Raw Mode into a way of saving text that doesn't
+/// parse: the user is repairing *this* request, and silently accepting the
+/// mistake would swap the request for a copy of it.
+#[test]
+fn raw_mode_still_refuses_text_that_does_not_parse() {
+    let mut app = TuiApp::default();
+    app.load_collection_text("api".into(), PARTLY_BROKEN, None);
+    app.focus = Pane::Main;
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        *editor =
+            super::editor::Editor::new("GET http://h/1\n[Captures]\nx: jsonpath \"$.a\"", true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(
+        app.overlay.is_some(),
+        "the editor stays open to be corrected"
+    );
+    assert!(matches!(app.status, Some(crate::i18n::Status::Error(_))));
+    let e = &app.collections[1].entries[0];
+    assert!(
+        !e.is_unreadable() && e.url == "http://h/1",
+        "entry untouched"
+    );
+}
+
+/// Regression: a click queued behind a keystroke that deleted a wizard row
+/// used to be resolved against the frame the row was still in, dropping focus
+/// past the end of the row list — and the *next* keystroke then indexed that
+/// list and panicked, taking the whole terminal UI with it.
+#[test]
+fn a_click_landing_where_a_deleted_wizard_row_used_to_be_never_crashes() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_multipart_value(&mut app);
+    // A few more rows, so there is one below the row that gets deleted.
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => {
+            for i in 1..4 {
+                let mut row = crate::tui::new_request::FormRow::new();
+                row.key = crate::tui::line_editor::Editor::new(&format!("k{i}"), false);
+                f.form_fields.push(row);
+            }
+        }
+        _ => panic!("New Request overlay not open"),
+    }
+    let rows = form_ref(&app).form_fields.len();
+    assert!(rows >= 2, "need rows to delete, had {rows}");
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let last = hit_rect(
+        &app,
+        MouseHitTarget::NewRequestField(NewField::FormField(rows - 1, FormCol::Value)),
+    );
+
+    // Delete a row without redrawing — exactly what happens when input arrives
+    // faster than frames — then click where the last row was.
+    ctrl(&mut app, KeyCode::Char('d'));
+    app.on_mouse(mouse_down(last.x + last.width / 2, last.y));
+
+    // The click must not have parked focus on a row that no longer exists...
+    let f = form_ref(&app);
+    if let NewField::FormField(i, _) = f.focus {
+        assert!(
+            i < f.form_fields.len(),
+            "focus {i} is past the {} remaining rows",
+            f.form_fields.len()
+        );
+    }
+    // ...and typing afterwards must not panic.
+    type_str(&mut app, "x");
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+}
+
+/// Regression: opening Edit on a request whose status check lives in
+/// `[Asserts]` (under an `HTTP *` line) and saving without touching anything
+/// used to move the check onto the `HTTP` line and flag the request modified —
+/// a rewrite nobody asked for. A no-op save is a no-op.
+#[test]
+fn saving_an_untouched_request_leaves_a_status_assert_where_it_was() {
+    let mut app = TuiApp::default();
+    let mut entry = HurlEntry::from_fields("Check", "GET", "http://h/x", vec![], "");
+    entry.expected_status = None;
+    entry.asserts = vec![
+        "status == 201".to_string(),
+        "jsonpath \"$.ok\" == true".to_string(),
+    ];
+    let before = entry.to_hurl();
+    app.collections
+        .push(Collection::new("Coll".to_string(), vec![entry]));
+    app.active_tab = 1;
+
+    press(&mut app, KeyCode::Enter); // open Edit on the request
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "the edit wizard opens"
+    );
+    ctrl(&mut app, KeyCode::Char('s')); // save, having changed nothing
+
+    let entry = &app.collections[1].entries[0];
+    assert_eq!(entry.expected_status, None, "the HTTP line is untouched");
+    assert_eq!(
+        entry.asserts,
+        vec![
+            "status == 201".to_string(),
+            "jsonpath \"$.ok\" == true".to_string()
+        ],
+        "and the asserts are exactly as they were"
+    );
+    assert_eq!(entry.to_hurl(), before, "the request is byte-identical");
+}
+
+// ── Workspace tabs: the left pane is the tree, not the request list ─────────
+//
+// A Workspace tab draws `ws_rows` (folders, collection files, reports,
+// environments and the requests of any open collection) while every other tab
+// draws `rows` (just the loaded collection's requests). `list_cursor` indexes
+// whichever of the two is on screen, and the keys below all used to read it
+// against the wrong one.
+
+/// Build a real workspace on disk with one collection file, open it in a tab,
+/// and expand the collection so its requests are rows in the tree. Returns the
+/// root (for cleanup) and the tab index.
+fn workspace_tab_with_requests(tag: &str, titles: &[&str]) -> (std::path::PathBuf, TuiApp, usize) {
+    let dir = std::env::temp_dir().join(format!("paperboy_ws_keys_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    let file = dir.join("api.hurl");
+    std::fs::write(&file, "GET https://example.test/\n").unwrap();
+    // A second file and a folder, so the tree has rows that are not requests
+    // sitting above the ones that are — which is exactly what made the cursor
+    // and the request list disagree.
+    std::fs::write(
+        dir.join("nested/other.hurl"),
+        "GET https://example.test/o\n",
+    )
+    .unwrap();
+
+    let mut col = Collection::new("ws".into(), titles.iter().map(|t| entry_named(t)).collect());
+    col.workspace_root = Some(dir.clone());
+    col.path = Some(file.clone());
+    col.workspace_expanded.insert(file.clone());
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    (dir, app, ci)
+}
+
+/// The cursor's position in the tree is not a position in `entries`: a
+/// workspace row can be a folder, a file, a report or an environment. Reading
+/// it against `rows()` reordered whichever two requests happened to sit at
+/// those offsets — with the cursor on the first request of a tree, the *last*
+/// two requests swapped, which is what a user reported.
+#[test]
+fn alt_arrows_reorder_the_request_under_the_cursor_in_a_workspace_tree() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("reorder", &["a", "b", "c"]);
+
+    // Find the row the first request is actually on, the way the screen does.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { idx: 0, .. }))
+        .expect("the expanded collection contributes request rows");
+    assert!(
+        first > 0,
+        "the tree has non-request rows above the requests — the whole point of the bug"
+    );
+    app.collections[ci].list_cursor = first;
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+    assert_eq!(
+        titles_of(&app, ci),
+        vec!["b", "a", "c"],
+        "the request under the cursor moved, not two unrelated ones"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The neighbour has to come from the same collection file. The tree
+/// interleaves several, and a request can only trade places inside its own
+/// `entries` list.
+#[test]
+fn alt_arrows_do_nothing_on_a_workspace_row_that_is_not_a_request() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("nonrequest", &["a", "b"]);
+    // Row 0 of the tree is a folder or a file, never a request.
+    app.collections[ci].list_cursor = 0;
+    assert!(!matches!(
+        app.collections[ci].ws_rows()[0],
+        crate::collection::WsRow::Request { .. }
+    ));
+
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+    assert_eq!(titles_of(&app, ci), vec!["a", "b"], "nothing moved");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/` on a Workspace tab's list used to fall through to the arm below it and
+/// jump the focus to the Environments panel — so the commonest way to open a
+/// collection was the one place the search key did something else entirely.
+#[test]
+fn slash_searches_the_tree_instead_of_jumping_to_environments_in_a_workspace() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("slash", &["Login", "Logout"]);
+
+    press(&mut app, KeyCode::Char('/'));
+
+    assert!(
+        app.list_filter_typing,
+        "the tree filter is capturing, not the environments one"
+    );
+    assert_eq!(app.focus, Pane::List, "focus stayed on the list");
+    assert!(!app.env_filter_typing);
+
+    type_filter(&mut app, "other");
+    let names: Vec<String> = app.collections[ci]
+        .ws_rows()
+        .iter()
+        .map(|r| r.name().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("other")),
+        "the matching file survived: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "Login"),
+        "a non-matching request was filtered out: {names:?}"
+    );
+    // The match is nested one folder down, and that folder was never expanded —
+    // a search that could only find what was already on screen would be no
+    // search at all.
+    assert!(
+        names.iter().any(|n| n == "nested"),
+        "the ancestor folder is kept so the match reads as a tree: {names:?}"
+    );
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.collections[ci].list_query.is_empty(), "Esc clears it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// On a Workspace tab `c` copies the highlighted request into another
+/// collection file, which the footer never mentioned — the `c duplicate` hint
+/// beside it is deliberately suppressed there, so the key was advertised
+/// nowhere but the help overlay.
+#[test]
+fn the_footer_offers_copy_request_on_a_workspace_request_row() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (dir, mut app, ci) = workspace_tab_with_requests("footer", &["a", "b"]);
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    let footer = |app: &mut TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(200, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let y = buf.area.height - 1;
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+    };
+
+    // On a non-request row there is nothing to copy, so the hint stays away.
+    app.collections[ci].list_cursor = 0;
+    assert!(
+        !footer(&mut app).contains(s.foot_copy_request),
+        "no hint on a folder/file row"
+    );
+
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    assert!(
+        footer(&mut app).contains(s.foot_copy_request),
+        "the hint appears on a request row"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reordering sets `structure_modified`, which no *request* carries a marker
+/// for — so the list looked untouched while the quit prompt insisted there was
+/// unsaved work, with nothing on screen to say where.
+#[test]
+fn a_reordered_collection_marks_its_tab_unsaved() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.collections.push(Collection::new(
+        "api".into(),
+        vec![entry_named("a"), entry_named("b")],
+    ));
+    let ci = app.collections.len() - 1;
+    app.active_tab = ci;
+    app.focus = Pane::List;
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    // The tab strip sits inside a bordered panel whose exact row depends on the
+    // layout, so find the row the tab name is drawn on rather than pinning one.
+    let tab_bar = |app: &mut TuiApp| -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("api"))
+            .expect("the tab strip shows the collection name")
+    };
+
+    assert!(
+        !tab_bar(&mut app).contains(s.tab_unsaved_marker),
+        "a freshly opened collection is clean"
+    );
+
+    app.collections[ci].list_cursor = 0;
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert_eq!(titles_of(&app, ci), vec!["b", "a"], "the reorder happened");
+
+    assert!(
+        app.collections[ci].structure_modified,
+        "a reorder is a structural change"
+    );
+    let bar = tab_bar(&mut app);
+    assert!(
+        bar.contains(s.tab_unsaved_marker),
+        "and the tab now says so: {bar:?}"
+    );
+}
+
+/// The move/copy picker used to open on whichever file sorted first, which in
+/// a workspace of any size means scrolling back to where you already were
+/// before you can get your bearings. It now opens on the file the request is
+/// coming out of.
+#[test]
+fn the_transfer_picker_opens_on_the_collection_the_request_came_from() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("picker", &["a", "b"]);
+    let source = app.collections[ci].path.clone().unwrap();
+
+    // Put the cursor on a real request row, then copy it.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    press(&mut app, KeyCode::Char('c'));
+
+    match &app.overlay {
+        Some(Overlay::WorkspacePicker(p)) => {
+            assert_eq!(p.mode, super::app::WsPickerMode::CopyRequest);
+            assert_eq!(
+                p.entries[p.selected].path, source,
+                "the picker starts on the source collection, not the top of the tree"
+            );
+            // Pinning the bug: the source is not simply the first file anyway.
+            let first_file = p
+                .entries
+                .iter()
+                .position(|e| !e.is_dir)
+                .expect("the workspace has files");
+            assert_ne!(
+                p.selected, first_file,
+                "this workspace sorts another file first, so the seeding is what's being tested"
+            );
+        }
+        _ => panic!("expected the workspace picker"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workspace shows one collection at a time, so an edit to a file you have
+/// since switched away from is invisible by construction: its requests are
+/// parked in `workspace_pending` and its rows are drawn from a name cache. The
+/// tab's pencil says *something* is unsaved; the tree has to say which file.
+#[test]
+fn the_workspace_tree_pencils_a_collection_holding_unsaved_edits() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let (dir, mut app, ci) = workspace_tab_with_requests("pencil", &["a", "b"]);
+    let s = crate::i18n::Strings::for_language(&app.language);
+
+    // The panel *title* also carries the loaded collection's name, so collect
+    // every line mentioning it rather than taking the first.
+    let row_for = |app: &mut TuiApp, needle: &str| -> String {
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|line| line.contains(needle))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert!(
+        !row_for(&mut app, "api").contains(s.tab_unsaved_marker),
+        "an untouched collection file is clean"
+    );
+
+    // Reorder its requests — a structural change no single request carries.
+    let rows = app.collections[ci].ws_rows();
+    let first = rows
+        .iter()
+        .position(|r| matches!(r, crate::collection::WsRow::Request { idx: 0, .. }))
+        .expect("request rows exist");
+    app.collections[ci].list_cursor = first;
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert!(app.collections[ci].structure_modified, "the reorder landed");
+
+    assert!(
+        row_for(&mut app, "api").contains(s.tab_unsaved_marker),
+        "the collection row now carries the pencil"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Workspace tab shows one file at a time and parks the others in memory, so
+/// the "was this reordered" question has to survive a round trip through the
+/// park. It is answered by comparing against the order the file had on disk —
+/// and that baseline is parked alongside the entries, so coming back to a
+/// reordered file and dragging the request home again clears the marker rather
+/// than leaving the file looking unsaved for the rest of the session.
+#[test]
+fn a_reorder_undone_after_switching_workspace_files_away_and_back_clears_the_marker() {
+    let (dir, mut app, ci) = workspace_tab_with_requests("baseline", &["one", "two", "three"]);
+    let other = dir.join("nested/other.hurl");
+
+    assert!(app.collections[ci].move_entry(0, 1));
+    assert!(app.collections[ci].structure_modified);
+
+    app.collections[ci].load_workspace_file(other).unwrap();
+    assert!(
+        !app.collections[ci].structure_modified,
+        "the file just switched to is untouched"
+    );
+    assert!(
+        app.collections[ci].unsaved_edit_count() > 0,
+        "but the parked file it left behind is still unsaved"
+    );
+
+    app.collections[ci]
+        .load_workspace_file(dir.join("api.hurl"))
+        .unwrap();
+    assert!(
+        app.collections[ci].structure_modified,
+        "coming back, the reorder is still there"
+    );
+    assert!(app.collections[ci].move_entry(1, 0));
+    assert!(
+        !app.collections[ci].structure_modified,
+        "and undoing it now returns the file to the order on disk"
+    );
+    assert_eq!(app.collections[ci].unsaved_edit_count(), 0);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

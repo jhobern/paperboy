@@ -424,7 +424,9 @@ pub fn diagnostics_fingerprint(
             e.title.hash(&mut h);
             e.method.hash(&mut h);
             e.url.hash(&mut h);
-            e.body.hash(&mut h);
+            // The wire body: adding a comment to a request must not
+            // invalidate every report that refers to it.
+            e.body_wire().hash(&mut h);
             e.basic_auth.hash(&mut h);
             for kv in e
                 .headers
@@ -595,7 +597,7 @@ mod tests {
         c.entries[0].method = "GET".into();
         cases.push(("method", c));
         let mut c = cols[0].clone();
-        c.entries[0].body = Some("{{tok}}".into());
+        c.entries[0].body_src = Some("{{tok}}".into());
         cases.push(("body", c));
         let mut c = cols[0].clone();
         c.entries[0].headers.push(KvRow::new("A", "{{v}}"));

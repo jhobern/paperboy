@@ -27,9 +27,11 @@ use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
 use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
 use crate::shared_utils::sanitize_file_stem;
 
-/// Run a report headlessly. Returns an OS exit code (0 = success, 1 = a fatal
-/// setup/validation error; a run that merely collected per-row errors still
-/// exits 0 — its errors are reported but every row was produced).
+/// Run a report headlessly. Returns an OS exit code: 0 when the report was
+/// produced and every row ran cleanly, 1 on a fatal setup/validation error
+/// *or* when the run collected per-row errors. The output is still written in
+/// that second case — the non-zero code is there so a CI pipeline can't pass
+/// green on a report in which every request failed.
 ///
 /// `collection` names the collection to run against (re-pointable without
 /// editing the report); when `None`, the report's own `# collection:` header is
@@ -361,7 +363,10 @@ pub fn run(
         }
     }
 
-    0
+    // The report was produced either way, but rows that errored mean the run
+    // did not do what was asked of it, and a caller scripting this needs to
+    // hear about that in the exit code rather than by scraping the output.
+    i32::from(!result.errors.is_empty())
 }
 
 /// Where the rendered report ended up (for the closing summary line).

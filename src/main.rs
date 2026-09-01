@@ -105,7 +105,7 @@ struct Cli {
 
     /// With `-r`: expand the report and show what it would do without sending
     /// any request (no HTTP). Handy before a large run.
-    #[arg(long)]
+    #[arg(long, requires = "report")]
     dry_run: bool,
 
     /// With `-r`: where to write the report output. `-` writes CSV to stdout
@@ -113,12 +113,12 @@ struct Cli {
     /// `.html` or `.xlsx`); omitted derives the file from the report's
     /// `# output:`/`# name:` headers (next to the report file, honouring the
     /// `{time}` token).
-    #[arg(short = 'o', long, value_name = "FILE")]
+    #[arg(short = 'o', long, value_name = "FILE", requires = "report")]
     output: Option<String>,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
-    /// with the `gui` feature (`cargo install paperboy --features gui`).
+    /// with the `gui` feature (`cargo install paperboy --locked --features gui`).
     #[arg(short = 'g', long)]
     gui: bool,
 
@@ -240,7 +240,7 @@ fn run_gui() -> i32 {
 fn run_gui() -> i32 {
     eprintln!(
         "This build of PaperBoy has no GUI. Reinstall it with the `gui` feature:\n\
-         \x20   cargo install paperboy --features gui"
+         \x20   cargo install paperboy --locked --features gui"
     );
     1
 }

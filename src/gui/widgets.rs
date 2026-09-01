@@ -709,7 +709,18 @@ pub fn kv_editor(
                     }
                     // A disabled row (checkbox unticked) isn't sent, so grey its
                     // key/value out to read as inactive — matching the terminal UI.
-                    let row_color = if rows[i].enabled {
+                    // A name or value the Hurl row grammar can't carry overrides
+                    // that: the serializer has to comment such a row out to keep
+                    // the file loadable at all (see `key_problem` and
+                    // `value_problem`), so it is flagged in the error colour
+                    // where it is typed rather than silently dropping off the
+                    // wire later.
+                    let bad_key = crate::hurl::key_problem(&rows[i].key).is_some()
+                        && !rows[i].key.trim().is_empty();
+                    let bad_value = crate::hurl::value_problem(&rows[i].value).is_some();
+                    let row_color = if bad_key || bad_value {
+                        theme.err
+                    } else if rows[i].enabled {
                         theme.text
                     } else {
                         theme.dim
@@ -733,11 +744,17 @@ pub fn kv_editor(
                     if k.changed() {
                         changed = true;
                     }
+                    if bad_key {
+                        k.on_hover_text(s.gui_bad_key_warning);
+                    }
                     // The value is the one cell whose content is the request
                     // itself, so it is the one that wraps rather than truncates.
                     let v = wrapping_field(ui, val_w, &mut rows[i].value, val_hint, row_color);
                     if v.changed() {
                         changed = true;
+                    }
+                    if bad_value {
+                        v.clone().on_hover_text(s.gui_bad_value_warning);
                     }
                     if !rows[i].value.trim().is_empty() {
                         v.context_menu(|ui| {
@@ -2065,6 +2082,19 @@ fn dialog_with<R>(
     if let Some(size) = default_size {
         window = window.default_size(size);
     }
+    // No dialog may be taller (or wider) than the window it sits in. A
+    // resizable egui window sizes itself to its content, and content that is
+    // laid out as "as much as I have" — a `ScrollArea` with `auto_shrink`
+    // off — will happily ask for more than the screen has, at which point the
+    // dialog runs off both ends at once and neither its heading nor its Close
+    // button can be reached. Capping it hands the overflow back to the scroll
+    // area, which is what was supposed to absorb it. The inset leaves the title
+    // bar and drop shadow on-screen so the dialog can still be dragged.
+    let content = ctx.input(|i| i.content_rect());
+    window = window.max_size([
+        (content.width() - 48.0).max(240.0),
+        (content.height() - 48.0).max(160.0),
+    ]);
     let shown = window.show(ctx, |ui| {
         if let Some(w) = min_width {
             ui.set_min_width(w);

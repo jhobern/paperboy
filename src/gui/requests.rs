@@ -48,7 +48,11 @@ fn clickable_row(
     let hit = ui.interact(
         rect,
         drawn.response.id.with("whole_row"),
-        egui::Sense::click(),
+        // Senses drags as well as clicks so a request can be dragged to a new
+        // position in the collection; a click still lands as a click, since
+        // egui only calls it a drag once the pointer actually moves. Same
+        // bargain the workspace tree's rows make (see `ws_row`).
+        egui::Sense::click_and_drag(),
     );
     if hit.hovered() || drawn.inner.hovered() {
         let visuals = ui.visuals().widgets.hovered;
@@ -89,6 +93,41 @@ struct Node {
     entries: Vec<usize>,
 }
 
+/// The navigable request rows of `col`, in the order they appear on screen, as
+/// flat entry indices. This is what the Requests-panel keyboard steps through:
+/// a filtered list is the flat set of matches (folders are gone), an unfiltered
+/// one is the folder tree walked exactly as [`render_node`] draws it — every
+/// folder's contents before the entries beside it — so Up/Down move to the row
+/// the eye expects rather than jumping around the underlying `entries` order.
+/// Folder rows are not navigable targets (there is no "selected folder"), so
+/// they are absent; the result holds only request indices.
+pub(super) fn nav_entry_order(col: &crate::collection::Collection) -> Vec<usize> {
+    if col.list_filter_active() {
+        crate::tree::rows_matching(&col.entries, &col.list_query)
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::tree::Row::Entry(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    } else {
+        let tree = build_tree(&col.entries);
+        let mut out = Vec::with_capacity(col.entries.len());
+        collect_entry_order(&tree, &mut out);
+        out
+    }
+}
+
+/// Flatten a folder tree into entry indices the way [`render_node`] renders it:
+/// each subfolder's contents first (recursively), then this level's own
+/// entries.
+fn collect_entry_order(node: &Node, out: &mut Vec<usize>) {
+    for child in node.folders.values() {
+        collect_entry_order(child, out);
+    }
+    out.extend(node.entries.iter().copied());
+}
+
 /// Group a collection's entries into a folder tree using their `/`-encoded
 /// titles. The leaf segment is the request's display name; everything before
 /// it is its folder path.
@@ -113,21 +152,44 @@ struct Actions {
     select: Option<usize>,
     run: Option<usize>,
     rename: Option<usize>,
+    duplicate: Option<usize>,
     delete: Option<usize>,
+    /// A request dragged to a new position: `(from, before)`, where `before` is
+    /// the index of the request it was dropped above (`entries.len()` for the
+    /// gap past the last one). Applied with
+    /// [`crate::collection::Collection::move_entry_before`].
+    reorder: Option<(usize, usize)>,
 }
 
+/// The request being dragged, identified by its index into `entries` — which is
+/// all the drop target needs, since the gap it lands in is decided by whichever
+/// row the pointer is over.
+#[derive(Clone, Debug)]
+struct ReqDrag(usize);
+
+/// The row's context-menu / marker labels, bundled so adding one doesn't grow
+/// `render_node`'s parameter list again — it had already picked up a run,
+/// rename, delete and edited-marker label as separate arguments, and
+/// duplicate would have made a fifth.
+struct RowLabels<'a> {
+    untitled: &'a str,
+    run: &'a str,
+    rename: &'a str,
+    duplicate: &'a str,
+    delete: &'a str,
+    edited: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_node(
     ui: &mut egui::Ui,
     node: &Node,
     entries: &[HurlEntry],
     selected: usize,
+    reveal: bool,
     theme: &GuiTheme,
     id_prefix: &str,
-    lbl_untitled: &str,
-    lbl_run: &str,
-    lbl_rename: &str,
-    lbl_delete: &str,
-    lbl_edited: &str,
+    labels: &RowLabels<'_>,
     actions: &mut Actions,
 ) {
     for (name, child) in &node.folders {
@@ -139,33 +201,54 @@ fn render_node(
             RichText::new(format!("{} {name}", super::icons::FOLDER)).color(theme.text),
             |ui| {
                 render_node(
-                    ui,
-                    child,
-                    entries,
-                    selected,
-                    theme,
-                    &salt,
-                    lbl_untitled,
-                    lbl_run,
-                    lbl_rename,
-                    lbl_delete,
-                    lbl_edited,
-                    actions,
+                    ui, child, entries, selected, reveal, theme, &salt, labels, actions,
                 );
             },
         );
     }
     for &i in &node.entries {
+        let leaf = entry_path(&entries[i].title).pop().unwrap_or_default();
+        render_entry_row(
+            ui, i, entries, leaf, selected, reveal, theme, labels, true, actions,
+        );
+    }
+}
+
+/// One request row — the shared body of the folder tree and the flat filtered
+/// list, which differ only in the label they show and whether a row can be
+/// dragged.
+///
+/// `label` is the request's own name in the tree (the folder rows above it
+/// supply the rest) but its whole title when filtered, where the tree has been
+/// flattened and two folders may each hold a `Login`.
+///
+/// `reorderable` is false while the list is filtered: the gap between two
+/// matches can span any number of requests that aren't on screen, so a drop
+/// there would move the request an unpredictable distance for reasons the user
+/// can't see.
+#[allow(clippy::too_many_arguments)]
+fn render_entry_row(
+    ui: &mut egui::Ui,
+    i: usize,
+    entries: &[HurlEntry],
+    label: String,
+    selected: usize,
+    reveal: bool,
+    theme: &GuiTheme,
+    labels: &RowLabels<'_>,
+    reorderable: bool,
+    actions: &mut Actions,
+) {
+    {
         let entry = &entries[i];
-        let leaf = entry_path(&entry.title).pop().unwrap_or_default();
-        let label = if leaf.trim().is_empty() {
+        let label = if label.trim().is_empty() {
             if entry.url.trim().is_empty() {
-                lbl_untitled.to_string()
+                labels.untitled.to_string()
             } else {
                 entry.url.clone()
             }
         } else {
-            leaf
+            label
         };
         let (marker, ok) = run_marker(entry.last_run);
         let is_sel = i == selected;
@@ -198,7 +281,7 @@ fn render_node(
                         let mc = if ok { theme.ok } else { theme.err };
                         ui.colored_label(mc, marker);
                     }
-                    edited_marker(ui, entry, theme, lbl_edited);
+                    edited_marker(ui, entry, theme, labels.edited);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         super::widgets::selectable_row(ui, is_sel, text)
                     })
@@ -211,24 +294,125 @@ fn render_node(
         if row.clicked() {
             actions.select = Some(i);
         }
+        // A keyboard move can select a row that is scrolled out of sight (a
+        // long collection, or Home/End jumping to an end); bring it back into
+        // view. Only on the selected row, and only when the move asked for it,
+        // so an ordinary scroll or click isn't yanked back.
+        //
+        // `None` rather than an alignment: it scrolls the least it can to get
+        // the row on screen, and does nothing at all when the row is already
+        // visible. Asking for `Align::Center` instead re-centres the list on
+        // *every* step, so a row-by-row walk drags the whole scrollbar along
+        // under a cursor that never appears to move — which is not how a list
+        // behaves anywhere else.
+        if reveal && is_sel {
+            row.scroll_to_me(None);
+        }
         if row.double_clicked() {
             actions.run = Some(i);
         }
         row.context_menu(|ui| {
-            if ui.button(lbl_run).clicked() {
+            if ui.button(labels.run).clicked() {
                 actions.run = Some(i);
                 ui.close();
             }
-            if ui.button(lbl_rename).clicked() {
+            if ui.button(labels.rename).clicked() {
                 actions.rename = Some(i);
                 ui.close();
             }
-            if ui.button(lbl_delete).clicked() {
+            // Duplicate sits next to Rename — both are creative actions on the
+            // row's identity — leaving Delete alone at the bottom as the one
+            // destructive entry.
+            if ui.button(labels.duplicate).clicked() {
+                actions.duplicate = Some(i);
+                ui.close();
+            }
+            if ui.button(labels.delete).clicked() {
                 actions.delete = Some(i);
                 ui.close();
             }
         });
+        if reorderable {
+            if row.drag_started() {
+                egui::DragAndDrop::set_payload(ui.ctx(), ReqDrag(i));
+            }
+            // Something has to follow the pointer, or a drag looks like nothing
+            // is happening — the rows themselves stay put, and the insertion
+            // line only appears once the pointer is over a row.
+            if row.dragged()
+                && let Some(pos) = ui.ctx().pointer_interact_pos()
+            {
+                let layer =
+                    egui::LayerId::new(egui::Order::Tooltip, ui.id().with("req_drag_label"));
+                ui.ctx().layer_painter(layer).text(
+                    pos + egui::vec2(12.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    &label,
+                    egui::TextStyle::Button.resolve(ui.style()),
+                    theme.accent,
+                );
+            }
+            request_drop_zone(ui, &row, theme, i, actions);
+        }
     }
+}
+
+/// Offer the gap above or below this row as somewhere the dragged request can
+/// land, and draw the line showing which.
+///
+/// A line *between* rows rather than a highlight *on* one: this is a reorder,
+/// so the question is which two requests it will end up between — an outlined
+/// row would say "into here", which is what the workspace tree's folder drop
+/// means and would read as moving the request into another request.
+fn request_drop_zone(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    theme: &GuiTheme,
+    i: usize,
+    actions: &mut Actions,
+) {
+    let Some(dragged) = egui::DragAndDrop::payload::<ReqDrag>(ui.ctx()) else {
+        return;
+    };
+    if !resp.contains_pointer() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let rect = resp.rect;
+    // Which half of the row the pointer is in decides which gap is being aimed
+    // at, so every pixel of the list targets a gap and there is no dead zone
+    // between rows to fall down.
+    let above = pos.y < rect.center().y;
+    let before = if above { i } else { i + 1 };
+    // Both gaps touching the dragged request are where it already is. Drawing a
+    // line there would promise a move that `move_entry_before` correctly
+    // refuses to make.
+    if dragged.0 == before || dragged.0 + 1 == before {
+        return;
+    }
+    let y = if above { rect.top() } else { rect.bottom() };
+    ui.painter()
+        .hline(rect.x_range(), y, egui::Stroke::new(2.0, theme.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        actions.reorder = Some((dragged.0, before));
+        egui::DragAndDrop::clear_payload(ui.ctx());
+    }
+}
+
+/// How a "Run All" of these entries should be gated: `(total, non_get)`, where
+/// `total` is how many requests would run and `non_get` how many of them use a
+/// method other than GET. A collection with `non_get == 0` is read-only and
+/// runs with no prompt; any other needs [`GuiApp::request_run_all`] to confirm
+/// first, because a stray click on Run All could otherwise fire a collection
+/// full of writes. GET is matched case-insensitively, the way Hurl treats it.
+pub(super) fn run_all_confirm_counts(entries: &[HurlEntry]) -> (usize, usize) {
+    let non_get = entries
+        .iter()
+        .filter(|e| !e.method.eq_ignore_ascii_case("GET"))
+        .count();
+    (entries.len(), non_get)
 }
 
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
@@ -250,6 +434,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_no_requests,
         lbl_run,
         lbl_rename,
+        lbl_duplicate,
         lbl_delete,
         lbl_edited,
     ) = (
@@ -261,6 +446,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.gui_no_requests_tree,
         s.gui_run,
         s.gui_rename_ellipsis,
+        s.gui_duplicate,
         s.gui_delete,
         s.gui_edited_request,
     );
@@ -271,13 +457,15 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.help_menu_import_file,
         s.help_menu_import_account,
     );
+    let (hint_filter, lbl_filter_no_matches) =
+        (s.gui_request_filter_hint, s.gui_request_filter_no_matches);
 
     // Header: collection name (truncates) + Run All / Add (always visible).
     let name = app.session.collections[ci].name.clone();
     super::widgets::panel_header(ui, &theme, name, |ui| {
         let run_all = format!("{} {}", super::icons::PLAY, lbl_run_all);
         if ui.button(run_all).on_hover_text(tip_run_all).clicked() {
-            app.session.run_all_entries(ci);
+            app.request_run_all(ci);
         }
         if ui
             .button(super::icons::PLUS)
@@ -297,7 +485,28 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
     ui.separator();
 
+    // Filter box. Shown whenever there is more than one request, and always
+    // once it is: the same reasoning as the Environments panel's, where an
+    // empty box costs one line and a tree of a few hundred requests is
+    // unusable without one. Hidden for a collection small enough to read at a
+    // glance, where it would be a control with nothing to do.
+    if app.session.collections[ci].entries.len() > 1 {
+        ui.horizontal(|ui| {
+            super::widgets::flat_fields(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.session.collections[ci].list_query)
+                        .hint_text(hint_filter)
+                        .desired_width(f32::INFINITY),
+                )
+            });
+        });
+        ui.separator();
+    }
+
     let selected = app.session.collections[ci].selected_entry;
+    let reveal = app.reveal_selected;
+    let filtering = app.session.collections[ci].list_filter_active();
+    let query = app.session.collections[ci].list_query.clone();
     let mut actions = Actions::default();
 
     egui::ScrollArea::vertical()
@@ -341,22 +550,73 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 return;
             }
             let tree = build_tree(entries);
+            let labels = RowLabels {
+                untitled: lbl_untitled,
+                run: lbl_run,
+                rename: lbl_rename,
+                duplicate: lbl_duplicate,
+                delete: lbl_delete,
+                edited: lbl_edited,
+            };
+            // A filtered list is flat and folder-blind (see
+            // `crate::tree::rows_matching`): the tree shows one collapsible
+            // folder per level, and leaving those in would mean hiding matches
+            // inside collapsed folders — a search that can't show you what it
+            // found. Each match carries its whole title instead, since the
+            // folder rows that told two `Login`s apart are gone.
+            if filtering {
+                let matches = crate::tree::rows_matching(entries, &query);
+                if matches.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(theme.dim, lbl_filter_no_matches);
+                    return;
+                }
+                for row in matches {
+                    let crate::tree::Row::Entry(i) = row else {
+                        continue;
+                    };
+                    let title = entries[i].title.trim().to_string();
+                    render_entry_row(
+                        ui,
+                        i,
+                        entries,
+                        title,
+                        selected,
+                        reveal,
+                        &theme,
+                        &labels,
+                        false,
+                        &mut actions,
+                    );
+                }
+                return;
+            }
             render_node(
                 ui,
                 &tree,
                 entries,
                 selected,
+                reveal,
                 &theme,
                 "req",
-                lbl_untitled,
-                lbl_run,
-                lbl_rename,
-                lbl_delete,
-                lbl_edited,
+                &labels,
                 &mut actions,
             );
         });
 
+    // One-shot: the row asked to be revealed has had its frame, so clear the
+    // request whether or not a row honoured it (an empty or filtered-away list
+    // has nothing to scroll to).
+    app.reveal_selected = false;
+    apply_actions(app, ci, actions);
+}
+
+/// Apply the actions collected while rendering the request tree
+/// (immutably-borrowed above) to the session. Pulled out of [`ui`] — the same
+/// shape as [`apply_ws_action`] for the workspace tree — so the effect of a
+/// context-menu click can be exercised directly in tests without having to
+/// drive an actual right-click through egui.
+fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
     if let Some(i) = actions.select {
         let col = &mut app.session.collections[ci];
         col.selected_entry = i;
@@ -371,14 +631,39 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             text: title,
         });
     }
-    if let Some(i) = actions.delete {
+    if let Some(i) = actions.duplicate {
         let col = &mut app.session.collections[ci];
-        if i < col.entries.len() {
-            col.entries.remove(i);
-            if col.selected_entry >= col.entries.len() {
-                col.selected_entry = col.entries.len().saturating_sub(1);
-            }
+        if let Some(mut clone) = col.entries.get(i).cloned() {
+            // The title is the request's identifier (reports resolve requests
+            // by name), so two entries sharing one would make the name
+            // ambiguous for both — the copy needs one of its own.
+            clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
+            clone.user_added = true;
+            clone.modified = true;
+            // A copy has never been sent, so carrying the original's response
+            // over would credit it with a result it did not produce.
+            clone.last_response = None;
+            // Insert right after the original, not at the end, so the copy
+            // lands beside the request it came from rather than out of sight
+            // at the bottom of a long collection.
+            col.entries.insert(i + 1, clone);
+            col.selected_entry = i + 1;
             col.invalidate_request_json();
+        }
+    }
+    if let Some(i) = actions.delete {
+        // Route through the preference-honouring path so the context menu and
+        // the Requests-panel Delete key can't disagree about whether to ask
+        // first (see `GuiApp::request_delete_request`).
+        app.request_delete_request(ci, i);
+    }
+    if let Some((from, before)) = actions.reorder {
+        // The order is what `run_all_entries` follows, so this is a real edit to
+        // the collection rather than a view preference — `move_entry_before`
+        // marks the file unsaved, and a drop that changed nothing returns false
+        // so it doesn't.
+        if app.session.collections[ci].move_entry_before(from, before) {
+            app.session.save();
         }
     }
     if let Some(i) = actions.run {
@@ -389,6 +674,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
 /// Row indentation per tree depth, in pixels.
 const WS_INDENT: f32 = 14.0;
+
+/// A screenful for the tree's PageUp/PageDown. The plain request list binds
+/// neither key, so there is no on-screen page height to match; a fixed jump is
+/// predictable and enough to cross a long tree in a few presses.
+const WS_PAGE_JUMP: usize = 10;
 
 /// An action collected while rendering the (immutably-read) workspace tree,
 /// applied to the session afterwards.
@@ -438,12 +728,75 @@ enum WsAction {
         src: PathBuf,
         dest_dir: PathBuf,
     },
+    /// Rename a workspace file or folder (its own name on disk). Raises the
+    /// rename dialog seeded with the current name; the filesystem rename runs
+    /// only once that is confirmed. Distinct from a *request* rename
+    /// ([`ReqEdit::Rename`]), which edits a `# name` comment inside a `.hurl`
+    /// file rather than the file's own name.
+    RenameItem {
+        path: PathBuf,
+    },
+    /// Delete a workspace file or folder from disk. Always raises a
+    /// confirmation first (a disk delete has no undo, so unlike a request
+    /// delete it can't be turned off), then removes it and prunes everything
+    /// the tab was holding about it.
+    DeleteItem {
+        path: PathBuf,
+        is_dir: bool,
+    },
+    /// Run/Rename/Duplicate/Delete a request from the workspace tree — the same
+    /// actions the plain request list offers on its rows. Kept as one variant
+    /// carrying the [`ReqEdit`] kind so all of them share the load-then-act
+    /// plumbing below: a `loaded: false` row indexes a cached snapshot, not the
+    /// live `entries`, so it loads that collection first (exactly as
+    /// double-click-to-run does) and only then acts, never on a stale index.
+    RequestAction {
+        collection: PathBuf,
+        idx: usize,
+        loaded: bool,
+        kind: ReqEdit,
+    },
+    /// Reorder a request within the loaded collection: move the request at
+    /// `from` into the gap above `before` (`before == entries.len()` for the
+    /// gap past the last one). Only ever emitted for the loaded file's rows —
+    /// a non-loaded row's index isn't the live one, and a request can only move
+    /// within its own file — so `collection` is carried purely to re-check that
+    /// the loaded file is still the one dragged before touching it.
+    ReorderRequest {
+        collection: PathBuf,
+        from: usize,
+        before: usize,
+    },
+}
+
+/// Which of the plain list's request actions a [`WsAction::RequestAction`]
+/// stands for. Run is not here: it already has its own [`WsAction::RunRequest`]
+/// (shared with double-click), so the menu reuses that rather than a second
+/// path to the same place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReqEdit {
+    Rename,
+    Duplicate,
+    Delete,
 }
 
 /// What's being dragged around the workspace tree: the item's own path is all
 /// the drop target needs, since where it lands is decided by the target.
 #[derive(Clone, Debug)]
 struct WsDrag(PathBuf);
+
+/// A workspace *request* being dragged to a new position within its own
+/// collection file. A distinct payload type from [`WsDrag`] (a *file* being
+/// moved between folders) on purpose: the two gestures share the same tree, so
+/// every drop target checks the payload's type before reacting, and a request
+/// drag can never be mistaken for a file move or vice versa. The `collection`
+/// rides along so the drop zone can refuse a drop onto a different file —
+/// reordering is within one file only.
+#[derive(Clone, Debug)]
+struct WsReqDrag {
+    collection: PathBuf,
+    idx: usize,
+}
 
 /// An indented, clickable tree row: a leading spacer for its depth, then a
 /// static-frame selectable carrying the (already coloured) label. Truncates
@@ -462,6 +815,48 @@ fn ws_row(ui: &mut egui::Ui, depth: usize, selected: bool, text: RichText) -> eg
         )
     })
     .inner
+}
+
+/// The keyboard cursor's own look: a thin outline around its row, plus the
+/// scroll-into-view a keyboard move asked for.
+///
+/// Deliberately *not* the filled highlight `ws_row` already gives the loaded
+/// file and the open report through its `selected` flag. That flag marks a
+/// *state* — "this is the file the tab has open" — while the cursor is a
+/// *position* that moves on its own and is frequently on a different row.
+/// Reusing the fill would make the two indistinguishable, and a plain move
+/// would read as changing which file is loaded. An outline reads as "focus is
+/// here" instead, and composes with the fill, so one row can be both the loaded
+/// file and under the cursor at once. Its colour is the theme's `accent` (never
+/// a literal), the same focus cue the drag targets and the panel border use.
+///
+/// The ring is drawn only when the panel actually holds focus (`show_ring`): an
+/// unfocused tree showing a cursor would put two "here" marks on screen at once
+/// — the cursor and the loaded-file highlight — competing for the eye when the
+/// keyboard isn't even aimed at the panel.
+fn ws_cursor_decoration(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    show_ring: bool,
+    reveal: bool,
+    theme: &super::theme::GuiTheme,
+) {
+    if show_ring {
+        ui.painter().rect_stroke(
+            resp.rect,
+            4.0,
+            egui::Stroke::new(1.0, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if reveal {
+        // The least scrolling that puts the row on screen, and none at all when
+        // it is already there: stepping through a tree should move the cursor
+        // against a still list, not haul the scrollbar along to keep the cursor
+        // pinned mid-panel. See the plain list's copy of this for the full
+        // reasoning.
+        resp.scroll_to_me(None);
+    }
 }
 
 /// Make a tree row draggable, and (for a folder) somewhere a dragged item can
@@ -526,6 +921,322 @@ fn ws_drag_and_drop(
     }
 }
 
+/// The workspace-tree twin of [`request_drop_zone`]: offer the gap above or
+/// below a loaded request row as somewhere the dragged request can land, and
+/// draw the insertion line showing which.
+///
+/// A line *between* rows, never a highlight *on* one — the same visual language
+/// the plain list uses, and deliberately unlike [`ws_drag_and_drop`]'s folder
+/// highlight: that one means "drop the file *into* this folder", so a
+/// highlighted request row would read as dropping a request *into* a request,
+/// which is not a thing. Keeping the two distinct is why this paints a line and
+/// that paints an outline.
+///
+/// Refuses a drop whose source is a different collection file — a request only
+/// reorders within its own file, and moving one between files is what the
+/// transfer flow is for — by matching the target's `collection` against the
+/// dragged payload's. It checks for a [`WsReqDrag`] payload specifically, so a
+/// file drag (a [`WsDrag`]) passing over the row is ignored here, just as this
+/// request drag is ignored by the file drop targets.
+fn ws_request_drop_zone(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    theme: &super::theme::GuiTheme,
+    collection: &std::path::Path,
+    i: usize,
+    actions: &mut Vec<WsAction>,
+) {
+    let Some(dragged) = egui::DragAndDrop::payload::<WsReqDrag>(ui.ctx()) else {
+        return;
+    };
+    // A request dragged out of another file only ever passes over this row on
+    // its way somewhere; it must not land here.
+    if dragged.collection.as_path() != collection {
+        return;
+    }
+    if !resp.contains_pointer() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let rect = resp.rect;
+    // Which half of the row the pointer is in decides which gap is aimed at, so
+    // every pixel of the list targets a gap and there is no dead zone to fall
+    // down between rows.
+    let above = pos.y < rect.center().y;
+    let before = if above { i } else { i + 1 };
+    // Both gaps touching the dragged request are where it already is; a line
+    // there would promise a move `move_entry_before` correctly refuses to make.
+    if dragged.idx == before || dragged.idx + 1 == before {
+        return;
+    }
+    let y = if above { rect.top() } else { rect.bottom() };
+    ui.painter()
+        .hline(rect.x_range(), y, egui::Stroke::new(2.0, theme.accent));
+    if ui.input(|i| i.pointer.any_released()) {
+        actions.push(WsAction::ReorderRequest {
+            collection: collection.to_path_buf(),
+            from: dragged.idx,
+            before,
+        });
+        egui::DragAndDrop::clear_payload(ui.ctx());
+    }
+}
+
+/// Keyboard for a Workspace tab's file tree — the counterpart to the plain
+/// list's [`GuiApp::handle_list_keys`], for the tree that isn't a flat request
+/// list. Only reached when the Requests panel holds focus and no widget owns
+/// the keyboard (see the call site), so, exactly like the plain list, it stands
+/// down for dialogs and text entry without a second mechanism of its own: the
+/// whole of [`GuiApp::handle_global_keys`] has already returned early while a
+/// dialog is up, and the caller has already checked panel focus and that
+/// nothing is being typed into. That gating is *why* Delete here can never
+/// reach past a rename box to destroy the file behind it.
+///
+/// Every action goes through the same [`WsAction`]s the mouse raises, so the
+/// two input methods can't drift apart, and every key that is handled has
+/// already been consumed by `consume_key` so it doesn't also reach the tab
+/// strip or the ScrollArea behind the tree.
+pub(super) fn handle_ws_tree_keys(app: &mut GuiApp, ctx: &egui::Context, ci: usize) {
+    // Read the rows once and clamp the cursor to them before doing anything
+    // with it: the tree reshapes constantly (a scan refresh, a rename, a
+    // delete), so a cursor saved against an older shape must never index the
+    // new one — a wrong-row Delete is unrecoverable.
+    let rows = app.session.collections[ci].ws_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    let cur = app.session.collections[ci].list_cursor.min(last);
+
+    let (up, down, home, end, pgup, pgdn, left, right, enter, f2, del) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::End),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::F2),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+        )
+    });
+    if !(up || down || home || end || pgup || pgdn || left || right || enter || f2 || del) {
+        return; // nothing for us this frame; leave the cursor exactly as it was
+    }
+
+    // Vertical movement: clamped at both ends, never wrapping, exactly as the
+    // plain list moves — the tree is still a list to step down, whatever its
+    // rows happen to mean.
+    let mut new_cursor = if up {
+        cur.saturating_sub(1)
+    } else if down {
+        (cur + 1).min(last)
+    } else if home {
+        0
+    } else if end {
+        last
+    } else if pgup {
+        cur.saturating_sub(WS_PAGE_JUMP)
+    } else if pgdn {
+        (cur + WS_PAGE_JUMP).min(last)
+    } else {
+        cur
+    };
+
+    let row = &rows[cur];
+    let mut action: Option<WsAction> = None;
+
+    if right {
+        match ws_expansion(row) {
+            // A collapsed folder/collection opens where it stands — the same
+            // action a click raises, so keyboard and mouse can't diverge.
+            Some(false) => action = ws_toggle_action(row),
+            // Already open: step onto the first child. The tree is drawn
+            // depth-first, so the first child is simply the next row, when it is
+            // indented one level deeper than this one.
+            Some(true) => {
+                if cur < last && rows[cur + 1].depth() > row.depth() {
+                    new_cursor = cur + 1;
+                }
+            }
+            // A leaf (a request, report or environment) has nothing to open or
+            // to descend into, so Right does nothing rather than guessing.
+            None => {}
+        }
+    } else if left {
+        match ws_expansion(row) {
+            // Left collapses what the cursor is looking into *before* it leaves
+            // it: the standard tree idiom, and the whole reason Left is worth
+            // binding — a folder can be shut without first walking off it. Only
+            // once nothing is open under the cursor does Left step out.
+            Some(true) => action = ws_toggle_action(row),
+            _ => {
+                if let Some(parent) = ws_parent_of(&rows, cur) {
+                    new_cursor = parent;
+                }
+            }
+        }
+    }
+
+    // Activation and editing, each dispatched by row kind to the very action
+    // the mouse uses. These and the movement keys are mutually exclusive in a
+    // real frame (one key press), so the later assignment simply wins if two
+    // somehow arrive together.
+    if enter {
+        action = ws_enter_action(row);
+    }
+    if f2 {
+        action = ws_rename_action(row);
+    }
+    if del {
+        action = ws_delete_action(row);
+    }
+
+    if let Some(action) = action {
+        apply_ws_action(app, ci, action);
+    }
+    // Place the cursor *after* any action has reshaped the tree, so an action
+    // that repositioned it itself (loading a file runs `sync_ws_cursor`) can't
+    // leave the keyboard cursor somewhere the keypress didn't ask for. Re-clamp
+    // against the *new* row count, for the same reason the read above clamped.
+    let col = &mut app.session.collections[ci];
+    let last = col.list_row_count().saturating_sub(1);
+    col.list_cursor = new_cursor.min(last);
+    // Bring the cursor row into view next frame, as the plain list does for its
+    // selection — a step in a long tree, or Home/End, can land off-screen.
+    app.reveal_selected = true;
+}
+
+/// The expansion state of a workspace row that can hold children: `Some(true)`
+/// when open, `Some(false)` when collapsed, `None` for a leaf (a request,
+/// report or environment) that has none. A collection's `open` flag *is* its
+/// expansion, so it steps and toggles just like a folder.
+fn ws_expansion(row: &WsRow) -> Option<bool> {
+    match row {
+        WsRow::Folder { expanded, .. } | WsRow::RequestFolder { expanded, .. } => Some(*expanded),
+        WsRow::Collection { open, .. } => Some(*open),
+        _ => None,
+    }
+}
+
+/// The action that flips a row's expansion — the very one the mouse raises, so
+/// keyboard and click expand/collapse can't diverge. A folder toggles its
+/// `workspace_expanded` membership; a collection carries its current `open` so
+/// [`apply_ws_action`] toggles from the right state (opening a collapsed file
+/// loads it, exactly as a click does). `None` for a leaf.
+fn ws_toggle_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. } | WsRow::RequestFolder { path, .. } => {
+            Some(WsAction::ToggleFolder(path.clone()))
+        }
+        WsRow::Collection { path, open, .. } => Some(WsAction::ToggleCollection {
+            path: path.clone(),
+            open: *open,
+        }),
+        _ => None,
+    }
+}
+
+/// The row Left steps out to: the nearest row above the cursor with a shallower
+/// depth, i.e. the parent in the tree. `None` at the top level, where there is
+/// no parent to climb to.
+fn ws_parent_of(rows: &[WsRow], cur: usize) -> Option<usize> {
+    let depth = rows[cur].depth();
+    rows[..cur].iter().rposition(|r| r.depth() < depth)
+}
+
+/// What Enter does, per row kind — each mapped to the same [`WsAction`] a click
+/// or double-click raises: a folder toggles, a collection opens/loads (or
+/// closes if already open, exactly as a click does), a request runs, a report
+/// or environment opens. Enter on an environment opens (loads) it without
+/// yanking the Environments panel around, which is what a single click does;
+/// the double-click's reveal is a mouse-only affordance.
+fn ws_enter_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { .. } | WsRow::RequestFolder { .. } | WsRow::Collection { .. } => {
+            ws_toggle_action(row)
+        }
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RunRequest {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+        }),
+        WsRow::Report { path, .. } => Some(WsAction::OpenReport(path.clone())),
+        WsRow::Environment { path, .. } => Some(WsAction::OpenEnv {
+            path: path.clone(),
+            reveal: false,
+        }),
+    }
+}
+
+/// What F2 renames, per row kind. A real file/folder (folder, collection,
+/// report, environment) renames the item on disk through the same dialog the
+/// right-click Rename raises; a request renames its `# name` inside the file
+/// through the plain list's own rename. A virtual request-folder has no file of
+/// its own to rename, so F2 does nothing on it rather than pretending to.
+fn ws_rename_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. }
+        | WsRow::Collection { path, .. }
+        | WsRow::Report { path, .. }
+        | WsRow::Environment { path, .. } => Some(WsAction::RenameItem { path: path.clone() }),
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RequestAction {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+            kind: ReqEdit::Rename,
+        }),
+        WsRow::RequestFolder { .. } => None,
+    }
+}
+
+/// What Delete removes, per row kind. A real file/folder goes through the
+/// always-on disk-delete confirmation (a disk delete has no undo, unlike a
+/// request delete); a request goes through the plain list's delete, which
+/// honours the `confirm_on_delete_request` preference. A virtual request-folder
+/// has no file to delete, so Delete does nothing on it.
+fn ws_delete_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. } => Some(WsAction::DeleteItem {
+            path: path.clone(),
+            is_dir: true,
+        }),
+        WsRow::Collection { path, .. }
+        | WsRow::Report { path, .. }
+        | WsRow::Environment { path, .. } => Some(WsAction::DeleteItem {
+            path: path.clone(),
+            is_dir: false,
+        }),
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RequestAction {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+            kind: ReqEdit::Delete,
+        }),
+        WsRow::RequestFolder { .. } => None,
+    }
+}
+
 /// The left-top panel for a Workspace tab: the real filesystem tree under the
 /// workspace root (folders, collection files with inline requests, `.trail`
 /// reports and `.vars` environments), driven by [`WsRow`] exactly like the
@@ -558,6 +1269,20 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         app.strings.gui_ws_revert_request,
         app.strings.gui_ws_revert_file,
     );
+    // Rename / Delete of a file or folder on disk — shared by every real
+    // file/folder row (a folder, a collection, a report, an environment), and
+    // pulled out here once so the closures can be built while the tree is
+    // borrowed immutably below.
+    let ws_rd = (app.strings.gui_ws_rename, app.strings.gui_ws_delete);
+    // The request row's own actions, borrowed verbatim from the plain request
+    // list so a request in a workspace tree can be Run/Renamed/Duplicated/
+    // Deleted with exactly the same menu it has in a single-collection tab.
+    let (lbl_run, lbl_rename, lbl_duplicate, lbl_delete) = (
+        app.strings.gui_run,
+        app.strings.gui_rename_ellipsis,
+        app.strings.gui_duplicate,
+        app.strings.gui_delete,
+    );
     let s_new = new_item_labels(&app.strings);
 
     let name = app.session.collections[ci].name.clone();
@@ -567,7 +1292,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
     super::widgets::panel_header(ui, &theme, name, |ui| {
         let run_all = format!("{} {}", super::icons::PLAY, lbl_run_all);
         if ui.button(run_all).on_hover_text(tip_run_all).clicked() {
-            app.session.run_all_entries(ci);
+            app.request_run_all(ci);
         }
         let ftxt =
             RichText::new(lbl_filter).color(if filter_on { theme.accent } else { theme.dim });
@@ -612,6 +1337,17 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         .and_then(|e| e.path().map(std::path::Path::to_path_buf));
 
     let mut actions: Vec<WsAction> = Vec::new();
+    // The keyboard cursor's row, clamped to the rows actually on screen: the
+    // tree reshapes constantly (a scan refresh, a collapse, a delete), so an
+    // index saved against an older shape must never be trusted against the new
+    // one. Shown only while the panel holds focus (see `ws_cursor_decoration`),
+    // so an unfocused tree paints no phantom cursor beside the loaded file.
+    let cursor = app.session.collections[ci].list_cursor.min(rows.len() - 1);
+    let show_cursor = app.focus == super::Focus::List;
+    let reveal = app.reveal_selected;
+    // Filled in when a row is clicked, so a mouse click can hand the keyboard
+    // cursor to that row after the render (see the end of this function).
+    let mut click_cursor: Option<usize> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -636,8 +1372,12 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                 ws_row_menu(&bg, root.clone(), lbl_in_root, s_new, &mut actions);
             }
             let mut folder_rects: Vec<egui::Rect> = Vec::new();
-            for row in &rows {
-                match row {
+            for (row_idx, row) in rows.iter().enumerate() {
+                // Each arm draws its row and yields the row's `Response`, so the
+                // keyboard-cursor ring, the reveal scroll and the click that
+                // hands the cursor to a row are all handled once below rather
+                // than repeated per row kind.
+                let resp: egui::Response = match row {
                     WsRow::Folder {
                         path,
                         name,
@@ -655,9 +1395,21 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::ToggleFolder(path.clone()));
                         }
-                        ws_row_menu(&resp, path.clone(), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            path.clone(),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let chosen = ws_rename_delete_entries(ui, path, true, ws_rd);
+                                ui.separator();
+                                chosen
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, true, &mut actions);
                         folder_rects.push(resp.rect);
+                        resp
                     }
                     WsRow::Collection {
                         path,
@@ -697,9 +1449,6 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 open: *open,
                             });
                         }
-                        // A file with edits only in memory can be put back to
-                        // what is on disk; a clean one has nothing to offer, so
-                        // the entry isn't shown at all rather than shown greyed.
                         let edited_file = app.session.collections[ci].workspace_file_edited(path);
                         ws_row_menu_with(
                             &resp,
@@ -708,15 +1457,20 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                if !edited_file {
-                                    return None;
+                                let mut chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                // A file with edits only in memory can be put
+                                // back to what is on disk; a clean one has
+                                // nothing to offer, so the entry isn't shown at
+                                // all rather than shown greyed.
+                                if edited_file && ui.button(lbl_revert_file).clicked() {
+                                    chosen = chosen.or(Some(WsAction::RevertFile(path.clone())));
                                 }
-                                let hit = ui.button(lbl_revert_file).clicked();
                                 ui.separator();
-                                hit.then(|| WsAction::RevertFile(path.clone()))
+                                chosen
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
                     // A virtual folder inside a collection file. It looks and
                     // toggles like a filesystem folder, but deliberately has
@@ -745,6 +1499,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::ToggleFolder(path.clone()));
                         }
+                        resp
                     }
                     WsRow::Request {
                         collection,
@@ -830,14 +1585,18 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                 loaded: *loaded,
                             });
                         }
+                        // A row belongs to the loaded file when it says so and
+                        // the tab still holds that file — the test both the
+                        // reorder drag and the single-request revert turn on.
+                        let is_loaded_here =
+                            *loaded && loaded_path.as_deref() == Some(collection.as_path());
                         // Only the loaded file's requests can be reverted one
                         // at a time: another file's edits are parked as a whole,
                         // with no on-disk entry to put back in place of a single
                         // one of them (its file row reverts the lot). An *added*
                         // request has no saved version either, so `modified` is
                         // the test, not the pencil.
-                        let revertable = *loaded
-                            && loaded_path.as_deref() == Some(collection.as_path())
+                        let revertable = is_loaded_here
                             && app.session.collections[ci]
                                 .entries
                                 .get(*idx)
@@ -849,17 +1608,96 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                if !revertable {
-                                    return None;
+                                // The plain request list's row menu, so a
+                                // workspace request is Run/Renamed/Duplicated/
+                                // Deleted with the very same entries — and the
+                                // very same handlers (see `apply_actions`), so
+                                // the two can't drift apart. Run reuses the
+                                // existing double-click action; the rest carry
+                                // `loaded` so a not-loaded row loads its file
+                                // before acting rather than on a cached index.
+                                if ui.button(lbl_run).clicked() {
+                                    return Some(WsAction::RunRequest {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                    });
                                 }
-                                let hit = ui.button(lbl_revert_req).clicked();
+                                if ui.button(lbl_rename).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Rename,
+                                    });
+                                }
+                                if ui.button(lbl_duplicate).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Duplicate,
+                                    });
+                                }
+                                if ui.button(lbl_delete).clicked() {
+                                    return Some(WsAction::RequestAction {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                        loaded: *loaded,
+                                        kind: ReqEdit::Delete,
+                                    });
+                                }
+                                if revertable && ui.button(lbl_revert_req).clicked() {
+                                    return Some(WsAction::RevertRequest {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                    });
+                                }
                                 ui.separator();
-                                hit.then(|| WsAction::RevertRequest {
-                                    collection: collection.clone(),
-                                    idx: *idx,
-                                })
+                                None
                             },
                         );
+                        // Drag-to-reorder, matching the plain list's rows — but
+                        // only for the loaded file's. A reorder edits `entries`,
+                        // and a non-loaded row indexes a cached snapshot, not
+                        // the live list; loading that file mid-drag to make it
+                        // live would reshape the tree out from under the pointer,
+                        // so those rows simply aren't draggable. A request can
+                        // also only move *within* its own file (a cross-file
+                        // move is what dragging into a folder is for), which the
+                        // payload and `ws_request_drop_zone` enforce together.
+                        if is_loaded_here {
+                            if resp.drag_started() {
+                                egui::DragAndDrop::set_payload(
+                                    ui.ctx(),
+                                    WsReqDrag {
+                                        collection: collection.clone(),
+                                        idx: *idx,
+                                    },
+                                );
+                            }
+                            // Something has to follow the pointer, or the drag
+                            // reads as nothing happening: the rows stay put and
+                            // the insertion line only shows once the pointer is
+                            // over a row.
+                            if resp.dragged()
+                                && let Some(pos) = ui.ctx().pointer_interact_pos()
+                            {
+                                let layer = egui::LayerId::new(
+                                    egui::Order::Tooltip,
+                                    ui.id().with("ws_req_drag_label"),
+                                );
+                                ui.ctx().layer_painter(layer).text(
+                                    pos + egui::vec2(12.0, 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    name,
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    theme.accent,
+                                );
+                            }
+                            ws_request_drop_zone(ui, &resp, &theme, collection, *idx, &mut actions);
+                        }
+                        resp
                     }
                     WsRow::Report { path, name, depth } => {
                         let is_open = report_path.as_deref() == Some(path.as_path());
@@ -876,8 +1714,20 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::OpenReport(path.clone()));
                         }
-                        ws_row_menu(&resp, sibling_dir(path), lbl_in_folder, s_new, &mut actions);
+                        ws_row_menu_with(
+                            &resp,
+                            sibling_dir(path),
+                            lbl_in_folder,
+                            s_new,
+                            &mut actions,
+                            |ui| {
+                                let chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                ui.separator();
+                                chosen
+                            },
+                        );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
                     WsRow::Environment { path, name, depth } => {
                         let text = RichText::new(format!("{} {name}", super::icons::ENV))
@@ -896,22 +1746,61 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             s_new,
                             &mut actions,
                             |ui| {
-                                let hit = ui.button(lbl_set_active_env).clicked();
+                                let mut chosen = ws_rename_delete_entries(ui, path, false, ws_rd);
+                                if ui.button(lbl_set_active_env).clicked() {
+                                    chosen = chosen.or(Some(WsAction::ActivateEnv(path.clone())));
+                                }
                                 ui.separator();
-                                hit.then(|| WsAction::ActivateEnv(path.clone()))
+                                chosen
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
+                };
+                // Common to every row: remember a click so the mouse can hand
+                // the keyboard cursor to it (applied after the render, below),
+                // and — for the cursor row — draw the focus ring and honour a
+                // reveal request. The ring is gated on the panel holding focus;
+                // the reveal is a one-shot from a keyboard move, so it scrolls
+                // whether or not the panel is focused this instant.
+                if resp.clicked() {
+                    click_cursor = Some(row_idx);
                 }
+                ws_cursor_decoration(
+                    ui,
+                    &resp,
+                    show_cursor && row_idx == cursor,
+                    reveal && row_idx == cursor,
+                    &theme,
+                );
             }
             if let Some(root) = &ws_root {
                 ws_root_drop(ui, bg_rect, &folder_rects, &theme, root, &mut actions);
             }
         });
+    // A one-shot, like the plain list's: the cursor row has had its frame to
+    // scroll itself into view, so clear the request whether or not a row
+    // honoured it (an empty or fully-visible tree has nothing to scroll).
+    app.reveal_selected = false;
 
     for action in header_new.into_iter().chain(actions) {
         apply_ws_action(app, ci, action);
+    }
+
+    // A click anywhere in the tree moves the keyboard cursor onto that row, so
+    // the mouse and the keyboard never fight over where "here" is: click a row,
+    // press Down, and the cursor steps from the row you clicked rather than
+    // jumping back to wherever it last was. Applied *after* the actions above
+    // because a few of them (selecting a request, re-expanding the loaded file)
+    // reposition the cursor themselves via `sync_ws_cursor`, and the row the
+    // user actually clicked is the one that should win. Expanding, collapsing
+    // or loading only ever inserts or removes rows *below* the clicked one, so
+    // its index still names the row that was clicked.
+    if let Some(idx) = click_cursor {
+        let col = &mut app.session.collections[ci];
+        let last = col.list_row_count().saturating_sub(1);
+        col.list_cursor = idx.min(last);
     }
 }
 
@@ -1147,7 +2036,7 @@ fn move_workspace_item(
     src: &std::path::Path,
     dest_dir: &std::path::Path,
 ) {
-    use crate::workspace::{MoveError, move_item, repoint};
+    use crate::workspace::{MoveError, move_item};
 
     let Some(root) = app.session.collections[ci].workspace_root.clone() else {
         return;
@@ -1175,40 +2064,127 @@ fn move_workspace_item(
         return;
     }
 
-    // Every tab can be showing the moved file, not just the one dragged in:
-    // two workspace tabs may be open on the same root.
-    for col in &mut app.session.collections {
-        if let Some(p) = col.path.clone().and_then(|p| repoint(&p, src, &dest)) {
-            col.path = Some(p);
-        }
-        if let Some(p) = col
-            .workspace_selected
-            .clone()
-            .and_then(|p| repoint(&p, src, &dest))
-        {
-            col.workspace_selected = Some(p);
-        }
-        col.workspace_expanded = col
-            .workspace_expanded
-            .iter()
-            .map(|p| repoint(p, src, &dest).unwrap_or_else(|| p.clone()))
-            .collect();
-        col.workspace_titles = col
-            .workspace_titles
-            .drain()
-            .map(|(p, v)| (repoint(&p, src, &dest).unwrap_or(p), v))
-            .collect();
-    }
-    if let Some(ed) = app.report_editor.as_mut()
-        && let Some(p) = ed.path().and_then(|p| repoint(p, src, &dest))
-    {
-        ed.report.path = Some(p);
-    }
-
+    repoint_workspace_holdings(app, src, &dest);
     reveal_in_tree(app, ci, &dest, &root);
     app.session.status = Some(crate::i18n::Status::WsItemMoved(
         crate::workspace::display_name(&root, &dest),
     ));
+}
+
+/// Rename a workspace file or folder on disk, then fix up everything the app was
+/// holding it by — the exact same repointing a move needs, because to the app a
+/// rename *is* a move (the item's path changes), just within its own folder.
+///
+/// The safety — no path separators, no clobbering, keeping a file's extension
+/// so it doesn't drop out of the tree — all lives in
+/// [`crate::workspace::rename_item`]; this only translates its result into the
+/// session's held paths and a status line. A rename to the name it already has
+/// comes back unchanged and is silently nothing, exactly as a drop onto a file's
+/// own folder is.
+pub(super) fn rename_workspace_item(
+    app: &mut GuiApp,
+    ci: usize,
+    src: &std::path::Path,
+    new_name: &str,
+) {
+    use crate::workspace::{RenameError, rename_item};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    let dest = match rename_item(&root, src, new_name) {
+        Ok(dest) => dest,
+        Err(RenameError::EmptyName) => return,
+        Err(RenameError::Exists(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemRenameExists(what));
+            return;
+        }
+        Err(RenameError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+            return;
+        }
+        Err(RenameError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+            return;
+        }
+    };
+    if dest == src {
+        return;
+    }
+
+    repoint_workspace_holdings(app, src, &dest);
+    reveal_in_tree(app, ci, &dest, &root);
+    app.session.status = Some(crate::i18n::Status::WsItemRenamed(
+        crate::workspace::display_name(&root, &dest),
+    ));
+}
+
+/// Delete a workspace file or folder from disk, then drop everything the app was
+/// holding it by.
+///
+/// The removal itself is [`crate::workspace::delete_item`], which alone decides
+/// what is safe to delete (never outside the root, never the root itself); this
+/// handles the *aftermath* — the mirror image of a move's repointing. A move
+/// gives every held path a new home; a delete has none to give, so each tab
+/// forgets the item and, if the deleted thing was the file it had loaded, falls
+/// back to the file-less state a fresh Workspace tab starts in rather than
+/// showing a phantom of a file that no longer exists. The open report is closed
+/// if it was the one deleted (or lived under a deleted folder).
+pub(super) fn delete_workspace_item(app: &mut GuiApp, ci: usize, path: &std::path::Path) {
+    use crate::workspace::{DeleteError, delete_item};
+
+    let Some(root) = app.session.collections[ci].workspace_root.clone() else {
+        return;
+    };
+    match delete_item(&root, path) {
+        Ok(()) => {}
+        Err(DeleteError::IsRoot) => {
+            app.session.status = Some(crate::i18n::Status::WsItemDeleteRoot);
+            return;
+        }
+        Err(DeleteError::Escapes(what)) => {
+            app.session.status = Some(crate::i18n::Status::WsItemEscaped(what));
+            return;
+        }
+        Err(DeleteError::Io(what)) => {
+            app.session.status = Some(crate::i18n::Status::Error(what));
+            return;
+        }
+    }
+
+    let name = crate::workspace::display_name(&root, path);
+    // Every tab on this root has to forget it, not just the active one — two
+    // workspace tabs can be open on the same folder.
+    for col in &mut app.session.collections {
+        col.prune_workspace_paths(path);
+    }
+    // A report open in the editor from under the deleted item has nowhere to
+    // save back to; close it rather than leave it editing a deleted file.
+    if let Some(ed) = app.report_editor.as_ref()
+        && ed.path().is_some_and(|p| p.starts_with(path))
+    {
+        app.close_report_editor();
+    }
+    app.session.status = Some(crate::i18n::Status::WsItemDeleted(name));
+    app.session.save();
+}
+
+/// Repoint every held path from `src` to `dest` after a workspace item has been
+/// moved or renamed on disk — across *all* tabs (two may be open on one root)
+/// and the open report editor. Each collection's own by-path state is repointed
+/// by [`crate::collection::Collection::repoint_workspace_paths`]; the report
+/// editor lives on the app, so it is handled here.
+fn repoint_workspace_holdings(app: &mut GuiApp, src: &std::path::Path, dest: &std::path::Path) {
+    for col in &mut app.session.collections {
+        col.repoint_workspace_paths(src, dest);
+    }
+    if let Some(ed) = app.report_editor.as_mut()
+        && let Some(p) = ed
+            .path()
+            .and_then(|p| crate::workspace::repoint(p, src, dest))
+    {
+        ed.report.path = Some(p);
+    }
 }
 
 /// Expand every folder between the workspace root and `path`, so a newly
@@ -1316,6 +2292,62 @@ fn ws_row_menu_with(
     });
 }
 
+/// The Rename / Delete entries every real file/folder row's menu leads with,
+/// returning whichever was clicked. Kept in one place so the four row kinds
+/// that draw it (folder, collection, report, environment) can't drift apart,
+/// and deliberately *not* baked into [`ws_row_menu_with`]: the tree's
+/// background stands in for the workspace root, which can be neither renamed nor
+/// deleted, and a *request* row's menu already has its own Rename/Delete that
+/// mean something else (a title inside a file, an undoable in-memory removal).
+fn ws_rename_delete_entries(
+    ui: &mut egui::Ui,
+    path: &std::path::Path,
+    is_dir: bool,
+    labels: (&'static str, &'static str),
+) -> Option<WsAction> {
+    let (lbl_rename, lbl_delete) = labels;
+    if ui.button(lbl_rename).clicked() {
+        return Some(WsAction::RenameItem {
+            path: path.to_path_buf(),
+        });
+    }
+    if ui.button(lbl_delete).clicked() {
+        return Some(WsAction::DeleteItem {
+            path: path.to_path_buf(),
+            is_dir,
+        });
+    }
+    None
+}
+
+/// Make `collection` the tab's loaded file if it isn't already, and return the
+/// live `entries` index to act on. A not-loaded row's `idx` indexes the cached
+/// title snapshot rather than the live list, so it can only be acted on once
+/// its file is loaded — the same load-then-act the double-click run path uses.
+/// The index is clamped into range and then checked to actually exist, because
+/// a file re-read off disk can be shorter than the cache promised; `None` there
+/// stops a request action from falling onto the wrong request.
+fn resolve_ws_request(
+    app: &mut GuiApp,
+    ci: usize,
+    collection: &std::path::Path,
+    idx: usize,
+    loaded: bool,
+) -> Option<usize> {
+    let already = loaded && app.session.collections[ci].path.as_deref() == Some(collection);
+    if !already
+        && !(app
+            .session
+            .load_workspace_file(ci, collection.to_path_buf())
+            && app.session.collections[ci].path.as_deref() == Some(collection))
+    {
+        return None;
+    }
+    let n = app.session.collections[ci].entries.len();
+    let idx = idx.min(n.saturating_sub(1));
+    app.session.collections[ci].entries.get(idx).map(|_| idx)
+}
+
 /// Apply one collected [`WsAction`] to the session (mutations are deferred out
 /// of the render pass so the tree is read immutably while drawing).
 fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
@@ -1330,6 +2362,12 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         | WsAction::RunRequest {
             collection: path, ..
         }
+        | WsAction::RequestAction {
+            collection: path, ..
+        }
+        | WsAction::ReorderRequest {
+            collection: path, ..
+        }
         | WsAction::OpenReport(path)
         | WsAction::OpenEnv { path, .. }
         | WsAction::ActivateEnv(path) => {
@@ -1338,10 +2376,14 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         // Opening or closing a folder isn't "working on" anything; a new or
         // moved file records itself once it is actually there.
         // A revert isn't "working on" the file either — it undoes work — and
-        // the dialog it raises names its own target.
+        // the dialog it raises names its own target. Rename/Delete only raise a
+        // dialog here; the rename records the item's new path once it lands, and
+        // a delete has no selection to remember.
         WsAction::ToggleFolder(_)
         | WsAction::NewItem { .. }
         | WsAction::MoveItem { .. }
+        | WsAction::RenameItem { .. }
+        | WsAction::DeleteItem { .. }
         | WsAction::RevertRequest { .. }
         | WsAction::RevertFile(_) => {}
     }
@@ -1437,6 +2479,62 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
             app.session.save();
             app.run_active();
         }
+        WsAction::RequestAction {
+            collection,
+            idx,
+            loaded,
+            kind,
+        } => {
+            // Resolve the *live* index first: a not-loaded row's index points
+            // into the cached title snapshot, so its file is loaded here (the
+            // same load-then-act the double-click run path uses) to make the
+            // index real before acting. `None` means the file couldn't be
+            // loaded, or the request is gone after a re-read — acting on nothing
+            // beats acting on a stale index.
+            if let Some(idx) = resolve_ws_request(app, ci, &collection, idx, loaded) {
+                // Route through the plain list's own handler, so the workspace
+                // menu and the single-collection menu can never disagree about
+                // what Rename/Duplicate/Delete do (the delete-confirm
+                // preference, the unique-title copy, the rename dialog target).
+                let actions = match kind {
+                    ReqEdit::Rename => Actions {
+                        rename: Some(idx),
+                        ..Default::default()
+                    },
+                    ReqEdit::Duplicate => Actions {
+                        duplicate: Some(idx),
+                        ..Default::default()
+                    },
+                    ReqEdit::Delete => Actions {
+                        delete: Some(idx),
+                        ..Default::default()
+                    },
+                };
+                apply_actions(app, ci, actions);
+            }
+        }
+        WsAction::ReorderRequest {
+            collection,
+            from,
+            before,
+        } => {
+            // Guard on the loaded file still being the one the drag started in:
+            // `from`/`before` index the list that was on screen then, so a
+            // reorder that somehow outlived a tab switch must not land on a
+            // different file's entries. Reuses the plain list's handler, so a
+            // no-op drop (`move_entry_before` returns false) doesn't mark the
+            // file unsaved.
+            if app.session.collections[ci].path.as_deref() == Some(collection.as_path()) {
+                apply_actions(
+                    app,
+                    ci,
+                    Actions {
+                        reorder: Some((from, before)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         WsAction::OpenReport(path) => match crate::report::Report::load_local(&path) {
             Ok(report) => {
                 app.open_report_editor(super::report_editor::ReportOrigin::Workspace, report);
@@ -1449,6 +2547,48 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         },
         WsAction::NewItem { dir, kind } => new_workspace_item(app, ci, &dir, kind),
         WsAction::MoveItem { src, dest_dir } => move_workspace_item(app, ci, &src, &dest_dir),
+        // Rename and Delete both raise a dialog first; the filesystem change
+        // happens when it is confirmed (see `rename_workspace_item` /
+        // `delete_workspace_item`). Rename reuses the request rename dialog via
+        // its own `RenameTarget`; Delete has a dedicated confirmation because it
+        // must always ask and needs to say how much is about to go.
+        WsAction::RenameItem { path } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            app.dialog = Some(super::app::Dialog::Rename {
+                target: super::app::RenameTarget::WorkspaceItem { ci, path },
+                text: name,
+            });
+        }
+        WsAction::DeleteItem { path, is_dir } => {
+            let name = app.session.collections[ci]
+                .workspace_root
+                .as_deref()
+                .map(|root| crate::workspace::display_name(root, &path))
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            // A folder delete takes everything under it, so the count is what
+            // turns "delete" into an informed choice; a file is just itself.
+            let file_count = if is_dir {
+                crate::workspace::descendant_file_count(&path)
+            } else {
+                1
+            };
+            let unsaved = app.session.collections[ci].workspace_unsaved_under(&path);
+            app.dialog = Some(super::app::Dialog::DeleteWorkspaceItem {
+                ci,
+                path,
+                is_dir,
+                name,
+                file_count,
+                unsaved,
+            });
+        }
         WsAction::OpenEnv { path, reveal } => {
             let id = app.session.open_workspace_environment(&path);
             if reveal {
@@ -1610,7 +2750,7 @@ pub(crate) mod tests {
     /// A workspace fixture shaped like a real one: a nested folder holding two
     /// collection files alongside an environment and a report, so every row
     /// kind the tree can draw is in the frame.
-    fn ws_tmp(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn ws_tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "paperboy_gui_reqs_{tag}_{}_{:?}",
             std::process::id(),
@@ -2011,5 +3151,1098 @@ pub(crate) mod tests {
             !background,
             "so the background behind it never steals the row's clicks"
         );
+    }
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e.method = "GET".into();
+        e
+    }
+
+    #[test]
+    fn duplicate_gives_the_copy_a_fresh_title_and_lands_it_right_after_the_original() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("Login"), entry("Logout")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                duplicate: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let titles: Vec<&str> = app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["Login", "Login (2)", "Logout"]);
+        assert_eq!(app.session.collections[ci].selected_entry, 1);
+    }
+
+    #[test]
+    fn duplicate_never_carries_over_the_originals_last_response() {
+        let mut session = crate::session::Session::default();
+        let mut original = entry("Login");
+        original.last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            ..Default::default()
+        });
+        session.collections[0].entries = vec![original];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                duplicate: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let copy = &app.session.collections[ci].entries[1];
+        assert!(
+            copy.last_response.is_none(),
+            "a copy that has never been sent shouldn't inherit a result it didn't produce"
+        );
+    }
+
+    /// A drop is aimed at the gap between two rows, so dragging downwards has
+    /// to account for the dragged request being lifted out first — otherwise it
+    /// lands one place short of where it was let go.
+    #[test]
+    fn dragging_a_request_downwards_lands_it_in_the_gap_it_was_dropped_into() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c"), entry("d")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        // "a" dropped into the gap above "d".
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                reorder: Some((0, 3)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(titles(&app, ci), vec!["b", "c", "a", "d"]);
+        assert!(
+            app.session.collections[ci].structure_modified,
+            "the order is what Run All follows, so this is an unsaved edit"
+        );
+    }
+
+    #[test]
+    fn dragging_a_request_upwards_lands_it_in_the_gap_it_was_dropped_into() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c"), entry("d")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        // "d" dropped into the gap above "b".
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                reorder: Some((3, 1)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(titles(&app, ci), vec!["a", "d", "b", "c"]);
+    }
+
+    /// Dropping a request back where it started must not mark the file unsaved
+    /// — an aborted drag would otherwise leave the tab claiming an edit.
+    #[test]
+    fn a_drag_that_goes_nowhere_is_not_an_edit() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+
+        for before in [1, 2] {
+            apply_actions(
+                &mut app,
+                ci,
+                Actions {
+                    reorder: Some((1, before)),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(titles(&app, ci), vec!["a", "b", "c"]);
+        assert!(!app.session.collections[ci].structure_modified);
+    }
+
+    /// The filter is the collection's, not the panel's, so both front-ends
+    /// narrow the same tab the same way and each tab keeps its own.
+    #[test]
+    fn the_request_filter_flattens_the_tree_and_matches_the_whole_title() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        let col = &mut session.collections[0];
+
+        col.list_query = "log".into();
+        assert!(col.list_filter_active());
+        assert_eq!(
+            crate::tree::rows_matching(&col.entries, &col.list_query),
+            vec![crate::tree::Row::Entry(0), crate::tree::Row::Entry(2)],
+        );
+
+        // Whitespace alone is not a filter — it matches everything anyway, and
+        // treating it as one would flatten the tree for no visible reason.
+        col.list_query = "  ".into();
+        assert!(!col.list_filter_active());
+    }
+
+    fn titles(app: &GuiApp, ci: usize) -> Vec<&str> {
+        app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.title.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn deleting_a_request_records_it_for_undo_and_restoring_reinserts_it() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b"), entry("c")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+        // This test is about the undo history, not the confirmation guard, so
+        // delete straight away (the guard has its own test below).
+        app.session.confirm_on_delete_request = false;
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                delete: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        assert_eq!(app.session.collections[ci].deleted_entries.len(), 1);
+
+        app.undo_delete_request();
+        assert_eq!(
+            app.session.collections[ci]
+                .entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(app.session.collections[ci].deleted_entries.is_empty());
+        assert_eq!(app.session.collections[ci].selected_entry, 1);
+    }
+
+    /// Only a method other than GET makes Run All worth a prompt; a read-only
+    /// collection should run with no friction. GET is matched the way Hurl
+    /// treats it — case-insensitively.
+    #[test]
+    fn run_all_confirm_counts_flags_only_the_non_get_requests() {
+        let get_only = vec![entry("a"), entry("b")];
+        assert_eq!(run_all_confirm_counts(&get_only), (2, 0));
+
+        let mut mixed = get_only.clone();
+        let mut post = entry("c");
+        post.method = "post".into();
+        mixed.push(post);
+        assert_eq!(run_all_confirm_counts(&mixed), (3, 1));
+
+        assert_eq!(run_all_confirm_counts(&[]), (0, 0));
+    }
+
+    /// An all-GET collection runs immediately; one with a write is held behind
+    /// a confirmation that carries the counts.
+    #[test]
+    fn request_run_all_asks_only_when_a_write_is_in_the_collection() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b")];
+        let mut app = GuiApp::for_test(session);
+        app.request_run_all(0);
+        assert!(
+            app.dialog.is_none(),
+            "a read-only collection runs with no prompt"
+        );
+
+        let mut post = entry("c");
+        post.method = "POST".into();
+        app.session.collections[0].entries.push(post);
+        app.request_run_all(0);
+        match &app.dialog {
+            Some(Dialog::ConfirmRunAll { ci, total, non_get }) => {
+                assert_eq!((*ci, *total, *non_get), (0, 3, 1));
+            }
+            _ => panic!("a collection with a write asks first, and says how many"),
+        }
+    }
+
+    /// The tree keyboard steps through requests in the order they are drawn:
+    /// each folder's contents before the entries beside it, so Up/Down move to
+    /// the row the eye expects rather than the raw `entries` order.
+    #[test]
+    fn nav_entry_order_walks_the_tree_as_it_is_rendered() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Root"),
+            entry("Auth/Login"),
+            entry("Auth/Logout"),
+            entry("Users/List"),
+        ];
+        let col = &session.collections[0];
+        // Auth (0..) then Users, each folder's entries, then the root entry.
+        assert_eq!(nav_entry_order(col), vec![1, 2, 3, 0]);
+    }
+
+    /// While filtered the list is flat — folders are gone — so the keyboard
+    /// steps through exactly the matches, in match order.
+    #[test]
+    fn nav_entry_order_follows_the_filter_when_one_is_typed() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        session.collections[0].list_query = "log".into();
+        let col = &session.collections[0];
+        assert_eq!(nav_entry_order(col), vec![0, 2]);
+    }
+
+    /// The context menu's Delete goes through the same preference-honouring path
+    /// as the Delete key: on by default, it asks first and leaves the request
+    /// in place until the prompt is answered.
+    #[test]
+    fn context_menu_delete_asks_before_removing_when_the_guard_is_on() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![entry("a"), entry("b")];
+        let ci = 0;
+        let mut app = GuiApp::for_test(session);
+        assert!(
+            app.session.confirm_on_delete_request,
+            "the guard is on by default, like the environment one"
+        );
+
+        apply_actions(
+            &mut app,
+            ci,
+            Actions {
+                delete: Some(1),
+                ..Default::default()
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::ConfirmDeleteRequest { ci: dci, idx, name }) => {
+                assert_eq!((*dci, *idx), (0, 1));
+                assert_eq!(name, "b");
+            }
+            _ => panic!("a delete confirmation naming the request should be up"),
+        }
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            2,
+            "nothing is removed until the prompt is answered"
+        );
+    }
+
+    /// Every URL of a workspace tab's loaded file, in order — the shape the
+    /// reorder tests compare against.
+    fn ws_urls(app: &GuiApp, ci: usize) -> Vec<String> {
+        app.session.collections[ci]
+            .entries
+            .iter()
+            .map(|e| e.url.clone())
+            .collect()
+    }
+
+    /// A workspace request could be selected and run, but never reordered — the
+    /// tree's rows skipped the drag-to-reorder the plain list's have always had.
+    /// Applying the action the drop zone raises moves the request within its
+    /// file and marks that file unsaved, exactly as the plain list's does.
+    #[test]
+    fn reordering_a_request_within_a_workspace_collection_moves_it_and_marks_the_file_unsaved() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsreorder");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        // one.hurl holds `a` then `a2`, in that order.
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/a", "https://example.com/a2"]
+        );
+
+        // The first request dragged into the gap past the last one.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::ReorderRequest {
+                collection: one.clone(),
+                from: 0,
+                before: 2,
+            },
+        );
+
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/a2", "https://example.com/a"],
+            "the request landed in the gap it was dropped into"
+        );
+        assert!(
+            app.session.collections[ci].structure_modified,
+            "a reorder is an unsaved structural edit, the same as in a plain tab"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request may only be reordered within its own file — moving one between
+    /// files is what the transfer flow is for. The drop zone refuses a drag
+    /// whose payload names a different collection than the row it is over; the
+    /// handler's guard is the backstop, and pinning it proves a stray cross-file
+    /// reorder can't fall onto the loaded file's entries.
+    #[test]
+    fn a_workspace_reorder_addressed_to_a_different_file_leaves_the_loaded_one_untouched() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsreorderxfile");
+        let one = dir.join("api/v1/one.hurl");
+        let two = dir.join("api/v1/two.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        let before = ws_urls(&app, ci);
+
+        // Address a reorder to two.hurl while one.hurl is loaded.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::ReorderRequest {
+                collection: two.clone(),
+                from: 0,
+                before: 2,
+            },
+        );
+
+        assert_eq!(
+            before,
+            ws_urls(&app, ci),
+            "the loaded file's order is unchanged"
+        );
+        assert!(
+            !app.session.collections[ci].structure_modified,
+            "and nothing is marked unsaved"
+        );
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(one.as_path()),
+            "nor is a different file loaded — a reorder never load-then-acts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Right-clicking a workspace request used to offer only the tree's "New…"
+    /// entries — none of the actions that apply to a request. The menu now
+    /// carries Run/Rename/Duplicate/Delete, routed through the very handlers the
+    /// plain list uses, so the two menus can't disagree: Rename raises the
+    /// request rename dialog, Duplicate inserts a uniquely-titled copy, Delete
+    /// (guard off) removes it.
+    #[test]
+    fn the_workspace_request_menu_renames_duplicates_and_deletes_through_the_plain_lists_handlers()
+    {
+        redirect_saved_state();
+        let dir = ws_tmp("wsmenu");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+
+        // Rename raises the same dialog the plain list's Rename does, aimed at
+        // the row it was invoked on.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 1,
+                loaded: true,
+                kind: ReqEdit::Rename,
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::Rename {
+                target: RenameTarget::Request { ci: dci, idx },
+                ..
+            }) => assert_eq!((*dci, *idx), (ci, 1)),
+            _ => panic!("Rename should raise the request rename dialog"),
+        }
+        app.dialog = None;
+
+        // Duplicate inserts a copy right after the original and selects it.
+        let before = app.session.collections[ci].entries.len();
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 0,
+                loaded: true,
+                kind: ReqEdit::Duplicate,
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            before + 1,
+            "a copy was inserted"
+        );
+        assert_eq!(
+            app.session.collections[ci].selected_entry, 1,
+            "and selected, right after the original it came from"
+        );
+
+        // Delete, with the guard off, removes it straight away.
+        app.session.confirm_on_delete_request = false;
+        let n = app.session.collections[ci].entries.len();
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: one.clone(),
+                idx: 0,
+                loaded: true,
+                kind: ReqEdit::Delete,
+            },
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            n - 1,
+            "the request was deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request row for a collection the tab hasn't loaded indexes a cached
+    /// name/method snapshot, not the live `entries`. A menu action on such a row
+    /// must load that file first (as double-click-to-run already does) and only
+    /// then act — acting on the loaded file's index would hit the wrong request.
+    #[test]
+    fn a_request_action_on_a_not_loaded_row_loads_that_file_before_acting() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsloadact");
+        let one = dir.join("api/v1/one.hurl");
+        let two = dir.join("api/v1/two.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        app.session.confirm_on_delete_request = false;
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(one.as_path()),
+            "one.hurl is the loaded file, two.hurl is not"
+        );
+
+        // Delete the second request of the *other* file. Its row is
+        // `loaded: false`, so this must load two.hurl before acting — deleting
+        // one.hurl's index 1 would remove the wrong request.
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RequestAction {
+                collection: two.clone(),
+                idx: 1,
+                loaded: false,
+                kind: ReqEdit::Delete,
+            },
+        );
+
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(two.as_path()),
+            "the addressed file is now the loaded one"
+        );
+        assert_eq!(
+            ws_urls(&app, ci),
+            vec!["https://example.com/b"],
+            "and its second request — not one.hurl's — was the one deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Renaming the file a tab has loaded moves it on disk *and* keeps the tab
+    /// pointing at it — the whole reason a rename needs the same repointing a
+    /// move does. Without it the tab would hold a path that no longer exists and
+    /// look as though its contents had vanished.
+    #[test]
+    fn renaming_the_loaded_workspace_file_repoints_the_tab_that_had_it_open() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsrenload");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+
+        rename_workspace_item(&mut app, ci, &one, "renamed");
+
+        let dest = dir.join("api/v1/renamed.hurl");
+        assert!(dest.exists(), "the file is at its new name on disk");
+        assert!(!one.exists(), "and gone from the old one");
+        assert_eq!(
+            app.session.collections[ci].path.as_deref(),
+            Some(dest.as_path()),
+            "the tab follows the file it had loaded"
+        );
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::WsItemRenamed(_))
+            ),
+            "and it reports the rename"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename of a request row is a different thing from a rename of the file:
+    /// the menu's file Rename raises a `WorkspaceItem` target, not a `Request`
+    /// one, so the two can't be confused.
+    #[test]
+    fn the_file_rename_menu_entry_targets_the_file_not_a_request() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsrenmenu");
+        let health = dir.join("health.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::RenameItem {
+                path: health.clone(),
+            },
+        );
+        match &app.dialog {
+            Some(Dialog::Rename {
+                target: RenameTarget::WorkspaceItem { ci: dci, path },
+                text,
+            }) => {
+                assert_eq!(*dci, ci);
+                assert_eq!(path, &health);
+                assert_eq!(text, "health.hurl", "seeded with the current name");
+            }
+            _ => panic!("file Rename should raise a WorkspaceItem rename dialog"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting the file a tab has loaded removes it from disk and leaves the
+    /// tab in the file-less state a fresh Workspace tab starts in, rather than
+    /// showing a phantom of a file that is gone.
+    #[test]
+    fn deleting_the_loaded_workspace_file_unloads_the_tab() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelload");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        assert!(!app.session.collections[ci].entries.is_empty());
+
+        delete_workspace_item(&mut app, ci, &one);
+
+        assert!(!one.exists(), "the file is gone from disk");
+        assert_eq!(
+            app.session.collections[ci].path, None,
+            "the tab no longer has a loaded file"
+        );
+        assert!(
+            app.session.collections[ci].entries.is_empty(),
+            "and isn't left showing the deleted file's requests"
+        );
+        assert!(
+            matches!(
+                app.session.status,
+                Some(crate::i18n::Status::WsItemDeleted(_))
+            ),
+            "and it reports the delete"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a folder takes its whole subtree with it, and the tab forgets
+    /// everything it was holding under it: the loaded file (which was inside),
+    /// the expanded rows, the remembered selection.
+    #[test]
+    fn deleting_a_workspace_folder_removes_it_and_forgets_its_children() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelfolder");
+        let api = dir.join("api");
+        let v1 = dir.join("api/v1");
+        let one = v1.join("one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        assert!(session.load_workspace_file(ci, one.clone()));
+        let mut app = GuiApp::for_test(session);
+        app.session.collections[ci]
+            .workspace_expanded
+            .insert(api.clone());
+        app.session.collections[ci]
+            .workspace_expanded
+            .insert(v1.clone());
+        app.session.collections[ci].workspace_selected = Some(one.clone());
+
+        delete_workspace_item(&mut app, ci, &api);
+
+        assert!(
+            !api.exists(),
+            "the folder and its subtree are gone from disk"
+        );
+        assert_eq!(
+            app.session.collections[ci].path, None,
+            "the loaded file, which was inside, is unloaded"
+        );
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .iter()
+                .any(|p| p.starts_with(&api)),
+            "no expanded row under the deleted folder survives"
+        );
+        assert_eq!(
+            app.session.collections[ci].workspace_selected, None,
+            "and the remembered selection, which was inside, is cleared"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delete menu entry always raises a confirmation — never acting on the
+    /// spot — and the confirmation carries what is about to go: a folder's file
+    /// count, so a folder delete says how much it will take.
+    #[test]
+    fn the_file_delete_menu_entry_always_confirms_and_counts_a_folder() {
+        redirect_saved_state();
+        let dir = ws_tmp("wsdelconfirm");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        // Even with the request-delete guard off, a disk delete still confirms.
+        app.session.confirm_on_delete_request = false;
+
+        apply_ws_action(
+            &mut app,
+            ci,
+            WsAction::DeleteItem {
+                path: api.clone(),
+                is_dir: true,
+            },
+        );
+
+        match &app.dialog {
+            Some(Dialog::DeleteWorkspaceItem {
+                path,
+                is_dir,
+                file_count,
+                ..
+            }) => {
+                assert_eq!(path, &api);
+                assert!(*is_dir, "api is a folder");
+                assert_eq!(
+                    *file_count, 4,
+                    "api/v1 holds two collections, an env and a report — four files"
+                );
+            }
+            _ => panic!("Delete should always raise the confirmation dialog"),
+        }
+        // Nothing was deleted just by opening the dialog.
+        assert!(api.exists(), "the folder is still there until confirmed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Keyboard for the Workspace tab's file tree (`handle_ws_tree_keys`). ---
+
+    /// Feed one key press to the workspace tree handler exactly as a frame
+    /// would, so `consume_key` runs the real input path rather than a poked
+    /// flag. The panel-focus and dialog gating live one level up in
+    /// `handle_global_keys`; those are exercised through the `press` helper in
+    /// `app.rs`, so here the handler is driven directly.
+    fn ws_key(app: &mut GuiApp, ctx: &egui::Context, ci: usize, key: egui::Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input.modifiers = egui::Modifiers::NONE;
+        let _ = ctx.run_ui(input, |ui| handle_ws_tree_keys(app, ui.ctx(), ci));
+    }
+
+    /// The row index of the first folder whose path is `path`.
+    fn folder_row(app: &GuiApp, ci: usize, path: &std::path::Path) -> usize {
+        app.session.collections[ci]
+            .ws_rows()
+            .iter()
+            .position(|r| matches!(r, WsRow::Folder { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no folder row for {}", path.display()))
+    }
+
+    #[test]
+    fn the_workspace_tree_cursor_moves_with_the_arrows_and_clamps_at_both_ends() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeymove");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let last = app.session.collections[ci].ws_rows().len() - 1;
+        assert!(last >= 1, "the fixture lists at least two top-level rows");
+        app.session.collections[ci].list_cursor = 0;
+        let ctx = egui::Context::default();
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowDown);
+        assert_eq!(app.session.collections[ci].list_cursor, 1);
+        assert!(
+            app.reveal_selected,
+            "a keyboard move asks the row into view for the next render"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::End);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, last,
+            "End jumps to the last row"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowDown);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, last,
+            "Down at the bottom clamps rather than wrapping"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::Home);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 0,
+            "Home jumps to the first row"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowUp);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 0,
+            "Up at the top clamps rather than wrapping"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn right_expands_a_collapsed_folder_and_left_collapses_it() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyexpand");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row;
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "the api folder starts collapsed"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowRight);
+        assert!(
+            app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Right expands a collapsed folder"
+        );
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "the cursor stays on the folder it just opened"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowLeft);
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Left collapses the folder it is looking into"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn right_steps_into_an_open_folder_and_left_climbs_to_the_parent() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeytree");
+        let api = dir.join("api");
+        let v1 = dir.join("api/v1");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        // Open `api` so `v1` shows beneath it, but leave `v1` collapsed.
+        session.collections[ci]
+            .workspace_expanded
+            .insert(api.clone());
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        let api_row = folder_row(&app, ci, &api);
+        let v1_row = folder_row(&app, ci, &v1);
+        assert_eq!(v1_row, api_row + 1, "v1 is api's first child in the tree");
+
+        app.session.collections[ci].list_cursor = api_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowRight);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, v1_row,
+            "Right on an already-open folder steps onto its first child"
+        );
+
+        assert!(
+            !app.session.collections[ci].workspace_expanded.contains(&v1),
+            "v1 is collapsed, so Left climbs out rather than closing it"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowLeft);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "Left on a collapsed child climbs to the parent row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_runs_a_request_and_toggles_a_folder() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyenter");
+        let api = dir.join("api");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        // Enter on a folder toggles it open (the same action a click raises).
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::Enter);
+        assert!(
+            app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Enter on a folder toggles it"
+        );
+
+        // Load a file so a request row exists, then Enter on it runs it.
+        assert!(app.session.load_workspace_file(ci, one.clone()));
+        let rows = app.session.collections[ci].ws_rows();
+        let (req_row, idx) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(row, r)| match r {
+                WsRow::Request {
+                    idx, loaded: true, ..
+                } => Some((row, *idx)),
+                _ => None,
+            })
+            .expect("the loaded file lists a request row");
+        app.session.collections[ci].list_cursor = req_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::Enter);
+        assert_eq!(
+            app.session.collections[ci].selected_entry, idx,
+            "Enter selects the request it is about to run"
+        );
+        assert_eq!(
+            app.session.collections[ci].entries[idx].last_run,
+            crate::hurl::RunStatus::Running,
+            "and starts it running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f2_and_delete_reach_the_file_on_a_file_row_and_the_request_on_a_request_row() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyedit");
+        let health = dir.join("health.hurl");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        // Guard off, so a *request* delete would act at once — the contrast that
+        // proves a *file* delete still always confirms.
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        // --- On a collection *file* row. ---
+        let file_row = app.session.collections[ci]
+            .ws_rows()
+            .iter()
+            .position(|r| matches!(r, WsRow::Collection { path, .. } if path == &health))
+            .expect("health.hurl is a top-level collection row");
+        app.session.collections[ci].list_cursor = file_row;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::F2);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::Rename {
+                    target: RenameTarget::WorkspaceItem { .. },
+                    ..
+                })
+            ),
+            "F2 on a file renames the workspace item, not a request"
+        );
+        app.dialog = None;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::Delete);
+        assert!(
+            matches!(app.dialog, Some(Dialog::DeleteWorkspaceItem { .. })),
+            "Delete on a file always raises the disk-delete confirmation"
+        );
+        assert!(health.exists(), "and nothing is gone until it is confirmed");
+        app.dialog = None;
+
+        // --- On a request row. ---
+        assert!(app.session.load_workspace_file(ci, one.clone()));
+        let rows = app.session.collections[ci].ws_rows();
+        let req_row = rows
+            .iter()
+            .position(|r| matches!(r, WsRow::Request { loaded: true, .. }))
+            .expect("the loaded file lists a request row");
+        app.session.collections[ci].list_cursor = req_row;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::F2);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::Rename {
+                    target: RenameTarget::Request { .. },
+                    ..
+                })
+            ),
+            "F2 on a request renames the request"
+        );
+        app.dialog = None;
+
+        let n = app.session.collections[ci].entries.len();
+        ws_key(&mut app, &ctx, ci, egui::Key::Delete);
+        assert!(
+            app.dialog.is_none(),
+            "the request-delete guard is off, so a request delete acts without a prompt"
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            n - 1,
+            "and the request under the cursor is gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clicking_a_tree_row_moves_the_keyboard_cursor_to_it() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyclick");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        app.focus = crate::gui::Focus::List;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        // Start the cursor on a *different* row than the one about to be clicked.
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row + 1;
+
+        // Lay the tree out once so the api folder row's rect is known.
+        let out = ctx.run_ui(frame(Vec::new()), |ui| {
+            crate::gui::requests::ui(&mut app, ui)
+        });
+        let row = texts(&out.shapes)
+            .into_iter()
+            .find(|(t, _)| t.contains("api"))
+            .expect("the api folder row is drawn")
+            .1;
+        let at = egui::pos2(row.center().x, row.center().y);
+
+        let mut events = vec![egui::Event::PointerMoved(at)];
+        for pressed in [true, false] {
+            events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = ctx.run_ui(frame(events), |ui| crate::gui::requests::ui(&mut app, ui));
+
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "clicking a row hands the keyboard cursor to it, so the two don't fight"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

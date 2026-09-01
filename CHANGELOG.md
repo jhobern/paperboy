@@ -8,6 +8,845 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.1] - 2026-08-27
+
+### Added
+
+- **The GUI's Workspace tree can be driven from the keyboard.** A plain
+  collection tab's request list already answered to the arrow keys, but a
+  Workspace tab's left pane — the filesystem tree of folders, collection files,
+  reports and environments, with expanded collections' requests nested among
+  them — was mouse-only, so a keyboard user could reach a workspace's contents
+  only by pointing at each row. With the Requests panel focused, the arrows now
+  move a cursor through the tree (Home/End to the ends, PageUp/PageDown ten
+  rows at a time), and, because a tree is not a flat list, **Right** expands a
+  collapsed folder or collection — or steps into its first child once open — and
+  **Left** collapses an open one or climbs to its parent, the idiom every file
+  tree uses. **Enter** does whatever the row is for (toggle a folder, open a
+  collection, run a request, open a report or environment), **F2** renames the
+  file or the request under the cursor, and **Delete** removes it — each through
+  the very same action the mouse raises, so the two can never disagree about
+  what Delete means on a `.trail` file versus a request, and each honouring the
+  same confirmation (a disk delete always asks; a request delete obeys the
+  *Confirm deleting a request* preference). The cursor is drawn as a quiet focus
+  outline rather than the filled highlight that marks the loaded file, since the
+  two are different things that often sit on different rows, and it is shown only
+  while the panel holds focus. Clicking a row moves the cursor onto it, so the
+  mouse and the keyboard never fight over where "here" is, and the bindings stand
+  down entirely while a dialog is open or a text field has the keyboard, so a
+  Delete keystroke can never reach past a dialog you are typing in to the file
+  behind it.
+
+- **`Ctrl+S` saves in the terminal UI.** It is the one shortcut every user
+  arrives already knowing, and until now the terminal UI did not bind it at
+  all: saving lived under `f` ▸ Save, and the keypress fell through to the
+  bare-`s` Settings arm, so the save reflex opened a menu. In the report view it
+  meant something else again — "export the results as CSV" — so the same chord
+  wrote a file nobody asked for. It now means one thing everywhere, and the same
+  thing the GUI has always meant by it: write what is in front of you back to
+  the file it came from — the open report if there is one, otherwise the active
+  collection — falling back to "Save As" when that document has never been
+  written anywhere, because a save shortcut that does nothing on an unsaved file
+  is no use on exactly the files most likely to need it. A bare `s` still opens
+  Settings. Report CSV export moves to **`Ctrl+E`**.
+
+- **Deleting a request asks first.** `x` in the Requests list removed the
+  highlighted request on the spot, while deleting an *environment* one pane over
+  has always been gated by a confirmation — the inconsistent half being the one
+  that throws away more work, since a request carries a body, headers, asserts
+  and captures that took longer to write than an environment row, and `x` sits
+  one key away from the list navigation. There is now a
+  "Confirm before deleting a request" preference, on by default and sitting
+  beside its environment counterpart, so anyone who would rather lean on `u`
+  can have the old behaviour back. The deletion stays undoable either way.
+
+- **The footer offers `c` on a Workspace tab.** There `c` copies the
+  highlighted request into another collection file in the workspace — the one
+  place the key reaches outside the collection being viewed — but the footer's
+  `c duplicate` hint is deliberately suppressed on a workspace, which left the
+  workspace meaning advertised nowhere but the help overlay. It now gets its
+  own hint, with its own wording, shown only on a row where it would do
+  something.
+
+- **The wizard's section tabs show which sections have something in them.** The
+  request wizard has ten tabs, and with one of them open the bar is the only
+  view of the other nine — but the labels alone said nothing about which were
+  populated, so the only way to find out was to visit each one or switch to the
+  "All" tab and read the whole stack. A section holding content is now drawn on
+  a filled background rather than dimmed. A background rather than a dot or a
+  count, so that marking a tab costs no width: the bar already has ten labels to
+  fit across the dialog.
+
+- **The GUI's request list can be driven from the keyboard.** Tab moved a
+  glowing focus border around the panels, but the Requests panel it landed on
+  answered to nothing: selecting a request meant clicking it, and running,
+  renaming or deleting one was buried in a right-click menu, so a keyboard user
+  could not pick, run or delete a request at all — and F5, which runs the
+  *selected* request, was unreachable because nothing but the mouse could
+  select one. With the panel focused, the arrow keys now move the selection
+  (Home/End jump to the first/last request), Enter runs it, F2 renames it and
+  Delete deletes it; the selected row is scrolled into view so a jump in a long
+  collection doesn't land off-screen. The keys stand down while a dialog is up
+  or a text field (a rename box, the list filter, a URL cell) has the keyboard,
+  so Delete and the arrows edit what you are typing rather than reaching past it
+  to destroy a request. A Workspace tab's list is a filesystem tree of folders,
+  collections, reports and environments rather than a flat list of requests, so
+  its rows are still driven by the mouse.
+
+- **The GUI has an F1 keyboard-shortcuts overlay, a Help menu and visible menu
+  accelerators.** Almost nothing about the GUI's keyboard was discoverable: it
+  had no help overlay at all (the terminal UI has one), and of its menu items
+  only Save admitted to having a shortcut. Pressing F1 — or Help ▸ Keyboard
+  Shortcuts — now opens a grouped, dismissible overlay listing every GUI
+  shortcut with a short description, built from the keys the app actually binds
+  so it can't drift out of date. Save As, Close Tab and Undo Delete Request now
+  show their accelerators (Ctrl+Shift+S, Ctrl+W, Ctrl+Z) next to them the same
+  way Save always showed Ctrl+S. All of it is translated across English, French
+  and Danish.
+
+- **A JSON request body can carry comments.** People arriving from Postman
+  bring bodies annotated with what each field is for, and Hurl has nowhere to
+  put them — `hurl_core` rejects `//` outright — so until now they had to be
+  deleted at the door. The body is now kept as you wrote it, comments and all,
+  and stripped on the way out: the request that is sent, and the body that
+  every other Hurl runner reads in the `.hurl` file, are strict JSON. The notes
+  ride along in a `# [Body]` block that Hurl ignores, so the file stays valid
+  and `hurlfmt` leaves it byte-for-byte alone. Both `//` and `/* … */` are
+  understood, and a slash that isn't a comment is left alone — a `"url":
+  "https://example.net"` keeps its slashes, and a body that was never JSON in
+  the first place is never touched at all, since truncating a GraphQL query at
+  a slash would be far worse than not annotating it.
+
+  Because the file carries the body twice, the two can be made to disagree by
+  editing one and not the other outside PaperBoy. The body in the file always
+  wins — it is what runs — and when the notes no longer describe it they are
+  **kept in the file as ordinary comments** rather than quietly deleted, so
+  nothing you wrote is ever thrown away on your behalf. A body that is merely
+  reformatted, or has its keys reordered, still counts as the same body, so
+  running someone else's formatter over a collection doesn't orphan every
+  comment in it.
+
+  Commenting out a field works the way you would expect, including the last one
+  in an object or array: the comma that used to separate it is dropped from the
+  body that gets sent, so `// "draft": true` on the final line leaves valid JSON
+  behind rather than a body no server will accept.
+
+  When notes do come loose from their body, the request says so rather than
+  leaving you to notice that your comments have quietly stopped following it
+  around. `Ctrl+B` in the terminal UI, or a notice beside the body in the
+  graphical one, offers the two answers that are actually available: take the
+  notes back as the body, or delete them and keep the body as it is. Neither
+  happens on its own, and doing nothing is always the third option — the notes
+  are still there precisely because nothing was thrown away without asking.
+  Taking them back is offered only when they would still make a valid body; when
+  they wouldn't, the reason is written on the button rather than left for you to
+  find out by pressing it.
+
+  Raw Mode is the one place where a body and its notes can be edited apart,
+  since it shows you both copies at once, so it now works out which one you
+  meant by comparing what you saved against what you were given. Edit only the
+  notes and they become the body — otherwise the copy that gets sent would
+  silently win and your edit would look ignored. Edit only the body and it is
+  kept, as it always was, with the notes preserved beside it. Edit both and
+  there is no honest way to merge two edits into one body, so the body is used,
+  the notes are kept as you left them, and you are told that is what happened
+  instead of being left to find out. Notes that would not survive being written
+  back as a body are never applied, however plain the intent.
+
+- **A collection with one broken request no longer opens as nothing.** A
+  `.hurl` file is parsed as a whole, so a single line Hurl rejects failed the
+  entire file: the collection opened empty, every other request in it became
+  unreachable, and the only way back in was a text editor. That is a poor trade
+  at the best of times, and worse given the damage is often PaperBoy's own — a
+  bad merge, a half-finished hand-edit, an escaping bug.
+
+  The file is now read in pieces. What parses becomes requests as before; what
+  doesn't is kept exactly as it was written, shown in the list as an unreadable
+  request, saved back byte for byte, and repairable in Raw Mode, which opens on
+  the offending text and turns it back into a real request the moment it
+  parses. Where the file was cut is only ever a guess — a body may well contain
+  a line that reads like a request — so a piece that fails is retried with its
+  neighbours joined on before anything is declared unreadable, and no request
+  is ever cut away from its own response.
+
+  Such a request is never sent: it has no method or URL to send. "Run All"
+  skips it and runs the rest, and the command-line runner says which requests
+  it skipped and why rather than failing the whole run to parse.
+
+  A multiline body is never cut into. Bodies hold data that reads exactly like
+  requests — HTTP logs, fixtures, lists of routes — and cutting one apart would
+  leave the fragments looking like requests in their own right, which a "Run
+  All" would then dutifully send. Recovering a large damaged file is also
+  quick: joining pieces back together only ever helps one that was cut off
+  part-way, so it is no longer attempted for a request that is simply
+  wrong.
+
+  Taking notes back as the body now asks the only question that matters —
+  would this survive being saved and reopened — rather than merely whether the
+  comments strip cleanly. Text with no comments in it is not thereby a body,
+  and a file Hurl cannot read comes back as no requests at all, so offering to
+  adopt a stray line of prose was offering to delete a collection. A marker
+  claiming no lines is no longer treated as empty notes that could replace a
+  real body, and a marker with a damaged count no longer hides well-formed
+  notes below it or brings the interface down when the request is drawn.
+
+
+- **The Requests list can be searched — `/` in the terminal UI, a filter box
+  in the graphical one.** The terminal UI's list shows one folder at a time and
+  the GUI's tree keeps folders collapsed, so in a collection of any size the
+  request you want is usually the one you can't see, and the only way to it was
+  to remember which folder you filed it under. Typing narrows the list to
+  matching requests from the *whole* collection, flattened out of their folders
+  — a search that hid its matches inside collapsed folders would be no search
+  at all — and each match shows its full title, since two folders can each hold
+  a `Login` and the folder rows that told them apart are gone. Matching is a
+  case-insensitive substring of the whole title, so `auth/` narrows to a folder
+  just as readily as a name does. The filter belongs to the tab, so each one
+  keeps its own and both front-ends narrow it the same way; it isn't remembered
+  across restarts, where a collection that looked like it had lost most of its
+  requests would be a poor greeting. In the terminal UI, Enter keeps the filter
+  and hands the keyboard back to the list, and Esc clears it — landing the
+  cursor on the request that was found, folder and all, rather than back where
+  the search started.
+
+- **Requests can be dragged into a new order in the graphical UI.** Drag a
+  request and a line shows which two requests it will land between; the drop
+  applies the same reorder `Alt+↑`/`Alt+↓` does in the terminal UI. Reordering
+  is turned off while the list is filtered, in both front-ends: the gap between
+  two matches can span any number of requests that aren't on screen, so a move
+  there would travel an unpredictable distance for reasons nothing on screen
+  explains.
+
+- **Requests can be reordered — `Alt+↑` / `Alt+↓` in the Requests
+  list.** A collection's order is not cosmetic: `Run All` follows it, so it
+  decides whether a login runs before the request that uses the token it
+  captures. Until now nothing in either front-end could change that order — the
+  only way was to delete a request and recreate it further down. "One place"
+  means one place *as shown*: folders are derived from request titles, so a
+  folder's requests can sit far apart in the file with other folders' requests
+  in between, and the move steps over those rather than swapping with them.
+
+- **`c` duplicates the highlighted request.** Building a family of
+  near-identical requests — the same call with a different header or body per
+  scenario — previously meant retyping the whole thing in the wizard. The copy
+  is inserted directly beneath its original (not appended out of sight) and the
+  selection follows it, so it is ready to edit. On Workspace tabs `c` keeps its
+  existing meaning of copying to a chosen collection file.
+
+- **The Response pane can now show the response headers.** They were being
+  captured all along and shown by the GUI, but the terminal UI drew only the
+  body, so anything carried in a header — a `Location` on a redirect, a
+  `WWW-Authenticate` challenge, rate-limit counters, the `Content-Type` that
+  explains a body that isn't parsing — was invisible. The pane now carries
+  section tabs (`Body` / `Headers`) on its top border, stepped with `i` and
+  back with `Shift+I` while the pane has focus. The headers are drawn through
+  the same panel the body uses, so they scroll, mouse-select and copy
+  identically, and a section with nothing in it says so rather than going
+  blank.
+
+  The tabs are on the border rather than a row of their own because the pane is
+  often only two or three rows tall. `i` was chosen over `[`/`]` or
+  Ctrl+Left/Right — both of which already mean "previous/next collection tab"
+  from every pane — so that no key changes meaning depending on which panel
+  happens to hold the cursor; the collection tab bar is on screen at the same
+  time, so there would be no telling which one a press was aimed at. It is a
+  ring rather than a two-way toggle so that further sections can be added
+  without needing another key.
+
+- **Escape now asks before throwing away an edited request.** The request wizard
+  has no autosave and F2 is the only thing that persists, so a single mistyped
+  Esc silently discarded everything that had been entered — with no undo and
+  nothing to show it had happened. Esc on a wizard with unsaved changes now
+  offers Save, Discard or Keep editing, defaulting to Keep editing so answering
+  it on reflex costs nothing. Save runs the same checks F2 does, so a request
+  that couldn't be saved normally isn't quietly saved this way either. An
+  untouched form still closes on the first Esc: prompting when there is nothing
+  to lose would only train the habit of dismissing the prompt unread.
+
+- **The Response pane now says when a response had no body.** A response that
+  carried nothing left the Response pane completely blank below the status line,
+  which reads as PaperBoy having lost the body rather than the server never
+  having sent one — an easy conclusion to jump to on the bare `404`s and `500`s
+  plenty of servers return. Such a response now says so explicitly. The note is
+  drawn over the panel rather than through it, so it is never selectable and a
+  whole-panel copy still yields an empty body rather than the placeholder text.
+
+- **The GUI can now duplicate a request, matching the terminal UI.** Right-click
+  a request in the tree and choose Duplicate (next to Rename) to get a copy
+  beside its original, ready to edit. It shares the terminal UI's rules for
+  what that means: a fresh name of its own (`Login` → `Login (2)`) rather than
+  one that collides with the original and makes both ambiguous to reports, and
+  no inherited response, since a copy that has never been sent hasn't earned
+  one.
+
+- **The GUI can now undo a request delete, matching the terminal UI's `u`.**
+  Deleting a request from the tree used to be final — no confirmation and no
+  way back. Edit ▸ Undo Delete Request reopens the most recently deleted
+  request as close as possible to where it was, and is greyed out when there
+  is nothing to restore. It shares one undo history (and its 20-entry cap)
+  with the terminal UI, so a request deleted from either front-end can be
+  brought back from either.
+
+- **A report's Results columns can be resized by dragging their borders.** The
+  grid sizes every column automatically — a wide body or a long file path is
+  cut to fit the window, with the full value on hover or in the cell viewer —
+  which is the right default but leaves no way to say "I want to read *this*
+  column and I don't mind the rest getting narrow". Hovering the border between
+  two header cells now shows a resize cursor, and dragging it sets that column's
+  width by hand; double-clicking the border hands the column back to the
+  automatic fitter. A hand-set column is taken out of the fit entirely — it
+  keeps exactly the width you gave it while the untouched columns go on sharing
+  what is left, so widening one column never quietly reshapes its neighbours —
+  and if the widths you pin add up to more than the window, the table scrolls
+  sideways rather than crushing anything back below a legible minimum. The
+  widths are remembered per report view for as long as the columns stay the
+  same, and are dropped automatically when a different report (or a re-run that
+  produces different columns) makes a width pinned to the old columns
+  meaningless.
+
+### Fixed
+
+- **Stepping through a list with the arrow keys no longer drags the scrollbar
+  with it.** Both of the graphical UI's Requests lists — a collection's requests
+  and a Workspace tab's file tree — asked to re-*centre* the row under the
+  cursor on every keyboard move. The effect was that the cursor appeared to
+  stand still in the middle of the panel while the whole list slid past beneath
+  it, and even a step between two rows already plainly on screen scrolled the
+  view. They now scroll the least they can to bring the row into sight, and
+  nothing at all when it is already visible, which is how a list behaves
+  everywhere else.
+
+- **Graphical UI: a request that hasn't been sent no longer describes a reply.**
+  The response panel's three sections each fell back to their own "nothing here"
+  note — `(empty body)`, `(no headers)`, `(no assertions)` — regardless of
+  whether a response had ever arrived. Every one of those is a statement about a
+  reply that was received, so an untouched request appeared to report that the
+  server had answered and sent nothing back. All three now say the request has
+  not been run yet, while a request that genuinely came back empty (a `204`, say)
+  still says so.
+
+- **A file or folder in a Workspace tree can be renamed.** The tree let you
+  *create* collections, reports, environments and folders, and drag them
+  between folders, but never rename one — the only recourse was to make a fresh
+  copy under the new name and delete the original. Right-clicking any file or
+  folder row now offers Rename, seeded with its current name. A file keeps the
+  extension that says what it *is*: rename `orders.hurl` to "invoices" and it
+  becomes `invoices.hurl`, not a nameless file the tree no longer recognises and
+  silently stops drawing — the extension is how a collection is told from a
+  report from an environment, so a rename changes a file's name without ever
+  changing (or losing) its kind. The name is refused if it is really a path (a
+  separator or a `..`, which would move the item elsewhere on disk rather than
+  rename it) or is already taken, and everything the tab was holding the file by
+  — the loaded collection, the open report, the expanded rows, the remembered
+  selection — follows it to its new name.
+
+- **A file or folder in a Workspace tree can be deleted.** The same gap: items
+  could be created and moved but never removed from the tree. Right-clicking a
+  file or folder now offers Delete, always behind a confirmation that cannot be
+  switched off — deleting from disk has no undo, unlike deleting a *request*
+  (which Ctrl+Z brings back), so the preference that can silence the
+  request-delete prompt deliberately doesn't reach this one. The confirmation
+  says what is about to go: for a folder, how many files it will take with it,
+  and, whenever there are unsaved in-memory edits under the item, that those
+  will be lost with it. Deleting the file a tab had loaded leaves the tab on its
+  tree rather than showing a phantom of a file that is gone, and deleting a
+  folder forgets every expanded row and selection that lived inside it.
+
+- **Requests in a Workspace tab can be dragged to reorder them.** A plain
+  collection tab has always let you drag a request to a new position; the
+  Workspace tab's tree — drawn by different code — left its request rows out of
+  that entirely, so a request in a workspace could be selected and run but never
+  reordered. Its rows now drag exactly like the plain list's, with the same
+  insertion line drawn *between* rows (never a highlight *on* one, which the
+  tree already uses to mean "drop this file into that folder"). A request only
+  ever reorders within its own file: a drag whose source is a different
+  collection than the row under the pointer is refused, since moving a request
+  between files is what the transfer flow is for. Only the loaded file's rows
+  are draggable — a request shown from another file is listed from a cached
+  name/method snapshot, not the live list, and loading that file mid-drag to
+  make it real would reshape the tree out from under the pointer.
+
+- **Right-clicking a request in a Workspace tab offers the actions that apply to
+  a request.** The tree gave every row the *tree's* menu — the "New collection /
+  report / environment in this folder" entries — so right-clicking a request
+  offered only ways to create a *sibling file*, none of the things you actually
+  do to a request. The menu now leads with Run, Rename, Duplicate and Delete,
+  routed through the very same handlers the plain request list uses so the two
+  menus can never disagree (the delete-confirmation preference, the copy's
+  unique title, the rename dialog), and keeps the workspace-only Revert and the
+  "New… in this folder" entries below them. A row for a collection the tab
+  hasn't loaded loads that file first and only then acts — the same
+  load-then-act double-clicking to run one already did — so an action can never
+  land on the wrong request through a stale index.
+
+- **Graphical UI: menu mnemonics are visible without pressing Alt first.** The
+  underline under `F`ile, `E`dit and the rest was only drawn once a lone `Alt`
+  had armed the menu bar — a Windows convention that assumes you already know
+  the mnemonics are there. Since the underline is the only thing that advertises
+  them, the menus simply looked as though they had none. Also fixed a latent
+  off-by-one that could underline the wrong character in a translated title.
+
+- **Graphical UI: resizing a report column no longer resizes the others.**
+  Dragging one border widened that column by taking the room out of every other
+  column on screen, so fixing one truncated heading started truncating the rest.
+  The automatic columns now keep the width they would have had regardless, and
+  the table grows into its horizontal scroll bar instead.
+
+- **Graphical UI: report column borders are visible at rest.** The divider was
+  drawn only while the pointer was on it, so nothing said the columns could be
+  resized or where the handle was. It is now a faint rule at all times, firming
+  up under the pointer and taking the accent colour while dragging.
+
+- **Graphical UI: dialogs can no longer grow taller than the window.** The
+  keyboard-shortcuts overlay ran off the top and bottom at once, putting both its
+  heading and its Close button out of reach. Dialogs are now capped to the
+  viewport, which hands the overflow to the scroll bar that was meant to take it.
+
+- **Undoing a reorder clears the unsaved marker again.** Dragging a request out
+  of place and back — or deleting one and undoing the delete — used to leave the
+  collection marked unsaved with nothing left to save, in both the terminal UI
+  and the GUI. Reordering, deleting and restoring are now measured against the
+  order the file was last read from or written to disk, so a collection that
+  ends up back where it started says so.
+
+- **The workspace tree says which collection holds unsaved edits.** A Workspace
+  tab shows one file at a time, so an edit to a file you have since switched
+  away from is invisible by construction: its requests are parked in memory and
+  its rows are drawn from a name cache. The tab's own pencil says *something* is
+  unsaved; the tree now says which file, and which of its requests — the same
+  pencil the graphical UI has always drawn there.
+
+- **Copying or moving a request in a workspace starts on the collection it came
+  from.** The destination picker opened on whichever file sorted first, so in a
+  workspace of any size the first move was always scrolling back to where you
+  already were. It now opens on the source file — the row you are already
+  thinking about, and a safe place to land, since confirming it copies the
+  request into its own file or, for a move, does nothing at all.
+
+- **`Alt+↑↓` reordered the wrong requests in a Workspace tab.** A Workspace
+  tab's left pane is the filesystem tree — folders, collection files, reports
+  and environments, with the open collection's requests nested among them —
+  while every other tab's is a plain list of requests. The cursor counts rows
+  of whichever is on screen, but the reorder read that number against the
+  request list, so it moved whichever two requests happened to sit at those
+  offsets: with the cursor on the first request of a tree, the *last* two
+  swapped. Both keys now resolve the cursor against the tree they are actually
+  drawn on, and a request will only trade places with one from the same file at
+  the same depth, since a request can only move within its own collection.
+
+- **`/` searched the wrong panel in a Workspace tab.** Pressed on the Requests
+  panel it jumped the focus to Environments and started filtering *those*
+  instead — in a workspace, which is the commonest way to open a collection and
+  the case where a search is worth most. The exclusion was justified in a
+  comment on the grounds that the tree "has its own Ctrl+F filter", which was
+  never true: Ctrl+F there toggles which file *types* the tree shows and has
+  never searched anything. `/` now filters the workspace tree by name, keeping
+  each match's ancestors so the results still read as a tree rather than as a
+  list of names with nothing to say which file they came from. While a filter
+  is typed every folder counts as expanded — a search that could only find what
+  was already on screen would be no search at all — though collection files are
+  left as they are, since opening every one on each keystroke would stall a
+  large workspace.
+
+- **A reordered collection now says it has unsaved changes.** Every other
+  unsaved edit announces itself where it happened — a `✚` on an added request,
+  a `✎` on an edited one — but reordering, deleting or restoring a request
+  belongs to no single request, so nothing on screen carried it. The quit
+  prompt counted it all the same, which left you told you had unsaved work and
+  given nowhere to look for it. A tab holding unsaved changes now carries a
+  `✎`, counting the files a Workspace tab has parked out of sight as well as
+  the one it is showing.
+
+- **The request wizard keeps its shortcut hint where every other dialog keeps
+  it.** The list of keys was appended to the wizard's title, along the *top*
+  border, while every other panel in the app puts its hint along the bottom
+  edge — so the one mode with the most bindings to discover was also the one
+  that hid them somewhere the eye had not been trained to look. It now uses the
+  same bottom-border hint as everything else, and drops whole items off the end
+  on a narrow terminal instead of letting the last one be clipped mid-word.
+
+- **Deleting a request in the GUI now asks first, and Ctrl+Z takes it back.**
+  A right-click ▸ Delete removed a request the instant it was clicked, with no
+  confirmation and no accelerator; the only way back was a menu item ("Edit ▸
+  Undo Delete Request") that advertised no shortcut and wasn't wired to Ctrl+Z
+  — even though the GUI already had a *Confirm deleting an environment*
+  preference, so the two dangers were inconsistent. There is now a matching
+  *Confirm deleting a request* preference (on by default, persisted alongside
+  the environment one), honoured before every GUI delete — the context menu and
+  the new Delete key alike — and Ctrl+Z now undoes the last request deletion by
+  exactly the code the menu item runs, so the shortcut and the menu can't
+  disagree. The binding stands down while the report editor is on screen, whose
+  own Ctrl+Z (block-structure undo, and the source view's text undoer) keeps
+  winning while it holds the keyboard.
+
+- **"Run All" in the GUI asks before firing a collection full of writes.** The
+  Run All button ran every request the moment it was clicked. Combined with
+  double-click-to-send, a collection of POSTs and DELETEs was one stray click
+  from executing against a real server. Run All now confirms whenever the
+  collection contains any request whose method is not GET, saying how many
+  requests will run and how many of those are writes; a read-only (all-GET)
+  collection still runs with no friction.
+
+- **Two Postman folders that log in as different users no longer share one
+  token.** PaperBoy replaces an OAuth 2.0 configuration with a real token
+  request and reuses that request wherever the same configuration appears, and
+  it decided "the same" from the token URL, the grant type and the client id
+  only. Two folders hitting one identity provider with different credentials
+  therefore collapsed into a single login: the second folder's requests went
+  out authenticated as the *first* folder's user, which looks like a
+  permissions bug in the API rather than an import bug. The username, password
+  and client secret now count towards a configuration's identity.
+
+- **A generated token no longer overwrites a collection variable.** The token
+  request always captured into `access_token`. If the collection already
+  defined a variable of that name — a hand-managed token, very common in
+  exports that used to do this by hand — the capture quietly replaced it part
+  way through the run. Generated names now skip anything already in use.
+
+- **A Postman request whose name contains a newline no longer imports as two
+  requests.** The name becomes the `# title` comment above the request, and
+  everything after the newline landed on its own line below it, where the Hurl
+  parser read it as the start of a second, runnable request. Titles are now
+  flattened to a single line, which also covers a multi-line name pasted into
+  the request wizard.
+
+- **A commented-out line in a Postman test script no longer creates a
+  capture.** The scan for `pm.environment.set(...)` looked at the script as
+  plain text, so a call inside `//`, inside `/* */` or quoted in a string
+  produced a capture that then rewrote the value later requests were sent
+  with. Comments and string literals are now skipped.
+
+- **GraphQL variables given as an object are no longer dropped.** Postman
+  usually stores them as a JSON string, and the importer insisted on that; an
+  export that stored the real object produced a request with no variables at
+  all, which the server rejects for a reason that points nowhere near the
+  import.
+
+- **URLs are no longer lost or truncated on import.** A URL that Postman kept
+  only as structured pieces (no raw text) imported as an empty URL; an enabled
+  query parameter present in the pieces but missing from the raw text was
+  dropped; and a `#` in the URL silently truncated it, because Hurl reads the
+  rest as a comment. The pieces are now rebuilt into a URL, missing parameters
+  are merged back in once, and a fragment is removed with a note saying so.
+
+- **An imported AWS signature no longer sends an empty region**, and the note
+  on an API key sent as a header no longer describes it as a query parameter.
+
+- **The Postman API key is no longer handed to a redirect target.** Imports
+  followed redirects with libcurl, which strips `Authorization` on a hop to
+  another host but re-sends custom headers — and the key travels in
+  `x-api-key`. Redirects are now followed by hand and a cross-origin hop is
+  refused rather than trusted.
+
+- **A failed Postman API call no longer panics on a non-ASCII error body**, a
+  long non-ASCII request name no longer aborts the whole import with a
+  filename the filesystem refuses, and listing a workspace's items gives up
+  after a bounded number of pages instead of following a broken cursor
+  forever.
+
+- **The headless runner counts a repeated request once.** With
+  `[Options] repeat`, the progress counter ran past the total (`[3/2]`) and the
+  summary reported more results than requests. Each request now contributes one
+  result, and it only passes if every one of its runs passed.
+
+- **A session saved by a newer build loses one field, not the session.** Two
+  fields nested inside a saved request — a form field's kind and a comment's
+  anchor — were not covered by the lenient reader, so an unrecognised value
+  discarded every tab, collection and environment instead of just that field.
+
+- **An error message no longer loses its detail.** The tidy-up that removes a
+  trailing `(os error 2)` matched anywhere in the text, so
+  `load failed (os error 2) for config(prod)` was cut back to `load failed`.
+
+- **Filtering the Environments panel and then pressing Tab no longer takes the
+  keyboard hostage.** `/` puts that panel into a typing mode, and Tab is
+  deliberately not consumed by it so the keyboard can leave — but nothing
+  switched the mode off on the way out. It stayed armed in a pane nobody was
+  looking at any more and quietly swallowed every printable key in the
+  application: the Requests list's `x`, `u`, `c` and `n` all stopped working,
+  and so did `q`, which reads as the terminal UI simply having locked up. The
+  mode is now parked when the panel loses focus rather than cancelled, so the
+  query survives and coming back resumes typing where you left off, and the
+  blinking cursor no longer advertises a capture that isn't happening.
+
+- **Deleting a request in a Workspace tab no longer un-deletes itself.** A
+  Workspace tab holds its edits in memory and re-reads the file from disk when
+  it switches away and back, so it has to know when there is something worth
+  keeping — and it decided by scanning the requests for edit markers. A
+  deletion leaves no request behind to carry one, so it read as "nothing has
+  changed": delete a request, look at another file in the same tab, come back,
+  and the request was there again. "Save workspace edits" ignored a
+  delete-only change for the same reason, including for files parked when the
+  tab switched away from them. The collection now records a structural change
+  — a request removed or restored — alongside the per-request markers.
+
+- **Closing a Workspace tab now warns about a deletion.** The "you have unsaved
+  edits" prompt counted edited requests, and a deleted one leaves nothing to
+  count, so a tab whose only change was a deletion closed without asking and
+  took the change with it.
+
+- **A copied request no longer takes its original's name.** A request's title
+  is its identifier — reports address requests by name — so two entries sharing
+  one made the reference ambiguous and broke it for *both* of them, not just
+  the copy. Copies are now given a name of their own (`Login` → `Login (2)`,
+  counting on rather than nesting to `Login (2) (2)`), keeping their folder so
+  a namesake elsewhere in the collection isn't treated as a clash. A copy also
+  no longer inherits the original's last response, which credited it with a
+  result it hadn't produced.
+
+- **A multipart request no longer sends the wrong file.** Files sent from
+  outside the collection's folder are copied in beside it so Hurl's sandbox
+  will accept them, and two fields sending different files that share a name
+  had the second one renamed to `photo_1.png`. Nothing checked whether the
+  request already had a real file called `photo_1.png` — if it did, one field
+  overwrote the other's copy and both fields uploaded the same bytes, silently
+  and with the right names on the wire. Generated names are now checked against
+  every name already claimed.
+
+- **A repeated request no longer credits its results to the wrong requests.**
+  `[Options] repeat` and `retry` make a single request report more than once,
+  and results were handed out one request at a time regardless: every result
+  after the repeat landed on the request before it, and the last request's
+  result was dropped entirely, leaving it looking like it had never run. Each
+  result now says which request it came from.
+
+- **A request title containing `-` or `=` no longer loses it.** Titles are
+  written as `# ` comments, and comment banners (`# ----`) are stripped when
+  reading them back — but the stripping ran over the whole line rather than its
+  ends, so `# Get user-profile` came back as `Get userprofile` and was written
+  back that way on the next save, breaking every report that addressed the
+  request by name.
+
+- **A multi-line environment value is no longer truncated to its first line.**
+  Pasting a PEM key or a JSON blob into a variable kept only the text before
+  the first newline, both in the saved `.vars` file and in the session restored
+  on the next start — and the value on screen still looked complete until then.
+  The `.vars` format is one `KEY=value` per line and cannot hold a newline, so
+  the newlines are now folded to spaces as the value is entered, where you can
+  see it happen, rather than silently at the point of writing.
+
+- **A setting written by a newer PaperBoy no longer costs you the whole
+  session.** One unrecognised value — a language, or a view this build doesn't
+  have — made the entire `state.json` unreadable, so every tab, collection and
+  environment was silently dropped and the next save overwrote the file that
+  still held them. Unknown values now fall back to the default and cost only
+  that one setting, and a state file that genuinely cannot be read is moved
+  aside to `state.json.unreadable` instead of being overwritten.
+
+- **Wide characters no longer displace the text cursor.** Single-line fields
+  measured text in characters rather than terminal columns, so CJK text, emoji
+  and box-drawing glyphs put the caret, the horizontal scroll and the selection
+  highlight progressively further from where they belonged — the caret could
+  sit inside a glyph, a narrow field could scroll too little to bring the caret
+  into view at all, and the "text continues" marker could land in a wide
+  glyph's second cell, where terminals never draw it.
+
+- **Clicking where a deleted wizard row used to be no longer crashes.** The map
+  of what is where on screen is built as the wizard is drawn and reused until
+  the next frame; deleting a row with the keyboard changed the rows without
+  rebuilding it, so a click on the stale rectangle could focus a row that was
+  no longer there and the next keystroke ended the program.
+
+- **Saving a request without changing it no longer rewrites it.** A status
+  check can live either on the `HTTP` response line or as a `status ==` assert;
+  the wizard shows both the same way, and on save it always wrote the first one
+  back onto the `HTTP` line. Opening a request that used the assert form and
+  saving it unchanged therefore moved the check and marked the request edited.
+  Requests now keep their status check where they had it.
+
+- **`--dry-run` and `--output` are no longer accepted and ignored.** Both only
+  mean anything alongside `--report`, and without it they were parsed happily
+  and did nothing — a scheduled run asking for a report file exited 0 having
+  written none. They now require `--report` and say so.
+
+- **A collection with nothing to run, and a report with failing rows, now exit
+  non-zero.** Both printed their complaint and exited 0, so a collection that
+  had failed to parse — or a report whose checks had failed — passed CI
+  silently.
+
+- **Two validation messages no longer print `{0}` instead of the name they are
+  about.** The alias diagnostics used a placeholder the formatter doesn't
+  understand, in all three languages.
+
+### Changed
+
+- **Errors no longer end in `(os error 2)`.** The operating system's error
+  number is repeated after a message that already says what went wrong, and
+  means nothing to the person reading it. It is now dropped from what is shown
+  in the status line.
+
+
+- **`/` now filters the Requests list when that list has focus.** It previously
+  always jumped to the Global Environments panel, wherever you pressed it. It
+  still does from every other pane — the pane you are looking at decides which
+  list "find me one of these" means, the same way `x` and `u` already do. A
+  Workspace tab is the exception: its left pane is the filesystem tree, which
+  has its own `Ctrl+F` filter, so `/` there keeps its environments meaning
+  rather than silently doing nothing.
+
+- **`u` now undoes the last deletion in the pane you are looking at, and only
+  that.** `u` was never a single time-ordered undo: it restores a deleted
+  request in the Requests list, a deleted environment in the Global
+  Environments panel, and — from anywhere else at all — reopened a closed tab.
+  So deleting a request, glancing at the response, and pressing `u` handed back
+  some tab closed ten minutes earlier while the request stayed gone, with no
+  hint as to which stack had been walked. Reopening a tab is now scoped to the
+  tab bar, matching the `x` that closes one there. Nothing becomes harder to
+  reach: closing a tab already moves the focus to the tab bar, whether it was
+  closed with `x` there or `Ctrl+W` from any pane, so the undo is waiting where
+  the status bar's "press (u) to reopen" says it is. A standalone report tab
+  keeps `u` on every pane, having no request or environment list to compete.
+
+- **Panel shortcut hints no longer get cut off mid-word.** A hint that didn't
+  fit on a panel's border was simply clipped by the renderer, so the
+  Environments panel showed "g go to act" — which reads as a rendering fault
+  rather than a shortage of room. Hints are now built as a priority-ordered
+  list and whole items are dropped from the end until what remains fits, so
+  everything on screen is legible and the help overlay (`?`) is still the
+  complete list. The Environments panel had no width check of any kind before
+  this; the Requests list had one, but it measured against the panel's full
+  width instead of the room inside its borders, so it could still clip by a
+  column or two.
+
+- **"w browse workspace" moved to the footer.** It used to sit beside the
+  collection name on the Requests panel's top border, shown only when the name
+  left room for it — which is why it seemed to come and go for no reason: a
+  long workspace name simply squeezed it out, with nothing to say why. The
+  footer spans the terminal and is where every other pane-independent shortcut
+  already lives, so the hint now appears for every Workspace-bound tab however
+  long its name.
+
+- **`? help` and `q quit` sit at a fixed spot at the front of the footer.**
+  They are the two hints that are always present and never change, but they
+  were at the end, so they slid left and right as the context-dependent hints
+  around them came and went. A hint that moves is one you have to re-find every
+  time; they now follow `Tab focus` at the head of the row, ahead of everything
+  that varies.
+
+- **`x` and F2 no longer act on the collection tab from anywhere.** Both were
+  fall-through cases, so as well as their scoped uses — `x` deleting a request
+  in the Requests list or an environment in the Environments panel, F2 renaming
+  an environment there — they also closed and renamed the whole active tab from
+  the Request and Response panes, where the thing under the cursor is a request
+  and nothing suggests a keypress is aimed at the tab bar. Reading a response
+  and pressing `x` took the collection with it. Both now act on a tab only from
+  the tab bar itself. Ctrl+W still closes the active tab from any pane, which is
+  the OS-wide convention for exactly that and isn't a key anyone presses by
+  accident while reading.
+
+- **The footer no longer restates the arrow keys and Enter.** `↑↓ move` and
+  `Enter edit` led a single-line footer that was being truncated before it
+  reached the hints specific to PaperBoy — at 80 columns the Response pane's
+  own shortcuts never appeared at all. Arrow keys moving a highlight and Enter
+  opening it are the two most universal conventions in a list UI, so the room
+  goes to the keys that aren't guessable instead. `x` and F2 are now shown only
+  in the panes where they actually do something, and `n` is labelled "New
+  Request" rather than "New Request/Var" — the variable half of that key
+  belongs to the environment popup, a different context with its own keys, and
+  never applied to the pane the footer is describing.
+
+- **Ctrl+C no longer quits.** Every other application treats it as "copy", so it
+  was being pressed by reflex part-way through dragging out a selection — and it
+  quit *harder* than `q` did, setting the exit flag directly and skipping even
+  the unsaved-work confirmation. It now copies the selection when there is one.
+  With nothing selected it always raises the exit confirmation, even when
+  confirm-on-exit is switched off, so a stray Ctrl+C can never end the session
+  outright; while an overlay is open it is swallowed entirely, since raising the
+  exit popup there would replace whatever half-finished form was in it.
+
+- **Esc quits from the top level, like `q`.** Backing out of a terminal
+  application with Esc is close to universal intuition. It still only quits once
+  it has run out of things to close: an open menu, an active text selection or
+  an environment filter is dismissed first, and only the next press means quit —
+  through the same confirmation `q` uses, so nothing unsaved is lost. (Clearing
+  a selection now also clears one made in a report, which previously stayed
+  stuck: Esc reported there was a selection, dropped nothing, and did so
+  forever.)
+
+- **Tab and Shift+Tab move between the buttons of every confirmation popup.** A
+  row of choices is a form, and Tab is how a form is walked; previously only the
+  arrow keys (and `h`/`l`) worked. This covers all of them — the Yes/No
+  confirmations, the workspace storage and reload prompts, the unsaved-changes
+  prompts and the wizard's own discard prompt. The wizard's prompt now wraps at
+  both ends like the other six, instead of clamping.
+
+- **`[` and `]` keep cycling the request wizard's section tabs all the way
+  round.** They used to stop working at Body: cycling moved focus into the
+  section, and the Body section's only field is a text editor, so every further
+  bracket was typed into the body instead of moving on. Cycling now parks on the
+  tab bar itself — which is a focus stop of its own, shown underlined — and Down
+  or Enter steps into the section when you're ready. Brackets still type
+  normally once focus is inside the Body, because JSON arrays have to be
+  typeable.
+
+- **Installation now recommends `cargo install paperboy --locked`.** Without it
+  Cargo re-resolves every transitive dependency to whatever is newest at install
+  time; `--locked` builds the versions PaperBoy was published and tested
+  against, from the lockfile shipped in the package, so the build is
+  reproducible and a freshly compromised semver-compatible release five levels
+  down can't silently reach your binary. The trade-off is that pinned
+  dependencies don't pick up their own patch releases either, so the pin is only
+  as current as the last PaperBoy release. The motivating case: `arrayref` — a
+  transitive dependency of `winit`, and so of the GUI — had releases yanked on
+  2026-08-20 after a supply-chain attack (since resolved), and while the yank
+  stood a plain `cargo install paperboy` failed outright while `--locked` kept
+  building. It took the terminal-only build down with it, because Cargo resolves
+  optional dependencies whether or not the feature enabling them is on.
+
+### Fixed
+
+- **Down from the wizard's Name field no longer stops on an invisible row.**
+  When editing an existing request the target-collection cycler isn't drawn —
+  the request already belongs to a collection — but it stayed in the focus ring,
+  so the cursor appeared to vanish and Down had to be pressed twice to reach
+  Method. It is now skipped whenever it isn't on screen.
+
+- **A Header, Cookie, Query, Options or Form row can no longer destroy the whole
+  collection.** Hurl decides what a line inside a request is by its first
+  character, so a row keyed with a leading `[` was written out as `[Body]:
+  value` — which Hurl reads as a malformed section header rather than a `key:
+  value` row. The damage wasn't local: a `.hurl` file that doesn't parse yields
+  *no* requests at all, so one such row silently emptied the entire collection
+  the next time it was loaded. The same held for a name containing `:`, `#`,
+  `"`, `\`, `;`, `,` or whitespace, and for a value containing a newline, a tab
+  or a backslash. The request wizard now refuses to save any of them, staying
+  open on the offending cell and saying why (as it already does for a missing
+  URL), and the GUI flags the cell as you type it. As a backstop for every other
+  producer — Postman import, Raw Mode, a hand-edited file — such a row is now
+  written out commented, so the file still loads and the row stays visible
+  instead of taking its neighbours with it.
+
+- **Rows with a valid but unusual name are no longer dropped when a collection
+  is reloaded.** PaperBoy's reader accepted a narrower set of names than Hurl
+  itself does, and a row it didn't recognise was quietly discarded rather than
+  reported — so `filter[name]`, `{{VAR}}`, `X-Ké`, `$X` and names beginning with
+  `-` or `_` survived being saved but not being loaded again. Reader and writer
+  now share one definition of a writable name, so every row PaperBoy will write
+  is a row it can read back.
+
+- **A `file,…;` or `base64,…;` request body is no longer deleted when the
+  collection is saved.** Neither form has a textual value, and PaperBoy's reader
+  returned "no body" for both — indistinguishable from a request that genuinely
+  has none, so the line was dropped the next time the file was written. Saving
+  rewrites *every* request in a collection rather than only the edited one, so
+  editing any request anywhere silently emptied the body of every file- or
+  base64-bodied request in the same file, with no error and no visible change to
+  hint at it. Expected response bodies were lost the same way. Both forms are
+  now preserved verbatim. Note that a body file outside the run's file root is
+  still rejected by Hurl at run time — unlike `[Form]` and `[Multipart]` files,
+  body files aren't yet staged into scope.
+
+- **The Browse button in the run settings sat lower than the field beside it.**
+  A button is slightly taller than a text field, and egui centres each item
+  against the height the row has reached *so far* — so a taller button placed
+  after the field grew the row downwards once the field had already been
+  positioned, leaving the two sharing a top edge with the button hanging below
+  it. Each parameter's row now claims the height of the tallest control it could
+  hold before anything goes in it, so the field and the button are centred on
+  the same line. Rows holding a dropdown or a plain field come out the same
+  height as each other too.
+
+
 ## [0.5.0] - 2026-08-20
 
 ### Changed

@@ -414,6 +414,43 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         .selected_entry
         .min(app.session.collections[ci].entries.len() - 1);
 
+    // Text the file could not be read at has no fields to edit. Showing the
+    // usual form would invite the user to fill in a method and a URL that
+    // would then be written over text they have not seen — so the text itself
+    // is shown, exactly as it was read, and editing it repairs the request.
+    if app.session.collections[ci].entries[sel].is_unreadable() {
+        let msg = app.strings.cannot_edit_unreadable;
+        ui.add_space(6.0);
+        ui.colored_label(theme.err, msg);
+        ui.add_space(6.0);
+        let mut raw = app.session.collections[ci].entries[sel]
+            .unparsed
+            .clone()
+            .unwrap_or_default();
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut raw)
+                .code_editor()
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed() {
+            // Reparsing on every keystroke is what lets a request heal the
+            // moment its text becomes valid, rather than needing a separate
+            // "try again" the user has to know to press.
+            let entries = crate::hurl::parse_hurl(&raw);
+            let col = &mut app.session.collections[ci];
+            match &entries[..] {
+                [only] if !only.is_unreadable() => {
+                    let mut healed = only.clone();
+                    healed.modified = true;
+                    col.entries[sel] = healed;
+                }
+                _ => col.entries[sel].unparsed = Some(raw),
+            }
+            col.invalidate_request_json();
+        }
+        return;
+    }
+
     let mut changed = false;
     let mut send = false;
     // A right-click "Extract to parameter…" anywhere in the editor lands here
@@ -504,7 +541,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let options_n = entry.options.len();
         let asserts_n = entry.asserts.len();
         let captures_n = entry.captures.len();
-        let has_body = entry.body.as_ref().map(|b| !b.is_empty()).unwrap_or(false)
+        let has_body = entry
+            .body_src
+            .as_ref()
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
             || !entry.form_fields.is_empty();
         let has_auth = entry.basic_auth.is_some();
         let mut cur = app.editor_section;
@@ -742,6 +783,56 @@ fn conflict_notice(ui: &mut egui::Ui, theme: &super::theme::GuiTheme, st: &Strin
     clear
 }
 
+/// Notice for `# [Body]` notes that no longer describe the body they were
+/// written for. Two ways out, because there are genuinely two right answers:
+/// the body is the newer truth (delete the notes), or the notes are (take them
+/// back). Nothing happens on its own — the notes are still here precisely
+/// because they were not thrown away without asking.
+fn stale_notes_notice(
+    ui: &mut egui::Ui,
+    theme: &super::theme::GuiTheme,
+    st: &Strings,
+    can_adopt: bool,
+) -> Option<bool> {
+    let mut choice = None;
+    egui::Frame::new()
+        .fill(theme.panel)
+        // The "not settled yet" orange rather than the error red: the request
+        // runs perfectly well, it is only the notes that have come loose.
+        .stroke(egui::Stroke::new(1.0, theme.pending))
+        .inner_margin(6.0)
+        .corner_radius(4.0)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new(st.gui_notes_stale_headline)
+                    .color(theme.pending)
+                    .strong(),
+            );
+            ui.label(RichText::new(st.gui_notes_stale_detail).color(theme.text));
+            ui.horizontal(|ui| {
+                // Adopting notes that no longer strip to JSON would write a
+                // body with its comments still in it, so the button says why
+                // it is off rather than failing after the click.
+                let adopt = ui.add_enabled(
+                    can_adopt,
+                    egui::Button::new(if can_adopt {
+                        st.notes_stale_adopt
+                    } else {
+                        st.notes_stale_adopt_blocked
+                    }),
+                );
+                if adopt.clicked() {
+                    choice = Some(true);
+                }
+                if ui.button(st.notes_stale_discard).clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+    choice
+}
+
 /// Human-readable heading for a section, used above each block in the "All"
 /// combined view. Reads the same i18n tab labels as the section tab bar.
 fn section_title(section: EditorSection, s: &Strings) -> &'static str {
@@ -968,8 +1059,19 @@ fn draw_section(
             if entry.body_form_conflict() {
                 let cleared = conflict_notice(ui, theme, st);
                 if cleared {
-                    entry.body = None;
+                    entry.body_src = None;
                     changed = true;
+                }
+                ui.add_space(4.0);
+            }
+            // Shown next to the body rather than in the comments, because the
+            // body is what the notes disagree with and what the user has to
+            // look at to decide which of the two is right.
+            if entry.stale_body_notes().is_some() {
+                match stale_notes_notice(ui, theme, st, entry.can_adopt_body_notes()) {
+                    Some(true) => changed |= entry.adopt_body_notes(),
+                    Some(false) => changed |= entry.discard_body_notes(),
+                    None => {}
                 }
                 ui.add_space(4.0);
             }
@@ -986,7 +1088,7 @@ fn draw_section(
                     changed = true;
                 }
             } else {
-                let mut body = entry.body.take().unwrap_or_default();
+                let mut body = entry.body_src.take().unwrap_or_default();
                 let resp = ui.add(
                     egui::TextEdit::multiline(&mut body)
                         .code_editor()
@@ -1000,7 +1102,7 @@ fn draw_section(
                 // The body is the one place a *part* of the field is usually
                 // what varies, so a selection narrows the extraction.
                 extract_menu(&resp, ex_label, ExtractTarget::Body, &body, true, extract);
-                entry.body = if body.is_empty() { None } else { Some(body) };
+                entry.body_src = if body.is_empty() { None } else { Some(body) };
             }
         }
         EditorSection::Auth => {
@@ -1379,6 +1481,69 @@ mod tests {
     }
 
     /// Draw the Body section for `entry` and report what it painted.
+    /// A request carrying `# [Body]` notes that no longer describe its body:
+    /// the block still parses, but what it strips down to is not what the file
+    /// actually sends, so the parser leaves it as prose.
+    fn entry_with_stale_notes() -> HurlEntry {
+        let text = "POST http://h/a\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"a\": 1 // mine\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        crate::hurl::parse_hurl(text).remove(0)
+    }
+
+    /// The body section says the notes have come loose, rather than leaving
+    /// the only clue to be comments that quietly stop following the body.
+    #[test]
+    fn the_body_section_says_when_notes_no_longer_match() {
+        let st = Strings::for_language(&Language::English);
+        let mut entry = entry_with_stale_notes();
+        let out = draw_body_section(&mut entry);
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_notes_stale_headline)),
+            "expected the stale-notes notice, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains(st.notes_stale_adopt)),
+            "expected the adopt button, painted: {out:?}"
+        );
+
+        // And nothing of the sort for a request whose body is its own.
+        let mut plain = HurlEntry {
+            body_src: Some("{\"a\": 1}".into()),
+            ..Default::default()
+        };
+        let out = draw_body_section(&mut plain);
+        assert!(!out.iter().any(|t| t.contains(st.gui_notes_stale_headline)));
+    }
+
+    /// Notes that would not survive being written back as a body offer only
+    /// the discard route, and say why the other one is shut.
+    #[test]
+    fn notes_that_cannot_be_adopted_say_so_on_the_button() {
+        let st = Strings::for_language(&Language::English);
+        // Four claimed lines, so the closing brace falls outside the block and
+        // what is left no longer reads as JSON.
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #   //extra\n\
+                    #   \"a\": 1 // mine\n\
+                    #\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        let mut entry = crate::hurl::parse_hurl(text).remove(0);
+        assert!(!entry.can_adopt_body_notes());
+
+        let out = draw_body_section(&mut entry);
+        assert!(
+            out.iter().any(|t| t.contains(st.notes_stale_adopt_blocked)),
+            "the blocked reason should be on the button, painted: {out:?}"
+        );
+    }
+
     fn draw_body_section(entry: &mut HurlEntry) -> Vec<String> {
         let th = GuiTheme::from_spec(&crate::theme::default_preset());
         let st = Strings::for_language(&Language::English);
@@ -1456,7 +1621,7 @@ mod tests {
     #[test]
     fn carrying_both_a_body_and_form_fields_is_reported_in_the_section() {
         let mut entry = HurlEntry {
-            body: Some(" ".into()),
+            body_src: Some(" ".into()),
             form_fields: vec![crate::hurl::FormField {
                 key: "grant_type".into(),
                 enabled: true,
@@ -1795,7 +1960,7 @@ pub(super) fn apply_extract_parameter(
     };
     let applied = match target {
         ExtractTarget::Url => replace(&mut e.url),
-        ExtractTarget::Body => match e.body.as_mut() {
+        ExtractTarget::Body => match e.body_src.as_mut() {
             Some(b) => replace(b),
             None => false,
         },
@@ -2115,6 +2280,71 @@ mod extract_tests {
             char_range_to_bytes(text, 3..3),
             None,
             "an empty range is no selection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+    use crate::i18n::Language;
+
+    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn app_with_unreadable() -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let entries = crate::hurl::parse_hurl("POST http://h/a\n[Captures]\nx: jsonpath \"$.a\"\n");
+        assert!(entries[0].is_unreadable());
+        session
+            .collections
+            .push(crate::collection::Collection::new("api".into(), entries));
+        GuiApp::for_test(session)
+    }
+
+    /// Text the file could not be read at has no fields, so the editor shows
+    /// the text itself and says why — rather than an empty form whose first
+    /// keystroke would overwrite something the user never saw.
+    #[test]
+    fn the_editor_shows_the_text_and_says_it_could_not_be_read() {
+        let mut app = app_with_unreadable();
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.cannot_edit_unreadable)),
+            "expected the explanation, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("[Captures]")),
+            "expected the request's own text, painted: {out:?}"
         );
     }
 }

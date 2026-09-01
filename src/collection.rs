@@ -218,6 +218,121 @@ impl WsRow {
             | WsRow::Request { depth, .. } => *depth,
         }
     }
+
+    /// The text shown for the row — what a typed filter matches against.
+    pub fn name(&self) -> &str {
+        match self {
+            WsRow::Folder { name, .. }
+            | WsRow::Collection { name, .. }
+            | WsRow::Report { name, .. }
+            | WsRow::Environment { name, .. }
+            | WsRow::RequestFolder { name, .. }
+            | WsRow::Request { name, .. } => name,
+        }
+    }
+}
+
+/// Narrow an already-built Workspace tree to the rows matching `query`, keeping
+/// every ancestor of a match so the survivors still read as a tree rather than
+/// as a flat list of names with no indication of which file they came from.
+///
+/// A plain collection's filter flattens instead ([`crate::tree::rows_matching`])
+/// because there the only context a match has is its title, which the row
+/// already spells out in full. A workspace row's context is the *file* it lives
+/// in, which the row does not repeat — so dropping the ancestors would leave a
+/// screen of request names with no way to tell two identically-named requests
+/// in different collections apart.
+///
+/// Matching is case-insensitive and on the substring, matching the Requests and
+/// Environments filters; a folder that matches keeps its whole subtree, since
+/// naming a folder is the obvious way to ask for what is in it.
+fn filter_ws_rows(rows: Vec<WsRow>, query: &str) -> Vec<WsRow> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return rows;
+    }
+    let mut keep = vec![false; rows.len()];
+    // The indices of the rows containing the one being looked at, innermost
+    // last — a match marks all of them, which is what keeps the tree readable.
+    let mut ancestors: Vec<usize> = Vec::new();
+    // Set while inside a matched folder's subtree, holding that folder's depth,
+    // so everything under it is kept without having to match on its own.
+    let mut inside: Option<usize> = None;
+    for (i, row) in rows.iter().enumerate() {
+        let d = row.depth();
+        while ancestors.last().is_some_and(|&a| rows[a].depth() >= d) {
+            ancestors.pop();
+        }
+        if inside.is_some_and(|kept| d <= kept) {
+            inside = None;
+        }
+        if inside.is_some() || row.name().to_lowercase().contains(&needle) {
+            keep[i] = true;
+            for &a in &ancestors {
+                keep[a] = true;
+            }
+            if inside.is_none() && matches!(row, WsRow::Folder { .. } | WsRow::RequestFolder { .. })
+            {
+                inside = Some(d);
+            }
+        }
+        ancestors.push(i);
+    }
+    rows.into_iter()
+        .zip(keep)
+        .filter_map(|(r, k)| k.then_some(r))
+        .collect()
+}
+
+/// A title for a copy of `title` that no entry in `entries` already carries.
+///
+/// A request's title is its *identifier*: reports address requests by name
+/// (see `report::run::resolve_qualified`), and two entries sharing a title
+/// make the name ambiguous — which breaks the reference for **both** of them,
+/// not just the new one. So a duplicate can't simply reuse the name; it has to
+/// arrive with one of its own.
+///
+/// Folders are derived by splitting the title on `/` (see [`crate::tree`]), so
+/// only the leaf is renamed — a copy belongs in the same folder as its
+/// original. Copying a copy counts on from the existing suffix rather than
+/// stacking them, so repeated duplication gives `Login (2)`, `Login (3)` …
+/// instead of `Login (2) (2)`.
+pub fn unique_entry_title(entries: &[HurlEntry], title: &str) -> String {
+    let (prefix, leaf) = match title.rfind('/') {
+        Some(i) => title.split_at(i + 1),
+        None => ("", title),
+    };
+    // Strip any trailing " (n)" so the counter continues rather than nests.
+    let stem = leaf
+        .rsplit_once(" (")
+        .and_then(|(head, tail)| {
+            tail.strip_suffix(')')
+                .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+                .map(|_| head)
+        })
+        .unwrap_or(leaf);
+    let taken: HashSet<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+    // Starts at 2 because the original is, in effect, number one.
+    (2..)
+        .map(|n| format!("{prefix}{stem} ({n})"))
+        .find(|candidate| !taken.contains(candidate.as_str()))
+        .unwrap_or_else(|| title.to_string())
+}
+
+/// Where the index `i` ends up after the entry at `from` is moved to `to`.
+///
+/// Only indices *between* the two move, and they all move one step in the
+/// opposite direction to the entry itself; `from` becomes `to` by definition.
+fn shift_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
 }
 
 /// The synthetic `workspace_expanded` key for the virtual folder `folder`
@@ -308,6 +423,18 @@ pub struct Collection {
     /// Index into the current folder's rows (see [`crate::tree::rows_for`]),
     /// i.e. which row is highlighted in the Requests list. Not persisted.
     pub list_cursor: usize,
+    /// A typed filter over the Requests list: while non-empty, the list shows
+    /// every request whose title contains this, flattened across folders (see
+    /// [`crate::tree::rows_matching`]) instead of the folder being browsed.
+    ///
+    /// Lives on the collection rather than on either front-end so both show the
+    /// same narrowed list for the same tab, the way `workspace_filter_hurl_json`
+    /// already does — and so switching tabs keeps each tab's own filter.
+    ///
+    /// Runtime-only, deliberately: a filter restored from a previous session
+    /// would present a collection that looks like it has lost most of its
+    /// requests, with the reason parked in a strip nobody has looked at yet.
+    pub list_query: String,
     /// Requests removed with `x` (List pane), most-recently-deleted last, so
     /// `u` (List pane) can bring them back in order — the exact parallel of
     /// [`crate::tui::app::TuiApp::closed_tabs`] for individual requests
@@ -398,6 +525,54 @@ pub struct Collection {
     /// across a restart (see [`crate::persistence`]), so neither are these.
     pub workspace_pending: HashMap<PathBuf, Vec<HurlEntry>>,
 
+    /// Whether the loaded entries differ *structurally* from the file they
+    /// came from — a request removed, restored or reordered.
+    ///
+    /// [`Self::has_unsaved_edits`] otherwise answers by scanning the entries
+    /// for `user_added`/`modified` flags, which only ever say "this request
+    /// was edited". Removing one leaves nothing behind to carry a flag, and
+    /// reordering changes no request at all, so both read as "no edits" — and
+    /// a Workspace tab, whose entries are held in memory and re-read from disk
+    /// when it switches away and back, would then throw the change away
+    /// without a word. Cleared by [`Self::mark_saved`] like any other marker.
+    ///
+    /// Runtime-only, for the same reason `workspace_pending` is.
+    ///
+    /// Derived rather than latched: see [`Self::refresh_structure_modified`].
+    /// A flag that only ever went *true* meant undoing a reorder — dragging a
+    /// request back where it started, or restoring the one just deleted — left
+    /// the collection marked unsaved with nothing left to save.
+    pub structure_modified: bool,
+
+    /// What the entry list looked like when it was last read from or written to
+    /// disk, as the sequence of [`HurlEntry::uid`] stamps. Compared against the
+    /// live list to decide [`Self::structure_modified`].
+    ///
+    /// Identities rather than positions, because positions are exactly what a
+    /// reorder changes; and identities rather than any part of the entry's
+    /// *content*, because editing a request is a different kind of change,
+    /// already carried by its own `modified` flag. This one answers only "is
+    /// this still the same list, in the same order" — so a URL rewritten in
+    /// place must not register, and two identically-named requests swapping
+    /// places must.
+    ///
+    /// Runtime-only, like the flag it feeds.
+    pub structure_baseline: Vec<u64>,
+
+    /// The baselines ([`Self::structure_baseline`]) of the parked files, so a
+    /// file switched away from and back is still measured against the order it
+    /// had on disk rather than against whatever it had been dragged into.
+    /// Without this, coming back to a reordered file and dragging the request
+    /// home again would leave it looking permanently unsaved.
+    pub workspace_baselines: HashMap<PathBuf, Vec<u64>>,
+
+    /// The parked files (see `workspace_pending`) whose entries differ
+    /// structurally from disk — `structure_modified` for a file that isn't the
+    /// loaded one. Kept separately because `workspace_pending` stores only the
+    /// entries, and a deletion is precisely the change that leaves no trace in
+    /// them.
+    pub workspace_structure_modified: HashSet<PathBuf>,
+
     /// Run results for this Workspace tab's files, keyed by file and indexed
     /// the way [`Self::workspace_titles`] is — see [`RunRecord`] for why they
     /// outlive the file being loaded, and why they are runtime-only.
@@ -405,6 +580,11 @@ pub struct Collection {
 }
 
 static NEXT_COLLECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Stamps for [`HurlEntry::uid`]. Starts at 1 so that zero keeps its meaning of
+/// "never stamped", and is shared across every collection so two tabs can never
+/// hand out the same identity to different requests.
+static NEXT_ENTRY_UID: AtomicU64 = AtomicU64::new(1);
 
 /// A process-unique id for a new collection.
 pub fn next_collection_id() -> u64 {
@@ -440,6 +620,7 @@ impl Collection {
             captures: HashMap::new(),
             folder: Vec::new(),
             list_cursor: 0,
+            list_query: String::new(),
             deleted_entries: Vec::new(),
             workspace_root: None,
             workspace_filter_hurl_json: true,
@@ -451,8 +632,16 @@ impl Collection {
             workspace_titles: HashMap::new(),
             workspace_scan: RefCell::new(None),
             workspace_pending: HashMap::new(),
+            structure_modified: false,
+            structure_baseline: Vec::new(),
+            workspace_baselines: HashMap::new(),
+            workspace_structure_modified: HashSet::new(),
             workspace_runs: HashMap::new(),
         };
+        // Whatever a collection is built from is, by definition, what it
+        // currently agrees with — a file just read, a Postman import, or an
+        // empty scratch tab. Later structural edits are measured against this.
+        c.reset_structure_baseline();
         c.sync_folder_to_selected();
         c
     }
@@ -481,10 +670,37 @@ impl Collection {
         self.request_json_for = None;
     }
 
-    /// The rows to show in the Requests list for the folder currently being
-    /// browsed.
+    /// The rows to show in the Requests list: the folder currently being
+    /// browsed, or — while a filter is typed — every match across the whole
+    /// collection.
     pub fn rows(&self) -> Vec<Row> {
-        tree::rows_for(&self.entries, &self.folder)
+        if self.list_filter_active() {
+            tree::rows_matching(&self.entries, &self.list_query)
+        } else {
+            tree::rows_for(&self.entries, &self.folder)
+        }
+    }
+
+    /// How many rows the left-hand list pane is showing, whichever kind of tab
+    /// it is: a Workspace tab draws its filesystem tree, every other tab draws
+    /// the loaded collection's requests. The two are different lists of
+    /// different lengths, and reading `list_cursor` against the wrong one is
+    /// how `Alt+↑↓` came to reorder requests nobody was pointing at.
+    pub fn list_row_count(&self) -> usize {
+        if self.is_workspace() {
+            self.ws_rows().len()
+        } else {
+            self.rows().len()
+        }
+    }
+
+    /// Whether the Requests list is currently narrowed by a typed filter.
+    ///
+    /// Trimmed, so a query of nothing but spaces counts as no filter at all —
+    /// it matches every request anyway, and treating it as active would leave
+    /// the list flattened out of its folders for no visible reason.
+    pub fn list_filter_active(&self) -> bool {
+        !self.list_query.trim().is_empty()
     }
 
     /// True when this tab is bound to a Workspace folder (so the list uses the
@@ -503,6 +719,26 @@ impl Collection {
     /// report embeds it in the right pane.  Empty for a non-Workspace tab.
     pub fn ws_rows(&self) -> Vec<WsRow> {
         self.ws_rows_at(Instant::now())
+    }
+
+    /// The entry index under the cursor when it is a *loaded* request on a
+    /// Workspace tab — that is, exactly when `m` (move) and `c` (copy) have
+    /// something to transfer to another collection file.
+    ///
+    /// A single predicate shared by the key handler and the footer hint, so the
+    /// footer can never advertise a key that would silently do nothing: a
+    /// folder row, a report, or a collection file whose requests haven't been
+    /// read in yet are all rows where `m`/`c` return without acting.
+    pub(crate) fn ws_transfer_target(&self) -> Option<usize> {
+        if !self.is_workspace() || self.workspace_root.is_none() {
+            return None;
+        }
+        match self.ws_rows().into_iter().nth(self.list_cursor) {
+            Some(WsRow::Request {
+                idx, loaded: true, ..
+            }) => Some(idx),
+            _ => None,
+        }
     }
 
     /// [`Self::ws_rows`] as of a given moment, so the scan cache's expiry can be
@@ -532,6 +768,16 @@ impl Collection {
             .unwrap_or_default();
         let mut out = Vec::new();
 
+        // A typed filter searches the whole workspace, so while one is active
+        // every *folder* counts as expanded: a search that could only find what
+        // was already on screen would be no search at all. Collection files are
+        // deliberately left alone — expanding one reads its requests off disk
+        // (or out of the title cache), and doing that for every file in the
+        // tree on each keystroke would stall a large workspace. So a filter
+        // reaches every file, report and environment in the workspace, and the
+        // requests of the collections already open.
+        let filtering = self.list_filter_active();
+
         // `ancestor_at[d]` holds the absolute path of the most-recently-visited
         // directory at depth d.  A row at depth D is visible iff every slot
         // ancestor_at[0..D] points to a path in `workspace_expanded`.
@@ -546,10 +792,11 @@ impl Collection {
             }
 
             // Visible iff every containing ancestor folder is expanded.
-            let visible = ancestor_at.iter().all(|opt| {
-                opt.as_ref()
-                    .is_some_and(|p| self.workspace_expanded.contains(p))
-            });
+            let visible = filtering
+                || ancestor_at.iter().all(|opt| {
+                    opt.as_ref()
+                        .is_some_and(|p| self.workspace_expanded.contains(p))
+                });
 
             if entry.is_dir {
                 // Record this directory as the current ancestor at depth d,
@@ -561,7 +808,7 @@ impl Collection {
                 }
 
                 if visible {
-                    let expanded = self.workspace_expanded.contains(&entry.path);
+                    let expanded = filtering || self.workspace_expanded.contains(&entry.path);
                     out.push(WsRow::Folder {
                         path: entry.path.clone(),
                         name: entry.display_name.clone(),
@@ -595,6 +842,9 @@ impl Collection {
                     }
                 }
             }
+        }
+        if filtering {
+            return filter_ws_rows(out, &self.list_query);
         }
         out
     }
@@ -786,10 +1036,28 @@ impl Collection {
             None => crate::postman::parse_collection(&std::fs::read_to_string(&path)?),
         };
         self.workspace_pending.remove(&path);
+        // Park the outgoing file *before* adopting the incoming file's flag,
+        // since parking reads `structure_modified` for the file being left.
         self.park_pending_edits();
+        // The incoming file's structural flag is about to be re-derived from its
+        // baseline, so the parked copy has done its job (it existed only to
+        // answer "is this parked file dirty" while the file was away).
+        self.workspace_structure_modified.remove(&path);
         self.park_run_results();
         self.snapshot_loaded_titles();
         self.entries = entries;
+        // A file coming back out of the park keeps the baseline it was parked
+        // with, because that baseline still describes the file on disk; one read
+        // fresh off disk simply *is* its own baseline. Either way the flag is
+        // derived from the comparison, so a file whose reorder has since been
+        // undone comes back clean instead of staying marked for the session.
+        match self.workspace_baselines.remove(&path) {
+            Some(baseline) => {
+                self.structure_baseline = baseline;
+                self.refresh_structure_modified();
+            }
+            None => self.reset_structure_baseline(),
+        }
         self.restore_run_results(&path);
         self.selected_entry = 0;
         self.path = Some(path);
@@ -809,6 +1077,14 @@ impl Collection {
             return;
         }
         if let Some(path) = self.path.clone() {
+            if self.structure_modified {
+                self.workspace_structure_modified.insert(path.clone());
+            }
+            // The baseline travels with the parked entries: it describes the
+            // file on disk, which is still what this file will have to be
+            // compared against when it comes back.
+            self.workspace_baselines
+                .insert(path.clone(), self.structure_baseline.clone());
             self.workspace_pending.insert(path, self.entries.clone());
         }
     }
@@ -896,31 +1172,81 @@ impl Collection {
             .unwrap_or(RunStatus::NotRun)
     }
 
+    /// The entry list's structural identity: the [`HurlEntry::uid`] of each
+    /// entry, in order.
+    fn structure_fingerprint(&self) -> Vec<u64> {
+        self.entries.iter().map(|e| e.uid).collect()
+    }
+
+    /// Adopt the current entry list as "what was saved", so nothing that
+    /// follows counts as a structural change until the list moves again.
+    ///
+    /// Stamps every entry with a fresh identity as it goes, which is what makes
+    /// the comparison work at all: from here on an entry can be edited, moved
+    /// or removed and its stamp goes with it, so the list can always be told
+    /// apart from a rearrangement of itself. Re-stamping (rather than keeping
+    /// the old numbers) is what makes a *duplicated* request — a clone, and so
+    /// initially a second entry carrying the same stamp — settle back down to a
+    /// list of unique identities once it is saved.
+    ///
+    /// Called wherever the list and the file are brought into agreement:
+    /// reading a file, writing one, and constructing a collection from entries
+    /// that came straight off disk.
+    pub fn reset_structure_baseline(&mut self) {
+        for e in &mut self.entries {
+            e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);
+        }
+        self.structure_baseline = self.structure_fingerprint();
+        self.structure_modified = false;
+    }
+
+    /// Recompute [`Self::structure_modified`] by comparing the entry list
+    /// against the baseline.
+    ///
+    /// Every structural edit routes through here rather than setting the flag,
+    /// so that undoing one clears it: putting a dragged request back where it
+    /// started, or restoring the request just deleted, returns the list to the
+    /// one that was saved and there is then genuinely nothing to save. A latched
+    /// flag left the pencil on with nothing behind it, which teaches people to
+    /// ignore the pencil.
+    fn refresh_structure_modified(&mut self) {
+        self.structure_modified = self.structure_fingerprint() != self.structure_baseline;
+    }
+
     /// `true` when this collection holds requests that have been added or
     /// edited since it was last read from / written to disk.
     pub fn has_unsaved_edits(&self) -> bool {
-        self.entries.iter().any(|e| e.user_added || e.modified)
+        self.structure_modified || self.entries.iter().any(|e| e.user_added || e.modified)
     }
 
-    /// How many requests in this tab are added-but-unsaved or edited, counting
-    /// a Workspace tab's parked files as well as the one it is showing.
+    /// How many unsaved changes this tab is holding, counting a Workspace
+    /// tab's parked files as well as the one it is showing.
+    ///
+    /// Mostly this is the added-but-unsaved and edited requests, one apiece.
+    /// A file that has been changed *structurally* — a request removed,
+    /// restored or reordered — counts one more, because no surviving request
+    /// carries a marker for it and it would otherwise total zero: this number
+    /// gates the "you have unsaved edits" prompt on closing a tab
+    /// ([`crate::gui::app::GuiApp::request_close_tab`]), so a delete-only
+    /// change reading as nothing meant closing the tab threw it away without
+    /// asking. One per file rather than one per removal, because how many
+    /// there were is not recorded — only that the list no longer matches disk.
     pub fn unsaved_edit_count(&self) -> usize {
-        let loaded = self
-            .entries
-            .iter()
-            .filter(|e| e.user_added || e.modified)
-            .count();
+        let edited = |entries: &[HurlEntry]| {
+            entries
+                .iter()
+                .filter(|e| e.user_added || e.modified)
+                .count()
+        };
+        let loaded = edited(&self.entries) + usize::from(self.structure_modified);
         let parked: usize = self
             .workspace_pending
             .iter()
             // The loaded file is parked *and* live while it is being shown, so
             // counting both would double it.
             .filter(|(path, _)| self.path.as_deref() != Some(path.as_path()))
-            .map(|(_, entries)| {
-                entries
-                    .iter()
-                    .filter(|e| e.user_added || e.modified)
-                    .count()
+            .map(|(path, entries)| {
+                edited(entries) + usize::from(self.workspace_structure_modified.contains(path))
             })
             .sum();
         loaded + parked
@@ -952,12 +1278,29 @@ impl Collection {
     /// either it is the loaded file and that has been edited, or it was edited
     /// and then switched away from (so it lives in `workspace_pending`). Drives
     /// the "edited" pencil in the workspace tree.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn workspace_file_edited(&self, path: &std::path::Path) -> bool {
         if self.workspace_pending.contains_key(path) {
             return true;
         }
         self.path.as_deref() == Some(path) && self.has_unsaved_edits()
+    }
+
+    /// Whether anything at or under `prefix` has unsaved in-memory edits — the
+    /// generalisation of [`Self::workspace_file_edited`] to a whole subtree, so
+    /// a delete confirmation can warn that removing a folder is about to throw
+    /// away edits parked in files inside it. Covers the loaded file, the files
+    /// parked in `workspace_pending`, and structural-only changes
+    /// (`workspace_structure_modified`) that leave no per-request marker.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn workspace_unsaved_under(&self, prefix: &std::path::Path) -> bool {
+        if self.path.as_deref().is_some_and(|p| p.starts_with(prefix)) && self.has_unsaved_edits() {
+            return true;
+        }
+        self.workspace_pending.keys().any(|p| p.starts_with(prefix))
+            || self
+                .workspace_structure_modified
+                .iter()
+                .any(|p| p.starts_with(prefix))
     }
 
     /// Whether request `idx` of the workspace collection file at `path` has
@@ -967,7 +1310,6 @@ impl Collection {
     /// was snapshotted from those same (edited) entries, so the indices line up.
     /// Without this, opening a second collection made the first one's pencils
     /// disappear from its rows even though the edits were still pending.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn workspace_request_edited(&self, path: &std::path::Path, idx: usize) -> bool {
         let entries = if self.path.as_deref() == Some(path) {
             &self.entries
@@ -1034,6 +1376,93 @@ impl Collection {
         Ok(())
     }
 
+    /// Repoint everything this tab holds about a workspace item that has just
+    /// been renamed or moved on disk from `from` to `to` — the loaded file, the
+    /// remembered selection, the expand/collapse set, and every by-path cache
+    /// keyed on it — so nothing goes on pointing at a path that no longer
+    /// exists. [`crate::workspace::repoint`] matches the item itself *and*
+    /// anything that was inside it, so renaming or moving a folder carries its
+    /// children's state along too.
+    ///
+    /// Every by-path map is rewritten, not just the visible ones: the parked
+    /// edits, structure baselines and run results are exactly the state that
+    /// makes "edit a file, look at another, come back" work, and leaving them
+    /// keyed on the old path would silently drop a renamed file's unsaved work.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn repoint_workspace_paths(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        use crate::workspace::repoint;
+        let moved = |p: &std::path::Path| repoint(p, from, to);
+        if let Some(p) = self.path.as_deref().and_then(moved) {
+            self.path = Some(p);
+        }
+        if let Some(p) = self.workspace_selected.as_deref().and_then(moved) {
+            self.workspace_selected = Some(p);
+        }
+        self.workspace_expanded = self
+            .workspace_expanded
+            .drain()
+            .map(|p| moved(&p).unwrap_or(p))
+            .collect();
+        self.workspace_titles = self
+            .workspace_titles
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_pending = self
+            .workspace_pending
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_baselines = self
+            .workspace_baselines
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+        self.workspace_structure_modified = self
+            .workspace_structure_modified
+            .drain()
+            .map(|p| moved(&p).unwrap_or(p))
+            .collect();
+        self.workspace_runs = self
+            .workspace_runs
+            .drain()
+            .map(|(p, v)| (moved(&p).unwrap_or(p), v))
+            .collect();
+    }
+
+    /// Drop everything this tab was holding about the workspace item at
+    /// `deleted` — and, when it is a folder, everything that was inside it —
+    /// because the item has just been removed from disk.
+    ///
+    /// If the *loaded* file was under the deletion, the tab is reset to the
+    /// file-less state a fresh Workspace tab starts in: leaving `entries`
+    /// showing the requests of a file that no longer exists would be a phantom
+    /// the user could keep editing and try to save into thin air. Every by-path
+    /// cache is pruned of the deleted subtree so no stale pencil, run marker or
+    /// parked edit survives — and so a later, same-named file can't inherit the
+    /// dead one's state.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn prune_workspace_paths(&mut self, deleted: &std::path::Path) {
+        let under = |p: &std::path::Path| p.starts_with(deleted);
+        if self.path.as_deref().is_some_and(under) {
+            self.path = None;
+            self.entries.clear();
+            self.selected_entry = 0;
+            self.structure_modified = false;
+            self.structure_baseline.clear();
+            self.invalidate_request_json();
+        }
+        if self.workspace_selected.as_deref().is_some_and(under) {
+            self.workspace_selected = None;
+        }
+        self.workspace_expanded.retain(|p| !under(p));
+        self.workspace_titles.retain(|p, _| !under(p));
+        self.workspace_pending.retain(|p, _| !under(p));
+        self.workspace_baselines.retain(|p, _| !under(p));
+        self.workspace_structure_modified.retain(|p| !under(p));
+        self.workspace_runs.retain(|p, _| !under(p));
+    }
+
     /// Clear this collection's "new"/"edited" request markers, and drop any
     /// parked edits for its file — called whenever its `.hurl` is written to
     /// disk (local Save or git push) so every save path agrees on what "saved"
@@ -1043,8 +1472,12 @@ impl Collection {
             e.user_added = false;
             e.modified = false;
         }
+        // The file on disk now *is* the entry list, so it becomes the baseline
+        // every later structural edit is measured against.
+        self.reset_structure_baseline();
         if let Some(path) = &self.path {
             self.workspace_pending.remove(path);
+            self.workspace_structure_modified.remove(path);
         }
     }
 
@@ -1081,13 +1514,21 @@ impl Collection {
             .map(|(p, e)| (p.clone(), e.clone()))
             .collect();
         for (path, entries) in parked {
-            if !entries.iter().any(|e| e.user_added || e.modified) {
+            // A parked file whose only change was a deletion or a reorder has
+            // no flagged entry to find — `workspace_structure_modified` is the
+            // only record that it differs from disk.
+            if !self.workspace_structure_modified.contains(&path)
+                && !entries.iter().any(|e| e.user_added || e.modified)
+            {
                 continue;
             }
             write_hurl(&path, &collection_to_hurl(&entries))?;
             written += 1;
         }
         self.workspace_pending.clear();
+        // Everything parked has just been written, so no file is structurally
+        // ahead of disk any more; `mark_saved` only clears the loaded one.
+        self.workspace_structure_modified.clear();
         self.mark_saved();
         Ok(written)
     }
@@ -1227,6 +1668,200 @@ impl Collection {
         self.folder = tree::folder_of(&self.entries, idx);
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
+    }
+
+    /// Remove the entry at `idx`, recording it (with the index it came from)
+    /// in `deleted_entries` so [`Self::restore_last_deleted`] can bring it
+    /// back. This is the part of "delete a request" both front-ends have to
+    /// agree on — one undo history and one 20-entry cap — everything around it
+    /// differs (the terminal UI also moves its list cursor, sets a status line
+    /// and persists state; the graphical one doesn't), so those stay in each
+    /// front-end's own delete method instead of being forced in here.
+    ///
+    /// Returns `None` for an out-of-range `idx` rather than panicking the way
+    /// `Vec::remove` would: the index reaching here came from a list row or a
+    /// context menu rendered from an earlier borrow of `entries`, so it is
+    /// exactly the kind of index that can go stale between being read and
+    /// being used.
+    pub fn remove_entry_recording_undo(&mut self, idx: usize) -> Option<HurlEntry> {
+        if idx >= self.entries.len() {
+            return None;
+        }
+        let removed = self.entries.remove(idx);
+        self.refresh_structure_modified();
+        self.deleted_entries.push((idx, removed.clone()));
+        if self.deleted_entries.len() > 20 {
+            self.deleted_entries.remove(0);
+        }
+        Some(removed)
+    }
+
+    /// Move the entry at `from` so it sits at index `to`, shifting everything
+    /// between them along. Returns whether anything actually moved.
+    ///
+    /// The order of `entries` is not cosmetic: `run_all_entries` walks it in
+    /// order, so it decides which request captures a token before another one
+    /// uses it. Until this existed the only way to change that was to delete a
+    /// request and recreate it further down.
+    ///
+    /// Remove-and-insert rather than a swap, because the two requests a user
+    /// sees as neighbours need not be neighbours in `entries` at all — folders
+    /// are derived by splitting titles on `/` (see [`crate::tree`]), so a
+    /// folder's requests can be scattered through the vector with other
+    /// folders' requests in between. Swapping would drag whichever unrelated
+    /// request sat at `to` across to `from`; shifting leaves everything else in
+    /// the order it was.
+    ///
+    /// Reordering is safe for reports, which address requests by title rather
+    /// than position (`report::run::resolve_qualified`) — unlike renaming.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> bool {
+        let len = self.entries.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        let entry = self.entries.remove(from);
+        self.entries.insert(to, entry);
+        // The selection is a position, so it has to be re-derived rather than
+        // left pointing at whatever slid into the old index: the moved request
+        // takes its selection with it, and a selection either side of the move
+        // shifts by one only if the move stepped across it.
+        self.selected_entry = shift_index(self.selected_entry, from, to);
+        // A reorder changes no request, so nothing else would record it — see
+        // `structure_modified`. Recomputed rather than latched, so dragging a
+        // request back where it started clears the marker again.
+        self.refresh_structure_modified();
+        self.invalidate_request_json();
+        self.sync_folder_to_selected();
+        true
+    }
+
+    /// Move the entry at `from` so it ends up immediately *before* the entry
+    /// currently at `before` — the drag-and-drop spelling of [`Self::move_entry`],
+    /// where a drop lands in the gap above a row rather than on a slot number.
+    /// `before == entries.len()` means "after the last one". Returns whether
+    /// anything actually moved.
+    ///
+    /// The index has to be adjusted when dragging *downwards*: `move_entry`
+    /// removes before it inserts, so once the dragged request is lifted out
+    /// every row below it slides up by one and the gap the user aimed at is now
+    /// one lower. Without this the request would consistently land one place
+    /// short of where it was dropped, which reads as the drop being ignored.
+    ///
+    /// Only the GUI drags requests; the terminal UI reorders with `Alt+↑↓`
+    /// through `move_entry`, so this is dead code without the `gui` feature.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn move_entry_before(&mut self, from: usize, before: usize) -> bool {
+        let len = self.entries.len();
+        if from >= len || before > len {
+            return false;
+        }
+        // Dropping into either gap touching the request is where it already is.
+        if before == from || before == from + 1 {
+            return false;
+        }
+        let to = if from < before { before - 1 } else { before };
+        self.move_entry(from, to)
+    }
+
+    /// Reopen the most recently deleted entry (if any), re-inserting it as
+    /// close as possible to the index it was removed from, and return that
+    /// index so the caller can select it. `None` when there is nothing to
+    /// restore, which both front-ends treat as a no-op.
+    pub fn restore_last_deleted(&mut self) -> Option<usize> {
+        let (idx, entry) = self.deleted_entries.pop()?;
+        let idx = idx.min(self.entries.len());
+        self.entries.insert(idx, entry);
+        // Restoring is as much a structural change as removing — and it is not
+        // assumed to *undo* one either, since the request lands at the nearest
+        // surviving index rather than necessarily its old one, and anything
+        // else may have moved meanwhile. So this is recomputed like the rest:
+        // when it does land back where it was, the collection is once again the
+        // one on disk and says so.
+        self.refresh_structure_modified();
+        Some(idx)
+    }
+}
+
+#[cfg(test)]
+mod undo_delete_tests {
+    use super::*;
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e
+    }
+
+    #[test]
+    fn remove_entry_recording_undo_records_index_and_entry() {
+        let mut c = Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")]);
+        let removed = c
+            .remove_entry_recording_undo(1)
+            .expect("index 1 is in range");
+        assert_eq!(removed.title, "b");
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        assert_eq!(c.deleted_entries.len(), 1);
+        assert_eq!(c.deleted_entries[0].0, 1);
+        assert_eq!(c.deleted_entries[0].1.title, "b");
+    }
+
+    #[test]
+    fn deleted_entries_cap_holds_at_20() {
+        let mut c = Collection::new(
+            "c".into(),
+            (0..25).map(|i| entry(&format!("r{i}"))).collect(),
+        );
+        for _ in 0..25 {
+            c.remove_entry_recording_undo(0);
+        }
+        // The oldest deletions are dropped so the history never grows without
+        // bound over a long session; only the most recent 20 survive.
+        assert_eq!(c.deleted_entries.len(), 20);
+        assert_eq!(c.deleted_entries.first().unwrap().1.title, "r5");
+        assert_eq!(c.deleted_entries.last().unwrap().1.title, "r24");
+    }
+
+    #[test]
+    fn restore_last_deleted_reinserts_at_recorded_index() {
+        let mut c = Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")]);
+        c.remove_entry_recording_undo(1);
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"]
+        );
+        let idx = c.restore_last_deleted().unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(
+            c.entries
+                .iter()
+                .map(|e| e.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(c.deleted_entries.is_empty());
+    }
+
+    #[test]
+    fn removing_an_out_of_range_entry_is_a_no_op_rather_than_a_panic() {
+        let mut c = Collection::new("c".into(), vec![entry("a")]);
+        assert!(c.remove_entry_recording_undo(7).is_none());
+        assert_eq!(c.entries.len(), 1, "nothing was removed");
+        assert!(c.deleted_entries.is_empty(), "and nothing was recorded");
+    }
+
+    #[test]
+    fn restore_last_deleted_is_none_when_history_empty() {
+        let mut c = Collection::new("c".into(), vec![entry("a")]);
+        assert!(c.restore_last_deleted().is_none());
     }
 }
 
@@ -1750,5 +2385,418 @@ mod request_folder_tests {
             !key.components().any(|c| c.as_os_str() == ".."),
             "and never contains a parent hop: {key:?}"
         );
+    }
+}
+
+/// A Workspace tab's edits are held in memory and re-read from disk when the
+/// tab switches away and back, so anything the tab doesn't recognise as an
+/// edit is silently discarded. These pin down that removing or reordering a
+/// request counts — neither touches a *surviving* entry's `user_added` /
+/// `modified` flags, which is all `has_unsaved_edits` used to look at.
+#[cfg(test)]
+mod structure_edit_tests {
+    use super::*;
+
+    fn ws_collection(dir: &std::path::Path, titles: &[&str]) -> (Collection, PathBuf) {
+        let a = dir.join("a.hurl");
+        let b = dir.join("b.hurl");
+        let entries: Vec<HurlEntry> = titles
+            .iter()
+            .map(|t| HurlEntry {
+                title: (*t).to_string(),
+                method: "GET".into(),
+                url: "http://x".into(),
+                ..Default::default()
+            })
+            .collect();
+        std::fs::write(&a, collection_to_hurl(&entries)).unwrap();
+        std::fs::write(&b, "GET http://other\n").unwrap();
+        let mut col = Collection::new("ws".into(), entries);
+        col.workspace_root = Some(dir.to_path_buf());
+        col.path = Some(a.clone());
+        (col, b)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("paperboy_structedit_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn deleting_a_request_survives_a_workspace_file_switch() {
+        let dir = temp_dir("delete");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+
+        col.remove_entry_recording_undo(0);
+        assert!(
+            col.has_unsaved_edits(),
+            "a deletion is an unsaved edit, even though no surviving entry is flagged"
+        );
+
+        let a = col.path.clone().unwrap();
+        col.load_workspace_file(other).unwrap();
+        col.load_workspace_file(a).unwrap();
+
+        let titles: Vec<&str> = col.entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Logout"],
+            "the deleted request must not come back from disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The subtler half: a file whose only change was a deletion, parked when
+    /// the tab switched away from it. `workspace_pending` holds its entries,
+    /// but a deletion leaves no flagged entry among them, so the save-all pass
+    /// had nothing to tell it apart from an untouched file.
+    /// The count gates the GUI's "unsaved edits" prompt on closing a tab, so
+    /// a delete-only change reading as zero meant the tab closed silently and
+    /// the deletion went with it.
+    fn titles(c: &Collection) -> Vec<&str> {
+        c.entries.iter().map(|e| e.title.as_str()).collect()
+    }
+
+    fn plain(titles: &[&str]) -> Collection {
+        Collection::new(
+            "c".into(),
+            titles
+                .iter()
+                .map(|t| HurlEntry {
+                    title: (*t).to_string(),
+                    method: "GET".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn moving_an_entry_shifts_the_ones_it_steps_over() {
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry(0, 2), "a moves down past b and c");
+        assert_eq!(titles(&c), vec!["b", "c", "a", "d"]);
+
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry(3, 1), "d moves up past c and b");
+        assert_eq!(titles(&c), vec!["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn a_move_that_cannot_happen_is_a_no_op() {
+        let mut c = plain(&["a", "b"]);
+        assert!(!c.move_entry(1, 1), "nowhere to go");
+        assert!(!c.move_entry(0, 9), "past the end");
+        assert!(!c.move_entry(9, 0), "from nowhere");
+        assert_eq!(titles(&c), vec!["a", "b"]);
+        assert!(
+            !c.structure_modified,
+            "and a move that did not happen is not an unsaved change"
+        );
+    }
+
+    /// Dropping into a gap is the drag-and-drop spelling of a move, and the
+    /// index needs adjusting when the drag goes downwards — the dragged request
+    /// is lifted out before it is put back, so everything below it slides up by
+    /// one first.
+    #[test]
+    fn a_drop_lands_in_the_gap_it_was_aimed_at() {
+        // Downwards: "a" dropped into the gap before "d" must end up between
+        // "c" and "d", not between "b" and "c".
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry_before(0, 3));
+        assert_eq!(titles(&c), vec!["b", "c", "a", "d"]);
+
+        // Upwards needs no adjustment: nothing below the gap has moved.
+        let mut c = plain(&["a", "b", "c", "d"]);
+        assert!(c.move_entry_before(3, 1));
+        assert_eq!(titles(&c), vec!["a", "d", "b", "c"]);
+
+        // Past the last row: the one gap that isn't before any entry.
+        let mut c = plain(&["a", "b", "c"]);
+        assert!(c.move_entry_before(0, 3));
+        assert_eq!(titles(&c), vec!["b", "c", "a"]);
+    }
+
+    /// Both gaps touching a request are where it already is, so a drop there
+    /// must not register as an edit — it would mark the file unsaved for a
+    /// change nobody made.
+    #[test]
+    fn dropping_a_request_back_where_it_started_changes_nothing() {
+        let mut c = plain(&["a", "b", "c"]);
+        assert!(!c.move_entry_before(1, 1), "the gap above it");
+        assert!(!c.move_entry_before(1, 2), "the gap below it");
+        assert!(!c.move_entry_before(9, 0), "from nowhere");
+        assert!(!c.move_entry_before(0, 9), "into nowhere");
+        assert_eq!(titles(&c), vec!["a", "b", "c"]);
+        assert!(!c.structure_modified);
+    }
+
+    /// The selection is a position, so every move has to re-derive it.
+    #[test]
+    fn the_selection_follows_whatever_it_was_pointing_at() {
+        // The moved entry carries the selection with it.
+        let mut c = plain(&["a", "b", "c"]);
+        c.selected_entry = 0;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 2, "still on 'a'");
+
+        // A selection the move steps across shifts by one.
+        let mut c = plain(&["a", "b", "c"]);
+        c.selected_entry = 1;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 0, "still on 'b', which slid up");
+
+        // A selection outside the moved span is left alone.
+        let mut c = plain(&["a", "b", "c", "d"]);
+        c.selected_entry = 3;
+        c.move_entry(0, 2);
+        assert_eq!(c.selected_entry, 3, "still on 'd'");
+    }
+
+    /// A reorder is exactly the change no request records, which is what
+    /// `structure_modified` exists for.
+    #[test]
+    fn reordering_counts_as_an_unsaved_change() {
+        let dir = temp_dir("reorder");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        assert!(col.move_entry(0, 1));
+        assert!(col.has_unsaved_edits());
+        assert_eq!(col.unsaved_edit_count(), 1);
+
+        assert_eq!(col.save_workspace_edits().unwrap(), 1);
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            on_disk.find("Logout").unwrap() < on_disk.find("Login").unwrap(),
+            "the new order reached the file: {on_disk}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_structural_edit_counts_as_an_unsaved_change() {
+        let dir = temp_dir("count");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+        assert_eq!(col.unsaved_edit_count(), 0);
+
+        col.remove_entry_recording_undo(0);
+        assert_eq!(
+            col.unsaved_edit_count(),
+            1,
+            "the deletion is a change, even with no request left to flag it"
+        );
+
+        // Once parked, it still counts — and only once.
+        col.load_workspace_file(other).unwrap();
+        assert_eq!(col.unsaved_edit_count(), 1);
+
+        col.save_workspace_edits().unwrap();
+        assert_eq!(col.unsaved_edit_count(), 0, "and saving settles it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parked_files_structural_edit_is_written_too() {
+        let dir = temp_dir("parked");
+        let (mut col, other) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        col.remove_entry_recording_undo(0);
+        // Switch away, so the edit is parked rather than loaded.
+        col.load_workspace_file(other).unwrap();
+        assert!(
+            col.workspace_pending.contains_key(&a),
+            "the deletion was parked rather than discarded"
+        );
+
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            1,
+            "the parked file was written"
+        );
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            !on_disk.contains("Login"),
+            "the parked deletion reached the file: {on_disk}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An untouched file must still be left alone — the flag has to be cleared
+    /// on the way through, or every later save would rewrite files needlessly
+    /// (and stamp over changes made outside PaperBoy).
+    #[test]
+    fn saving_clears_the_structural_marks_it_just_wrote() {
+        let dir = temp_dir("clears");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+
+        col.remove_entry_recording_undo(0);
+        col.save_workspace_edits().unwrap();
+        assert!(col.workspace_structure_modified.is_empty());
+        assert!(!col.structure_modified);
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            0,
+            "a second save has nothing left to write"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_structural_edit_is_written_by_save_workspace_edits() {
+        let dir = temp_dir("save");
+        let (mut col, _) = ws_collection(&dir, &["Login", "Logout"]);
+        let a = col.path.clone().unwrap();
+
+        col.remove_entry_recording_undo(0);
+        assert_eq!(
+            col.save_workspace_edits().unwrap(),
+            1,
+            "the file was written"
+        );
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            !on_disk.contains("Login"),
+            "the deletion reached the file: {on_disk}"
+        );
+        assert!(
+            !col.has_unsaved_edits(),
+            "and saving clears the structural edit, like any other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod structure_baseline_tests {
+    use super::*;
+
+    fn entry(title: &str) -> HurlEntry {
+        let mut e = HurlEntry::default();
+        e.title = title.into();
+        e
+    }
+
+    fn col() -> Collection {
+        Collection::new("c".into(), vec![entry("a"), entry("b"), entry("c")])
+    }
+
+    #[test]
+    fn a_freshly_built_collection_is_not_structurally_modified() {
+        assert!(!col().structure_modified);
+    }
+
+    #[test]
+    fn reordering_marks_the_collection_and_reordering_back_clears_it() {
+        let mut c = col();
+        assert!(c.move_entry(0, 1));
+        assert!(
+            c.structure_modified,
+            "a reorder has to register — nothing else records it"
+        );
+        assert!(c.move_entry(1, 0));
+        assert!(
+            !c.structure_modified,
+            "putting the request back leaves nothing to save, so the marker must clear"
+        );
+    }
+
+    #[test]
+    fn a_longer_walk_back_to_the_original_order_also_clears_it() {
+        // Not just a single undo: any sequence of drags that happens to end in
+        // the saved order is, by then, the saved order.
+        let mut c = col();
+        let titles = |c: &Collection| {
+            c.entries
+                .iter()
+                .map(|e| e.title.clone())
+                .collect::<Vec<_>>()
+        };
+        c.move_entry(0, 2);
+        c.move_entry(0, 1);
+        assert_eq!(titles(&c), vec!["c", "b", "a"]);
+        assert!(c.structure_modified);
+        c.move_entry(0, 2);
+        c.move_entry(0, 1);
+        assert_eq!(titles(&c), vec!["a", "b", "c"]);
+        assert!(!c.structure_modified);
+    }
+
+    #[test]
+    fn deleting_marks_the_collection_and_undoing_the_delete_clears_it() {
+        let mut c = col();
+        c.remove_entry_recording_undo(1);
+        assert!(c.structure_modified);
+        c.restore_last_deleted();
+        assert!(
+            !c.structure_modified,
+            "the restored request landed back where it was, so the list matches disk again"
+        );
+    }
+
+    #[test]
+    fn a_restore_that_lands_somewhere_else_stays_marked() {
+        // `restore_last_deleted` reinserts at the *nearest* surviving index, so
+        // deleting two and restoring one need not undo anything.
+        let mut c = col();
+        c.remove_entry_recording_undo(0);
+        c.remove_entry_recording_undo(0);
+        c.restore_last_deleted();
+        assert!(c.structure_modified);
+    }
+
+    /// The reason the comparison is by identity and not by anything the entry
+    /// *says*. A `.hurl` file whose requests carry no `#` name gives every
+    /// entry the same empty title, so a title-based fingerprint saw a reorder
+    /// of them as no change at all — and a workspace file of unnamed requests
+    /// is the common case, not a corner one.
+    #[test]
+    fn reordering_untitled_requests_is_still_detected() {
+        let mut c = Collection::new("c".into(), vec![entry(""), entry(""), entry("")]);
+        c.entries[0].url = "https://example.test/a".into();
+        c.entries[1].url = "https://example.test/b".into();
+        c.entries[2].url = "https://example.test/c".into();
+        // Re-adopt, so the URLs above are part of the saved state.
+        c.mark_saved();
+        assert!(c.move_entry(0, 1));
+        assert!(c.structure_modified, "the requests really did swap places");
+        assert!(c.move_entry(1, 0));
+        assert!(!c.structure_modified);
+    }
+
+    /// ...and the other half of that reason: editing a request in place is not
+    /// a change to the *list*. It is already reported by the entry's own
+    /// `modified` flag, and counting it twice would inflate the "N unsaved
+    /// edits" warning.
+    #[test]
+    fn editing_a_request_in_place_is_not_a_structural_change() {
+        let mut c = col();
+        c.entries[1].url = "https://example.test/rewritten".into();
+        c.entries[1].title = "renamed".into();
+        c.entries[1].modified = true;
+        assert!(
+            !c.structure_modified,
+            "the list is unchanged; only what one of its entries holds is"
+        );
+        assert!(c.has_unsaved_edits(), "still unsaved, via the entry's flag");
+        assert_eq!(c.unsaved_edit_count(), 1, "counted once, not twice");
+    }
+
+    #[test]
+    fn saving_adopts_the_current_order_as_the_new_baseline() {
+        let mut c = col();
+        c.move_entry(0, 2);
+        c.mark_saved();
+        assert!(!c.structure_modified);
+        // Going back to the *old* order is now itself a change, because the
+        // file on disk holds the new one.
+        c.move_entry(2, 0);
+        assert!(c.structure_modified);
     }
 }

@@ -11,16 +11,23 @@ use hurl_core::ast::{
 use hurl_core::parser::parse_hurl_file;
 use hurl_core::types::ToSource;
 
+use std::ops::Range;
+
 use super::entry::{
     BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
-    RunStatus,
+    RunStatus, decode_body_line, parse_body_marker,
 };
+use super::json_comments;
 
-/// Parse a Hurl-format string into a list of [`HurlEntry`] values. Invalid input
-/// yields an empty list (the UI treats "no entries" as a failed load).
+/// Parse a Hurl-format string into a list of [`HurlEntry`] values.
+///
+/// Text that does not parse as a whole is not thrown away: see
+/// [`recover_entries`]. The result is empty only for input with nothing in it
+/// that looks like a request at all, which is how callers still recognise "this
+/// file isn't a collection".
 pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
     let Ok(file) = parse_hurl_file(content) else {
-        return Vec::new();
+        return recover_entries(content);
     };
     let lines: Vec<&str> = content.lines().collect();
     // Each entry's `# [Reports]` comment block is recovered by scanning the raw
@@ -43,6 +50,192 @@ pub fn parse_hurl(content: &str) -> Vec<HurlEntry> {
             map_entry(e, &lines, method_lines[i], end, i == 0)
         })
         .collect()
+}
+
+/// Salvage what can be read from a file that does not parse.
+///
+/// A `.hurl` file is parsed as a whole, so one damaged request used to cost the
+/// user every other request in the file: the load failed, the collection opened
+/// as nothing, and the only way back in was a text editor. The damage is often
+/// PaperBoy's own — a bad merge, a half-finished hand-edit, an escaping bug —
+/// which makes "all or nothing" a poor trade.
+///
+/// So the file is cut into pieces at the lines that look like the start of a
+/// request, and the pieces are parsed on their own. What parses becomes real
+/// requests; what doesn't is kept verbatim as an unreadable one (see
+/// [`HurlEntry::unreadable`]) so it is still visible, still saved unchanged,
+/// and still repairable in Raw Mode.
+///
+/// The cut is a guess — a request body may contain a line that reads like a
+/// method — so it is never trusted on its own. A piece that fails to parse is
+/// retried with the piece after it joined on, and again with the one after
+/// that, which is exactly what heals a body that was cut in half. Only when no
+/// amount of joining helps is the piece declared unreadable, and even then only
+/// the first piece is: the rest go back into the queue, so one broken request
+/// cannot swallow the good ones behind it.
+///
+/// Every byte of `content` ends up in exactly one entry, in order. Nothing is
+/// invented and nothing is dropped.
+fn recover_entries(content: &str) -> Vec<HurlEntry> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let starts = request_starts(&lines);
+    if starts.is_empty() {
+        return Vec::new();
+    }
+    // Anything above the first request start is a preamble — a banner comment,
+    // or leading junk. It has no request to belong to, so it rides with the
+    // first piece rather than becoming an unreadable entry of its own.
+    let mut bounds: Vec<usize> = starts;
+    bounds[0] = 0;
+    bounds.push(lines.len());
+
+    // How many pieces may be joined on while trying to heal one that was cut
+    // off part-way. Small on purpose: joining is the fallback for a cut made in
+    // the wrong place, and the cuts themselves are now chosen carefully enough
+    // that it is rarely needed.
+    const JOIN_LIMIT: usize = 8;
+
+    let mut out: Vec<HurlEntry> = Vec::new();
+    let mut i = 0;
+    while i + 1 < bounds.len() {
+        let alone = lines[bounds[i]..bounds[i + 1]].concat();
+        let mut healed = None;
+        match parse_hurl_file(&alone) {
+            // A piece is cut so that it holds one whole request — response
+            // line, sections and body included — so a piece that parses on its
+            // own is taken as it stands.
+            Ok(_) => {
+                let entries = parse_hurl(&alone);
+                if !entries.is_empty() {
+                    healed = Some((entries, i + 1));
+                }
+            }
+            // Joining the next piece on can only help a piece that was cut off
+            // before it finished. An error anywhere but the last line is a
+            // fault in the text itself, and no amount of text after it will
+            // repair that — trying anyway is what made opening a large damaged
+            // file take minutes rather than moments.
+            Err(e) if e.pos.line >= alone.lines().count() => {
+                // Longest first, so a body cut in several places is put back
+                // together in one piece rather than in the first two.
+                let far = bounds.len().min(i + 1 + JOIN_LIMIT);
+                for j in (i + 2..far).rev() {
+                    let text = lines[bounds[i]..bounds[j]].concat();
+                    // Reparsing through `parse_hurl` (rather than using the
+                    // AST here) is what recovers the `# [Reports]` and
+                    // `# [Body]` blocks, which are read from the raw source and
+                    // so need line numbers belonging to the piece being parsed
+                    // rather than to the whole file.
+                    if parse_hurl_file(&text).is_ok() {
+                        let entries = parse_hurl(&text);
+                        if !entries.is_empty() {
+                            healed = Some((entries, j));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        match healed {
+            Some((entries, j)) => {
+                out.extend(entries);
+                i = j;
+            }
+            None => {
+                out.push(HurlEntry::unreadable(&alone));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The line indices where a request looks like it begins: the contiguous
+/// comment block above an HTTP method in capitals at the very start of a line,
+/// followed by a URL.
+///
+/// Deliberately shallow. This decides only where to *try* cutting; whether the
+/// cut was right is settled by parsing the result, so the rule can afford to be
+/// generous. It does insist on column zero and on capitals, which is what keeps
+/// it from firing on the indented `"GET /x"` inside a JSON body.
+///
+/// The cut is made above the comment block rather than at the method line
+/// because that block is the request's name. Cutting below it would hand every
+/// request's title to the request before it, and — where the cut lands next to
+/// a piece that could not be read — bury it in text the user is being asked to
+/// repair by hand.
+fn request_starts(lines: &[&str]) -> Vec<usize> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut in_body = false;
+    for (i, l) in lines.iter().enumerate() {
+        // Inside a multiline body every line is data, and some data reads
+        // exactly like a request: an HTTP log, a fixture, a list of routes.
+        // Cutting there tears a healthy request's body apart, and — far worse —
+        // leaves the fragments looking like requests in their own right, which
+        // a "Run All" would then dutifully send to the server. A multiline body
+        // is the only place in Hurl where arbitrary text can begin at column
+        // zero, so tracking its fences is enough to rule that out.
+        if l.trim_start().starts_with("```") {
+            in_body = !in_body;
+            continue;
+        }
+        if in_body || !looks_like_a_request_line(l) {
+            continue;
+        }
+        let floor = starts.last().map(|&p| p + 1).unwrap_or(0);
+        starts.push(title_block_top(lines, i, floor));
+    }
+    starts
+}
+
+/// Walk up from a method line over the comment block that names it, stopping at
+/// a blank line, at the previous request, or at either of PaperBoy's own
+/// comment-encoded blocks.
+///
+/// The blocks are the reason this is not a plain walk: `# [Reports]` and
+/// `# [Body]` rows belong to the request *above*, and in a file laid out by
+/// hand they can sit directly against the next method line with no blank
+/// between. Taking them would move them into the following request, where they
+/// would be read as its reports or its body. Where that is even a risk the
+/// whole walk is abandoned and the cut stays at the method line: a misplaced
+/// title is a cosmetic loss, a stolen block is a real one.
+fn title_block_top(lines: &[&str], method: usize, floor: usize) -> usize {
+    let mut top = method;
+    while top > floor {
+        let prev = lines[top - 1].trim();
+        if !prev.starts_with('#') {
+            break;
+        }
+        if is_reports_marker(prev) || parse_body_marker(prev).is_some() {
+            return method;
+        }
+        top -= 1;
+    }
+    top
+}
+
+fn looks_like_a_request_line(line: &str) -> bool {
+    let line = line.trim_end_matches(['\n', '\r']);
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let Some((method, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    // A response line is never the start of a request, however much it looks
+    // like one — cutting there would separate every request from its own
+    // response.
+    if method == "HTTP" || method.starts_with("HTTP/") {
+        return false;
+    }
+    // Hurl accepts any all-caps token as a method, so no fixed list is used —
+    // a WebDAV or custom verb has to be able to start a request too.
+    !method.is_empty()
+        && method
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '-' || c == '_')
+        && !rest.trim().is_empty()
 }
 
 /// The 1-based line number of an entry's HTTP-method line: the first
@@ -245,7 +438,7 @@ fn map_entry(
             resp.status.source_info.start.line + 1,
             first_response_anchor(resp),
         );
-        response_body = resp.body.as_ref().and_then(body_source);
+        response_body = resp.body.as_ref().and_then(|b| body_source(b, lines));
         for section in &resp.sections {
             match &section.value {
                 SectionValue::Captures(caps) => {
@@ -266,7 +459,34 @@ fn map_entry(
         .iter()
         .any(|f| f.enabled && f.kind.is_multipart());
 
+    // The body as the file carries it, and the `# [Body]` block that still
+    // describes it (if one does). A claimed block replaces the body with the
+    // text it was authored from — comments and all — and its lines are then
+    // spoken for, so neither the header scan below nor the prose-comment scan
+    // may read them again.
+    let file_body = req.body.as_ref().and_then(|b| body_source(b, lines));
+    let claimed = claim_body_block(lines, scan_start, scan_end, file_body.as_deref());
+    let claimed_range = claimed.as_ref().map(|(r, _)| r.clone());
+
+    // A claimed block sits between the headers and the body, inside the window
+    // the header scan would otherwise cover. Its lines can't currently be
+    // mistaken for disabled `# key: value` rows — JSON keys are quoted, and a
+    // quote is not a legal key start — but that is a property of another
+    // module's validation, not of this one, so bound the scan explicitly rather
+    // than rely on it.
+    let url_line = req.url.source_info.start.line;
+    let header_end = match (
+        first_anchor_after(&anchors, url_line),
+        claimed_range.as_ref().map(|r| r.start),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+
     HurlEntry {
+        // Stamped when the collection adopts these entries as its baseline.
+        uid: 0,
+        unparsed: None,
         title: title_from_span(req.source_info.start.line, lines),
         method: req.method.to_string(),
         url: req.url.to_source().to_string(),
@@ -274,18 +494,14 @@ fn map_entry(
         // structural anchor (body / section / response). Scanning them (instead
         // of reading the AST) recovers disabled rows kept as `# key: value`
         // comments; the anchor bound keeps the scan inside this request.
-        headers: scan_kv_rows(
-            lines,
-            req.url.source_info.start.line + 1,
-            first_anchor_after(&anchors, req.url.source_info.start.line),
-        ),
+        headers: scan_kv_rows(lines, url_line + 1, header_end),
         basic_auth,
         form_fields,
         is_multipart,
         queries: query_params,
         cookies,
         options,
-        body: req.body.as_ref().and_then(body_source),
+        body_src: claimed.map(|(_, text)| text).or(file_body),
         expected_status,
         response_version,
         response_headers,
@@ -297,6 +513,7 @@ fn map_entry(
             lines,
             &landmarks,
             &body_ranges,
+            claimed_range,
             scan_start,
             scan_end,
             is_first,
@@ -371,6 +588,7 @@ fn scan_comments(
     lines: &[&str],
     landmarks: &[(usize, CommentAnchor)],
     body_ranges: &[(usize, usize)],
+    body_block: Option<Range<usize>>,
     method_line: usize,
     scan_end: usize,
     is_first: bool,
@@ -543,6 +761,7 @@ fn scan_comments(
             || in_body(line_no)
             || is_disabled_row(line_no)
             || reports_block.contains(&line_no)
+            || body_block.as_ref().is_some_and(|r| r.contains(&line_no))
             || next_title.contains(&line_no)
         {
             continue;
@@ -657,17 +876,15 @@ fn uncomment(line: &str) -> (bool, &str) {
 }
 
 /// Split a `key: value` line into its trimmed key and value, requiring the key
-/// to be a plausible header/param token (starts alphanumeric, token characters
-/// only). Returns `None` for anything else.
+/// to be a name Hurl can carry. The test is
+/// [`key_problem`](crate::hurl::key_problem) — the *same* one the writer
+/// enforces, so a row that can be written can always be read back. Returns
+/// `None` for anything else, which is also what keeps an ordinary prose comment
+/// (`# see also: the docs`) from being mistaken for a disabled row.
 fn split_kv(text: &str) -> Option<(&str, &str)> {
     let colon = text.find(':')?;
     let key = text[..colon].trim();
-    let mut chars = key.chars();
-    let starts_ok = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-    let token_ok = key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if !starts_ok || !token_ok {
+    if crate::hurl::key_problem(key).is_some() {
         return None;
     }
     Some((key, text[colon + 1..].trim()))
@@ -959,16 +1176,27 @@ fn multipart_field(p: &MultipartParam) -> FormField {
     }
 }
 
-/// Render a request body back to its Hurl source form.
-fn body_source(b: &Body) -> Option<String> {
+/// Render a request or response body back to its Hurl source form.
+///
+/// `file,…;` and `base64,…;` bodies have no textual value to render, so they
+/// are recovered from the source line itself. Returning `None` for them (as
+/// this did) is indistinguishable from "this request has no body", and since
+/// [`collection_to_hurl`](super::entry::collection_to_hurl) rewrites *every*
+/// entry on every save — not just the edited one — a single save anywhere in
+/// the collection silently deleted the body line of every such request, with
+/// no parse error and no change in entry count to hint at it.
+///
+/// Both forms are a single line and carry a source span, so `source_line`
+/// gives them back verbatim and the round trip is byte-stable.
+fn body_source(b: &Body, lines: &[&str]) -> Option<String> {
     let s = match &b.value {
         Bytes::Json(v) => v.to_source().to_string(),
         Bytes::Xml(x) => x.clone(),
         Bytes::OnelineString(t) => t.to_source().to_string(),
         Bytes::MultilineString(m) => m.to_source().to_string(),
         Bytes::Hex(h) => h.to_string(),
-        // Base64 / file bodies aren't represented in HurlEntry's string body.
-        Bytes::Base64(_) | Bytes::File(_) => return None,
+        Bytes::Base64(x) => source_line(x.space0.source_info.start.line, lines)?,
+        Bytes::File(x) => source_line(x.space0.source_info.start.line, lines)?,
     };
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
@@ -1021,6 +1249,88 @@ fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, S
     reports
 }
 
+/// Find every `# [Body]` block candidate in an entry's source window, as
+/// `(claimed line range, decoded body text)`.
+///
+/// Every candidate is offered, including ones nested inside another, and the
+/// cursor advances a line at a time rather than jumping past a block it just
+/// matched. Being *well-formed* only means the count matches the lines below
+/// it; whether a block is the real one is decided later, by reconciling it
+/// against the body. A stale block whose count happens to span the good block
+/// underneath it would otherwise hide it completely — the good block would
+/// never be offered, and a request whose notes were perfectly correct would
+/// quietly stop carrying them.
+///
+/// A block whose count doesn't describe the lines below it is not a candidate
+/// at all. Its lines fall to the ordinary prose-comment scan, which round-trips
+/// them verbatim — so a damaged block degrades to exactly what a `.hurl` file
+/// did before this feature existed, and the user's notes survive even when we
+/// can no longer tell what they described.
+fn body_blocks(lines: &[&str], from: usize, to: usize) -> Vec<(Range<usize>, String)> {
+    let hi = to.min(lines.len() + 1);
+    let mut out = Vec::new();
+    for i in from..hi {
+        let Some(n) = lines
+            .get(i.wrapping_sub(1))
+            .and_then(|l| parse_body_marker(l))
+        else {
+            continue;
+        };
+        // The count comes out of a file that may have been hand-edited or
+        // badly merged, so the arithmetic is checked. Left to wrap, a count
+        // near `usize::MAX` produces a range ending before it starts, which
+        // reads as well-formed and claims nothing.
+        let Some(end) = i.checked_add(1).and_then(|e| e.checked_add(n)) else {
+            continue;
+        };
+        let well_formed = end <= hi
+            && (i + 1..end).all(|j| {
+                lines
+                    .get(j - 1)
+                    .is_some_and(|l| l.trim_start().starts_with('#'))
+            });
+        if well_formed {
+            let text = (i + 1..end)
+                .map(|j| decode_body_line(lines[j - 1]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push((i..end, text));
+        }
+    }
+    out
+}
+
+/// The `# [Body]` block that still describes `body`, if any.
+///
+/// A block is only believed when stripping its comments yields the body the
+/// file actually carries. Anything else means something other than PaperBoy
+/// edited one of the two and they no longer agree — in which case the body in
+/// the file wins (it is what runs, and what every other tool sees) and the
+/// block is left unclaimed, surviving as prose comments rather than being
+/// deleted on the user's behalf.
+///
+/// The comparison asks the writer's own question — "does this block derive the
+/// body in the file?" — by running the same `wire_body` the file was written
+/// with, rather than a stripped approximation of it. Anything less and a block
+/// that legitimately produced the body (one that commented out a last field,
+/// say, and so shed a trailing comma) would fail to reconcile and orphan every
+/// comment in it.
+///
+/// The comparison is semantic rather than byte-for-byte so that a reformat, or
+/// a re-ordering of keys, doesn't orphan every comment in the request over
+/// whitespace that changes nothing about what gets sent.
+fn claim_body_block(
+    lines: &[&str],
+    from: usize,
+    to: usize,
+    body: Option<&str>,
+) -> Option<(Range<usize>, String)> {
+    let body = body?;
+    body_blocks(lines, from, to)
+        .into_iter()
+        .find(|(_, text)| json_comments::bodies_equivalent(&json_comments::wire_body(text), body))
+}
+
 /// `true` when `line` is the `# [Reports]` block marker (leading whitespace and
 /// the comment `#` allowed, case-insensitive on the section name).
 fn is_reports_marker(line: &str) -> bool {
@@ -1053,7 +1363,11 @@ fn parse_report_row(line: &str) -> Option<(String, String)> {
 }
 
 /// Title = the `#` comment lines immediately above the request's method line
-/// (reset by a blank line), with `#` and `-`/`=` decoration stripped. The
+/// (reset by a blank line), with `#` and surrounding `-`/`=` decoration
+/// stripped — `# ---- Login ----` is titled "Login". Only the leading and
+/// trailing runs go: a hyphen or `=` *inside* the text is part of the name
+/// ("Get user-profile"), and stripping those made our own output unreadable
+/// by our own parser, permanently corrupting the name on the next save. The
 /// entry's `source_info.start` is sometimes the leading comment and sometimes
 /// the method line (depending on how `hurl_core` attaches inter-entry
 /// comments), so we first locate the method line, then scan back for its block.
@@ -1075,9 +1389,8 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
         .iter()
         .map(|l| {
             l.trim_start_matches('#')
-                .chars()
-                .filter(|c| !matches!(c, '-' | '='))
-                .collect::<String>()
+                .trim()
+                .trim_matches(|c| matches!(c, '-' | '='))
                 .trim()
                 .to_string()
         })
@@ -1098,7 +1411,10 @@ mod tests {
         // request section. The message must name the section and the fix.
         let content =
             "# Get token\nPOST http://h/oauth2\n[Captures]\naccess_token: jsonpath \"$.token\"\n";
-        assert!(parse_hurl(content).is_empty(), "this really is unparseable");
+        // Unparseable, so recovery carries it as text rather than as a
+        // request — the reason below is what tells the user why.
+        let recovered = parse_hurl(content);
+        assert!(recovered.iter().all(|e| e.is_unreadable()));
         let why = parse_hurl_error(content).expect("a reason is produced");
         assert!(
             why.contains("Captures"),
@@ -1123,9 +1439,9 @@ mod tests {
         let content = "# First\nPOST http://x/a\nContent-Type: application/json\n{\n  \"k\": \"v\"\n}\nHTTP 200\n\n# Second\nGET http://x/b\nAccept: application/json\nHTTP 200\n";
         let e = parse_hurl(content);
         assert_eq!(e.len(), 2, "the body must not swallow the second entry");
-        assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
+        assert_eq!(e[0].body_src.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
         assert_eq!(e[1].method, "GET");
-        assert!(e[1].body.is_none());
+        assert!(e[1].body_src.is_none());
     }
 
     #[test]
@@ -1160,7 +1476,7 @@ mod tests {
             e[0].headers,
             vec![("Accept".into(), "application/json".into(), true)]
         );
-        assert!(e[0].body.is_none());
+        assert!(e[0].body_src.is_none());
     }
 
     #[test]
@@ -1171,7 +1487,7 @@ mod tests {
         let e = parse_hurl(content);
         assert_eq!(e.len(), 1);
         assert!(e[0].headers.is_empty(), "the JSON body is not a header");
-        assert_eq!(e[0].body.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
+        assert_eq!(e[0].body_src.as_deref(), Some("{\n  \"k\": \"v\"\n}"));
     }
 
     #[test]
@@ -1346,7 +1662,7 @@ mod tests {
             assert_eq!(a.method, b.method);
             assert_eq!(a.url, b.url);
             assert_eq!(a.headers, b.headers);
-            assert_eq!(a.body, b.body);
+            assert_eq!(a.body_src, b.body_src);
         }
     }
 
@@ -2002,12 +2318,12 @@ mod tests {
             e[0].comments
         );
         assert!(
-            e[0].body
+            e[0].body_src
                 .as_deref()
                 .unwrap_or_default()
                 .contains("# not a comment"),
             "the body must still contain the # line: {:?}",
-            e[0].body
+            e[0].body_src
         );
     }
 
@@ -2109,7 +2425,7 @@ mod tests {
         let src = "POST http://h/a\n[Options]\nretry: 2\n```\n{\"x\":1}\n```\nHTTP 200\n";
         let e = parse_hurl(src);
         assert_eq!(e[0].options, vec![("retry".into(), "2".into(), true)]);
-        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        assert_eq!(e[0].body_src.as_deref(), Some("```\n{\"x\":1}\n```"));
         let text = e[0].to_hurl();
         assert!(
             text.find("[Options]").unwrap() < text.find("```").unwrap(),
@@ -2161,6 +2477,64 @@ mod tests {
             "the response body must follow the response sections:\n{text}"
         );
         assert_sections_round_trip(src);
+    }
+
+    /// A `file,…;` body used to come back as `None` — indistinguishable from
+    /// "no body at all" — so the next save dropped the line entirely. Because
+    /// `collection_to_hurl` rewrites *every* entry, editing any request in the
+    /// collection silently deleted the body of every file-bodied one, with no
+    /// parse error to hint at it.
+    #[test]
+    fn a_file_body_survives_a_save() {
+        let src = "POST http://h/a\nContent-Type: application/json\nfile, body.json;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].body_src.as_deref(), Some("file, body.json;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("file, body.json;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        // Idempotent: a second save must not rewrite it again.
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// The same for a `base64,…;` body, the other `Bytes` variant with no
+    /// textual value to render.
+    #[test]
+    fn a_base64_body_survives_a_save() {
+        let src = "POST http://h/a\nbase64,SGVsbG8=;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].body_src.as_deref(), Some("base64,SGVsbG8=;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("base64,SGVsbG8=;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// Expected *response* bodies read through the same helper, so they were
+    /// lost the same way.
+    #[test]
+    fn a_file_response_body_survives_a_save() {
+        let src = "POST http://h/a\n{\"a\":1}\n\nHTTP 200\nfile,expected.json;\n";
+        let e = parse_hurl(src);
+        assert_eq!(e[0].response_body.as_deref(), Some("file,expected.json;"));
+        let text = collection_to_hurl(&e);
+        assert!(text.contains("file,expected.json;"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(collection_to_hurl(&parse_hurl(&text)), text);
+    }
+
+    /// The blast radius that made this severe: a save triggered by editing one
+    /// request must not quietly empty the body of an untouched neighbour.
+    #[test]
+    fn a_file_body_is_not_lost_when_another_request_is_edited() {
+        let src = "POST http://h/a\nfile, body.json;\n\nGET http://h/b\n";
+        let mut e = parse_hurl(src);
+        e[1].url = "http://h/c".into();
+        let text = collection_to_hurl(&e);
+        assert!(
+            text.contains("file, body.json;"),
+            "the untouched request keeps its body:\n{text}"
+        );
+        assert_eq!(parse_hurl(&text).len(), 2, "\n{text}");
     }
 
     #[test]
@@ -2256,7 +2630,7 @@ mod tests {
             vec![("X-Trace".into(), "t".into(), true)]
         );
         assert_eq!(e[0].response_body.as_deref(), Some("```\n{\"id\":9}\n```"));
-        assert_eq!(e[0].body.as_deref(), Some("```\n{\"x\":1}\n```"));
+        assert_eq!(e[0].body_src.as_deref(), Some("```\n{\"x\":1}\n```"));
         assert_sections_round_trip(src);
         assert_comments_round_trip(src);
     }
@@ -2419,5 +2793,645 @@ mod tests {
             "and the line should survive as a comment: {:?}",
             back[0].comments
         );
+    }
+
+    /// The whole feature in one pass: a commented body is written as a block
+    /// plus strict JSON, and comes back as the text it was authored from.
+    #[test]
+    fn a_commented_body_survives_a_save_and_a_reload() {
+        let mut e = HurlEntry {
+            title: "t".into(),
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  // who\n  \"id\": {{user_id}} // the caller\n}";
+        e.body_src = Some(authored.into());
+
+        let text = collection_to_hurl(&[e]);
+        assert!(text.contains("# [Body] 4"), "\n{text}");
+        // What Hurl itself reads has no commentary in it.
+        assert!(
+            text.contains("{\n  \"id\": {{user_id}}\n}"),
+            "the wire body is strict JSON:\n{text}"
+        );
+
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].body_src.as_deref(), Some(authored));
+        // And the block must not also come back as prose, or it would be
+        // written twice on the next save, and again after that.
+        assert!(
+            !back[0].comments.iter().any(|c| c.text.contains("[Body]")),
+            "{:?}",
+            back[0].comments
+        );
+        assert_eq!(collection_to_hurl(&back), text, "a second save is stable");
+    }
+
+    /// The file's body is what runs and what every other tool sees, so when the
+    /// two disagree it wins — but the notes are left in the file rather than
+    /// deleted on the user's behalf.
+    #[test]
+    fn a_block_that_no_longer_describes_the_body_is_kept_as_comments() {
+        let src = "POST http://h/a\n\
+                   # [Body] 3\n\
+                   # {\n\
+                   #   \"id\": 1 // the caller\n\
+                   # }\n\
+                   {\"id\": 999}\n";
+        let e = parse_hurl(src);
+
+        assert_eq!(
+            e[0].body_src.as_deref(),
+            Some("{\"id\": 999}"),
+            "the body in the file wins"
+        );
+        let text = collection_to_hurl(&e);
+        assert!(
+            text.contains("#   \"id\": 1 // the caller"),
+            "the orphaned notes are still there:\n{text}"
+        );
+        assert!(text.contains("{\"id\": 999}"), "\n{text}");
+    }
+
+    /// Reformatting a body outside PaperBoy changes nothing about what is sent,
+    /// so it must not orphan every comment in the request.
+    #[test]
+    fn reformatting_the_body_elsewhere_does_not_orphan_the_comments() {
+        let src = "POST http://h/a\n\
+                   # [Body] 3\n\
+                   # {\n\
+                   #   \"id\": 1, // the caller\n\
+                   #   \"b\": 2\n\
+                   # }\n\
+                   {\"b\":2,\"id\":1}\n";
+        // Four lines of block content, but the marker claims three — so this
+        // also pins that a miscount is refused rather than half-claimed.
+        assert!(parse_hurl(src)[0].body_src.as_deref() == Some("{\"b\":2,\"id\":1}"));
+
+        let ok = src.replace("# [Body] 3", "# [Body] 4");
+        let e = parse_hurl(&ok);
+        assert_eq!(
+            e[0].body_src.as_deref(),
+            Some("{\n  \"id\": 1, // the caller\n  \"b\": 2\n}"),
+            "a reordered, reformatted body still matches"
+        );
+    }
+
+    /// A body may contain a line reading `[Body]`; counting lines rather than
+    /// hunting for an end marker is what stops it closing its own block.
+    #[test]
+    fn body_content_cannot_terminate_its_own_block() {
+        let mut e = HurlEntry {
+            title: "t".into(),
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  // note\n  \"a\": \"[Body] 1\"\n}";
+        e.body_src = Some(authored.into());
+
+        let text = collection_to_hurl(&[e]);
+        assert_eq!(parse_hurl(&text)[0].body_src.as_deref(), Some(authored));
+    }
+
+    /// A body with no comments must be written exactly as it always was — the
+    /// block is pure cost for the requests that don't need it.
+    #[test]
+    fn an_uncommented_body_gains_no_block() {
+        let src = "POST http://h/a\n{\"id\": 1}\n";
+        let e = parse_hurl(src);
+        let text = collection_to_hurl(&e);
+        assert!(!text.contains("[Body]"), "\n{text}");
+        assert_eq!(text, src);
+    }
+
+    /// C1, the whole file at stake: commenting out a last field leaves a comma
+    /// behind, and a body that isn't JSON used to be written out with its
+    /// comments intact. That is invalid Hurl, and because a parse failure
+    /// yields an empty collection it silently deleted every request in the
+    /// file — not just the annotated one.
+    #[test]
+    fn commenting_out_a_last_field_does_not_empty_the_collection() {
+        let mut a = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        let authored = "{\n  \"a\": 1,\n  // \"b\": 2\n}";
+        a.body_src = Some(authored.into());
+        let b = HurlEntry {
+            method: "GET".into(),
+            url: "http://h/b".into(),
+            ..Default::default()
+        };
+
+        let text = collection_to_hurl(&[a, b]);
+        assert!(parse_hurl_error(&text).is_none(), "invalid hurl:\n{text}");
+
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 2, "the other request went with it:\n{text}");
+        assert_eq!(back[0].body_src.as_deref(), Some(authored));
+        // What is sent is strict JSON: no comment, and no stranded comma.
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+    }
+
+    /// C2: the count comes from the file, so it can say anything. Unchecked, a
+    /// count near `usize::MAX` wrapped to a range ending before it began, which
+    /// looked well-formed and never advanced the cursor — the app hung on a
+    /// file stock Hurl reads as an ordinary comment.
+    #[test]
+    fn a_body_marker_claiming_the_whole_address_space_is_ignored() {
+        let text = format!(
+            "POST http://h/a\n# [Body] {}\n# {{\"a\":1}}\n{{\"a\":1}}\n",
+            usize::MAX
+        );
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        // Degrades to prose: the note survives and the body is untouched.
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\"a\":1}"));
+        assert!(collection_to_hurl(&back).contains("[Body]"));
+    }
+
+    /// C3: a hand-edit to a non-JSON body must win over the block describing
+    /// it. Comparing loosely let the stale block be claimed, and PaperBoy then
+    /// sent bytes that differed from the ones in the file.
+    #[test]
+    fn an_edit_to_a_non_json_body_beats_the_block_describing_it() {
+        let text = "POST http://h/a\n# [Body] 1\n# <a>x y</a>\n<a>x  y</a>\n";
+        let back = parse_hurl(text);
+        assert_eq!(back[0].body_wire().as_deref(), Some("<a>x  y</a>"));
+        // Unclaimed, but not deleted: the note is still in the file.
+        assert!(collection_to_hurl(&back).contains("# <a>x y</a>"));
+    }
+
+    /// M1: the file is read line-wise, which eats a `\r`, so a block written
+    /// with CRLF came back as LF and the next save wrote different bytes than
+    /// the last — a file that churns in git every time it is opened.
+    #[test]
+    fn a_body_authored_with_windows_line_endings_settles() {
+        let mut e = HurlEntry {
+            method: "POST".into(),
+            url: "http://h/a".into(),
+            ..Default::default()
+        };
+        e.body_src = Some("{\r\n  // who\r\n  \"a\": 1\r\n}".into());
+
+        let once = collection_to_hurl(&[e]);
+        let twice = collection_to_hurl(&parse_hurl(&once));
+        assert_eq!(once, twice, "not a fixed point");
+        assert!(!once.contains('\r'), "\n{once:?}");
+    }
+
+    /// The notes left behind when a block stops describing its body are found
+    /// without any stored state: a block that still reconciles is claimed by
+    /// the parser and never reaches `comments`, so anything sitting there is
+    /// stale by construction.
+    #[test]
+    fn leftover_notes_are_found_and_can_be_thrown_away() {
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #     //extra comment\n\
+                    #     \"a\": 2 // just a test\n\
+                    #\n\
+                    # }\n\
+                    {\n    \"a\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+
+        let (at, notes) = e.stale_body_notes().expect("the leftover block");
+        assert_eq!(at.len(), 5, "the marker and the four lines it claims");
+        assert_eq!(
+            notes,
+            "{\n    //extra comment\n    \"a\": 2 // just a test\n"
+        );
+        // The count says four, so `# }` is not part of the block: it is an
+        // ordinary comment that happens to sit below it.
+        assert_eq!(e.comments.len(), 6);
+
+        assert!(e.discard_body_notes());
+        assert_eq!(e.comments.len(), 1, "only the unclaimed `# }} ` is left");
+        assert_eq!(e.body_wire().as_deref(), Some("{\n    \"a\": 2\n}"));
+        assert!(e.stale_body_notes().is_none());
+    }
+
+    /// Adopting takes the notes back as the body, which changes what the
+    /// request sends — so it is never automatic, and never offered when the
+    /// notes would not survive the trip.
+    #[test]
+    fn leftover_notes_can_be_taken_back_as_the_body() {
+        let text = "POST http://h/a\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"a\": 1 // mine\n\
+                    # }\n\
+                    {\n  \"b\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_some(), "the bodies disagree");
+        assert!(e.can_adopt_body_notes());
+        assert!(e.adopt_body_notes());
+
+        assert_eq!(e.body_src.as_deref(), Some("{\n  \"a\": 1 // mine\n}"));
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"a\": 1\n}"));
+        assert!(
+            e.comments.is_empty(),
+            "the block is the body now, not prose"
+        );
+        // And it round-trips as a live block again.
+        let out = collection_to_hurl(&back);
+        assert_eq!(
+            parse_hurl(&out)[0].body_src.as_deref(),
+            Some("{\n  \"a\": 1 // mine\n}")
+        );
+    }
+
+    /// Notes that no longer strip down to JSON cannot be adopted: writing them
+    /// as a body would put comments in the file and read back as an empty
+    /// collection. Discarding is still allowed — it is the body that is at
+    /// risk, not the notes.
+    #[test]
+    fn notes_that_would_not_survive_being_a_body_cannot_be_adopted() {
+        // Four claimed lines, so the closing brace falls outside the block and
+        // what is left does not parse.
+        let text = "POST http://h/a\n\
+                    # [Body] 4\n\
+                    # {\n\
+                    #     //extra comment\n\
+                    #     \"a\": 2 // just a test\n\
+                    #\n\
+                    # }\n\
+                    {\n    \"a\": 2\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_some());
+        assert!(!e.can_adopt_body_notes(), "it would not be valid Hurl");
+        assert!(!e.adopt_body_notes());
+        assert_eq!(
+            e.body_wire().as_deref(),
+            Some("{\n    \"a\": 2\n}"),
+            "body untouched"
+        );
+    }
+
+    /// Prose that happens to carry no comments still isn't a body. Adopting it
+    /// would write text Hurl cannot parse, and a file that will not parse
+    /// reads back as *no requests at all* — so one adopt could take a whole
+    /// collection with it. The guard is "would this survive being written",
+    /// not "did the comments strip cleanly".
+    #[test]
+    fn notes_that_are_not_a_body_at_all_cannot_be_adopted() {
+        let text = "POST http://h/a\n\
+                    # [Body] 1\n\
+                    # hello world\n\
+                    {\n  \"real\": 1\n}\n\
+                    HTTP 200\n\n\
+                    GET http://h/keepme\nHTTP 200\n";
+        let mut back = parse_hurl(text);
+        assert_eq!(back.len(), 2);
+        let e = &mut back[0];
+        assert!(
+            e.stale_body_notes().is_some(),
+            "the notes are still offered"
+        );
+        assert!(!e.can_adopt_body_notes(), "prose is not a body");
+        assert!(!e.adopt_body_notes());
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"real\": 1\n}"));
+        // The whole file still loads, which is the thing actually at stake.
+        let out = collection_to_hurl(&back);
+        assert_eq!(parse_hurl(&out).len(), 2, "no request was lost");
+    }
+
+    /// A marker claiming no lines describes no body. Offering it as leftover
+    /// notes would put the indicator up for nothing, and adopting it would
+    /// replace a perfectly good body with emptiness.
+    #[test]
+    fn a_body_marker_claiming_no_lines_is_not_leftover_notes() {
+        let text = "POST http://h/a\n# [Body] 0\n{\n  \"real\": 1\n}\n";
+        let mut back = parse_hurl(text);
+        let e = &mut back[0];
+        assert!(e.stale_body_notes().is_none());
+        assert!(!e.can_adopt_body_notes());
+        assert!(!e.adopt_body_notes());
+        assert_eq!(e.body_wire().as_deref(), Some("{\n  \"real\": 1\n}"));
+    }
+
+    /// The count is read on the draw path, so a damaged one must not be able
+    /// to bring the interface down. `usize::MAX` overflowed the addition that
+    /// finds the end of the block.
+    #[test]
+    fn a_body_marker_claiming_the_whole_address_space_is_not_leftover_notes() {
+        let text = "POST http://h/a\n# [Body] 18446744073709551615\n{\n  \"a\": 1\n}\n";
+        let back = parse_hurl(text);
+        assert!(back[0].stale_body_notes().is_none());
+    }
+
+    /// A block whose count overruns the comments below it is a damaged marker,
+    /// not the end of the search — the same mistake the parser makes when a
+    /// stale block spans a good one, and just as capable of hiding notes the
+    /// user could otherwise resolve.
+    #[test]
+    fn an_overrunning_block_does_not_hide_a_well_formed_one_below_it() {
+        let text = "POST http://h/a\n\
+                    # [Body] 9\n\
+                    # {\n\
+                    #   \"old\": 1\n\
+                    # }\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"b\": 9 // note\n\
+                    # }\n\
+                    {\n  \"real\": 1\n}\n";
+        let back = parse_hurl(text);
+        let (_, notes) = back[0]
+            .stale_body_notes()
+            .expect("the well-formed block is still found");
+        assert_eq!(notes, "{\n  \"b\": 9 // note\n}");
+    }
+
+    /// Deleting a body leaves a stale block behind as prose, and writing a new
+    /// body then puts a second block in the file. The good one must still be
+    /// found: when the stale count happens to span it exactly, jumping past the
+    /// block we matched first hid the real one completely, and a request whose
+    /// notes were perfectly correct quietly stopped carrying them.
+    #[test]
+    fn a_stale_block_cannot_hide_the_good_one_beneath_it() {
+        let text = "POST http://h/a\n\
+                    # [Body] 7\n\
+                    # {\n\
+                    #   \"old\": 1\n\
+                    # }\n\
+                    # [Body] 3\n\
+                    # {\n\
+                    #   \"b\": 9 // new note\n\
+                    # }\n\
+                    {\n  \"b\": 9\n}\n";
+        let back = parse_hurl(&text);
+        assert_eq!(
+            back[0].body_src.as_deref(),
+            Some("{\n  \"b\": 9 // new note\n}"),
+            "the good block was hidden by the stale one"
+        );
+        assert_eq!(back[0].body_wire().as_deref(), Some("{\n  \"b\": 9\n}"));
+        // The stale block is still in the file, untouched.
+        assert!(collection_to_hurl(&back).contains("#   \"old\": 1"));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::hurl::collection_to_hurl;
+
+    /// The whole point: one damaged request used to cost the user every other
+    /// request in the file.
+    #[test]
+    fn a_broken_request_no_longer_takes_the_file_with_it() {
+        let text = "# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                    # three\nGET http://h/3\nHTTP 200\n";
+        assert!(
+            parse_hurl_file(text).is_err(),
+            "this really is an unparseable file"
+        );
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 3);
+        assert_eq!(es[0].url, "http://h/1");
+        assert_eq!(es[2].url, "http://h/3");
+        assert!(!es[0].is_unreadable() && !es[2].is_unreadable());
+        assert!(es[1].is_unreadable(), "only the damaged one is text");
+        assert_eq!(es[1].title, "two", "named, so it can be found again");
+    }
+
+    /// The text of what could not be read is kept exactly, and written back
+    /// out exactly. A file that opens must not be a file that has been
+    /// silently rewritten.
+    #[test]
+    fn unreadable_text_is_kept_and_written_back_unchanged() {
+        let text = "# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        let raw = es[1].unparsed.as_deref().expect("kept verbatim");
+        assert!(raw.contains("[Captures]") && raw.contains("x: jsonpath \"$.a\""));
+        let out = collection_to_hurl(&es);
+        assert!(out.contains("# two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\""));
+        // And it survives being read back in again, still as one piece.
+        let again = parse_hurl(&out);
+        assert_eq!(again.len(), 2);
+        assert!(again[1].is_unreadable());
+        assert_eq!(collection_to_hurl(&again), out, "a second save is a no-op");
+    }
+
+    /// The corruption the JSON-comments feature could produce — comments left
+    /// in a body — is exactly the shape recovery exists for.
+    #[test]
+    fn a_body_with_comments_left_in_it_costs_only_its_own_request() {
+        let text = "GET http://h/1\nHTTP 200\n\n\
+                    POST http://h/2\n{\n  \"a\": 1 // note\n}\n\n\
+                    GET http://h/3\nHTTP 200\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 3);
+        assert!(es[1].is_unreadable());
+        assert!(
+            collection_to_hurl(&es).contains("\"a\": 1 // note"),
+            "the user's own text is still there to repair"
+        );
+    }
+
+    /// The cut is a guess, so it must never be trusted on its own: a body
+    /// containing something that reads like a request line is still one
+    /// request.
+    #[test]
+    fn a_method_like_line_inside_a_body_does_not_split_a_request() {
+        let text = "POST http://h/1\n```\nGET /inside is data\n```\nHTTP 200\n\n\
+                    GET http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2, "the good request was not cut in half");
+        assert_eq!(es[0].url, "http://h/1");
+        assert!(!es[0].is_unreadable());
+        assert!(es[0].body_wire().unwrap().contains("GET /inside is data"));
+    }
+
+    /// A response line looks exactly like a request line. Cutting there would
+    /// tear every request away from its own response.
+    #[test]
+    fn a_response_line_is_not_a_place_to_cut() {
+        let text = "GET http://h/1\nHTTP 200\n[Asserts]\njsonpath \"$.a\" == 1\n\n\
+                    GET http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2);
+        assert_eq!(es[0].expected_status, Some(200));
+        assert_eq!(es[0].asserts, vec!["jsonpath \"$.a\" == 1".to_string()]);
+    }
+
+    /// Damage at either end is recovered the same way as damage in the middle.
+    #[test]
+    fn the_first_and_last_requests_are_recovered_too() {
+        let broken_first = "POST http://h/1\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                            GET http://h/2\nHTTP 200\n";
+        let es = parse_hurl(broken_first);
+        assert_eq!(es.len(), 2);
+        assert!(es[0].is_unreadable() && !es[1].is_unreadable());
+
+        let broken_last = "GET http://h/1\nHTTP 200\n\n\
+                           POST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(broken_last);
+        assert_eq!(es.len(), 2);
+        assert!(!es[0].is_unreadable() && es[1].is_unreadable());
+    }
+
+    /// A file with nothing request-shaped in it is still "not a collection",
+    /// which is how every caller recognises a file it should not have opened.
+    #[test]
+    fn text_that_is_not_a_collection_at_all_still_yields_nothing() {
+        assert!(parse_hurl("hello\nworld\n").is_empty());
+        assert!(parse_hurl("").is_empty());
+        assert!(parse_hurl("\n\n   \n").is_empty());
+        assert!(parse_hurl("# just a comment\n").is_empty());
+    }
+
+    /// Recovery may regroup text but must never invent or drop any of it.
+    #[test]
+    fn every_line_of_a_damaged_file_survives_somewhere() {
+        let text = "# banner\n\n# one\nGET http://h/1\nHTTP 200\n\n\
+                    # two\nPOST http://h/2\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+                    # three\nPUT http://h/3\n{\n  \"b\": 2\n}\nHTTP 201\n";
+        let out = collection_to_hurl(&parse_hurl(text));
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(out.contains(line), "lost {line:?} from\n{out}");
+        }
+    }
+
+    /// Damage next to a `# [Reports]` block must not move the block into the
+    /// following request, where it would be read as *its* report fields.
+    #[test]
+    fn a_reports_block_is_not_pulled_into_the_next_request() {
+        let text = "GET http://h/1\nHTTP 200\n# [Reports]\n# code: status\n\
+                    GET http://h/2\nHTTP 200\n\n\
+                    POST http://h/3\n[Captures]\nx: jsonpath \"$.a\"\n";
+        let es = parse_hurl(text);
+        let with_reports: Vec<_> = es.iter().filter(|e| !e.reports.is_empty()).collect();
+        assert_eq!(with_reports.len(), 1, "exactly one request has reports");
+        assert_eq!(with_reports[0].url, "http://h/1");
+    }
+}
+
+#[cfg(test)]
+mod recovery_hardening_tests {
+    use super::*;
+    use crate::hurl::collection_to_hurl;
+
+    /// The worst thing recovery could do is invent requests. A multiline body
+    /// full of lines that read like requests — an HTTP log, a list of routes —
+    /// must not be cut into fragments, because each fragment then looks like a
+    /// request of its own and a "Run All" would send it.
+    #[test]
+    fn a_body_full_of_request_like_lines_is_never_cut_into_requests() {
+        let mut body = String::new();
+        for k in 0..40 {
+            body.push_str(&format!("GET /orders/{k}\n"));
+        }
+        let text = format!(
+            "GET http://h/broken\n[Captures]\nx: jsonpath \"$.a\"\n\n\
+             POST http://h/bulk\n```\n{body}```\nHTTP 200\n"
+        );
+        assert!(parse_hurl_file(&text).is_err(), "the file really is broken");
+
+        let es = parse_hurl(&text);
+        assert_eq!(es.len(), 2, "one broken request and one good one: {es:#?}");
+        assert!(es[0].is_unreadable());
+        assert!(!es[1].is_unreadable());
+        assert_eq!(es[1].url, "http://h/bulk");
+        let sent = es[1].body_wire().expect("the body survived");
+        for k in 0..40 {
+            assert!(sent.contains(&format!("GET /orders/{k}")), "lost line {k}");
+        }
+        // Nothing that would be sent was invented.
+        assert!(
+            es.iter()
+                .all(|e| e.is_unreadable() || e.url.starts_with("http"))
+        );
+        // And saving it does not rewrite the body.
+        let once = collection_to_hurl(&es);
+        assert_eq!(collection_to_hurl(&parse_hurl(&once)), once, "stable");
+    }
+
+    /// Recovery runs on the thread that is drawing the interface, so the work
+    /// it does has to stay in proportion to the file. Joining pieces together
+    /// only ever helps a piece that was cut off part-way through; doing it for
+    /// every request in a large damaged file cost minutes.
+    #[test]
+    fn recovering_a_large_damaged_file_is_quick() {
+        let filler: String = (0..120)
+            .map(|i| format!("  \"key_{i}\": \"value {i}\",\n"))
+            .collect();
+        let mut text = String::new();
+        for k in 0..1500 {
+            text.push_str(&format!(
+                "POST http://h/{k}\n[Captures]\nx: jsonpath \"$.a\"\n{filler}\n"
+            ));
+        }
+        let started = std::time::Instant::now();
+        let es = parse_hurl(&text);
+        let took = started.elapsed();
+        assert_eq!(es.len(), 1500);
+        assert!(
+            took < std::time::Duration::from_secs(8),
+            "recovering a 4MB damaged file took {took:?}"
+        );
+    }
+
+    /// Recovery must attribute a comment to the same request the ordinary
+    /// parser would. A block directly above a method line is that request's
+    /// name — that is the rule everywhere else, and recovery disagreeing with
+    /// it would move names around as a file was repaired.
+    #[test]
+    fn a_comment_above_a_method_line_names_the_same_request_either_way() {
+        let healthy = "GET http://h/1\nHTTP 200\n# note\nPOST http://h/2\nHTTP 200\n";
+        let healthy = parse_hurl(healthy);
+        assert_eq!(healthy[1].title, "note", "the ordinary parser's rule");
+
+        let broken = "GET http://h/1\n[Captures]\nx: jsonpath \"$.a\"\n\
+                      # note\nPOST http://h/2\nHTTP 200\n";
+        let broken = parse_hurl(broken);
+        assert!(broken[0].is_unreadable());
+        assert_eq!(broken[1].title, "note", "recovery follows the same rule");
+    }
+
+    /// A fenced body that swallows what follows it must still be recoverable:
+    /// the piece is cut off rather than faulty, so joining the next piece on is
+    /// exactly the case joining exists for.
+    #[test]
+    fn a_body_cut_off_by_a_damaged_fence_is_still_recovered() {
+        let text = "POST http://h/1\n```\nGET /a\nGET /b\n```\nHTTP 200\n\n\
+                    GET http://h/2\nHTTP 200\n";
+        let es = parse_hurl(text);
+        assert_eq!(es.len(), 2);
+        assert!(es.iter().all(|e| !e.is_unreadable()));
+        assert_eq!(es[1].url, "http://h/2");
+    }
+
+    /// Regression: `-` and `=` are stripped only as surrounding decoration.
+    /// Stripping them everywhere meant our own serializer wrote a name our own
+    /// parser could not read back, so "Get user-profile" became "Get
+    /// userprofile" on load and was written back that way on the next save.
+    #[test]
+    fn a_hyphen_or_equals_inside_a_title_survives_a_round_trip() {
+        let entry =
+            HurlEntry::from_fields("Get user-profile v2=beta", "GET", "http://h/x", vec![], "");
+        let text = collection_to_hurl(&[entry]);
+        let back = parse_hurl(&text);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].title, "Get user-profile v2=beta");
+    }
+
+    /// ...while a banner drawn around a name is still decoration, and goes.
+    #[test]
+    fn a_banner_around_a_title_is_still_stripped() {
+        let entries = parse_hurl("# ==== Login ====\nGET http://h/x\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Login");
     }
 }

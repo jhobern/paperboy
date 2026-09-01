@@ -48,6 +48,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_empty_body,
         lbl_no_headers,
         lbl_no_assertions,
+        lbl_unsent,
         lbl_body,
         lbl_headers,
         lbl_asserts,
@@ -64,6 +65,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_empty_body,
             s.gui_no_headers,
             s.gui_no_assertions,
+            s.no_response_yet,
             s.gui_sec_body,
             s.gui_sec_headers,
             s.gui_sec_asserts,
@@ -72,6 +74,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     // See `selected_response`: the panel follows the selection, not the wire.
     let (shown, loading) = selected_response(&app.session, app.active_ci());
+    // Whether this request has a response *at all*, as opposed to a response
+    // that happens to be empty. Without the distinction each section falls back
+    // to its own "there is nothing here" note — "(empty body)", "(no headers)",
+    // "(no assertions)" — and every one of those is a claim about a reply that
+    // was never received. A request that has not been sent would report that the
+    // server returned no body, which is exactly backwards: the reader is being
+    // told the result of a request rather than that there isn't one yet.
+    let sent = shown.is_some();
     let (status, status_text, body, error, headers, asserts, duration) = match shown {
         Some(r) => (
             r.status,
@@ -174,7 +184,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| match app.response_section {
             ResponseSection::Body => {
-                if body.is_empty() {
+                if !sent {
+                    ui.colored_label(theme.dim, lbl_unsent);
+                } else if body.is_empty() {
                     ui.colored_label(theme.dim, lbl_empty_body);
                 } else {
                     let mut text = if app.response_compact {
@@ -192,7 +204,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 }
             }
             ResponseSection::Headers => {
-                if headers.is_empty() {
+                if !sent {
+                    ui.colored_label(theme.dim, lbl_unsent);
+                } else if headers.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_headers);
                 } else {
                     egui::Grid::new("resp_headers")
@@ -209,7 +223,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 }
             }
             ResponseSection::Asserts => {
-                if asserts.is_empty() {
+                if !sent {
+                    ui.colored_label(theme.dim, lbl_unsent);
+                } else if asserts.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_assertions);
                 } else {
                     for a in &asserts {
@@ -342,5 +358,108 @@ mod tests {
         let (shown, loading) = selected_response(&session, 0);
         assert!(shown.is_none());
         assert!(!loading);
+    }
+}
+
+#[cfg(test)]
+mod unsent_tests {
+    use super::*;
+    use crate::collection::Collection;
+    use crate::gui::app::GuiApp;
+    use crate::hurl::HurlEntry;
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// Draw the response panel and read back every string it painted. A real
+    /// screen rect matters: the sections live in a `ScrollArea`, which culls
+    /// anything it believes is offscreen.
+    fn draw(app: &mut GuiApp, section: ResponseSection) -> Vec<String> {
+        app.response_section = section;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(700.0, 600.0),
+        ));
+        let out = ctx.run_ui(input, |panel| super::ui(app, panel));
+        painted_text(&out.shapes)
+    }
+
+    fn app_with(response: Option<ApiResponse>) -> GuiApp {
+        let mut e = HurlEntry {
+            title: "First".to_string(),
+            ..Default::default()
+        };
+        e.last_response = response;
+        let mut session = Session::default();
+        session.collections.clear();
+        session
+            .collections
+            .push(Collection::new("api".to_string(), vec![e]));
+        GuiApp::for_test(session)
+    }
+
+    /// A request that has never been sent has no response to describe, so the
+    /// panel must say that rather than describing one. Every section had its
+    /// own "nothing here" note and every one of them read as a *result*:
+    /// "(empty body)" claims the server answered and sent nothing back.
+    #[test]
+    fn an_unsent_request_says_so_in_every_section() {
+        let mut app = app_with(None);
+        let unsent = app.strings.no_response_yet.to_string();
+        let empty_body = app.strings.gui_empty_body.to_string();
+        let no_headers = app.strings.gui_no_headers.to_string();
+        let no_asserts = app.strings.gui_no_assertions.to_string();
+
+        for (name, section) in [
+            ("body", ResponseSection::Body),
+            ("headers", ResponseSection::Headers),
+            ("asserts", ResponseSection::Asserts),
+        ] {
+            let painted = draw(&mut app, section);
+            assert!(
+                painted.contains(&unsent),
+                "{name}: expected the not-sent-yet note, got {painted:?}"
+            );
+            for lie in [&empty_body, &no_headers, &no_asserts] {
+                assert!(
+                    !painted.contains(lie),
+                    "{name}: {lie:?} describes a reply that never arrived: {painted:?}"
+                );
+            }
+        }
+    }
+
+    /// The other half: a request that *was* sent and genuinely came back with
+    /// nothing must still say so. The fix must not swallow the real empty case.
+    #[test]
+    fn a_sent_request_with_an_empty_body_still_says_the_body_was_empty() {
+        let mut app = app_with(Some(ApiResponse {
+            status: 204,
+            body: std::sync::Arc::from(""),
+            ..Default::default()
+        }));
+        let painted = draw(&mut app, ResponseSection::Body);
+        assert!(
+            painted.contains(&app.strings.gui_empty_body.to_string()),
+            "204 really did return no body: {painted:?}"
+        );
+        assert!(
+            !painted.contains(&app.strings.no_response_yet.to_string()),
+            "but it was sent, so the not-sent note would now be the lie: {painted:?}"
+        );
     }
 }

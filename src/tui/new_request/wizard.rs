@@ -279,6 +279,12 @@ pub(crate) enum NewField {
     Target,
     Method,
     Url,
+    /// The section-view tab bar itself. Focusing the bar (rather than diving
+    /// straight into the section) is what lets `[`/`]` keep cycling: landing
+    /// inside a text cell — the Body especially — would otherwise mean the very
+    /// next bracket got typed into it instead of moving on. Down/Enter steps
+    /// into the section proper.
+    TabBar,
     /// A focused cell of one of the three identical Headers/Cookies/Queries
     /// sections (which one is carried by the [`KvdKind`]).
     Kvd(KvdKind, usize, HdrCol),
@@ -304,7 +310,11 @@ impl NewField {
     /// section for navigation-confinement purposes.
     pub(crate) fn wizard_section(self) -> Option<WizardTab> {
         match self {
-            NewField::Name | NewField::Target | NewField::Method | NewField::Url => None,
+            NewField::Name
+            | NewField::Target
+            | NewField::Method
+            | NewField::Url
+            | NewField::TabBar => None,
             NewField::Kvd(kind, ..) => Some(kind.wizard_tab()),
             NewField::AddKvd(kind) => Some(kind.wizard_tab()),
             NewField::FormField(..) | NewField::AddFormField => Some(WizardTab::Form),
@@ -411,6 +421,15 @@ const KEY_DROPDOWN: u64 = 1;
 const CTYPE_DROPDOWN: u64 = 2;
 
 /// In-progress New Request / Edit Request form (an overlay while open).
+/// The choices on the wizard's "unsaved changes" prompt, in display order.
+/// Save first (the likeliest intent when Esc was a mistake), then the
+/// destructive option, then the way back — which is also the default, so
+/// Enter on reflex costs nothing.
+pub(crate) const WIZARD_DISCARD_SAVE: usize = 0;
+pub(crate) const WIZARD_DISCARD_DISCARD: usize = 1;
+pub(crate) const WIZARD_DISCARD_CHOICES: usize = 3;
+pub(crate) const WIZARD_DISCARD_DEFAULT: usize = 2;
+
 pub(crate) struct NewReq {
     pub(crate) name: Editor,
     pub(crate) url: Editor,
@@ -511,6 +530,27 @@ pub(crate) struct NewReq {
     /// `Ctrl+Shift+Left/Right`, mirroring how collection tabs are
     /// reordered); `All` is always pinned first and can never move.
     pub(crate) tab_order: Vec<WizardTab>,
+    /// [`content_signature`](Self::content_signature) as it was when the
+    /// wizard opened, so Esc can tell an abandoned form from an edited one and
+    /// only interrupt for the latter.
+    pub(crate) opened_signature: String,
+    /// The "discard your changes?" prompt, when it is open, holding the index
+    /// of the highlighted choice. Like [`ExtractPrompt`] this is a modal over
+    /// the wizard rather than another dropdown — while it is open every key
+    /// belongs to it — but it lives on `NewReq` instead of becoming an
+    /// [`Overlay::Confirm`](crate::tui::app::Overlay) because the whole point
+    /// is to keep the half-finished form alive behind it.
+    pub(crate) confirm_discard: Option<usize>,
+    /// The edited request kept its status check in `[Asserts]` (under an
+    /// `HTTP *` response line) rather than on the response line itself.
+    ///
+    /// Both spellings mean the same thing, and the wizard shows either as a
+    /// `status == <code>` row, so on save it can't tell them apart by looking
+    /// at the rows. Without remembering, saving a request that used the
+    /// `[Asserts]` form — even with nothing changed — moved the check onto the
+    /// `HTTP` line and marked the request modified: a rewrite the user never
+    /// asked for. A request opened this way keeps it where it was.
+    pub(crate) status_in_asserts: bool,
 }
 
 /// The "extract to parameter" prompt: a modal over the wizard that names the
@@ -634,6 +674,38 @@ impl NewReq {
             .collect()
     }
 
+    /// Whether a section-view tab holds anything the user has typed, read live
+    /// from the editors so the tab bar reacts as a row is filled in.
+    ///
+    /// The tab bar is how the wizard's ten sections are navigated, and its
+    /// labels alone say nothing about which ones are populated: with focus in
+    /// Body there is no way to tell that Headers has three rows and Asserts is
+    /// empty without visiting them, or switching to the "All" tab to see
+    /// everything stacked. The bar shades the tabs that answer "yes" here (see
+    /// `draw_wizard_tab_bar`), which is the same affordance Postman's green dot
+    /// on Params/Headers/Body provides.
+    ///
+    /// "All" is never marked: it shows every section, so it is populated
+    /// whenever anything else is and the mark would carry no information.
+    /// Blank rows don't count — a section the user tabbed through but never
+    /// filled in has no content, which is exactly what
+    /// [`KvdSection::is_blank`] and the row-level `is_blank` helpers already
+    /// mean everywhere else in the wizard.
+    pub(crate) fn tab_has_content(&self, tab: WizardTab) -> bool {
+        match tab {
+            WizardTab::All => false,
+            WizardTab::Headers => !self.headers.is_blank(),
+            WizardTab::Cookies => !self.cookies.is_blank(),
+            WizardTab::Queries => !self.queries.is_blank(),
+            WizardTab::Options => !self.options.is_blank(),
+            WizardTab::Form => self.form_fields.iter().any(|r| !r.is_blank()),
+            WizardTab::Body => !self.body.text().trim().is_empty(),
+            WizardTab::Asserts => self.asserts.iter().any(|r| !r.is_blank()),
+            WizardTab::Captures => self.captures.iter().any(|r| !r.is_blank()),
+            WizardTab::Reports => self.reports.iter().any(|r| !r.is_blank()),
+        }
+    }
+
     /// The parameters this request declares — the names of its enabled
     /// `[Options] variable: NAME=value` rows, read live from the editors so the
     /// section band updates as the row is typed.
@@ -646,6 +718,116 @@ impl NewReq {
                     .map(|(name, _)| name)
             })
             .collect()
+    }
+
+    /// A fingerprint of everything the user can type into the wizard.
+    ///
+    /// Compared against [`opened_signature`](Self::opened_signature) to decide
+    /// whether Esc should ask before throwing the form away. Deliberately built
+    /// from the *content* fields only: focus, scroll offsets, the active tab,
+    /// tab order and the transient dropdown state all change constantly while
+    /// someone reads a form without editing it, and treating those as edits
+    /// would make the prompt fire on every Esc and train the user to dismiss it
+    /// unread.
+    ///
+    /// Values are joined with control characters no cell can contain (see
+    /// [`value_problem`](crate::hurl::value_problem), which refuses tabs and
+    /// newlines in a row value), so no combination of typed text can forge a
+    /// separator and make two different forms share a signature.
+    pub(crate) fn content_signature(&self) -> String {
+        use std::fmt::Write as _;
+        // Unit separator between fields, record separator between rows.
+        const F: char = '\x1f';
+        const R: char = '\x1e';
+        let mut sig = String::new();
+        let _ = write!(
+            sig,
+            "{}{F}{}{F}{}{F}{}{F}{}",
+            self.method_idx,
+            self.target_idx,
+            self.name.text(),
+            self.url.text(),
+            self.body.text()
+        );
+        for kind in KvdKind::ALL {
+            sig.push(R);
+            for row in &self.kvd(kind).rows {
+                let _ = write!(
+                    sig,
+                    "{F}{}{F}{}{F}{}{F}{}",
+                    row.key.text(),
+                    row.value.text(),
+                    row.desc.text(),
+                    row.enabled
+                );
+            }
+        }
+        sig.push(R);
+        for row in &self.form_fields {
+            let _ = write!(
+                sig,
+                "{F}{}{F}{}{F}{}{F}{}{F}{}{F}{:?}{F}{}",
+                row.key.text(),
+                row.value.text(),
+                row.ctype.text(),
+                row.base64_prefix.text(),
+                row.desc.text(),
+                row.kind,
+                row.enabled
+            );
+        }
+        sig.push(R);
+        for row in &self.asserts {
+            let _ = write!(sig, "{F}{}", row.expr.text());
+        }
+        sig.push(R);
+        for row in &self.captures {
+            let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
+        }
+        sig.push(R);
+        for row in &self.reports {
+            let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
+        }
+        sig
+    }
+
+    /// What stops this form being saved, if anything: the cell to focus, the
+    /// section tab to reveal it on, and the status explaining why.
+    ///
+    /// Shared by F2 and by the Save choice on the discard prompt, so closing
+    /// the wizard with Esc can't slip a request past the checks that a normal
+    /// save enforces.
+    pub(crate) fn save_blocker(&self) -> Option<(NewField, WizardTab, crate::i18n::Status)> {
+        // A request can't be saved without a URL — that's the one field
+        // `submit_new_request` bails on, silently discarding everything else
+        // the user typed. Every other section is either dropped-if-empty or
+        // stored as-is and only checked at run time.
+        if self.url.text().trim().is_empty() {
+            return Some((
+                NewField::Url,
+                WizardTab::All,
+                crate::i18n::Status::NewRequestUrlRequired,
+            ));
+        }
+        self.first_unwritable_row().map(|(field, status)| {
+            (
+                field,
+                field.wizard_section().unwrap_or(WizardTab::All),
+                status,
+            )
+        })
+    }
+
+    /// Whether anything has been typed since the wizard opened.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.content_signature() != self.opened_signature
+    }
+
+    /// Record the current content as the baseline, so what is on screen now
+    /// counts as "unchanged". Called once each constructor has built the form.
+    fn seal(mut self) -> Self {
+        self.opened_signature = self.content_signature();
+        self
     }
 
     pub(crate) fn new(
@@ -694,6 +876,30 @@ impl NewReq {
             editing: None,
             view_tab: WizardTab::All,
             tab_order: WizardTab::ALL.to_vec(),
+            opened_signature: String::new(),
+            confirm_discard: None,
+            status_in_asserts: false,
+        }
+        .seal()
+    }
+
+    /// Whether `field` addresses a cell that currently exists.
+    ///
+    /// Focus is a *position*, and the row-bearing positions carry an index
+    /// into a `Vec` that later key handlers index directly. A mouse hit is
+    /// resolved against the rects of the last frame drawn, so a keystroke
+    /// that shrinks a section (deleting a row) between the draw and the click
+    /// can otherwise land focus past the end — and the next keystroke panics.
+    /// Every route that sets focus from outside the wizard's own navigation
+    /// checks here first.
+    pub(crate) fn field_exists(&self, field: NewField) -> bool {
+        match field {
+            NewField::Kvd(kind, i, _) => i < self.kvd(kind).rows.len(),
+            NewField::FormField(i, _) => i < self.form_fields.len(),
+            NewField::Assert(i) => i < self.asserts.len(),
+            NewField::Capture(i, _) => i < self.captures.len(),
+            NewField::Report(i, _) => i < self.reports.len(),
+            _ => true,
         }
     }
 
@@ -803,7 +1009,7 @@ impl NewReq {
             queries,
             options,
             form_fields,
-            body: Editor::new(entry.body.as_deref().unwrap_or(""), true),
+            body: Editor::new(entry.body_src.as_deref().unwrap_or(""), true),
             asserts,
             captures,
             reports,
@@ -835,7 +1041,11 @@ impl NewReq {
             editing: Some((ci, ei)),
             view_tab: WizardTab::All,
             tab_order: WizardTab::ALL.to_vec(),
+            opened_signature: String::new(),
+            confirm_discard: None,
+            status_in_asserts: entry.expected_status.is_none(),
         }
+        .seal()
     }
 
     /// Display name of the currently selected target collection.
@@ -1065,6 +1275,7 @@ impl NewReq {
             NewField::Report(i, col) => self.reports.get_mut(i).map(|r| r.cell_mut(col)),
             NewField::Method
             | NewField::Target
+            | NewField::TabBar
             | NewField::AddKvd(KvdKind::Header)
             | NewField::AddKvd(KvdKind::Cookie)
             | NewField::AddKvd(KvdKind::Query)
@@ -1327,6 +1538,13 @@ impl NewReq {
     }
 
     pub(crate) fn focus_next(&mut self, forward: bool, wrap: bool) {
+        // Moving forward off the tab bar means "into the section the bar is
+        // showing", which isn't necessarily the next stop in document order
+        // once a single section is on view.
+        if forward && self.focus == NewField::TabBar {
+            self.focus = self.first_field_of(self.view_tab);
+            return;
+        }
         self.focus = if forward {
             self.next_forward(wrap)
         } else {
@@ -1384,6 +1602,11 @@ impl NewReq {
             NewField::Target => (1, 0, 0),
             NewField::Method => (2, 0, 0),
             NewField::Url => (3, 0, 0),
+            // Deliberately *not* a Tab stop (it isn't in `tab_stops`) — walking
+            // the form with Tab shouldn't have to pass through the bar. The
+            // ordering key still places it between Url and the first section so
+            // that stepping *off* the bar with Shift+Tab lands on Url.
+            NewField::TabBar => (3, 1, 0),
             NewField::Kvd(KvdKind::Header, i, c) => (4, i, hdr(c)),
             NewField::AddKvd(KvdKind::Header) => (4, usize::MAX, 0),
             NewField::Kvd(KvdKind::Cookie, i, c) => (5, i, hdr(c)),
@@ -1404,6 +1627,67 @@ impl NewReq {
         }
     }
 
+    /// The first Headers/Cookies/Queries/Options/Form row the Hurl format can't
+    /// carry, as the cell to focus and the status explaining why.
+    ///
+    /// Such a row serialises to a line Hurl can't read back as a `key: value`
+    /// pair — at worst one it reads as a section header or splits in two — and
+    /// a Hurl file that doesn't parse yields *no* entries at all, so saving one
+    /// would cost the user every request in the collection on the next load.
+    /// Disabled rows are checked too: they go out commented and are harmless
+    /// right now, but a single keypress re-enables them, and by then the wizard
+    /// is long closed.
+    pub(crate) fn first_unwritable_row(&self) -> Option<(NewField, crate::i18n::Status)> {
+        use crate::hurl::KeyProblem;
+        use crate::i18n::Status;
+        fn problem(key: &str, value: &str) -> Option<Status> {
+            let key = key.trim();
+            match crate::hurl::key_problem(key) {
+                Some(KeyProblem::Empty) => return Some(Status::NewRequestKeyEmpty),
+                Some(KeyProblem::LeadingBracket) => {
+                    return Some(Status::NewRequestBracketKey(key.to_string()));
+                }
+                Some(KeyProblem::Char(c)) => {
+                    return Some(Status::NewRequestKeyChar(key.to_string(), c));
+                }
+                None => {}
+            }
+            crate::hurl::value_problem(value)
+                .map(|c| Status::NewRequestValueChar(key.to_string(), c))
+        }
+
+        for kind in KvdKind::ALL {
+            for (i, row) in self.kvd(kind).rows.iter().enumerate() {
+                // A wholly blank row is the wizard's own placeholder, not
+                // something the user asked to save — `submit_new_request`
+                // drops it. Only a row with something in it is judged.
+                if row.key.text().trim().is_empty() && row.value.text().trim().is_empty() {
+                    continue;
+                }
+                if let Some(st) = problem(&row.key.text(), &row.value.text()) {
+                    return Some((kind.field(i, HdrCol::Key), st));
+                }
+            }
+        }
+        for (i, row) in self.form_fields.iter().enumerate() {
+            if row.key.text().trim().is_empty() && row.value.text().trim().is_empty() {
+                continue;
+            }
+            // Only a Text field's value is judged: a File row's value is a path,
+            // and the serializer escapes those itself.
+            let value = row.value.text();
+            let value = if row.kind == FormFieldKind::Text {
+                value.as_str()
+            } else {
+                ""
+            };
+            if let Some(st) = problem(&row.key.text(), value) {
+                return Some((NewField::FormField(i, FormCol::Key), st));
+            }
+        }
+        None
+    }
+
     /// The ordered list of fields Tab / Shift+Tab visits, in visual order,
     /// given the current form state. A section that is entirely blank
     /// contributes a single "entry" stop (its first row, or its "+ Add …"
@@ -1412,12 +1696,17 @@ impl NewReq {
     /// `next_forward`/`next_backward` are just steps along this one list,
     /// they can never disagree about ordering or empty-section skipping.
     fn tab_stops(&self) -> Vec<NewField> {
-        let mut v = vec![
-            NewField::Name,
-            NewField::Target,
-            NewField::Method,
-            NewField::Url,
-        ];
+        let mut v = vec![NewField::Name];
+        // The target-collection cycler is only *drawn* for a brand-new request
+        // (see `draw_new_request`) — when editing, the request already belongs
+        // to a collection. Leaving it in the stop list anyway parked the focus
+        // on a row that renders nothing, so the cursor appeared to vanish and
+        // Down had to be pressed twice to reach Method.
+        if self.editing.is_none() {
+            v.push(NewField::Target);
+        }
+        v.push(NewField::Method);
+        v.push(NewField::Url);
         for kind in KvdKind::ALL {
             if self.kvd_blank(kind) {
                 v.push(self.kvd_entry(kind));
@@ -1515,6 +1804,9 @@ impl NewReq {
             NewField::Name | NewField::Target | NewField::Method | NewField::Url => {
                 self.next_forward(true)
             }
+            // From the bar, the "next section" is whatever the bar is sitting
+            // on — step into it rather than past it.
+            NewField::TabBar => self.first_field_of(self.view_tab),
             NewField::Kvd(KvdKind::Header, ..) | NewField::AddKvd(KvdKind::Header) => {
                 self.kvd_entry(KvdKind::Cookie)
             }
@@ -1543,7 +1835,9 @@ impl NewReq {
             // Wrapping backward past the first field lands on the last section,
             // matching jump_forward's `Report -> Name` wrap.
             NewField::Name => self.report_entry(),
-            NewField::Target | NewField::Method | NewField::Url => self.next_backward(true),
+            NewField::Target | NewField::Method | NewField::Url | NewField::TabBar => {
+                self.next_backward(true)
+            }
             NewField::Kvd(KvdKind::Header, ..) | NewField::AddKvd(KvdKind::Header) => NewField::Url,
             NewField::Kvd(KvdKind::Cookie, ..) | NewField::AddKvd(KvdKind::Cookie) => {
                 self.kvd_entry(KvdKind::Header)
@@ -1586,6 +1880,9 @@ impl NewReq {
     /// tab-cycling shortcuts.
     pub(crate) fn focus_is_text_entry(&self) -> bool {
         match self.focus {
+            // The tab bar is emphatically not a text cell — that is the whole
+            // point of it, so `[`/`]` keep cycling from there.
+            NewField::TabBar => false,
             NewField::Name | NewField::Url | NewField::Body => true,
             NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
@@ -1632,9 +1929,13 @@ impl NewReq {
             (idx + len - 1) % len
         };
         self.view_tab = self.tab_order[next];
-        if self.view_tab != WizardTab::All {
-            self.focus = self.first_field_of(self.view_tab);
-        }
+        // Focus the bar, not the section. Diving into the section's first field
+        // put the cursor inside a text cell for Body (and for any section whose
+        // first row is a text cell), so the next `[`/`]` was typed rather than
+        // cycling — the keys stopped working exactly where a user is most
+        // likely to keep pressing them. Down or Enter steps in when they're
+        // ready.
+        self.focus = NewField::TabBar;
     }
 
     /// Ctrl+Shift+Left/Right: reorder the active tab within `tab_order`,
@@ -1935,6 +2236,16 @@ pub(crate) fn draw_new_request_with_hits(
     let h = 36u16.min(f.area().height);
     let area = centered_rect(w, h, f.area());
     f.render_widget(Clear, area);
+    // The wizard's shortcut hint sits on the *bottom* border, like every other
+    // dialog in the app (see `panel_hinted`): keys belong on the frame, and the
+    // one place users have learned to look for them is the bottom edge. It used
+    // to be appended to the title, which put the wizard's keys somewhere no
+    // other panel keeps them.
+    //
+    // Built as parts rather than one string so `fit_border_hint` can drop whole
+    // items off the end on a narrow terminal instead of letting ratatui clip
+    // the last one mid-word.
+    //
     // Drop the Ctrl+Enter submit shortcut from the hint on terminals that can't
     // report it distinctly (F2 stays as the universal trigger).
     let hint_str = if form.editing.is_some() {
@@ -1942,11 +2253,11 @@ pub(crate) fn draw_new_request_with_hits(
     } else {
         s.new_request_hint
     };
-    let mut hint = if enhanced {
+    let mut parts: Vec<String> = vec![if enhanced {
         hint_str.to_string()
     } else {
         hint_str.replace(&format!("{}/F2", s.ctrl_enter_key), "F2")
-    };
+    }];
     // Contextual addition: only shown while a `File`- or `Base64 File`-kind
     // Form row's Value cell is focused (both pick a file), so the
     // always-visible hint bar stays short otherwise.
@@ -1957,7 +2268,7 @@ pub(crate) fn draw_new_request_with_hits(
             .map(|r| r.kind)
             .is_some_and(|v| v.is_multipart())
     {
-        hint = format!("{hint} · {}", s.hint_pick_file);
+        parts.push(s.hint_pick_file.to_string());
     }
     // Contextual addition: only shown while focus is on an existing
     // Header/Cookie/Form row (the row kinds that actually have an enabled
@@ -1974,7 +2285,7 @@ pub(crate) fn draw_new_request_with_hits(
         NewField::FormField(i, _) if i < form.form_fields.len()
     );
     if on_toggleable_row {
-        hint = format!("{hint} · {}", s.hint_toggle_enabled);
+        parts.push(s.hint_toggle_enabled.to_string());
     }
     // Contextual addition: only shown while focus is on an existing
     // Header/Cookie/Form/Assert/Capture row, so users can discover the
@@ -1990,14 +2301,14 @@ pub(crate) fn draw_new_request_with_hits(
             NewField::Capture(i, _) if i < form.captures.len()
         );
     if on_deletable_row {
-        hint = format!("{hint} · {}", s.hint_delete_row);
+        parts.push(s.hint_delete_row.to_string());
     }
     // Contextual addition: only where there is something to extract, i.e. on a
     // text cell that holds a value. Extracting is the one way to declare a
     // parameter without knowing the `variable:` syntax, so it has to be
     // findable from the field it applies to rather than only in the docs.
     if form.extractable_hint() {
-        hint = format!("{hint} · {}", s.hint_extract_parameter);
+        parts.push(s.hint_extract_parameter.to_string());
     }
     // Contextual addition: only in the Options section, where the way to
     // declare a report-steerable parameter is a `variable:` row and there is
@@ -2005,15 +2316,15 @@ pub(crate) fn draw_new_request_with_hits(
     if matches!(form.focus, NewField::Kvd(KvdKind::Options, ..))
         || form.focus == KvdKind::Options.add_field()
     {
-        hint = format!("{hint} · {}", s.hint_declare_parameter);
+        parts.push(s.hint_declare_parameter.to_string());
     }
     let title_text = if form.editing.is_some() {
         s.edit_request
     } else {
         s.new_request
     };
-    let title = format!("{}   ({})", title_text, hint);
-    let block = panel(title, true, th);
+    let hint = fit_border_hint(&parts, " \u{b7} ", area.width);
+    let block = panel_hinted(title_text.to_string(), &hint, th);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2112,7 +2423,16 @@ pub(crate) fn draw_new_request_with_hits(
             MouseHitTarget::NewRequestField(NewField::Url),
         );
     }
-    draw_wizard_tab_bar(f, rows[4], form.view_tab, &form.tab_order, s, th);
+    draw_wizard_tab_bar(
+        f,
+        rows[4],
+        form,
+        form.view_tab,
+        &form.tab_order,
+        form.focus == NewField::TabBar,
+        s,
+        th,
+    );
     if let Some(app) = app {
         register_wizard_tab_hits(app, rows[4], &form.tab_order, s);
     }
@@ -2261,6 +2581,22 @@ pub(crate) fn draw_new_request_with_hits(
     draw_kind_dropdown(f, form, s, th, app);
     draw_content_type_dropdown(f, form, s, th, app);
     draw_extract_prompt(f, form, s, th);
+    // Last of all: the discard prompt is the outermost modal, so it must cover
+    // the dropdowns and the extract prompt too.
+    if let Some(sel) = form.confirm_discard {
+        crate::tui::draw::draw_confirm_popup(
+            f,
+            s.wizard_discard_q,
+            &[
+                s.wizard_discard_save,
+                s.wizard_discard_discard,
+                s.wizard_discard_cancel,
+            ],
+            sel,
+            th,
+            None,
+        );
+    }
 }
 
 fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &Strings) {
@@ -2289,8 +2625,10 @@ fn register_wizard_tab_hits(app: &TuiApp, area: Rect, order: &[WizardTab], s: &S
 fn draw_wizard_tab_bar(
     f: &mut Frame,
     area: Rect,
+    form: &NewReq,
     active: WizardTab,
     order: &[WizardTab],
+    bar_focused: bool,
     s: &Strings,
     th: &Theme,
 ) {
@@ -2300,11 +2638,29 @@ fn draw_wizard_tab_bar(
             spans.push(Span::styled(" ", Style::default().fg(th.dim)));
         }
         let is_active = *tab == active;
-        let style = if is_active {
+        // The bar is a focus stop of its own (see `NewField::TabBar`), so the
+        // active tab has two looks: highlighted-and-underlined when the bar
+        // itself holds the cursor, plain highlight when focus has moved on into
+        // the section. Without the distinction there'd be nothing on screen to
+        // say where the arrow keys will go next.
+        let style = if is_active && bar_focused {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if is_active {
             Style::default()
                 .fg(th.bg)
                 .bg(th.accent)
                 .add_modifier(Modifier::BOLD)
+        } else if form.tab_has_content(*tab) {
+            // A section with something in it reads as a filled surface rather
+            // than a dim label: the tab bar is the only view of the other nine
+            // sections while one is open, and without this nothing on screen
+            // says which of them are populated (see `NewReq::tab_has_content`).
+            // A background rather than a badge character, so the marking costs
+            // no width -- the bar already has ten labels to fit.
+            Style::default().fg(th.text).bg(th.line)
         } else {
             Style::default().fg(th.dim)
         };

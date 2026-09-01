@@ -110,6 +110,7 @@ impl EntryRunner for DryRunner {
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
             entries: vec![EntryOutcome {
+                entry_index: 0,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 0,
@@ -1581,7 +1582,7 @@ fn apply_override(
 
     match target {
         OverrideTarget::Url => entry.url = value,
-        OverrideTarget::Body => entry.body = Some(value),
+        OverrideTarget::Body => entry.body_src = Some(value),
         OverrideTarget::Header(k) => upsert(&mut entry.headers, k, value),
         OverrideTarget::Query(k) => upsert(&mut entry.queries, k, value),
         OverrideTarget::Cookie(k) => upsert(&mut entry.cookies, k, value),
@@ -1996,6 +1997,7 @@ mod tests {
             self.sent.lock().unwrap().push(base.clone());
             let c = self.canned.get(&base.title).cloned().unwrap_or_default();
             let eo = EntryOutcome {
+                entry_index: 0,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: c.status,
@@ -3463,6 +3465,7 @@ mod tests {
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
                     entries: vec![EntryOutcome {
+                        entry_index: 0,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3555,6 +3558,7 @@ mod tests {
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
                     entries: vec![EntryOutcome {
+                        entry_index: 0,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3658,6 +3662,7 @@ mod tests {
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
                     entries: vec![EntryOutcome {
+                        entry_index: 0,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -4690,6 +4695,7 @@ mod tests {
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
                     entries: vec![EntryOutcome {
+                        entry_index: 0,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -5229,6 +5235,7 @@ mod helper_collection_tests {
                 self.0.lock().unwrap().push(base.title.clone());
                 RunOutput {
                     entries: vec![EntryOutcome {
+                        entry_index: 0,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -5311,6 +5318,7 @@ mod timing_column_tests {
             n.push(ms);
             RunOutput {
                 entries: vec![EntryOutcome {
+                    entry_index: 0,
                     method: base.method.clone(),
                     url: base.url.clone(),
                     status: 200,

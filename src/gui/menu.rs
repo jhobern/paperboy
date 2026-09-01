@@ -48,6 +48,11 @@ pub struct AltMenus {
 }
 
 impl AltMenus {
+    /// Whether a lone `Alt` has put the bar into "waiting for a letter" mode.
+    ///
+    /// The underlines no longer depend on this — they are always drawn — so
+    /// this is now only read by the tests that pin the arming state machine.
+    #[cfg(test)]
     pub fn is_armed(&self) -> bool {
         self.armed
     }
@@ -145,17 +150,30 @@ fn handle_menu_mnemonics(app: &mut GuiApp, ctx: &egui::Context) {
     app.alt_menus.alt_was_down = f.alt_down;
 }
 
-/// A menu title with its mnemonic underlined while the bar is armed.
+/// A menu title with its mnemonic underlined.
+///
+/// Drawn always, not only once `Alt` has armed the bar. Hiding the underlines
+/// until Alt is tapped is a Windows convention that assumes you already know
+/// the mnemonics are there — and here it left the menus looking as though they
+/// had none, so nobody would think to press Alt to find out. The underline is
+/// the only thing that advertises the feature, so it has to be visible before
+/// the feature is used.
 ///
 /// Falls back to the plain title when the mnemonic doesn't occur in the
 /// translated title at all — a translator is free to pick a letter that isn't in
 /// the word (Danish "Indstillinger" happens to start with its own), and an
 /// underline drawn under the wrong character would be worse than none.
-fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char, armed: bool) -> egui::WidgetText {
-    if !armed {
-        return title.into();
-    }
-    let Some(pos) = title.to_uppercase().find(mnemonic) else {
+fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char) -> egui::WidgetText {
+    // Matched case-insensitively over the *original* title, so `pos` is a byte
+    // index into the string actually being sliced below. Searching an
+    // uppercased copy instead would drift the moment a language's uppercase
+    // form has a different byte length from its lowercase one (German "ß" is
+    // the classic; Turkish dotted "i" is the near miss), silently underlining
+    // the wrong character.
+    let Some((pos, matched)) = title
+        .char_indices()
+        .find(|(_, c)| c.to_uppercase().eq(mnemonic.to_uppercase()))
+    else {
         return title.into();
     };
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -180,7 +198,7 @@ fn menu_title(ui: &egui::Ui, title: &str, mnemonic: char, armed: bool) -> egui::
             },
         );
     };
-    let end = pos + title[pos..].chars().next().map_or(0, |c| c.len_utf8());
+    let end = pos + matched.len_utf8();
     push(&title[..pos], false);
     push(&title[pos..end], true);
     push(&title[end..], false);
@@ -193,8 +211,10 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
     handle_menu_mnemonics(app, ui.ctx());
     egui::MenuBar::new().ui(ui, |ui| {
         file_menu(app, ui);
+        edit_menu(app, ui);
         settings_menu(app, ui);
         view_menu(app, ui);
+        help_menu(app, ui);
         // No Send button here. There used to be one pinned to the right of this
         // bar, doing exactly what the Send beside the URL does (`run_active`) —
         // but it was drawn unconditionally, so in the report editor or a
@@ -203,8 +223,28 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
 }
 
+/// The Help menu: a home for the keyboard-shortcuts overlay so F1 is not the
+/// only way to find it. Discoverability was the whole complaint — a shortcut no
+/// menu points at is a shortcut nobody knows exists — so the overlay earns a
+/// visible entry, with its F1 accelerator shown the same way Save shows Ctrl+S.
+fn help_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let (title, mnemonic) = (app.strings.gui_menu_help, app.strings.gui_menu_help_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
+        if ui
+            .button(format!(
+                "{}\t{}",
+                app.strings.gui_shortcuts_title, app.strings.gui_shortcut_help
+            ))
+            .clicked()
+        {
+            app.dialog = Some(Dialog::Shortcuts);
+            ui.close();
+        }
+    });
+}
+
 /// Draw one top-level menu button, registering its mnemonic so `Alt`+letter can
-/// open it and underlining that letter while the bar is armed.
+/// open it and underlining that letter.
 fn top_menu<R>(
     app: &mut GuiApp,
     ui: &mut egui::Ui,
@@ -212,13 +252,45 @@ fn top_menu<R>(
     mnemonic: &str,
     content: impl FnOnce(&mut GuiApp, &mut egui::Ui) -> R,
 ) {
-    let armed = app.alt_menus.is_armed();
     let Some(m) = mnemonic_char(mnemonic) else {
         return;
     };
-    let text = menu_title(ui, title, m, armed);
+    let text = menu_title(ui, title, m);
     let resp = ui.menu_button(text, |ui| content(app, ui));
     app.alt_menus.register(m, resp.response.id);
+}
+
+/// The Edit menu. Currently just the one entry — undoing a request delete —
+/// but that action needed a home somewhere more discoverable than "press `u`
+/// in the terminal UI", and there was no existing menu that fit rather than
+/// stretched to accommodate it (File is about whole files; Settings and View
+/// are configuration, not an in-session action). A one-item menu is a fair
+/// trade for that: the alternative was wedging it into the Requests panel's
+/// header, which only the graphical front-end has and which was still less
+/// discoverable than the standard place every editor puts "Undo".
+fn edit_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let (title, mnemonic) = (app.strings.gui_menu_edit, app.strings.gui_menu_edit_key);
+    top_menu(app, ui, title, mnemonic, |app, ui| {
+        let ci = app.active_ci();
+        // Disabled rather than hidden when there's nothing to restore, so the
+        // menu's shape doesn't shift under a user who opens it out of habit —
+        // and so the one item in it is still there to explain what the
+        // shortcut does even when it currently can't.
+        let has_deleted = !app.session.collections[ci].deleted_entries.is_empty();
+        if ui
+            .add_enabled(
+                has_deleted,
+                egui::Button::new(format!(
+                    "{}\t{}",
+                    app.strings.gui_undo_delete_request, app.strings.gui_shortcut_undo_delete
+                )),
+            )
+            .clicked()
+        {
+            app.undo_delete_request();
+            ui.close();
+        }
+    });
 }
 
 /// The File menu. Grouped into submenus by *verb* (New / Open / Save) rather
@@ -361,64 +433,70 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
             close_menu = true;
             ui.close();
         }
-        ui.menu_button(app.strings.gui_menu_save_as, |ui| {
-            ui.menu_button(app.strings.file_kind_collection, |ui| {
-                if ui.button(app.strings.gui_menu_to_file).clicked() {
-                    save_via_picker(app, SaveKind::Collection);
-                    close_menu = true;
-                    ui.close();
-                }
-                if ui.button(app.strings.gui_menu_to_git).clicked() {
-                    app.remote.open_save_collection(app.active_ci());
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            // Only offered where they can work: a report save needs a report in
-            // the editor, and a workspace push needs a tab that came from git.
-            let has_report = app.report_editor.is_some();
-            ui.menu_button(app.strings.file_kind_report, |ui| {
-                if ui
-                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_file))
-                    .clicked()
-                {
-                    save_via_picker(app, SaveKind::Report);
-                    close_menu = true;
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_git))
-                    .clicked()
-                {
-                    app.remote.open_save_report();
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            let ci = app.active_ci();
-            let is_ws = app
-                .session
-                .collections
-                .get(ci)
-                .is_some_and(|c| c.workspace_git_origin.is_some());
-            ui.menu_button(app.strings.file_kind_workspace, |ui| {
-                if ui
-                    .add_enabled(is_ws, egui::Button::new(app.strings.gui_menu_to_git))
-                    .clicked()
-                {
-                    app.remote.open_save_workspace(ci);
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-            ui.menu_button(app.strings.gui_menu_kind_response, |ui| {
-                if ui.button(app.strings.gui_menu_to_file).clicked() {
-                    save_via_picker(app, SaveKind::Response);
-                    close_menu = true;
-                    ui.close();
-                }
-            });
-        });
+        ui.menu_button(
+            format!(
+                "{}\t{}",
+                app.strings.gui_menu_save_as, app.strings.gui_shortcut_save_as
+            ),
+            |ui| {
+                ui.menu_button(app.strings.file_kind_collection, |ui| {
+                    if ui.button(app.strings.gui_menu_to_file).clicked() {
+                        save_via_picker(app, SaveKind::Collection);
+                        close_menu = true;
+                        ui.close();
+                    }
+                    if ui.button(app.strings.gui_menu_to_git).clicked() {
+                        app.remote.open_save_collection(app.active_ci());
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                // Only offered where they can work: a report save needs a report in
+                // the editor, and a workspace push needs a tab that came from git.
+                let has_report = app.report_editor.is_some();
+                ui.menu_button(app.strings.file_kind_report, |ui| {
+                    if ui
+                        .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_file))
+                        .clicked()
+                    {
+                        save_via_picker(app, SaveKind::Report);
+                        close_menu = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_report, egui::Button::new(app.strings.gui_menu_to_git))
+                        .clicked()
+                    {
+                        app.remote.open_save_report();
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                let ci = app.active_ci();
+                let is_ws = app
+                    .session
+                    .collections
+                    .get(ci)
+                    .is_some_and(|c| c.workspace_git_origin.is_some());
+                ui.menu_button(app.strings.file_kind_workspace, |ui| {
+                    if ui
+                        .add_enabled(is_ws, egui::Button::new(app.strings.gui_menu_to_git))
+                        .clicked()
+                    {
+                        app.remote.open_save_workspace(ci);
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+                ui.menu_button(app.strings.gui_menu_kind_response, |ui| {
+                    if ui.button(app.strings.gui_menu_to_file).clicked() {
+                        save_via_picker(app, SaveKind::Response);
+                        close_menu = true;
+                        ui.close();
+                    }
+                });
+            },
+        );
         ui.separator();
 
         if ui.button(app.strings.gui_set_base_url).clicked() {
@@ -430,7 +508,13 @@ fn file_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         ui.separator();
 
-        if ui.button(app.strings.gui_close_tab).clicked() {
+        if ui
+            .button(format!(
+                "{}\t{}",
+                app.strings.gui_close_tab, app.strings.gui_shortcut_close_tab_key
+            ))
+            .clicked()
+        {
             app.request_close_tab(app.active_ci());
             ui.close();
         }
@@ -536,6 +620,15 @@ fn settings_menu(app: &mut GuiApp, ui: &mut egui::Ui) {
         }
         if ui
             .checkbox(
+                &mut app.session.confirm_on_delete_request,
+                app.strings.gui_confirm_delete_request,
+            )
+            .changed()
+        {
+            app.session.save();
+        }
+        if ui
+            .checkbox(
                 &mut app.session.run_all_batch_mode,
                 app.strings.gui_run_all_batch,
             )
@@ -622,6 +715,241 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             entry,
             name,
         } => revert_to_saved_dialog(app, ctx, ci, path, entry, name),
+        Dialog::ConfirmDeleteRequest { ci, idx, name } => {
+            confirm_delete_request_dialog(app, ctx, ci, idx, name)
+        }
+        Dialog::DeleteWorkspaceItem {
+            ci,
+            path,
+            is_dir,
+            name,
+            file_count,
+            unsaved,
+        } => confirm_delete_workspace_item_dialog(
+            app, ctx, ci, path, is_dir, name, file_count, unsaved,
+        ),
+        Dialog::ConfirmRunAll { ci, total, non_get } => {
+            confirm_run_all_dialog(app, ctx, ci, total, non_get)
+        }
+        Dialog::Shortcuts => shortcuts_dialog(app, ctx),
+    }
+}
+
+/// Confirm deleting a request. Gated on `confirm_on_delete_request`; the delete
+/// records an undo step, so cancelling re-arms the dialog (a click outside must
+/// not be able to lose the request either) while confirming removes it and
+/// leaves it recoverable via Undo Delete Request / Ctrl+Z.
+fn confirm_delete_request_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    idx: usize,
+    name: String,
+) {
+    let title = app.strings.gui_delete_request_title;
+    let (go, cancel, question) = (
+        app.strings.gui_delete,
+        app.strings.gui_cancel,
+        app.strings.confirm_delete_request_q.replace("{r}", &name),
+    );
+    let mut decided = false;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                app.delete_request_now(ci, idx);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    })
+    .dismissed;
+    decided |= dismissed;
+    if !decided {
+        app.dialog = Some(Dialog::ConfirmDeleteRequest { ci, idx, name });
+    }
+}
+
+/// Confirm deleting a workspace file or folder from disk.
+///
+/// Unlike the request delete above, this is *not* gated on the
+/// `confirm_on_delete_request` preference and can never be turned off: that
+/// preference guards an undoable in-memory delete, whereas this removes a file
+/// — or a whole folder's worth of them — from disk with no undo, so it must
+/// always ask. The prompt says what is about to go: a folder's file count so
+/// the size of the loss is visible, and a warning when there are unsaved edits
+/// under the item that the delete would take with it. Cancelling (or dismissing)
+/// re-arms the dialog so a stray click outside can't delete by default;
+/// confirming performs the delete and its fix-up.
+#[allow(clippy::too_many_arguments)]
+fn confirm_delete_workspace_item_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    path: std::path::PathBuf,
+    is_dir: bool,
+    name: String,
+    file_count: usize,
+    unsaved: bool,
+) {
+    let title = app.strings.gui_ws_delete_title;
+    let go = app.strings.gui_delete;
+    let cancel = app.strings.gui_cancel;
+    let question = if is_dir {
+        app.strings
+            .confirm_delete_ws_folder_q
+            .replace("{name}", &name)
+            .replace("{n}", &file_count.to_string())
+    } else {
+        app.strings
+            .confirm_delete_ws_file_q
+            .replace("{name}", &name)
+    };
+    let unsaved_note = unsaved.then_some(app.strings.confirm_delete_ws_unsaved);
+    let mut decided = false;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        if let Some(note) = unsaved_note {
+            ui.add_space(4.0);
+            ui.colored_label(app.theme.err, note);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                super::requests::delete_workspace_item(app, ci, &path);
+                decided = true;
+            }
+            if ui.button(cancel).clicked() {
+                decided = true;
+            }
+        });
+    })
+    .dismissed;
+    decided |= dismissed;
+    if !decided {
+        app.dialog = Some(Dialog::DeleteWorkspaceItem {
+            ci,
+            path,
+            is_dir,
+            name,
+            file_count,
+            unsaved,
+        });
+    }
+}
+
+/// Confirm a "Run All" that would fire non-GET requests. The count of how many
+/// will run — and how many of those are not GET — is the whole point: it turns
+/// "run everything" from a leap into an informed choice, so a collection full
+/// of writes isn't one stray click from executing. Cancelling re-arms nothing
+/// (there is nothing to lose by dismissing); confirming runs the collection.
+fn confirm_run_all_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    ci: usize,
+    total: usize,
+    non_get: usize,
+) {
+    let title = app.strings.gui_run_all_confirm_title;
+    let (go, cancel, question) = (
+        app.strings.gui_run_all,
+        app.strings.gui_cancel,
+        app.strings
+            .confirm_run_all_q
+            .replace("{n}", &total.to_string())
+            .replace("{m}", &non_get.to_string()),
+    );
+    let mut answered: Option<bool> = None;
+    let dismissed = modal(ctx, title, |ui| {
+        ui.colored_label(app.theme.text, question);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(go).clicked() {
+                answered = Some(true);
+            }
+            if ui.button(cancel).clicked() {
+                answered = Some(false);
+            }
+        });
+    })
+    .dismissed;
+    if dismissed {
+        answered = Some(false);
+    }
+    match answered {
+        Some(true) => {
+            app.session.run_all_entries(ci);
+        }
+        Some(false) => {}
+        // No answer yet (egui drew nothing, or the user hasn't clicked): keep
+        // the dialog armed rather than deciding for them.
+        None => app.dialog = Some(Dialog::ConfirmRunAll { ci, total, non_get }),
+    }
+}
+
+/// The F1 keyboard-shortcuts overlay: every GUI shortcut, grouped, with a short
+/// description. Built from [`super::shortcut_help_sections`] so it can never
+/// drift from the keys the app actually binds, and dismissed with Escape or the
+/// close button like every other modal.
+fn shortcuts_dialog(app: &mut GuiApp, ctx: &egui::Context) {
+    let title = app.strings.gui_shortcuts_title;
+    let sections = super::shortcut_help_sections(&app.strings);
+    let theme = app.theme;
+    let close_lbl = app.strings.gui_close;
+    let mut close = false;
+    // Sized to its content rather than resizable. This is a reference card, not
+    // a workspace: there is nothing in it worth dragging bigger, and being
+    // resizable was what let it grow. `egui` remembers a resizable window's
+    // size across runs, so leaving it resizable would also have left anyone who
+    // had already seen the oversized version still looking at it.
+    let list_max_h = (ctx.input(|i| i.content_rect()).height() * 0.65).max(200.0);
+    let dismissed = super::widgets::dialog(ctx, title, Some(420.0), |ui| {
+        egui::ScrollArea::vertical()
+            // Shrink to the content vertically, but not horizontally: the grid
+            // wants the full dialog width so its two columns line up down the
+            // whole overlay, while its height should be the height of the list.
+            // `false` on this axis made the scroll area claim every pixel it
+            // could be given, so the dialog filled the screen with most of it
+            // blank and ran its heading and Close button off both ends at once.
+            .auto_shrink([false, true])
+            // ...and a ceiling, so a list longer than the screen scrolls inside
+            // the dialog instead of pushing Close out of the bottom of it.
+            .max_height(list_max_h)
+            .show(ui, |ui| {
+                for (i, section) in sections.iter().enumerate() {
+                    if i > 0 {
+                        ui.add_space(8.0);
+                    }
+                    ui.colored_label(theme.accent, section.title);
+                    ui.add_space(2.0);
+                    egui::Grid::new(("shortcuts_grid", i))
+                        .num_columns(2)
+                        .spacing([18.0, 4.0])
+                        .show(ui, |ui| {
+                            for (keys, desc) in &section.rows {
+                                ui.colored_label(theme.text, egui::RichText::new(*keys).strong());
+                                ui.colored_label(theme.dim, *desc);
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(close_lbl).clicked() {
+                close = true;
+            }
+        });
+    })
+    .dismissed;
+    // Not re-armed on close: the overlay is a reference the user is done with,
+    // not a question waiting on an answer.
+    if !(close || dismissed) {
+        app.dialog = Some(Dialog::Shortcuts);
     }
 }
 
@@ -1695,6 +2023,12 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
                         col.name = text.clone();
                     }
                 }
+                // A workspace file/folder is renamed on disk (and everything
+                // holding its old path repointed), rather than by editing an
+                // in-memory title — see `rename_workspace_item`.
+                RenameTarget::WorkspaceItem { ci, path } => {
+                    super::requests::rename_workspace_item(app, ci, &path, text.trim());
+                }
             }
             app.session.save();
         }
@@ -2402,8 +2736,10 @@ mod tests {
             let s = crate::i18n::Strings::for_language(&lang);
             let keys = [
                 s.gui_menu_file_key,
+                s.gui_menu_edit_key,
                 s.gui_menu_view_key,
                 s.gui_menu_settings_key,
+                s.gui_menu_help_key,
             ];
             for k in keys {
                 assert_eq!(
@@ -2516,12 +2852,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mnemonic_is_underlined_only_while_the_bar_is_armed() {
+    fn the_mnemonic_is_underlined_without_waiting_for_alt() {
         let ctx = egui::Context::default();
-        let underlined = |armed: bool| {
+        let underlined = |title: &str, m: char| {
             let mut found = Vec::new();
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let text = menu_title(ui, "Settings", 'S', armed);
+                let text = menu_title(ui, title, m);
                 found = match text {
                     egui::WidgetText::LayoutJob(job) => job
                         .sections
@@ -2532,14 +2868,48 @@ mod tests {
                                 .to_string()
                         })
                         .collect::<Vec<_>>(),
-                    // A plain string carries no formatting at all, which is the
-                    // unarmed case.
+                    // A plain string carries no formatting at all, which is how
+                    // the "mnemonic isn't in the title" fallback comes back.
                     _ => Vec::new(),
                 };
             });
             found
         };
-        assert_eq!(underlined(false), Vec::<String>::new());
-        assert_eq!(underlined(true), vec!["S".to_string()]);
+        // The underline is what advertises the mnemonic, so it is there from the
+        // first frame rather than only after the user has already found Alt.
+        assert_eq!(underlined("Settings", 'S'), vec!["S".to_string()]);
+        // Matched case-insensitively, and under the letter as the title spells
+        // it rather than an uppercased copy of it.
+        assert_eq!(underlined("File", 'F'), vec!["F".to_string()]);
+        assert_eq!(underlined("edit", 'E'), vec!["e".to_string()]);
+        // A mnemonic that isn't in the translated title underlines nothing at
+        // all, rather than guessing at a character.
+        assert_eq!(underlined("Aide", 'H'), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_multibyte_title_underlines_the_right_character() {
+        // The byte index came from searching an uppercased copy of the title,
+        // which is only the same string when uppercasing preserves every byte
+        // length. The "\u{fb00}" ligature is three bytes and uppercases to the
+        // two bytes "FF", so every index past it was off by one: searching the
+        // copy finds 'E' at byte 5, which in the original is the hyphen.
+        let ctx = egui::Context::default();
+        let mut found = Vec::new();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let text = menu_title(ui, "A\u{fb00}x-End", 'E');
+            if let egui::WidgetText::LayoutJob(job) = text {
+                found = job
+                    .sections
+                    .iter()
+                    .filter(|s| s.format.underline != egui::Stroke::NONE)
+                    .map(|s| {
+                        job.text[usize::from(s.byte_range.start)..usize::from(s.byte_range.end)]
+                            .to_string()
+                    })
+                    .collect();
+            }
+        });
+        assert_eq!(found, vec!["E".to_string()], "underlined the wrong glyph");
     }
 }

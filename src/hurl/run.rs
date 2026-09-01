@@ -35,7 +35,20 @@ pub struct AssertOutcome {
 }
 
 /// The mapped result of running one Hurl entry.
+///
+/// `Default` exists for tests, which mostly care about two or three fields and
+/// would otherwise have to spell out a dozen empty ones to say so.
+#[derive(Default)]
 pub struct EntryOutcome {
+    /// Which request in the collection this is the result of (0-based).
+    ///
+    /// Not the same as the outcome's position in the result list: a request
+    /// carrying `[Options] repeat: N` — or one that fails and is retried —
+    /// produces several outcomes, all bearing the index of the single request
+    /// that produced them. Counting outcomes instead would slide every later
+    /// result up by one and show a response against the wrong request, which
+    /// in an API client is the worst kind of wrong.
+    pub entry_index: usize,
     /// The method/URL actually sent (fully substituted, incl. chained captures).
     pub method: String,
     pub url: String,
@@ -372,6 +385,7 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
 
     (
         EntryOutcome {
+            entry_index: e.entry_index.to_zero_based(),
             method,
             url,
             status,
@@ -768,5 +782,107 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&staged_dir).ok();
+    }
+
+    /// An error-status response must keep its body. A 4xx/5xx payload is
+    /// usually the *most* interesting thing on screen — it carries the API's
+    /// explanation of what went wrong — so losing it would be worse than
+    /// losing a 200's. Checked with and without an `HTTP <code>` expectation
+    /// line, because a failed status assertion takes a different path through
+    /// `map_entry_result` (it fills in `error`) and must not discard the
+    /// response it is complaining about.
+    #[test]
+    fn error_status_responses_keep_their_body() {
+        for status in [400u16, 401, 404, 422, 500, 502, 503] {
+            // No expectation line: the entry passes, and the body is the point.
+            let port = one_shot_server(status, "Err");
+            let content = format!("GET http://127.0.0.1:{port}/\n");
+            let out = run_hurl(&content, &HashMap::new(), None);
+            let e = out.entries.first().expect("one entry");
+            assert_eq!(e.status, status);
+            assert!(e.ok, "no expectation means nothing to fail: {:?}", e.error);
+            assert_eq!(
+                e.raw_body, "{\"ok\":true}",
+                "the {status} body must survive verbatim"
+            );
+            assert!(
+                e.body.contains("\"ok\""),
+                "and be pretty-printed for display: {:?}",
+                e.body
+            );
+
+            // Now with an expectation the response fails: the entry is marked
+            // failed and carries an error, but the body must still be there.
+            let port = one_shot_server(status, "Err");
+            let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+            let out = run_hurl(&content, &HashMap::new(), None);
+            let e = out.entries.first().expect("one entry");
+            assert_eq!(e.status, status);
+            assert!(!e.ok, "expected 200, got {status}");
+            assert!(
+                e.error.as_deref().unwrap_or_default().contains("200"),
+                "the mismatch is reported: {:?}",
+                e.error
+            );
+            assert_eq!(
+                e.raw_body, "{\"ok\":true}",
+                "a failed status assert must not discard the {status} body"
+            );
+        }
+    }
+
+    /// Answer `n` connections in turn, echoing the requested path back in the
+    /// body so the responses of several requests can be told apart.
+    fn echo_path_server(n: usize) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let read = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..read]).to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = format!("{{\"path\":\"{path}\"}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// Regression: `[Options] repeat` makes one request produce several
+    /// outcomes. Each must name the request it came from, because that index
+    /// is what the runner keys results by — counting outcomes instead slid
+    /// every later result up and showed one request's response against the
+    /// next one.
+    #[test]
+    fn every_outcome_of_a_repeated_request_names_that_request() {
+        let port = echo_path_server(3);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/first\n[Options]\nrepeat: 2\nHTTP 200\n\nGET http://127.0.0.1:{port}/second\nHTTP 200\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        assert_eq!(out.entries.len(), 3, "two repeats, then the second request");
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| e.entry_index)
+                .collect::<Vec<_>>(),
+            vec![0, 0, 1],
+            "both repeats belong to request 0"
+        );
+        assert!(
+            out.entries[2].url.ends_with("/second"),
+            "and the last outcome really is the second request"
+        );
     }
 }

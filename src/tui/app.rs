@@ -170,7 +170,17 @@ pub(crate) enum PromptKind {
     RenameNewEnv,
     /// Raw Mode: the selected entry's actual Hurl-text representation,
     /// reparsed back into the entry on commit.
-    Raw(usize),
+    ///
+    /// `before` is the text the editor opened with. Raw Mode shows the file,
+    /// and a file carries an annotated body *twice* — once as the `# [Body]`
+    /// notes and once as the strict JSON that is sent — so it is the one place
+    /// in PaperBoy where the two copies can be edited apart from each other.
+    /// Keeping the original is what lets a save tell which copy the user
+    /// actually changed, instead of guessing.
+    Raw {
+        ci: usize,
+        before: String,
+    },
     /// Raw JSON Mode: the selected entry's [`build_request_json`] preview,
     /// reparsed back into the entry on commit — the JSON-text counterpart to
     /// `Raw`, opened with Shift+J instead of Shift+H.
@@ -405,6 +415,22 @@ impl WorkspacePickerState {
             .or_else(|| self.entries.iter().position(|e| !e.is_dir))
             .unwrap_or(self.entries.len());
         self.scroll = 0;
+    }
+
+    /// Highlight the row for `path` if the scan found it as a file, leaving the
+    /// selection alone otherwise (the file may be filtered out, or gone).
+    ///
+    /// Lets a picker open on a file the user is already working in rather than
+    /// at the top of the workspace. The list draws itself around
+    /// `selected`, so this scrolls too.
+    pub(crate) fn select_path(&mut self, path: &std::path::Path) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| !e.is_dir && e.path == path)
+        {
+            self.selected = i;
+        }
     }
 
     /// Move the selection to the next/previous FILE row (skipping over
@@ -689,6 +715,15 @@ pub(crate) enum Overlay {
         target: PathBuf,
         sel: usize,
     },
+    /// Shown when a request is carrying `# [Body]` notes that no longer
+    /// describe its body — the block stopped reconciling, so the parser left it
+    /// as prose rather than deleting it. `sel`: 0 = take the notes back as the
+    /// body, 1 = delete the notes and keep the body, 2 = leave them alone.
+    StaleBodyNotes {
+        ci: usize,
+        ei: usize,
+        sel: usize,
+    },
 }
 
 /// Which action a confirmation popup is guarding.
@@ -706,6 +741,12 @@ pub(crate) enum ConfirmAction {
     /// the Global Environments panel) — any collections linked to it become
     /// unlinked.
     DeleteEnv(usize),
+    /// Delete the request the Requests list is sitting on (`x` in that pane).
+    /// It carries no index: the confirmation owns the keyboard while it is up,
+    /// so the selection cannot move underneath it, and re-reading the selection
+    /// on confirm keeps this on exactly the one code path that deletes a
+    /// request.
+    DeleteRequest,
     /// Discard a request's in-memory edits, reloading it from the collection's
     /// on-disk file. Holds `(collection index, entry index)`. Raised by `Ctrl+R`
     /// in the Requests list only when that entry has unsaved changes.
@@ -736,6 +777,38 @@ pub(crate) enum Pane {
     GlobalEnv,
     Main,
     Response,
+}
+
+/// Which section of the response the Response pane is currently showing,
+/// mirroring the GUI's `ResponseSection` so the two front-ends agree on what a
+/// response is made of.
+///
+/// Deliberately modelled as a *ring* rather than a boolean toggle even though
+/// there are only two members today: the runner already captures more than
+/// this (per-phase timings, captured `[Captures]` values, the redirect chain)
+/// and none of it is drawn yet. Adding one of those later should be a new
+/// variant and a new draw arm, not a re-negotiation of the key map.
+///
+/// Cycled with `i` / `Shift+I` while the Response pane holds focus. Not `[`/`]`
+/// — those mean "previous/next collection tab" from *every* pane, and quietly
+/// re-pointing them at the response would make them mean different things
+/// depending on which panel happened to have the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ResponseSection {
+    Body,
+    Headers,
+}
+
+impl ResponseSection {
+    /// The ring, in tab-bar order. Also the order `i` steps through.
+    pub(crate) const ALL: [ResponseSection; 2] = [ResponseSection::Body, ResponseSection::Headers];
+
+    pub(crate) fn label(self, s: &Strings) -> &'static str {
+        match self {
+            ResponseSection::Body => s.resp_section_body,
+            ResponseSection::Headers => s.resp_section_headers,
+        }
+    }
 }
 
 /// Interaction layers in paint order. Mouse dispatch only considers hits from
@@ -1108,6 +1181,14 @@ pub struct TuiApp {
     /// Environments panel, so letters type into the query instead of firing the
     /// panel's single-key actions (`a`, `x`, `u`, …).
     pub(crate) env_filter_typing: bool,
+    /// True while `/` filter entry is capturing keys for the Requests list, so
+    /// letters type into [`crate::collection::Collection::list_query`] instead
+    /// of firing the list's single-key actions (`x`, `u`, `c`, `n`, …).
+    ///
+    /// The query itself lives on the collection (each tab keeps its own); only
+    /// the "am I typing right now" mode is app-wide, since only one pane can
+    /// hold the keyboard at a time.
+    pub(crate) list_filter_typing: bool,
     /// Max scroll offset for the Response body (wrapped content rows −
     /// viewport height); cached each frame by `draw_response` from
     /// `resp_panel.clamp_scroll(..)` so a scrollbar drag between frames (and
@@ -1157,6 +1238,10 @@ pub struct TuiApp {
     /// the Response pane is focused. Display-only: `resp_full_body` keeps the
     /// untruncated text so a whole-panel `y`-copy still yields the full body.
     pub(crate) response_compact: bool,
+    /// Which section of the response the pane is showing (Body / Headers).
+    /// Purely a view choice — it changes what `resp_panel` is fed, never the
+    /// response itself — so it isn't persisted and resets to `Body` on start.
+    pub(crate) response_section: ResponseSection,
     /// The full (untruncated) Response body cached each frame the normal body is
     /// drawn, so the whole-panel copy fallback can return it even while the
     /// panel is showing the compacted overview. Empty when the current frame
@@ -1439,6 +1524,7 @@ impl Default for TuiApp {
             global_env_idx: 0,
             env_query: String::new(),
             env_filter_typing: false,
+            list_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
             list_hscroll: 0,
@@ -1449,6 +1535,7 @@ impl Default for TuiApp {
             resp_text_area: Rect::default(),
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
+            response_section: ResponseSection::Body,
             resp_full_body: Arc::from(""),
             resp_compact_line_maps: Vec::new(),
             main_scrollbar_area: Rect::default(),
@@ -1501,6 +1588,66 @@ impl Default for TuiApp {
             mouse_hit_valid: Cell::new(false),
             session: crate::session::Session::default(),
         }
+    }
+}
+
+/// The two copies of a body that a `.hurl` file carries: the `# [Body]` notes,
+/// and the strict text that is actually sent.
+///
+/// A block the parser claimed lives in `body_src` with the sent text derived
+/// from it; one it could not claim sits in the comment list instead. Both are
+/// reported the same way here, because for deciding *what the user edited* it
+/// makes no difference which state the file happened to be in.
+fn body_copies(e: &HurlEntry) -> (Option<String>, Option<String>) {
+    if let Some((_, notes)) = e.stale_body_notes() {
+        return (Some(notes), e.body_src.clone());
+    }
+    match (&e.body_src, e.body_wire()) {
+        (Some(src), Some(wire)) if *src != wire.as_ref() => {
+            (Some(src.clone()), Some(wire.into_owned()))
+        }
+        _ => (None, e.body_src.clone()),
+    }
+}
+
+/// Decide which copy of an annotated body a Raw Mode edit meant to change.
+///
+/// Raw Mode shows the file, and the file spells an annotated body out twice.
+/// Left alone, the file's own precedence applies — the sent body wins and the
+/// notes are kept as prose — which is right when the body is what was edited
+/// and quietly wrong when the notes were: the user's edit would be preserved
+/// but never applied, which reads as being ignored.
+///
+/// Comparing against the text the editor opened with settles it:
+///
+/// * only the notes changed → they are the newer truth, so the body is derived
+///   from them;
+/// * only the body changed → the file's precedence was right all along;
+/// * both changed → there is no honest way to merge two edits into one body, so
+///   the body wins (it is what runs, and what every other tool sees), the notes
+///   are kept, and the user is told rather than left to discover it.
+///
+/// Notes that would not survive being written back as a body are never adopted,
+/// however clear the intent: doing so would put comments in the sent body and
+/// read back as an empty collection.
+fn settle_raw_body_edit(before: &str, parsed: &mut HurlEntry) -> Option<Status> {
+    // Nothing to settle unless the file came back with the two disagreeing.
+    parsed.stale_body_notes()?;
+    // Intent is knowable only by comparison. If the text the editor opened
+    // with isn't a single request — it failed to parse, or the user pasted
+    // something else over it — there is nothing to compare against, so leave
+    // the file's own precedence to it rather than guess.
+    let opened = crate::hurl::parse_hurl(before);
+    let [was] = &opened[..] else { return None };
+    let (was_notes, was_body) = body_copies(was);
+    let (now_notes, now_body) = body_copies(parsed);
+
+    match (now_notes != was_notes, now_body != was_body) {
+        (true, false) => parsed
+            .adopt_body_notes()
+            .then_some(Status::NotesAppliedFromRaw),
+        (true, true) => Some(Status::NotesKeptBodyWon),
+        _ => None,
     }
 }
 
@@ -1615,6 +1762,44 @@ impl TuiApp {
     pub(crate) fn clear_selections(&mut self) {
         self.main_panel.clear();
         self.resp_panel.clear();
+        // The report panels count towards `has_any_selection`, so they have to
+        // be cleared here too. Without this, Esc over a selected report region
+        // reports "there was a selection", drops nothing, and stays wedged in
+        // that state for every later press — which now also means it could
+        // never fall through to quitting.
+        if let Some(idx) = self.active_report_index() {
+            let rt = &mut self.reports[idx];
+            rt.source_panel.clear();
+            rt.validation_panel.clear();
+            rt.results_panel.clear();
+        }
+    }
+
+    /// Step the Response pane's section ring (`i` forward, `Shift+I` back).
+    ///
+    /// Switching section swaps what `resp_panel` holds, so the old scroll
+    /// offset and any painted selection would both be pointing at text that is
+    /// no longer on screen — reset the one and drop the other. Only the
+    /// response panel's selection is dropped: a selection in the Request pane
+    /// is untouched by this and shouldn't be collateral damage.
+    pub(crate) fn cycle_response_section(&mut self, forward: bool) {
+        let all = ResponseSection::ALL;
+        let i = all
+            .iter()
+            .position(|s| *s == self.response_section)
+            .unwrap_or(0);
+        let next = if forward {
+            (i + 1) % all.len()
+        } else {
+            (i + all.len() - 1) % all.len()
+        };
+        if all[next] == self.response_section {
+            return;
+        }
+        self.response_section = all[next];
+        self.resp_panel.clear();
+        self.resp_panel.set_scroll(0);
+        self.resp_max_scroll = 0;
     }
 
     pub(crate) fn begin_request(&mut self) {
@@ -1931,14 +2116,22 @@ impl TuiApp {
                     self.save_state();
                 }
             }
-            PromptKind::Raw(ci) => {
+            PromptKind::Raw { ci, before } => {
                 // Reparse the edited Hurl text back into the entry; on success
                 // this can change any field (Raw Mode exposes everything,
                 // including query_params/form_fields/cookies/basic_auth). On
                 // failure, reopen the overlay with the user's text intact so
                 // they can fix it.
                 let entries = crate::hurl::parse_hurl(&text);
-                if entries.len() != 1 {
+                // Recovery means unparseable text now comes back as an
+                // unreadable entry rather than as nothing. That is right when
+                // *loading a file* — the alternative is losing the rest of it
+                // — but wrong here: the user is editing this request, and
+                // quietly accepting text that does not parse would swap the
+                // request they were repairing for a copy of the mistake. Raw
+                // Mode keeps telling them what is wrong and holding onto what
+                // they typed.
+                if entries.len() != 1 || entries[0].is_unreadable() {
                     let s = Strings::for_language(&self.language);
                     // Prefer the concrete parse reason (line + what's wrong)
                     // over the generic "expected exactly one request" — the
@@ -1949,7 +2142,7 @@ impl TuiApp {
                         .unwrap_or_else(|| s.invalid_hurl.to_string());
                     self.status = Some(Status::Error(msg));
                     self.overlay = Some(Overlay::Prompt {
-                        kind: PromptKind::Raw(ci),
+                        kind: PromptKind::Raw { ci, before },
                         editor: Editor::new(&text, true),
                         title: s.entry_raw_hurl.to_string(),
                         mask: false,
@@ -1960,6 +2153,11 @@ impl TuiApp {
                     return;
                 }
                 let mut parsed = entries.into_iter().next().unwrap();
+                // Raw Mode is the one surface where the two copies of an
+                // annotated body can be edited apart from each other, so work
+                // out which of them the user actually touched before letting
+                // the file's own precedence decide it for them.
+                let note = settle_raw_body_edit(&before, &mut parsed);
                 if let Some(col) = self.collections.get_mut(ci) {
                     let ei = col.selected_entry;
                     if let Some(entry) = col.entries.get_mut(ei) {
@@ -1971,7 +2169,7 @@ impl TuiApp {
                             || entry.form_fields != parsed.form_fields
                             || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
-                            || entry.body != parsed.body
+                            || entry.body_src != parsed.body_src
                             || entry.expected_status != parsed.expected_status
                             || entry.captures != parsed.captures
                             || entry.asserts != parsed.asserts;
@@ -1986,6 +2184,9 @@ impl TuiApp {
                     }
                     col.invalidate_request_json();
                     col.sync_folder_to_selected();
+                }
+                if let Some(status) = note {
+                    self.status = Some(status);
                 }
                 self.save_state();
             }
@@ -2030,7 +2231,7 @@ impl TuiApp {
                             || entry.form_fields != parsed.form_fields
                             || entry.queries != parsed.queries
                             || entry.cookies != parsed.cookies
-                            || entry.body != parsed.body;
+                            || entry.body_src != parsed.body_src;
                         if changed {
                             parsed.modified = true;
                             *entry = parsed;
@@ -2238,7 +2439,9 @@ impl TuiApp {
                     let name = collection_name_from_path(path, "collection");
                     self.load_collection_text(name, &content, Some(PathBuf::from(path)));
                 }
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             // Sorted by what the export holds rather than by what the user
             // said it was: knowing whether a `.json` is a collection or an
@@ -2255,7 +2458,9 @@ impl TuiApp {
                     }
                     None => self.status = Some(Status::NotCollection),
                 },
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             FileAction::SaveCollection => {
                 let ci = self.active_tab;
@@ -2280,7 +2485,9 @@ impl TuiApp {
                         self.save_state();
                         self.status = Some(Status::Saved);
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
@@ -2288,7 +2495,9 @@ impl TuiApp {
                     let name = env_name_from_path(path, "environment");
                     self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
                 }
-                Err(e) => self.status = Some(Status::Error(e.to_string())),
+                Err(e) => {
+                    self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                }
             },
             FileAction::SaveEnv => {
                 let Some(env_id) = self.current_env_id() else {
@@ -2320,7 +2529,9 @@ impl TuiApp {
                         self.save_state();
                         self.status = Some(Status::Saved);
                     }
-                    Err(e) => self.status = Some(Status::Error(e.to_string())),
+                    Err(e) => {
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
+                    }
                 }
             }
             FileAction::SaveResponse => {
@@ -2464,12 +2675,21 @@ impl TuiApp {
             });
             return false;
         }
+        // Recovery keeps the requests that parsed and carries the rest as
+        // text, so a file with one bad request opens instead of being refused.
+        // Say so, and keep the concrete reason: it is the only place the user
+        // is told why without opening Raw Mode themselves.
+        let unreadable = entries.iter().filter(|e| e.is_unreadable()).count();
         let mut col = Collection::new(name, entries);
         col.path = path;
         self.collections.push(col);
         self.active_tab = self.collections.len() - 1;
         self.focus = Pane::List;
-        self.status = Some(Status::Loaded);
+        self.status = Some(if unreadable > 0 {
+            Status::SomeRequestsUnreadable(unreadable, crate::hurl::parse_hurl_error(content))
+        } else {
+            Status::Loaded
+        });
         self.save_state();
         true
     }
@@ -2672,7 +2892,7 @@ impl TuiApp {
                 self.status = Some(Status::Loaded);
                 self.save_state();
             }
-            Err(e) => self.status = Some(Status::Error(e.to_string())),
+            Err(e) => self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e))),
         }
     }
 
@@ -2734,6 +2954,8 @@ impl TuiApp {
             return;
         };
         let filter = col.workspace_filter_hurl_json;
+        // The file the request is being moved or copied *out of*.
+        let source = col.path.clone();
         self.active_tab = ci;
         let mut picker = WorkspacePickerState::new(ci, root, filter);
         picker.mode = if is_move {
@@ -2741,6 +2963,17 @@ impl TuiApp {
         } else {
             WsPickerMode::CopyRequest
         };
+        // Open on the collection the request came from rather than at the top
+        // of the workspace. It is the row the user is already thinking about,
+        // and in a workspace of any size the alternative is scrolling back to
+        // where they just were to get their bearings before choosing. It is a
+        // safe place to land, too: confirming it outright copies the request
+        // into its own file (a duplicate) or, for a move, does nothing at all —
+        // neither of which can lose the request, unlike whichever unrelated
+        // file happens to sort first.
+        if let Some(src) = source {
+            picker.select_path(&src);
+        }
         self.overlay = Some(Overlay::WorkspacePicker(picker));
     }
 
@@ -2791,16 +3024,30 @@ impl TuiApp {
                 return;
             }
             // Copy within the loaded file: duplicate in memory, then persist.
+            //
+            // The copy is retitled and inserted beside its original rather than
+            // appended verbatim. Two entries sharing a title makes the name
+            // ambiguous, which breaks any report addressing *either* of them
+            // (`report::validate` says as much: "N requests share that title"),
+            // and an appended clone with the same name is indistinguishable
+            // from the original in the list.
             let Some(col) = self.collections.get_mut(source_ci) else {
                 return;
             };
             let mut clone = entry;
+            clone.title = crate::collection::unique_entry_title(&col.entries, &clone.title);
             clone.user_added = true;
             clone.modified = true;
-            col.entries.push(clone);
+            // A copy has never been sent; the original's response isn't its own.
+            clone.last_response = None;
+            let dup_title = clone.title.clone();
+            let at = (source_idx + 1).min(col.entries.len());
+            col.entries.insert(at, clone);
+            col.selected_entry = at;
+            col.sync_folder_to_selected();
             let text = crate::hurl::collection_to_hurl(&col.entries);
             if let Err(e) = std::fs::write(&dest_path, text) {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 return;
             }
             self.mark_collection_saved(source_ci);
@@ -2809,7 +3056,7 @@ impl TuiApp {
                 col.sync_ws_cursor();
             }
             self.save_state();
-            self.status = Some(Status::RequestCopied(method, dest_name));
+            self.status = Some(Status::RequestDuplicated(method, dup_title));
             return;
         }
 
@@ -2818,7 +3065,7 @@ impl TuiApp {
             Ok(text) => crate::postman::parse_collection(&text),
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 return;
             }
         };
@@ -2829,12 +3076,12 @@ impl TuiApp {
         if let Some(parent) = dest_path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            self.status = Some(Status::Error(e.to_string()));
+            self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
             return;
         }
         let dest_text = crate::hurl::collection_to_hurl(&dest_entries);
         if let Err(e) = std::fs::write(&dest_path, dest_text) {
-            self.status = Some(Status::Error(e.to_string()));
+            self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
             return;
         }
 
@@ -2850,7 +3097,7 @@ impl TuiApp {
                 if let Some(path) = col.path.clone() {
                     let text = crate::hurl::collection_to_hurl(&col.entries);
                     if let Err(e) = std::fs::write(&path, text) {
-                        self.status = Some(Status::Error(e.to_string()));
+                        self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                         return;
                     }
                 }
@@ -4180,7 +4427,7 @@ impl TuiApp {
                 true
             }
             Err(e) => {
-                self.status = Some(Status::Error(e.to_string()));
+                self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)));
                 false
             }
         }

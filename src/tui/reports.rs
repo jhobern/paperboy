@@ -2935,7 +2935,14 @@ impl TuiApp {
             }
             KeyCode::Left | KeyCode::Right => {}
             KeyCode::Char('w') if ctrl => self.close_active_tab(),
-            KeyCode::Char('u') => self.reopen_closed_tab(),
+            // A *standalone* report is full-screen: it has no Requests list or
+            // Environments panel, so a tab is the only thing `u` could undo the
+            // loss of and the focus (which Tab doesn't even move here) can't
+            // disambiguate anything. An *embedded* report shares its collection
+            // tab and only reaches this handler with `Pane::Main` focused, where
+            // `u` is inert in the collection view too — reopening a tab from a
+            // report body would be the same surprise that scoping cured there.
+            KeyCode::Char('u') if !embedded => self.reopen_closed_tab(),
             // `/` walks the results filters -- the key filters a list in k9s,
             // lazygit and their neighbours, and nothing in the report view
             // wanted it. The same filters the GUI's bar offers and the
@@ -2943,7 +2950,7 @@ impl TuiApp {
             // wrong rows" selects the same rows in all three.
             KeyCode::Char('/') => self.cycle_report_row_filter(),
             // Global menus, unchanged from the collection view.
-            // Ctrl+O opens what Ctrl+S wrote, so an exported HTML report is one
+            // Ctrl+O opens what Ctrl+E wrote, so an exported HTML report is one
             // keystroke from the browser it was written for.
             KeyCode::Char('o') if ctrl => self.open_exported_report(),
             KeyCode::Char('f') => self.overlay = Some(Overlay::FileMenu(0)),
@@ -2959,8 +2966,9 @@ impl TuiApp {
             // request wizard — falling back to raw editing on a report that
             // doesn't parse (so Enter always opens *an* editor). Esc backs out
             // of the node editor again. `n` is deliberately left unbound here,
-            // reserved for a future "new request" binding.
-            KeyCode::Char('e') => self.enter_report_edit(),
+            // reserved for a future "new request" binding. Guarded on `!ctrl`
+            // so `Ctrl+E` (export) can't fall in here and open the editor.
+            KeyCode::Char('e') if !ctrl => self.enter_report_edit(),
             KeyCode::Enter => self.open_report_node_editor(),
             KeyCode::Esc => {
                 if let Some(idx) = self.active_report_index() {
@@ -2974,7 +2982,16 @@ impl TuiApp {
                     } else if self.reports[idx].view == ReportView::Nodes {
                         self.reports[idx].view = ReportView::Source;
                         self.reports[idx].editor_view = ReportView::Source;
+                    } else if self.has_any_selection() {
+                        self.clear_selections();
+                    } else {
+                        // Nothing left to back out of, so Esc means here what
+                        // it means in the collection view: quit, through the
+                        // same confirmation `q` goes through.
+                        self.request_quit();
                     }
+                } else {
+                    self.request_quit();
                 }
             }
             // Run the report against its bound collection and show the grid.
@@ -3000,11 +3017,18 @@ impl TuiApp {
             KeyCode::Tab if embedded => self.cycle_focus(true),
             KeyCode::BackTab if embedded => self.cycle_focus(false),
             KeyCode::Tab | KeyCode::BackTab => {}
-            // Export the last run to CSV next to the report. `Ctrl+S` (rather
+            // Export the last run to CSV next to the report. `Ctrl+E` (rather
             // than a bare `x`) so it can't be confused with — or fat-fingered
             // into — the collection view's `x` = delete-environment / delete-
-            // request binding, which felt unsafe sitting one pane away.
-            KeyCode::Char('s') if ctrl => self.export_active_report_csv(),
+            // request binding, which felt unsafe sitting one pane away. It used
+            // to be `Ctrl+S`, which cost this view the one shortcut everybody
+            // arrives already knowing: a person editing a report and pressing
+            // the universal save chord got a CSV written somewhere instead of
+            // their edits saved.
+            KeyCode::Char('e') if ctrl => self.export_active_report_csv(),
+            // `Ctrl+S` means the same thing here as everywhere else in
+            // PaperBoy: write the thing in front of you back to its own file.
+            KeyCode::Char('s') if ctrl => self.save_active(),
             // Save the last run as a `.baseline` snapshot (Shift+B) — `b` is
             // already BIND. A `# baseline:` directive later diffs runs against it.
             KeyCode::Char('B') => self.save_active_report_baseline(),

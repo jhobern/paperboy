@@ -69,6 +69,32 @@ pub fn rows_for(entries: &[HurlEntry], folder: &[String]) -> Vec<Row> {
     rows
 }
 
+/// The rows to show when the Requests list is being filtered by a typed query:
+/// every request whose title contains `query`, case-insensitively, in original
+/// order.
+///
+/// Deliberately **flat and folder-blind**, unlike [`rows_for`]. The list shows
+/// one folder level at a time, so a filter that only looked inside the current
+/// folder would fail at the one job it has — "find me that request" almost
+/// always means finding one you can't currently see. There is no `Up` row and
+/// there are no `Folder` rows: with the tree flattened there is nothing to
+/// descend into, and a folder row that couldn't be entered would be a dead end.
+/// Callers should show each match's *full* title, since two folders can hold
+/// requests with the same leaf name and the folder rows that used to tell them
+/// apart are gone.
+///
+/// Matching is against the whole title, folder segments included, so `auth/`
+/// narrows to a folder just as readily as a request name does.
+pub fn rows_matching(entries: &[HurlEntry], query: &str) -> Vec<Row> {
+    let needle = query.trim().to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.title.to_lowercase().contains(&needle))
+        .map(|(i, _)| Row::Entry(i))
+        .collect()
+}
+
 /// The folder containing `entries[idx]` (all but the leaf segment of its
 /// title path), or the root if `idx` is out of range.
 pub fn folder_of(entries: &[HurlEntry], idx: usize) -> Vec<String> {
@@ -153,6 +179,52 @@ mod tests {
         let entries = vec![entry("Files/Upload/Big"), entry("Files/Upload/Small")];
         let rows = rows_for(&entries, &["Files".to_string(), "Upload".to_string()]);
         assert_eq!(rows, vec![Row::Up, Row::Entry(0), Row::Entry(1)]);
+    }
+
+    #[test]
+    fn a_filtered_list_is_flat_and_matches_on_the_whole_title() {
+        let entries = vec![
+            entry("plain"),
+            entry("Auth/Login"),
+            entry("Auth/Logout"),
+            entry("Files/Upload/Big"),
+        ];
+        // No Up row and no Folder rows: the tree is flattened, so there is
+        // nothing left to descend into.
+        assert_eq!(
+            rows_matching(&entries, "log"),
+            vec![Row::Entry(1), Row::Entry(2)]
+        );
+        // The folder segments are part of the haystack, so a folder name
+        // narrows to that folder without needing a separate gesture.
+        assert_eq!(
+            rows_matching(&entries, "auth/"),
+            vec![Row::Entry(1), Row::Entry(2)]
+        );
+        // Case-insensitive, like every other filter in the app.
+        assert_eq!(rows_matching(&entries, "BIG"), vec![Row::Entry(3)]);
+        assert!(rows_matching(&entries, "nothing").is_empty());
+    }
+
+    #[test]
+    fn a_filter_reaches_requests_the_current_folder_would_hide() {
+        let entries = vec![entry("Auth/Login"), entry("Files/Upload/Big")];
+        // Browsing inside Auth, `rows_for` cannot see the Files request at all
+        // — which is exactly the case a filter exists to solve.
+        let browsing = rows_for(&entries, &["Auth".to_string()]);
+        assert_eq!(browsing, vec![Row::Up, Row::Entry(0)]);
+        assert_eq!(rows_matching(&entries, "upload"), vec![Row::Entry(1)]);
+    }
+
+    #[test]
+    fn an_all_whitespace_query_matches_everything_rather_than_nothing() {
+        let entries = vec![entry("Auth/Login"), entry("plain")];
+        // The query is trimmed, so a lone space (mid-typing, or left behind by
+        // a backspace) must not read as "no request contains a space".
+        assert_eq!(
+            rows_matching(&entries, "   "),
+            vec![Row::Entry(0), Row::Entry(1)]
+        );
     }
 
     #[test]
