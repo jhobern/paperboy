@@ -251,7 +251,13 @@ What changes is how you interact with it:
   first/last request), **Enter** runs it, **F2** renames it and **Delete**
   deletes it (asking first unless you turn the *Confirm deleting a request*
   preference off; **Ctrl+Z** undoes the deletion). A Workspace tab's list is a
-  filesystem tree of mixed row kinds, so it stays mouse-driven.
+  filesystem tree of mixed row kinds rather than a flat request list, so it has
+  a keyboard of its own: the same up/down/Home/End/Enter/F2/Delete, plus
+  **Right**/**Left** to expand and collapse folders and collections (or step in
+  to a child and out to a parent), and **PageUp**/**PageDown** to move ten rows
+  at a time. Each key does exactly what the mouse does on that row kind, and a
+  keyboard cursor — a quiet focus outline, distinct from the highlight on the
+  loaded file — follows the arrows and jumps to whichever row you click.
 - **Most single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
   `n`, `b`, `x`, `u` and `m`/`c` are terminal-only: in a desktop window those
   keys are text you are typing, so the same actions live on the menus, the

@@ -668,6 +668,11 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
 /// Row indentation per tree depth, in pixels.
 const WS_INDENT: f32 = 14.0;
 
+/// A screenful for the tree's PageUp/PageDown. The plain request list binds
+/// neither key, so there is no on-screen page height to match; a fixed jump is
+/// predictable and enough to cross a long tree in a few presses.
+const WS_PAGE_JUMP: usize = 10;
+
 /// An action collected while rendering the (immutably-read) workspace tree,
 /// applied to the session afterwards.
 enum WsAction {
@@ -805,6 +810,43 @@ fn ws_row(ui: &mut egui::Ui, depth: usize, selected: bool, text: RichText) -> eg
     .inner
 }
 
+/// The keyboard cursor's own look: a thin outline around its row, plus the
+/// scroll-into-view a keyboard move asked for.
+///
+/// Deliberately *not* the filled highlight `ws_row` already gives the loaded
+/// file and the open report through its `selected` flag. That flag marks a
+/// *state* — "this is the file the tab has open" — while the cursor is a
+/// *position* that moves on its own and is frequently on a different row.
+/// Reusing the fill would make the two indistinguishable, and a plain move
+/// would read as changing which file is loaded. An outline reads as "focus is
+/// here" instead, and composes with the fill, so one row can be both the loaded
+/// file and under the cursor at once. Its colour is the theme's `accent` (never
+/// a literal), the same focus cue the drag targets and the panel border use.
+///
+/// The ring is drawn only when the panel actually holds focus (`show_ring`): an
+/// unfocused tree showing a cursor would put two "here" marks on screen at once
+/// — the cursor and the loaded-file highlight — competing for the eye when the
+/// keyboard isn't even aimed at the panel.
+fn ws_cursor_decoration(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    show_ring: bool,
+    reveal: bool,
+    theme: &super::theme::GuiTheme,
+) {
+    if show_ring {
+        ui.painter().rect_stroke(
+            resp.rect,
+            4.0,
+            egui::Stroke::new(1.0, theme.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if reveal {
+        resp.scroll_to_me(Some(egui::Align::Center));
+    }
+}
+
 /// Make a tree row draggable, and (for a folder) somewhere a dragged item can
 /// be dropped.
 ///
@@ -930,6 +972,259 @@ fn ws_request_drop_zone(
     }
 }
 
+/// Keyboard for a Workspace tab's file tree — the counterpart to the plain
+/// list's [`GuiApp::handle_list_keys`], for the tree that isn't a flat request
+/// list. Only reached when the Requests panel holds focus and no widget owns
+/// the keyboard (see the call site), so, exactly like the plain list, it stands
+/// down for dialogs and text entry without a second mechanism of its own: the
+/// whole of [`GuiApp::handle_global_keys`] has already returned early while a
+/// dialog is up, and the caller has already checked panel focus and that
+/// nothing is being typed into. That gating is *why* Delete here can never
+/// reach past a rename box to destroy the file behind it.
+///
+/// Every action goes through the same [`WsAction`]s the mouse raises, so the
+/// two input methods can't drift apart, and every key that is handled has
+/// already been consumed by `consume_key` so it doesn't also reach the tab
+/// strip or the ScrollArea behind the tree.
+pub(super) fn handle_ws_tree_keys(app: &mut GuiApp, ctx: &egui::Context, ci: usize) {
+    // Read the rows once and clamp the cursor to them before doing anything
+    // with it: the tree reshapes constantly (a scan refresh, a rename, a
+    // delete), so a cursor saved against an older shape must never index the
+    // new one — a wrong-row Delete is unrecoverable.
+    let rows = app.session.collections[ci].ws_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    let cur = app.session.collections[ci].list_cursor.min(last);
+
+    let (up, down, home, end, pgup, pgdn, left, right, enter, f2, del) = ctx.input_mut(|i| {
+        (
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Home),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::End),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::F2),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
+        )
+    });
+    if !(up || down || home || end || pgup || pgdn || left || right || enter || f2 || del) {
+        return; // nothing for us this frame; leave the cursor exactly as it was
+    }
+
+    // Vertical movement: clamped at both ends, never wrapping, exactly as the
+    // plain list moves — the tree is still a list to step down, whatever its
+    // rows happen to mean.
+    let mut new_cursor = if up {
+        cur.saturating_sub(1)
+    } else if down {
+        (cur + 1).min(last)
+    } else if home {
+        0
+    } else if end {
+        last
+    } else if pgup {
+        cur.saturating_sub(WS_PAGE_JUMP)
+    } else if pgdn {
+        (cur + WS_PAGE_JUMP).min(last)
+    } else {
+        cur
+    };
+
+    let row = &rows[cur];
+    let mut action: Option<WsAction> = None;
+
+    if right {
+        match ws_expansion(row) {
+            // A collapsed folder/collection opens where it stands — the same
+            // action a click raises, so keyboard and mouse can't diverge.
+            Some(false) => action = ws_toggle_action(row),
+            // Already open: step onto the first child. The tree is drawn
+            // depth-first, so the first child is simply the next row, when it is
+            // indented one level deeper than this one.
+            Some(true) => {
+                if cur < last && rows[cur + 1].depth() > row.depth() {
+                    new_cursor = cur + 1;
+                }
+            }
+            // A leaf (a request, report or environment) has nothing to open or
+            // to descend into, so Right does nothing rather than guessing.
+            None => {}
+        }
+    } else if left {
+        match ws_expansion(row) {
+            // Left collapses what the cursor is looking into *before* it leaves
+            // it: the standard tree idiom, and the whole reason Left is worth
+            // binding — a folder can be shut without first walking off it. Only
+            // once nothing is open under the cursor does Left step out.
+            Some(true) => action = ws_toggle_action(row),
+            _ => {
+                if let Some(parent) = ws_parent_of(&rows, cur) {
+                    new_cursor = parent;
+                }
+            }
+        }
+    }
+
+    // Activation and editing, each dispatched by row kind to the very action
+    // the mouse uses. These and the movement keys are mutually exclusive in a
+    // real frame (one key press), so the later assignment simply wins if two
+    // somehow arrive together.
+    if enter {
+        action = ws_enter_action(row);
+    }
+    if f2 {
+        action = ws_rename_action(row);
+    }
+    if del {
+        action = ws_delete_action(row);
+    }
+
+    if let Some(action) = action {
+        apply_ws_action(app, ci, action);
+    }
+    // Place the cursor *after* any action has reshaped the tree, so an action
+    // that repositioned it itself (loading a file runs `sync_ws_cursor`) can't
+    // leave the keyboard cursor somewhere the keypress didn't ask for. Re-clamp
+    // against the *new* row count, for the same reason the read above clamped.
+    let col = &mut app.session.collections[ci];
+    let last = col.list_row_count().saturating_sub(1);
+    col.list_cursor = new_cursor.min(last);
+    // Bring the cursor row into view next frame, as the plain list does for its
+    // selection — a step in a long tree, or Home/End, can land off-screen.
+    app.reveal_selected = true;
+}
+
+/// The expansion state of a workspace row that can hold children: `Some(true)`
+/// when open, `Some(false)` when collapsed, `None` for a leaf (a request,
+/// report or environment) that has none. A collection's `open` flag *is* its
+/// expansion, so it steps and toggles just like a folder.
+fn ws_expansion(row: &WsRow) -> Option<bool> {
+    match row {
+        WsRow::Folder { expanded, .. } | WsRow::RequestFolder { expanded, .. } => Some(*expanded),
+        WsRow::Collection { open, .. } => Some(*open),
+        _ => None,
+    }
+}
+
+/// The action that flips a row's expansion — the very one the mouse raises, so
+/// keyboard and click expand/collapse can't diverge. A folder toggles its
+/// `workspace_expanded` membership; a collection carries its current `open` so
+/// [`apply_ws_action`] toggles from the right state (opening a collapsed file
+/// loads it, exactly as a click does). `None` for a leaf.
+fn ws_toggle_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. } | WsRow::RequestFolder { path, .. } => {
+            Some(WsAction::ToggleFolder(path.clone()))
+        }
+        WsRow::Collection { path, open, .. } => Some(WsAction::ToggleCollection {
+            path: path.clone(),
+            open: *open,
+        }),
+        _ => None,
+    }
+}
+
+/// The row Left steps out to: the nearest row above the cursor with a shallower
+/// depth, i.e. the parent in the tree. `None` at the top level, where there is
+/// no parent to climb to.
+fn ws_parent_of(rows: &[WsRow], cur: usize) -> Option<usize> {
+    let depth = rows[cur].depth();
+    rows[..cur].iter().rposition(|r| r.depth() < depth)
+}
+
+/// What Enter does, per row kind — each mapped to the same [`WsAction`] a click
+/// or double-click raises: a folder toggles, a collection opens/loads (or
+/// closes if already open, exactly as a click does), a request runs, a report
+/// or environment opens. Enter on an environment opens (loads) it without
+/// yanking the Environments panel around, which is what a single click does;
+/// the double-click's reveal is a mouse-only affordance.
+fn ws_enter_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { .. } | WsRow::RequestFolder { .. } | WsRow::Collection { .. } => {
+            ws_toggle_action(row)
+        }
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RunRequest {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+        }),
+        WsRow::Report { path, .. } => Some(WsAction::OpenReport(path.clone())),
+        WsRow::Environment { path, .. } => Some(WsAction::OpenEnv {
+            path: path.clone(),
+            reveal: false,
+        }),
+    }
+}
+
+/// What F2 renames, per row kind. A real file/folder (folder, collection,
+/// report, environment) renames the item on disk through the same dialog the
+/// right-click Rename raises; a request renames its `# name` inside the file
+/// through the plain list's own rename. A virtual request-folder has no file of
+/// its own to rename, so F2 does nothing on it rather than pretending to.
+fn ws_rename_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. }
+        | WsRow::Collection { path, .. }
+        | WsRow::Report { path, .. }
+        | WsRow::Environment { path, .. } => Some(WsAction::RenameItem { path: path.clone() }),
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RequestAction {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+            kind: ReqEdit::Rename,
+        }),
+        WsRow::RequestFolder { .. } => None,
+    }
+}
+
+/// What Delete removes, per row kind. A real file/folder goes through the
+/// always-on disk-delete confirmation (a disk delete has no undo, unlike a
+/// request delete); a request goes through the plain list's delete, which
+/// honours the `confirm_on_delete_request` preference. A virtual request-folder
+/// has no file to delete, so Delete does nothing on it.
+fn ws_delete_action(row: &WsRow) -> Option<WsAction> {
+    match row {
+        WsRow::Folder { path, .. } => Some(WsAction::DeleteItem {
+            path: path.clone(),
+            is_dir: true,
+        }),
+        WsRow::Collection { path, .. }
+        | WsRow::Report { path, .. }
+        | WsRow::Environment { path, .. } => Some(WsAction::DeleteItem {
+            path: path.clone(),
+            is_dir: false,
+        }),
+        WsRow::Request {
+            collection,
+            idx,
+            loaded,
+            ..
+        } => Some(WsAction::RequestAction {
+            collection: collection.clone(),
+            idx: *idx,
+            loaded: *loaded,
+            kind: ReqEdit::Delete,
+        }),
+        WsRow::RequestFolder { .. } => None,
+    }
+}
+
 /// The left-top panel for a Workspace tab: the real filesystem tree under the
 /// workspace root (folders, collection files with inline requests, `.trail`
 /// reports and `.vars` environments), driven by [`WsRow`] exactly like the
@@ -1030,6 +1325,17 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
         .and_then(|e| e.path().map(std::path::Path::to_path_buf));
 
     let mut actions: Vec<WsAction> = Vec::new();
+    // The keyboard cursor's row, clamped to the rows actually on screen: the
+    // tree reshapes constantly (a scan refresh, a collapse, a delete), so an
+    // index saved against an older shape must never be trusted against the new
+    // one. Shown only while the panel holds focus (see `ws_cursor_decoration`),
+    // so an unfocused tree paints no phantom cursor beside the loaded file.
+    let cursor = app.session.collections[ci].list_cursor.min(rows.len() - 1);
+    let show_cursor = app.focus == super::Focus::List;
+    let reveal = app.reveal_selected;
+    // Filled in when a row is clicked, so a mouse click can hand the keyboard
+    // cursor to that row after the render (see the end of this function).
+    let mut click_cursor: Option<usize> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -1054,8 +1360,12 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                 ws_row_menu(&bg, root.clone(), lbl_in_root, s_new, &mut actions);
             }
             let mut folder_rects: Vec<egui::Rect> = Vec::new();
-            for row in &rows {
-                match row {
+            for (row_idx, row) in rows.iter().enumerate() {
+                // Each arm draws its row and yields the row's `Response`, so the
+                // keyboard-cursor ring, the reveal scroll and the click that
+                // hands the cursor to a row are all handled once below rather
+                // than repeated per row kind.
+                let resp: egui::Response = match row {
                     WsRow::Folder {
                         path,
                         name,
@@ -1087,6 +1397,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, true, &mut actions);
                         folder_rects.push(resp.rect);
+                        resp
                     }
                     WsRow::Collection {
                         path,
@@ -1147,6 +1458,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
                     // A virtual folder inside a collection file. It looks and
                     // toggles like a filesystem folder, but deliberately has
@@ -1175,6 +1487,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         if resp.clicked() {
                             actions.push(WsAction::ToggleFolder(path.clone()));
                         }
+                        resp
                     }
                     WsRow::Request {
                         collection,
@@ -1372,6 +1685,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             }
                             ws_request_drop_zone(ui, &resp, &theme, collection, *idx, &mut actions);
                         }
+                        resp
                     }
                     WsRow::Report { path, name, depth } => {
                         let is_open = report_path.as_deref() == Some(path.as_path());
@@ -1401,6 +1715,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
                     WsRow::Environment { path, name, depth } => {
                         let text = RichText::new(format!("{} {name}", super::icons::ENV))
@@ -1428,16 +1743,52 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                             },
                         );
                         ws_drag_and_drop(ui, &resp, &theme, path, false, &mut actions);
+                        resp
                     }
+                };
+                // Common to every row: remember a click so the mouse can hand
+                // the keyboard cursor to it (applied after the render, below),
+                // and — for the cursor row — draw the focus ring and honour a
+                // reveal request. The ring is gated on the panel holding focus;
+                // the reveal is a one-shot from a keyboard move, so it scrolls
+                // whether or not the panel is focused this instant.
+                if resp.clicked() {
+                    click_cursor = Some(row_idx);
                 }
+                ws_cursor_decoration(
+                    ui,
+                    &resp,
+                    show_cursor && row_idx == cursor,
+                    reveal && row_idx == cursor,
+                    &theme,
+                );
             }
             if let Some(root) = &ws_root {
                 ws_root_drop(ui, bg_rect, &folder_rects, &theme, root, &mut actions);
             }
         });
+    // A one-shot, like the plain list's: the cursor row has had its frame to
+    // scroll itself into view, so clear the request whether or not a row
+    // honoured it (an empty or fully-visible tree has nothing to scroll).
+    app.reveal_selected = false;
 
     for action in header_new.into_iter().chain(actions) {
         apply_ws_action(app, ci, action);
+    }
+
+    // A click anywhere in the tree moves the keyboard cursor onto that row, so
+    // the mouse and the keyboard never fight over where "here" is: click a row,
+    // press Down, and the cursor steps from the row you clicked rather than
+    // jumping back to wherever it last was. Applied *after* the actions above
+    // because a few of them (selecting a request, re-expanding the loaded file)
+    // reposition the cursor themselves via `sync_ws_cursor`, and the row the
+    // user actually clicked is the one that should win. Expanding, collapsing
+    // or loading only ever inserts or removes rows *below* the clicked one, so
+    // its index still names the row that was clicked.
+    if let Some(idx) = click_cursor {
+        let col = &mut app.session.collections[ci];
+        let last = col.list_row_count().saturating_sub(1);
+        col.list_cursor = idx.min(last);
     }
 }
 
@@ -2387,7 +2738,7 @@ pub(crate) mod tests {
     /// A workspace fixture shaped like a real one: a nested folder holding two
     /// collection files alongside an environment and a report, so every row
     /// kind the tree can draw is in the frame.
-    fn ws_tmp(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn ws_tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "paperboy_gui_reqs_{tag}_{}_{:?}",
             std::process::id(),
@@ -3538,6 +3889,348 @@ pub(crate) mod tests {
         }
         // Nothing was deleted just by opening the dialog.
         assert!(api.exists(), "the folder is still there until confirmed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Keyboard for the Workspace tab's file tree (`handle_ws_tree_keys`). ---
+
+    /// Feed one key press to the workspace tree handler exactly as a frame
+    /// would, so `consume_key` runs the real input path rather than a poked
+    /// flag. The panel-focus and dialog gating live one level up in
+    /// `handle_global_keys`; those are exercised through the `press` helper in
+    /// `app.rs`, so here the handler is driven directly.
+    fn ws_key(app: &mut GuiApp, ctx: &egui::Context, ci: usize, key: egui::Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input.modifiers = egui::Modifiers::NONE;
+        let _ = ctx.run_ui(input, |ui| handle_ws_tree_keys(app, ui.ctx(), ci));
+    }
+
+    /// The row index of the first folder whose path is `path`.
+    fn folder_row(app: &GuiApp, ci: usize, path: &std::path::Path) -> usize {
+        app.session.collections[ci]
+            .ws_rows()
+            .iter()
+            .position(|r| matches!(r, WsRow::Folder { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no folder row for {}", path.display()))
+    }
+
+    #[test]
+    fn the_workspace_tree_cursor_moves_with_the_arrows_and_clamps_at_both_ends() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeymove");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let last = app.session.collections[ci].ws_rows().len() - 1;
+        assert!(last >= 1, "the fixture lists at least two top-level rows");
+        app.session.collections[ci].list_cursor = 0;
+        let ctx = egui::Context::default();
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowDown);
+        assert_eq!(app.session.collections[ci].list_cursor, 1);
+        assert!(
+            app.reveal_selected,
+            "a keyboard move asks the row into view for the next render"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::End);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, last,
+            "End jumps to the last row"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowDown);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, last,
+            "Down at the bottom clamps rather than wrapping"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::Home);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 0,
+            "Home jumps to the first row"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowUp);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 0,
+            "Up at the top clamps rather than wrapping"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn right_expands_a_collapsed_folder_and_left_collapses_it() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyexpand");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row;
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "the api folder starts collapsed"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowRight);
+        assert!(
+            app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Right expands a collapsed folder"
+        );
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "the cursor stays on the folder it just opened"
+        );
+
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowLeft);
+        assert!(
+            !app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Left collapses the folder it is looking into"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn right_steps_into_an_open_folder_and_left_climbs_to_the_parent() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeytree");
+        let api = dir.join("api");
+        let v1 = dir.join("api/v1");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        // Open `api` so `v1` shows beneath it, but leave `v1` collapsed.
+        session.collections[ci]
+            .workspace_expanded
+            .insert(api.clone());
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        let api_row = folder_row(&app, ci, &api);
+        let v1_row = folder_row(&app, ci, &v1);
+        assert_eq!(v1_row, api_row + 1, "v1 is api's first child in the tree");
+
+        app.session.collections[ci].list_cursor = api_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowRight);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, v1_row,
+            "Right on an already-open folder steps onto its first child"
+        );
+
+        assert!(
+            !app.session.collections[ci].workspace_expanded.contains(&v1),
+            "v1 is collapsed, so Left climbs out rather than closing it"
+        );
+        ws_key(&mut app, &ctx, ci, egui::Key::ArrowLeft);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "Left on a collapsed child climbs to the parent row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_runs_a_request_and_toggles_a_folder() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyenter");
+        let api = dir.join("api");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        // Enter on a folder toggles it open (the same action a click raises).
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::Enter);
+        assert!(
+            app.session.collections[ci]
+                .workspace_expanded
+                .contains(&api),
+            "Enter on a folder toggles it"
+        );
+
+        // Load a file so a request row exists, then Enter on it runs it.
+        assert!(app.session.load_workspace_file(ci, one.clone()));
+        let rows = app.session.collections[ci].ws_rows();
+        let (req_row, idx) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(row, r)| match r {
+                WsRow::Request {
+                    idx, loaded: true, ..
+                } => Some((row, *idx)),
+                _ => None,
+            })
+            .expect("the loaded file lists a request row");
+        app.session.collections[ci].list_cursor = req_row;
+        ws_key(&mut app, &ctx, ci, egui::Key::Enter);
+        assert_eq!(
+            app.session.collections[ci].selected_entry, idx,
+            "Enter selects the request it is about to run"
+        );
+        assert_eq!(
+            app.session.collections[ci].entries[idx].last_run,
+            crate::hurl::RunStatus::Running,
+            "and starts it running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f2_and_delete_reach_the_file_on_a_file_row_and_the_request_on_a_request_row() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyedit");
+        let health = dir.join("health.hurl");
+        let one = dir.join("api/v1/one.hurl");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        // Guard off, so a *request* delete would act at once — the contrast that
+        // proves a *file* delete still always confirms.
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        let ctx = egui::Context::default();
+
+        // --- On a collection *file* row. ---
+        let file_row = app.session.collections[ci]
+            .ws_rows()
+            .iter()
+            .position(|r| matches!(r, WsRow::Collection { path, .. } if path == &health))
+            .expect("health.hurl is a top-level collection row");
+        app.session.collections[ci].list_cursor = file_row;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::F2);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::Rename {
+                    target: RenameTarget::WorkspaceItem { .. },
+                    ..
+                })
+            ),
+            "F2 on a file renames the workspace item, not a request"
+        );
+        app.dialog = None;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::Delete);
+        assert!(
+            matches!(app.dialog, Some(Dialog::DeleteWorkspaceItem { .. })),
+            "Delete on a file always raises the disk-delete confirmation"
+        );
+        assert!(health.exists(), "and nothing is gone until it is confirmed");
+        app.dialog = None;
+
+        // --- On a request row. ---
+        assert!(app.session.load_workspace_file(ci, one.clone()));
+        let rows = app.session.collections[ci].ws_rows();
+        let req_row = rows
+            .iter()
+            .position(|r| matches!(r, WsRow::Request { loaded: true, .. }))
+            .expect("the loaded file lists a request row");
+        app.session.collections[ci].list_cursor = req_row;
+
+        ws_key(&mut app, &ctx, ci, egui::Key::F2);
+        assert!(
+            matches!(
+                app.dialog,
+                Some(Dialog::Rename {
+                    target: RenameTarget::Request { .. },
+                    ..
+                })
+            ),
+            "F2 on a request renames the request"
+        );
+        app.dialog = None;
+
+        let n = app.session.collections[ci].entries.len();
+        ws_key(&mut app, &ctx, ci, egui::Key::Delete);
+        assert!(
+            app.dialog.is_none(),
+            "the request-delete guard is off, so a request delete acts without a prompt"
+        );
+        assert_eq!(
+            app.session.collections[ci].entries.len(),
+            n - 1,
+            "and the request under the cursor is gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clicking_a_tree_row_moves_the_keyboard_cursor_to_it() {
+        redirect_saved_state();
+        let dir = ws_tmp("wskeyclick");
+        let api = dir.join("api");
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
+        let mut app = GuiApp::for_test(session);
+        app.focus = crate::gui::Focus::List;
+
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
+        let frame = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        // Start the cursor on a *different* row than the one about to be clicked.
+        let api_row = folder_row(&app, ci, &api);
+        app.session.collections[ci].list_cursor = api_row + 1;
+
+        // Lay the tree out once so the api folder row's rect is known.
+        let out = ctx.run_ui(frame(Vec::new()), |ui| {
+            crate::gui::requests::ui(&mut app, ui)
+        });
+        let row = texts(&out.shapes)
+            .into_iter()
+            .find(|(t, _)| t.contains("api"))
+            .expect("the api folder row is drawn")
+            .1;
+        let at = egui::pos2(row.center().x, row.center().y);
+
+        let mut events = vec![egui::Event::PointerMoved(at)];
+        for pressed in [true, false] {
+            events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = ctx.run_ui(frame(events), |ui| crate::gui::requests::ui(&mut app, ui));
+
+        assert_eq!(
+            app.session.collections[ci].list_cursor, api_row,
+            "clicking a row hands the keyboard cursor to it, so the two don't fight"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,6 +12,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **The GUI's Workspace tree can be driven from the keyboard.** A plain
+  collection tab's request list already answered to the arrow keys, but a
+  Workspace tab's left pane — the filesystem tree of folders, collection files,
+  reports and environments, with expanded collections' requests nested among
+  them — was mouse-only, so a keyboard user could reach a workspace's contents
+  only by pointing at each row. With the Requests panel focused, the arrows now
+  move a cursor through the tree (Home/End to the ends, PageUp/PageDown ten
+  rows at a time), and, because a tree is not a flat list, **Right** expands a
+  collapsed folder or collection — or steps into its first child once open — and
+  **Left** collapses an open one or climbs to its parent, the idiom every file
+  tree uses. **Enter** does whatever the row is for (toggle a folder, open a
+  collection, run a request, open a report or environment), **F2** renames the
+  file or the request under the cursor, and **Delete** removes it — each through
+  the very same action the mouse raises, so the two can never disagree about
+  what Delete means on a `.trail` file versus a request, and each honouring the
+  same confirmation (a disk delete always asks; a request delete obeys the
+  *Confirm deleting a request* preference). The cursor is drawn as a quiet focus
+  outline rather than the filled highlight that marks the loaded file, since the
+  two are different things that often sit on different rows, and it is shown only
+  while the panel holds focus. Clicking a row moves the cursor onto it, so the
+  mouse and the keyboard never fight over where "here" is, and the bindings stand
+  down entirely while a dialog is open or a text field has the keyboard, so a
+  Delete keystroke can never reach past a dialog you are typing in to the file
+  behind it.
+
 - **`Ctrl+S` saves in the terminal UI.** It is the one shortcut every user
   arrives already knowing, and until now the terminal UI did not bind it at
   all: saving lived under `f` ▸ Save, and the keypress fell through to the

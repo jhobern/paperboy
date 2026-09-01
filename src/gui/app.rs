@@ -1178,18 +1178,18 @@ impl GuiApp {
     ///
     /// A Workspace tab's list is not an ordinary request list but a filesystem
     /// tree of folders, collection files, reports and environments with no
-    /// single "selected request" to step through; giving those rows a keyboard
-    /// is a separate feature, so here the keys are left to the mouse rather than
-    /// guessing what Delete means on a `.trail` file. Everything below is for an
-    /// ordinary collection.
+    /// single "selected request" — so it has a keyboard of its own, one that
+    /// also has to expand and collapse rows and act on whichever kind the cursor
+    /// is on. That lives in [`super::requests::handle_ws_tree_keys`], and this
+    /// hands straight over to it; everything below is for an ordinary
+    /// collection.
     fn handle_list_keys(&mut self, ctx: &egui::Context) {
         let ci = self.active_ci();
-        if self
-            .session
-            .collections
-            .get(ci)
-            .is_none_or(|c| c.is_workspace())
-        {
+        let Some(col) = self.session.collections.get(ci) else {
+            return;
+        };
+        if col.is_workspace() {
+            super::requests::handle_ws_tree_keys(self, ctx, ci);
             return;
         }
         let order = super::requests::nav_entry_order(&self.session.collections[ci]);
@@ -2227,23 +2227,47 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_tabs_list_keys_are_left_to_the_mouse() {
+    fn a_workspace_tree_is_keyboard_driven_but_stands_down_for_dialogs() {
+        // A real workspace fixture (the plain-list tests use hand-built
+        // collections, but the tree scans the filesystem), so its rows are the
+        // ones the keyboard actually steps through.
+        crate::gui::requests::tests::redirect_saved_state();
+        let dir = crate::gui::requests::tests::ws_tmp("appkeyws");
         let mut session = Session::default();
-        {
-            let col = &mut session.collections[0];
-            col.entries = vec![req("a"), req("b")];
-            col.selected_entry = 0;
-            col.workspace_root = Some(std::path::PathBuf::from("/tmp/paperboy-test-ws"));
-        }
+        session.collections.clear();
+        let ci = session.open_workspace(dir.clone());
+        session.active_tab = ci;
         let mut app = GuiApp::for_test(session);
         app.focus = Focus::List;
         let ctx = egui::Context::default();
 
+        assert!(
+            app.session.collections[ci].ws_rows().len() >= 2,
+            "the fixture lists at least two top-level rows for Down to move between"
+        );
+        app.session.collections[ci].list_cursor = 0;
+
+        // The tree now has a keyboard: through the real global-key path the
+        // arrows move its cursor, the same as the plain list's.
         press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
         assert_eq!(
-            app.session.collections[0].selected_entry, 0,
-            "a workspace file tree isn't stepped through here (its rows aren't all requests)"
+            app.session.collections[ci].list_cursor, 1,
+            "a workspace tree steps its cursor with the arrows now"
         );
+
+        // With a dialog up, the whole handler stands down, so the cursor holds
+        // still. This is the guarantee that keeps a Delete keystroke from
+        // reaching past a dialog the user is typing in to the file behind it.
+        app.dialog = Some(Dialog::Prompt {
+            kind: PromptKind::BaseUrl,
+            text: String::new(),
+        });
+        press(&mut app, &ctx, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            app.session.collections[ci].list_cursor, 1,
+            "an open dialog freezes the tree keys entirely"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
