@@ -4,7 +4,6 @@
 //! terminal UI uses). Add / select / rename / delete / run requests, plus
 //! per-collection Run All.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use eframe::egui::{self, RichText};
@@ -85,12 +84,18 @@ fn edited_marker(ui: &mut egui::Ui, entry: &HurlEntry, theme: &GuiTheme, tip: &s
         .on_hover_text(tip);
 }
 
-/// A folder node of the request tree: named subfolders (sorted) and the flat
-/// indices of the requests directly inside this folder (original order).
+/// A folder node of the request tree: its children in the order the file lists
+/// them, folders and requests interleaved.
 #[derive(Default)]
 struct Node {
-    folders: BTreeMap<String, Node>,
-    entries: Vec<usize>,
+    children: Vec<Child>,
+}
+
+/// One row of a [`Node`], either a nested folder or a flat index into the
+/// collection's `entries`.
+enum Child {
+    Folder(String, Node),
+    Entry(usize),
 }
 
 /// The navigable request rows of `col`, in the order they appear on screen, as
@@ -103,7 +108,7 @@ struct Node {
 /// they are absent; the result holds only request indices.
 pub(super) fn nav_entry_order(col: &crate::collection::Collection) -> Vec<usize> {
     if col.list_filter_active() {
-        crate::tree::rows_matching(&col.entries, &col.list_query)
+        col.rows()
             .into_iter()
             .filter_map(|r| match r {
                 crate::tree::Row::Entry(i) => Some(i),
@@ -111,7 +116,7 @@ pub(super) fn nav_entry_order(col: &crate::collection::Collection) -> Vec<usize>
             })
             .collect()
     } else {
-        let tree = build_tree(&col.entries);
+        let tree = build_tree(&col.entries, col.list_sort);
         let mut out = Vec::with_capacity(col.entries.len());
         collect_entry_order(&tree, &mut out);
         out
@@ -119,30 +124,68 @@ pub(super) fn nav_entry_order(col: &crate::collection::Collection) -> Vec<usize>
 }
 
 /// Flatten a folder tree into entry indices the way [`render_node`] renders it:
-/// each subfolder's contents first (recursively), then this level's own
-/// entries.
+/// every child in turn, recursing into folders.
 fn collect_entry_order(node: &Node, out: &mut Vec<usize>) {
-    for child in node.folders.values() {
-        collect_entry_order(child, out);
+    for child in &node.children {
+        match child {
+            Child::Folder(_, sub) => collect_entry_order(sub, out),
+            Child::Entry(i) => out.push(*i),
+        }
     }
-    out.extend(node.entries.iter().copied());
 }
 
 /// Group a collection's entries into a folder tree using their `/`-encoded
 /// titles. The leaf segment is the request's display name; everything before
 /// it is its folder path.
-fn build_tree(entries: &[HurlEntry]) -> Node {
+///
+/// Order is the file's, at every level: a folder is created where its first
+/// request appears and keeps that position, so what is drawn matches what Run
+/// All executes. See [`crate::tree::rows_for`], which the terminal UI builds
+/// the same way. `sort` then reorders each level's children for display only.
+fn build_tree(entries: &[HurlEntry], sort: crate::tree::SortMode) -> Node {
     let mut root = Node::default();
     for (i, e) in entries.iter().enumerate() {
         let path = entry_path(&e.title);
         let (folders, _leaf) = path.split_at(path.len() - 1);
-        let mut node = &mut root;
-        for seg in folders {
-            node = node.folders.entry(seg.clone()).or_default();
-        }
-        node.entries.push(i);
+        insert(&mut root, folders, i);
     }
+    sort_node(&mut root, entries, sort);
     root
+}
+
+/// Reorder every level of the tree by display name. Folders and requests sort
+/// together rather than in separate blocks, so A-Z means what it looks like,
+/// and the sort is stable, so `SortMode::File` leaves the file's order alone.
+fn sort_node(node: &mut Node, entries: &[HurlEntry], sort: crate::tree::SortMode) {
+    let name = |child: &Child| match child {
+        Child::Folder(n, _) => n.clone(),
+        Child::Entry(i) => entries.get(*i).map(crate::tree::leaf_name).unwrap_or_default(),
+    };
+    node.children
+        .sort_by(|a, b| crate::tree::cmp_names(sort, &name(a), &name(b)));
+    for child in &mut node.children {
+        if let Child::Folder(_, sub) = child {
+            sort_node(sub, entries, sort);
+        }
+    }
+}
+
+fn insert(node: &mut Node, folders: &[String], i: usize) {
+    let Some((head, rest)) = folders.split_first() else {
+        node.children.push(Child::Entry(i));
+        return;
+    };
+    let existing = node
+        .children
+        .iter_mut()
+        .find(|c| matches!(c, Child::Folder(name, _) if name == head));
+    if let Some(Child::Folder(_, sub)) = existing {
+        insert(sub, rest, i);
+        return;
+    }
+    let mut sub = Node::default();
+    insert(&mut sub, rest, i);
+    node.children.push(Child::Folder(head.clone(), sub));
 }
 
 /// Actions collected while rendering the (immutably-borrowed) tree, applied to
@@ -190,27 +233,51 @@ fn render_node(
     theme: &GuiTheme,
     id_prefix: &str,
     labels: &RowLabels<'_>,
+    reorderable: bool,
     actions: &mut Actions,
 ) {
-    for (name, child) in &node.folders {
-        let salt = format!("{id_prefix}/{name}");
-        super::widgets::tree_header(
-            ui,
-            &salt,
-            true,
-            RichText::new(format!("{} {name}", super::icons::FOLDER)).color(theme.text),
-            |ui| {
-                render_node(
-                    ui, child, entries, selected, reveal, theme, &salt, labels, actions,
+    for child in &node.children {
+        match child {
+            Child::Folder(name, sub) => {
+                let salt = format!("{id_prefix}/{name}");
+                super::widgets::tree_header(
+                    ui,
+                    &salt,
+                    true,
+                    RichText::new(format!("{} {name}", super::icons::FOLDER)).color(theme.text),
+                    |ui| {
+                        render_node(
+                            ui,
+                            sub,
+                            entries,
+                            selected,
+                            reveal,
+                            theme,
+                            &salt,
+                            labels,
+                            reorderable,
+                            actions,
+                        );
+                    },
                 );
-            },
-        );
-    }
-    for &i in &node.entries {
-        let leaf = entry_path(&entries[i].title).pop().unwrap_or_default();
-        render_entry_row(
-            ui, i, entries, leaf, selected, reveal, theme, labels, true, actions,
-        );
+            }
+            Child::Entry(i) => {
+                let i = *i;
+                let leaf = crate::tree::leaf_name(&entries[i]);
+                render_entry_row(
+                    ui,
+                    i,
+                    entries,
+                    leaf,
+                    selected,
+                    reveal,
+                    theme,
+                    labels,
+                    reorderable,
+                    actions,
+                );
+            }
+        }
     }
 }
 
@@ -222,10 +289,10 @@ fn render_node(
 /// supply the rest) but its whole title when filtered, where the tree has been
 /// flattened and two folders may each hold a `Login`.
 ///
-/// `reorderable` is false while the list is filtered: the gap between two
-/// matches can span any number of requests that aren't on screen, so a drop
-/// there would move the request an unpredictable distance for reasons the user
-/// can't see.
+/// `reorderable` is false while the list is filtered or sorted: in both, the
+/// gap between two rows can span any number of requests that aren't beside
+/// them in the file, so a drop there would move the request an unpredictable
+/// distance for reasons the user can't see.
 #[allow(clippy::too_many_arguments)]
 fn render_entry_row(
     ui: &mut egui::Ui,
@@ -459,6 +526,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     );
     let (hint_filter, lbl_filter_no_matches) =
         (s.gui_request_filter_hint, s.gui_request_filter_no_matches);
+    let (lbl_sort_file, lbl_sort_alpha, lbl_sort_reverse, tip_sort) = (
+        s.gui_sort_file,
+        s.gui_sort_alpha,
+        s.gui_sort_reverse,
+        s.help_sort_button,
+    );
 
     // Header: collection name (truncates) + Run All / Add (always visible).
     let name = app.session.collections[ci].name.clone();
@@ -485,19 +558,42 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     });
     ui.separator();
 
-    // Filter box. Shown whenever there is more than one request, and always
-    // once it is: the same reasoning as the Environments panel's, where an
-    // empty box costs one line and a tree of a few hundred requests is
-    // unusable without one. Hidden for a collection small enough to read at a
-    // glance, where it would be a control with nothing to do.
+    // Filter box and sort button. Shown whenever there is more than one
+    // request, and always once it is: the same reasoning as the Environments
+    // panel's, where an empty box costs one line and a tree of a few hundred
+    // requests is unusable without one. Hidden for a collection small enough
+    // to read at a glance, where they would be controls with nothing to do.
     if app.session.collections[ci].entries.len() > 1 {
         ui.horizontal(|ui| {
-            super::widgets::flat_fields(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.session.collections[ci].list_query)
-                        .hint_text(hint_filter)
-                        .desired_width(f32::INFINITY),
-                )
+            // Right-to-left so the button takes its natural width first and
+            // the filter's `desired_width(INFINITY)` fills whatever is left,
+            // instead of claiming the row and pushing the button off it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let sort = app.session.collections[ci].list_sort;
+                let (icon, label) = match sort {
+                    crate::tree::SortMode::File => (super::icons::SORT_FILE, lbl_sort_file),
+                    crate::tree::SortMode::Alpha => (super::icons::SORT_ASC, lbl_sort_alpha),
+                    crate::tree::SortMode::ReverseAlpha => {
+                        (super::icons::SORT_DESC, lbl_sort_reverse)
+                    }
+                };
+                // The icon alone can't say which of three states the button is
+                // in, so the current mode is named in the tooltip above the
+                // explanation.
+                if ui
+                    .button(icon)
+                    .on_hover_text(format!("{label}\n\n{tip_sort}"))
+                    .clicked()
+                {
+                    app.session.collections[ci].list_sort = sort.next();
+                }
+                super::widgets::flat_fields(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.session.collections[ci].list_query)
+                            .hint_text(hint_filter)
+                            .desired_width(f32::INFINITY),
+                    )
+                });
             });
         });
         ui.separator();
@@ -506,6 +602,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let selected = app.session.collections[ci].selected_entry;
     let reveal = app.reveal_selected;
     let filtering = app.session.collections[ci].list_filter_active();
+    let sort = app.session.collections[ci].list_sort;
     let query = app.session.collections[ci].list_query.clone();
     let mut actions = Actions::default();
 
@@ -549,7 +646,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 });
                 return;
             }
-            let tree = build_tree(entries);
+            let tree = build_tree(entries, sort);
             let labels = RowLabels {
                 untitled: lbl_untitled,
                 run: lbl_run,
@@ -565,7 +662,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // found. Each match carries its whole title instead, since the
             // folder rows that told two `Login`s apart are gone.
             if filtering {
-                let matches = crate::tree::rows_matching(entries, &query);
+                let mut matches = crate::tree::rows_matching(entries, &query);
+                crate::tree::sort_rows(&mut matches, entries, sort);
                 if matches.is_empty() {
                     ui.add_space(8.0);
                     ui.colored_label(theme.dim, lbl_filter_no_matches);
@@ -600,6 +698,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 &theme,
                 "req",
                 &labels,
+                sort == crate::tree::SortMode::File,
                 &mut actions,
             );
         });
@@ -3400,21 +3499,63 @@ pub(crate) mod tests {
         }
     }
 
-    /// The tree keyboard steps through requests in the order they are drawn:
-    /// each folder's contents before the entries beside it, so Up/Down move to
-    /// the row the eye expects rather than the raw `entries` order.
+    /// The tree keyboard steps through requests in the order they are drawn,
+    /// which is the order the file lists them: a folder sits where its first
+    /// request does, so Up/Down move to the row the eye expects.
     #[test]
-    fn nav_entry_order_walks_the_tree_as_it_is_rendered() {
+    fn nav_entry_order_follows_the_file_order() {
         let mut session = crate::session::Session::default();
         session.collections[0].entries = vec![
             entry("Root"),
+            entry("Users/List"),
             entry("Auth/Login"),
             entry("Auth/Logout"),
-            entry("Users/List"),
         ];
         let col = &session.collections[0];
-        // Auth (0..) then Users, each folder's entries, then the root entry.
-        assert_eq!(nav_entry_order(col), vec![1, 2, 3, 0]);
+        // Users comes first because its request does, not because of its name,
+        // and the loose root request keeps the top slot the file gave it.
+        assert_eq!(nav_entry_order(col), vec![0, 1, 2, 3]);
+    }
+
+    /// A folder is drawn once, where it first appears, and later requests from
+    /// it join that folder rather than opening a second one further down.
+    #[test]
+    fn nav_entry_order_reuses_a_folder_that_the_file_returns_to() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        let col = &session.collections[0];
+        assert_eq!(nav_entry_order(col), vec![0, 2, 1]);
+    }
+
+    /// The sort button reorders the drawn tree at every level, so the keyboard
+    /// has to walk it the same way or Up/Down would jump around the screen.
+    #[test]
+    fn nav_entry_order_follows_the_sort_mode() {
+        let mut session = crate::session::Session::default();
+        session.collections[0].entries = vec![
+            entry("Zed/One"),
+            entry("loose"),
+            entry("Abe/Solo"),
+            entry("Zed/Two"),
+        ];
+        let order = |s: &crate::session::Session| nav_entry_order(&s.collections[0]);
+
+        assert_eq!(order(&session), vec![0, 3, 1, 2], "the file's own order");
+
+        session.collections[0].list_sort = crate::tree::SortMode::Alpha;
+        // Abe, the loose request, then Zed with its own two sorted inside it.
+        assert_eq!(order(&session), vec![2, 1, 0, 3]);
+
+        session.collections[0].list_sort = crate::tree::SortMode::ReverseAlpha;
+        assert_eq!(order(&session), vec![3, 0, 1, 2]);
+
+        // Back to the file's order, not to whatever the last sort left behind.
+        session.collections[0].list_sort = crate::tree::SortMode::File;
+        assert_eq!(order(&session), vec![0, 3, 1, 2]);
     }
 
     /// While filtered the list is flat — folders are gone — so the keyboard

@@ -12,6 +12,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The requests list is now in the collection's own order.** Folders were
+  sorted alphabetically and hoisted above the loose requests, in both UIs, so
+  the list on screen could bear no resemblance to the file it came from — and
+  a `.hurl` collection is a *sequence*: requests that capture a token for the
+  ones below them have to run in that order, which is the order Run All uses.
+  Rows now follow the file exactly, a folder appearing where its first request
+  does and holding that position for the rest of its requests.
+
 - **The GUI's response body can be selected again, and double-click selects a
   word.** It was drawn with `.interactive(false)` to keep it read-only, which
   in egui also removes selection — so the one panel whose entire purpose is

@@ -929,6 +929,10 @@ strings! {
     gui_env_filter_no_matches => "No environment matches the filter.", "Aucun environnement ne correspond au filtre.", "Intet miljø matcher filteret.";
     gui_request_filter_hint => "Find a request…", "Chercher une requête…", "Find en forespørgsel…";
     gui_request_filter_no_matches => "No request matches the filter.", "Aucune requête ne correspond au filtre.", "Ingen forespørgsel matcher filteret.";
+    gui_sort_file => "Sorting: file order", "Tri : ordre du fichier", "Sortering: filens rækkefølge";
+    gui_sort_alpha => "Sorting: A-Z", "Tri : A-Z", "Sortering: A-Å";
+    gui_sort_reverse => "Sorting: Z-A", "Tri : Z-A", "Sortering: Å-A";
+    help_sort_button => "Click to change how the list is ordered: file order, A-Z, Z-A. Display only — the file and Run All always follow the file's order. Requests can only be dragged to a new position in file order.", "Cliquez pour changer l'ordre de la liste : ordre du fichier, A-Z, Z-A. Affichage seulement — le fichier et Tout exécuter suivent toujours l'ordre du fichier. Les requêtes ne peuvent être déplacées que dans l'ordre du fichier.", "Klik for at ændre listens rækkefølge: filens rækkefølge, A-Å, Å-A. Kun visning — filen og Kør alle følger altid filens rækkefølge. Forespørgsler kan kun trækkes til en ny position i filens rækkefølge.";
     gui_env_source_all => "All", "Tous", "Alle";
     gui_env_source_global => "Global", "Global", "Global";
     gui_env_source_workspace => "Workspace", "Workspace", "Workspace";

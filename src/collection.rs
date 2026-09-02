@@ -435,6 +435,12 @@ pub struct Collection {
     /// would present a collection that looks like it has lost most of its
     /// requests, with the reason parked in a strip nobody has looked at yet.
     pub list_query: String,
+    /// How the Requests list orders its rows (see [`crate::tree::SortMode`]).
+    /// Purely a view over the same entries — sorting never touches the file or
+    /// the order Run All sends in. Runtime-only, like `folder` and
+    /// `list_cursor`: a sort restored from a previous session would silently
+    /// misrepresent a freshly-opened file's order.
+    pub list_sort: tree::SortMode,
     /// Requests removed with `x` (List pane), most-recently-deleted last, so
     /// `u` (List pane) can bring them back in order — the exact parallel of
     /// [`crate::tui::app::TuiApp::closed_tabs`] for individual requests
@@ -621,6 +627,7 @@ impl Collection {
             folder: Vec::new(),
             list_cursor: 0,
             list_query: String::new(),
+            list_sort: tree::SortMode::default(),
             deleted_entries: Vec::new(),
             workspace_root: None,
             workspace_filter_hurl_json: true,
@@ -674,11 +681,13 @@ impl Collection {
     /// browsed, or — while a filter is typed — every match across the whole
     /// collection.
     pub fn rows(&self) -> Vec<Row> {
-        if self.list_filter_active() {
+        let mut rows = if self.list_filter_active() {
             tree::rows_matching(&self.entries, &self.list_query)
         } else {
             tree::rows_for(&self.entries, &self.folder)
-        }
+        };
+        tree::sort_rows(&mut rows, &self.entries, self.list_sort);
+        rows
     }
 
     /// How many rows the left-hand list pane is showing, whichever kind of tab

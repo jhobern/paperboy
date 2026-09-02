@@ -7,7 +7,81 @@
 //! given folder, you see its direct subfolders and direct requests, never a
 //! deep indented tree.
 
+use std::cmp::Ordering;
+
 use crate::hurl::HurlEntry;
+
+/// How the Requests list orders its rows.
+///
+/// View state, not a property of the collection: sorting changes what the list
+/// looks like, never what the file says or what Run All executes. Cycled by the
+/// GUI's sort button; the terminal UI leaves it at the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub enum SortMode {
+    /// The order the file lists its requests in. The default, because a
+    /// `.hurl` collection is a sequence and that sequence is what runs.
+    #[default]
+    File,
+    /// By display name, A-Z.
+    Alpha,
+    /// By display name, Z-A.
+    ReverseAlpha,
+}
+
+impl SortMode {
+    /// The next mode the sort button steps to, wrapping back to `File` so the
+    /// file's own order is always at most two clicks away.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn next(self) -> Self {
+        match self {
+            Self::File => Self::Alpha,
+            Self::Alpha => Self::ReverseAlpha,
+            Self::ReverseAlpha => Self::File,
+        }
+    }
+}
+
+/// The name a request shows in the list: the leaf of its `/`-encoded title,
+/// since the folder rows above it supply the rest.
+pub fn leaf_name(entry: &HurlEntry) -> String {
+    entry_path(&entry.title).pop().unwrap_or_default()
+}
+
+/// Order two display names under `mode`, case-insensitively.
+///
+/// `File` reports every pair equal, which is what makes a *stable* sort under
+/// it a no-op — so callers need no special case, and switching back to `File`
+/// restores the file's order rather than some previous sort's leftovers.
+pub fn cmp_names(mode: SortMode, a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    match mode {
+        SortMode::File => Ordering::Equal,
+        SortMode::Alpha => a.cmp(&b),
+        SortMode::ReverseAlpha => b.cmp(&a),
+    }
+}
+
+/// Reorder `rows` in place under `mode`.
+///
+/// `Row::Up` is pinned to the top whichever way the rest is ordered: it is the
+/// way out of the folder, not one of its contents, and a "go up" row that sank
+/// to the bottom under Z-A would be a trap. Folders and requests sort together
+/// by the name on screen rather than in separate blocks, so A-Z means what it
+/// looks like.
+pub fn sort_rows(rows: &mut [Row], entries: &[HurlEntry], mode: SortMode) {
+    let name = |row: &Row| match row {
+        Row::Up => String::new(),
+        Row::Folder(n) => n.clone(),
+        Row::Entry(i) => entries.get(*i).map(leaf_name).unwrap_or_default(),
+    };
+    rows.sort_by(|a, b| {
+        let pinned = |r: &Row| u8::from(!matches!(r, Row::Up));
+        pinned(a)
+            .cmp(&pinned(b))
+            .then_with(|| cmp_names(mode, &name(a), &name(b)))
+    });
+}
 
 /// Split a request title into its folder path, e.g. `"Auth/Login"` →
 /// `["Auth", "Login"]`. Always returns at least one element (the leaf name,
@@ -40,32 +114,34 @@ pub enum Row {
 }
 
 /// The rows to show for `folder` (the current breadcrumb path, root = `[]`):
-/// an optional `Up` row, then every direct subfolder (alphabetical,
-/// deduplicated), then every direct request, in original order.
+/// an optional `Up` row, then this folder's direct requests and subfolders
+/// **in the order the file lists them**, a subfolder appearing where its first
+/// request does.
+///
+/// The file is the source of truth for order: a `.hurl` collection is a
+/// sequence, requests that share state have to run in sequence, and the author
+/// put them in that sequence deliberately. Sorting the folders, or hoisting
+/// them above the loose requests, would show a different collection to the one
+/// on disk and to the one Run All executes.
 pub fn rows_for(entries: &[HurlEntry], folder: &[String]) -> Vec<Row> {
-    let mut folders: Vec<String> = Vec::new();
-    let mut leaves: Vec<usize> = Vec::new();
+    let mut rows = Vec::with_capacity(entries.len() + 1);
+    if !folder.is_empty() {
+        rows.push(Row::Up);
+    }
     for (i, e) in entries.iter().enumerate() {
         let path = entry_path(&e.title);
         if path.len() <= folder.len() || path[..folder.len()] != *folder {
             continue;
         }
         if path.len() == folder.len() + 1 {
-            leaves.push(i);
+            rows.push(Row::Entry(i));
         } else {
-            let name = &path[folder.len()];
-            if !folders.contains(name) {
-                folders.push(name.clone());
+            let row = Row::Folder(path[folder.len()].clone());
+            if !rows.contains(&row) {
+                rows.push(row);
             }
         }
     }
-    folders.sort();
-    let mut rows = Vec::with_capacity(folders.len() + leaves.len() + 1);
-    if !folder.is_empty() {
-        rows.push(Row::Up);
-    }
-    rows.extend(folders.into_iter().map(Row::Folder));
-    rows.extend(leaves.into_iter().map(Row::Entry));
     rows
 }
 
@@ -136,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn root_rows_show_top_level_requests_and_folders_without_an_up_row() {
+    fn root_rows_interleave_folders_and_requests_in_file_order() {
         let entries = vec![
             entry("plain"),
             entry("Auth/Login"),
@@ -144,12 +220,27 @@ mod tests {
             entry("Files/Upload/Big"),
         ];
         let rows = rows_for(&entries, &[]);
+        // `plain` is first because the file puts it first, and Auth precedes
+        // Files for the same reason, not alphabetically.
         assert_eq!(
             rows,
             vec![
+                Row::Entry(0),
                 Row::Folder("Auth".into()),
                 Row::Folder("Files".into()),
-                Row::Entry(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_folder_keeps_the_position_of_its_first_request() {
+        let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
+        assert_eq!(
+            rows_for(&entries, &[]),
+            vec![
+                Row::Folder("Zed".into()),
+                Row::Entry(1),
+                Row::Folder("Abe".into()),
             ]
         );
     }
@@ -159,17 +250,17 @@ mod tests {
         let entries = vec![
             entry("plain"),
             entry("Auth/Login"),
-            entry("Auth/Logout"),
             entry("Auth/Tokens/Refresh"),
+            entry("Auth/Logout"),
         ];
         let rows = rows_for(&entries, &["Auth".to_string()]);
         assert_eq!(
             rows,
             vec![
                 Row::Up,
-                Row::Folder("Tokens".into()),
                 Row::Entry(1),
-                Row::Entry(2)
+                Row::Folder("Tokens".into()),
+                Row::Entry(3)
             ]
         );
     }
@@ -225,6 +316,63 @@ mod tests {
             rows_matching(&entries, "   "),
             vec![Row::Entry(0), Row::Entry(1)]
         );
+    }
+
+    #[test]
+    fn sorting_orders_folders_and_requests_together_and_pins_the_up_row() {
+        let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
+        let mut rows = rows_for(&entries, &[]);
+
+        sort_rows(&mut rows, &entries, SortMode::Alpha);
+        assert_eq!(
+            rows,
+            vec![
+                Row::Folder("Abe".into()),
+                Row::Entry(1),
+                Row::Folder("Zed".into()),
+            ],
+            "folders and requests sort into one A-Z run, not separate blocks"
+        );
+
+        sort_rows(&mut rows, &entries, SortMode::ReverseAlpha);
+        assert_eq!(
+            rows,
+            vec![
+                Row::Folder("Zed".into()),
+                Row::Entry(1),
+                Row::Folder("Abe".into()),
+            ]
+        );
+
+        // The Up row is the way out of a folder, not one of its contents, so
+        // it stays on top even when everything else is reversed.
+        let mut nested = rows_for(&entries, &["Zed".to_string()]);
+        sort_rows(&mut nested, &entries, SortMode::ReverseAlpha);
+        assert_eq!(nested.first(), Some(&Row::Up));
+    }
+
+    #[test]
+    fn file_order_is_restored_by_switching_back_rather_than_left_half_sorted() {
+        let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
+        let mut rows = rows_for(&entries, &[]);
+        let original = rows.clone();
+        sort_rows(&mut rows, &entries, SortMode::Alpha);
+        // `File` compares every pair equal and the sort is stable, so it is a
+        // no-op over whatever order the rows are already in — which only gets
+        // back to the file's order because `Collection::rows` rebuilds them.
+        sort_rows(&mut rows, &entries, SortMode::File);
+        assert_ne!(rows, original);
+        let mut fresh = rows_for(&entries, &[]);
+        sort_rows(&mut fresh, &entries, SortMode::File);
+        assert_eq!(fresh, original);
+    }
+
+    #[test]
+    fn the_sort_button_cycles_back_to_file_order() {
+        assert_eq!(SortMode::default(), SortMode::File);
+        assert_eq!(SortMode::File.next(), SortMode::Alpha);
+        assert_eq!(SortMode::Alpha.next(), SortMode::ReverseAlpha);
+        assert_eq!(SortMode::ReverseAlpha.next(), SortMode::File);
     }
 
     #[test]

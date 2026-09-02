@@ -961,8 +961,9 @@ fn the_delete_confirmation_is_not_raised_on_a_folder_row() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
-    // Row 0 at the root of a foldered collection is a folder, not an entry.
-    app.collections[0].list_cursor = 0;
+    // Row 0 at the root of a foldered collection may be an entry now that rows
+    // follow file order, so ask the tree which row actually holds the folder.
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
 
     press(&mut app, KeyCode::Char('x'));
 
@@ -14910,28 +14911,34 @@ fn row_of_entry(col: &Collection, title: &str) -> usize {
         .unwrap_or_else(|| panic!("entry {title:?} is not visible in the current folder"))
 }
 
+/// Arrow keys step through folder and entry rows alike, but `selected_entry`
+/// only follows when the cursor lands on a row that actually holds a request.
 #[test]
-fn down_arrow_steps_through_folder_and_entry_rows_at_the_root() {
+fn arrows_step_through_folder_and_entry_rows_at_the_root() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
 
-    // Root view: "A" (folder, alphabetically first) then "root" (entry).
+    // Root view, in file order: "root" (entry) then "A" (folder).
     let folder_row = row_of_folder(&app.collections[0], "A");
     let root_row = row_of_entry(&app.collections[0], "root");
-    app.collections[0].list_cursor = folder_row;
-
-    press(&mut app, KeyCode::Down);
-    assert_eq!(
-        app.collections[0].list_cursor, root_row,
-        "Down moves to the next row (the leaf request)"
-    );
-    // Selected_entry only updates when landing on an actual entry row.
     let root_idx = app.collections[0]
         .entries
         .iter()
         .position(|e| e.title == "root")
         .unwrap();
+    app.collections[0].list_cursor = root_row;
+    app.collections[0].selected_entry = 3;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.collections[0].list_cursor, folder_row);
+    assert_eq!(
+        app.collections[0].selected_entry, 3,
+        "a folder row holds no request, so the selection stays put"
+    );
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.collections[0].list_cursor, root_row);
     assert_eq!(app.collections[0].selected_entry, root_idx);
 }
 
