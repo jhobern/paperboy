@@ -1833,7 +1833,11 @@ impl TuiApp {
             return;
         }
         let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
+        let in_envs = self.envs_defining_keys(col_idx, &undefined);
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
+            keys: undefined,
+            in_envs,
+        });
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1886,7 +1890,11 @@ impl TuiApp {
             return;
         }
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
+        let in_envs = self.envs_defining_keys(col_idx, &undefined);
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
+            keys: undefined,
+            in_envs,
+        });
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.

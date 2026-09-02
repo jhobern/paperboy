@@ -17977,7 +17977,7 @@ fn run_entry_reports_undefined_variables_without_blocking() {
     app.run_entry(1);
 
     assert!(
-        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars { ref keys, .. }) if keys == &vec!["MISSING".to_string()]),
         "the unknown variable must be named, got {:?}",
         app.status
     );
@@ -18006,7 +18006,7 @@ fn run_all_streaming_cookie_note_does_not_hide_undefined_variables() {
     app.run_all_entries(1);
 
     assert!(
-        matches!(app.status, Some(crate::i18n::Status::UndefinedVars(ref k)) if k == &vec!["MISSING".to_string()]),
+        matches!(app.status, Some(crate::i18n::Status::UndefinedVars { ref keys, .. }) if keys == &vec!["MISSING".to_string()]),
         "undefined variables must outrank the cookie note, got {:?}",
         app.status
     );
@@ -18048,6 +18048,64 @@ fn run_entry_says_nothing_when_every_variable_is_defined() {
 
     app.run_entry(1);
 
+    assert!(app.status.is_none(), "got {:?}", app.status);
+}
+
+/// Loading a `.vars` file only adds it to the Environments list, so nothing is
+/// substituted and every variable reads as undefined. Naming the variables
+/// alone is indistinguishable from a typo; the report has to name the
+/// environment sitting there unused.
+#[test]
+fn undefined_variables_name_a_loaded_environment_that_defines_them() {
+    use crate::environment::{EnvVar, Environment, ValueSource};
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://192.0.2.1:81/{{ HOST }}".into(),
+        ..Default::default()
+    };
+    let env = Environment {
+        id: 0,
+        name: "prod.vars".into(),
+        vars: vec![EnvVar {
+            key: "HOST".into(),
+            value: "example.net".into(),
+            source: ValueSource::Literal,
+            resolved: true,
+            loading: false,
+            original_value: "example.net".into(),
+            modified: false,
+            user_added: false,
+            raw: String::new(),
+        }],
+        path: None,
+        git_origin: None,
+    };
+
+    let mut app = TuiApp::default();
+    // Loaded, but deliberately neither activated nor linked.
+    add_global_env(&mut app, env);
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+
+    app.run_entry(1);
+
+    let Some(crate::i18n::Status::UndefinedVars { keys, in_envs }) = app.status.clone() else {
+        panic!(
+            "expected an undefined-variable report, got {:?}",
+            app.status
+        );
+    };
+    assert_eq!(keys, vec!["HOST".to_string()]);
+    assert_eq!(
+        in_envs,
+        vec!["prod.vars".to_string()],
+        "the loaded-but-unused environment must be named"
+    );
+
+    // Once it is in use, nothing is reported at all.
+    let env_id = app.global_envs[0].id;
+    app.set_active_env(Some(env_id));
+    app.run_entry(1);
     assert!(app.status.is_none(), "got {:?}", app.status);
 }
 

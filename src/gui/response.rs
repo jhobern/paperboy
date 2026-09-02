@@ -189,17 +189,22 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 } else if body.is_empty() {
                     ui.colored_label(theme.dim, lbl_empty_body);
                 } else {
-                    let mut text = if app.response_compact {
+                    let text = if app.response_compact {
                         crate::shared_utils::compact_long_strings(&body[..])
                     } else {
                         body.to_string()
                     };
+                    // `&mut &str`, not `&mut String`: `TextBuffer for &str`
+                    // reports `is_mutable() == false`, so the field stays
+                    // read-only while remaining interactive - which is what
+                    // gives it selection, word-on-double-click and Ctrl+C.
+                    // `interactive(false)` takes those away too.
                     ui.add(
-                        egui::TextEdit::multiline(&mut text)
+                        egui::TextEdit::multiline(&mut text.as_str())
+                            .id(egui::Id::new("resp_body"))
                             .code_editor()
                             .desired_width(f32::INFINITY)
-                            .desired_rows(12)
-                            .interactive(false),
+                            .desired_rows(12),
                     );
                 }
             }
@@ -358,6 +363,93 @@ mod tests {
         let (shown, loading) = selected_response(&session, 0);
         assert!(shown.is_none());
         assert!(!loading);
+    }
+
+    /// Read-only must not mean unselectable: the one panel whose whole purpose
+    /// is text to copy out of was the one panel that could not be dragged
+    /// across.
+    #[test]
+    fn double_clicking_the_response_body_selects_the_word_under_the_pointer() {
+        let mut app = GuiApp::for_test(session_with_two_answered_requests());
+        app.response_section = ResponseSection::Body;
+
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut frame = |app: &mut GuiApp, events: Vec<egui::Event>| {
+            let mut input = egui::RawInput::default();
+            input.time = Some(time);
+            time += 0.05;
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(600.0, 400.0),
+            ));
+            input.events = events;
+            ctx.run_ui(input, |panel| super::ui(app, panel)).shapes
+        };
+
+        // The first frame only locates the body text; the next two are the
+        // double-click's two clicks, which egui pairs by time.
+        let shapes = frame(&mut app, Vec::new());
+        let pos = body_text_pos(&shapes).expect("the body must be drawn");
+        frame(&mut app, click_at(pos));
+        frame(&mut app, click_at(pos));
+
+        let state = egui::text_edit::TextEditState::load(&ctx, egui::Id::new("resp_body"))
+            .expect("the body must be a real, interactive TextEdit");
+        let range = state
+            .cursor
+            .char_range()
+            .expect("a double-click must leave a selection");
+        let (a, b) = (
+            range.primary.index.0.min(range.secondary.index.0),
+            range.primary.index.0.max(range.secondary.index.0),
+        );
+        assert_eq!(
+            &"first body"[a..b],
+            "first",
+            "a word, not a character and not the whole line"
+        );
+    }
+
+    fn body_text_pos(shapes: &[egui::epaint::ClippedShape]) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::epaint::Shape::Text(t) if out.is_none() => {
+                    if t.galley.text().contains("first body") {
+                        // Two characters in: inside "first", clear of the edge
+                        // where rounding could land the cursor on the word
+                        // before it.
+                        let h = t.galley.size().y;
+                        *out = Some(t.pos + egui::vec2(2.0 * h * 0.5, h * 0.5));
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
     }
 }
 

@@ -421,6 +421,7 @@ strings! {
     subst_hint_missing => "missing", "manquant", "mangler";
     subst_hint_undefined => "undefined", "non défini", "udefineret";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
+    env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
     gui_undefined_banner_many => "{n} variables in this request are undefined", "{n} variables de cette requête ne sont pas définies", "{n} variabler i denne anmodning er udefinerede";
     subst_hint_shadowed => "shadowed by linked env", "masqué par l'environnement lié", "skygget af tilknyttet miljø";
@@ -1644,7 +1645,14 @@ pub enum Status {
     /// refusal to send — Hurl will happily put `{{ tokn }}` on the wire — but
     /// the resulting failure arrives as an unexplained 401 several steps later,
     /// so the cause is named at the moment it is introduced.
-    UndefinedVars(Vec<String>),
+    ///
+    /// `in_envs` names any loaded Global Environment that defines one of them
+    /// but is neither active nor linked: the difference between a typo and a
+    /// file the user loaded and assumed was in use.
+    UndefinedVars {
+        keys: Vec<String>,
+        in_envs: Vec<String>,
+    },
     /// The run was refused because these requests carry both a raw body and
     /// form fields, which Hurl sends as neither (the body silently replaces the
     /// form). Blocking rather than advisory: the request would otherwise appear
@@ -1950,8 +1958,16 @@ impl Status {
             Status::WaitingSecrets(keys) => {
                 format!("{} {}", s.env_waiting_secrets, keys.join(", "))
             }
-            Status::UndefinedVars(keys) => {
-                format!("{} {}", s.env_undefined_vars, keys.join(", "))
+            Status::UndefinedVars { keys, in_envs } => {
+                let mut out = format!("{} {}", s.env_undefined_vars, keys.join(", "));
+                if !in_envs.is_empty() {
+                    out.push(' ');
+                    out.push_str(
+                        &s.env_undefined_in_loaded_env
+                            .replace("{envs}", &in_envs.join(", ")),
+                    );
+                }
+                out
             }
             Status::BodyFormConflict(names) => {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))

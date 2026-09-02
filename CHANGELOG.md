@@ -8,6 +8,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.2] - 2026-09-02
+
+### Changed
+
+- **The GUI's response body can be selected again, and double-click selects a
+  word.** It was drawn with `.interactive(false)` to keep it read-only, which
+  in egui also removes selection — so the one panel whose entire purpose is
+  text you want to copy out of was the one panel you could not drag across.
+  Backing it with `&str` (read-only *and* interactive) restores egui's own text
+  selection: double-click a word, triple-click a line, drag a range, Ctrl+A,
+  Ctrl+C — while typing into it still does nothing.
+
+- The README now lists the build prerequisites. `hurl` needs libxml2 and finds
+  it through `pkg-config`, so an install fails in `libxml`'s build script with
+  `No package 'libxml-2.0' found` unless the *development* package is present —
+  having libxml2 itself installed isn't enough. libcurl and OpenSSL are built
+  from source and linked statically and need nothing, which made the one
+  dependency that does need something easy to miss.
+
+- **An unresolved secret can be typed over.** A provider reference that failed
+  to resolve (`op` not installed, auth declined, the shell variable never
+  exported) was painted in the GUI as a verdict — "unresolved" — with no field
+  to put a value in, so a user holding the value in their clipboard had no way
+  to get it into the app short of editing the `.vars` file and reloading. That
+  cell is now editable, prefilled with the reference so it says *which* name is
+  missing. An `op://`/`ssm:` value typed there is kept in memory only, exactly
+  as in the TUI: the reference stays in the file, and the pasted secret is never
+  written to `state.json`. The TUI already allowed this.
+
+- **The undefined-variable warning now names the environment you forgot to
+  activate.** Loading a `.vars` file only adds it to the Global Environments
+  list; nothing is substituted until it is made active or linked, so a user
+  who loaded their variables, saw them listed, and ran anyway got a red band
+  naming variables they had just watched load. The warning (TUI status line
+  and GUI banner alike) now says which loaded environment defines them and
+  that it is neither active nor linked — the difference between a typo and a
+  file sitting one keystroke away from working.
+
+- The README gained a "Loading an environment isn't enough" section covering
+  active vs linked, and the `a` / `p` keys that set them, which the keyboard
+  shortcuts table had never listed. It also notes that a defined-but-empty
+  variable is not undefined and warns about nothing — it is substituted as an
+  empty string, which with Basic Auth produces a well-formed request and a
+  puzzling `401`.
+
+
 ## [0.5.1] - 2026-08-27
 
 ### Added
