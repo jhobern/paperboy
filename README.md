@@ -25,7 +25,6 @@ git-remote workflows behave identically across them.
 ## Contents
 
 - [Installing & running](#installing--running)
-  - [Build prerequisites](#build-prerequisites)
 - [Core concepts](#core-concepts)
 - [Features](#features)
 - [Graphical UI](#graphical-ui)
@@ -76,38 +75,6 @@ From a checkout:
 cargo run                           # launch the terminal UI
 cargo run --features gui -- --gui   # launch the graphical UI
 cargo build --release
-```
-
-### Build prerequisites
-
-libcurl and OpenSSL are compiled from source and linked statically, so there is
-nothing to install for them. **libxml2 is not** — `hurl` needs it for XPath
-queries, and its build script finds it through `pkg-config`. Having the library
-installed isn't enough: it needs the *development* package, which is what ships
-`libxml-2.0.pc`.
-
-```sh
-sudo apt install libxml2-dev pkg-config              # Debian / Ubuntu
-sudo dnf install libxml2-devel pkgconf-pkg-config    # Fedora / RHEL
-sudo pacman -S libxml2 pkgconf                       # Arch
-sudo apk add libxml2-dev pkgconf                     # Alpine
-brew install libxml2 pkg-config                      # macOS
-```
-
-Without it the build fails in `libxml`'s build script with
-`Couldn't find libxml2 via pkg-config` / `No package 'libxml-2.0' found`.
-
-On macOS the Homebrew copy is keg-only, so point `pkg-config` at it first:
-
-```sh
-export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig"
-```
-
-If the `.pc` file genuinely isn't available, name the library file directly —
-this also skips the bindgen step, so `libclang` isn't needed either:
-
-```sh
-LIBXML2=/usr/lib/x86_64-linux-gnu/libxml2.so cargo install paperboy
 ```
 
 ## Core concepts

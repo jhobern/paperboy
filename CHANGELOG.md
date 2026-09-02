@@ -20,13 +20,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   selection: double-click a word, triple-click a line, drag a range, Ctrl+A,
   Ctrl+C — while typing into it still does nothing.
 
-- The README now lists the build prerequisites. `hurl` needs libxml2 and finds
-  it through `pkg-config`, so an install fails in `libxml`'s build script with
-  `No package 'libxml-2.0' found` unless the *development* package is present —
-  having libxml2 itself installed isn't enough. libcurl and OpenSSL are built
-  from source and linked statically and need nothing, which made the one
-  dependency that does need something easy to miss.
-
 - **An unresolved secret can be typed over.** A provider reference that failed
   to resolve (`op` not installed, auth declined, the shell variable never
   exported) was painted in the GUI as a verdict — "unresolved" — with no field
