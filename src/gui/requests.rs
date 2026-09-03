@@ -159,7 +159,10 @@ fn build_tree(entries: &[HurlEntry], sort: crate::tree::SortMode) -> Node {
 fn sort_node(node: &mut Node, entries: &[HurlEntry], sort: crate::tree::SortMode) {
     let name = |child: &Child| match child {
         Child::Folder(n, _) => n.clone(),
-        Child::Entry(i) => entries.get(*i).map(crate::tree::leaf_name).unwrap_or_default(),
+        Child::Entry(i) => entries
+            .get(*i)
+            .map(crate::tree::leaf_name)
+            .unwrap_or_default(),
     };
     node.children
         .sort_by(|a, b| crate::tree::cmp_names(sort, &name(a), &name(b)));

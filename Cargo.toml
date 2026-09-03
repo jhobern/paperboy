@@ -1,11 +1,15 @@
 [package]
 name = "paperboy"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
 repository = "https://github.com/jhobern/paperboy"
 license = "MIT"
+# A pre-flight probe for the system libxml2 that `hurl` -> `libxml` needs but
+# Cargo cannot supply. It only ever prints advice; see build.rs for why it can
+# neither prevent the failure nor ask the user anything.
+build = "build.rs"
 
 [features]
 # The terminal UI and the headless runner are always built. The native GUI is

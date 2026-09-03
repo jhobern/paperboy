@@ -25,6 +25,7 @@ git-remote workflows behave identically across them.
 ## Contents
 
 - [Installing & running](#installing--running)
+  - [Build prerequisites](#build-prerequisites)
 - [Core concepts](#core-concepts)
 - [Features](#features)
 - [Graphical UI](#graphical-ui)
@@ -41,6 +42,133 @@ git-remote workflows behave identically across them.
 cargo install paperboy --locked                 # terminal UI + headless runner
 cargo install paperboy --locked --features gui  # …and the graphical UI
 ```
+
+### Build prerequisites
+
+PaperBoy compiles from source, and a few of its dependencies need **system
+tools and libraries that Cargo cannot fetch for you**. There are five, and the
+table below installs all of them at once; the list was arrived at by auditing
+the tree, not by guessing:
+
+- **libxml2**, and **`pkg-config`** to locate it. PaperBoy uses the Hurl format
+  as its internal request model and the `hurl` crate as its runner; `hurl` and
+  `hurl_core` depend unconditionally on the `libxml` crate, because Hurl's XPath
+  queries in `[Captures]` and `[Asserts]` *are* libxml2's XPath engine. That
+  dependency is not behind a Cargo feature, so it cannot be switched off, and
+  `libxml` is a *binding*, not a vendored copy — its build script finds an
+  already-installed libxml2 through `pkg-config`.
+- **libclang**, which `bindgen` loads at build time to generate those bindings.
+  Missing, it fails with `Unable to find libclang`.
+- **A C compiler, `perl` and `make`** — the price of the choice described below
+  to vendor libcurl and OpenSSL rather than require them as system packages.
+  `openssl-src` builds OpenSSL by literally running `perl Configure`, then
+  `make`.
+
+Nothing else in the tree qualifies. `libz-sys` compiles its own bundled zlib
+when it can't find a system one, and the `gui` feature adds no build-time
+requirement at all: `wayland-sys` is built with `dlopen`, `khronos-egl` with
+`dynamic`/`libloading`, and `x11-dl` doesn't mind a failed probe. Those
+X11/Wayland libraries are needed to *run* the GUI, not to build it.
+
+Left to itself, a missing one of these surfaces as a panic inside a crate you
+never asked for, several levels down and several minutes in:
+
+```
+error: failed to run custom build command for `libxml v0.3.x`
+…
+Couldn't find libxml2 via pkg-config
+```
+
+So PaperBoy's own build script checks for all five up front and stops the build
+with a message naming what is missing, how it knows, what needs it, and the
+package-manager command your machine actually wants — it detects
+Homebrew/MacPorts, apt, dnf, yum, zypper, pacman or apk rather than guessing
+from the OS name. It says nothing at all when everything is present.
+
+Failing deliberately, rather than only warning, is the point. Cargo runs a
+dependency's build script and the root package's *concurrently*, so this check
+can't be scheduled ahead of `libxml`'s to pre-empt it, and a warning on its own
+gets lost — measured on a real failing build, it landed 65 `Compiling …` lines
+above the error, and Cargo doesn't replay build-script warnings at the end. By
+failing it becomes the last thing on screen, puts PaperBoy's name on the error
+instead of a crate you never asked for, and saves you the several minutes of
+compiling that would otherwise happen before the same build failed anyway.
+
+It never installs anything for you: `cargo install` silently mutating your
+system would be a supply-chain trap, and `sudo` would deadlock with no TTY to
+take a password. Nor can it ask — a build script has no terminal on stdin,
+stdout *or* stderr. And it is hedged, because stopping a build is a strong move:
+only certain checks can stop it (a `pkg-config` verdict, or a file on `PATH` —
+the libclang search is a heuristic and only ever advises), everything downgrades
+to a warning when the probe might not match the one that matters
+(cross-compilation, or target-suffixed `PKG_CONFIG_*` variables that redirect
+the real probe), and
+
+```sh
+PAPERBOY_SKIP_DEP_CHECK=1 cargo install paperboy --locked
+```
+
+turns it off outright, so a false positive can never be the thing standing
+between you and a build.
+
+Install everything it wants before `cargo install`:
+
+| Platform | Command |
+| --- | --- |
+| macOS | `xcode-select --install` then `brew install pkg-config` |
+| Debian/Ubuntu | `sudo apt install build-essential pkg-config libxml2-dev libclang-dev perl` |
+| Fedora/RHEL | `sudo dnf install pkgconf-pkg-config gcc make perl libxml2-devel clang-devel` |
+| Arch | `sudo pacman -S pkgconf base-devel perl libxml2 clang` |
+| Alpine | `sudo apk add build-base pkgconfig perl libxml2-dev clang-dev` |
+| Windows (MSVC) | `vcpkg install libxml2:x64-windows-static-md` (the build script falls back to vcpkg there) |
+
+On macOS `xcode-select --install` covers everything except `pkg-config` —
+libxml2 itself, libclang, the compiler, `perl` and `make` all come with the
+Command Line Tools — so `pkg-config` is usually the only piece actually missing,
+and that is the failure most people hit, because macOS ships neither
+`pkg-config` nor Homebrew by default. If you have installed libxml2 through
+Homebrew instead of using the SDK's copy, point `pkg-config` at it:
+
+```sh
+brew install libxml2
+export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+Nothing else needs a `-dev` package. libcurl and OpenSSL reach the tree the same
+transitive way (via `hurl` → `curl` → `curl-sys`), but PaperBoy depends on
+`curl` directly with `static-curl`/`static-ssl` precisely so curl-sys compiles
+and statically links vendored copies from source — which is why the build wants
+a C compiler, `perl` and `make`, and why there is no `libcurl4-openssl-dev` row
+in the table above. libxml2 is the one library that has to come from the system,
+because the `libxml` crate offers no vendored build.
+
+That asymmetry isn't for want of trying. The libcurl trick works because
+`curl-sys` *has* a `static-curl` feature that compiles vendored C sources, so a
+direct `curl` dependency here turns it on and Cargo's feature unification
+applies it to the same `curl` crate `hurl` uses. `libxml` has no equivalent: as
+of 0.3.21 its only features are `runtime` and `static`, and both merely choose
+how `bindgen` finds `libclang` — neither builds libxml2 itself. Nor is there a
+`libxml2-src` crate on crates.io to lean on, the way `openssl-sys` leans on
+`openssl-src`. And PaperBoy can't reach *into* that build from the outside:
+`libxml` declares no `links` key, so there's no `DEP_*` metadata channel; a
+published crate's `[patch]`/`[replace]` is ignored for its consumers; a
+`.cargo/config.toml` shipped in the package isn't read by `cargo install`, which
+takes its config from the invoking directory; and a build script can't set
+environment variables for a dependency's build script, which has already run by
+then. Vendoring would have to be added upstream in `rust-libxml` before it could
+be switched on from here.
+
+If you already have a libxml2 built somewhere — and want to skip `pkg-config`
+and `bindgen` entirely — `libxml`'s build script takes an escape hatch: point
+`LIBXML2` at the library file itself and it links that and uses its pre-generated
+bindings. Cargo passes `--config` environment down to every build script,
+including a transitive one:
+
+```sh
+cargo install paperboy --locked --config 'env.LIBXML2="/opt/homebrew/opt/libxml2/lib/libxml2.dylib"'
+```
+
+Installing `pkg-config` is still the simpler answer for almost everyone.
 
 `--locked` is a deliberate recommendation, not a workaround. It builds the exact
 dependency versions PaperBoy was published and tested against, from the lockfile
