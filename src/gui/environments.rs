@@ -1,11 +1,12 @@
 //! Left-bottom panel: Global Environments — activate one for substitution,
 //! link one to the active collection, edit variables, and load/save `.vars`
-//! files. Resolved secret values are shown but never editable (their provider
-//! reference is the source of truth).
+//! files. A *resolved* secret value is shown but never editable (its provider
+//! reference is the source of truth); one that failed to resolve is editable,
+//! so a value can be pasted in when the provider isn't available.
 
 use eframe::egui::{self, RichText};
 
-use crate::environment::{EnvVar, ValueSource};
+use crate::environment::{EnvVar, PendingSecret, ValueSource, spawn_resolution};
 use crate::i18n::Strings;
 
 use super::app::{Dialog, GuiApp, OpenKind, PromptKind, SaveKind};
@@ -222,6 +223,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let mut link: Option<u64> = None;
     let mut delete: Option<u64> = None;
     let mut save: Option<u64> = None;
+    let mut resolve: Option<(u64, Vec<PendingSecret>)> = None;
     let mut open_file: Option<std::path::PathBuf> = None;
     let mut changed = false;
 
@@ -371,13 +373,20 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             }
                         });
                         ui.add_space(4.0);
-                        if var_editor(
+                        let (edited, pending) = var_editor(
                             ui,
                             &theme,
                             &app.strings,
                             &mut app.session.global_envs[idx].vars,
-                        ) {
+                        );
+                        if edited {
                             changed = true;
+                        }
+                        // A pasted value that is itself an `op://`/`ssm:`
+                        // reference needs resolving like any other, or it sits
+                        // at "resolving..." forever.
+                        if !pending.is_empty() {
+                            resolve = Some((id, pending));
                         }
                     },
                 );
@@ -457,6 +466,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     if let Some(id) = save {
         super::menu::save_via_picker(app, SaveKind::Environment(id));
     }
+    if let Some((id, pending)) = resolve {
+        app.session.pending_env.push(spawn_resolution(id, pending));
+    }
     if changed {
         for col in &mut app.session.collections {
             col.invalidate_request_json();
@@ -465,15 +477,26 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 }
 
 /// Editable variable table for one environment. Literal values are editable in
-/// place; secret-backed values show their provider and resolution state and are
-/// not directly editable (the `.vars` reference is the source of truth).
+/// place; a secret-backed value that resolved shows its provider and a mask,
+/// since the `.vars` reference is the source of truth and there is nothing
+/// useful to type over it.
+///
+/// One that *failed* to resolve is editable: the reference is a source of truth
+/// for nothing, and there may be no way to make the provider work from here. An
+/// `op://`/`ssm:` value typed in is kept in memory only, as when editing a
+/// resolved secret in the TUI - the reference stays in `raw`, and the pasted
+/// value is never written to the plaintext state file.
+///
+/// Returns whether anything changed, and any pasted value that is itself a
+/// provider reference and so needs background resolution.
 fn var_editor(
     ui: &mut egui::Ui,
     theme: &super::theme::GuiTheme,
     s: &Strings,
     vars: &mut Vec<EnvVar>,
-) -> bool {
+) -> (bool, Vec<PendingSecret>) {
     let mut changed = false;
+    let mut pending: Vec<PendingSecret> = Vec::new();
     let mut remove: Option<usize> = None;
     // Give the key ~40% of the free width so it grows with the panel instead of
     // staying a fixed sliver next to the filling value (see `split_key_width`).
@@ -539,7 +562,30 @@ fn var_editor(
                                 } else if vars[i].resolved {
                                     ui.colored_label(theme.dim, "••••••");
                                 } else {
+                                    // `value` still holds the reference until
+                                    // it is typed over, so comparing against
+                                    // `raw` keeps an untouched row from
+                                    // committing anything.
                                     ui.colored_label(theme.err, s.gui_unresolved);
+                                    let w = ui.available_width().max(60.0);
+                                    if super::widgets::wrapping_field(
+                                        ui,
+                                        w,
+                                        &mut vars[i].value,
+                                        s.gui_hint_value,
+                                        theme.text,
+                                    )
+                                    .lost_focus()
+                                        && vars[i].value != vars[i].raw
+                                    {
+                                        let v = vars[i].value.clone();
+                                        let keep = vars[i].is_secret_source();
+                                        if let Some(p) = vars[i].set_user_value_secrecy(v, keep, i)
+                                        {
+                                            pending.push(p);
+                                        }
+                                        changed = true;
+                                    }
                                 }
                             },
                         );
@@ -566,7 +612,7 @@ fn var_editor(
         vars.push(EnvVar::user(String::new(), String::new()));
         changed = true;
     }
-    changed
+    (changed, pending)
 }
 
 #[cfg(test)]
@@ -878,6 +924,37 @@ mod tests {
         assert!(
             painted.iter().any(|t| t == super::super::icons::CARET_DOWN),
             "an opened row should show the expanded caret: {painted:?}"
+        );
+    }
+
+    /// Editability is visible in the paint: an editable field draws the whole
+    /// reference as its contents, where the label beside it only ever says
+    /// `{{ env }}`.
+    #[test]
+    fn a_provider_value_that_failed_to_resolve_is_editable() {
+        let mut app = GuiApp::for_test(crate::session::Session::default());
+        let id = app
+            .session
+            .load_environment_text(
+                "dev".into(),
+                "TOKEN={{ env:PB_TEST_DELIBERATELY_UNSET }}\n",
+                None,
+                None,
+            )
+            .unwrap();
+        app.reveal_env = Some(id);
+
+        let painted = draw(&mut app);
+
+        assert!(
+            painted
+                .iter()
+                .any(|t| t.contains("PB_TEST_DELIBERATELY_UNSET")),
+            "the reference must be in an editable field, not just labelled: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t.contains("••••••")),
+            "nothing resolved, so there is no value to mask: {painted:?}"
         );
     }
 

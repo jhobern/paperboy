@@ -956,6 +956,10 @@ impl GuiApp {
     /// someone looking at a list of their own variable names what they already
     /// knew, in small dim type, and pushed the request itself further down the
     /// screen every time it appeared.
+    ///
+    /// The one exception is a loaded environment that defines them but is
+    /// neither active nor linked: that is not advice, it is the answer, and the
+    /// list of names cannot say it.
     fn undefined_vars_banner(&mut self, ui: &mut egui::Ui) {
         let ci = self.active_ci();
         let Some(col) = self.session.collections.get(ci) else {
@@ -966,6 +970,7 @@ impl GuiApp {
         if missing.is_empty() {
             return;
         }
+        let in_envs = self.session.envs_defining_keys(ci, &missing);
         let s = &self.strings;
         let headline = if missing.len() == 1 {
             s.gui_undefined_banner_one.to_string()
@@ -973,6 +978,10 @@ impl GuiApp {
             s.gui_undefined_banner_many
                 .replace("{n}", &missing.len().to_string())
         };
+        let hint = (!in_envs.is_empty()).then(|| {
+            s.env_undefined_in_loaded_env
+                .replace("{envs}", &in_envs.join(", "))
+        });
         let th = self.theme;
         // Drawn inline at the top of the centre panel rather than in a
         // `Panel::top`: a panel would reserve a fixed strip and clip the list
@@ -992,6 +1001,11 @@ impl GuiApp {
                             .monospace(),
                     );
                 });
+                if let Some(hint) = hint {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(hint).color(th.err));
+                    });
+                }
             });
         ui.add_space(4.0);
     }

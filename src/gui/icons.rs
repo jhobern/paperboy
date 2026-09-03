@@ -46,6 +46,13 @@ pub const REPORT: &str = p::CHART_BAR;
 /// An environment file (`.vars`) in the tree, and the git-loaded env marker.
 pub const ENV: &str = p::KEY;
 
+/// The requests list is in the collection file's own order (the default).
+pub const SORT_FILE: &str = p::LIST;
+/// The requests list is sorted A-Z.
+pub const SORT_ASC: &str = p::SORT_ASCENDING;
+/// The requests list is sorted Z-A.
+pub const SORT_DESC: &str = p::SORT_DESCENDING;
+
 /// Run / send action (formerly `▶`).
 pub const PLAY: &str = p::PLAY;
 /// Add action (formerly `＋`).

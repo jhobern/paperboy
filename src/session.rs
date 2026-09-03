@@ -103,6 +103,29 @@ pub fn shadowed_env_keys(
     }
 }
 
+/// Loaded Global Environments that define one of `keys` but are neither active
+/// nor linked to collection `ci`, so their values are not substituted.
+///
+/// Loading a `.vars` file only adds it to the Global Environments list;
+/// [`effective_env`] reads the active one merged with the collection's linked
+/// one, so a file that is neither does nothing and its variables read as
+/// undefined.
+pub fn envs_defining_keys(
+    collections: &[Collection],
+    global_envs: &[Environment],
+    ci: usize,
+    active_env_id: Option<u64>,
+    keys: &[String],
+) -> Vec<String> {
+    let linked_id = collections.get(ci).and_then(|c| c.linked_env_id);
+    global_envs
+        .iter()
+        .filter(|e| Some(e.id) != active_env_id && Some(e.id) != linked_id)
+        .filter(|e| e.vars.iter().any(|v| keys.contains(&v.key)))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 /// Every selectable theme, in display order: the built-in presets followed by
 /// the user's custom themes.
 pub fn all_themes(custom_themes: &[ThemeSpec]) -> Vec<ThemeSpec> {
@@ -351,6 +374,18 @@ impl Session {
     /// collection's linked Environment (see the free [`shadowed_env_keys`]).
     pub fn shadowed_env_keys(&self, ci: usize) -> HashSet<String> {
         shadowed_env_keys(&self.collections, &self.global_envs, ci, self.active_env_id)
+    }
+
+    /// Loaded environments that would define `keys` if activated or linked (see
+    /// the free [`envs_defining_keys`]).
+    pub fn envs_defining_keys(&self, ci: usize, keys: &[String]) -> Vec<String> {
+        envs_defining_keys(
+            &self.collections,
+            &self.global_envs,
+            ci,
+            self.active_env_id,
+            keys,
+        )
     }
 
     /// Toggle which Global Environment is active (activating the same one again
@@ -846,7 +881,11 @@ impl Session {
             return Vec::new();
         }
         let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
+        let in_envs = self.envs_defining_keys(ci, &undefined);
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
+            keys: undefined,
+            in_envs,
+        });
         self.begin_request();
         let selected = self.collections[ci].selected_entry;
         if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
@@ -881,7 +920,11 @@ impl Session {
             return Vec::new();
         }
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars(undefined));
+        let in_envs = self.envs_defining_keys(ci, &undefined);
+        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
+            keys: undefined,
+            in_envs,
+        });
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;

@@ -412,6 +412,28 @@ Notes on saving:
 - A modified request shows a pencil icon next to it in the Requests list
   until it's saved.
 
+### Loading an environment isn't enough
+
+Loading a `.vars` file only adds it to the **Global Environments** list. Nothing
+is substituted until that environment is either:
+
+- **Active** — press `a` on it in the Global Environments panel (GUI: the
+  **Active** button). One environment at a time, shared by every collection tab.
+- **Linked** — press `p` in the **Requests list** to pick an environment to pin
+  to the active collection (GUI: the **Linked** button). A linked environment
+  wins over the active one on any key both define.
+
+Both at once is fine: they merge, and the linked value wins on a collision.
+A collection whose variables are all still `{{ VAR }}`-shaped, or a red
+"variables in this request are undefined" band, almost always means this step
+was skipped — the warning names the loaded environment when one of them defines
+the missing variables.
+
+A variable that is *defined but empty* is not undefined, and nothing warns about
+it: it is substituted as an empty string. With Basic Auth that produces a
+perfectly-formed request that comes back `401`, so if credentials fail, check
+the value is actually there and not just the key.
+
 ### Settings & preferences
 
 Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
@@ -634,6 +656,8 @@ up-to-date list. Highlights:
 | `F2`, `Enter` (on tab bar) | Rename the active collection tab |
 | `x` | Delete request / close collection tab (deleting a request asks first; the confirmation can be turned off in Preferences, and `u` undoes it either way) |
 | `r` (Env pane) | Reload the selected environment entry if it failed to load |
+| `a` (Env pane, or a `.vars` row in the Workspace tree) | Make the selected Global Environment **active** — until an environment is active or linked, a loaded `.vars` file substitutes nothing |
+| `p` (Requests list) | Pick a Global Environment to **link** to the active collection (overrides the active one on shared keys) |
 | `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
 | `Ctrl+W` / `u` | Close / reopen a collection tab |
 | `u` (Requests list) | Restore the most recently deleted request in the active collection |
