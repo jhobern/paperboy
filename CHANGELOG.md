@@ -51,6 +51,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The README is a third of its former length.** It had grown to 9,000 words
+  of prose aimed at nobody in particular, and a reference nobody finishes is not
+  a reference. It is now written for people who already know what an HTTP client
+  is: the rationale essays are gone (the reasoning lives here and in the code),
+  the shortcut tables keep the keys worth memorising and defer the rest to the
+  in-app `?` overlay, and the facts that actually catch people out — the build
+  prerequisites, that a loaded environment substitutes nothing until it is
+  activated or linked, that a temporary git workspace is never cleaned up — are
+  still there.
+
 - **The saved key references are a dropdown hanging off the key field**, like
   the request wizard's header-name suggestions: anchored under the field, in a
   bordered popup that says what Enter does, filtered by what has been typed, and
