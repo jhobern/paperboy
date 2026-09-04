@@ -1,117 +1,51 @@
 # PaperBoy
 
-PaperBoy is a Rust-native alternative to Postman. Collections and environments
-are plain, git-friendly text files — [Hurl](https://hurl.dev) `.hurl` files
-for requests, `.vars` files for environments — so everything can be committed,
-diffed, and shared through a normal git repository. There is no hosted
-service and nothing runs outside your machine.
+A Rust-native alternative to Postman. Collections are [Hurl](https://hurl.dev)
+`.hurl` files and environments are `.vars` files (`KEY=value`), so everything is
+plain text you can commit, diff and review. No hosted service, no telemetry,
+nothing leaves your machine.
 
-It ships as a single binary with three front-ends:
+One binary, three front-ends over the same core:
 
-- **Terminal UI** (default) — a full interactive client for building,
-  editing, running and organizing requests.
-- **Graphical UI** (`-g`/`--gui`) — a native desktop client (eframe/egui)
-  with the same features and layout as the terminal UI, adding mouse gestures
-  (drag to resize panels, click to switch tabs) alongside keyboard navigation
-  and an F1 shortcuts overlay. Opt-in at
-  build time via the `gui` Cargo feature, since it more than doubles the
-  dependency tree.
-- **Headless CLI** (`-c`/`--collection`) — runs a collection end-to-end and
-  prints the results, for scripts and CI.
+| Front-end | How | Notes |
+|---|---|---|
+| Terminal UI | `paperboy` | The default. Full client. |
+| Graphical UI | `paperboy -g` | eframe/egui. Behind the `gui` Cargo feature. |
+| Headless runner | `paperboy -c collection.hurl` | For scripts and CI. Also runs reports (`-r`). Exits non-zero on failure. |
 
-All three drive the same shared core, so collections, environments, themes and
-git-remote workflows behave identically across them.
+Collections, environments, themes and the git workflows behave identically in
+all three.
 
-## Contents
-
-- [Installing & running](#installing--running)
-  - [Build prerequisites](#build-prerequisites)
-- [Core concepts](#core-concepts)
-- [Features](#features)
+- [Install](#install)
+- [Concepts](#concepts)
+- [Terminal UI](#terminal-ui)
 - [Graphical UI](#graphical-ui)
-- [Working with collections & environments](#working-with-collections--environments)
-- [Loading & saving via git](#loading--saving-via-git)
-- [Secrets & environment variables](#secrets--environment-variables)
-- [Keyboard shortcuts](#keyboard-shortcuts)
-- [Headless CLI mode](#headless-cli-mode)
+- [Environments and secrets](#environments-and-secrets)
+- [Git remotes](#git-remotes)
+- [Importing from Postman](#importing-from-postman)
+- [Headless runner](#headless-runner)
 - [Changelog](CHANGELOG.md)
 
-## Installing & running
+## Install
 
 ```sh
 cargo install paperboy --locked                 # terminal UI + headless runner
 cargo install paperboy --locked --features gui  # …and the graphical UI
 ```
 
+`--locked` is recommended: it builds the dependency versions PaperBoy was
+tested against rather than re-resolving to whatever is newest. (A yanked
+`arrayref` release took plain `cargo install` down on 2026-08-20 while
+`--locked` kept working — and it took the terminal-only build with it, since
+Cargo resolves optional dependencies whether or not their feature is on.)
+
+The `gui` feature is opt-in because eframe/winit/wgpu roughly double the
+dependency tree. Both builds share the same state file, so you lose nothing by
+switching. Running `--gui` without it prints the command to install one with it.
+
 ### Build prerequisites
 
-PaperBoy compiles from source, and a few of its dependencies need **system
-tools and libraries that Cargo cannot fetch for you**. There are five, and the
-table below installs all of them at once; the list was arrived at by auditing
-the tree, not by guessing:
-
-- **libxml2**, and **`pkg-config`** to locate it. PaperBoy uses the Hurl format
-  as its internal request model and the `hurl` crate as its runner; `hurl` and
-  `hurl_core` depend unconditionally on the `libxml` crate, because Hurl's XPath
-  queries in `[Captures]` and `[Asserts]` *are* libxml2's XPath engine. That
-  dependency is not behind a Cargo feature, so it cannot be switched off, and
-  `libxml` is a *binding*, not a vendored copy — its build script finds an
-  already-installed libxml2 through `pkg-config`.
-- **libclang**, which `bindgen` loads at build time to generate those bindings.
-  Missing, it fails with `Unable to find libclang`.
-- **A C compiler, `perl` and `make`** — the price of the choice described below
-  to vendor libcurl and OpenSSL rather than require them as system packages.
-  `openssl-src` builds OpenSSL by literally running `perl Configure`, then
-  `make`.
-
-Nothing else in the tree qualifies. `libz-sys` compiles its own bundled zlib
-when it can't find a system one, and the `gui` feature adds no build-time
-requirement at all: `wayland-sys` is built with `dlopen`, `khronos-egl` with
-`dynamic`/`libloading`, and `x11-dl` doesn't mind a failed probe. Those
-X11/Wayland libraries are needed to *run* the GUI, not to build it.
-
-Left to itself, a missing one of these surfaces as a panic inside a crate you
-never asked for, several levels down and several minutes in:
-
-```
-error: failed to run custom build command for `libxml v0.3.x`
-…
-Couldn't find libxml2 via pkg-config
-```
-
-So PaperBoy's own build script checks for all five up front and stops the build
-with a message naming what is missing, how it knows, what needs it, and the
-package-manager command your machine actually wants — it detects
-Homebrew/MacPorts, apt, dnf, yum, zypper, pacman or apk rather than guessing
-from the OS name. It says nothing at all when everything is present.
-
-Failing deliberately, rather than only warning, is the point. Cargo runs a
-dependency's build script and the root package's *concurrently*, so this check
-can't be scheduled ahead of `libxml`'s to pre-empt it, and a warning on its own
-gets lost — measured on a real failing build, it landed 65 `Compiling …` lines
-above the error, and Cargo doesn't replay build-script warnings at the end. By
-failing it becomes the last thing on screen, puts PaperBoy's name on the error
-instead of a crate you never asked for, and saves you the several minutes of
-compiling that would otherwise happen before the same build failed anyway.
-
-It never installs anything for you: `cargo install` silently mutating your
-system would be a supply-chain trap, and `sudo` would deadlock with no TTY to
-take a password. Nor can it ask — a build script has no terminal on stdin,
-stdout *or* stderr. And it is hedged, because stopping a build is a strong move:
-only certain checks can stop it (a `pkg-config` verdict, or a file on `PATH` —
-the libclang search is a heuristic and only ever advises), everything downgrades
-to a warning when the probe might not match the one that matters
-(cross-compilation, or target-suffixed `PKG_CONFIG_*` variables that redirect
-the real probe), and
-
-```sh
-PAPERBOY_SKIP_DEP_CHECK=1 cargo install paperboy --locked
-```
-
-turns it off outright, so a false positive can never be the thing standing
-between you and a build.
-
-Install everything it wants before `cargo install`:
+Five things Cargo can't fetch for you:
 
 | Platform | Command |
 | --- | --- |
@@ -120,830 +54,383 @@ Install everything it wants before `cargo install`:
 | Fedora/RHEL | `sudo dnf install pkgconf-pkg-config gcc make perl libxml2-devel clang-devel` |
 | Arch | `sudo pacman -S pkgconf base-devel perl libxml2 clang` |
 | Alpine | `sudo apk add build-base pkgconfig perl libxml2-dev clang-dev` |
-| Windows (MSVC) | `vcpkg install libxml2:x64-windows-static-md` (the build script falls back to vcpkg there) |
+| Windows (MSVC) | `vcpkg install libxml2:x64-windows-static-md` |
 
-On macOS `xcode-select --install` covers everything except `pkg-config` —
-libxml2 itself, libclang, the compiler, `perl` and `make` all come with the
-Command Line Tools — so `pkg-config` is usually the only piece actually missing,
-and that is the failure most people hit, because macOS ships neither
-`pkg-config` nor Homebrew by default. If you have installed libxml2 through
-Homebrew instead of using the SDK's copy, point `pkg-config` at it:
+**libxml2 + `pkg-config`** because `hurl`/`hurl_core` depend unconditionally on
+the `libxml` crate (Hurl's XPath asserts *are* libxml2's XPath engine), and that
+crate is a binding to a system libxml2 rather than a vendored copy.
+**libclang** because `bindgen` generates those bindings at build time. **A C
+compiler, `perl` and `make`** because PaperBoy pulls `curl` in directly with
+`static-curl`/`static-ssl`, so libcurl and OpenSSL are compiled from vendored
+sources — which is why there is no `libcurl-dev` row above. The `gui` feature
+adds no build-time requirement; its X11/Wayland libraries are `dlopen`ed at
+runtime.
+
+On macOS the Command Line Tools cover everything except `pkg-config`, which is
+the failure most people hit. If your libxml2 came from Homebrew rather than the
+SDK:
 
 ```sh
-brew install libxml2
 export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig:$PKG_CONFIG_PATH"
 ```
 
-Nothing else needs a `-dev` package. libcurl and OpenSSL reach the tree the same
-transitive way (via `hurl` → `curl` → `curl-sys`), but PaperBoy depends on
-`curl` directly with `static-curl`/`static-ssl` precisely so curl-sys compiles
-and statically links vendored copies from source — which is why the build wants
-a C compiler, `perl` and `make`, and why there is no `libcurl4-openssl-dev` row
-in the table above. libxml2 is the one library that has to come from the system,
-because the `libxml` crate offers no vendored build.
+PaperBoy's `build.rs` checks for all five before the build gets going and fails
+with the package-manager command your machine actually wants (it detects
+Homebrew/MacPorts, apt, dnf, yum, zypper, pacman, apk). It fails rather than
+warns because Cargo runs build scripts concurrently and doesn't replay their
+warnings — a warning lands dozens of `Compiling …` lines above the real error.
+It never installs anything, and it can't prompt: a build script has no terminal.
+Checks that could be wrong (cross-compilation, target-suffixed `PKG_CONFIG_*`,
+the libclang heuristic) only warn, and `PAPERBOY_SKIP_DEP_CHECK=1` disables it
+entirely.
 
-That asymmetry isn't for want of trying. The libcurl trick works because
-`curl-sys` *has* a `static-curl` feature that compiles vendored C sources, so a
-direct `curl` dependency here turns it on and Cargo's feature unification
-applies it to the same `curl` crate `hurl` uses. `libxml` has no equivalent: as
-of 0.3.21 its only features are `runtime` and `static`, and both merely choose
-how `bindgen` finds `libclang` — neither builds libxml2 itself. Nor is there a
-`libxml2-src` crate on crates.io to lean on, the way `openssl-sys` leans on
-`openssl-src`. And PaperBoy can't reach *into* that build from the outside:
-`libxml` declares no `links` key, so there's no `DEP_*` metadata channel; a
-published crate's `[patch]`/`[replace]` is ignored for its consumers; a
-`.cargo/config.toml` shipped in the package isn't read by `cargo install`, which
-takes its config from the invoking directory; and a build script can't set
-environment variables for a dependency's build script, which has already run by
-then. Vendoring would have to be added upstream in `rust-libxml` before it could
-be switched on from here.
-
-If you already have a libxml2 built somewhere — and want to skip `pkg-config`
-and `bindgen` entirely — `libxml`'s build script takes an escape hatch: point
-`LIBXML2` at the library file itself and it links that and uses its pre-generated
-bindings. Cargo passes `--config` environment down to every build script,
-including a transitive one:
+If you have a libxml2 lying around and want to skip `pkg-config` and `bindgen`,
+`libxml`'s build script takes an explicit path — `--config` reaches transitive
+build scripts:
 
 ```sh
-cargo install paperboy --locked --config 'env.LIBXML2="/opt/homebrew/opt/libxml2/lib/libxml2.dylib"'
+cargo install paperboy --locked \
+  --config 'env.LIBXML2="/opt/homebrew/opt/libxml2/lib/libxml2.dylib"'
 ```
 
-Installing `pkg-config` is still the simpler answer for almost everyone.
-
-`--locked` is a deliberate recommendation, not a workaround. It builds the exact
-dependency versions PaperBoy was published and tested against, from the lockfile
-shipped inside the package, instead of letting Cargo re-resolve every transitive
-dependency to whatever is newest at install time. That makes the build
-reproducible, and it means a freshly published — or freshly compromised —
-semver-compatible release of some crate five levels down doesn't silently end up
-in your binary.
-
-The trade-off is the honest one: pinned dependencies don't pick up their own
-patch releases either, security fixes included, so the pin is only as current as
-the last PaperBoy release. Dropping `--locked` is a reasonable choice if you'd
-rather have the newer transitive versions.
-
-This isn't hypothetical. `arrayref` — a transitive dependency of `winit`, and so
-of the GUI — had releases yanked on 2026-08-20 following a supply-chain attack on
-the crate (since resolved). While the yank stood, a plain `cargo install
-paperboy` failed outright on `arrayref = "^0.3.6"` while `--locked` kept
-building. Note that it took the terminal-only build down with it: Cargo resolves
-optional dependencies whether or not the feature enabling them is switched on.
-
-The graphical UI is behind the `gui` feature because it pulls in
-eframe/winit/wgpu — roughly twice as many crates as everything else combined —
-and most of that build time is wasted on anyone who only wants PaperBoy in a
-terminal. A build without it still reads and writes the same state file, so
-switching between the two loses nothing. Running `--gui` on a build that lacks
-it prints the command to install one that has it.
+Vendoring libxml2 instead isn't possible from here: the crate has no vendored
+build, no `libxml2-src` exists, and it declares no `links` key, so there's no
+`DEP_*` channel to reach into it with. It would have to be added upstream.
 
 From a checkout:
 
 ```sh
-cargo run                           # launch the terminal UI
-cargo run --features gui -- --gui   # launch the graphical UI
-cargo build --release
+cargo run                           # terminal UI
+cargo run --features gui -- --gui   # graphical UI
+cargo test                          # add --features gui for the GUI's tests
 ```
 
-## Core concepts
+## Concepts
 
-- **Collection** — a `.hurl` file: an ordered list of requests, each with a
-  method, URL, headers, cookies, body/form fields, and optional
-  `[Captures]`/`[Asserts]` sections. Postman collection exports (`.json`)
-  can also be opened directly — they are imported and converted to Hurl
-  automatically.
-- **Environment** — a `.vars` file: `KEY=value` lines supplying the
-  `{{ VAR }}` values a collection references. A value can be a literal, or a
-  reference to a secret provider (see [Secrets](#secrets--environment-variables)).
-- **Scratch Space** — the first, always-present tab. It behaves like any
-  other collection (add/run/edit requests) but isn't tied to a file until you
-  explicitly save it — a place to try things out without committing to a
-  collection first.
+- **Collection** — a `.hurl` file: an ordered list of requests with method,
+  URL, headers, cookies, body/form fields and optional `[Captures]`/`[Asserts]`.
+  Postman `.json` exports open directly and are converted on the way in.
+- **Environment** — a `.vars` file of `KEY=value` lines supplying `{{ VAR }}`
+  values. See [Environments and secrets](#environments-and-secrets).
+- **Workspace** — a folder of collections, reports and environments, browsed
+  through a single tab as a filesystem tree.
+- **Report** — a `.trail` file: a PaperTrail script that runs requests from a
+  collection, loops over environments or data, and writes CSV/JSON/HTML/XLSX.
+  Editable as text or as [blocks](#the-papertrail-block-editor); runnable from
+  the UI or [headlessly](#reports).
+- **Scratch Space** — tab 0. A collection with no file behind it until you save
+  it.
+- **Request names encode folders.** `Auth/Tokens/Refresh` browses as a folder
+  path; Postman's folder structure imports into this automatically.
 
-## Features
+## Terminal UI
 
-- Multiple collection tabs, each with its own environment.
-- Add, edit, reorder, run, and delete requests within a collection.
-- **Edit Request wizard**: pressing `Enter` on a request opens the same
-  form used for "New Request", prefilled with its current method, URL,
-  headers, cookies, body, form fields, `[Captures]`, and `[Asserts]` — no
-  manual JSON or Hurl syntax required. The expected response status is one of
-  those asserts (`status == 200`), so it can be changed or removed there like
-  any other. `Shift+R` opens **Raw Mode** instead, a direct editor for the
-  request's real Hurl text (for anything the form doesn't expose, such as
-  Basic Auth); saving reparses the text and applies it back to the request,
-  keeping invalid text open for correction rather than discarding it.
-- **`[Form]`/`[Multipart]` and `[Cookies]` sections** in the request wizard:
-  add form fields (enabled checkbox, Key, a Kind dropdown defaulting to
-  `Text` — press `Enter` to open it and pick `File` or `Base64 File` instead,
-  Value, a separate Content-Type column, a Base64 Prefix column, and a
-  free-text Description column — Kind comes before Value so filling a row
-  naturally picks the type before typing the value) and cookies (checkbox,
-  Key, Value), using the same table and tabbing conventions as `[Headers]`.
-  Saving picks the correct Hurl section automatically — all-Text fields become
-  `[Form]`, and any File field promotes the section to `[Multipart]`. File
-  fields are colored to show whether the referenced path exists and is
-  readable — relative paths resolve against the collection's own directory,
-  matching where Hurl actually looks for them when sending the request. With
-  focus on a `File`- or `Base64 File`-kind Value cell, `Ctrl+F` (or `Enter`)
-  opens a file picker to choose the path instead of typing it (without
-  stealing focus to the Content-Type column afterwards); the Content-Type cell
-  is a dropdown offering "Auto" plus the fixed MIME types from
-  [hurl.dev](https://hurl.dev/docs/request.html) (still editable as free
-  text for anything else), and is auto-set from the picked file's
-  extension. An empty/auto-detected Content-Type cell shows a dimmed
-  "Auto" placeholder rather than looking blank. A **`Base64 File`** field is
-  sent as plain text: its picked file is base64-encoded (unwrapped) at send
-  time and the field value becomes `<Base64 Prefix><base64>`, so a prefix like
-  `data:image/png;base64,` produces a ready-to-use data URI. The Base64 Prefix
-  column only affects `Base64 File` rows. Editing a request into an
-  impossible Body + Form/Multipart combination shows a clear status-bar
-  error instead of sending it.
-- **Headers, Cookies, Form, Asserts, and Captures all start empty** — just
-  a "+ Add …" button for each, with no default blank row to delete for
-  requests that don't need one (a lingering blank row used to intercept
-  the `↓` key meant for scrolling past that section). To remove a row you
-  no longer need, focus any cell in it and press `Ctrl+D`; the wizard's
-  hint bar shows `^D delete row` as a reminder whenever focus is on a
-  deletable row.
-- **Enabled checkbox is reachable with `←` from a row's Key cell** — it's
-  the leftmost visual column of every Headers/Cookies/Form row, so arrow
-  navigation now matches that layout instead of requiring a trip through
-  every other column to reach it. A brand new row still starts focus on
-  Key (not the checkbox), matching how you naturally fill a row in. `Ctrl+E`
-  toggles the focused row's enabled state and jumps focus to the checkbox,
-  from anywhere in that row.
-- **Dropdowns only auto-open when their cell is empty.** The Key suggestion
-  and Content-Type dropdowns pop open automatically the first time you land
-  on an empty cell, but once a cell has a value, navigating onto it again
-  leaves the dropdown closed — press `Enter` to bring it back up without
-  disturbing the current value. The Form Kind dropdown follows the same
-  "populated cell" rule: since it defaults to `Text` on a fresh row, it
-  never auto-opens — `Enter` always reveals it to switch to `File`. This
-  keeps `↑`/`↓` navigation through a populated section from getting stuck
-  reopening a dropdown on every row.
-- **Scrollable, navigable tables**: when a Headers/Cookies/Form/Asserts/
-  Captures section has more rows than fit on screen, it grows to show up
-  to 5 rows before a scrollbar appears on the **left** edge, right next to
-  the data; `↑`/`↓` scroll the focused row into view, and `Ctrl+↑`/`Ctrl+↓`
-  jump straight to the first row of the previous/next section. The "+ Add
-  …" row always stays reachable even when the list is scrolled, and a long
-  `Body` also grows a left-hand scrollbar once it overflows.
-- **Per-section wizard tabs**: the request wizard has a tab bar (`All │
-  Headers │ Cookies │ Form │ Body │ Asserts │ Captures`), switched with
-  `[`/`]` or `PageUp`/`PageDown` and reordered with `Ctrl+Shift+←`/`→`
-  (just like collection tabs). `[`/`]` only cycle tabs when focus is on a
-  non-text field (Method, Target, or a "+ Add …" row), so they can still be
-  typed into URLs, bodies, and other text cells; `PageUp`/`PageDown` always
-  switch tabs. Picking a section tab gives that section almost the
-  whole dialog to itself — handy for editing long Headers or Form-field
-  lists — while `All` keeps the combined, everything-at-once layout. Every
-  tab is just a different view of the same request, so edits made on one
-  tab show up immediately on every other. Switching to a section tab jumps
-  focus straight to its first entry (Body's tab drops you right into
-  editing), and `Tab`/`Shift+Tab`/`↑`/`↓`/`Enter` are confined to the
-  active section so navigation never jumps to a section you can't see.
-- **Request chaining**: capture a value from a response (Hurl `[Captures]`)
-  and reference it as `{{ name }}` in any later request in the same
-  collection.
-- **Basic Auth** support (Hurl's native `[BasicAuth]` section).
-- Colored, substituted request preview: `{{ VAR }}` placeholders in the
-  Request JSON panel are shown replaced with their real value, colored by
-  status (green = loaded, cyan = literal, orange = still loading, red =
-  missing) — while the editor itself always keeps the original `{{ VAR }}`
-  text, so you always know exactly what will be sent versus what's stored.
-  Secrets substituted into the preview are masked as 8 dots.
-- Editing an environment entry to look like a secret reference (e.g. typing
-  `{{ op://vault/item/field }}` or `{{ ssm:/path }}` into a value) triggers an
-  automatic load attempt, the same as if it had been in the file originally.
-- Load/save collections and environments from local files, or straight from a
-  git remote (see below) — no local clone required. A collection or
-  environment loaded from git shows a small ⎇ icon in its tab title /
-  Environment heading, and can be pushed back to a new branch or tag with
-  **Save → Collection → To Git…**.
-- A **recently-used git URLs** dropdown in the "from Git" wizard, most
-  recent first.
-- Resizable panes: the left column width and the response pane height are
-  both adjustable and persisted across restarts.
-- Tab management: close (`Ctrl+W`/`x`), reopen the last-closed tab (`u`),
-  cycle tabs (`[`/`]` or `PageUp`/`PageDown`), and reorder tabs
-  (`Ctrl+Shift+←`/`→`).
-- **Deleted requests can be restored too.** Pressing `x` on the Requests
-  list deletes the selected request; `u` on that same pane brings back the
-  most recently deleted one (last-deleted-first, one collection's stack
-  per collection) — the exact parallel of reopening a closed tab, just
-  scoped to individual requests instead of whole collections. Closing a tab
-  or deleting a request also shows a status-bar message naming the `u` undo
-  key, so an accidental deletion is easy to reverse.
-- **Move or copy requests between workspace collections.** In a workspace
-  tab, `m` moves and `c` copies the selected request into another collection
-  file — a picker chooses the destination and the change is written straight
-  to disk (no separate Save).
-- The app remembers your window layout, active tab/request, language, and
-  recently-used git URLs across restarts.
-- English, French and Danish UI languages (Options → Language).
-- **Custom themes.** Settings → Theme lets you pick a per-language preset or
-  build and save your own colour scheme (see [Themes](#themes)).
-- **Nested folders.** A request's name can encode a folder path with `/`
-  separators (e.g. `Auth/Tokens/Refresh`); the Requests list browses these
-  as folders — `Enter` on a folder row descends into it, `Enter` on the
-  "‹ .." row (or `Backspace`) goes back up — instead of an ever-more-indented
-  tree, and the panel title shows a breadcrumb of the folder you're in.
-  Importing a Postman collection preserves its nested folder structure this
-  way automatically; native Hurl collections get the same behavior for free
-  simply by naming requests with `/` in them. Creating a new request while
-  browsing a folder prefills the Name field with that folder's path.
-
-## Graphical UI
-
-Run `paperboy -g` (or `cargo run --features gui -- --gui`) to open the native
-desktop front-end instead of the terminal UI. It needs a build made with the
-`gui` feature (see [Installing & running](#installing--running)). It is built
-on
-[eframe/egui](https://github.com/emilk/egui) and drives the exact same core as
-the terminal UI, so it is feature-for-feature equivalent — collection tabs, the
-folder tree, the request editor (Params, Headers, Body, Auth, Cookies, Options,
-Asserts, Captures, and a resolved-request Code view), the response viewer
-(Body / Headers / Asserts), the Global Environments panel (activate, link, edit
-variables, resolve `env:` / `ssm:` / `op://` secrets), report tabs, the theme
-editor, and loading/saving collections and environments to a git remote with no
-local clone.
-
-What changes is how you interact with it:
-
-- **Tab** cycles the focused panel in the same order as the terminal UI
-  (Tabs → List → Main → GlobalEnv → Response), and **Shift+Tab** cycles
-  backwards.
-- **The focused request list is keyboard-driven.** With the Requests panel
-  focused, the **arrow keys** move the selection (**Home**/**End** jump to the
-  first/last request), **Enter** runs it, **F2** renames it and **Delete**
-  deletes it (asking first unless you turn the *Confirm deleting a request*
-  preference off; **Ctrl+Z** undoes the deletion). A Workspace tab's list is a
-  filesystem tree of mixed row kinds rather than a flat request list, so it has
-  a keyboard of its own: the same up/down/Home/End/Enter/F2/Delete, plus
-  **Right**/**Left** to expand and collapse folders and collections (or step in
-  to a child and out to a parent), and **PageUp**/**PageDown** to move ten rows
-  at a time. Each key does exactly what the mouse does on that row kind, and a
-  keyboard cursor — a quiet focus outline, distinct from the highlight on the
-  loaded file — follows the arrows and jumps to whichever row you click.
-- **Most single-letter shortcuts do not carry over.** The terminal UI's `j`/`k`,
-  `n`, `b`, `x`, `u` and `m`/`c` are terminal-only: in a desktop window those
-  keys are text you are typing, so the same actions live on the menus, the
-  toolbar and the right-click menus instead (the arrow-key list navigation above
-  covers select/run/rename/delete). What the keyboard *does* do globally is
-  **F5** or **Ctrl+Enter** (run the request), **Ctrl+S** / **Ctrl+Shift+S**
-  (save / save as), **Ctrl+W** (close the tab), **Ctrl+Z** (undo delete
-  request), **Alt+F** (open the File menu) and **F1** (the shortcuts overlay).
-- **Press F1** — or use **Help ▸ Keyboard Shortcuts** — for a grouped overlay
-  of every GUI shortcut, the graphical counterpart to the terminal UI's `?`/`F1`
-  help. Menu items that have a shortcut show it next to their name.
-- **Panels are resized by dragging** their splitters, rather than with keyboard
-  shortcuts.
-- **Results columns are resized by dragging** the border between two header
-  cells (double-click it to hand the column back to the automatic fit). A
-  hand-set column keeps exactly the width you gave it while the rest go on
-  sharing what is left, and pinning columns wider than the window scrolls the
-  table sideways rather than crushing the others. The widths last as long as the
-  report keeps producing the same columns.
-- **Selection, scrolling and the clipboard** use the platform's native
-  handling; **collection tabs switch by clicking**; folders collapse/expand by
-  clicking their header.
-- **The File menu is grouped by verb** (New / Import / Open / Save) rather than
-  one flat list. **File ▸ Import from Postman** has the two routes across:
-  *From an exported file (.json)…*, which needs nothing but the file and works
-  out by itself whether it holds a collection or an environment, and *From my
-  Postman account…*, which connects with an API key and brings whole workspaces
-  over. (**Open ▸ Collection** takes a Postman export too — it is the same
-  load.) Every file dialog reopens in the folder you last used it in.
-- **Workspaces can be grown from inside the app.** The workspace panel's **New**
-  menu adds a collection, report or environment at the top of the tree, and
-  right-clicking any row offers the same three inside *that* folder. Files (and
-  folders) can be **dragged onto another folder to move them**, or dropped on
-  the empty space below the tree to move them back out to the root; whatever the
-  app was holding — the loaded collection, the open report, which folders were
-  expanded — follows the file. Nothing can be created or moved outside the
-  workspace root, and nothing is ever silently overwritten.
-- **Workspaces stay portable.** A report binds to its collection by a path
-  *relative to the report* — including `../apis/billing.hurl` for a collection
-  in a sibling folder — so a workspace still works when it is zipped up, checked
-  in, or handed to someone whose folders are laid out differently. The
-  `collection` dropdown lists collections **by name**, offers the ones in the
-  report's own workspace first, and keeps anything from outside it behind a
-  "Show collections outside this workspace" toggle, since binding to one of
-  those is what makes a workspace stop travelling.
-- **Git remotes load whole workspaces**, not just single files — the same
-  no-local-clone loading and saving the terminal UI offers, for collections,
-  environments and entire workspace trees.
-- **The window remembers itself** — its size, the widths and heights of every
-  panel you dragged (including the block editor's palette and diagnostics
-  panel), which view was open, which report or request you were on, and which
-  node a Workspace tab was showing are all restored on the next launch. A
-  Workspace selection is dropped if that file has since gone, since a workspace
-  is a live folder rather than a snapshot.
-- **The active environment is unmissable** — it is ticked, coloured and banded
-  in the Global Environments list rather than marked with a dot.
-- **Every theme applies unchanged** — built-in language presets and custom
-  themes are read from the same `ThemeSpec` and mapped onto egui's visual
-  style, and the whole GUI is translated (English / French / Danish) through
-  the same `i18n` table as the terminal UI.
-
-### The PaperTrail block editor
-
-Reports open in a drag-and-drop block editor (a **Blocks** view alongside the
-**Source** and **Results** views). Blocks are dragged from a palette into the
-flow, reordered, nested inside `FOR` loops — whole loops move as one, with
-their body — and dropped on the trash bar to delete. Both the dashed outline
-left behind by a picked-up block and the marker showing where it will land are
-drawn as that block's own silhouette — one outline per row, at its own width
-and indent — so what you see really is what will land there.
-
-Editable directly on the blocks:
-
-- the request a step runs, its alias, response format, and its `SHOW(…)` /
-  `HIDE(…)` / `STATISTICS(…)` column lists;
-- a `FOR` loop's binder, source and roles, and the maximum concurrency of a
-  `PARALLEL(n)` loop;
-- the report's own settings — `collection`, `output`, `environment`, `root`,
-  `baseline` and `columns` — stacked in a boxed panel above `BEGIN`. These
-  apply to the report as a whole rather than running as a step, so they are
-  deliberately not draggable blocks; the box is what says so, and it keeps a
-  fixed width so the view doesn't twitch as you edit. `collection` and `output`
-  are always shown (a missing `collection` is flagged as an error; `output`
-  simply defaults to CSV); the rest are appended from the **Add a report
-  setting** button below them, and any setting that is set can be cleared with
-  its `×`. Settings with a
-  closed set of values are dropdowns — including `output`, which names a
-  *format* (`csv`, `json`, `html`, `xlsx`), not a filename: the file is named
-  after the report, and only the command-line runner's `-o` takes a path.
-
-Every block and setting has hover help explaining what it is and what its
-editable parts do. The **Source** view is syntax-highlighted with exactly the
-same colours as the terminal UI, and the line the parser rejected is
-underlined.
-
-### Desktop icon on Linux
-
-Wayland has no per-window icon protocol, so shells such as GNOME resolve the
-dock/taskbar icon by matching the window's app id (`paperboy`) against an
-installed `.desktop` file. The first GUI launch therefore writes, if they are
-not already there:
-
-- `$XDG_DATA_HOME/paperboy/paperboy_logo.png` — a copy of the bundled logo, and
-- `$XDG_DATA_HOME/applications/paperboy.desktop` — a launcher entry pointing at
-  it, with `StartupWMClass=paperboy` so X11 sessions match too.
-
-Both are left alone if they already exist, so you can customise them. Because
-the entry only appears *during* the first launch, the shell may not pick it up
-until it next rescans — log out and back in (or restart the shell) if the
-generic icon is still showing. Deleting the two files and relaunching
-regenerates them, which is also how you refresh the `Exec=` line after moving
-the binary.
-
-## Working with collections & environments
-
-Open the **File menu** with `f`, then pick **(L)oad** or **(S)ave**. Each
-opens a short list of *what* you want to load or save (Request, Collection,
-Environment, Workspace, Response). Choosing a kind that can come from — or go
-to — more than one place opens a second step to pick the source or
-destination, so git and local options no longer clutter one long list:
-
-| Kind | Load sources | Save destinations |
-|---|---|---|
-| Request | Local file only (goes straight to a path prompt) | Local file only |
-| Collection | **Local file…** / **From Git…** | **Save** (original file) / **Save As…** / **To Git…** |
-| Environment | **Local file…** / **From Git…** | **Save** (original file) / **Save As…** |
-| Workspace | **Local file…** / **From Git…** | **Save As…** (copy the folder) / **To Git…** |
-| Response | — | Local file only |
-
-Every step is keyboard-driven: each item has a bracketed mnemonic (e.g.
-**(L)ocal file…**, **From (G)it…**, **(S)ave**), and pressing that letter both
-selects *and* activates the item — no extra Enter needed. `→` (or `Enter`)
-steps into the next level and `←` (or `Esc`) steps back, with the kind you
-picked still highlighted.
-
-- **To Git…** is only meaningful for a collection/workspace that was itself
-  loaded from git; on anything else it just reports that there's no remembered
-  git origin.
-
-Notes on saving:
-
-- **Save** (Collection / Environment / Report) writes back to the file the tab
-  was originally loaded from, straight away and without a confirmation:
-  overwriting that file with your changes is exactly what Save means. Something
-  that has never been saved has no file to write back to, so Save becomes
-  Save As.
-- **Save As…** always prompts for a filename. If the chosen path already
-  exists you'll be asked to confirm the overwrite (Yes/No) before anything is
-  written.
-- The Scratch Space (tab 0) can be saved like any other collection — pick
-  Collection → **Save As…** to give it a file for the first time.
-- A modified request shows a pencil icon next to it in the Requests list
-  until it's saved.
-
-### Loading an environment isn't enough
-
-Loading a `.vars` file only adds it to the **Global Environments** list. Nothing
-is substituted until that environment is either:
-
-- **Active** — press `a` on it in the Global Environments panel (GUI: the
-  **Active** button). One environment at a time, shared by every collection tab.
-- **Linked** — press `p` in the **Requests list** to pick an environment to pin
-  to the active collection (GUI: the **Linked** button). A linked environment
-  wins over the active one on any key both define.
-
-Both at once is fine: they merge, and the linked value wins on a collision.
-A collection whose variables are all still `{{ VAR }}`-shaped, or a red
-"variables in this request are undefined" band, almost always means this step
-was skipped — the warning names the loaded environment when one of them defines
-the missing variables.
-
-A variable that is *defined but empty* is not undefined, and nothing warns about
-it: it is substituted as an empty string. With Basic Auth that produces a
-perfectly-formed request that comes back `401`, so if credentials fail, check
-the value is actually there and not just the key.
-
-### Settings & preferences
-
-Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
-**Preferences** for a few toggles that persist across restarts:
-
-- **Confirm on exit** / **Confirm on clear** — ask before quitting or before
-  clearing all collections.
-- **Confirm before deleting an environment** (on by default) — ask before
-  deleting a Global Environment with `x`. Turn it off to delete straight away;
-  either way the deletion is undoable with `u`.
-- **Always save when prompted** (off by default) — whenever an action would
-  otherwise pop up a **Save / Discard / Cancel** choice (e.g. switching away
-  from a Workspace collection with unsaved changes), automatically pick
-  **Save** without asking. Leave it off to keep being prompted each time.
-- **Esc discards request edits without asking** (off by default) — Esc on a
-  request form holding unsaved changes normally asks first, since the form has
-  no autosave and F2 is the only thing that persists. Turn this on to get the
-  older behaviour back, where one Esc closes the form and throws the edits away.
-- **Default Request view** — whether the Request panel opens in JSON or Hurl.
-
-### Themes
-
-Settings → **Theme** opens a theme editor. PaperBoy ships three presets — one
-per UI language, evoking its country: **Britannia** (English), **Parisian
-Purple** (French), and **Dannebrog** (Danish). By default the theme follows
-the current language; pick any preset (or a custom theme) from the list to use
-it. Presets are read-only — to make your own, base a new theme on one:
-
-- `Ctrl+N` — open the **New theme** popup. Give it a name — the cursor blinks
-  in the name field ready for typing — and choose an existing theme to copy its
-  colours from (`Tab` switches between the name and the base list). Pressing
-  `Enter` creates the theme, activates it, adds it to the list, and drops you
-  into the colour rows to edit.
-- Editing colours — with a custom theme selected, step into the colour rows
-  with `→` (or `Tab`). The first row is the theme's **name** — edit it to rename
-  the theme, then press `Enter` (or move off the row) to submit. Below it are
-  the colours. Move between rows with `↑`/`↓`. Press
-  `Enter` on a colour to open the **colour picker**: adjust the highlighted
-  R/G/B channel with `←`/`→` (±1) or `Ctrl`+`←`/`→` / `PageUp`/`PageDown` (±16),
-  or type a `0`–`255` value, and switch channels with `↑`/`↓`. The whole UI
-  previews live; `Enter` applies (and **auto-saves**), `Esc` cancels. `←` steps
-  back from the rows to the list.
-- `Ctrl+D` — delete the selected custom theme (presets can't be deleted); focus
-  moves to the theme just above the deleted one.
-- `Esc` — close the editor.
-
-Once you've chosen a theme by hand it stays put; changing language only
-switches the theme while you're still on **Automatic**.
-
-## Loading & saving via git
-
-This is the one workflow that isn't just "open a file", so here's the full
-step-by-step. **Loading** fetches a single file out of a remote repository
-without cloning it: it lists the repo's branches/tags, fetches just enough
-git history to read the file tree for the ref you pick, and checks out only
-the one file you select. No other file in the repo ever touches your disk.
-
-1. Press `f` to open the File menu, choose **(L)oad**, then pick the kind
-   (**Collection** or **Environment**) and choose **From (G)it…**.
-2. **Connect** — type the repository URL (`https://…` or `git@…`). If the
-   repo needs an access token, Tab to the token field and enter it (only used
-   for this fetch — the wizard supports GitHub-style
-   `https://x-access-token:<token>@host/...` URLs and injects the token for
-   you). Press `↓` on the URL field to open a dropdown of your recently-used
-   URLs and pick one instead of retyping it; press `Enter` to connect.
-3. **Pick a ref** — choose a branch or tag from the list (type to filter).
-4. **Pick a file** — choose the `.hurl`/`.json` (or `.vars`) file from the
-   ref's file tree (type to filter).
-5. The file is checked out and opened as a new tab. Its URL is remembered at
-   the top of the "recently used" list for next time, and a small ⎇ icon is
-   shown in the tab title (or, for an environment, in the Environment panel
-   heading) to mark it as loaded from git.
-6. When loading a **collection**, you're then asked whether to also load its
-   environment — answering Yes reuses the same file listing already fetched
-   in step 4 (no second network round-trip) and lets you pick the `.vars`
-   file to pair with it. Answering No (or loading an environment on its own
-   via Environment → **From Git…**) leaves it as-is.
-
-Loading a directory of files, or importing a whole repo, is not supported
-this way — for that, see **Loading a Workspace from git** below.
-
-### Loading a Workspace from git
-
-A **Workspace** is a folder containing many `.hurl`/`.json` collection
-files, browsed and chosen from through a single tab (press `w` on a
-Workspace tab to reopen its file-tree picker at any time). Workspaces can
-also be loaded straight from a remote repository, instead of only from a
-local folder:
-
-1. Press `f` to open the File menu, choose **(L)oad**, then pick
-   **(W)orkspace** and choose **From (G)it…**.
-2. **Connect** and **pick a ref**, exactly as for a single collection/
-   environment above.
-3. **Choose which files to download** — a repo can hold plenty of large,
-   unrelated files that have nothing to do with your collections, so before
-   anything is fetched you pick one of: `.hurl` and `.json` files only
-   (the default), `.hurl` files only, `.json` files only, or every file.
-   Only files matching this choice are ever downloaded — anything else in
-   the repo never touches your disk.
-4. The matching files are checked out into a throwaway local folder. Before
-   the new tab is created you're asked whether to **keep it temporarily**
-   (the folder above) or **save it to a permanent location now** — picking
-   the latter opens a folder browser and a name prompt, then copies the
-   files there immediately and binds the new tab to that permanent folder
-   instead. Either way, the file-tree picker then opens immediately so you
-   can choose which collection to view.
-
-**⚠️ A temporarily-kept Workspace's files are not cleaned up automatically.**
-Unlike the single-file collection/environment load above, if you choose to
-keep it temporary its files stay on disk in a temp folder for as long as its
-tab exists — including across closing and reopening the tab within the same
-session (`u` / `Ctrl+Shift+T` undoes a close, so the folder can't be safely
-deleted the moment the tab closes). Restarting PaperBoy does not delete it
-either. If you load the same Workspace from git repeatedly, or load many
-different ones and keep them all temporary, these folders will accumulate
-under your system's temp directory and you may want to clear them out
-yourself from time to time — or avoid the problem entirely by choosing
-**save it to a permanent location** when asked, or later via **File → Save
-→ (W)orkspace → Save (A)s…** (available for any Workspace tab, local or from
-git; it copies the whole folder to a destination and name you choose, and
-stops tracking it as a temporary git download). Saving a Workspace-loaded
-collection back to git is also not currently supported — use **Save →
-Collection → Save As…** into your own local clone instead.
-
-### Saving to git
-
-A collection that was itself loaded from git (shown by the ⎇ icon in its tab
-title) can be saved back with **Save → Collection → To (G)it…**, which pushes
-a new commit straight to the remote — no local clone, staging area, or manual
-`git` commands needed. Like loading, this never performs a full checkout: only
-the file(s) you're actually writing are ever fetched or touched, no matter how
-large the repository is.
-
-1. **Connect** — the repository URL is pre-filled with the one this
-   collection was loaded from (editable, e.g. to push to a fork), plus an
-   optional access token field.
-2. **Choose what to save** — the collection's in-repo path (defaults to
-   where it was loaded from), and, if an environment is attached, whether to
-   also save it in the same commit (and its in-repo path).
-3. **Choose a target** — Tab switches between **Branch** and **Tag**:
-   - A **branch** name defaults to the one you loaded from (so pressing
-     Enter here just appends a new commit to it); typing a different name
-     targets another existing branch (also a plain append) or creates a
-     brand-new one. `↓` opens a dropdown of the remote's existing branches
-     to pick from instead of typing. No merge or rebase is ever attempted —
-     if the branch has moved in a way that makes the push a non-fast-forward,
-     it's simply reported as an error.
-   - A **tag** name must be brand new. PaperBoy re-`fetch`es the remote
-     immediately before checking, so even a tag another user created seconds
-     ago is caught — **an existing tag name is always rejected and never
-     overwritten**, with no way to force it.
-4. **Commit message** — auto-generated (`Update <name> via PaperBoy`) and
-   editable before pushing. The commit author is your system git identity
-   (`git config user.name`/`user.email`), or a generic `PaperBoy
-   <paperboy@localhost>` identity if that isn't configured.
-5. Once pushed, a branch-target save updates the collection's (and, if
-   included, the environment's) remembered git origin to that branch and
-   clears their "new"/"modified" markers, exactly like a local Save. A
-   tag-target save clears the markers too but leaves the remembered branch
-   origin untouched, so the *next* "Save to Git" still defaults back to your
-   working branch.
-
-For a collection that *wasn't* loaded from git (or when you'd rather manage
-git yourself), the local workflow still works exactly as before: use **Save →
-Collection → Save As…** / **Save → Environment → Save As…** and choose a path
-inside your own local clone of the repository, then commit and push with your
-normal git tooling outside the app.
-
-## Secrets & environment variables
-
-An environment `.vars` file has one `KEY=value` entry per line. The value can
-be:
-
-| Form | Example | Meaning |
-|---|---|---|
-| Literal | `USERNAME=demo` | Used as-is |
-| Process env var | `BASE_URL={{ env:DEMO_BASE_URL }}` | Read from the process environment |
-| 1Password (`op` CLI) | `API_TOKEN={{ op://Vault/Item/field }}` | Resolved via the local `op` CLI |
-| AWS SSM parameter | `DB_PASSWORD={{ ssm:/path/to/param }}` | Resolved via local AWS auth |
-
-Provider-backed values (`op://…`, `ssm:…`) are resolved in the background
-when the environment loads; the Environment panel shows their status while
-this happens. Every 1Password reference across every open collection's
-environment is resolved with a single `op inject` call (one authorization
-prompt), instead of one prompt per collection. If an entry fails to load
-(missing tool, declined auth, unreachable parameter store), select it in
-the Environment panel and press `r` to retry just that one entry — works
-for process env vars, 1Password, and SSM references alike. When editing
-such an entry, a **"still secret?"** checkbox lets you keep it masked or,
-if you're confident the new value isn't sensitive, save it as a plain
-value in the state. Rewriting a value to look like a provider reference
-(typing `{{ op://... }}` or `{{ ssm:... }}` into any entry) automatically
-triggers a load attempt for it, same as on initial file load.
-
-## Keyboard shortcuts
-
-These are the **terminal UI's** keys; the graphical front-end uses menus for
-most of them, plus arrow-key navigation in the focused request list and an
-**F1** shortcuts overlay of its own (see [Graphical UI](#graphical-ui)). Open
-the terminal UI's in-app help overlay any time with `?` or `F1` for the full,
-up-to-date list. Highlights:
+Press `?` or `F1` for the full, current key list. The essentials:
 
 | Key | Action |
 |---|---|
 | `Tab` / `Shift+Tab` | Move focus between panes |
 | `↑`/`↓`, `j`/`k` | Move selection |
-| `←`/`→`, `h`/`l` | Switch tabs / scroll list-panel text horizontally (in the File menu: `←`/`→` leave / enter a submenu) |
-| `Enter` | Open the Edit Request wizard for the selected request (or, on a folder row in the Requests list, descend into that folder; on the "‹ .." row, go back up) |
-| `→` / `l` (Workspace list) | Open the highlighted workspace folder or collection (same as `Enter`); `Enter` on an already-open collection collapses it |
-| `w` (Workspace tab) | Pop up the full workspace file-tree picker to jump to any collection |
-| `Shift+N` (Workspace tab) | New collection / report / environment in the highlighted folder — the extension you type (`.hurl`, `.trail`, `.vars`) chooses which |
-| `Shift+M` (Workspace tab) | Move the highlighted workspace file or folder — `Space` confirms the destination folder |
-| `Backspace` (Requests list) | Go up a folder, from anywhere in the current folder |
-| `Shift+R` | Edit the selected request in Raw Mode (Hurl text) |
+| `←`/`→`, `h`/`l` | Switch tabs / scroll list text horizontally |
+| `Enter` | Edit the selected request (or descend into a folder row) |
+| `Shift+R` | Edit as raw Hurl text — for anything the form doesn't expose |
 | `F5`, `Ctrl+Enter` | Run the current request |
-| `Alt+F5` | Run every request in the collection in order, in one Hurl execution (like the CLI's batch mode) — pass/fail markers appear in the Requests list and a Passed/Failed/Total summary on the status bar |
-| `n` | New request (List/Response/Tabs panes) — or add environment variable (Env pane) |
-| `b` | Set the base URL |
+| `Alt+F5` | Run the whole collection in one Hurl execution |
+| `n` / `b` | New request / set the base URL |
 | `f` / `s` | File menu / Settings menu |
-| `/` (other panes) | Filter the Global Environment list |
-| `Ctrl+S` | Save what's on screen back to its own file — the open report if there is one, otherwise the active collection (falls back to "Save As" when it has never been written anywhere) |
-| `[` / `]`, `Ctrl+←`/`→` | Previous / next tab |
-| `PageUp`/`PageDown` | Previous / next tab (same as `[`/`]`) |
-| `F2`, `Enter` (on tab bar) | Rename the active collection tab |
-| `x` | Delete request / close collection tab (deleting a request asks first; the confirmation can be turned off in Preferences, and `u` undoes it either way) |
-| `r` (Env pane) | Reload the selected environment entry if it failed to load |
-| `a` (Env pane, or a `.vars` row in the Workspace tree) | Make the selected Global Environment **active** — until an environment is active or linked, a loaded `.vars` file substitutes nothing |
-| `p` (Requests list) | Pick a Global Environment to **link** to the active collection (overrides the active one on shared keys) |
-| `x` / `u` (Env pane) | Delete / reopen the selected Global Environment (deletion is undoable and can skip its confirmation via Preferences) |
-| `Ctrl+W` / `u` | Close / reopen a collection tab |
-| `u` (Requests list) | Restore the most recently deleted request in the active collection |
-| `m` / `c` (Requests list, workspace) | Move / copy the selected request to another collection file in the workspace |
-| `c` (Requests list) | Duplicate the selected request in place, giving the copy a name of its own |
-| `/` (Requests list) | Find a request anywhere in the collection, not just the folder being browsed — on a Workspace tab it searches the whole tree (files, reports, environments, and the requests of collections already open). `Esc` clears it |
-| `Alt+↑`/`↓` (Requests list) | Move the selected request up / down. The order is what `Alt+F5` and the CLI follow. A request only moves within its own collection and folder, and the list must be unfiltered so the move can be seen |
+| `Ctrl+S` | Save the open report, else the active collection |
+| `[` / `]`, `PageUp`/`PageDown` | Previous / next tab |
 | `Ctrl+Shift+←`/`→` | Reorder the active tab |
-| `+` / `-` | Grow / shrink the response pane |
-| `<` / `>` | Grow / shrink the left column |
-| `Ctrl+↑`/`↓` (in wizard) | Jump to the previous/next section (Headers/Cookies/Form/Body/Asserts/Captures) |
-| `Alt+1`-`6` (in wizard) | Jump directly to a section (1=Headers, 2=Cookies, 3=Form, 4=Body, 5=Asserts, 6=Captures) — `Alt`, not `Ctrl`, since most terminals can't report `Ctrl`+digit without special keyboard-protocol support |
-| `[` / `]` (in wizard) | Switch the wizard's section-view tab, same as `PageUp`/`PageDown` — only when focus is on a non-text field (Method, Target, or a "+ Add …" row), so brackets can still be typed into URLs/bodies/values |
-| `PageUp`/`PageDown` (in wizard) | Switch the wizard's section-view tab (`All`/Headers/Cookies/Form/Body/Asserts/Captures); switching to a section tab focuses its first entry |
-| `Ctrl+Shift+←`/`→` (in wizard) | Reorder the wizard's section-view tabs |
-| `Ctrl+D` (on a Header/Cookie/Form/Assert/Capture row) | Delete that row |
-| `Ctrl+E` (on a Header/Cookie/Form row) | Toggle that row's enabled/disabled state and focus its checkbox |
-| `←` (from a row's Key cell) | Reach the Enabled checkbox — it's the leftmost visual column, so arrowing left from Key goes straight to it |
-| `Ctrl+F`, `Enter` (on a `File`- or `Base64 File`-kind Form Value cell) | Open a file picker to choose the path |
-| `F2`, `Ctrl+Enter` | Save the open editor / wizard |
-| `Esc` | Cancel |
+| `x` / `u` | Delete / undo — requests, tabs and environments each keep their own undo stack |
+| `/` | Find a request anywhere in the collection (whole tree on a Workspace tab) |
+| `Alt+↑`/`↓` | Reorder requests — the order `Alt+F5` and the CLI follow |
+| `m` / `c` | Move / copy a request to another collection in the workspace |
+| `p` (Requests) | Link an environment to this collection |
+| `a` (Env pane) | Make an environment active |
+| `r` (Env pane) | Retry a failed secret lookup |
+| `w` (Workspace tab) | Reopen the file-tree picker |
+| `+`/`-`, `<`/`>` | Resize the response pane / left column |
 | `q`, `Ctrl+C` | Quit |
 
-## Importing a Postman workspace
+In the request wizard:
 
-Bring a whole Postman workspace across at once, rather than exporting each
-collection by hand.
+| Key | Action |
+|---|---|
+| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Form│Body│Asserts│Captures`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
+| `Alt+1`–`6` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
+| `Ctrl+↑`/`↓` | Previous / next section |
+| `Ctrl+D` / `Ctrl+E` | Delete a row / toggle its enabled checkbox |
+| `←` from a Key cell | Reach the enabled checkbox — it's the leftmost column |
+| `Ctrl+F` or `Enter` on a File value | Open a file picker |
+| `F2`, `Ctrl+Enter` | Save |
+| `Esc` | Cancel (asks first if there are unsaved edits) |
 
-If all you have is a file you already exported from Postman, none of this is
-needed: **File ▸ Import from Postman ▸ From an exported file (.json)…** opens it
-straight away — collection or environment, whichever it turns out to be — with
-no API key and no account.
+Worth knowing:
 
-**In the app**, it's **File ▸ Import ▸ Postman account…** in the terminal UI and
-**File ▸ Import from Postman ▸ From my Postman account…** in the GUI — or, if
-you are already thinking in workspaces, **File ▸ Load ▸ Workspace ▸ From a
-Postman account…** (**Open ▸ Workspace ▸ …** in the GUI). Give it your API key and
-it lists the workspaces the key can see; pick one, choose what to bring across
-and where to put it, and the imported folder opens as a workspace.
+- **`[Form]`/`[Multipart]`, `[Cookies]`, `[Captures]`, `[Asserts]` and
+  `[BasicAuth]`** are all editable as tables in the wizard; the expected status
+  is just an assert (`status == 200`). Saving picks the right Hurl section:
+  all-text fields become `[Form]`, any file field promotes it to `[Multipart]`.
+  File paths are colour-coded by whether they resolve and are readable
+  (relative to the collection's directory, matching where Hurl looks). A
+  `Base64 File` field is encoded at send time behind a configurable prefix, so
+  `data:image/png;base64,` yields a ready-made data URI.
+- **The request preview substitutes `{{ VAR }}`** and colours each by status —
+  green loaded, cyan literal, orange loading, red missing — while the editor
+  keeps the original text. Secrets are masked as eight dots.
+- **Sections start empty** and dropdowns only auto-open on an empty cell, so
+  arrowing through a populated table doesn't keep reopening them.
+- **Settings ▸ Preferences** persists: confirm on exit/clear, confirm before
+  deleting an environment or a request, always-save-when-prompted, whether
+  `Alt+F5` runs the collection in batch mode (chaining cookies and captures),
+  whether Esc discards request edits without asking (off by default), and the
+  default Request view (JSON or Hurl).
+- **Settings ▸ Theme** ships three presets — Britannia, Parisian Purple,
+  Dannebrog — one per UI language (English/French/Danish), and follows the
+  language until you pick one by hand. `Ctrl+N` clones a preset into an
+  editable custom theme; `Enter` on a colour opens an RGB picker that previews
+  live and auto-saves. `Ctrl+D` deletes a custom theme.
+- **Saving.** **Save** overwrites the file the tab came from without
+  confirmation; **Save As…** always prompts, and confirms an overwrite. Every
+  File-menu item has a bracketed mnemonic that both selects and activates it.
 
-Migrating off Postman entirely? Take the lot in one go: press `Ctrl+A` on the
-workspace list in the terminal UI, or click **Import all** in the GUI. Every
-workspace the list is showing is imported — the filter is honoured, so a
-filtered list imports what it shows — and each lands in its own folder inside
-the destination, so two workspaces that both hold a "Billing API" keep both.
-Listing them costs two API calls per workspace, which is why the estimate and
-the confirmation step still come first.
+## Graphical UI
 
-Because Postman rate-limits its API, the wizard shows you what it found and
-roughly how long the download will take *before* downloading anything, so
-backing out costs nothing. While it runs it shows a remaining time worked out
-from the rate it is actually achieving, and says so explicitly when it is
-pausing to stay inside the limit.
+`paperboy -g`, from a build with the `gui` feature. Feature-for-feature
+equivalent to the terminal UI — same tabs, folder tree, request editor,
+response viewer, environments panel, reports, theme editor, git remotes, and
+the same three languages. What differs:
 
-If you already know the workspace, paste its id — or its address in Postman —
-into the optional field on the first step and the wizard skips the listing
-entirely.
+- **Panels and result columns are resized by dragging**; double-click a column
+  border to hand it back to the automatic fit. Hand-set widths persist as long
+  as the report keeps producing the same columns.
+- **`Tab`/`Shift+Tab` cycle panels** in the terminal UI's order. The focused
+  request list is arrow-driven: `Home`/`End`, `Enter` to run, `F2` to rename,
+  `Delete` to delete, `Ctrl+Z` to undo. A Workspace tree adds `Left`/`Right` to
+  collapse and expand, and `PageUp`/`PageDown` for ten rows.
+- **Single-letter shortcuts don't carry over** — in a desktop window those keys
+  are text. Globally: `F5`/`Ctrl+Enter` run, `Ctrl+S`/`Ctrl+Shift+S` save,
+  `Ctrl+W` closes, `Ctrl+Z` undoes a delete, `Alt+F` opens the File menu, `F1`
+  shows every shortcut.
+- **The File menu is grouped by verb** (New / Import / Open / Save). Open ▸
+  Collection and Load ▸ Environment take Postman exports too — they work out
+  what the file holds. Every dialog reopens where you left it.
+- **Workspaces are editable in place**: New adds a collection, report or
+  environment; drag files and folders onto another folder to move them, or onto
+  the empty space to move them back to the root. Nothing escapes the workspace
+  root and nothing is silently overwritten.
+- **Reports bind to their collection by a relative path** (`../apis/billing.hurl`
+  included), so a workspace survives being zipped up or handed over. The
+  `collection` dropdown offers the report's own workspace first and hides
+  outside collections behind a toggle.
+- **The window remembers itself** — size, every splitter you dragged, the open
+  view, the selected report/request and the Workspace node.
 
-**From the command line**, the same import runs headlessly:
+### The PaperTrail block editor
+
+Reports get a **Blocks** view alongside **Source** and **Results**: a
+drag-and-drop editor where blocks are dragged from a palette, reordered, nested
+inside `FOR` loops (which move as one, body included) and dropped on the trash
+bar to delete. The drag outline and the drop marker are both drawn as the
+block's own silhouette, at its real width and indent.
+
+Editable on the blocks: the request a step runs, its alias, response format and
+`SHOW(…)`/`HIDE(…)`/`STATISTICS(…)` lists; a `FOR` loop's binder, source, roles
+and `PARALLEL(n)` concurrency; and the report's own settings — `collection`,
+`output`, `environment`, `root`, `baseline`, `columns` — in a boxed panel above
+`BEGIN`. Those apply to the report rather than running as a step, so they're
+deliberately not blocks. `output` names a *format* (`csv`, `json`, `html`,
+`xlsx`), not a filename; only the CLI's `-o` takes a path. Everything has hover
+help, and **Source** is highlighted with the terminal UI's colours, underlining
+whatever the parser rejected.
+
+### Desktop icon on Linux
+
+Wayland has no per-window icon protocol, so shells match the window's app id
+against an installed `.desktop` file. The first GUI launch writes
+`$XDG_DATA_HOME/paperboy/paperboy_logo.png` and
+`$XDG_DATA_HOME/applications/paperboy.desktop` (with `StartupWMClass=paperboy`
+for X11) if they aren't already there, and never touches them again — so you
+can customise them. The shell may need a rescan (log out, or restart it) to
+notice. Delete both and relaunch to regenerate, which is also how you refresh
+`Exec=` after moving the binary.
+
+## Environments and secrets
+
+A `.vars` file is one `KEY=value` per line. Values can be:
+
+| Form | Example | Resolved by |
+|---|---|---|
+| Literal | `USERNAME=demo` | — |
+| Process env var | `BASE_URL={{ env:DEMO_BASE_URL }}` | The process environment |
+| 1Password | `API_TOKEN={{ op://Vault/Item/field }}` | The local `op` CLI |
+| AWS SSM | `DB_PASSWORD={{ ssm:/path/to/param }}` | Local AWS auth |
+
+Provider references resolve in the background at load time, and the resolved
+values are never persisted — `state.json` keeps only the reference. Every
+1Password reference across every open collection resolves in a single `op
+inject` call, so you get one authorization prompt rather than one per
+collection. `r` in the Environment panel retries a single failed entry. Editing
+a value into something that looks like a reference triggers a load attempt, and
+a "still secret?" checkbox decides whether the new value stays masked.
+
+**Loading a `.vars` file substitutes nothing on its own.** It only joins the
+Global Environments list. It has to be either:
+
+- **active** — `a` in the Global Environments panel (GUI: the **Active**
+  button). One at a time, shared by every tab; or
+- **linked** — `p` in the Requests list pins one to the active collection (GUI:
+  **Linked**).
+
+Both at once merge, with the linked value winning. A collection still showing
+raw `{{ VAR }}`, or a red "variables in this request are undefined" band, nearly
+always means this step was missed.
+
+A variable that is *defined but empty* is not undefined and warns about nothing
+— it substitutes as an empty string. With Basic Auth that produces a
+well-formed request that comes back `401`.
+
+## Git remotes
+
+Load and save collections, environments and whole workspaces straight from a
+remote, with **no local clone**: PaperBoy lists refs, fetches just enough
+history to read the file tree, and checks out only the files you actually
+asked for. Nothing else in the repo touches your disk, however large it is.
+
+**Loading** (File ▸ Load ▸ *kind* ▸ From Git…): give the URL — `https://…` or
+`git@…`, with an optional access token used only for that fetch (GitHub-style
+`https://x-access-token:<token>@host/…` is handled for you) — then pick a ref
+and a file, both filterable as you type. `↓` on the URL field offers your
+recent URLs. Loading a collection then offers to pair an environment from the
+same listing, with no second round-trip. Anything loaded from git shows a ⎇ in
+its tab title and remembers its origin.
+
+**Workspaces** ask which files to fetch first — `.hurl` and `.json` (default),
+`.hurl` only, `.json` only, or everything — and then whether to keep the
+download temporarily or copy it somewhere permanent immediately.
+
+> **A temporary workspace is never cleaned up.** Its files live in a temp
+> folder for as long as the tab exists — including across a close and undo, and
+> across restarts. They accumulate. Choose "save to a permanent location" when
+> asked, or later via File ▸ Save ▸ Workspace ▸ Save As…, which copies the
+> folder and stops tracking it as temporary.
+
+**Saving** (File ▸ Save ▸ Collection ▸ To Git…) pushes a commit directly to the
+remote. The URL is prefilled from where the collection came from, so you can
+redirect it to a fork. You choose the in-repo path, whether the attached
+environment goes in the same commit, and a branch or tag:
+
+- A **branch** defaults to the one you loaded from, so `Enter` just appends a
+  commit. `↓` lists the remote's branches. No merge or rebase is attempted — a
+  non-fast-forward is reported as an error.
+- A **tag** must be new. The remote is re-fetched immediately before the check,
+  and an existing tag is always rejected with no way to force it.
+
+The message defaults to `Update <name> via PaperBoy` and is editable. The author
+is your git identity, or `PaperBoy <paperboy@localhost>` if you have none. A
+branch push updates the remembered origin and clears the modified markers; a tag
+push clears the markers but leaves the origin on your working branch.
+
+To Git… only works for something loaded from git. For anything else, Save As…
+into your own clone and use git normally.
+
+## Importing from Postman
+
+Already have an export? Just open it — **Open ▸ Collection** and **Load ▸
+Environment** both work out what the file holds, and File ▸ Import from Postman
+▸ *From an exported file* says so explicitly. No API key, no account.
+
+To pull from an account, File ▸ Import ▸ Postman account… (terminal) or File ▸
+Import from Postman ▸ From my Postman account… (GUI). Give it an API key, pick a
+workspace, choose what to bring and where, and the result opens as a workspace.
+Paste a workspace id — or its Postman address — on the first step to skip the
+listing entirely.
+
+Migrating off Postman altogether: `Ctrl+A` on the workspace list, or **Import
+all** in the GUI. Everything the list is *showing* is imported (so the filter is
+honoured), each workspace into its own folder, so two "Billing API" collections
+from different workspaces both survive.
+
+Postman rate-limits its API, so the wizard shows what it found and roughly how
+long the download will take before fetching anything, then reports the remaining
+time from the rate it is actually achieving and says when it is pausing to stay
+inside the limit. A Postman API key carries its owner's full access and can't be
+scoped, so a missing workspace is one your account isn't a member of.
+
+The same import runs headlessly:
 
 ```sh
 export POSTMAN_API_KEY='PMAK-…'
 
-# List the workspaces the key can see
-paperboy --postman-import
-
-# Download one into a folder you can open as a workspace
+paperboy --postman-import                                       # list workspaces
 paperboy --postman-import --postman-workspace 12ece9e1-… -o ~/API
-
-# Or download every workspace the key can see, each into its own subfolder
-paperboy --postman-import --postman-all -o ~/Postman
+paperboy --postman-import --postman-all -o ~/Postman            # every workspace
 ```
 
-The workspace may be given as its id or as its address in Postman, so the
-browser address bar can be pasted straight in. The result is a folder of
-`Collections/` and `Environments/` — open it with **Open ▸ Workspace**.
+| Flag | Effect |
+|---|---|
+| `--postman-key` | The key, instead of `$POSTMAN_API_KEY`. Takes the same `{{ … }}` provider references as a `.vars` file — `'{{ op://Private/Postman/credential }}'` keeps it out of your shell history. Never written to disk, stripped from error messages. |
+| `--postman-all` | Every visible workspace, each into its own folder under `-o`. Empty workspaces are skipped and inaccessible ones reported rather than fatal, so forty workspaces aren't stopped by one. Excludes `--postman-workspace`. |
+| `--postman-what` | `collections`, `environments` or `all`. |
+| `--postman-format` | `postman` (default) keeps the JSON byte for byte; `hurl` converts. |
+| `--overwrite` | Replace a non-empty destination, which is otherwise refused. |
+| `--postman-base-url` | Another tenant, e.g. `https://api.eu.postman.com` for EU Enterprise. |
 
-- `--postman-key` supplies the key instead of `$POSTMAN_API_KEY`. It accepts the
-  same `{{ … }}` provider references as a `.vars` file, so the key needn't
-  appear in your shell history:
-  `--postman-key '{{ op://Private/Postman/credential }}'`. The key is never
-  written to disk, and is stripped from any error message.
-- `--postman-all` downloads every workspace the key can see instead of one,
-  each into its own folder under `-o`. A workspace with nothing in it is
-  skipped, and one the key has lost access to is reported and skipped rather
-  than ending the run — so a migration of forty workspaces isn't stopped by
-  one of them. It can't be combined with `--postman-workspace`.
-- `--postman-what collections|environments|all` limits what is downloaded.
-- `--postman-format hurl` converts on the way in: collections become `.hurl`
-  files and environments become `.vars` files, so the result owes nothing to
-  Postman. See **Converting to Hurl** below. The default, `postman`, keeps
-  Postman's own JSON byte for byte — PaperBoy opens that directly too.
-- `--overwrite` replaces an existing destination; without it, a destination that
-  exists and isn't empty is refused.
-- `--postman-base-url` points at a different tenant (EU Enterprise accounts use
-  `https://api.eu.postman.com`).
-
-A Postman API key carries its owner's own access — it can't be scoped — so a
-workspace missing from the list is one your Postman account isn't a member of.
-
-Postman rate-limits its API, so an import is paced deliberately and tells you
-up front roughly how long it will take; a large workspace takes a minute or two.
+The result is a folder of `Collections/` and `Environments/`; open it with Open
+▸ Workspace.
 
 ### Converting to Hurl
 
-`--postman-format hurl` writes Hurl rather than Postman JSON. What comes across:
+`--postman-format hurl` brings across requests, folders (as `Folder/Name`
+titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 
-- Requests, folders (as `Folder/Name` titles), headers, query parameters,
-  raw bodies and form/multipart fields.
-- **Auth, including inheritance.** Postman applies a collection's or folder's
-  auth to every request that doesn't set its own, and `noauth` on a request
-  opts back out; all three levels are resolved, so a collection that
-  authenticates once at the top doesn't import as an unauthenticated one.
-  `basic`, `bearer` and `apikey` (header or query) are mapped.
-- **Collection variables**, which have nowhere to live in a `.hurl` file, become
-  `<name> (collection variables).vars` alongside the environments — select it
-  like any other environment and `{{base}}` resolves.
-- `pm.<store>.set("NAME", body.a.b)` calls in a test script, as `[Captures]`.
+- **Auth, including inheritance.** Collection- and folder-level auth is applied
+  to requests that don't set their own, and `noauth` opts back out. `basic`,
+  `bearer` and `apikey` (header or query) are mapped.
+- **Collection variables**, which have nowhere to live in a `.hurl` file, as
+  `<name> (collection variables).vars` beside the environments.
+- `pm.<store>.set("NAME", body.a.b)` calls in test scripts, as `[Captures]`.
 
-Hurl doesn't cover everything Postman does, so anything dropped — a
-pre-request script, an OAuth 2 block, a GraphQL body — is listed by request in
-`CONVERSION-NOTES.md` at the root of the imported folder. No notes file means
-nothing was lost. A collection this build can't read is written out as its
-original JSON instead, so converting can never cost you data.
+Hurl doesn't cover everything Postman does. Anything dropped — pre-request
+scripts, OAuth 2, GraphQL bodies — is listed per request in
+`CONVERSION-NOTES.md` at the root of the import; no file means nothing was lost.
+A collection this build can't read is written out as its original JSON, so
+converting can't cost you data.
 
-## Headless CLI mode
-
-Run a collection end-to-end from the command line, with no UI:
+## Headless runner
 
 ```sh
 paperboy -c collection.hurl
 paperboy -c collection.hurl -e environment.vars
+paperboy -c collection.hurl --batch
 ```
 
-- `-c`/`--collection` accepts a Hurl `.hurl` file or a Postman collection
-  export (`.json`), imported automatically.
-- `-e`/`--env` supplies a `.vars` environment file for any `{{ VAR }}`
-  references in the collection (required if the collection uses
-  `{{ BASE_URL }}` or similar).
-- `-b`/`--batch` runs every request as a single Hurl call instead of the
-  default streaming mode (see below).
+`-c` takes a `.hurl` file or a Postman export. `-e` supplies the environment.
+Exit status is `0` only if every request passed.
 
-By default, each request's method, URL, status, asserts, captures, and body
-(truncated) are printed as soon as that request finishes, instead of
-waiting for the whole collection — output is color-formatted (skipped
-automatically when not writing to a terminal, or when `NO_COLOR` is set) to
-make passes, failures, and sections easier to tell apart at a glance.
-Streaming reuses the same `hurl` crate runner one request at a time, so
-captures still chain correctly between requests — but it can't carry
-Hurl's automatic cookie jar (cookies remembered from `Set-Cookie` response
-headers) across requests the way running the whole collection in one call
-can; a warning to this effect is printed at startup. An explicit
-`[Cookies]` section on a request is unaffected either way. If a collection
-relies on cookie continuity between requests, pass `--batch` to run it as
-a single call like before, trading incremental output for that guarantee.
+By default each request's method, URL, status, asserts, captures and truncated
+body print as it finishes, coloured unless the output isn't a terminal or
+`NO_COLOR` is set. Streaming runs one request at a time through the same `hurl`
+runner, so captures still chain — but it can't carry Hurl's automatic cookie jar
+between requests, and says so at startup. An explicit `[Cookies]` section is
+unaffected. `-b`/`--batch` runs the collection as a single Hurl call, trading
+incremental output for cookie continuity.
 
-The process exits `0` if every request passed, non-zero otherwise.
+### Reports
+
+`-r report.trail` runs a PaperTrail report and exits.
+
+```sh
+paperboy -r report.trail                                  # collection from the report's headers
+paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout
+paperboy -c api.hurl -e prod.vars -e staging.vars -r report.trail
+paperboy -c api.hurl -r report.trail --dry-run            # expand it, send nothing
+```
+
+Without `-c`/`-e` the report's own `# collection:` / `# environment:` headers
+apply, resolved relative to the report. `-e` is repeatable: each file is named
+by its stem and becomes selectable in an `ENVS` loop, so `-e prod.vars -e
+staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`;
+the first is also the base variable layer. `-o`'s extension picks the format
+(`.csv`, `.json`, `.html`, `.xlsx`), `-` writes CSV to stdout, and omitting it
+derives the filename from the report's own headers.
