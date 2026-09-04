@@ -12,9 +12,10 @@ use std::io::IsTerminal;
 use ratatui::crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
+use crate::generators::SystemSource;
 use crate::hurl::{
     EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, parse_hurl_error,
-    run_hurl, run_hurl_streaming,
+    run_hurl, run_hurl_streaming_with,
 };
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::request;
@@ -200,7 +201,43 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     let mut per_request: Vec<Option<bool>> = vec![None; total];
     let mut record = |eo: &EntryOutcome| credit(&mut per_request, eo);
 
+    // `# [Gen]` blocks. A block belongs to one request and is evaluated per
+    // send, so it cannot simply be folded into the run's variables up front:
+    // two requests that each compute a `nonce` must each get their own.
+    // Streaming already runs one entry at a time, so each block is evaluated
+    // in its window — which also lets a generator read a value an earlier
+    // request captured. Batch is a single Hurl call over the whole file and
+    // has no such window, so there every block is evaluated once, before the
+    // run, against the environment alone; a name computed by two requests
+    // takes the first request's value for both.
+    let gen_entries = entries.clone();
+    let mut gen_reported: Vec<bool> = vec![false; gen_entries.len()];
+    let strings = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+    let report_gen = |title: &str, errors: &[crate::generators::GenError]| {
+        for detail in crate::i18n::describe_gen_errors(&strings, errors) {
+            eprintln!(
+                "{}",
+                paint(color, Hue::Red, &format!("  ! {title}: {detail}"))
+            );
+        }
+    };
+
     let out = if batch {
+        let mut vars = vars.clone();
+        for e in &gen_entries {
+            if e.generators.is_empty() {
+                continue;
+            }
+            let mut merged = vars.clone();
+            let errors =
+                crate::generators::expand(&e.generators, &mut merged, &SystemSource::new());
+            report_gen(&e.title, &errors);
+            for (name, _) in &e.generators {
+                if let Some(v) = merged.get(name) {
+                    vars.entry(name.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
         let out = run_hurl(&run_content, &vars, file_root);
         for eo in out.entries.iter() {
             print_entry(
@@ -214,16 +251,42 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
         }
         out
     } else {
-        run_hurl_streaming(&run_content, &vars, file_root, |eo| {
-            print_entry(
-                color,
-                eo.entry_index,
-                total,
-                titles.get(eo.entry_index).copied(),
-                eo,
-            );
-            record(eo);
-        })
+        run_hurl_streaming_with(
+            &run_content,
+            &vars,
+            file_root,
+            |i, known| {
+                let Some(entry) = gen_entries.get(i) else {
+                    return Vec::new();
+                };
+                if entry.generators.is_empty() {
+                    return Vec::new();
+                }
+                let mut merged = known.clone();
+                let errors =
+                    crate::generators::expand(&entry.generators, &mut merged, &SystemSource::new());
+                // Reported once per request however often it repeats, so a
+                // `[Options] retry` does not print the same typo five times.
+                if !std::mem::replace(&mut gen_reported[i], true) {
+                    report_gen(&entry.title, &errors);
+                }
+                entry
+                    .generators
+                    .iter()
+                    .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
+                    .collect()
+            },
+            |eo| {
+                print_entry(
+                    color,
+                    eo.entry_index,
+                    total,
+                    titles.get(eo.entry_index).copied(),
+                    eo,
+                );
+                record(eo);
+            },
+        )
     };
     let passed = per_request.iter().filter(|r| **r == Some(true)).count();
     let failed = per_request.iter().filter(|r| **r == Some(false)).count();

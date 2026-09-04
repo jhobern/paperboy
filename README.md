@@ -350,6 +350,13 @@ will not build a canonical request from the live headers, so AWS SigV4 and
 friends are out of scope. Chaining a MAC into the *key* of the next one isn't
 expressible either, since every value here is text.
 
+The block works headlessly too. `paperboy -c …` evaluates each request's rows
+in its own window, so a generator can read a value an earlier request captured
+and two requests each get their own nonce. `--batch` is a single Hurl call over
+the whole file and has no such window: there every block is evaluated once
+before the run, and a name computed by two requests takes the first one's value
+for both.
+
 A row that fails — unknown function, wrong arity, a name nothing defines —
 reports rather than blocks the send. It binds nothing, so `{{sig}}` goes out
 literally and comes back a loud `401`, which is easier to diagnose than a
@@ -361,6 +368,9 @@ Importing from Postman maps the dynamic variables that have an exact equivalent:
 are renamed and listed in `CONVERSION-NOTES.md` as values you must supply —
 guessing at `$randomFirstName` would send a plausible wrong value, which is
 harder to notice than a request that won't run.
+
+Worked examples — collections to import, and the `.hurl` file they should become
+— are in [`examples/postman/`](examples/postman/).
 
 ## Git remotes
 

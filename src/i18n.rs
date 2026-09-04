@@ -2037,46 +2037,11 @@ impl Status {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))
             }
             Status::GeneratorErrors(errors) => {
-                use crate::generators::GenError as G;
-                let described: Vec<String> = errors
-                    .iter()
-                    .map(|e| match e {
-                        G::Syntax { name, detail } => s
-                            .gen_err_syntax
-                            .replace("{row}", name)
-                            .replace("{detail}", detail),
-                        G::UnknownFunction { name, function } => s
-                            .gen_err_unknown
-                            .replace("{row}", name)
-                            .replace("{function}", function),
-                        G::Arity {
-                            name,
-                            function,
-                            expected,
-                            got,
-                        } => s
-                            .gen_err_arity
-                            .replace("{row}", name)
-                            .replace("{function}", function)
-                            .replace("{expected}", expected)
-                            .replace("{got}", &got.to_string()),
-                        G::BadArgument {
-                            name,
-                            function,
-                            detail,
-                        } => s
-                            .gen_err_argument
-                            .replace("{row}", name)
-                            .replace("{function}", function)
-                            .replace("{detail}", detail),
-                        G::UndefinedReference { name, reference } => s
-                            .gen_err_undefined
-                            .replace("{row}", name)
-                            .replace("{reference}", reference),
-                        G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
-                    })
-                    .collect();
-                format!("{} {}", s.gen_status, described.join("; "))
+                format!(
+                    "{} {}",
+                    s.gen_status,
+                    describe_gen_errors(s, errors).join("; ")
+                )
             }
             Status::TruncatedPlaceholders(items) => {
                 format!(
@@ -2275,4 +2240,51 @@ mod tests {
         assert_eq!(da.response_heading, "Svar");
         assert_eq!(da.new_request, "\u{FF0B} Ny anmodning");
     }
+}
+
+/// Render `# [Gen]` failures in the active language, one string per failing row.
+///
+/// Shared by the status line and the headless runner: the block is evaluated by
+/// both, and a user who has learned "there is no function called `hmac_sha526`"
+/// from the UI should meet the same sentence from the CLI.
+pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) -> Vec<String> {
+    use crate::generators::GenError as G;
+    errors
+        .iter()
+        .map(|e| match e {
+            G::Syntax { name, detail } => s
+                .gen_err_syntax
+                .replace("{row}", name)
+                .replace("{detail}", detail),
+            G::UnknownFunction { name, function } => s
+                .gen_err_unknown
+                .replace("{row}", name)
+                .replace("{function}", function),
+            G::Arity {
+                name,
+                function,
+                expected,
+                got,
+            } => s
+                .gen_err_arity
+                .replace("{row}", name)
+                .replace("{function}", function)
+                .replace("{expected}", expected)
+                .replace("{got}", &got.to_string()),
+            G::BadArgument {
+                name,
+                function,
+                detail,
+            } => s
+                .gen_err_argument
+                .replace("{row}", name)
+                .replace("{function}", function)
+                .replace("{detail}", detail),
+            G::UndefinedReference { name, reference } => s
+                .gen_err_undefined
+                .replace("{row}", name)
+                .replace("{reference}", reference),
+            G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
+        })
+        .collect()
 }

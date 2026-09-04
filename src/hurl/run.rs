@@ -195,6 +195,26 @@ pub fn run_hurl_streaming(
     content: &str,
     vars: &HashMap<String, String>,
     file_root: Option<&Path>,
+    on_entry: impl FnMut(&EntryOutcome),
+) -> RunOutput {
+    run_hurl_streaming_with(content, vars, file_root, |_, _| Vec::new(), on_entry)
+}
+
+/// [`run_hurl_streaming`], with a chance to bind extra variables just before
+/// each entry runs.
+///
+/// `before_entry` is called with the entry's zero-based index and everything
+/// currently bound — the environment, plus whatever earlier entries captured —
+/// and whatever it returns is bound over the top for that entry onwards. This
+/// is how a `# [Gen]` block reaches the headless runner: the block belongs to
+/// one request and is evaluated per send, so it cannot be folded into the run's
+/// variables up front, and evaluating it here is also what lets a generator
+/// read a value an earlier request captured.
+pub fn run_hurl_streaming_with(
+    content: &str,
+    vars: &HashMap<String, String>,
+    file_root: Option<&Path>,
+    mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> Vec<(String, String)>,
     mut on_entry: impl FnMut(&EntryOutcome),
 ) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
@@ -220,6 +240,13 @@ pub fn run_hurl_streaming(
     let total = hurl_file.entries.len();
 
     for i in 1..=total {
+        let known: HashMap<String, String> = variables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value().to_string()))
+            .collect();
+        for (k, v) in before_entry(i - 1, &known) {
+            variables.insert(k, Value::String(v));
+        }
         let runner_opts = RunnerOptionsBuilder::new()
             .continue_on_error(true)
             .from_entry(Some(i))

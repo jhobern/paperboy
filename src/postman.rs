@@ -1408,7 +1408,17 @@ fn note_losses(
         .iter()
         .any(|e| e.listen == "prerequest" && !e.script.exec.is_empty())
     {
-        note("a pre-request script was dropped — Hurl has no equivalent".into());
+        // Worth naming the `[Gen]` block here rather than only in the README:
+        // this note is the moment the user learns the script is gone, and most
+        // pre-request scripts are computing a nonce, a stamp or a signature,
+        // which the block does. It is not offered as an automatic translation
+        // because a script can do anything, and a wrong guess at a signature
+        // sends a plausible-looking request that fails for no visible reason.
+        note(
+            "a pre-request script was dropped — Hurl cannot run one. If it was computing a \
+             nonce, a timestamp or a signature, the request's `[Gen]` block can do that instead"
+                .into(),
+        );
     }
     let has_tests = events
         .iter()
@@ -1816,6 +1826,190 @@ fn unquote(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collections under `examples/postman/` are what a user is told to
+    /// import to see this working. A mapping change that stopped producing the
+    /// outcome the example's own description promises would be found by them,
+    /// not by us, so they are converted here.
+    mod shipped_examples {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn convert_example(file: &str) -> ConvertedCollection {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/postman/");
+            let json = std::fs::read_to_string(format!("{path}{file}"))
+                .unwrap_or_else(|e| panic!("{file} is shipped and must be readable: {e}"));
+            convert_postman(&json)
+        }
+
+        fn entry<'a>(c: &'a ConvertedCollection, title: &str) -> &'a HurlEntry {
+            c.entries
+                .iter()
+                .find(|e| e.title == title)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no request titled {title:?}; found {:?}",
+                        c.entries.iter().map(|e| &e.title).collect::<Vec<_>>()
+                    )
+                })
+        }
+
+        #[test]
+        fn the_dynamic_variable_example_demonstrates_all_three_outcomes() {
+            let c = convert_example("dynamic-variables.postman_collection.json");
+
+            let builtin = entry(&c, "Built in/A GUID and an ISO timestamp");
+            let text = builtin.to_hurl();
+            assert!(
+                text.contains("{{newUuid}}") && text.contains("{{newDate}}"),
+                "$guid and $isoTimestamp become Hurl's own placeholders: {text}"
+            );
+            assert!(
+                builtin.generators.is_empty(),
+                "a built-in needs no computed row"
+            );
+
+            let twice = entry(&c, "Built in/The same GUID twice");
+            assert!(
+                twice.generators.is_empty(),
+                "and still none when used in two places"
+            );
+
+            let computed = entry(&c, "Computed/A Unix timestamp and a random integer");
+            let names: Vec<&str> = computed
+                .generators
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            assert_eq!(
+                computed.generators.len(),
+                2,
+                "one row per name however often it is used, not one per use: {names:?}"
+            );
+            let exprs: Vec<&str> = computed
+                .generators
+                .iter()
+                .map(|(_, e)| e.as_str())
+                .collect();
+            assert!(
+                exprs.contains(&"timestamp"),
+                "$timestamp is Unix seconds: {exprs:?}"
+            );
+            assert!(
+                exprs.iter().any(|e| e.starts_with("random_int(")),
+                "$randomInt is a bounded integer: {exprs:?}"
+            );
+
+            let supplied = entry(&c, "Supplied/Faker data nothing can produce");
+            assert!(
+                supplied.generators.is_empty(),
+                "nothing here can be honestly computed"
+            );
+            assert!(
+                c.notes.iter().any(|n| n.item == supplied.title),
+                "so the user is told to supply it instead"
+            );
+        }
+
+        #[test]
+        fn every_shipped_example_still_parses_as_hurl() {
+            for file in [
+                "dynamic-variables.postman_collection.json",
+                "signed-requests.postman_collection.json",
+            ] {
+                let c = convert_example(file);
+                assert!(!c.entries.is_empty(), "{file} converted to nothing");
+                for e in &c.entries {
+                    let text = e.to_hurl();
+                    let back = crate::hurl::parse_hurl(&text);
+                    assert_eq!(
+                        back.len(),
+                        1,
+                        "{file}: {:?} did not survive a round trip:\n{text}",
+                        e.title
+                    );
+                    assert_eq!(back[0].generators, e.generators, "{file}: {:?}", e.title);
+                }
+            }
+        }
+
+        /// `signed-requests.hurl` is the worked answer the README tells the
+        /// user to compare their own block against, so its rows must actually
+        /// evaluate. A `.hurl` file that no longer parses, or a function that
+        /// has been renamed out from under it, would otherwise be found by
+        /// whoever followed the instructions.
+        #[test]
+        fn the_worked_signing_example_parses_and_evaluates() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/postman/signed-requests.hurl"
+            );
+            let text = std::fs::read_to_string(path).expect("shipped example must be readable");
+            let entries = crate::hurl::parse_hurl(&text);
+            assert_eq!(entries.len(), 6, "six requests, one deliberately broken");
+
+            let vars: HashMap<String, String> = [
+                ("baseUrl", "https://postman-echo.com"),
+                ("API_KEY", "EXAMPLE-KEY-id"),
+                ("API_SECRET", "EXAMPLE-SECRET-not-a-real-key"),
+                ("SINCE", "2026-01-01T00:00:00Z"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+            for e in &entries {
+                assert!(
+                    !e.generators.is_empty(),
+                    "{:?} is in this file to demonstrate a block",
+                    e.title
+                );
+                let mut merged = vars.clone();
+                let errors = crate::generators::expand(
+                    &e.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                );
+                if e.title.starts_with("Deliberately broken") {
+                    assert_eq!(errors.len(), 1, "the typo is the point of that request");
+                    continue;
+                }
+                assert!(errors.is_empty(), "{:?}: {errors:?}", e.title);
+            }
+
+            // The known-answer request is the file's own proof, so check the
+            // vector here too rather than only against a live server.
+            let vector = &entries[4];
+            let mut merged = vars.clone();
+            crate::generators::expand(
+                &vector.generators,
+                &mut merged,
+                &crate::generators::SystemSource::new(),
+            );
+            assert_eq!(
+                merged.get("sig").map(String::as_str),
+                Some("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+                "RFC 4231 case 2"
+            );
+        }
+
+        #[test]
+        fn the_signing_example_keeps_the_scripts_it_cannot_run() {
+            let c = convert_example("signed-requests.postman_collection.json");
+            let signed = entry(&c, "HMAC-SHA256 over a nonce and a timestamp");
+            assert!(
+                signed.to_hurl().contains("{{sig}}"),
+                "the signature placeholder is preserved for the [Gen] row to fill"
+            );
+            assert!(
+                c.notes
+                    .iter()
+                    .any(|n| n.item == signed.title && n.detail.to_lowercase().contains("script")),
+                "and the dropped pre-request script is reported, not silently lost: {:?}",
+                c.notes
+            );
+        }
+    }
 
     #[test]
     fn imports_requests_headers_and_body() {

@@ -1,0 +1,198 @@
+{
+  "info": {
+    "_postman_id": "8a2d5c14-77b9-4f0e-b3a2-6d1c9e4f5a67",
+    "name": "PaperBoy — Signed requests",
+    "description": "The case the [Gen] block exists for. Every request here is signed by a Postman pre-request script; the script is dropped on import and listed in CONVERSION-NOTES.md, and the comment on each request says which [Gen] rows reproduce it. Add those rows in the wizard's Computed section (Alt+0) and the request works with no scripting engine anywhere.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "https://postman-echo.com" },
+    { "key": "API_KEY", "value": "EXAMPLE-KEY-id" },
+    { "key": "API_SECRET", "value": "EXAMPLE-SECRET-not-a-real-key" }
+  ],
+  "item": [
+    {
+      "name": "HMAC-SHA256 over a nonce and a timestamp",
+      "description": "Reproduce with:\n\n# [Gen] 3\n# nonce = random_hex(16)\n# ts = timestamp\n# sig = hmac_sha256(API_SECRET, concat(nonce, ts))\n\nThe rows are evaluated once per send, so the nonce in the header and the nonce inside the signature are the same nonce — which the Postman script only manages by remembering to set both from one variable.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const nonce = CryptoJS.lib.WordArray.random(16).toString();",
+              "const ts = Math.floor(Date.now() / 1000).toString();",
+              "const sig = CryptoJS.HmacSHA256(nonce + ts, pm.collectionVariables.get('API_SECRET')).toString();",
+              "pm.variables.set('nonce', nonce);",
+              "pm.variables.set('ts', ts);",
+              "pm.variables.set('sig', sig);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key", "value": "{{API_KEY}}" },
+          { "key": "X-Nonce", "value": "{{nonce}}" },
+          { "key": "X-Timestamp", "value": "{{ts}}" },
+          { "key": "Authorization", "value": "HMAC-SHA256 {{sig}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": 1250,\n  \"currency\": \"GBP\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/post",
+          "host": ["{{baseUrl}}"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "The same signature in Base64",
+      "description": "Reproduce with:\n\n# [Gen] 3\n# nonce = random_hex(16)\n# ts = timestamp\n# sig = hmac_sha256_b64(API_SECRET, concat(nonce, ts))\n\nNote hmac_sha256_b64, not base64(hmac_sha256(...)): the first encodes the 32 digest bytes, the second encodes the 64 characters of hex. Both are valid Base64 of the right shape and only one is what the server checks.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const nonce = CryptoJS.lib.WordArray.random(16).toString();",
+              "const ts = Math.floor(Date.now() / 1000).toString();",
+              "const mac = CryptoJS.HmacSHA256(nonce + ts, pm.collectionVariables.get('API_SECRET'));",
+              "pm.variables.set('nonce', nonce);",
+              "pm.variables.set('ts', ts);",
+              "pm.variables.set('sig', CryptoJS.enc.Base64.stringify(mac));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key", "value": "{{API_KEY}}" },
+          { "key": "X-Nonce", "value": "{{nonce}}" },
+          { "key": "X-Timestamp", "value": "{{ts}}" },
+          { "key": "Authorization", "value": "HMAC-SHA256 {{sig}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": 1250,\n  \"currency\": \"GBP\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/post",
+          "host": ["{{baseUrl}}"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "A Base64 credential and a digest of the body",
+      "description": "Reproduce with:\n\n# [Gen] 2\n# cred = base64(concat(API_KEY, \":\", API_SECRET))\n# body_hash = sha256_b64(BODY)\n\nwhere BODY is an environment variable holding the exact bytes you send. PaperBoy signs what you give it and will not assemble the body for you, which is the same reason it does not build AWS SigV4 canonical requests.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const key = pm.collectionVariables.get('API_KEY');",
+              "const secret = pm.collectionVariables.get('API_SECRET');",
+              "pm.variables.set('cred', btoa(key + ':' + secret));",
+              "const body = pm.request.body ? pm.request.body.raw : '';",
+              "pm.variables.set('body_hash', CryptoJS.enc.Base64.stringify(CryptoJS.SHA256(body)));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Basic {{cred}}" },
+          { "key": "Digest", "value": "SHA-256={{body_hash}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"state\":\"settled\"}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/put",
+          "host": ["{{baseUrl}}"],
+          "path": ["put"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "A signature over a URL-encoded query",
+      "description": "Reproduce with:\n\n# [Gen] 3\n# ts = timestamp\n# msg = concat(\"GET\\n/orders\\nsince=\", urlencode(SINCE), \"&ts=\", ts)\n# sig = hmac_sha1_b64(API_SECRET, msg)\n\nThe canonical string is assembled by hand, on purpose: only you know what the server expects to be in it and in what order.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const ts = Math.floor(Date.now() / 1000).toString();",
+              "const since = pm.variables.get('SINCE') || '2026-01-01T00:00:00Z';",
+              "const msg = 'GET\\n/orders\\nsince=' + encodeURIComponent(since) + '&ts=' + ts;",
+              "const mac = CryptoJS.HmacSHA1(msg, pm.collectionVariables.get('API_SECRET'));",
+              "pm.variables.set('ts', ts);",
+              "pm.variables.set('sig', CryptoJS.enc.Base64.stringify(mac));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "X-Api-Key", "value": "{{API_KEY}}" },
+          { "key": "Authorization", "value": "HMAC-SHA1 {{sig}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/get?since={{SINCE}}&ts={{ts}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["get"],
+          "query": [
+            { "key": "since", "value": "{{SINCE}}" },
+            { "key": "ts", "value": "{{ts}}" }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Known-answer check (RFC 4231 case 2)",
+      "description": "Reproduce with:\n\n# [Gen] 1\n# sig = hmac_sha256(\"Jefe\", \"what do ya want for nothing?\")\n\nand the echo should show\n5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843.\nA published vector, so a self-consistently wrong implementation still fails it. Send this first if a real signature is being rejected and you are not sure which side is wrong.",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.variables.set('sig', CryptoJS.HmacSHA256('what do ya want for nothing?', 'Jefe').toString());"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "X-Signature", "value": "{{sig}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/get?sig={{sig}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["get"],
+          "query": [{ "key": "sig", "value": "{{sig}}" }]
+        }
+      },
+      "response": []
+    }
+  ]
+}

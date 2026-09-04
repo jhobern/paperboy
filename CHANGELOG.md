@@ -79,6 +79,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   yields a single row, since a name defined twice is a block whose meaning
   depends on which row won.
 
+  The headless runner evaluates the block too, which it did not at first: a
+  collection that ran from the UI came back "Undefined variable" from `-c`,
+  which is the worst possible way to find out, since the whole point of the CLI
+  is running in something that is not watching. Each request's rows are
+  evaluated in its own window as it comes up, so a generator can read a value an
+  earlier request captured and two requests each get their own nonce. `--batch`
+  is one Hurl call over the whole file and has no such window, so there the
+  blocks are evaluated once before the run and a name computed by two requests
+  takes the first one's value for both. Failing rows are named on stderr in the
+  same words the status line uses.
+
+  `examples/postman/` holds collections to import and the `.hurl` file they
+  should become once the blocks are written, including a request signed against
+  the RFC 4231 test vector — a signing implementation that is self-consistently
+  wrong passes every test written from its own output.
+
 - **Import every Postman workspace at once.** The wizard could only ever take
   one workspace at a time, which is fine for trying PaperBoy out and useless
   for the thing people actually want it for: leaving Postman. An account with
