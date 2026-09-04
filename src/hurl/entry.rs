@@ -805,19 +805,21 @@ pub fn suggest_parameter_name(value: &str, declared: &[(String, String)]) -> Str
         .expect("an unused suffix always exists")
 }
 
-/// Whether `name` could be the name of a `{{name}}` variable.
+/// Whether `name` could be the name of a `{{name}}` variable Hurl will actually
+/// resolve: non-empty, and made only of the characters
+/// [`hurl_name_char`] accepts.
 ///
-/// Deliberately liberal — anything the `{{ … }}` placeholder pattern in
-/// [`crate::environment`] would match, i.e. non-empty with no whitespace and no
-/// braces. A stricter identifier rule would quietly refuse to default names
-/// that already work everywhere else in PaperBoy (`api-key`, `x.y`), and the
-/// two definitions of "a variable name" drifting apart is exactly the kind of
-/// bug nobody finds.
+/// This used to be deliberately liberal — anything PaperBoy's own `{{ … }}`
+/// pattern would match, on the reasoning that a name working everywhere else in
+/// PaperBoy should not be refused here. The reasoning was sound and the premise
+/// was wrong: `{{x.y}}` resolves in PaperBoy's preview but reaches the wire as
+/// the value of `x`, because Hurl reads a name only as far as the first
+/// character outside its own set and silently drops the rest (see
+/// [`placeholder_problem`]). Offering such a name here meant helping the user
+/// build a request that [`crate::request::truncated_placeholders`] then refuses
+/// to send — caught, but a step too late to be useful.
 pub fn is_variable_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name
-            .chars()
-            .any(|c| c.is_whitespace() || c == '{' || c == '}')
+    !name.is_empty() && name.chars().all(hurl_name_char)
 }
 
 /// Recognise a `# [Body] <n>` marker and return the line count it claims.
@@ -2026,6 +2028,26 @@ mod placeholder_tests {
                 "{inner:?} should be unparsable"
             );
             assert_eq!(hurl_reads(inner), None, "hurl disagrees about {inner:?}");
+        }
+    }
+
+    /// The name offered to "extract to parameter" is held to Hurl's rule, not
+    /// PaperBoy's looser one. `api.key` reads as a perfectly good variable name
+    /// and resolves in the preview, but Hurl sends the value of `api` — so
+    /// accepting it here would build a request PaperBoy then refuses to send.
+    #[test]
+    fn a_parameter_name_hurl_would_truncate_is_not_offered() {
+        for good in ["TOKEN", "api_key", "api-key", "x1", "Ké"] {
+            assert_eq!(check_parameter_name(good, "v", &[]), None, "{good:?}");
+            assert!(is_variable_name(good), "{good:?}");
+        }
+        for bad in ["api.key", "$guid", "a b", "", "a{b"] {
+            assert_eq!(
+                check_parameter_name(bad, "v", &[]),
+                Some(ParamNameError::Invalid),
+                "{bad:?}"
+            );
+            assert!(!is_variable_name(bad), "{bad:?}");
         }
     }
 

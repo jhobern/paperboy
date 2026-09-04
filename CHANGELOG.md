@@ -99,6 +99,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   surfacing later as a collection that loads as nothing. Hurl's own
   `{{ newUuid }}` and `{{ newDate }}` are unaffected.
 
+- **"Extract to parameter" no longer offers a name Hurl can't use.** The prompt
+  accepted anything PaperBoy's own substitution would match, so `api.key` was
+  allowed — building a request that the check above then refuses to send. It is
+  now held to the same rule at the point the name is typed.
+
 - The Postman importer's allowance line stopped flickering between two
   unrelated numbers. Postman meters listing calls (10 per 10 seconds) and fetch
   calls (300 per minute) as separate accounts, and an import draws on both
