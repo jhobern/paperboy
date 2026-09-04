@@ -826,6 +826,14 @@ Postman account…** (**Open ▸ Workspace ▸ …** in the GUI). Give it your A
 it lists the workspaces the key can see; pick one, choose what to bring across
 and where to put it, and the imported folder opens as a workspace.
 
+Migrating off Postman entirely? Take the lot in one go: press `Ctrl+A` on the
+workspace list in the terminal UI, or click **Import all** in the GUI. Every
+workspace the list is showing is imported — the filter is honoured, so a
+filtered list imports what it shows — and each lands in its own folder inside
+the destination, so two workspaces that both hold a "Billing API" keep both.
+Listing them costs two API calls per workspace, which is why the estimate and
+the confirmation step still come first.
+
 Because Postman rate-limits its API, the wizard shows you what it found and
 roughly how long the download will take *before* downloading anything, so
 backing out costs nothing. While it runs it shows a remaining time worked out
@@ -846,6 +854,9 @@ paperboy --postman-import
 
 # Download one into a folder you can open as a workspace
 paperboy --postman-import --postman-workspace 12ece9e1-… -o ~/API
+
+# Or download every workspace the key can see, each into its own subfolder
+paperboy --postman-import --postman-all -o ~/Postman
 ```
 
 The workspace may be given as its id or as its address in Postman, so the
@@ -857,6 +868,11 @@ browser address bar can be pasted straight in. The result is a folder of
   appear in your shell history:
   `--postman-key '{{ op://Private/Postman/credential }}'`. The key is never
   written to disk, and is stripped from any error message.
+- `--postman-all` downloads every workspace the key can see instead of one,
+  each into its own folder under `-o`. A workspace with nothing in it is
+  skipped, and one the key has lost access to is reported and skipped rather
+  than ending the run — so a migration of forty workspaces isn't stopped by
+  one of them. It can't be combined with `--postman-workspace`.
 - `--postman-what collections|environments|all` limits what is downloaded.
 - `--postman-format hurl` converts on the way in: collections become `.hurl`
   files and environments become `.vars` files, so the result owes nothing to

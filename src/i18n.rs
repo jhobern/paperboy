@@ -1301,6 +1301,8 @@ strings! {
     postman_word_collections => "collections", "collections", "samlinger";
     postman_word_environment => "environment", "environnement", "miljø";
     postman_word_environments => "environments", "environnements", "miljøer";
+    postman_word_workspace => "workspace", "espace de travail", "workspace";
+    postman_word_workspaces => "workspaces", "espaces de travail", "workspaces";
     postman_unit_seconds => "seconds", "secondes", "sekunder";
     postman_unit_minutes => "minutes", "minutes", "minutter";
     postman_title => "Import from Postman", "Importer depuis Postman", "Importér fra Postman";
@@ -1327,6 +1329,11 @@ strings! {
     postman_base_url_label => "API host", "Hôte de l’API", "API-vært";
     postman_base_url_hint => "api.getpostman.com · EU: api.eu.postman.com", "api.getpostman.com · UE : api.eu.postman.com", "api.getpostman.com · EU: api.eu.postman.com";
     postman_pick_workspace => "Choose a workspace", "Choisissez un espace de travail", "Vælg et workspace";
+    postman_pick_workspace_hint => "Type to filter · Enter select · Ctrl+A import all · Esc cancel", "Filtrer en tapant · Entrée choisir · Ctrl+A tout importer · Échap annuler", "Skriv for at filtrere · Enter vælg · Ctrl+A importér alle · Esc annuller";
+    postman_all_workspaces => "All workspaces", "Tous les espaces de travail", "Alle workspaces";
+    postman_import_all => "Import all", "Tout importer", "Importér alle";
+    postman_import_all_note => "Every workspace shown is imported, each into its own folder inside the destination. Listing them all costs two API calls per workspace.", "Chaque espace de travail affiché est importé, chacun dans son propre dossier au sein de la destination. Les lister tous coûte deux appels d'API par espace de travail.", "Hvert viste workspace importeres, hver i sin egen mappe inde i destinationen. At liste dem alle koster to API-kald pr. workspace.";
+    postman_ws_skipped => "could not be listed and were skipped", "n'ont pas pu être listés et ont été ignorés", "kunne ikke listes og blev sprunget over";
     postman_include_collections => "Collections", "Collections", "Samlinger";
     postman_include_environments => "Environments", "Environnements", "Miljøer";
     postman_dest_label => "Import into", "Importer dans", "Importér til";

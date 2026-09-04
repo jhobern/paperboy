@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui_explorer::FileExplorer;
 
@@ -4121,6 +4121,13 @@ impl TuiApp {
                     KeyCode::Down if w.flow.selected + 1 < n => w.flow.selected += 1,
                     KeyCode::Enter => {
                         if w.flow.submit_workspace() {
+                            w.suggest_dest(import_base.as_deref());
+                        }
+                    }
+                    // Ctrl rather than a bare letter: every printable key on
+                    // this screen types into the filter.
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if w.flow.submit_all_workspaces() {
                             w.suggest_dest(import_base.as_deref());
                         }
                     }

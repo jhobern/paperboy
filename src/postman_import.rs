@@ -230,14 +230,39 @@ impl Pacer {
 // Plan and estimation
 // ---------------------------------------------------------------------------
 
-/// What an import will fetch, worked out before any bulk downloading starts so
-/// the user can be shown a cost and an ETA and given the chance to back out.
+/// One workspace's share of an import.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportPlan {
+pub struct WorkspacePlan {
     pub workspace_id: String,
     pub workspace_name: String,
     pub collections: Vec<ItemSummary>,
     pub environments: Vec<ItemSummary>,
+}
+
+impl WorkspacePlan {
+    pub fn is_empty(&self) -> bool {
+        self.collections.is_empty() && self.environments.is_empty()
+    }
+}
+
+/// What an import will fetch, worked out before any bulk downloading starts so
+/// the user can be shown a cost and an ETA and given the chance to back out.
+///
+/// An import covers one workspace or many (see [`Importer::plan_all`]). The
+/// flat `collections`/`environments` lists are every workspace's items
+/// concatenated, workspace by workspace, so everything that only wants totals,
+/// an ETA or a preview list can ignore the grouping entirely; only the writer
+/// cares which workspace an item came from, because that decides its folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPlan {
+    /// The workspaces this import covers, in the order they are downloaded.
+    pub workspaces: Vec<WorkspacePlan>,
+    pub collections: Vec<ItemSummary>,
+    pub environments: Vec<ItemSummary>,
+    /// Workspaces that were asked for but could not be listed, as
+    /// `(name, reason)`. Only an import of many workspaces can have these: one
+    /// workspace the key has lost access to must not cost the other forty.
+    pub skipped: Vec<(String, String)>,
     /// `RateLimit-Remaining-Month` as of the listing calls, when Postman sent
     /// it. Lets the confirmation step warn that an import would eat most of a
     /// user's monthly budget before it spends any of it.
@@ -245,6 +270,44 @@ pub struct ImportPlan {
 }
 
 impl ImportPlan {
+    /// Build a plan from the per-workspace listings, flattening them once so
+    /// the two views can never drift apart.
+    pub fn new(
+        workspaces: Vec<WorkspacePlan>,
+        skipped: Vec<(String, String)>,
+        remaining_month: Option<u64>,
+    ) -> Self {
+        let collections = workspaces
+            .iter()
+            .flat_map(|w| w.collections.iter().cloned())
+            .collect();
+        let environments = workspaces
+            .iter()
+            .flat_map(|w| w.environments.iter().cloned())
+            .collect();
+        ImportPlan {
+            workspaces,
+            collections,
+            environments,
+            skipped,
+            remaining_month,
+        }
+    }
+
+    /// Whether this import spans more than one workspace, which is what
+    /// decides the on-disk layout.
+    pub fn is_multi(&self) -> bool {
+        self.workspaces.len() > 1
+    }
+
+    /// The workspace name, when there is exactly one. Empty for an import of
+    /// several, which belongs to no single workspace.
+    pub fn workspace_name(&self) -> &str {
+        match self.workspaces.as_slice() {
+            [only] => &only.workspace_name,
+            _ => "",
+        }
+    }
     /// Total number of items to download.
     pub fn item_count(&self) -> usize {
         self.collections.len() + self.environments.len()
@@ -584,12 +647,77 @@ impl<'a> Importer<'a> {
         self.check_cancel()?;
 
         let mut remaining_month = None;
+        let one =
+            self.list_workspace(workspace_id, workspace_name, options, &mut remaining_month)?;
+        if one.is_empty() {
+            return Err(ImportError::Empty);
+        }
 
+        let plan = ImportPlan::new(vec![one], Vec::new(), remaining_month);
+        self.send(ImportMsg::Planned(Box::new(plan.clone())));
+        Ok(plan)
+    }
+
+    /// Work out what an import of *several* workspaces would fetch.
+    ///
+    /// Listing is per workspace, so this costs two calls per workspace before
+    /// anything is downloaded — which is exactly why the result still goes to
+    /// a confirmation step rather than straight to the download.
+    ///
+    /// A workspace that lists nothing is dropped rather than reported: an
+    /// account that has an empty scratch workspace should still be able to
+    /// import the rest of itself in one go. A workspace the key has lost
+    /// access to is recorded in [`ImportPlan::skipped`] for the same reason.
+    /// Anything else — a bad key, an exhausted monthly budget — would fail for
+    /// every remaining workspace too, so it stops the whole plan.
+    pub fn plan_all(
+        &mut self,
+        workspaces: &[(String, String)],
+        options: &ImportOptions,
+    ) -> Result<ImportPlan, ImportError> {
+        self.send(ImportMsg::Listing);
+        self.check_cancel()?;
+
+        let mut remaining_month = None;
+        let mut planned: Vec<WorkspacePlan> = Vec::new();
+        let mut skipped: Vec<(String, String)> = Vec::new();
+
+        for (id, name) in workspaces {
+            self.check_cancel()?;
+            match self.list_workspace(id, name, options, &mut remaining_month) {
+                Ok(w) if w.is_empty() => {}
+                Ok(w) => planned.push(w),
+                Err(ImportError::Api(e)) if workspace_failure_is_survivable(&e) => {
+                    skipped.push((display_workspace(id, name), e.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if planned.is_empty() {
+            return Err(ImportError::Empty);
+        }
+
+        let plan = ImportPlan::new(planned, skipped, remaining_month);
+        self.send(ImportMsg::Planned(Box::new(plan.clone())));
+        Ok(plan)
+    }
+
+    /// List one workspace's collections and environments. Returns an empty
+    /// plan rather than an error when the workspace holds nothing, because
+    /// what that means depends on whether it was the only one asked for.
+    fn list_workspace(
+        &mut self,
+        workspace_id: &str,
+        workspace_name: &str,
+        options: &ImportOptions,
+        remaining_month: &mut Option<u64>,
+    ) -> Result<WorkspacePlan, ImportError> {
         let collections = if options.include_collections {
             self.pace(RateBucket::Strict);
             let (items, rate) =
                 self.retrying(RateBucket::Strict, |c| c.list_collections(workspace_id))?;
-            remaining_month = rate.remaining_month.or(remaining_month);
+            *remaining_month = rate.remaining_month.or(*remaining_month);
             self.observe(RateBucket::Strict, &rate);
             items
         } else {
@@ -602,26 +730,19 @@ impl<'a> Importer<'a> {
             self.pace(RateBucket::General);
             let (items, rate) =
                 self.retrying(RateBucket::General, |c| c.list_environments(workspace_id))?;
-            remaining_month = rate.remaining_month.or(remaining_month);
+            *remaining_month = rate.remaining_month.or(*remaining_month);
             self.observe(RateBucket::General, &rate);
             items
         } else {
             Vec::new()
         };
 
-        if collections.is_empty() && environments.is_empty() {
-            return Err(ImportError::Empty);
-        }
-
-        let plan = ImportPlan {
+        Ok(WorkspacePlan {
             workspace_id: workspace_id.to_string(),
             workspace_name: workspace_name.to_string(),
             collections,
             environments,
-            remaining_month,
-        };
-        self.send(ImportMsg::Planned(Box::new(plan.clone())));
-        Ok(plan)
+        })
     }
 
     /// Fetch everything in `plan` and leave it at `dest`.
@@ -693,31 +814,51 @@ impl<'a> Importer<'a> {
         let mut collections = 0usize;
         let mut environments = 0usize;
 
-        if !plan.collections.is_empty() {
-            std::fs::create_dir_all(staging.join(COLLECTIONS_DIR)).map_err(io_err)?;
-        }
-        if !plan.environments.is_empty() {
-            std::fs::create_dir_all(staging.join(ENVIRONMENTS_DIR)).map_err(io_err)?;
+        // Where each workspace's files go. One workspace keeps the flat
+        // `Collections/` + `Environments/` layout it has always had; several
+        // each get a folder of their own, because merging two workspaces'
+        // same-named collections into one directory would leave them told
+        // apart only by a " (2)" suffix nobody can trace back to a workspace.
+        let roots = workspace_roots(plan, staging);
+        for (i, ws) in plan.workspaces.iter().enumerate() {
+            if !ws.collections.is_empty() {
+                std::fs::create_dir_all(roots[i].join(COLLECTIONS_DIR)).map_err(io_err)?;
+            }
+            if !ws.environments.is_empty() {
+                std::fs::create_dir_all(roots[i].join(ENVIRONMENTS_DIR)).map_err(io_err)?;
+            }
         }
 
-        let mut taken_collections: HashSet<String> = HashSet::new();
-        let mut taken_environments: HashSet<String> = HashSet::new();
-        let mut notes: Vec<ConversionNote> = Vec::new();
+        // De-duplication is per workspace, since each has its own folder: two
+        // workspaces may both hold a "Billing API" without either being
+        // renamed.
+        let n = plan.workspaces.len();
+        let mut taken_collections: Vec<HashSet<String>> = vec![HashSet::new(); n];
+        let mut taken_environments: Vec<HashSet<String>> = vec![HashSet::new(); n];
+        let mut notes: Vec<Vec<ConversionNote>> = vec![Vec::new(); n];
 
-        // The queue, in the order the files must be written: collections first,
-        // then environments. Fetching happens out of order and in parallel;
-        // *processing* follows this order regardless, so the names a workspace
-        // with two "Billing API"s produces don't depend on which reply won the
-        // race.
-        let jobs: Vec<(ItemKind, &ItemSummary)> = plan
-            .collections
-            .iter()
-            .map(|i| (ItemKind::Collection, i))
-            .chain(plan.environments.iter().map(|i| (ItemKind::Environment, i)))
-            .collect();
+        // The queue, in the order the files must be written: one workspace at a
+        // time, collections before environments. Fetching happens out of order
+        // and in parallel; *processing* follows this order regardless, so the
+        // names a workspace with two "Billing API"s produces don't depend on
+        // which reply won the race.
+        let mut jobs: Vec<(ItemKind, &ItemSummary)> = Vec::with_capacity(total);
+        // Which workspace each job belongs to, and so which folder it lands in.
+        let mut owners: Vec<usize> = Vec::with_capacity(total);
+        for (i, ws) in plan.workspaces.iter().enumerate() {
+            for item in &ws.collections {
+                jobs.push((ItemKind::Collection, item));
+                owners.push(i);
+            }
+            for item in &ws.environments {
+                jobs.push((ItemKind::Environment, item));
+                owners.push(i);
+            }
+        }
 
         self.fetch_each(&jobs, |job_index, fetched| {
             let (kind, item) = jobs[job_index];
+            let ws = owners[job_index];
             {
                 self.check_cancel()?;
                 index += 1;
@@ -747,15 +888,19 @@ impl<'a> Importer<'a> {
                 self.observe(RateBucket::General, &rate);
 
                 let (dir, taken, counter) = match kind {
-                    ItemKind::Collection => {
-                        (COLLECTIONS_DIR, &mut taken_collections, &mut collections)
-                    }
-                    ItemKind::Environment => {
-                        (ENVIRONMENTS_DIR, &mut taken_environments, &mut environments)
-                    }
+                    ItemKind::Collection => (
+                        COLLECTIONS_DIR,
+                        &mut taken_collections[ws],
+                        &mut collections,
+                    ),
+                    ItemKind::Environment => (
+                        ENVIRONMENTS_DIR,
+                        &mut taken_environments[ws],
+                        &mut environments,
+                    ),
                 };
                 let rendered = render(&display, &body, kind, options.format, taken);
-                std::fs::write(staging.join(dir).join(&rendered.name), rendered.contents)
+                std::fs::write(roots[ws].join(dir).join(&rendered.name), rendered.contents)
                     .map_err(io_err)?;
                 *counter += 1;
 
@@ -764,27 +909,34 @@ impl<'a> Importer<'a> {
                 // belongs — including when the workspace has no environments of
                 // its own and the folder wouldn't otherwise exist.
                 if let Some((stem, contents)) = rendered.vars {
-                    let name = unique_file_name(&stem, "vars", &mut taken_environments);
-                    let dir = staging.join(ENVIRONMENTS_DIR);
+                    let name = unique_file_name(&stem, "vars", &mut taken_environments[ws]);
+                    let dir = roots[ws].join(ENVIRONMENTS_DIR);
                     std::fs::create_dir_all(&dir).map_err(io_err)?;
                     std::fs::write(dir.join(name), contents).map_err(io_err)?;
                 }
-                notes.extend(rendered.notes);
+                notes[ws].extend(rendered.notes);
             }
             Ok(())
         })?;
 
-        if let Some(report) = conversion_report(&plan.workspace_name, &notes) {
-            std::fs::write(staging.join(NOTES_FILE), report).map_err(io_err)?;
+        for (i, ws) in plan.workspaces.iter().enumerate() {
+            if let Some(report) = conversion_report(&ws.workspace_name, &notes[i]) {
+                std::fs::write(roots[i].join(NOTES_FILE), report).map_err(io_err)?;
+            }
         }
+
+        // A workspace that could not even be listed is reported next to the
+        // items that could not be fetched: both are "asked for, not imported",
+        // and both are things the summary must not quietly drop.
+        failures.extend(plan.skipped.iter().cloned());
 
         Ok(ImportSummary {
             dest: PathBuf::new(),
-            workspace_name: plan.workspace_name.clone(),
+            workspace_name: plan.workspace_name().to_string(),
             collections,
             environments,
             failures,
-            converted_with_notes: !notes.is_empty(),
+            converted_with_notes: notes.iter().any(|n| !n.is_empty()),
             elapsed: self.clock.now().saturating_duration_since(started),
         })
     }
@@ -1128,6 +1280,51 @@ fn item_failure_is_survivable(e: &ApiError) -> bool {
     }
 }
 
+/// The staging folder each workspace's files are written under.
+///
+/// One workspace writes straight into the staging root, which keeps the layout
+/// every existing import produced. Several get a folder each, named after the
+/// workspace and de-duplicated the same way item files are, because two teams
+/// really can both call a workspace "Platform".
+fn workspace_roots(plan: &ImportPlan, staging: &Path) -> Vec<PathBuf> {
+    if !plan.is_multi() {
+        return vec![staging.to_path_buf(); plan.workspaces.len().max(1)];
+    }
+    let mut taken: HashSet<String> = HashSet::new();
+    plan.workspaces
+        .iter()
+        .map(|ws| {
+            let base = sanitize_file_name(&display_workspace(&ws.workspace_id, &ws.workspace_name));
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while !taken.insert(candidate.to_lowercase()) {
+                candidate = format!("{base} ({n})");
+                n += 1;
+            }
+            staging.join(candidate)
+        })
+        .collect()
+}
+
+/// Whether failing to *list* one workspace should drop it from a multi-
+/// workspace plan rather than end the run. Only reasons that are specific to
+/// that workspace qualify: a rejected key or an exhausted monthly budget would
+/// fail for every other workspace too, and reporting forty identical skips
+/// instead of one error would hide what actually went wrong.
+fn workspace_failure_is_survivable(e: &ApiError) -> bool {
+    matches!(e, ApiError::Forbidden(_) | ApiError::NotFound(_))
+}
+
+/// What to call a workspace in a message, falling back to the id when Postman
+/// gave no name (the `--postman-workspace` path plans by id alone).
+fn display_workspace(id: &str, name: &str) -> String {
+    if name.trim().is_empty() {
+        id.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workspace references
 // ---------------------------------------------------------------------------
@@ -1458,17 +1655,20 @@ mod tests {
     // -- estimation -------------------------------------------------------
 
     fn plan_of(collections: usize, environments: usize) -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: (0..collections)
-                .map(|i| item(&format!("c{i}"), &format!("uc{i}")))
-                .collect(),
-            environments: (0..environments)
-                .map(|i| item(&format!("e{i}"), &format!("ue{i}")))
-                .collect(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: (0..collections)
+                    .map(|i| item(&format!("c{i}"), &format!("uc{i}")))
+                    .collect(),
+                environments: (0..environments)
+                    .map(|i| item(&format!("e{i}"), &format!("ue{i}")))
+                    .collect(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     #[test]
@@ -1529,7 +1729,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.collections.len(), 1);
         assert_eq!(plan.environments.len(), 1);
-        assert_eq!(plan.workspace_name, "My Workspace");
+        assert_eq!(plan.workspace_name(), "My Workspace");
         let urls = script.urls.lock().unwrap();
         assert!(urls[0].contains("/collections?workspace=ws-1"));
         assert!(urls[1].contains("/environments?workspace=ws-1"));
@@ -1549,6 +1749,210 @@ mod tests {
         let mut imp = Importer::new(&c).with_clock(&clock);
         let err = imp.plan("nope", "", &ImportOptions::default()).unwrap_err();
         assert_eq!(err, ImportError::Empty);
+    }
+
+    /// The migration case: several workspaces planned through one importer,
+    /// so the pacer's picture of the account's budget survives the whole
+    /// listing rather than being thrown away between workspaces.
+    #[test]
+    fn plan_all_covers_every_workspace_and_flattens_the_items() {
+        let script = Scripted::new(vec![
+            res(
+                200,
+                r#"{"collections":[{"uid":"u1","id":"1","name":"Alpha"}]}"#,
+            ),
+            res(
+                200,
+                r#"{"environments":[{"uid":"u2","id":"2","name":"Dev"}]}"#,
+            ),
+            res(
+                200,
+                r#"{"collections":[{"uid":"u3","id":"3","name":"Beta"}]}"#,
+            ),
+            res(200, r#"{"environments":[]}"#),
+        ]);
+        let c = client(script.clone());
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let targets = vec![
+            ("ws-1".to_string(), "One".to_string()),
+            ("ws-2".to_string(), "Two".to_string()),
+        ];
+        let plan = imp.plan_all(&targets, &ImportOptions::default()).unwrap();
+
+        assert!(plan.is_multi());
+        assert_eq!(plan.workspaces.len(), 2);
+        assert_eq!(plan.item_count(), 3, "two collections and one environment");
+        assert_eq!(
+            plan.workspace_name(),
+            "",
+            "an import of several belongs to no one workspace"
+        );
+        let urls = script.urls.lock().unwrap();
+        assert!(urls[0].contains("/collections?workspace=ws-1"));
+        assert!(urls[2].contains("/collections?workspace=ws-2"));
+    }
+
+    /// An account nobody has tidied up has empty workspaces in it, and a key
+    /// may have lost access to one. Neither may cost the other thirty-nine.
+    #[test]
+    fn plan_all_drops_the_empty_and_records_the_unreachable() {
+        let script = Scripted::new(vec![
+            res(200, r#"{"collections":[]}"#),
+            res(200, r#"{"environments":[]}"#),
+            res(403, r#"{"error":{"message":"not on your plan"}}"#),
+            res(
+                200,
+                r#"{"collections":[{"uid":"u1","id":"1","name":"Alpha"}]}"#,
+            ),
+            res(200, r#"{"environments":[]}"#),
+        ]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let targets = vec![
+            ("ws-empty".to_string(), "Empty".to_string()),
+            ("ws-gone".to_string(), "Gone".to_string()),
+            ("ws-ok".to_string(), "Keeper".to_string()),
+        ];
+        let plan = imp.plan_all(&targets, &ImportOptions::default()).unwrap();
+
+        assert_eq!(plan.workspaces.len(), 1, "only the one with anything in it");
+        assert_eq!(plan.workspaces[0].workspace_name, "Keeper");
+        assert_eq!(plan.skipped.len(), 1, "the unreachable one is reported");
+        assert_eq!(plan.skipped[0].0, "Gone");
+    }
+
+    /// A rejected key would fail for every remaining workspace, so it stops
+    /// the plan rather than being logged forty times.
+    #[test]
+    fn plan_all_stops_on_a_failure_that_would_repeat() {
+        let script = Scripted::new(vec![res(401, r#"{"error":{"message":"nope"}}"#)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let targets = vec![
+            ("ws-1".to_string(), "One".to_string()),
+            ("ws-2".to_string(), "Two".to_string()),
+        ];
+        let err = imp
+            .plan_all(&targets, &ImportOptions::default())
+            .unwrap_err();
+        assert_eq!(err, ImportError::Api(ApiError::Unauthorized));
+    }
+
+    /// Several workspaces each get a folder; the same name in two of them is
+    /// two files, not one renamed to " (2)".
+    #[test]
+    fn downloading_several_workspaces_gives_each_its_own_folder() {
+        let script = Scripted::new(vec![
+            res(200, r#"{"collection":{"n":1}}"#),
+            res(200, r#"{"environment":{"name":"Dev"}}"#),
+            res(200, r#"{"collection":{"n":2}}"#),
+        ]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let plan = ImportPlan::new(
+            vec![
+                WorkspacePlan {
+                    workspace_id: "ws-1".into(),
+                    workspace_name: "Alpha".into(),
+                    collections: vec![item("Billing", "u1")],
+                    environments: vec![item("Dev", "u2")],
+                },
+                WorkspacePlan {
+                    workspace_id: "ws-2".into(),
+                    workspace_name: "Beta".into(),
+                    collections: vec![item("Billing", "u3")],
+                    environments: vec![],
+                },
+            ],
+            Vec::new(),
+            None,
+        );
+        let dest = tmpdir("allws");
+        let summary = imp
+            .download(&plan, &dest, &ImportOptions::default())
+            .unwrap();
+
+        assert_eq!(summary.collections, 2);
+        assert_eq!(summary.environments, 1);
+        assert!(dest.join("Alpha/Collections/Billing.json").is_file());
+        assert!(dest.join("Alpha/Environments/Dev.json").is_file());
+        assert!(dest.join("Beta/Collections/Billing.json").is_file());
+        assert!(
+            !dest.join("Beta/Collections/Billing (2).json").exists(),
+            "de-duplication is per workspace, not across them"
+        );
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// Two teams really can both call a workspace "Platform", and one folder
+    /// holding both would lose half of it.
+    #[test]
+    fn workspaces_with_the_same_name_get_separate_folders() {
+        let script = Scripted::new(vec![
+            res(200, r#"{"collection":{"n":1}}"#),
+            res(200, r#"{"collection":{"n":2}}"#),
+        ]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let plan = ImportPlan::new(
+            vec![
+                WorkspacePlan {
+                    workspace_id: "ws-1".into(),
+                    workspace_name: "Platform".into(),
+                    collections: vec![item("A", "u1")],
+                    environments: vec![],
+                },
+                WorkspacePlan {
+                    workspace_id: "ws-2".into(),
+                    workspace_name: "Platform".into(),
+                    collections: vec![item("B", "u2")],
+                    environments: vec![],
+                },
+            ],
+            Vec::new(),
+            None,
+        );
+        let dest = tmpdir("samename");
+        imp.download(&plan, &dest, &ImportOptions::default())
+            .unwrap();
+        assert!(dest.join("Platform/Collections/A.json").is_file());
+        assert!(dest.join("Platform (2)/Collections/B.json").is_file());
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    /// A workspace that could not be listed is not silently forgotten between
+    /// the plan and the summary: the import reports it as not landed.
+    #[test]
+    fn skipped_workspaces_are_reported_in_the_summary() {
+        let script = Scripted::new(vec![res(200, r#"{"collection":{"n":1}}"#)]);
+        let c = client(script);
+        let clock = FakeClock::new();
+        let mut imp = Importer::new(&c).with_clock(&clock);
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-1".into(),
+                workspace_name: "Alpha".into(),
+                collections: vec![item("A", "u1")],
+                environments: vec![],
+            }],
+            vec![("Gone".to_string(), "not permitted".to_string())],
+            None,
+        );
+        let dest = tmpdir("skipped");
+        let summary = imp
+            .download(&plan, &dest, &ImportOptions::default())
+            .unwrap();
+        assert!(!summary.is_complete());
+        assert_eq!(
+            summary.failures,
+            vec![("Gone".into(), "not permitted".into())]
+        );
+        std::fs::remove_dir_all(&dest).ok();
     }
 
     #[test]
@@ -1597,13 +2001,16 @@ mod tests {
         let c = client(script);
         let clock = FakeClock::new();
         let mut imp = Importer::new(&c).with_clock(&clock);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("Alpha", "u1")],
-            environments: vec![item("Dev", "u2")],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("Alpha", "u1")],
+                environments: vec![item("Dev", "u2")],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("layout");
         let summary = imp
             .download(&plan, &dest, &ImportOptions::default())
@@ -1631,13 +2038,16 @@ mod tests {
         let c = client(script);
         let clock = FakeClock::new();
         let mut imp = Importer::new(&c).with_clock(&clock);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("Same", "u1"), item("Same", "u2")],
-            environments: vec![],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("Same", "u1"), item("Same", "u2")],
+                environments: vec![],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("dupes");
         let summary = imp
             .download(&plan, &dest, &ImportOptions::default())
@@ -1663,13 +2073,16 @@ mod tests {
         let clock = FakeClock::new();
         let (tx, rx) = channel();
         let mut imp = Importer::new(&c).with_clock(&clock).with_progress(tx);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("A", "u1"), item("Gone", "u2"), item("C", "u3")],
-            environments: vec![],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("A", "u1"), item("Gone", "u2"), item("C", "u3")],
+                environments: vec![],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("survive");
         let summary = imp
             .download(&plan, &dest, &ImportOptions::default())
@@ -1901,13 +2314,16 @@ mod tests {
         let clock = FakeClock::new();
         let (tx, rx) = channel();
         let mut imp = Importer::new(&c).with_clock(&clock).with_progress(tx);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("A", "u1")],
-            environments: vec![item("E", "u2")],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("A", "u1")],
+                environments: vec![item("E", "u2")],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("progress");
         imp.download(&plan, &dest, &ImportOptions::default())
             .unwrap();
@@ -1993,13 +2409,16 @@ mod tests {
         let c = client(script);
         let clock = FakeClock::new();
         let mut imp = Importer::new(&c).with_clock(&clock);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("Billing", "u1")],
-            environments: vec![item("Prod", "u2")],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("Billing", "u1")],
+                environments: vec![item("Prod", "u2")],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("opens");
         imp.download(&plan, &dest, &ImportOptions::default())
             .unwrap();
@@ -2240,13 +2659,16 @@ mod tests {
         let c = client(script);
         let clock = FakeClock::new();
         let mut imp = Importer::new(&c).with_clock(&clock);
-        let plan = ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "WS".into(),
-            collections: vec![item("API", "u1")],
-            environments: vec![item("Prod", "u2")],
-            remaining_month: None,
-        };
+        let plan = ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "WS".into(),
+                collections: vec![item("API", "u1")],
+                environments: vec![item("Prod", "u2")],
+            }],
+            Vec::new(),
+            None,
+        );
         let dest = tmpdir("convert");
         imp.download(&plan, &dest, &hurl_options()).unwrap();
 

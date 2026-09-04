@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.4] - 2026-09-04
+
+### Added
+
+- **Import every Postman workspace at once.** The wizard could only ever take
+  one workspace at a time, which is fine for trying PaperBoy out and useless
+  for the thing people actually want it for: leaving Postman. An account with
+  forty workspaces meant forty passes through the same four steps, re-entering
+  the key, the destination and the format each time. Both front-ends can now
+  take the lot — `Ctrl+A` on the workspace list in the terminal UI (`Ctrl`,
+  because every printable key on that screen types into the filter), an
+  **Import all** button beside **Next** in the GUI — and the headless import
+  has `--postman-all` to match. Everything the list is *showing* is imported,
+  so a filtered list imports what it shows rather than quietly taking more
+  than was asked for.
+
+  Each workspace lands in its own folder inside the destination, keeping the
+  `Collections/` + `Environments/` layout a single import has always produced;
+  two workspaces that both hold a "Billing API" therefore keep both, rather
+  than one being renamed to " (2)" with nothing to say which it came from. Two
+  workspaces that share a *name* get separate folders too.
+
+  The whole run still goes through one importer and one confirmation step: the
+  rate-limit pacer's picture of the account's real budget is worth more the
+  more calls are left to make, and the estimate, the ETA and the monthly-budget
+  warning now cover the entire import, so backing out before a forty-workspace
+  download still costs nothing. A workspace with nothing in it is dropped, and
+  one the key has lost access to is reported and skipped rather than ending the
+  run — an account is not a migration's fault. Anything that would fail for
+  every remaining workspace, such as a rejected key or an exhausted monthly
+  quota, still stops the plan instead of being logged forty times.
+
+
 ## [0.5.3] - 2026-09-03
 
 ### Added

@@ -310,7 +310,11 @@ pub(crate) struct PostmanFlow {
     busy_since: Option<Instant>,
     budget: Option<Budget>,
     workspaces: Vec<WorkspaceSummary>,
-    chosen: Option<WorkspaceSummary>,
+    /// The workspaces the import will cover: one when it was picked from the
+    /// list or named by id, every listed one when "import everything" was
+    /// asked for. A `Vec` rather than an `Option` so the two cases travel the
+    /// same path — a migration is a whole account, not a workspace at a time.
+    chosen: Vec<WorkspaceSummary>,
     plan: Option<ImportPlan>,
     progress: Progress,
     /// Items that could not be fetched, accumulated as they are reported so the
@@ -587,7 +591,7 @@ impl PostmanFlow {
             busy_since: None,
             budget: None,
             workspaces: Vec::new(),
-            chosen: None,
+            chosen: Vec::new(),
             plan: None,
             progress: Progress::default(),
             failures: Vec::new(),
@@ -717,7 +721,7 @@ impl PostmanFlow {
     /// back as a suggestion. A pasted key is never returned: it is the
     /// credential itself, and this ends up in `state.json`.
     pub(crate) fn key_to_remember(&self) -> Option<&str> {
-        let proven = !self.workspaces.is_empty() || self.chosen.is_some() || self.plan.is_some();
+        let proven = !self.workspaces.is_empty() || !self.chosen.is_empty() || self.plan.is_some();
         let key = self.key.trim();
         (proven && !key.is_empty() && !KeySource::detect(key).0.is_secret()).then_some(key)
     }
@@ -1004,8 +1008,28 @@ impl PostmanFlow {
     }
 
     /// The name of the workspace being imported, once one is settled on.
+    /// Empty when the import covers several: it belongs to no one workspace,
+    /// and callers that need something to show use [`Self::target_label`].
     pub(crate) fn workspace_name(&self) -> &str {
-        self.chosen.as_ref().map(|w| w.name.as_str()).unwrap_or("")
+        match self.chosen.as_slice() {
+            [only] => only.name.as_str(),
+            _ => "",
+        }
+    }
+
+    /// How many workspaces the import covers.
+    pub(crate) fn target_count(&self) -> usize {
+        self.chosen.len()
+    }
+
+    /// What to head the remaining steps with: the workspace's name, or how
+    /// many workspaces are being imported when it is more than one.
+    pub(crate) fn target_label(&self, s: &Strings) -> String {
+        match self.chosen.as_slice() {
+            [] => String::new(),
+            [only] => only.name.clone(),
+            many => format!("{} ({})", s.postman_all_workspaces, many.len()),
+        }
     }
 
     pub(crate) fn dest_path(&self) -> PathBuf {
@@ -1044,11 +1068,11 @@ impl PostmanFlow {
             };
             // Nothing has been listed, so the name isn't known — the id stands
             // in until the plan comes back with the real one.
-            self.chosen = Some(WorkspaceSummary {
+            self.chosen = vec![WorkspaceSummary {
                 id,
                 name: typed,
                 kind: WorkspaceKind::Other(String::new()),
-            });
+            }];
             self.step = Step::Options;
             return;
         }
@@ -1091,7 +1115,23 @@ impl PostmanFlow {
         let Some(ws) = self.selected_workspace().cloned() else {
             return false;
         };
-        self.chosen = Some(ws);
+        self.chosen = vec![ws];
+        self.step = Step::Options;
+        true
+    }
+
+    /// Take every workspace now listed — the filter included, so a filtered
+    /// list imports what it shows — and move on to the options.
+    ///
+    /// This is the migration case: someone leaving Postman wants all of it,
+    /// and doing that a workspace at a time means re-entering the key, the
+    /// destination and the format for each one. Returns whether it advanced.
+    pub(crate) fn submit_all_workspaces(&mut self) -> bool {
+        let all: Vec<WorkspaceSummary> = self.visible_workspaces().into_iter().cloned().collect();
+        if all.is_empty() {
+            return false;
+        }
+        self.chosen = all;
         self.step = Step::Options;
         true
     }
@@ -1107,10 +1147,15 @@ impl PostmanFlow {
             self.step = Step::Failed(s.postman_err_nothing_selected.to_string());
             return false;
         }
-        let Some(ws) = self.chosen.clone() else {
+        let targets: Vec<(String, String)> = self
+            .chosen
+            .iter()
+            .map(|w| (w.id.clone(), w.name.clone()))
+            .collect();
+        if targets.is_empty() {
             self.step = Step::Failed(s.postman_err_no_workspace.to_string());
             return false;
-        };
+        }
 
         let (tx, rx) = mpsc::channel();
         let (progress_tx, progress_rx) = mpsc::channel();
@@ -1140,7 +1185,14 @@ impl PostmanFlow {
                 .with_progress(progress_tx)
                 .with_cancel(cancel);
 
-            let plan = match importer.plan(&ws.id, &ws.name, &options) {
+            // One workspace still goes through `plan`, which treats an empty
+            // one as an error; several go through `plan_all`, which drops the
+            // empty and the inaccessible rather than failing the whole batch.
+            let planned = match targets.as_slice() {
+                [(id, name)] => importer.plan(id, name, &options),
+                many => importer.plan_all(many, &options),
+            };
+            let plan = match planned {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(Msg::Failed(e.to_string()));
@@ -1213,7 +1265,7 @@ impl PostmanFlow {
     /// Go back to the workspace list, keeping it — the list belongs to the key
     /// that fetched it, and that hasn't changed.
     pub(crate) fn to_pick_workspace(&mut self) {
-        self.chosen = None;
+        self.chosen.clear();
         self.plan = None;
         self.reset_preview();
         self.step = Step::PickWorkspace;
@@ -1247,7 +1299,7 @@ impl PostmanFlow {
         self.progress_rx = None;
         self.clear_busy();
         self.workspaces.clear();
-        self.chosen = None;
+        self.chosen.clear();
         self.plan = None;
         self.reset_preview();
         // The key may be about to change, and a listing belongs to the key
@@ -1280,7 +1332,7 @@ impl PostmanFlow {
     pub(crate) fn recoverable(&self, back_to: Step) -> Step {
         match back_to {
             Step::PickWorkspace if self.workspaces.is_empty() => Step::Connect,
-            Step::Options | Step::Confirm | Step::Downloading if self.chosen.is_none() => {
+            Step::Options | Step::Confirm | Step::Downloading if self.chosen.is_empty() => {
                 Step::Connect
             }
             // A download that failed cannot be resumed from its progress bar;
@@ -1406,10 +1458,10 @@ impl PostmanFlow {
                 self.clear_busy();
                 // The plan carries the workspace's real name, which is all the
                 // wizard had an id for when the user typed one in.
-                if let Some(chosen) = self.chosen.as_mut()
-                    && !plan.workspace_name.trim().is_empty()
+                if let [chosen] = self.chosen.as_mut_slice()
+                    && !plan.workspace_name().trim().is_empty()
                 {
-                    chosen.name = plan.workspace_name.clone();
+                    chosen.name = plan.workspace_name().to_string();
                 }
                 self.plan = Some(*plan);
                 None
@@ -1446,7 +1498,7 @@ impl PostmanFlow {
     }
 
     pub(crate) fn seed_chosen(&mut self, workspace: WorkspaceSummary) {
-        self.chosen = Some(workspace);
+        self.chosen = vec![workspace];
     }
 
     pub(crate) fn seed_plan(&mut self, plan: ImportPlan) {
@@ -1492,14 +1544,41 @@ pub(crate) fn default_dest_name(workspace: &str) -> String {
 }
 
 /// A short "3 collections, 2 environments" line for the confirmation step.
+/// An import of several workspaces says how many it covers first: the item
+/// counts alone would give no hint that the number came from forty listings.
 pub(crate) fn plan_summary(plan: &ImportPlan, s: &Strings) -> String {
-    format!(
+    let items = format!(
         "{} {} · {} {}",
         plan.collections.len(),
         s.postman_word_collections,
         plan.environments.len(),
         s.postman_word_environments
-    )
+    );
+    if plan.is_multi() {
+        format!(
+            "{} {} · {items}",
+            plan.workspaces.len(),
+            s.postman_word_workspaces
+        )
+    } else {
+        items
+    }
+}
+
+/// "2 workspaces could not be listed and were skipped", when planning an
+/// import of many hit workspaces this key can no longer see. `None` when
+/// nothing was skipped, which is the usual case.
+pub(crate) fn plan_skipped_line(plan: &ImportPlan, s: &Strings) -> Option<String> {
+    let n = plan.skipped.len();
+    if n == 0 {
+        return None;
+    }
+    let word = if n == 1 {
+        s.postman_word_workspace
+    } else {
+        s.postman_word_workspaces
+    };
+    Some(format!("{n} {word} {}", s.postman_ws_skipped))
 }
 
 /// "3 collections · 1 environment" — what an import actually landed, each count
@@ -1560,6 +1639,7 @@ mod tests {
     use super::*;
     use crate::i18n::Language;
     use crate::postman_api::ItemSummary;
+    use crate::postman_import::WorkspacePlan;
 
     fn s() -> Strings {
         Strings::for_language(&Language::English)
@@ -1679,25 +1759,28 @@ mod tests {
     }
 
     fn plan_with(collections: usize, environments: usize) -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "Billing".into(),
-            collections: (0..collections)
-                .map(|i| ItemSummary {
-                    uid: format!("u{i}"),
-                    id: format!("i{i}"),
-                    name: format!("c{i}"),
-                })
-                .collect(),
-            environments: (0..environments)
-                .map(|i| ItemSummary {
-                    uid: format!("e{i}"),
-                    id: format!("e{i}"),
-                    name: format!("e{i}"),
-                })
-                .collect(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "Billing".into(),
+                collections: (0..collections)
+                    .map(|i| ItemSummary {
+                        uid: format!("u{i}"),
+                        id: format!("i{i}"),
+                        name: format!("c{i}"),
+                    })
+                    .collect(),
+                environments: (0..environments)
+                    .map(|i| ItemSummary {
+                        uid: format!("e{i}"),
+                        id: format!("e{i}"),
+                        name: format!("e{i}"),
+                    })
+                    .collect(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     /// The key is the one thing the import cannot proceed without, and saying
@@ -1721,8 +1804,7 @@ mod tests {
         assert_eq!(*f.step(), Step::Options);
         assert!(!f.is_busy(), "nothing was fetched");
         assert_eq!(
-            f.chosen.as_ref().unwrap().id,
-            "11111111-2222-3333-4444-555555555555",
+            f.chosen[0].id, "11111111-2222-3333-4444-555555555555",
             "the id was taken out of the pasted address"
         );
     }
@@ -1762,12 +1844,48 @@ mod tests {
         assert_eq!(*f.step(), Step::Options);
     }
 
+    /// The migration case: everything the list is showing, in one go. The
+    /// filter is honoured, because a list that says twelve and imports forty
+    /// would be spending someone's API budget on their behalf.
+    #[test]
+    fn importing_everything_takes_every_visible_workspace() {
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a"), ws("Billing", "b"), ws("Beta", "c")];
+        assert!(f.submit_all_workspaces());
+        assert_eq!(*f.step(), Step::Options);
+        assert_eq!(f.target_count(), 3);
+        assert_eq!(
+            f.workspace_name(),
+            "",
+            "an import of several belongs to no one workspace"
+        );
+        assert_eq!(
+            f.target_label(&s()),
+            format!("{} (3)", s().postman_all_workspaces)
+        );
+
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a"), ws("Billing", "b"), ws("Beta", "c")];
+        f.filter = "b".to_string();
+        assert!(f.submit_all_workspaces());
+        assert_eq!(f.target_count(), 2, "only what the filter is showing");
+    }
+
+    /// Nothing listed means nothing to import: advancing to the options with
+    /// no workspaces would only fail a step later.
+    #[test]
+    fn importing_everything_with_an_empty_list_does_nothing() {
+        let mut f = flow();
+        assert!(!f.submit_all_workspaces());
+        assert_eq!(*f.step(), Step::Connect);
+    }
+
     /// Downloading neither collections nor environments would produce an empty
     /// folder after spending API calls to find that out.
     #[test]
     fn importing_nothing_at_all_is_refused() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.include_collections = false;
         f.include_environments = false;
         assert!(!f.submit_options(&s()));
@@ -1779,7 +1897,7 @@ mod tests {
     #[test]
     fn a_missing_destination_is_refused() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.dest = "   ".to_string();
         assert!(!f.submit_options(&s()));
         assert_eq!(f.error(), Some(s().postman_err_dest_required));
@@ -1790,7 +1908,7 @@ mod tests {
     #[test]
     fn the_plan_is_shown_before_anything_is_downloaded() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.step = Step::Confirm;
         f.busy = Some(Phase::Planning);
         f.apply(Msg::Planned(Box::new(plan_with(3, 2))), &s());
@@ -1809,11 +1927,11 @@ mod tests {
     #[test]
     fn the_workspaces_real_name_replaces_a_typed_id() {
         let mut f = flow();
-        f.chosen = Some(WorkspaceSummary {
+        f.chosen = vec![WorkspaceSummary {
             id: "11111111-2222-3333-4444-555555555555".into(),
             name: "11111111-2222-3333-4444-555555555555".into(),
             kind: WorkspaceKind::Other(String::new()),
-        });
+        }];
         f.apply(Msg::Planned(Box::new(plan_with(1, 0))), &s());
         assert_eq!(f.workspace_name(), "Billing");
     }
@@ -1982,7 +2100,7 @@ mod tests {
     fn going_back_to_the_key_discards_the_listing() {
         let mut f = flow();
         f.workspaces = vec![ws("Alpha", "a")];
-        f.chosen = Some(ws("Alpha", "a"));
+        f.chosen = vec![ws("Alpha", "a")];
         f.plan = Some(plan_with(1, 1));
         f.back_to_connect();
         assert_eq!(*f.step(), Step::Connect);
@@ -2043,7 +2161,7 @@ mod tests {
     #[test]
     fn a_failed_download_goes_back_to_the_options() {
         let mut f = PostmanFlow::new();
-        f.chosen = Some(ws("Alpha", "a"));
+        f.chosen = vec![ws("Alpha", "a")];
         f.plan = Some(plan_with(1, 1));
         f.step = Step::Downloading;
         f.fail("connection reset".to_string());
@@ -2124,13 +2242,16 @@ mod tests {
     }
 
     fn plan_of(collections: Vec<ItemSummary>) -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "Workspace".into(),
-            collections,
-            environments: Vec::new(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "Workspace".into(),
+                collections,
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     /// The whole point of reading a collection before importing it is seeing
@@ -2408,7 +2529,8 @@ mod end_to_end {
         let plan = flow.plan().expect("a plan").clone();
         assert_eq!(plan.item_count(), 2, "one collection and one environment");
         assert_eq!(
-            plan.workspace_name, "Alpha",
+            plan.workspace_name(),
+            "Alpha",
             "the plan carries the workspace's real name"
         );
 

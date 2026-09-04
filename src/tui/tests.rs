@@ -27562,7 +27562,7 @@ fn taking_an_overlay_that_does_not_match_leaves_it_open() {
 
 use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
 use crate::postman_flow::Step as PostmanStep;
-use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary};
+use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary, WorkspacePlan};
 
 /// Finding the 1Password item path is the tedious half of setting an import
 /// up, and it is the same path every time — so the wizard offers back the
@@ -27963,6 +27963,45 @@ fn items_that_could_not_be_fetched_are_reported_ahead_of_the_conversion_notes() 
     assert!(matches!(app.status, Some(Status::PostmanSkipped(1))));
 }
 
+/// Leaving Postman means taking every workspace, and doing that one at a time
+/// is what stops people migrating. Ctrl+A rather than a bare letter because
+/// every printable key on this screen types into the filter.
+#[test]
+fn ctrl_a_on_the_workspace_list_imports_all_of_them() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+            a_workspace("Gamma", "ws-g"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.flow.target_count(), 3);
+
+    // A plain "a" still filters, or the list would be unusable.
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Char('a'));
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::PickWorkspace);
+    assert_eq!(w.flow.filter, "a");
+}
+
 #[test]
 fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
     let mut app = TuiApp::default();
@@ -27978,13 +28017,16 @@ fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
     press(&mut app, KeyCode::Enter);
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
 
-    postman_wizard(&mut app).flow.seed_plan(ImportPlan {
-        workspace_id: "ws-a".to_string(),
-        workspace_name: "Alpha".to_string(),
-        collections: Vec::new(),
-        environments: Vec::new(),
-        remaining_month: None,
-    });
+    postman_wizard(&mut app).flow.seed_plan(ImportPlan::new(
+        vec![WorkspacePlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+        }],
+        Vec::new(),
+        None,
+    ));
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
 }
 
@@ -28003,24 +28045,27 @@ fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
         let w = postman_wizard(&mut app);
         w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
         w.flow.seed_step(PostmanStep::Confirm);
-        w.flow.seed_plan(ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: vec![
-                ItemSummary {
-                    uid: "uid-a".to_string(),
-                    id: "id-a".to_string(),
-                    name: "Billing".to_string(),
-                },
-                ItemSummary {
-                    uid: "uid-b".to_string(),
-                    id: "id-b".to_string(),
-                    name: "Shipping".to_string(),
-                },
-            ],
-            environments: Vec::new(),
-            remaining_month: None,
-        });
+        w.flow.seed_plan(ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: vec![
+                    ItemSummary {
+                        uid: "uid-a".to_string(),
+                        id: "id-a".to_string(),
+                        name: "Billing".to_string(),
+                    },
+                    ItemSummary {
+                        uid: "uid-b".to_string(),
+                        id: "id-b".to_string(),
+                        name: "Shipping".to_string(),
+                    },
+                ],
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        ));
         // Cached, so the keystroke does not want a Postman API behind it.
         w.flow.seed_preview_cache(Preview {
             uid: "uid-b".to_string(),
@@ -28081,13 +28126,16 @@ fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
 fn every_step_of_the_postman_wizard_renders() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let plan = ImportPlan {
-        workspace_id: "ws-a".to_string(),
-        workspace_name: "Alpha".to_string(),
-        collections: Vec::new(),
-        environments: Vec::new(),
-        remaining_month: None,
-    };
+    let plan = ImportPlan::new(
+        vec![WorkspacePlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+        }],
+        Vec::new(),
+        None,
+    );
     let steps = [
         PostmanStep::Connect,
         PostmanStep::PickWorkspace,
@@ -28362,13 +28410,16 @@ fn the_confirmation_says_enter_imports_not_enter_connects() {
     {
         let w = postman_wizard(&mut app);
         w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
-        w.flow.seed_plan(ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: Vec::new(),
-            environments: Vec::new(),
-            remaining_month: None,
-        });
+        w.flow.seed_plan(ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: Vec::new(),
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        ));
         w.flow.seed_step(PostmanStep::Confirm);
     }
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();

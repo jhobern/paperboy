@@ -1,11 +1,14 @@
 //! Headless Postman import:
-//! `paperboy --postman-import [--postman-workspace ID|URL] [-o DIR]`.
+//! `paperboy --postman-import [--postman-workspace ID|URL|--postman-all] [-o DIR]`.
 //!
 //! A thin shell over [`crate::postman_import`], which does the actual work.
-//! Two shapes, because a workspace id is not something anyone has memorised:
+//! Three shapes, because a workspace id is not something anyone has memorised:
 //! without `--postman-workspace` it lists the workspaces the key can see and
-//! exits, and with one it downloads that workspace into a folder PaperBoy can
-//! open.
+//! exits, with one it downloads that workspace into a folder PaperBoy can
+//! open, and with `--postman-all` it downloads every workspace the key can
+//! see, each into its own folder — the migration case, which is asked for
+//! rather than assumed because it can be hundreds of collections and a large
+//! slice of the account's monthly API budget.
 //!
 //! Following [`crate::report_cli`], progress goes to **stderr** and the result
 //! to **stdout**, so `--postman-import` on its own can be piped into `grep` or
@@ -43,6 +46,8 @@ impl What {
 pub struct Args {
     pub key: Option<String>,
     pub workspace: Option<String>,
+    /// Download every workspace the key can see instead of one.
+    pub all: bool,
     pub out: Option<String>,
     pub what: Option<String>,
     pub base_url: Option<String>,
@@ -82,8 +87,19 @@ pub fn run(args: Args) -> i32 {
 
     // No workspace given: list what this key can see and stop. Downloading
     // "everything" by default could be hundreds of collections and a large
-    // slice of the account's monthly API budget, so it has to be asked for.
+    // slice of the account's monthly API budget, so it has to be asked for —
+    // which is what `--postman-all` is.
     let Some(raw_workspace) = args.workspace.as_deref() else {
+        if args.all {
+            let Some(out) = args.out.as_deref() else {
+                eprintln!(
+                    "error: --postman-all needs -o/--output to say where to write the workspaces"
+                );
+                return 2;
+            };
+            let options = import_options(what, format, args.overwrite);
+            return download_all(&client, &PathBuf::from(out), &options);
+        }
         return list_workspaces(&client);
     };
 
@@ -102,14 +118,18 @@ pub fn run(args: Args) -> i32 {
     };
     let dest = PathBuf::from(out);
 
-    let options = ImportOptions {
+    let options = import_options(what, format, args.overwrite);
+
+    download(&client, &workspace_id, &dest, &options)
+}
+
+fn import_options(what: What, format: ImportFormat, overwrite: bool) -> ImportOptions {
+    ImportOptions {
         include_collections: matches!(what, What::All | What::Collections),
         include_environments: matches!(what, What::All | What::Environments),
         format,
-        overwrite: args.overwrite,
-    };
-
-    download(&client, &workspace_id, &dest, &options)
+        overwrite,
+    }
 }
 
 /// `--postman-format`. `postman` keeps the JSON exactly as Postman sends it;
@@ -181,7 +201,9 @@ fn list_workspaces(client: &PostmanClient) -> i32 {
     }
     eprintln!(
         "\n{} workspace(s). Import one with:\n\
-         \x20   paperboy --postman-import --postman-workspace <ID> -o <FOLDER>",
+         \x20   paperboy --postman-import --postman-workspace <ID> -o <FOLDER>\n\
+         Or all of them, each into its own folder, with:\n\
+         \x20   paperboy --postman-import --postman-all -o <FOLDER>",
         workspaces.len()
     );
     0
@@ -206,7 +228,62 @@ fn download(
         Err(e) => return fail_import(e),
     };
 
-    announce_plan(&plan);
+    fetch_plan(importer, rx, &plan, dest, options)
+}
+
+/// `--postman-all`: every workspace the key can see, each into its own folder
+/// under `dest`.
+///
+/// The whole account goes through one importer, exactly as one workspace does:
+/// the pacer's picture of this account's real rate budget is worth more the
+/// more calls are left to make, and forty workspaces is where losing it would
+/// hurt most.
+fn download_all(client: &PostmanClient, dest: &PathBuf, options: &ImportOptions) -> i32 {
+    eprintln!("Listing workspaces…");
+    let kinds = WorkspaceKind::default_selection();
+    let (mut workspaces, _rate) = match client.list_workspaces(&kinds) {
+        Ok(v) => v,
+        Err(e) => return fail_api(e),
+    };
+    if workspaces.is_empty() {
+        eprintln!(
+            "No workspaces found for this key.\n\
+             A Postman API key carries its owner's own access, so a workspace you\n\
+             cannot see here is one your Postman account is not a member of."
+        );
+        return 1;
+    }
+    workspaces.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut importer = Importer::new(client).with_progress(tx);
+
+    // Said before it starts, because it is the slow part and it is paced:
+    // listing forty workspaces is eighty calls before a byte is downloaded.
+    eprintln!("Listing the contents of {} workspace(s)…", workspaces.len());
+    let targets: Vec<(String, String)> = workspaces
+        .iter()
+        .map(|w| (w.id.clone(), w.name.clone()))
+        .collect();
+    let plan = match importer.plan_all(&targets, options) {
+        Ok(p) => p,
+        Err(e) => return fail_import(e),
+    };
+
+    fetch_plan(importer, rx, &plan, dest, options)
+}
+
+/// Announce a plan, download it, and report what landed. Shared by the
+/// one-workspace and every-workspace paths, which differ only in how the plan
+/// was arrived at.
+fn fetch_plan(
+    mut importer: Importer<'_>,
+    rx: std::sync::mpsc::Receiver<crate::postman_import::ImportMsg>,
+    plan: &ImportPlan,
+    dest: &PathBuf,
+    options: &ImportOptions,
+) -> i32 {
+    announce_plan(plan);
 
     // Progress is pumped to stderr on its own thread so a slow terminal never
     // holds up the download. Messages already buffered by the planning phase
@@ -214,7 +291,7 @@ fn download(
     let total = plan.item_count();
     let printer = std::thread::spawn(move || pump_progress(rx, total));
 
-    let result = importer.download(&plan, dest, options);
+    let result = importer.download(plan, dest, options);
     // Release the sender before joining. The engine reports every outcome, but
     // a printer thread blocked on a channel nobody will write to again is a
     // hang rather than an error, so the CLI does not rely on that alone.
@@ -253,6 +330,15 @@ fn download(
 }
 
 fn announce_plan(plan: &ImportPlan) {
+    if plan.is_multi() {
+        eprintln!("{} workspace(s) to import.", plan.workspaces.len());
+    }
+    // A workspace that could not be listed is said now rather than at the end:
+    // an import of forty that quietly became thirty-eight is the one thing a
+    // migration must not discover afterwards.
+    for (name, why) in &plan.skipped {
+        eprintln!("warning: skipping workspace {name}: {why}");
+    }
     eprintln!(
         "{} collection(s), {} environment(s) — about {}",
         plan.collections.len(),

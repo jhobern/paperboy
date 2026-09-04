@@ -16,7 +16,8 @@ use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::i18n::Strings;
 use crate::postman_flow::{
-    KeySource, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label, plan_summary,
+    KeySource, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
+    plan_skipped_line, plan_summary,
 };
 use crate::postman_import::ImportFormat;
 
@@ -459,7 +460,14 @@ fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme
         f.area(),
     );
     f.render_widget(Clear, area);
-    let block = panel_hinted(s.postman_pick_workspace.to_string(), s.git_filter_hint, th);
+    // A Postman-specific hint rather than the shared filter one: importing
+    // everything is the reason someone opened this wizard during a migration,
+    // and a key nobody is told about may as well not exist.
+    let block = panel_hinted(
+        s.postman_pick_workspace.to_string(),
+        s.postman_pick_workspace_hint,
+        th,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
@@ -495,13 +503,25 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         r if r == OPTION_ROWS - 1 => s.postman_options_hint_import,
         _ => s.postman_options_hint_toggle,
     };
-    let note = (w.flow.format == ImportFormat::Hurl).then_some(s.postman_format_hurl_note);
+    // Whatever this particular set of options needs said about it. Importing
+    // several workspaces changes the shape of what lands on disk, so it is
+    // spelled out here rather than discovered afterwards.
+    let mut notes: Vec<&str> = Vec::new();
+    if w.flow.target_count() > 1 {
+        notes.push(s.postman_import_all_note);
+    }
+    if w.flow.format == ImportFormat::Hurl {
+        notes.push(s.postman_format_hurl_note);
+    }
     let width = 78.min(f.area().width);
-    let note_h = note.map_or(0, |n| wrapped_height(n, width.saturating_sub(2)));
+    let note_h: u16 = notes
+        .iter()
+        .map(|n| wrapped_height(n, width.saturating_sub(2)))
+        .sum();
     let area = centered_rect(width, OPTION_ROWS as u16 + note_h + 3, f.area());
     f.render_widget(Clear, area);
     let block = panel_hinted(
-        format!("{title} \u{2014} {}", w.flow.workspace_name()),
+        format!("{title} \u{2014} {}", w.flow.target_label(s)),
         hint,
         th,
     );
@@ -566,12 +586,12 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         .collect();
     f.render_widget(List::new(list_items), rows[2]);
 
-    if let Some(note) = note {
-        f.render_widget(
-            Paragraph::new(Line::styled(note, Style::default().fg(th.dim)))
-                .wrap(Wrap { trim: true }),
-            rows[3],
-        );
+    if !notes.is_empty() {
+        let lines: Vec<Line> = notes
+            .iter()
+            .map(|n| Line::styled(*n, Style::default().fg(th.dim)))
+            .collect();
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[3]);
     }
 }
 
@@ -592,6 +612,13 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     } else {
         0
     };
+    // Workspaces that could not be listed are said here, not only in the final
+    // summary: an import of forty that quietly became thirty-eight is exactly
+    // the kind of thing a migration must not find out about afterwards.
+    let skipped = plan_skipped_line(plan, s);
+    let skip_h = skipped
+        .as_deref()
+        .map_or(0, |t| wrapped_height(t, width.saturating_sub(2)));
     // Sized to its content — no trailing empty rows, which on a four-line
     // screen read as "something failed to draw".
     // The collections, so the workspace can be read into before any of it is
@@ -601,7 +628,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         0 => 0,
         n => (n as u16).min(8) + 2, // + the cost note and a blank line
     };
-    let area = centered_rect(width, note_h + warn_h + list_h + 5, f.area());
+    let area = centered_rect(width, note_h + warn_h + skip_h + list_h + 5, f.area());
     f.render_widget(Clear, area);
     // The hint is on the border like everywhere else, but in the accent rather
     // than dim: nothing on this screen is waiting for anything else, and a dim
@@ -626,6 +653,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         Constraint::Length(note_h), // rate limit note
         Constraint::Length(1),      // estimate
         Constraint::Length(warn_h), // budget warning
+        Constraint::Length(skip_h), // workspaces that could not be listed
         Constraint::Length(list_h), // collections to preview
     ])
     .split(inner);
@@ -673,8 +701,15 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             rows[4],
         );
     }
+    if let Some(text) = skipped {
+        f.render_widget(
+            Paragraph::new(Line::styled(text, Style::default().fg(th.err)))
+                .wrap(Wrap { trim: true }),
+            rows[5],
+        );
+    }
     if list_h > 0 {
-        draw_preview_list(f, w, s, th, rows[5]);
+        draw_preview_list(f, w, s, th, rows[6]);
     }
 }
 
