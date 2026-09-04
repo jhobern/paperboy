@@ -76,6 +76,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- The Postman importer's allowance line stopped flickering between two
+  unrelated numbers. Postman meters listing calls (10 per 10 seconds) and fetch
+  calls (300 per minute) as separate accounts, and an import draws on both
+  within the same second; the line reported whichever call answered last, so
+  "calls left before reset" flipped between 9 and 283 several times a second
+  and read as though the allowance itself were unstable. It now reports the
+  limit actually holding the import up — the one spacing the calls out — and
+  retires a reading once the window it described has reset, so a bucket the
+  import has finished with stops speaking for it. The monthly count belongs to
+  the account rather than to either bucket, so it still follows whichever call
+  reported most recently.
+
 - Single-line fields keep their text colour when focus moves elsewhere. An
   unfocused field was dimmed, which is also how an *empty* field draws the
   example of what belongs in it — so a Postman key source, a git URL or a theme

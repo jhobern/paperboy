@@ -429,6 +429,12 @@ pub enum ImportMsg {
     /// every response — it was simply being folded into the pacer and thrown
     /// away.
     Budget {
+        /// Which of Postman's two allowances these numbers describe. Sent
+        /// because they are separate accounts — a listing call and a fetch
+        /// call answer with unrelated figures — and a reader shown them
+        /// interleaved would watch the same "calls left" jump between 9 and
+        /// 283 with nothing to say why.
+        bucket: RateBucket,
         /// Calls left in the current window, and how long until it resets.
         remaining: Option<u64>,
         reset_secs: Option<u64>,
@@ -618,6 +624,7 @@ impl<'a> Importer<'a> {
             pacer.interval(bucket)
         };
         self.send(ImportMsg::Budget {
+            bucket,
             remaining: rate.remaining,
             reset_secs: rate.reset_secs,
             remaining_month: rate.remaining_month,

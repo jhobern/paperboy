@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::i18n::Strings;
-use crate::postman_api::{PostmanClient, WorkspaceKind, WorkspaceSummary};
+use crate::postman_api::{PostmanClient, RateBucket, WorkspaceKind, WorkspaceSummary};
 use crate::postman_import::{
     ImportFormat, ImportMsg, ImportOptions, ImportPlan, ImportSummary, Importer, ItemKind,
     WaitReason, parse_workspace_ref,
@@ -308,7 +308,10 @@ pub(crate) struct PostmanFlow {
     /// limit can genuinely take minutes, and a spinner with no elapsed time (or
     /// no reason for the wait) is indistinguishable from a hang.
     busy_since: Option<Instant>,
-    budget: Option<Budget>,
+    /// The latest reading from each [`RateBucket`], looked up by bucket rather
+    /// than kept as a single "last thing Postman said". See
+    /// [`PostmanFlow::budget_line`].
+    budgets: Vec<Budget>,
     workspaces: Vec<WorkspaceSummary>,
     /// The workspaces the import will cover: one when it was picked from the
     /// list or named by id, every listed one when "import everything" was
@@ -611,7 +614,7 @@ impl PostmanFlow {
             step: Step::Connect,
             busy: None,
             busy_since: None,
-            budget: None,
+            budgets: Vec::new(),
             workspaces: Vec::new(),
             chosen: Vec::new(),
             plan: None,
@@ -702,8 +705,25 @@ impl PostmanFlow {
     /// two calls left this month or two hundred, and the estimate swings about
     /// as paced waits land inside it — so show the budget itself, which is a
     /// fact rather than an extrapolation.
+    ///
+    /// Postman meters listing calls (10 per 10 seconds) separately from fetch
+    /// calls (300 per minute), and an import draws on both. Reporting whichever
+    /// answered last made the figure jump between the two accounts several
+    /// times a second, reading as though the allowance itself were unstable —
+    /// so this reports the one actually holding the import up: the widest
+    /// spacing, and the emptier bucket if the spacing matches. Readings are
+    /// retired once the window they described has reset, so a bucket the import
+    /// has finished with stops speaking for it.
     pub(crate) fn budget_line(&self, s: &Strings) -> Option<String> {
-        let b = self.budget?;
+        let now = Instant::now();
+        let fresh: Vec<&Budget> = self.budgets.iter().filter(|b| !b.is_stale(now)).collect();
+        let b = *fresh.iter().max_by_key(|b| {
+            (
+                b.interval_secs,
+                b.remaining.is_some(),
+                std::cmp::Reverse(b.remaining),
+            )
+        })?;
         let mut parts: Vec<String> = Vec::new();
         if let Some(n) = b.remaining {
             let window = match b.reset_secs {
@@ -717,7 +737,16 @@ impl PostmanFlow {
             };
             parts.push(window);
         }
-        if let Some(n) = b.remaining_month {
+        // The monthly allowance belongs to the account, not to either bucket,
+        // so take the newest reading of it from whichever call reported one —
+        // otherwise the count would sit still whenever the bucket being shown
+        // was not the one doing the work.
+        let monthly = fresh
+            .iter()
+            .filter(|b| b.remaining_month.is_some())
+            .max_by_key(|b| b.seen)
+            .and_then(|b| b.remaining_month);
+        if let Some(n) = monthly {
             parts.push(format!("{n} {}", s.postman_budget_month));
         }
         if b.interval_secs > 0 {
@@ -1457,17 +1486,24 @@ impl PostmanFlow {
                     self.progress.waiting = Some((reason, secs));
                 }
                 ImportMsg::Budget {
+                    bucket,
                     remaining,
                     reset_secs,
                     remaining_month,
                     interval_secs,
                 } => {
-                    self.budget = Some(Budget {
+                    let entry = Budget {
+                        bucket,
                         remaining,
                         reset_secs,
                         remaining_month,
                         interval_secs,
-                    });
+                        seen: Instant::now(),
+                    };
+                    match self.budgets.iter_mut().find(|b| b.bucket == bucket) {
+                        Some(slot) => *slot = entry,
+                        None => self.budgets.push(entry),
+                    }
                 }
                 ImportMsg::ItemFailed { name, error } => {
                     self.failures.push((name, error));
@@ -1658,12 +1694,30 @@ pub(crate) fn imported_counts(collections: usize, environments: usize, s: &Strin
 /// What Postman's rate headers last reported, kept so the front-ends can show
 /// the user how much of their allowance is left rather than only how long the
 /// import thinks it has to run.
+///
+/// One of these per [`RateBucket`]: Postman meters listing calls and fetch
+/// calls separately, so the two are simply different accounts and cannot be
+/// collapsed into a single "calls left".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Budget {
+    bucket: RateBucket,
     remaining: Option<u64>,
     reset_secs: Option<u64>,
     remaining_month: Option<u64>,
     interval_secs: u64,
+    /// When this reading arrived, so it can be retired once the window it
+    /// describes has turned over — a figure from a bucket nothing has drawn on
+    /// for a minute is not news about the import happening now.
+    seen: Instant,
+}
+
+impl Budget {
+    /// How long a reading stays worth showing: until the window it reported
+    /// resets. Without a reset the per-minute window is the safe assumption.
+    fn is_stale(&self, now: Instant) -> bool {
+        let window = Duration::from_secs(self.reset_secs.filter(|s| *s > 0).unwrap_or(60));
+        now.saturating_duration_since(self.seen) > window
+    }
 }
 
 pub(crate) fn human_duration(d: Duration, s: &Strings) -> String {
@@ -2130,6 +2184,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         f.progress_rx = Some(rx);
         tx.send(ImportMsg::Budget {
+            bucket: RateBucket::Strict,
             remaining: Some(8),
             reset_secs: Some(45),
             remaining_month: Some(812),
@@ -2143,6 +2198,70 @@ mod tests {
         assert!(
             line.contains(s.postman_budget_pace),
             "the spacing explains the wait: {line}"
+        );
+    }
+
+    /// Postman meters listing calls and fetch calls as separate accounts, and
+    /// an import draws on both within the same second. Showing whichever
+    /// answered last made "calls left" flip between the two — 9 one frame, 283
+    /// the next — reading as though the allowance itself were unstable.
+    #[test]
+    fn the_two_rate_limits_do_not_take_turns_in_the_same_line() {
+        let s = s();
+        let mut f = flow();
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+
+        // The strict bucket is what an import waits on: one call a second,
+        // against a general bucket wide enough not to space calls at all.
+        let strict = ImportMsg::Budget {
+            bucket: RateBucket::Strict,
+            remaining: Some(9),
+            reset_secs: Some(10),
+            remaining_month: Some(99_261),
+            interval_secs: 1,
+        };
+        let general = ImportMsg::Budget {
+            bucket: RateBucket::General,
+            remaining: Some(283),
+            reset_secs: Some(16),
+            remaining_month: Some(99_258),
+            interval_secs: 0,
+        };
+        tx.send(strict.clone()).unwrap();
+        f.drain_progress();
+        let first = f.budget_line(&s).expect("a budget was reported");
+
+        tx.send(general.clone()).unwrap();
+        f.drain_progress();
+        let second = f.budget_line(&s).expect("still reporting");
+        assert_eq!(
+            first.contains('9'),
+            second.contains('9'),
+            "the binding limit is the one that gets reported: {first} / {second}"
+        );
+        assert!(
+            !second.contains("283"),
+            "the roomier bucket is not what is holding the import up: {second}"
+        );
+        // The month, though, belongs to the account rather than to either
+        // bucket, so it follows whichever call reported most recently.
+        assert!(
+            second.contains("99258"),
+            "the monthly count is the freshest one: {second}"
+        );
+
+        // Once the strict window has turned over with nothing drawing on it,
+        // its reading is history and the general bucket speaks for the import.
+        for b in &mut f.budgets {
+            if b.bucket == RateBucket::Strict {
+                b.seen = Instant::now() - Duration::from_secs(30);
+            }
+        }
+        let later = f.budget_line(&s).expect("the general bucket still has one");
+        assert!(
+            later.contains("283"),
+            "a bucket the import has finished with stops speaking for it: {later}"
         );
     }
 
