@@ -237,12 +237,12 @@ block's own silhouette, at its real width and indent.
 Editable on the blocks: the request a step runs, its alias, response format and
 `SHOW(…)`/`HIDE(…)`/`STATISTICS(…)` lists; a `FOR` loop's binder, source, roles
 and `PARALLEL(n)` concurrency; and the report's own settings — `collection`,
-`output`, `environment`, `root`, `baseline`, `columns` — in a boxed panel above
-`BEGIN`. Those apply to the report rather than running as a step, so they're
-deliberately not blocks. `output` names a *format* (`csv`, `json`, `html`,
-`xlsx`), not a filename; only the CLI's `-o` takes a path. Everything has hover
-help, and **Source** is highlighted with the terminal UI's colours, underlining
-whatever the parser rejected.
+`output`, `environment`, `root`, `baseline`, `columns` — in a boxed panel at the
+top of the flow. Those apply to the report rather than running as a step, so
+they're deliberately not blocks. `output` names a *format* (`csv`, `json`,
+`html`, `xlsx`), not a filename; only the CLI's `-o` takes a path. Everything has
+hover help, and **Source** is highlighted with the terminal UI's colours,
+underlining whatever the parser rejected.
 
 ### Desktop icon on Linux
 
