@@ -3489,6 +3489,66 @@ fn a_postman_export_lands_on_the_right_shelf_whichever_kind_it_is() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The same knowledge the dedicated importer has is worth having in the
+/// everyday pickers: "Open Collection" given a Postman *environment* export
+/// (both are `.json`) loads it as an environment and says so, rather than
+/// refusing a file it can plainly read -- and the environment picker does the
+/// mirror of it.
+#[test]
+fn the_ordinary_pickers_follow_a_postman_export_to_the_right_shelf() {
+    let dir = temp_dir("pb_picker_export");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let collection = dir.join("api.json");
+    std::fs::write(
+        &collection,
+        r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+    )
+    .unwrap();
+    let environment = dir.join("staging.json");
+    std::fs::write(
+        &environment,
+        r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+    )
+    .unwrap();
+
+    let mut app = TuiApp::default();
+    let tabs = app.collections.len();
+    let envs = app.global_envs.len();
+
+    app.do_file_action(FileAction::OpenCollection, environment.to_str().unwrap());
+    assert_eq!(app.global_envs.len(), envs + 1, "loaded as an environment");
+    assert_eq!(app.collections.len(), tabs, "and not as an empty tab");
+    assert!(
+        matches!(app.status, Some(Status::OpenedAsEnvironment)),
+        "the status explains which shelf it landed on, got {:?}",
+        app.status
+    );
+
+    app.do_file_action(FileAction::LoadEnv, collection.to_str().unwrap());
+    assert_eq!(app.collections.len(), tabs + 1, "opened as a collection");
+    assert_eq!(app.global_envs.len(), envs + 1, "and added no environment");
+    assert!(
+        matches!(app.status, Some(Status::OpenedAsCollection)),
+        "the status explains which shelf it landed on, got {:?}",
+        app.status
+    );
+
+    // A file that is neither still gets the picker's own complaint.
+    let other = dir.join("notes.json");
+    std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
+    app.do_file_action(FileAction::OpenCollection, other.to_str().unwrap());
+    assert!(
+        !app.status.as_ref().unwrap().is_ok(),
+        "a non-export is refused by Open Collection, got {:?}",
+        app.status
+    );
+    app.do_file_action(FileAction::LoadEnv, other.to_str().unwrap());
+    assert!(matches!(app.status, Some(Status::NotEnvironment)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn file_menu_opens_the_remote_git_wizards() {
     let mut app = TuiApp::default();
@@ -27612,6 +27672,52 @@ fn a_working_key_reference_is_offered_back_next_time() {
     assert_eq!(
         postman_wizard(&mut app).recent_entries(),
         vec!["/postman/key".to_string()]
+    );
+}
+
+/// Those suggestions used to be drawn in the same dim as every placeholder on
+/// the screen, so the one line telling a user their old 1Password path is a
+/// keystroke away read as ghost text they had already filled in. They are
+/// choices: they get a marker and full-weight text.
+#[test]
+fn the_saved_references_look_like_something_you_can_pick() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    assert!(
+        app.session
+            .remember_key_ref("{{ op://Private/Postman/credential }}")
+    );
+    app.open_postman_wizard();
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(90, 16)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let buf = term.backend().buffer();
+
+    let (x, y) = (0..buf.area().height)
+        .find_map(|y| {
+            let row: String = (0..buf.area().width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            // Cell symbols are one character each here, so a character offset
+            // into the row is the column.
+            row.find("Private/Postman/credential")
+                .map(|byte| (row[..byte].chars().count() as u16, y))
+        })
+        .expect("the saved reference is on screen");
+
+    assert_eq!(
+        buf[(x, y)].fg,
+        th.text,
+        "the suggestion is drawn at full weight, not as ghost text"
+    );
+    assert_eq!(
+        (buf[(x - 2, y)].symbol(), buf[(x - 2, y)].fg),
+        ("\u{203a}", th.accent),
+        "and is marked as a choice"
     );
 }
 

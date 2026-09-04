@@ -383,6 +383,12 @@ pub(crate) struct PostmanFlow {
     /// wizard: the resolved secret is never persisted, exactly as an
     /// environment's resolved secret isn't.
     resolved_key: Arc<Mutex<Option<(String, String)>>>,
+    /// When the provider lookup above finished, stamped by whichever worker
+    /// did it and consumed once by [`PostmanFlow::absorb_approval_wait`].
+    /// Approving a 1Password prompt is unbounded human time; the clocks the
+    /// wizard shows are meant to say how the *import* is going, so they start
+    /// again from here.
+    key_ready: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Where the Postman API key comes from.
@@ -548,7 +554,20 @@ impl KeySource {
 /// `op`/`aws`, which can take seconds and put a fingerprint prompt on screen.
 /// The answer is cached against the text it came from so an import asks once
 /// rather than once per API phase.
-fn resolve_key(raw: &str, cache: &Mutex<Option<(String, String)>>) -> Option<String> {
+/// Resolve the key the user typed, which may be a provider reference such as
+/// `{{ op://Vault/Item/field }}`, shelling out once and remembering the answer.
+///
+/// `ready` is stamped with the moment a *lookup actually happened*. Those
+/// lookups run someone else's CLI, and 1Password (or an MFA-guarded SSM
+/// parameter) can sit there for as long as the user takes to reach for their
+/// laptop and approve the prompt. That is their time, not the import's, so the
+/// wizard's elapsed counter is moved forward to this instant rather than
+/// reporting a two-minute approval as two minutes of listing.
+fn resolve_key(
+    raw: &str,
+    cache: &Mutex<Option<(String, String)>>,
+    ready: &Mutex<Option<Instant>>,
+) -> Option<String> {
     let raw = raw.trim();
     // Nothing to ask anyone, and so nothing worth remembering.
     if !raw.contains("{{") {
@@ -563,6 +582,9 @@ fn resolve_key(raw: &str, cache: &Mutex<Option<(String, String)>>) -> Option<Str
     let value = crate::environment::resolve_reference(raw)?;
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((raw.to_string(), value.clone()));
+    }
+    if let Ok(mut guard) = ready.lock() {
+        *guard = Some(Instant::now());
     }
     Some(value)
 }
@@ -611,6 +633,7 @@ impl PostmanFlow {
             go: None,
             cancel: Arc::new(AtomicBool::new(false)),
             resolved_key: Arc::new(Mutex::new(None)),
+            key_ready: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -822,10 +845,11 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let pending = id.clone();
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Err(bad_ref.to_string()));
@@ -931,11 +955,12 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let wanted = id.to_string();
         let id = id.to_string();
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Err(bad_ref.to_string()));
@@ -1084,9 +1109,10 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Msg::Workspaces(Err(bad_ref.to_string())));
@@ -1163,6 +1189,7 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let options = self.options();
         let dest = self.dest_path();
@@ -1170,7 +1197,7 @@ impl PostmanFlow {
         cancel.store(false, Ordering::Relaxed);
 
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Msg::Failed(bad_ref.to_string()));
@@ -1356,6 +1383,7 @@ impl PostmanFlow {
     /// Collect whatever the worker has produced. Call each tick (the terminal
     /// UI) or each frame (the GUI).
     pub(crate) fn poll(&mut self, s: &Strings) -> Option<PostmanEvent> {
+        self.absorb_approval_wait();
         self.drain_progress();
         self.drain_preview();
         self.drain_peek();
@@ -1374,6 +1402,28 @@ impl PostmanFlow {
                 self.clear_busy();
                 None
             }
+        }
+    }
+
+    /// Restart the on-screen clocks from the moment the API key finished
+    /// resolving.
+    ///
+    /// A key written as `{{ op://… }}` is fetched by running 1Password's CLI,
+    /// which asks the user to approve the read -- a prompt that may sit
+    /// unanswered while they find their phone. The wizard is already showing
+    /// "Fetching the workspace list… · 2m" by then, which is a lie about
+    /// Postman and, worse, feeds the download's ETA a rate that includes the
+    /// approval. Both clocks are pushed forward to when the key arrived; a
+    /// literal key never sets the stamp, so nothing moves.
+    fn absorb_approval_wait(&mut self) {
+        let Some(at) = self.key_ready.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        if self.busy_since.is_some_and(|started| started < at) {
+            self.busy_since = Some(at);
+        }
+        if self.progress.started.is_some_and(|started| started < at) {
+            self.progress.started = Some(at);
         }
     }
 
@@ -1711,8 +1761,9 @@ mod tests {
     #[test]
     fn a_typed_key_is_used_as_it_stands() {
         let cache = Mutex::new(None);
+        let ready = Mutex::new(None);
         assert_eq!(
-            resolve_key("  PMAK-abcdef  ", &cache),
+            resolve_key("  PMAK-abcdef  ", &cache, &ready),
             Some("PMAK-abcdef".to_string())
         );
         assert!(
@@ -1728,9 +1779,10 @@ mod tests {
     fn a_resolved_key_is_remembered_for_the_rest_of_the_import() {
         let raw = "{{ op://Private/Postman/credential }}";
         let cache = Mutex::new(Some((raw.to_string(), "PMAK-from-1password".to_string())));
+        let ready = Mutex::new(None);
         // Nothing here can reach `op`; an answer proves it came from the cache.
         assert_eq!(
-            resolve_key(raw, &cache),
+            resolve_key(raw, &cache, &ready),
             Some("PMAK-from-1password".to_string())
         );
     }
@@ -1744,8 +1796,9 @@ mod tests {
             "{{ op://Private/Postman/credential }}".to_string(),
             "PMAK-old".to_string(),
         )));
+        let ready = Mutex::new(None);
         assert_eq!(
-            resolve_key("PMAK-typed-instead", &cache),
+            resolve_key("PMAK-typed-instead", &cache, &ready),
             Some("PMAK-typed-instead".to_string())
         );
     }
@@ -2025,6 +2078,44 @@ mod tests {
             line.contains(s.postman_waiting_limited),
             "the reason for the wait belongs on the line: {line}"
         );
+    }
+
+    /// A key kept in 1Password is fetched by asking 1Password, which puts an
+    /// approval prompt on the screen — and the user may be away from their desk
+    /// when it appears. That wait is theirs, not Postman's: counting it made
+    /// the wizard claim minutes spent listing a workspace it had not yet been
+    /// allowed to ask about, and fed the same minutes into the download's ETA.
+    #[test]
+    fn a_long_provider_approval_does_not_count_against_the_import() {
+        let s = s();
+        let mut f = flow();
+        f.set_busy(Phase::ListingWorkspaces);
+        let long_ago = Instant::now() - Duration::from_secs(120);
+        f.busy_since = Some(long_ago);
+        f.progress.started = Some(long_ago);
+        assert!(
+            f.busy_line(&s).unwrap().len() > Phase::ListingWorkspaces.label(&s).len(),
+            "two minutes in, the counter is on the line"
+        );
+
+        // What the worker stamps the moment `op` finally answers.
+        *f.key_ready.lock().unwrap() = Some(Instant::now());
+        f.absorb_approval_wait();
+        assert_eq!(
+            f.busy_line(&s).as_deref(),
+            Some(Phase::ListingWorkspaces.label(&s)),
+            "the elapsed counter starts again from the approval"
+        );
+        assert!(
+            f.progress.started.unwrap().elapsed() < Duration::from_secs(3),
+            "and so does the clock the ETA is extrapolated from"
+        );
+
+        // Consumed, so later ticks don't keep pushing the start forward and
+        // freeze the counter at zero.
+        let restarted = f.busy_since;
+        f.absorb_approval_wait();
+        assert_eq!(f.busy_since, restarted);
     }
 
     /// "How much have we got left?" is the first question a slow import raises,

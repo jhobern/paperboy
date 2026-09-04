@@ -2444,8 +2444,25 @@ impl TuiApp {
             }
             FileAction::OpenCollection => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = collection_name_from_path(path, "collection");
-                    self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    // Postman writes collections and environments to the same
+                    // `.json`, so this picker is regularly handed the other
+                    // one. The file says plainly which it is, and answering
+                    // "not a collection" to something PaperBoy can open is a
+                    // dead end -- follow the content and say so.
+                    if crate::postman::export_kind(&content)
+                        == Some(crate::postman::ExportKind::Environment)
+                    {
+                        let name = env_name_from_path(path, "environment");
+                        if self
+                            .load_environment_text(name, &content, Some(PathBuf::from(path)), None)
+                            .is_some()
+                        {
+                            self.status = Some(Status::OpenedAsEnvironment);
+                        }
+                    } else {
+                        let name = collection_name_from_path(path, "collection");
+                        self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    }
                 }
                 Err(e) => {
                     self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
@@ -2500,8 +2517,20 @@ impl TuiApp {
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = env_name_from_path(path, "environment");
-                    self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    // The mirror of Open Collection above: a Postman collection
+                    // export offered here is opened as a collection rather than
+                    // refused for not being KEY=value lines.
+                    if crate::postman::export_kind(&content)
+                        == Some(crate::postman::ExportKind::Collection)
+                    {
+                        let name = collection_name_from_path(path, "collection");
+                        if self.load_collection_text(name, &content, Some(PathBuf::from(path))) {
+                            self.status = Some(Status::OpenedAsCollection);
+                        }
+                    } else {
+                        let name = env_name_from_path(path, "environment");
+                        self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    }
                 }
                 Err(e) => {
                     self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))

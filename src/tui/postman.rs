@@ -392,23 +392,32 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     );
 
     if recent_rows > 0 {
+        // These are *choices*, not a placeholder. Drawn dim they read as more
+        // ghost text -- the screen already has plenty -- and a user who has
+        // never pressed Down here has no reason to suspect the line under
+        // their key field is a list they can pick from. So each entry gets a
+        // marker in the accent colour, sitting in the label gutter so the
+        // entries themselves stay aligned with the value column, and the text
+        // is drawn at full weight like anything else selectable.
+        let gutter = (label_w as usize).saturating_sub(2);
         let items: Vec<ListItem> = recent
             .iter()
             .take(5)
             .enumerate()
             .map(|(i, entry)| {
-                let style = if w.recent_sel == Some(i) {
-                    Style::default()
+                let (marker, text) = if w.recent_sel == Some(i) {
+                    let sel = Style::default()
                         .bg(th.accent)
                         .fg(th.bg)
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::BOLD);
+                    (sel, sel)
                 } else {
-                    Style::default().fg(th.dim)
+                    (Style::default().fg(th.accent), Style::default().fg(th.text))
                 };
-                ListItem::new(Line::styled(
-                    format!("{:pad$}{entry}", "", pad = label_w as usize),
-                    style,
-                ))
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:gutter$}\u{203a} ", ""), marker),
+                    Span::styled(entry.clone(), text),
+                ]))
             })
             .collect();
         f.render_widget(List::new(items), all_rows[3]);
@@ -558,13 +567,22 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     // The "press Enter" affordance is the point of the row, so it keeps its
     // width and the path gives way - elided from the LEFT, since the folder
     // name at the end is what distinguishes one destination from another.
+    // It is a hint about the row rather than part of the path, so it is drawn
+    // dim: at the path's own weight it reads as another path segment.
     let browse = format!("  {}", s.postman_browse);
     let room = (rows[1].width as usize).saturating_sub(browse.chars().count());
+    let hint_style = if w.option_row == 0 {
+        // On the selected row the highlight owns the background, so the hint
+        // steps back by dropping the path's bold rather than by changing hue.
+        Style::default().bg(th.accent).fg(th.bg)
+    } else {
+        Style::default().fg(th.dim)
+    };
     f.render_widget(
-        Paragraph::new(Line::styled(
-            format!("{}{browse}", elide_left(&dest, room)),
-            dest_style,
-        )),
+        Paragraph::new(Line::from(vec![
+            Span::styled(elide_left(&dest, room), dest_style),
+            Span::styled(browse, hint_style),
+        ])),
         rows[1],
     );
 

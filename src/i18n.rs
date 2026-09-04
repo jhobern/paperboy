@@ -178,6 +178,8 @@ strings! {
     file_not_collection_prefix => "Not a valid collection file —", "Fichier de collection invalide —", "Ikke en gyldig samlingsfil —";
     save_unreadable_empty_file => "Won't save — the multipart file field '{field}' in '{req}' has no file path, which PaperBoy couldn't read back. Pick a file or remove the field.", "Enregistrement refusé — le champ fichier multipart « {field} » dans « {req} » n'a pas de chemin, que PaperBoy ne pourrait pas relire. Choisissez un fichier ou supprimez le champ.", "Gemmer ikke — multipart-filfeltet '{field}' i '{req}' har ingen filsti, som PaperBoy ikke kunne læse igen. Vælg en fil, eller fjern feltet.";
     file_not_environment => "Not a valid environment file (expected KEY=value lines).", "Fichier d'environnement invalide (lignes CLÉ=valeur attendues).", "Ikke en gyldig miljøfil (forventede NØGLE=værdi-linjer).";
+    file_opened_as_collection => "That file is a Postman collection, so it opened as one.", "Ce fichier est une collection Postman, il a donc été ouvert comme telle.", "Filen er en Postman-samling, så den blev åbnet som en samling.";
+    file_opened_as_environment => "That file is a Postman environment, so it loaded as one.", "Ce fichier est un environnement Postman, il a donc été chargé comme tel.", "Filen er et Postman-miljø, så det blev indlæst som et miljø.";
     open_workspace => "Choose Workspace Folder…", "Choisir le dossier Workspace…", "Vælg Workspace-mappe…";
     browser_hint_workspace => "Enter open folder · Space choose as Workspace · ← parent · type to filter · ^r reset · Esc cancel", "Entrée ouvrir dossier · Espace choisir comme Workspace · ← dossier parent · taper pour filtrer · ^r réinitialiser · Échap annuler", "Enter åbn mappe · Mellemrum vælg som Workspace · ← overordnet · skriv for at filtrere · ^r nulstil · Esc annuller";
     workspace_empty_state => "No collection — press w.", "Aucune collection — appuyez sur w.", "Ingen samling — tryk w.";
@@ -1341,7 +1343,7 @@ strings! {
     postman_browse => "[Enter to choose…]", "[Entrée pour choisir…]", "[Enter for at vælge…]";
     postman_dest_folder => "Import into", "Importer dans", "Importér til";
     postman_options_hint_dest => "Enter choose folder · Esc back", "Entrée choisir le dossier · Échap retour", "Enter vælg mappe · Esc tilbage";
-    postman_options_hint_toggle => "Space change · Esc back", "Espace changer · Échap retour", "Mellemrum skift · Esc tilbage";
+    postman_options_hint_toggle => "Space toggle · Esc back", "Espace basculer · Échap retour", "Mellemrum slå til/fra · Esc tilbage";
     postman_options_hint_import => "Enter import · Esc back", "Entrée importer · Échap retour", "Enter importér · Esc tilbage";
     postman_format_label => "Format", "Format", "Format";
     postman_format_raw => "Postman JSON (keeps everything)", "JSON Postman (conserve tout)", "Postman-JSON (bevarer alt)";
@@ -1627,6 +1629,12 @@ pub enum Status {
     NoResponse,
     NotCollection,
     NotEnvironment,
+    /// A picker was given the *other* kind of Postman export -- a collection
+    /// where an environment was asked for, or the reverse -- and PaperBoy
+    /// followed the file rather than the menu entry. Said out loud because the
+    /// result lands on a different shelf than the one the user was looking at.
+    OpenedAsCollection,
+    OpenedAsEnvironment,
     /// The active tab isn't a report, so a report-only action (Save Report,
     /// BIND) can't proceed.
     NotReport,
@@ -1918,6 +1926,8 @@ impl Status {
                 self,
                 Status::Saved
                     | Status::Loaded
+                    | Status::OpenedAsCollection
+                    | Status::OpenedAsEnvironment
                     | Status::Cleared
                     | Status::GitSaved
                     | Status::Copied
@@ -1959,6 +1969,8 @@ impl Status {
             Status::NoResponse => s.file_no_response.to_string(),
             Status::NotCollection => s.file_not_collection.to_string(),
             Status::NotEnvironment => s.file_not_environment.to_string(),
+            Status::OpenedAsCollection => s.file_opened_as_collection.to_string(),
+            Status::OpenedAsEnvironment => s.file_opened_as_environment.to_string(),
             Status::NotReport => s.status_not_report.to_string(),
             Status::ReportBound(name) => format!("{} {name}", s.report_bound_status),
             Status::ReportBindNoCollections => s.report_bind_no_collections.to_string(),

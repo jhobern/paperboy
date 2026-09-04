@@ -6,7 +6,7 @@ use std::path::Path;
 
 use eframe::egui;
 
-use crate::i18n::{Language, Strings};
+use crate::i18n::{Language, Status, Strings};
 use crate::request::RequestView;
 use crate::session::PickerKind;
 use crate::theme::{THEME_COLOR_COUNT, ThemeSpec, is_builtin};
@@ -1612,13 +1612,27 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
     // An export is sorted by what it holds, not by what the user said it was:
     // Postman writes collections and environments to the same `.json`, and
     // making the user know which they picked is exactly the knowledge they
-    // came here without.
+    // came here without. The same applies to the plain Collection and
+    // Environment pickers -- one of them is bound to be handed the other kind.
+    let asked = kind;
     let kind = match kind {
         OpenKind::PostmanExport => match crate::postman::export_kind(&content) {
             Some(crate::postman::ExportKind::Collection) => OpenKind::Collection,
             Some(crate::postman::ExportKind::Environment) => OpenKind::Environment,
             None => return Err(app.strings.gui_not_postman_export.to_string()),
         },
+        OpenKind::Collection
+            if crate::postman::export_kind(&content)
+                == Some(crate::postman::ExportKind::Environment) =>
+        {
+            OpenKind::Environment
+        }
+        OpenKind::Environment
+            if crate::postman::export_kind(&content)
+                == Some(crate::postman::ExportKind::Collection) =>
+        {
+            OpenKind::Collection
+        }
         other => other,
     };
     let ok = match kind {
@@ -1633,6 +1647,14 @@ fn apply_open(app: &mut GuiApp, kind: OpenKind, path: &Path) -> Result<(), Strin
         OpenKind::Workspace | OpenKind::Report | OpenKind::PostmanExport => unreachable!(),
     };
     if ok {
+        // Only when the file overruled the menu entry -- a Postman export
+        // opened through the dedicated entry went where it was asked to go.
+        if asked != OpenKind::PostmanExport && asked != kind {
+            app.session.status = Some(match kind {
+                OpenKind::Collection => Status::OpenedAsCollection,
+                _ => Status::OpenedAsEnvironment,
+            });
+        }
         Ok(())
     } else {
         Err(app.strings.gui_could_not_parse.to_string())
@@ -2368,9 +2390,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An export is remembered so the toolbar can offer to open it: the file an
-    /// HTML export writes is meant to be read in a browser, and the path is the
-    /// only thing standing between the two.
+    /// The everyday Collection and Environment entries do the same sorting:
+    /// pointing "Open Collection" at a Postman *environment* export loads it as
+    /// an environment (and says so) instead of refusing a file the app can
+    /// plainly read. Only PaperBoy's own formats are taken at their word.
+    #[test]
+    fn the_ordinary_open_entries_follow_a_postman_export_too() {
+        let dir = std::env::temp_dir().join(format!("pb_gui_reroute_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let collection = dir.join("api.json");
+        std::fs::write(
+            &collection,
+            r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+        )
+        .unwrap();
+        let environment = dir.join("staging.json");
+        std::fs::write(
+            &environment,
+            r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+        )
+        .unwrap();
+
+        let mut app = app();
+        let tabs = app.session.collections.len();
+        let envs = app.session.global_envs.len();
+
+        assert!(apply_open(&mut app, OpenKind::Collection, &environment).is_ok());
+        assert_eq!(app.session.global_envs.len(), envs + 1);
+        assert_eq!(app.session.collections.len(), tabs);
+        assert!(
+            matches!(app.session.status, Some(Status::OpenedAsEnvironment)),
+            "the status says which shelf it landed on, got {:?}",
+            app.session.status
+        );
+
+        assert!(apply_open(&mut app, OpenKind::Environment, &collection).is_ok());
+        assert_eq!(app.session.collections.len(), tabs + 1);
+        assert_eq!(app.session.global_envs.len(), envs + 1);
+        assert!(
+            matches!(app.session.status, Some(Status::OpenedAsCollection)),
+            "the status says which shelf it landed on, got {:?}",
+            app.session.status
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
     #[test]
     fn an_export_remembers_the_file_it_wrote_so_it_can_be_opened() {
         use crate::report::model::{ReportResult, ReportRow};

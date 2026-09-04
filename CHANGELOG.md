@@ -40,6 +40,37 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   every remaining workspace, such as a rejected key or an exhausted monthly
   quota, still stops the plan instead of being logged forty times.
 
+### Changed
+
+- **The everyday file pickers sort Postman exports out for themselves.** Postman
+  writes collections and environments to the same `.json` extension, and only
+  the dedicated *Import from Postman exported file* entry knew that. Pointing
+  **Open Collection** at an exported environment therefore got "not a valid
+  collection file" for a file PaperBoy can plainly read, and the reverse
+  happened on the environment picker. Both now follow the content and say which
+  shelf the file landed on. PaperBoy's own formats are still taken at their
+  word; a `.json` that is neither still gets the picker's own complaint.
+
+- **Waiting for a 1Password approval no longer counts against the import.** A
+  key written as `{{ op://… }}` is fetched by running the provider's CLI, which
+  can leave an approval prompt on screen for as long as it takes the user to
+  reach it. The wizard was counting that from the moment they pressed Enter, so
+  it would claim two minutes spent fetching a workspace list it had not yet been
+  allowed to ask for — and feed those minutes into the download's ETA. Both
+  clocks now start when the key arrives.
+
+### Fixed
+
+- The saved key references offered under the Postman wizard's key field were
+  drawn in the same dim as every placeholder on screen, so the line telling a
+  user their old 1Password path is one keystroke away read as ghost text. They
+  are now marked and drawn at full weight, like the choices they are.
+
+- The destination row's `[Enter to choose…]` hint is drawn dim, so it reads as a
+  hint rather than as the last segment of the folder path it sits beside. The
+  options screen's footer says "Space toggle" rather than the vaguer
+  "Space change".
+
 
 ## [0.5.3] - 2026-09-03
 
