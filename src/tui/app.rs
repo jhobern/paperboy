@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui_explorer::FileExplorer;
 
@@ -2444,8 +2444,25 @@ impl TuiApp {
             }
             FileAction::OpenCollection => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = collection_name_from_path(path, "collection");
-                    self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    // Postman writes collections and environments to the same
+                    // `.json`, so this picker is regularly handed the other
+                    // one. The file says plainly which it is, and answering
+                    // "not a collection" to something PaperBoy can open is a
+                    // dead end -- follow the content and say so.
+                    if crate::postman::export_kind(&content)
+                        == Some(crate::postman::ExportKind::Environment)
+                    {
+                        let name = env_name_from_path(path, "environment");
+                        if self
+                            .load_environment_text(name, &content, Some(PathBuf::from(path)), None)
+                            .is_some()
+                        {
+                            self.status = Some(Status::OpenedAsEnvironment);
+                        }
+                    } else {
+                        let name = collection_name_from_path(path, "collection");
+                        self.load_collection_text(name, &content, Some(PathBuf::from(path)));
+                    }
                 }
                 Err(e) => {
                     self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
@@ -2500,8 +2517,20 @@ impl TuiApp {
             }
             FileAction::LoadEnv => match std::fs::read_to_string(path) {
                 Ok(content) => {
-                    let name = env_name_from_path(path, "environment");
-                    self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    // The mirror of Open Collection above: a Postman collection
+                    // export offered here is opened as a collection rather than
+                    // refused for not being KEY=value lines.
+                    if crate::postman::export_kind(&content)
+                        == Some(crate::postman::ExportKind::Collection)
+                    {
+                        let name = collection_name_from_path(path, "collection");
+                        if self.load_collection_text(name, &content, Some(PathBuf::from(path))) {
+                            self.status = Some(Status::OpenedAsCollection);
+                        }
+                    } else {
+                        let name = env_name_from_path(path, "environment");
+                        self.load_environment_text(name, &content, Some(PathBuf::from(path)), None);
+                    }
                 }
                 Err(e) => {
                     self.status = Some(Status::Error(crate::shared_utils::friendly_error(&e)))
@@ -4034,15 +4063,20 @@ impl TuiApp {
         w.remember_step();
         match w.stage() {
             PostmanStage::Connect => match key.code {
-                // While the recent-keys dropdown has focus, Esc backs out of it
-                // rather than leaving the wizard's connect step.
-                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
+                // While the saved-references dropdown is showing, Esc dismisses
+                // it rather than leaving the wizard's connect step. It stays
+                // dismissed only until something changes what it would offer.
+                KeyCode::Esc if w.recent_open() => {
+                    w.recent_sel = None;
+                    w.recent_hidden = true;
+                }
                 KeyCode::Esc => return,
                 // On the key field, Down opens (or moves down in) the list of
                 // references this key has been read from before, instead of
                 // jumping to the workspace field.
-                KeyCode::Down if w.field == 1 && !w.recent_entries().is_empty() => {
-                    let last = w.recent_entries().len() - 1;
+                KeyCode::Down if w.field == 1 && !w.recent_matches().is_empty() => {
+                    w.recent_hidden = false;
+                    let last = w.recent_matches().len() - 1;
                     w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
                 }
                 KeyCode::Up if w.recent_sel.is_some() => {
@@ -4052,10 +4086,15 @@ impl TuiApp {
                 KeyCode::Tab | KeyCode::Down => {
                     w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS;
                     w.recent_sel = None;
+                    // Coming back to the key field offers the suggestions
+                    // again: a dismissal answered the list that was showing,
+                    // not every list it might ever show.
+                    w.recent_hidden = false;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
                     w.field = (w.field + POSTMAN_CONNECT_FIELDS - 1) % POSTMAN_CONNECT_FIELDS;
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
                 // The key-source row is a choice, so Left/Right change it —
                 // the same gesture that changes the import format two steps
@@ -4063,23 +4102,33 @@ impl TuiApp {
                 KeyCode::Left if w.field == 0 => {
                     w.key_source = w.key_source.cycled(false);
                     // The remembered entries belong to a source; the old
-                    // selection would index into a different list.
+                    // selection would index into a different list, and a
+                    // dismissed list was a different list too.
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
                 KeyCode::Right if w.field == 0 => {
                     w.key_source = w.key_source.cycled(true);
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
-                KeyCode::Enter => {
-                    // Picking a remembered reference fills the field and
-                    // connects, rather than making the user press Enter twice.
+                // Enter inside the dropdown fills the field and stops there,
+                // as the request wizard's suggestion list does. Connecting on
+                // the same keystroke saved a keypress but committed a form the
+                // user was still reading: the key is the first of three fields,
+                // and picking a remembered reference is precisely the moment
+                // they want to look at what they picked.
+                KeyCode::Enter if w.recent_sel.is_some() => {
                     if let Some(entry) = w
                         .recent_sel
-                        .and_then(|i| w.recent_entries().get(i).cloned())
+                        .and_then(|i| w.recent_matches().get(i).cloned())
                     {
                         w.key = Editor::new(&entry, false);
+                        w.sync_fields();
                     }
                     w.recent_sel = None;
+                }
+                KeyCode::Enter => {
                     w.sync_fields();
                     w.flow.submit_connect(&s);
                     // A typed workspace id skips the listing and lands straight
@@ -4091,9 +4140,11 @@ impl TuiApp {
                 // The source row is a choice, not an editor: there is nothing
                 // for a keystroke to type into.
                 _ if w.field > 0 => {
-                    // Typing anything else closes the dropdown and edits the
-                    // field normally.
+                    // Typing anything else edits the field normally. The
+                    // dropdown follows what is typed rather than closing --
+                    // the text is the filter, as it is in the request wizard.
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                     let ed = match w.field {
                         1 => &mut w.key,
                         2 => &mut w.workspace_ref,
@@ -4121,6 +4172,13 @@ impl TuiApp {
                     KeyCode::Down if w.flow.selected + 1 < n => w.flow.selected += 1,
                     KeyCode::Enter => {
                         if w.flow.submit_workspace() {
+                            w.suggest_dest(import_base.as_deref());
+                        }
+                    }
+                    // Ctrl rather than a bare letter: every printable key on
+                    // this screen types into the filter.
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if w.flow.submit_all_workspaces() {
                             w.suggest_dest(import_base.as_deref());
                         }
                     }

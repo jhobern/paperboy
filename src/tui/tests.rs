@@ -2015,6 +2015,45 @@ fn key_cell_shows_a_prepopulated_dropdown() {
     assert_eq!(dd.unwrap().1, COMMON_HEADERS.to_vec());
 }
 
+/// The suggestion popup drew on whatever `Clear` left behind, which is the
+/// *terminal's* default background rather than the theme's — a hole of some
+/// unrelated colour in the middle of an otherwise themed screen. Every other
+/// dialog paints `th.panel`; so does this.
+#[test]
+fn the_suggestion_dropdown_is_painted_in_the_theme() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app);
+    assert!(form_ref(&app).key_dropdown().is_some());
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+    // Twice: the popup is anchored to the Key cell's rect, which the first
+    // frame is what records.
+    for _ in 0..2 {
+        term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+            .unwrap();
+    }
+    let buf = term.backend().buffer();
+
+    let (x, y) = (0..buf.area().height)
+        .find_map(|y| {
+            let row: String = (0..buf.area().width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            row.find("Accept-Charset")
+                .map(|byte| (row[..byte].chars().count() as u16, y))
+        })
+        .expect("the dropdown is on screen");
+    assert_eq!(
+        buf[(x, y)].bg,
+        th.panel,
+        "an unhighlighted suggestion sits on the theme's panel colour"
+    );
+}
+
 #[test]
 fn dropdown_filters_as_you_type_and_enter_fills_the_key() {
     let mut app = TuiApp::default();
@@ -2369,6 +2408,50 @@ fn run_all_batch_mode_toggles_from_preferences_and_round_trips() {
 }
 
 #[test]
+fn the_esc_discard_preference_round_trips() {
+    let mut app = TuiApp::default();
+    assert!(
+        !app.discard_request_edits_on_esc,
+        "off by default: Esc asks before throwing edits away"
+    );
+
+    // Row 6 of the Preferences menu toggles it (Enter and Space both work).
+    app.overlay = Some(Overlay::Preferences(6));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.discard_request_edits_on_esc, "Enter toggles it on");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        "the highlight stays on the toggle row"
+    );
+    press(&mut app, KeyCode::Char(' '));
+    assert!(!app.discard_request_edits_on_esc, "Space toggles it back");
+
+    // The 'e' mnemonic toggles it from anywhere in the menu.
+    app.overlay = Some(Overlay::Preferences(0));
+    press(&mut app, KeyCode::Char('e'));
+    assert!(app.discard_request_edits_on_esc, "the (e) mnemonic toggles");
+
+    let json = serde_json::to_string(&app.to_persisted()).unwrap();
+    let back: PersistedState = serde_json::from_str(&json).unwrap();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(back);
+    assert!(
+        restored.discard_request_edits_on_esc,
+        "the choice survives JSON (de)serialization"
+    );
+
+    // A state written before the setting existed still loads, with the safe
+    // answer rather than a deserialization failure.
+    let mut older: serde_json::Value = serde_json::from_str(&json).unwrap();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("discard_request_edits_on_esc");
+    let back: PersistedState = serde_json::from_value(older).unwrap();
+    assert!(!back.discard_request_edits_on_esc, "absent means 'ask'");
+}
+
+#[test]
 fn default_request_view_setting_round_trips() {
     let mut app = TuiApp::default();
     assert_eq!(
@@ -2698,9 +2781,10 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
     press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Esc discards request edits)
+    press(&mut app, KeyCode::Down); // -> sel 7 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Down moves to the last item without wrapping past it"
     );
 
@@ -2728,7 +2812,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
         "selecting JSON in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -2736,14 +2820,14 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(6)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(7)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
         "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -2768,7 +2852,8 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
     press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Esc discards request edits)
+    press(&mut app, KeyCode::Down); // -> sel 7 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
     assert_eq!(app.default_request_view, RequestView::Hurl);
 
@@ -2788,7 +2873,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(6))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(7))));
     assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
@@ -3485,6 +3570,66 @@ fn a_postman_export_lands_on_the_right_shelf_whichever_kind_it_is() {
     std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
     app.do_file_action(FileAction::ImportPostmanFile, other.to_str().unwrap());
     assert!(matches!(app.status, Some(Status::NotCollection)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same knowledge the dedicated importer has is worth having in the
+/// everyday pickers: "Open Collection" given a Postman *environment* export
+/// (both are `.json`) loads it as an environment and says so, rather than
+/// refusing a file it can plainly read -- and the environment picker does the
+/// mirror of it.
+#[test]
+fn the_ordinary_pickers_follow_a_postman_export_to_the_right_shelf() {
+    let dir = temp_dir("pb_picker_export");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let collection = dir.join("api.json");
+    std::fs::write(
+        &collection,
+        r#"{"info":{"name":"Api","schema":"x"},"item":[{"name":"Health","request":{"method":"GET","url":"http://127.0.0.1:8080/health"}}]}"#,
+    )
+    .unwrap();
+    let environment = dir.join("staging.json");
+    std::fs::write(
+        &environment,
+        r#"{"name":"Staging","values":[{"key":"BASE","value":"http://x","enabled":true}]}"#,
+    )
+    .unwrap();
+
+    let mut app = TuiApp::default();
+    let tabs = app.collections.len();
+    let envs = app.global_envs.len();
+
+    app.do_file_action(FileAction::OpenCollection, environment.to_str().unwrap());
+    assert_eq!(app.global_envs.len(), envs + 1, "loaded as an environment");
+    assert_eq!(app.collections.len(), tabs, "and not as an empty tab");
+    assert!(
+        matches!(app.status, Some(Status::OpenedAsEnvironment)),
+        "the status explains which shelf it landed on, got {:?}",
+        app.status
+    );
+
+    app.do_file_action(FileAction::LoadEnv, collection.to_str().unwrap());
+    assert_eq!(app.collections.len(), tabs + 1, "opened as a collection");
+    assert_eq!(app.global_envs.len(), envs + 1, "and added no environment");
+    assert!(
+        matches!(app.status, Some(Status::OpenedAsCollection)),
+        "the status explains which shelf it landed on, got {:?}",
+        app.status
+    );
+
+    // A file that is neither still gets the picker's own complaint.
+    let other = dir.join("notes.json");
+    std::fs::write(&other, r#"{"hello":"world"}"#).unwrap();
+    app.do_file_action(FileAction::OpenCollection, other.to_str().unwrap());
+    assert!(
+        !app.status.as_ref().unwrap().is_ok(),
+        "a non-export is refused by Open Collection, got {:?}",
+        app.status
+    );
+    app.do_file_action(FileAction::LoadEnv, other.to_str().unwrap());
+    assert!(matches!(app.status, Some(Status::NotEnvironment)));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -6939,6 +7084,39 @@ fn esc_on_an_edited_wizard_asks_before_discarding() {
         "the prompt opens on 'keep editing', so Enter on reflex costs nothing"
     );
     assert_eq!(form_ref(&app).name.text(), "h", "the edits are still there");
+}
+
+/// ...unless the user has asked for the old behaviour back. Some people close
+/// far more forms than they lose work in, and had learned Esc as "close this";
+/// the setting is off by default, so nobody gets that by accident.
+#[test]
+fn the_preference_puts_the_one_keypress_discard_back() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    assert!(
+        !app.discard_request_edits_on_esc,
+        "asking first is the default"
+    );
+
+    // Settings -> Preferences -> the Esc row, toggled on.
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Down); // -> Theme
+    press(&mut app, KeyCode::Down); // -> Preferences
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('e')); // the row's mnemonic
+    assert!(app.discard_request_edits_on_esc, "toggled on");
+    press(&mut app, KeyCode::Esc); // back to Settings
+    press(&mut app, KeyCode::Esc); // and out
+
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // type into the Name field
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.overlay.is_none(),
+        "one keypress closes the form, edits and all"
+    );
 }
 
 /// ...but an untouched form still closes on one Esc. Prompting when there is
@@ -27562,7 +27740,7 @@ fn taking_an_overlay_that_does_not_match_leaves_it_open() {
 
 use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
 use crate::postman_flow::Step as PostmanStep;
-use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary};
+use crate::postman_import::{ImportFormat, ImportPlan, ImportSummary, WorkspacePlan};
 
 /// Finding the 1Password item path is the tedious half of setting an import
 /// up, and it is the same path every time — so the wizard offers back the
@@ -27597,7 +27775,11 @@ fn a_working_key_reference_is_offered_back_next_time() {
         "only the references belonging to the chosen source are offered"
     );
 
-    // Down opens the list, Enter takes the highlighted one into the field.
+    // Down opens the list, Enter takes the highlighted one into the field —
+    // and stops there. It used to connect on the same keystroke, which
+    // committed a form the user was still reading: the key is the first of
+    // three fields, and picking a remembered reference is exactly when they
+    // want to look at what they picked.
     press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Down);
     assert_eq!(postman_wizard(&mut app).recent_sel, Some(0));
@@ -27605,6 +27787,10 @@ fn a_working_key_reference_is_offered_back_next_time() {
     let w = postman_wizard(&mut app);
     assert_eq!(w.key.text(), "Private/Postman/credential");
     assert_eq!(w.recent_sel, None);
+    assert!(
+        matches!(w.stage(), crate::tui::postman::PostmanStage::Connect),
+        "filling the field is not submitting the form"
+    );
 
     // Switching source switches the list with it.
     let w = postman_wizard(&mut app);
@@ -27613,6 +27799,133 @@ fn a_working_key_reference_is_offered_back_next_time() {
         postman_wizard(&mut app).recent_entries(),
         vec!["/postman/key".to_string()]
     );
+}
+
+/// Those suggestions used to be drawn in the same dim as every placeholder on
+/// the screen, so the one line telling a user their old 1Password path is a
+/// keystroke away read as ghost text they had already filled in. They are
+/// choices: they get a marker and full-weight text.
+#[test]
+fn the_saved_references_hang_off_the_key_field_as_a_dropdown() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    assert!(
+        app.session
+            .remember_key_ref("{{ op://Private/Postman/credential }}")
+    );
+    app.open_postman_wizard();
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(90, 16)).unwrap();
+    let mut render = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw_overlay(f, app, &s, &th))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let text: Vec<String> = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let found = text.iter().enumerate().find_map(|(y, row)| {
+            // Cell symbols are one character each here, so a character offset
+            // into the row is the column.
+            row.find("Private/Postman/credential")
+                .map(|byte| (row[..byte].chars().count() as u16, y as u16))
+        });
+        (text.join("\n"), found, buf.clone())
+    };
+
+    // The key-source row has focus first, and the dropdown belongs to the key
+    // field: nothing is hanging open over the form.
+    let (_, found, _) = render(&mut app);
+    assert!(found.is_none(), "no dropdown until the key field has focus");
+
+    press(&mut app, KeyCode::Tab);
+    let (screen, found, buf) = render(&mut app);
+    let (x, y) = found.expect("the key field offers what it was given before");
+    assert!(
+        screen.contains(s.suggest_hint),
+        "the popup says what Enter does: {screen}"
+    );
+    assert_eq!(
+        buf[(x, y)].bg,
+        th.panel,
+        "and paints its own themed background"
+    );
+
+    // Down highlights a row; the highlight is a marker plus the accent, not a
+    // shade of the ghost text every placeholder on the screen is drawn in.
+    press(&mut app, KeyCode::Down);
+    let (_, found, buf) = render(&mut app);
+    let (x, y) = found.expect("still showing");
+    assert_eq!(buf[(x, y)].bg, th.accent, "the highlighted row stands out");
+    assert_eq!(buf[(x - 2, y)].symbol(), "\u{203a}", "and is marked");
+
+    // Typing filters it, exactly as the request wizard's dropdown does, and a
+    // field holding the whole reference has nothing left to suggest.
+    press(&mut app, KeyCode::Esc);
+    type_str(&mut app, "Private/Postman/credential");
+    let (screen, _, _) = render(&mut app);
+    assert!(
+        !screen.contains(s.suggest_hint),
+        "a field holding the whole reference has nothing left to offer: {screen}"
+    );
+}
+
+/// An answered field keeps its colour when focus moves on. Dim is the colour
+/// of the placeholder -- of something nobody has typed yet -- so a dim value
+/// read as an empty field the moment the user tabbed away from it.
+#[test]
+fn a_filled_field_does_not_fade_into_looking_like_a_placeholder() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key_source = crate::postman_flow::KeySource::OnePassword;
+        w.key = Editor::new("Engineering/Postman/api-key", false);
+        // Focus sits on the source row, so the key field below is unfocused.
+        w.field = 0;
+    }
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(90, 16)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+
+    let found = (0..buf.area().height).find_map(|y| {
+        let row: String = (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        row.find("Engineering/Postman/api-key")
+            .map(|byte| (row[..byte].chars().count() as u16, y))
+    });
+    let (x, y) = found.expect("the key the user typed is on screen");
+    assert_eq!(
+        buf[(x, y)].fg,
+        th.text,
+        "an unfocused answer is still an answer"
+    );
+    assert_ne!(buf[(x, y)].fg, th.dim, "and is not ghost text");
+
+    // The hint in the still-empty workspace field is the thing that should be
+    // dim -- that is the difference the colour is carrying.
+    let hint = (0..buf.area().height).find_map(|y| {
+        let row: String = (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        row.find(s.postman_workspace_hint)
+            .map(|byte| (row[..byte].chars().count() as u16, y))
+    });
+    let (hx, hy) = hint.expect("the empty field shows its example");
+    assert_eq!(buf[(hx, hy)].fg, th.dim, "which is what dim means here");
 }
 
 /// The list is only written once the key has actually worked: a half-typed
@@ -27963,6 +28276,45 @@ fn items_that_could_not_be_fetched_are_reported_ahead_of_the_conversion_notes() 
     assert!(matches!(app.status, Some(Status::PostmanSkipped(1))));
 }
 
+/// Leaving Postman means taking every workspace, and doing that one at a time
+/// is what stops people migrating. Ctrl+A rather than a bare letter because
+/// every printable key on this screen types into the filter.
+#[test]
+fn ctrl_a_on_the_workspace_list_imports_all_of_them() {
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+            a_workspace("Gamma", "ws-g"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::Options);
+    assert_eq!(w.flow.target_count(), 3);
+
+    // A plain "a" still filters, or the list would be unusable.
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        w.flow.seed_step(PostmanStep::PickWorkspace);
+    }
+    press(&mut app, KeyCode::Char('a'));
+    let w = postman_wizard(&mut app);
+    assert_eq!(w.stage(), PostmanStage::PickWorkspace);
+    assert_eq!(w.flow.filter, "a");
+}
+
 #[test]
 fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
     let mut app = TuiApp::default();
@@ -27978,13 +28330,16 @@ fn the_confirm_step_waits_for_the_plan_before_offering_to_start() {
     press(&mut app, KeyCode::Enter);
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Loading);
 
-    postman_wizard(&mut app).flow.seed_plan(ImportPlan {
-        workspace_id: "ws-a".to_string(),
-        workspace_name: "Alpha".to_string(),
-        collections: Vec::new(),
-        environments: Vec::new(),
-        remaining_month: None,
-    });
+    postman_wizard(&mut app).flow.seed_plan(ImportPlan::new(
+        vec![WorkspacePlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+        }],
+        Vec::new(),
+        None,
+    ));
     assert_eq!(postman_wizard(&mut app).stage(), PostmanStage::Confirm);
 }
 
@@ -28003,24 +28358,27 @@ fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
         let w = postman_wizard(&mut app);
         w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
         w.flow.seed_step(PostmanStep::Confirm);
-        w.flow.seed_plan(ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: vec![
-                ItemSummary {
-                    uid: "uid-a".to_string(),
-                    id: "id-a".to_string(),
-                    name: "Billing".to_string(),
-                },
-                ItemSummary {
-                    uid: "uid-b".to_string(),
-                    id: "id-b".to_string(),
-                    name: "Shipping".to_string(),
-                },
-            ],
-            environments: Vec::new(),
-            remaining_month: None,
-        });
+        w.flow.seed_plan(ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: vec![
+                    ItemSummary {
+                        uid: "uid-a".to_string(),
+                        id: "id-a".to_string(),
+                        name: "Billing".to_string(),
+                    },
+                    ItemSummary {
+                        uid: "uid-b".to_string(),
+                        id: "id-b".to_string(),
+                        name: "Shipping".to_string(),
+                    },
+                ],
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        ));
         // Cached, so the keystroke does not want a Postman API behind it.
         w.flow.seed_preview_cache(Preview {
             uid: "uid-b".to_string(),
@@ -28081,13 +28439,16 @@ fn a_collection_can_be_read_before_the_workspace_is_downloaded() {
 fn every_step_of_the_postman_wizard_renders() {
     use ratatui::{Terminal, backend::TestBackend};
 
-    let plan = ImportPlan {
-        workspace_id: "ws-a".to_string(),
-        workspace_name: "Alpha".to_string(),
-        collections: Vec::new(),
-        environments: Vec::new(),
-        remaining_month: None,
-    };
+    let plan = ImportPlan::new(
+        vec![WorkspacePlan {
+            workspace_id: "ws-a".to_string(),
+            workspace_name: "Alpha".to_string(),
+            collections: Vec::new(),
+            environments: Vec::new(),
+        }],
+        Vec::new(),
+        None,
+    );
     let steps = [
         PostmanStep::Connect,
         PostmanStep::PickWorkspace,
@@ -28362,13 +28723,16 @@ fn the_confirmation_says_enter_imports_not_enter_connects() {
     {
         let w = postman_wizard(&mut app);
         w.flow.seed_chosen(a_workspace("Alpha", "ws-a"));
-        w.flow.seed_plan(ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: Vec::new(),
-            environments: Vec::new(),
-            remaining_month: None,
-        });
+        w.flow.seed_plan(ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: Vec::new(),
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        ));
         w.flow.seed_step(PostmanStep::Confirm);
     }
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();

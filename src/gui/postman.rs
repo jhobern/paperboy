@@ -278,6 +278,8 @@ enum UiAction {
     Connect,
     /// Step 2: take the highlighted workspace.
     PickWorkspace,
+    /// Step 2, the migration case: take every workspace the list is showing.
+    PickAllWorkspaces,
     /// Step 3: validate the options and start planning.
     StartPlanning,
     /// Step 4: approve the plan and let the parked worker download.
@@ -386,6 +388,11 @@ pub fn show(app: &mut GuiApp, ctx: &egui::Context) {
         }
         UiAction::PickWorkspace => {
             if w.flow.submit_workspace() {
+                w.suggest_dest(import_base.as_deref());
+            }
+        }
+        UiAction::PickAllWorkspaces => {
+            if w.flow.submit_all_workspaces() {
                 w.suggest_dest(import_base.as_deref());
             }
         }
@@ -713,6 +720,19 @@ fn draw_pick_workspace(
         {
             action = UiAction::PickWorkspace;
         }
+        // Beside "Next", not hidden behind it: leaving Postman means taking
+        // every workspace, and doing that one at a time is the whole reason
+        // people gave up on migrating.
+        if ui
+            .add_enabled(
+                !busy && !rows.is_empty(),
+                egui::Button::new(format!("{} ({})", s.postman_import_all, rows.len())),
+            )
+            .on_hover_text(s.postman_import_all_note)
+            .clicked()
+        {
+            action = UiAction::PickAllWorkspaces;
+        }
         if ui
             .add_enabled(!busy, egui::Button::new(s.gui_git_back))
             .clicked()
@@ -730,7 +750,15 @@ fn draw_options(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     let mut action = UiAction::None;
     let busy = w.flow.is_busy();
 
-    // No heading: the window's title bar already says what this dialog is.
+    // No heading: the window's title bar already says what this dialog is —
+    // but not *what* is being imported, which now that it can be every
+    // workspace at once is worth confirming before the options are set.
+    ui.colored_label(colors.dim, w.flow.target_label(s));
+    if w.flow.target_count() > 1 {
+        ui.colored_label(colors.dim, s.postman_import_all_note);
+    }
+    ui.add_space(6.0);
+
     ui.checkbox(
         &mut w.flow.include_collections,
         s.postman_include_collections,
@@ -820,13 +848,7 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
             .color(colors.text),
     );
     ui.add_space(4.0);
-    ui.label(format!(
-        "{} {} · {} {}",
-        plan.collections.len(),
-        s.postman_word_collections,
-        plan.environments.len(),
-        s.postman_word_environments
-    ));
+    ui.label(crate::postman_flow::plan_summary(plan, s));
     ui.add_space(6.0);
     ui.colored_label(colors.dim, s.postman_rate_limit_note);
     ui.label(format!(
@@ -836,6 +858,12 @@ fn draw_confirm(ui: &mut egui::Ui, w: &mut Wizard, colors: UiColors, s: &Strings
     ));
     if plan.strains_monthly_budget() {
         ui.colored_label(colors.err, s.postman_budget_warning);
+    }
+    // Said before the download starts, not only in the final summary: an
+    // import of forty workspaces that quietly became thirty-eight is what a
+    // migration most needs to be told about.
+    if let Some(text) = crate::postman_flow::plan_skipped_line(plan, s) {
+        ui.colored_label(colors.err, text);
     }
 
     // What is actually in there. The plan can only count collections, and a
@@ -1099,7 +1127,7 @@ mod tests {
     use super::*;
     use crate::i18n::Language;
     use crate::postman_api::{WorkspaceKind, WorkspaceSummary};
-    use crate::postman_import::ImportPlan;
+    use crate::postman_import::{ImportPlan, WorkspacePlan};
     use crate::session::Session;
 
     fn s() -> Strings {
@@ -1290,13 +1318,16 @@ mod tests {
     }
 
     fn a_plan() -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: Vec::new(),
-            environments: Vec::new(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: Vec::new(),
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     /// Every word the dialog paints this frame, as one line. A few frames, so
@@ -1398,6 +1429,22 @@ mod tests {
         assert_eq!(w.flow.dest, "/somewhere/mine");
     }
 
+    /// Importing everything belongs to no one workspace, so the folder it is
+    /// suggested into cannot be named after one.
+    #[test]
+    fn importing_every_workspace_suggests_a_generic_folder() {
+        let mut w = wizard();
+        w.flow.seed_workspaces(vec![
+            a_workspace("Alpha", "ws-a"),
+            a_workspace("Beta", "ws-b"),
+        ]);
+        assert!(w.flow.submit_all_workspaces());
+        w.suggest_dest(None);
+
+        assert_eq!(w.flow.target_count(), 2);
+        assert!(w.flow.dest.ends_with("Postman"), "got {:?}", w.flow.dest);
+    }
+
     /// A blank field is still a suggestion opportunity even after the user has
     /// been in it — otherwise clearing it strands the wizard with no path.
     #[test]
@@ -1461,17 +1508,20 @@ mod tests {
         app.postman.open();
         app.postman.seed_step_for_audit(Step::Confirm);
         let flow = &mut app.postman.flow.as_mut().unwrap().flow;
-        flow.seed_plan(ImportPlan {
-            workspace_id: "ws-a".to_string(),
-            workspace_name: "Alpha".to_string(),
-            collections: vec![ItemSummary {
-                uid: "uid-a".to_string(),
-                id: "id-a".to_string(),
-                name: "Billing".to_string(),
+        flow.seed_plan(ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws-a".to_string(),
+                workspace_name: "Alpha".to_string(),
+                collections: vec![ItemSummary {
+                    uid: "uid-a".to_string(),
+                    id: "id-a".to_string(),
+                    name: "Billing".to_string(),
+                }],
+                environments: Vec::new(),
             }],
-            environments: Vec::new(),
-            remaining_month: None,
-        });
+            Vec::new(),
+            None,
+        ));
         // Cached, so the test needs no Postman API behind it.
         flow.seed_preview_cache(Preview {
             uid: "uid-a".to_string(),

@@ -2902,6 +2902,9 @@ pub(crate) fn draw_kind_dropdown(
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
+        // See `draw_key_suggestions`: a popup paints its own themed background
+        // rather than letting `Clear` expose the terminal's.
+        .style(Style::default().bg(th.panel).fg(th.text))
         .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             format!(" {} ", s.hdr_type),
@@ -3055,6 +3058,9 @@ pub(crate) fn draw_content_type_dropdown(
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
+        // See `draw_key_suggestions`: a popup paints its own themed background
+        // rather than letting `Clear` expose the terminal's.
+        .style(Style::default().bg(th.panel).fg(th.text))
         .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             format!(" {} ", s.content_type_hint),
@@ -3141,6 +3147,11 @@ pub(crate) fn draw_key_suggestions(
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
+        // `Clear` only resets cells to the terminal's own default colours, so
+        // without a background of its own the popup showed whatever the user's
+        // terminal paints behind it -- a purple hole in an otherwise themed
+        // screen. `panel` is what every other dialog sits on.
+        .style(Style::default().bg(th.panel).fg(th.text))
         .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             format!(" {} ", s.suggest_hint),

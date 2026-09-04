@@ -8,6 +8,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.4] - 2026-09-04
+
+### Added
+
+- **Import every Postman workspace at once.** The wizard could only ever take
+  one workspace at a time, which is fine for trying PaperBoy out and useless
+  for the thing people actually want it for: leaving Postman. An account with
+  forty workspaces meant forty passes through the same four steps, re-entering
+  the key, the destination and the format each time. Both front-ends can now
+  take the lot — `Ctrl+A` on the workspace list in the terminal UI (`Ctrl`,
+  because every printable key on that screen types into the filter), an
+  **Import all** button beside **Next** in the GUI — and the headless import
+  has `--postman-all` to match. Everything the list is *showing* is imported,
+  so a filtered list imports what it shows rather than quietly taking more
+  than was asked for.
+
+  Each workspace lands in its own folder inside the destination, keeping the
+  `Collections/` + `Environments/` layout a single import has always produced;
+  two workspaces that both hold a "Billing API" therefore keep both, rather
+  than one being renamed to " (2)" with nothing to say which it came from. Two
+  workspaces that share a *name* get separate folders too.
+
+  The whole run still goes through one importer and one confirmation step: the
+  rate-limit pacer's picture of the account's real budget is worth more the
+  more calls are left to make, and the estimate, the ETA and the monthly-budget
+  warning now cover the entire import, so backing out before a forty-workspace
+  download still costs nothing. A workspace with nothing in it is dropped, and
+  one the key has lost access to is reported and skipped rather than ending the
+  run — an account is not a migration's fault. Anything that would fail for
+  every remaining workspace, such as a rejected key or an exhausted monthly
+  quota, still stops the plan instead of being logged forty times.
+
+### Added
+
+- **A preference for the old Esc behaviour.** Esc on a request form with unsaved
+  edits asks before discarding them, which is the right default for a form with
+  no autosave — but it is also a second keypress in a loop some users run dozens
+  of times an hour, and they had learned Esc as simply "close this". Settings →
+  Preferences → **Esc discards request edits without asking** puts the one-press
+  discard back. Off by default, so nobody gets it by accident.
+
+### Changed
+
+- **The saved key references are a dropdown hanging off the key field**, like
+  the request wizard's header-name suggestions: anchored under the field, in a
+  bordered popup that says what Enter does, filtered by what has been typed, and
+  dismissed with Esc. As a permanent list inside the form it read as another row
+  of the form — or, drawn dim, as more ghost text.
+
+- **The everyday file pickers sort Postman exports out for themselves.** Postman
+  writes collections and environments to the same `.json` extension, and only
+  the dedicated *Import from Postman exported file* entry knew that. Pointing
+  **Open Collection** at an exported environment therefore got "not a valid
+  collection file" for a file PaperBoy can plainly read, and the reverse
+  happened on the environment picker. Both now follow the content and say which
+  shelf the file landed on. PaperBoy's own formats are still taken at their
+  word; a `.json` that is neither still gets the picker's own complaint.
+
+- **Waiting for a 1Password approval no longer counts against the import.** A
+  key written as `{{ op://… }}` is fetched by running the provider's CLI, which
+  can leave an approval prompt on screen for as long as it takes the user to
+  reach it. The wizard was counting that from the moment they pressed Enter, so
+  it would claim two minutes spent fetching a workspace list it had not yet been
+  allowed to ask for — and feed those minutes into the download's ETA. Both
+  clocks now start when the key arrives.
+
+### Fixed
+
+- The Postman importer's allowance line stopped flickering between two
+  unrelated numbers. Postman meters listing calls (10 per 10 seconds) and fetch
+  calls (300 per minute) as separate accounts, and an import draws on both
+  within the same second; the line reported whichever call answered last, so
+  "calls left before reset" flipped between 9 and 283 several times a second
+  and read as though the allowance itself were unstable. It now reports the
+  limit actually holding the import up — the one spacing the calls out — and
+  retires a reading once the window it described has reset, so a bucket the
+  import has finished with stops speaking for it. The monthly count belongs to
+  the account rather than to either bucket, so it still follows whichever call
+  reported most recently.
+
+- Single-line fields keep their text colour when focus moves elsewhere. An
+  unfocused field was dimmed, which is also how an *empty* field draws the
+  example of what belongs in it — so a Postman key source, a git URL or a theme
+  name that had been filled in looked unanswered as soon as the user tabbed
+  past it. Focus is now said by the highlight background alone, and dim means
+  only "nobody has typed this yet".
+
+- The saved key references offered under the Postman wizard's key field were
+  drawn in the same dim as every placeholder on screen, so the line telling a
+  user their old 1Password path is one keystroke away read as ghost text. They
+  are now marked and drawn at full weight, like the choices they are.
+
+- The destination row's `[Enter to choose…]` hint is drawn dim, so it reads as a
+  hint rather than as the last segment of the folder path it sits beside. The
+  options screen's footer says "Space toggle" rather than the vaguer
+  "Space change".
+
+- Enter on a saved key reference now fills the field and stops there, the way
+  the request wizard's suggestion dropdown behaves. It used to connect on the
+  same keystroke — one press fewer, but it committed a form the user was still
+  reading, and picking a remembered reference is exactly the moment they want
+  to look at what they picked. The panel's hint says so while the list is open.
+
+- The request wizard's dropdowns (header names, header type, content type) paint
+  the theme's panel colour. `Clear` only resets cells to the *terminal's* default
+  background, so the popups showed whatever colour sat behind the app — a hole
+  in the middle of an otherwise themed screen.
+
+
+## [0.5.3] - 2026-09-03
+
+### Added
+
+- **A build-time check that names the missing dependency.** `hurl`'s libxml2
+  requirement used to announce itself as `failed to run custom build command for
+  libxml v0.3.16`, five levels down a dependency tree, which tells a user
+  nothing about what to install. PaperBoy now has a `build.rs` that checks, up
+  front, every system prerequisite its tree has and Cargo cannot supply, and
+  when one is absent stops the build with what is missing, how it knows, which
+  part of the build wants it, and the command *this* machine wants — chosen by
+  looking for the package manager that is actually installed (Homebrew,
+  MacPorts, apt, dnf, yum, zypper, pacman, apk) rather than by guessing from the
+  OS name. It is silent when everything is present.
+
+  The list is the result of auditing the tree rather than guessing: **libxml2**
+  and **pkg-config** to find it (`libxml` binds the system copy, and Hurl's
+  XPath asserts and captures *are* libxml2); a **C compiler**, **perl** and
+  **make**, which are the price of the `static-curl`/`static-ssl` choice that
+  spares users a system libcurl and OpenSSL — `openssl-src` really does run
+  `perl Configure` and then `make`; and **libclang**, which `bindgen` `dlopen`s
+  to generate `libxml`'s bindings. Nothing else qualifies: `libz-sys` falls back
+  to compiling its bundled zlib, and the `gui` feature adds no build-time system
+  dependency at all, because `wayland-sys` is built with `dlopen`, `khronos-egl`
+  with `dynamic`/`libloading`, and `x11-dl` tolerates a failed probe — those
+  X11/Wayland libraries are needed to *run* the GUI, not to build it.
+
+  Failing rather than merely warning is deliberate, and was settled by
+  measurement: Cargo runs a dependency's build script and the root package's
+  *concurrently*, so this check can't be scheduled ahead of `libxml`'s to
+  pre-empt it, and on a real failing build a warning alone landed 65
+  `Compiling …` lines above the error, with no replay at the end — comfortably
+  lost. Failing puts the message last on screen (Cargo echoes a failing build
+  script's own output inside its error report), puts PaperBoy's name on the
+  error, and skips the several minutes of compiling that preceded the identical
+  failure before.
+
+  Because stopping a build is a strong move, it is hedged three ways: only
+  certain checks can stop it — a `pkg-config` verdict or a file on `PATH`, never
+  the heuristic libclang search, which can only advise; everything downgrades to
+  a warning when the probe might not match the one that matters (cross-
+  compilation, or target-suffixed/host-prefixed `PKG_CONFIG_*` variables that
+  send the real probe somewhere this one didn't look); and
+  `PAPERBOY_SKIP_DEP_CHECK=1` bypasses it entirely, so a false positive never
+  needs a new release to get past. Two things it will not do, each also settled
+  by experiment: it never prompts, because a build script's stdin, stdout and
+  stderr are all pipes, so a question would reach nobody and nothing could
+  answer it; and it never installs anything, since that would let `cargo
+  install` silently mutate the system, and `sudo` would deadlock with no TTY for
+  a password. It also avoids the "always re-run" build-script idiom, which would
+  recompile PaperBoy on every single
+  `cargo build`.
+
+### Documentation
+
+- **`cargo install paperboy` needs libxml2 on the system, and the README now
+  says so.** Several people hit `error: failed to run custom build command for
+  libxml` — the `libxml` crate is a binding to the system libxml2 (it locates it
+  with `pkg-config` and generates bindings with `bindgen`/`libclang`), not a
+  vendored copy, and it arrives as a hard, feature-less dependency of `hurl` and
+  `hurl_core`, whose XPath support in `[Captures]`/`[Asserts]` *is* libxml2. It
+  therefore can't be dropped or feature-gated away. Installing & running gained
+  a Build prerequisites section with the per-platform package commands
+  (`pkg-config` + libxml2 headers + clang), the Homebrew `PKG_CONFIG_PATH`
+  escape hatch, and the reason no libcurl/OpenSSL `-dev` package is listed
+  alongside them: those are statically vendored from source via
+  `static-curl`/`static-ssl`, so libxml2 is the only library that must already
+  be installed.
+- **Why it can't just be vendored.** The same README section now records the
+  answer to the obvious follow-up: libcurl and OpenSSL are vendored here only
+  because `curl-sys` ships a `static-curl` feature that compiles them from
+  source, which a direct `curl` dependency switches on and feature unification
+  applies to `hurl`'s copy. `libxml` has no such feature (`runtime`/`static`
+  only pick how `bindgen` finds `libclang`), there is no `libxml2-src` crate to
+  lean on, and nothing PaperBoy can do from the outside reaches a transitive
+  build script — no `links` key means no `DEP_*` metadata, a published crate's
+  `[patch]` is ignored for consumers, `cargo install` doesn't read a packaged
+  `.cargo/config.toml`, and dependencies' build scripts run first. Documented
+  alongside it is `libxml`'s own escape hatch, `LIBXML2=/path/to/libxml2.dylib`
+  (passable through `cargo install --config 'env.LIBXML2="…"'`), which skips
+  pkg-config and bindgen for anyone who already has the library.
+
+
 ## [0.5.2] - 2026-09-02
 
 ### Changed

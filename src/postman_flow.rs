@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::i18n::Strings;
-use crate::postman_api::{PostmanClient, WorkspaceKind, WorkspaceSummary};
+use crate::postman_api::{PostmanClient, RateBucket, WorkspaceKind, WorkspaceSummary};
 use crate::postman_import::{
     ImportFormat, ImportMsg, ImportOptions, ImportPlan, ImportSummary, Importer, ItemKind,
     WaitReason, parse_workspace_ref,
@@ -308,9 +308,16 @@ pub(crate) struct PostmanFlow {
     /// limit can genuinely take minutes, and a spinner with no elapsed time (or
     /// no reason for the wait) is indistinguishable from a hang.
     busy_since: Option<Instant>,
-    budget: Option<Budget>,
+    /// The latest reading from each [`RateBucket`], looked up by bucket rather
+    /// than kept as a single "last thing Postman said". See
+    /// [`PostmanFlow::budget_line`].
+    budgets: Vec<Budget>,
     workspaces: Vec<WorkspaceSummary>,
-    chosen: Option<WorkspaceSummary>,
+    /// The workspaces the import will cover: one when it was picked from the
+    /// list or named by id, every listed one when "import everything" was
+    /// asked for. A `Vec` rather than an `Option` so the two cases travel the
+    /// same path — a migration is a whole account, not a workspace at a time.
+    chosen: Vec<WorkspaceSummary>,
     plan: Option<ImportPlan>,
     progress: Progress,
     /// Items that could not be fetched, accumulated as they are reported so the
@@ -379,6 +386,12 @@ pub(crate) struct PostmanFlow {
     /// wizard: the resolved secret is never persisted, exactly as an
     /// environment's resolved secret isn't.
     resolved_key: Arc<Mutex<Option<(String, String)>>>,
+    /// When the provider lookup above finished, stamped by whichever worker
+    /// did it and consumed once by [`PostmanFlow::absorb_approval_wait`].
+    /// Approving a 1Password prompt is unbounded human time; the clocks the
+    /// wizard shows are meant to say how the *import* is going, so they start
+    /// again from here.
+    key_ready: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Where the Postman API key comes from.
@@ -544,7 +557,20 @@ impl KeySource {
 /// `op`/`aws`, which can take seconds and put a fingerprint prompt on screen.
 /// The answer is cached against the text it came from so an import asks once
 /// rather than once per API phase.
-fn resolve_key(raw: &str, cache: &Mutex<Option<(String, String)>>) -> Option<String> {
+/// Resolve the key the user typed, which may be a provider reference such as
+/// `{{ op://Vault/Item/field }}`, shelling out once and remembering the answer.
+///
+/// `ready` is stamped with the moment a *lookup actually happened*. Those
+/// lookups run someone else's CLI, and 1Password (or an MFA-guarded SSM
+/// parameter) can sit there for as long as the user takes to reach for their
+/// laptop and approve the prompt. That is their time, not the import's, so the
+/// wizard's elapsed counter is moved forward to this instant rather than
+/// reporting a two-minute approval as two minutes of listing.
+fn resolve_key(
+    raw: &str,
+    cache: &Mutex<Option<(String, String)>>,
+    ready: &Mutex<Option<Instant>>,
+) -> Option<String> {
     let raw = raw.trim();
     // Nothing to ask anyone, and so nothing worth remembering.
     if !raw.contains("{{") {
@@ -559,6 +585,9 @@ fn resolve_key(raw: &str, cache: &Mutex<Option<(String, String)>>) -> Option<Str
     let value = crate::environment::resolve_reference(raw)?;
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((raw.to_string(), value.clone()));
+    }
+    if let Ok(mut guard) = ready.lock() {
+        *guard = Some(Instant::now());
     }
     Some(value)
 }
@@ -585,9 +614,9 @@ impl PostmanFlow {
             step: Step::Connect,
             busy: None,
             busy_since: None,
-            budget: None,
+            budgets: Vec::new(),
             workspaces: Vec::new(),
-            chosen: None,
+            chosen: Vec::new(),
             plan: None,
             progress: Progress::default(),
             failures: Vec::new(),
@@ -607,6 +636,7 @@ impl PostmanFlow {
             go: None,
             cancel: Arc::new(AtomicBool::new(false)),
             resolved_key: Arc::new(Mutex::new(None)),
+            key_ready: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -675,8 +705,25 @@ impl PostmanFlow {
     /// two calls left this month or two hundred, and the estimate swings about
     /// as paced waits land inside it — so show the budget itself, which is a
     /// fact rather than an extrapolation.
+    ///
+    /// Postman meters listing calls (10 per 10 seconds) separately from fetch
+    /// calls (300 per minute), and an import draws on both. Reporting whichever
+    /// answered last made the figure jump between the two accounts several
+    /// times a second, reading as though the allowance itself were unstable —
+    /// so this reports the one actually holding the import up: the widest
+    /// spacing, and the emptier bucket if the spacing matches. Readings are
+    /// retired once the window they described has reset, so a bucket the import
+    /// has finished with stops speaking for it.
     pub(crate) fn budget_line(&self, s: &Strings) -> Option<String> {
-        let b = self.budget?;
+        let now = Instant::now();
+        let fresh: Vec<&Budget> = self.budgets.iter().filter(|b| !b.is_stale(now)).collect();
+        let b = *fresh.iter().max_by_key(|b| {
+            (
+                b.interval_secs,
+                b.remaining.is_some(),
+                std::cmp::Reverse(b.remaining),
+            )
+        })?;
         let mut parts: Vec<String> = Vec::new();
         if let Some(n) = b.remaining {
             let window = match b.reset_secs {
@@ -690,7 +737,16 @@ impl PostmanFlow {
             };
             parts.push(window);
         }
-        if let Some(n) = b.remaining_month {
+        // The monthly allowance belongs to the account, not to either bucket,
+        // so take the newest reading of it from whichever call reported one —
+        // otherwise the count would sit still whenever the bucket being shown
+        // was not the one doing the work.
+        let monthly = fresh
+            .iter()
+            .filter(|b| b.remaining_month.is_some())
+            .max_by_key(|b| b.seen)
+            .and_then(|b| b.remaining_month);
+        if let Some(n) = monthly {
             parts.push(format!("{n} {}", s.postman_budget_month));
         }
         if b.interval_secs > 0 {
@@ -717,7 +773,7 @@ impl PostmanFlow {
     /// back as a suggestion. A pasted key is never returned: it is the
     /// credential itself, and this ends up in `state.json`.
     pub(crate) fn key_to_remember(&self) -> Option<&str> {
-        let proven = !self.workspaces.is_empty() || self.chosen.is_some() || self.plan.is_some();
+        let proven = !self.workspaces.is_empty() || !self.chosen.is_empty() || self.plan.is_some();
         let key = self.key.trim();
         (proven && !key.is_empty() && !KeySource::detect(key).0.is_secret()).then_some(key)
     }
@@ -818,10 +874,11 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let pending = id.clone();
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Err(bad_ref.to_string()));
@@ -927,11 +984,12 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let wanted = id.to_string();
         let id = id.to_string();
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Err(bad_ref.to_string()));
@@ -1004,8 +1062,28 @@ impl PostmanFlow {
     }
 
     /// The name of the workspace being imported, once one is settled on.
+    /// Empty when the import covers several: it belongs to no one workspace,
+    /// and callers that need something to show use [`Self::target_label`].
     pub(crate) fn workspace_name(&self) -> &str {
-        self.chosen.as_ref().map(|w| w.name.as_str()).unwrap_or("")
+        match self.chosen.as_slice() {
+            [only] => only.name.as_str(),
+            _ => "",
+        }
+    }
+
+    /// How many workspaces the import covers.
+    pub(crate) fn target_count(&self) -> usize {
+        self.chosen.len()
+    }
+
+    /// What to head the remaining steps with: the workspace's name, or how
+    /// many workspaces are being imported when it is more than one.
+    pub(crate) fn target_label(&self, s: &Strings) -> String {
+        match self.chosen.as_slice() {
+            [] => String::new(),
+            [only] => only.name.clone(),
+            many => format!("{} ({})", s.postman_all_workspaces, many.len()),
+        }
     }
 
     pub(crate) fn dest_path(&self) -> PathBuf {
@@ -1044,11 +1122,11 @@ impl PostmanFlow {
             };
             // Nothing has been listed, so the name isn't known — the id stands
             // in until the plan comes back with the real one.
-            self.chosen = Some(WorkspaceSummary {
+            self.chosen = vec![WorkspaceSummary {
                 id,
                 name: typed,
                 kind: WorkspaceKind::Other(String::new()),
-            });
+            }];
             self.step = Step::Options;
             return;
         }
@@ -1060,9 +1138,10 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Msg::Workspaces(Err(bad_ref.to_string())));
@@ -1091,7 +1170,23 @@ impl PostmanFlow {
         let Some(ws) = self.selected_workspace().cloned() else {
             return false;
         };
-        self.chosen = Some(ws);
+        self.chosen = vec![ws];
+        self.step = Step::Options;
+        true
+    }
+
+    /// Take every workspace now listed — the filter included, so a filtered
+    /// list imports what it shows — and move on to the options.
+    ///
+    /// This is the migration case: someone leaving Postman wants all of it,
+    /// and doing that a workspace at a time means re-entering the key, the
+    /// destination and the format for each one. Returns whether it advanced.
+    pub(crate) fn submit_all_workspaces(&mut self) -> bool {
+        let all: Vec<WorkspaceSummary> = self.visible_workspaces().into_iter().cloned().collect();
+        if all.is_empty() {
+            return false;
+        }
+        self.chosen = all;
         self.step = Step::Options;
         true
     }
@@ -1107,10 +1202,15 @@ impl PostmanFlow {
             self.step = Step::Failed(s.postman_err_nothing_selected.to_string());
             return false;
         }
-        let Some(ws) = self.chosen.clone() else {
+        let targets: Vec<(String, String)> = self
+            .chosen
+            .iter()
+            .map(|w| (w.id.clone(), w.name.clone()))
+            .collect();
+        if targets.is_empty() {
             self.step = Step::Failed(s.postman_err_no_workspace.to_string());
             return false;
-        };
+        }
 
         let (tx, rx) = mpsc::channel();
         let (progress_tx, progress_rx) = mpsc::channel();
@@ -1118,6 +1218,7 @@ impl PostmanFlow {
         let raw = self.key.trim().to_string();
         let base = self.base_url_opt();
         let cache = Arc::clone(&self.resolved_key);
+        let ready = Arc::clone(&self.key_ready);
         let bad_ref = s.postman_err_key_ref;
         let options = self.options();
         let dest = self.dest_path();
@@ -1125,7 +1226,7 @@ impl PostmanFlow {
         cancel.store(false, Ordering::Relaxed);
 
         thread::spawn(move || {
-            let key = match resolve_key(&raw, &cache) {
+            let key = match resolve_key(&raw, &cache, &ready) {
                 Some(k) => k,
                 None => {
                     let _ = tx.send(Msg::Failed(bad_ref.to_string()));
@@ -1140,7 +1241,14 @@ impl PostmanFlow {
                 .with_progress(progress_tx)
                 .with_cancel(cancel);
 
-            let plan = match importer.plan(&ws.id, &ws.name, &options) {
+            // One workspace still goes through `plan`, which treats an empty
+            // one as an error; several go through `plan_all`, which drops the
+            // empty and the inaccessible rather than failing the whole batch.
+            let planned = match targets.as_slice() {
+                [(id, name)] => importer.plan(id, name, &options),
+                many => importer.plan_all(many, &options),
+            };
+            let plan = match planned {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(Msg::Failed(e.to_string()));
@@ -1213,7 +1321,7 @@ impl PostmanFlow {
     /// Go back to the workspace list, keeping it — the list belongs to the key
     /// that fetched it, and that hasn't changed.
     pub(crate) fn to_pick_workspace(&mut self) {
-        self.chosen = None;
+        self.chosen.clear();
         self.plan = None;
         self.reset_preview();
         self.step = Step::PickWorkspace;
@@ -1247,7 +1355,7 @@ impl PostmanFlow {
         self.progress_rx = None;
         self.clear_busy();
         self.workspaces.clear();
-        self.chosen = None;
+        self.chosen.clear();
         self.plan = None;
         self.reset_preview();
         // The key may be about to change, and a listing belongs to the key
@@ -1280,7 +1388,7 @@ impl PostmanFlow {
     pub(crate) fn recoverable(&self, back_to: Step) -> Step {
         match back_to {
             Step::PickWorkspace if self.workspaces.is_empty() => Step::Connect,
-            Step::Options | Step::Confirm | Step::Downloading if self.chosen.is_none() => {
+            Step::Options | Step::Confirm | Step::Downloading if self.chosen.is_empty() => {
                 Step::Connect
             }
             // A download that failed cannot be resumed from its progress bar;
@@ -1304,6 +1412,7 @@ impl PostmanFlow {
     /// Collect whatever the worker has produced. Call each tick (the terminal
     /// UI) or each frame (the GUI).
     pub(crate) fn poll(&mut self, s: &Strings) -> Option<PostmanEvent> {
+        self.absorb_approval_wait();
         self.drain_progress();
         self.drain_preview();
         self.drain_peek();
@@ -1322,6 +1431,28 @@ impl PostmanFlow {
                 self.clear_busy();
                 None
             }
+        }
+    }
+
+    /// Restart the on-screen clocks from the moment the API key finished
+    /// resolving.
+    ///
+    /// A key written as `{{ op://… }}` is fetched by running 1Password's CLI,
+    /// which asks the user to approve the read -- a prompt that may sit
+    /// unanswered while they find their phone. The wizard is already showing
+    /// "Fetching the workspace list… · 2m" by then, which is a lie about
+    /// Postman and, worse, feeds the download's ETA a rate that includes the
+    /// approval. Both clocks are pushed forward to when the key arrived; a
+    /// literal key never sets the stamp, so nothing moves.
+    fn absorb_approval_wait(&mut self) {
+        let Some(at) = self.key_ready.lock().ok().and_then(|mut g| g.take()) else {
+            return;
+        };
+        if self.busy_since.is_some_and(|started| started < at) {
+            self.busy_since = Some(at);
+        }
+        if self.progress.started.is_some_and(|started| started < at) {
+            self.progress.started = Some(at);
         }
     }
 
@@ -1355,17 +1486,24 @@ impl PostmanFlow {
                     self.progress.waiting = Some((reason, secs));
                 }
                 ImportMsg::Budget {
+                    bucket,
                     remaining,
                     reset_secs,
                     remaining_month,
                     interval_secs,
                 } => {
-                    self.budget = Some(Budget {
+                    let entry = Budget {
+                        bucket,
                         remaining,
                         reset_secs,
                         remaining_month,
                         interval_secs,
-                    });
+                        seen: Instant::now(),
+                    };
+                    match self.budgets.iter_mut().find(|b| b.bucket == bucket) {
+                        Some(slot) => *slot = entry,
+                        None => self.budgets.push(entry),
+                    }
                 }
                 ImportMsg::ItemFailed { name, error } => {
                     self.failures.push((name, error));
@@ -1406,10 +1544,10 @@ impl PostmanFlow {
                 self.clear_busy();
                 // The plan carries the workspace's real name, which is all the
                 // wizard had an id for when the user typed one in.
-                if let Some(chosen) = self.chosen.as_mut()
-                    && !plan.workspace_name.trim().is_empty()
+                if let [chosen] = self.chosen.as_mut_slice()
+                    && !plan.workspace_name().trim().is_empty()
                 {
-                    chosen.name = plan.workspace_name.clone();
+                    chosen.name = plan.workspace_name().to_string();
                 }
                 self.plan = Some(*plan);
                 None
@@ -1446,7 +1584,7 @@ impl PostmanFlow {
     }
 
     pub(crate) fn seed_chosen(&mut self, workspace: WorkspaceSummary) {
-        self.chosen = Some(workspace);
+        self.chosen = vec![workspace];
     }
 
     pub(crate) fn seed_plan(&mut self, plan: ImportPlan) {
@@ -1492,14 +1630,41 @@ pub(crate) fn default_dest_name(workspace: &str) -> String {
 }
 
 /// A short "3 collections, 2 environments" line for the confirmation step.
+/// An import of several workspaces says how many it covers first: the item
+/// counts alone would give no hint that the number came from forty listings.
 pub(crate) fn plan_summary(plan: &ImportPlan, s: &Strings) -> String {
-    format!(
+    let items = format!(
         "{} {} · {} {}",
         plan.collections.len(),
         s.postman_word_collections,
         plan.environments.len(),
         s.postman_word_environments
-    )
+    );
+    if plan.is_multi() {
+        format!(
+            "{} {} · {items}",
+            plan.workspaces.len(),
+            s.postman_word_workspaces
+        )
+    } else {
+        items
+    }
+}
+
+/// "2 workspaces could not be listed and were skipped", when planning an
+/// import of many hit workspaces this key can no longer see. `None` when
+/// nothing was skipped, which is the usual case.
+pub(crate) fn plan_skipped_line(plan: &ImportPlan, s: &Strings) -> Option<String> {
+    let n = plan.skipped.len();
+    if n == 0 {
+        return None;
+    }
+    let word = if n == 1 {
+        s.postman_word_workspace
+    } else {
+        s.postman_word_workspaces
+    };
+    Some(format!("{n} {word} {}", s.postman_ws_skipped))
 }
 
 /// "3 collections · 1 environment" — what an import actually landed, each count
@@ -1529,12 +1694,30 @@ pub(crate) fn imported_counts(collections: usize, environments: usize, s: &Strin
 /// What Postman's rate headers last reported, kept so the front-ends can show
 /// the user how much of their allowance is left rather than only how long the
 /// import thinks it has to run.
+///
+/// One of these per [`RateBucket`]: Postman meters listing calls and fetch
+/// calls separately, so the two are simply different accounts and cannot be
+/// collapsed into a single "calls left".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Budget {
+    bucket: RateBucket,
     remaining: Option<u64>,
     reset_secs: Option<u64>,
     remaining_month: Option<u64>,
     interval_secs: u64,
+    /// When this reading arrived, so it can be retired once the window it
+    /// describes has turned over — a figure from a bucket nothing has drawn on
+    /// for a minute is not news about the import happening now.
+    seen: Instant,
+}
+
+impl Budget {
+    /// How long a reading stays worth showing: until the window it reported
+    /// resets. Without a reset the per-minute window is the safe assumption.
+    fn is_stale(&self, now: Instant) -> bool {
+        let window = Duration::from_secs(self.reset_secs.filter(|s| *s > 0).unwrap_or(60));
+        now.saturating_duration_since(self.seen) > window
+    }
 }
 
 pub(crate) fn human_duration(d: Duration, s: &Strings) -> String {
@@ -1560,6 +1743,7 @@ mod tests {
     use super::*;
     use crate::i18n::Language;
     use crate::postman_api::ItemSummary;
+    use crate::postman_import::WorkspacePlan;
 
     fn s() -> Strings {
         Strings::for_language(&Language::English)
@@ -1631,8 +1815,9 @@ mod tests {
     #[test]
     fn a_typed_key_is_used_as_it_stands() {
         let cache = Mutex::new(None);
+        let ready = Mutex::new(None);
         assert_eq!(
-            resolve_key("  PMAK-abcdef  ", &cache),
+            resolve_key("  PMAK-abcdef  ", &cache, &ready),
             Some("PMAK-abcdef".to_string())
         );
         assert!(
@@ -1648,9 +1833,10 @@ mod tests {
     fn a_resolved_key_is_remembered_for_the_rest_of_the_import() {
         let raw = "{{ op://Private/Postman/credential }}";
         let cache = Mutex::new(Some((raw.to_string(), "PMAK-from-1password".to_string())));
+        let ready = Mutex::new(None);
         // Nothing here can reach `op`; an answer proves it came from the cache.
         assert_eq!(
-            resolve_key(raw, &cache),
+            resolve_key(raw, &cache, &ready),
             Some("PMAK-from-1password".to_string())
         );
     }
@@ -1664,8 +1850,9 @@ mod tests {
             "{{ op://Private/Postman/credential }}".to_string(),
             "PMAK-old".to_string(),
         )));
+        let ready = Mutex::new(None);
         assert_eq!(
-            resolve_key("PMAK-typed-instead", &cache),
+            resolve_key("PMAK-typed-instead", &cache, &ready),
             Some("PMAK-typed-instead".to_string())
         );
     }
@@ -1679,25 +1866,28 @@ mod tests {
     }
 
     fn plan_with(collections: usize, environments: usize) -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "Billing".into(),
-            collections: (0..collections)
-                .map(|i| ItemSummary {
-                    uid: format!("u{i}"),
-                    id: format!("i{i}"),
-                    name: format!("c{i}"),
-                })
-                .collect(),
-            environments: (0..environments)
-                .map(|i| ItemSummary {
-                    uid: format!("e{i}"),
-                    id: format!("e{i}"),
-                    name: format!("e{i}"),
-                })
-                .collect(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "Billing".into(),
+                collections: (0..collections)
+                    .map(|i| ItemSummary {
+                        uid: format!("u{i}"),
+                        id: format!("i{i}"),
+                        name: format!("c{i}"),
+                    })
+                    .collect(),
+                environments: (0..environments)
+                    .map(|i| ItemSummary {
+                        uid: format!("e{i}"),
+                        id: format!("e{i}"),
+                        name: format!("e{i}"),
+                    })
+                    .collect(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     /// The key is the one thing the import cannot proceed without, and saying
@@ -1721,8 +1911,7 @@ mod tests {
         assert_eq!(*f.step(), Step::Options);
         assert!(!f.is_busy(), "nothing was fetched");
         assert_eq!(
-            f.chosen.as_ref().unwrap().id,
-            "11111111-2222-3333-4444-555555555555",
+            f.chosen[0].id, "11111111-2222-3333-4444-555555555555",
             "the id was taken out of the pasted address"
         );
     }
@@ -1762,12 +1951,48 @@ mod tests {
         assert_eq!(*f.step(), Step::Options);
     }
 
+    /// The migration case: everything the list is showing, in one go. The
+    /// filter is honoured, because a list that says twelve and imports forty
+    /// would be spending someone's API budget on their behalf.
+    #[test]
+    fn importing_everything_takes_every_visible_workspace() {
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a"), ws("Billing", "b"), ws("Beta", "c")];
+        assert!(f.submit_all_workspaces());
+        assert_eq!(*f.step(), Step::Options);
+        assert_eq!(f.target_count(), 3);
+        assert_eq!(
+            f.workspace_name(),
+            "",
+            "an import of several belongs to no one workspace"
+        );
+        assert_eq!(
+            f.target_label(&s()),
+            format!("{} (3)", s().postman_all_workspaces)
+        );
+
+        let mut f = flow();
+        f.workspaces = vec![ws("Alpha", "a"), ws("Billing", "b"), ws("Beta", "c")];
+        f.filter = "b".to_string();
+        assert!(f.submit_all_workspaces());
+        assert_eq!(f.target_count(), 2, "only what the filter is showing");
+    }
+
+    /// Nothing listed means nothing to import: advancing to the options with
+    /// no workspaces would only fail a step later.
+    #[test]
+    fn importing_everything_with_an_empty_list_does_nothing() {
+        let mut f = flow();
+        assert!(!f.submit_all_workspaces());
+        assert_eq!(*f.step(), Step::Connect);
+    }
+
     /// Downloading neither collections nor environments would produce an empty
     /// folder after spending API calls to find that out.
     #[test]
     fn importing_nothing_at_all_is_refused() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.include_collections = false;
         f.include_environments = false;
         assert!(!f.submit_options(&s()));
@@ -1779,7 +2004,7 @@ mod tests {
     #[test]
     fn a_missing_destination_is_refused() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.dest = "   ".to_string();
         assert!(!f.submit_options(&s()));
         assert_eq!(f.error(), Some(s().postman_err_dest_required));
@@ -1790,7 +2015,7 @@ mod tests {
     #[test]
     fn the_plan_is_shown_before_anything_is_downloaded() {
         let mut f = flow();
-        f.chosen = Some(ws("Billing", "b"));
+        f.chosen = vec![ws("Billing", "b")];
         f.step = Step::Confirm;
         f.busy = Some(Phase::Planning);
         f.apply(Msg::Planned(Box::new(plan_with(3, 2))), &s());
@@ -1809,11 +2034,11 @@ mod tests {
     #[test]
     fn the_workspaces_real_name_replaces_a_typed_id() {
         let mut f = flow();
-        f.chosen = Some(WorkspaceSummary {
+        f.chosen = vec![WorkspaceSummary {
             id: "11111111-2222-3333-4444-555555555555".into(),
             name: "11111111-2222-3333-4444-555555555555".into(),
             kind: WorkspaceKind::Other(String::new()),
-        });
+        }];
         f.apply(Msg::Planned(Box::new(plan_with(1, 0))), &s());
         assert_eq!(f.workspace_name(), "Billing");
     }
@@ -1909,6 +2134,44 @@ mod tests {
         );
     }
 
+    /// A key kept in 1Password is fetched by asking 1Password, which puts an
+    /// approval prompt on the screen — and the user may be away from their desk
+    /// when it appears. That wait is theirs, not Postman's: counting it made
+    /// the wizard claim minutes spent listing a workspace it had not yet been
+    /// allowed to ask about, and fed the same minutes into the download's ETA.
+    #[test]
+    fn a_long_provider_approval_does_not_count_against_the_import() {
+        let s = s();
+        let mut f = flow();
+        f.set_busy(Phase::ListingWorkspaces);
+        let long_ago = Instant::now() - Duration::from_secs(120);
+        f.busy_since = Some(long_ago);
+        f.progress.started = Some(long_ago);
+        assert!(
+            f.busy_line(&s).unwrap().len() > Phase::ListingWorkspaces.label(&s).len(),
+            "two minutes in, the counter is on the line"
+        );
+
+        // What the worker stamps the moment `op` finally answers.
+        *f.key_ready.lock().unwrap() = Some(Instant::now());
+        f.absorb_approval_wait();
+        assert_eq!(
+            f.busy_line(&s).as_deref(),
+            Some(Phase::ListingWorkspaces.label(&s)),
+            "the elapsed counter starts again from the approval"
+        );
+        assert!(
+            f.progress.started.unwrap().elapsed() < Duration::from_secs(3),
+            "and so does the clock the ETA is extrapolated from"
+        );
+
+        // Consumed, so later ticks don't keep pushing the start forward and
+        // freeze the counter at zero.
+        let restarted = f.busy_since;
+        f.absorb_approval_wait();
+        assert_eq!(f.busy_since, restarted);
+    }
+
     /// "How much have we got left?" is the first question a slow import raises,
     /// and every response already answers it — the numbers were being folded
     /// into the pacer and then thrown away.
@@ -1921,6 +2184,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         f.progress_rx = Some(rx);
         tx.send(ImportMsg::Budget {
+            bucket: RateBucket::Strict,
             remaining: Some(8),
             reset_secs: Some(45),
             remaining_month: Some(812),
@@ -1934,6 +2198,70 @@ mod tests {
         assert!(
             line.contains(s.postman_budget_pace),
             "the spacing explains the wait: {line}"
+        );
+    }
+
+    /// Postman meters listing calls and fetch calls as separate accounts, and
+    /// an import draws on both within the same second. Showing whichever
+    /// answered last made "calls left" flip between the two — 9 one frame, 283
+    /// the next — reading as though the allowance itself were unstable.
+    #[test]
+    fn the_two_rate_limits_do_not_take_turns_in_the_same_line() {
+        let s = s();
+        let mut f = flow();
+        let (tx, rx) = mpsc::channel();
+        f.progress_rx = Some(rx);
+
+        // The strict bucket is what an import waits on: one call a second,
+        // against a general bucket wide enough not to space calls at all.
+        let strict = ImportMsg::Budget {
+            bucket: RateBucket::Strict,
+            remaining: Some(9),
+            reset_secs: Some(10),
+            remaining_month: Some(99_261),
+            interval_secs: 1,
+        };
+        let general = ImportMsg::Budget {
+            bucket: RateBucket::General,
+            remaining: Some(283),
+            reset_secs: Some(16),
+            remaining_month: Some(99_258),
+            interval_secs: 0,
+        };
+        tx.send(strict.clone()).unwrap();
+        f.drain_progress();
+        let first = f.budget_line(&s).expect("a budget was reported");
+
+        tx.send(general.clone()).unwrap();
+        f.drain_progress();
+        let second = f.budget_line(&s).expect("still reporting");
+        assert_eq!(
+            first.contains('9'),
+            second.contains('9'),
+            "the binding limit is the one that gets reported: {first} / {second}"
+        );
+        assert!(
+            !second.contains("283"),
+            "the roomier bucket is not what is holding the import up: {second}"
+        );
+        // The month, though, belongs to the account rather than to either
+        // bucket, so it follows whichever call reported most recently.
+        assert!(
+            second.contains("99258"),
+            "the monthly count is the freshest one: {second}"
+        );
+
+        // Once the strict window has turned over with nothing drawing on it,
+        // its reading is history and the general bucket speaks for the import.
+        for b in &mut f.budgets {
+            if b.bucket == RateBucket::Strict {
+                b.seen = Instant::now() - Duration::from_secs(30);
+            }
+        }
+        let later = f.budget_line(&s).expect("the general bucket still has one");
+        assert!(
+            later.contains("283"),
+            "a bucket the import has finished with stops speaking for it: {later}"
         );
     }
 
@@ -1982,7 +2310,7 @@ mod tests {
     fn going_back_to_the_key_discards_the_listing() {
         let mut f = flow();
         f.workspaces = vec![ws("Alpha", "a")];
-        f.chosen = Some(ws("Alpha", "a"));
+        f.chosen = vec![ws("Alpha", "a")];
         f.plan = Some(plan_with(1, 1));
         f.back_to_connect();
         assert_eq!(*f.step(), Step::Connect);
@@ -2043,7 +2371,7 @@ mod tests {
     #[test]
     fn a_failed_download_goes_back_to_the_options() {
         let mut f = PostmanFlow::new();
-        f.chosen = Some(ws("Alpha", "a"));
+        f.chosen = vec![ws("Alpha", "a")];
         f.plan = Some(plan_with(1, 1));
         f.step = Step::Downloading;
         f.fail("connection reset".to_string());
@@ -2124,13 +2452,16 @@ mod tests {
     }
 
     fn plan_of(collections: Vec<ItemSummary>) -> ImportPlan {
-        ImportPlan {
-            workspace_id: "ws".into(),
-            workspace_name: "Workspace".into(),
-            collections,
-            environments: Vec::new(),
-            remaining_month: None,
-        }
+        ImportPlan::new(
+            vec![WorkspacePlan {
+                workspace_id: "ws".into(),
+                workspace_name: "Workspace".into(),
+                collections,
+                environments: Vec::new(),
+            }],
+            Vec::new(),
+            None,
+        )
     }
 
     /// The whole point of reading a collection before importing it is seeing
@@ -2408,7 +2739,8 @@ mod end_to_end {
         let plan = flow.plan().expect("a plan").clone();
         assert_eq!(plan.item_count(), 2, "one collection and one environment");
         assert_eq!(
-            plan.workspace_name, "Alpha",
+            plan.workspace_name(),
+            "Alpha",
             "the plan carries the workspace's real name"
         );
 

@@ -52,7 +52,8 @@ pub struct EditorTheme {
     pub text: Color,
     /// Background colour of a focused single-line field ([`render_line_field`]).
     pub panel: Color,
-    /// Foreground colour of an unfocused single-line field ([`render_line_field`]).
+    /// Foreground colour of a single-line field's placeholder text
+    /// ([`render_line_field_placeholder`]) — never of a value the user typed.
     pub dim: Color,
     /// Foreground colour of selected text ([`render_editor`]).
     pub select_fg: Color,
@@ -940,6 +941,10 @@ fn slice_spans(spans: &[Span], start: usize, end: usize) -> Vec<Span<'static>> {
 
 /// Render a single-line editor's text into `area`, masking every character with
 /// `•` when `mask` is set. Places the terminal cursor when `focused`.
+///
+/// Focus is shown by the highlight background alone; the text keeps its normal
+/// colour either way, so a filled field never fades into looking like the
+/// placeholder of an empty one.
 pub fn render_line_field(
     f: &mut Frame,
     area: Rect,
@@ -970,10 +975,15 @@ pub fn render_line_field(
     } else {
         clip_to_width(&shown, col_off, w)
     };
+    // Focus is said with the highlight background, not by dimming the text an
+    // answer was typed into: [`render_line_field_placeholder`] draws its
+    // example in `dim`, so a dim *value* read as "nothing has been entered
+    // here yet" the moment the field lost focus. `dim` is the colour of
+    // something the user did not write.
     let cell_style = if focused {
         Style::default().fg(style.text).bg(style.panel)
     } else {
-        Style::default().fg(style.dim)
+        Style::default().fg(style.text)
     };
     f.render_widget(Paragraph::new(vis).style(cell_style), area);
     if focused {

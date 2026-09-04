@@ -242,6 +242,13 @@ pub struct Session {
     /// default, so Run All streams results as they finish (matching the CLI
     /// default), at the cost of not carrying automatic cookies between requests.
     pub run_all_batch_mode: bool,
+    /// Skip the "discard these edits?" prompt the request wizard shows when
+    /// Esc is pressed on a form holding changes, throwing them away on the one
+    /// keypress. Off by default: the wizard has no autosave, so Esc is the
+    /// moment a body, its asserts and its captures all vanish. It exists
+    /// because that prompt is a second keypress in a loop some users run
+    /// dozens of times an hour, and they were used to Esc simply closing.
+    pub discard_request_edits_on_esc: bool,
     /// Width (columns) of the terminal UI's left column.
     pub list_width: u16,
     pub response_pct: u16,
@@ -319,6 +326,7 @@ impl Default for Session {
             always_save_when_prompted: false,
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
+            discard_request_edits_on_esc: false,
             list_width: 38,
             response_pct: 42,
             env_source: EnvSource::Both,
@@ -1084,6 +1092,7 @@ impl Session {
             report_params: self.report_params.clone(),
             default_request_view: self.default_request_view,
             run_all_batch_mode: self.run_all_batch_mode,
+            discard_request_edits_on_esc: self.discard_request_edits_on_esc,
             custom_themes: self.custom_themes.clone(),
             active_theme: self.active_theme.clone(),
             global_envs: self
@@ -1191,6 +1200,7 @@ impl Session {
         self.report_params = state.report_params;
         self.default_request_view = state.default_request_view;
         self.run_all_batch_mode = state.run_all_batch_mode;
+        self.discard_request_edits_on_esc = state.discard_request_edits_on_esc;
         self.custom_themes = state.custom_themes;
         self.active_theme = state.active_theme;
     }

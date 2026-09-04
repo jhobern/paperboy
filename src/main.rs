@@ -60,7 +60,8 @@ Runs in one of four modes:\n\
 \x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
 \x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
-\x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\n\
+\x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\
+\x20 paperboy --postman-import --postman-all -o ./API           Download every workspace the key can see\n\n\
 Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 {{ ... }} provider reference resolved when the environment is loaded:\n\
 \x20 Literal value       USERNAME=demo\n\
@@ -135,6 +136,13 @@ struct Cli {
     #[arg(long, value_name = "ID|URL")]
     postman_workspace: Option<String>,
 
+    /// With `--postman-import`: download every workspace the key can see
+    /// rather than one, each into its own folder inside `-o`. This is the
+    /// migration case; it costs two API calls per workspace to list them, so
+    /// it has to be asked for.
+    #[arg(long, conflicts_with = "postman_workspace")]
+    postman_all: bool,
+
     /// With `--postman-import`: the Postman API key. Defaults to
     /// `$POSTMAN_API_KEY`. Accepts the same `{{ … }}` provider references as a
     /// `.vars` file (e.g. `{{ op://Private/Postman/credential }}`), so the key
@@ -177,6 +185,7 @@ fn main() {
         std::process::exit(postman_cli::run(postman_cli::Args {
             key: cli.postman_key,
             workspace: cli.postman_workspace,
+            all: cli.postman_all,
             out: cli.output,
             what: cli.postman_what,
             base_url: cli.postman_base_url,

@@ -12,11 +12,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::i18n::Strings;
 use crate::postman_flow::{
-    KeySource, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label, plan_summary,
+    KeySource, PostmanFlow, Step, default_dest_name, human_duration, item_kind_label,
+    plan_skipped_line, plan_summary,
 };
 use crate::postman_import::ImportFormat;
 
@@ -85,8 +86,13 @@ pub(crate) struct PostmanWizard {
     /// to SSM doesn't offer 1Password paths.
     pub(crate) recent: Vec<String>,
     /// `Some` while the recent-keys dropdown has keyboard focus, indexing into
-    /// [`PostmanWizard::recent_entries`].
+    /// [`PostmanWizard::recent_matches`].
     pub(crate) recent_sel: Option<usize>,
+    /// Set by Esc, which dismisses the dropdown without leaving the field.
+    /// Cleared by anything that changes what the list would show -- typing,
+    /// switching source, or coming back to the field -- so the suggestions are
+    /// never gone for good, exactly as the request wizard's dropdown behaves.
+    pub(crate) recent_hidden: bool,
     /// What a finished import landed, kept so the receipt can say it rather
     /// than only naming the folder it wrote.
     pub(crate) done: Option<crate::postman_import::ImportSummary>,
@@ -114,6 +120,7 @@ impl PostmanWizard {
             preview_scroll: 0,
             recent,
             recent_sel: None,
+            recent_hidden: false,
             done: None,
         }
     }
@@ -128,6 +135,29 @@ impl PostmanWizard {
                 (src == self.key_source && !entry.is_empty()).then_some(entry)
             })
             .collect()
+    }
+
+    /// The remembered entries the dropdown is actually offering: those for
+    /// this source, narrowed to what the field already holds. Typing therefore
+    /// filters the list rather than leaving a dozen paths on screen that no
+    /// longer match, and a field holding one of them exactly has nothing left
+    /// to suggest.
+    pub(crate) fn recent_matches(&self) -> Vec<String> {
+        let typed = self.key.text();
+        let typed = typed.trim().to_lowercase();
+        self.recent_entries()
+            .into_iter()
+            .filter(|e| {
+                let e = e.to_lowercase();
+                e != typed && (typed.is_empty() || e.contains(&typed))
+            })
+            .collect()
+    }
+
+    /// Whether the dropdown is on screen: the key field has focus, it has not
+    /// been dismissed, and there is something to offer.
+    pub(crate) fn recent_open(&self) -> bool {
+        self.field == 1 && !self.recent_hidden && !self.recent_matches().is_empty()
     }
 
     pub(crate) fn stage(&self) -> PostmanStage {
@@ -309,11 +339,12 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             .chain(KeySource::ALL.iter().map(|src| src.field_label(s))),
     );
 
-    // The references this key has been read from before, offered under the key
-    // field: finding the 1Password item path is the tedious half of setting an
-    // import up, and it is the same path every time.
-    let recent = w.recent_entries();
-    let recent_rows = recent.len().min(5) as u16;
+    // The references this key has been read from before, offered *under* the
+    // key field as a dropdown rather than as a permanent list: finding the
+    // 1Password item path is the tedious half of setting an import up, and it
+    // is the same path every time -- but it is a suggestion about one field,
+    // not a fifth row of the form.
+    let recent = w.recent_matches();
 
     // A line under the key field saying what picking this source commits the
     // user to. The picker names four sources but says nothing about what each
@@ -322,13 +353,13 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let help = w.key_source.field_help(s);
     let width = 66.min(f.area().width);
     let help_rows = wrapped_height(help, width.saturating_sub(2));
-    let area = centered_rect(
-        width,
-        fields.len() as u16 + recent_rows + help_rows + 2,
-        f.area(),
-    );
+    let area = centered_rect(width, fields.len() as u16 + help_rows + 2, f.area());
     f.render_widget(Clear, area);
-    let hint = if recent_rows > 0 {
+    let hint = if w.recent_sel.is_some() {
+        // While the list has focus the connect hint is describing keys that
+        // now do something else: Enter fills the field rather than connecting.
+        s.postman_recent_pick_hint.to_string()
+    } else if !recent.is_empty() {
         format!(
             "{}  \u{b7}  {}",
             s.postman_connect_hint, s.postman_recent_hint
@@ -341,15 +372,14 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     f.render_widget(block, area);
 
     let all_rows = Layout::vertical([
-        Constraint::Length(1),           // key source
-        Constraint::Length(1),           // key
-        Constraint::Length(help_rows),   // what that source means
-        Constraint::Length(recent_rows), // remembered references
-        Constraint::Length(1),           // workspace
-        Constraint::Length(1),           // host
+        Constraint::Length(1),         // key source
+        Constraint::Length(1),         // key
+        Constraint::Length(help_rows), // what that source means
+        Constraint::Length(1),         // workspace
+        Constraint::Length(1),         // host
     ])
     .split(inner);
-    let rows = [all_rows[0], all_rows[1], all_rows[4], all_rows[5]];
+    let rows = [all_rows[0], all_rows[1], all_rows[3], all_rows[4]];
     for (row, (label, placeholder, idx)) in rows.iter().zip(fields.iter()) {
         let cols =
             Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(*row);
@@ -390,28 +420,95 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         all_rows[2],
     );
 
-    if recent_rows > 0 {
-        let items: Vec<ListItem> = recent
-            .iter()
-            .take(5)
-            .enumerate()
-            .map(|(i, entry)| {
-                let style = if w.recent_sel == Some(i) {
-                    Style::default()
-                        .bg(th.accent)
-                        .fg(th.bg)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(th.dim)
-                };
-                ListItem::new(Line::styled(
-                    format!("{:pad$}{entry}", "", pad = label_w as usize),
-                    style,
-                ))
-            })
-            .collect();
-        f.render_widget(List::new(items), all_rows[3]);
+    if w.recent_open() {
+        // Anchored under the key field, like the request wizard's header-name
+        // dropdown: these are suggestions about one field, and a list living
+        // permanently in the form read as another row of it -- or, drawn dim,
+        // as more ghost text. Last, so it sits over the rows beneath it.
+        let value_col = Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)])
+            .split(all_rows[1])[1];
+        draw_recent_dropdown(f, w, s, th, value_col, &recent);
     }
+}
+
+/// The saved key references, as a dropdown hanging off the key field.
+///
+/// Deliberately the same object as [`super::new_request::wizard::draw_key_suggestions`]:
+/// a bordered popup saying what Enter does, a `\u{203a}` on the highlighted row,
+/// and a background of its own -- `Clear` alone would let the terminal's
+/// colours through.
+fn draw_recent_dropdown(
+    f: &mut Frame,
+    w: &PostmanWizard,
+    s: &Strings,
+    th: &Theme,
+    anchor: Rect,
+    entries: &[String],
+) {
+    const VISIBLE: usize = 6;
+    let fr = f.area();
+    let content_w = entries.iter().map(|e| e.chars().count()).max().unwrap_or(0) as u16;
+    let width = (content_w + 6).max(anchor.width).max(16).min(fr.width);
+    let rows = entries.len().min(VISIBLE) as u16;
+    let height = (rows + 2).min(fr.height);
+
+    let mut x = anchor.x;
+    if x + width > fr.right() {
+        x = fr.right().saturating_sub(width);
+    }
+    // Below the field where possible, flipped above when there is no room.
+    let y = if anchor.y + 1 + height <= fr.bottom() {
+        anchor.y + 1
+    } else {
+        anchor.y.saturating_sub(height)
+    };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // Enough of a scroll to keep the highlight on screen. Stateless: there is
+    // nowhere else to go in a list of at most ten.
+    let offset = w
+        .recent_sel
+        .map_or(0, |i| i.saturating_sub(VISIBLE - 1))
+        .min(entries.len().saturating_sub(VISIBLE));
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(VISIBLE)
+        .map(|(i, entry)| {
+            let selected = w.recent_sel == Some(i);
+            let style = if selected {
+                Style::default()
+                    .bg(th.accent)
+                    .fg(th.bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.text)
+            };
+            let marker = if selected { "\u{203a} " } else { "  " };
+            ListItem::new(Line::styled(format!("{marker}{entry}"), style))
+        })
+        .collect();
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().bg(th.panel).fg(th.text))
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    format!(" {} ", s.suggest_hint),
+                    Style::default().fg(th.dim),
+                )),
+        ),
+        popup,
+    );
 }
 
 fn draw_loading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {
@@ -459,7 +556,14 @@ fn draw_pick_workspace(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme
         f.area(),
     );
     f.render_widget(Clear, area);
-    let block = panel_hinted(s.postman_pick_workspace.to_string(), s.git_filter_hint, th);
+    // A Postman-specific hint rather than the shared filter one: importing
+    // everything is the reason someone opened this wizard during a migration,
+    // and a key nobody is told about may as well not exist.
+    let block = panel_hinted(
+        s.postman_pick_workspace.to_string(),
+        s.postman_pick_workspace_hint,
+        th,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
@@ -495,13 +599,25 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         r if r == OPTION_ROWS - 1 => s.postman_options_hint_import,
         _ => s.postman_options_hint_toggle,
     };
-    let note = (w.flow.format == ImportFormat::Hurl).then_some(s.postman_format_hurl_note);
+    // Whatever this particular set of options needs said about it. Importing
+    // several workspaces changes the shape of what lands on disk, so it is
+    // spelled out here rather than discovered afterwards.
+    let mut notes: Vec<&str> = Vec::new();
+    if w.flow.target_count() > 1 {
+        notes.push(s.postman_import_all_note);
+    }
+    if w.flow.format == ImportFormat::Hurl {
+        notes.push(s.postman_format_hurl_note);
+    }
     let width = 78.min(f.area().width);
-    let note_h = note.map_or(0, |n| wrapped_height(n, width.saturating_sub(2)));
+    let note_h: u16 = notes
+        .iter()
+        .map(|n| wrapped_height(n, width.saturating_sub(2)))
+        .sum();
     let area = centered_rect(width, OPTION_ROWS as u16 + note_h + 3, f.area());
     f.render_widget(Clear, area);
     let block = panel_hinted(
-        format!("{title} \u{2014} {}", w.flow.workspace_name()),
+        format!("{title} \u{2014} {}", w.flow.target_label(s)),
         hint,
         th,
     );
@@ -538,13 +654,22 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     // The "press Enter" affordance is the point of the row, so it keeps its
     // width and the path gives way - elided from the LEFT, since the folder
     // name at the end is what distinguishes one destination from another.
+    // It is a hint about the row rather than part of the path, so it is drawn
+    // dim: at the path's own weight it reads as another path segment.
     let browse = format!("  {}", s.postman_browse);
     let room = (rows[1].width as usize).saturating_sub(browse.chars().count());
+    let hint_style = if w.option_row == 0 {
+        // On the selected row the highlight owns the background, so the hint
+        // steps back by dropping the path's bold rather than by changing hue.
+        Style::default().bg(th.accent).fg(th.bg)
+    } else {
+        Style::default().fg(th.dim)
+    };
     f.render_widget(
-        Paragraph::new(Line::styled(
-            format!("{}{browse}", elide_left(&dest, room)),
-            dest_style,
-        )),
+        Paragraph::new(Line::from(vec![
+            Span::styled(elide_left(&dest, room), dest_style),
+            Span::styled(browse, hint_style),
+        ])),
         rows[1],
     );
 
@@ -566,12 +691,12 @@ fn draw_options(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         .collect();
     f.render_widget(List::new(list_items), rows[2]);
 
-    if let Some(note) = note {
-        f.render_widget(
-            Paragraph::new(Line::styled(note, Style::default().fg(th.dim)))
-                .wrap(Wrap { trim: true }),
-            rows[3],
-        );
+    if !notes.is_empty() {
+        let lines: Vec<Line> = notes
+            .iter()
+            .map(|n| Line::styled(*n, Style::default().fg(th.dim)))
+            .collect();
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[3]);
     }
 }
 
@@ -592,6 +717,13 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     } else {
         0
     };
+    // Workspaces that could not be listed are said here, not only in the final
+    // summary: an import of forty that quietly became thirty-eight is exactly
+    // the kind of thing a migration must not find out about afterwards.
+    let skipped = plan_skipped_line(plan, s);
+    let skip_h = skipped
+        .as_deref()
+        .map_or(0, |t| wrapped_height(t, width.saturating_sub(2)));
     // Sized to its content — no trailing empty rows, which on a four-line
     // screen read as "something failed to draw".
     // The collections, so the workspace can be read into before any of it is
@@ -601,7 +733,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         0 => 0,
         n => (n as u16).min(8) + 2, // + the cost note and a blank line
     };
-    let area = centered_rect(width, note_h + warn_h + list_h + 5, f.area());
+    let area = centered_rect(width, note_h + warn_h + skip_h + list_h + 5, f.area());
     f.render_widget(Clear, area);
     // The hint is on the border like everywhere else, but in the accent rather
     // than dim: nothing on this screen is waiting for anything else, and a dim
@@ -626,6 +758,7 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         Constraint::Length(note_h), // rate limit note
         Constraint::Length(1),      // estimate
         Constraint::Length(warn_h), // budget warning
+        Constraint::Length(skip_h), // workspaces that could not be listed
         Constraint::Length(list_h), // collections to preview
     ])
     .split(inner);
@@ -673,8 +806,15 @@ fn draw_confirm(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             rows[4],
         );
     }
+    if let Some(text) = skipped {
+        f.render_widget(
+            Paragraph::new(Line::styled(text, Style::default().fg(th.err)))
+                .wrap(Wrap { trim: true }),
+            rows[5],
+        );
+    }
     if list_h > 0 {
-        draw_preview_list(f, w, s, th, rows[5]);
+        draw_preview_list(f, w, s, th, rows[6]);
     }
 }
 
