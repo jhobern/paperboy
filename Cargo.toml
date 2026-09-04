@@ -54,6 +54,10 @@ ratatui = "0.30.2"
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui-explorer = "0.3.0"
 uuid = { version = "1", features = ["v4"] }
+# Randomness for the `# [Gen]` block's nonces and keys. Already compiled as a
+# transitive dependency of `uuid`, so naming it directly costs no extra build;
+# pure Rust, so it doesn't disturb the no-C-toolchain story `build.rs` guards.
+getrandom = "0.3"
 regex = "1"
 # Local-time formatting for the report name `{time}` token. `Local` reads the
 # system timezone via libc (robust in our multithreaded runner, unlike the

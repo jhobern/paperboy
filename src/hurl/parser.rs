@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use super::entry::{
     BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
-    RunStatus, decode_body_line, parse_body_marker,
+    RunStatus, decode_body_line, parse_body_marker, parse_gen_marker, parse_gen_row,
 };
 use super::json_comments;
 
@@ -207,7 +207,10 @@ fn title_block_top(lines: &[&str], method: usize, floor: usize) -> usize {
         if !prev.starts_with('#') {
             break;
         }
-        if is_reports_marker(prev) || parse_body_marker(prev).is_some() {
+        if is_reports_marker(prev)
+            || parse_body_marker(prev).is_some()
+            || parse_gen_marker(prev).is_some()
+        {
             return method;
         }
         top -= 1;
@@ -509,6 +512,7 @@ fn map_entry(
         captures,
         asserts,
         reports: reports_from_span(lines, scan_start, scan_end),
+        generators: generators_from_span(lines, scan_start, scan_end),
         comments: scan_comments(
             lines,
             &landmarks,
@@ -705,6 +709,8 @@ fn scan_comments(
             m..j
         })
     };
+    // … the `# [Gen]` block, claimed by its declared row count …
+    let gen_block = gen_block_range(lines, method_line, scan_end);
     // … and the next entry's title block (the contiguous comment lines directly
     // above the next entry's method line, which `title_from_span` will claim as
     // that entry's title). Only when there *is* a next entry in the window.
@@ -761,6 +767,7 @@ fn scan_comments(
             || in_body(line_no)
             || is_disabled_row(line_no)
             || reports_block.contains(&line_no)
+            || gen_block.contains(&line_no)
             || body_block.as_ref().is_some_and(|r| r.contains(&line_no))
             || next_title.contains(&line_no)
         {
@@ -1247,6 +1254,58 @@ fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, S
         i += 1;
     }
     reports
+}
+
+/// Recover a request's `# [Gen] <n>` block from raw source, within the entry's
+/// 1-based line window `[start, end)`.
+///
+/// Unlike the `# [Reports]` scan above, the block is claimed by its declared row
+/// count rather than by scanning until a line stops looking like a row. A
+/// generator row (`# name = expr`) is close enough to an ordinary prose comment
+/// (`# note = see ticket 42`) that adjacency alone would sometimes swallow one;
+/// the count means the block either describes the lines below it exactly or is
+/// not a block at all. A block that fails to validate falls through to the prose
+/// scan and round-trips verbatim — the definitions stop being live, which is the
+/// safe way for a signing block to fail.
+fn generators_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, String)> {
+    let to = end.saturating_sub(1).min(lines.len());
+    for i in start.saturating_sub(1)..to {
+        let Some(n) = parse_gen_marker(lines[i]) else {
+            continue;
+        };
+        let Some(last) = i.checked_add(1).and_then(|f| f.checked_add(n)) else {
+            continue;
+        };
+        if last > to {
+            continue;
+        }
+        let rows: Option<Vec<(String, String)>> =
+            (i + 1..last).map(|j| parse_gen_row(lines[j])).collect();
+        if let Some(rows) = rows {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
+/// The lines a valid `# [Gen]` block occupies in `[start, end)` — the marker and
+/// its rows — so the prose-comment scan doesn't also capture them and duplicate
+/// the block on the next save.
+fn gen_block_range(lines: &[&str], start: usize, end: usize) -> Range<usize> {
+    let to = end.saturating_sub(1).min(lines.len());
+    for i in start.saturating_sub(1)..to {
+        let Some(n) = parse_gen_marker(lines[i]) else {
+            continue;
+        };
+        let Some(last) = i.checked_add(1).and_then(|f| f.checked_add(n)) else {
+            continue;
+        };
+        if last <= to && (i + 1..last).all(|j| parse_gen_row(lines[j]).is_some()) {
+            // Back to the 1-based line numbering the comment scan works in.
+            return i + 1..last + 1;
+        }
+    }
+    0..0
 }
 
 /// Find every `# [Body]` block candidate in an entry's source window, as
@@ -1793,6 +1852,125 @@ mod tests {
             parsed[1].reports.is_empty(),
             "second entry must not inherit the first's Reports block"
         );
+    }
+
+    // ── The `# [Gen]` block ────────────────────────────────────────────
+
+    /// The definitions survive a save/load, and the file they are written into
+    /// is still ordinary Hurl: every placeholder in the request itself is a
+    /// plain variable, so `hurl_core` parses the document unchanged and stock
+    /// `hurl` would run it given the values.
+    #[test]
+    fn a_gen_block_round_trips_and_leaves_the_file_valid_hurl() {
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://h/orders?n={{nonce}}",
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![
+            ("nonce".to_string(), "random_hex(32)".to_string()),
+            (
+                "sig".to_string(),
+                r#"hmac_sha256(SECRET, concat("GET\n/orders\n", nonce))"#.to_string(),
+            ),
+        ];
+
+        let text = e.to_hurl();
+        assert!(text.contains("# [Gen] 2\n"), "\n{text}");
+        assert!(text.contains("# nonce = random_hex(32)\n"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(parse_hurl(&text)[0].generators, e.generators);
+
+        // Saving what was loaded must produce the same bytes. Reader and writer
+        // drifting apart here is not hypothetical — see `encode_body_block`.
+        assert_eq!(parse_hurl(&text)[0].to_hurl(), text);
+    }
+
+    /// An expression may contain the characters that mark up the rest of the
+    /// file — `:` (a row separator), `#` (a comment) and quotes — because a
+    /// date format or a canonical signing string genuinely contains them.
+    #[test]
+    fn a_gen_expression_may_contain_colons_hashes_and_quotes() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![
+            ("stamp".to_string(), r#"date("%H:%M:%S")"#.to_string()),
+            ("frag".to_string(), r#"concat("a#b", ":", "c")"#.to_string()),
+        ];
+        let text = e.to_hurl();
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        let back = parse_hurl(&text);
+        assert_eq!(back[0].generators, e.generators);
+        // Crucially, not mistaken for disabled `key: value` request rows — the
+        // reason the rows are written with `=` (see `parse_gen_row`).
+        assert!(back[0].headers.is_empty(), "{:?}", back[0].headers);
+        assert!(back[0].comments.is_empty(), "{:?}", back[0].comments);
+    }
+
+    /// The block sits at the end of its request, so in a collection it lands
+    /// directly above the *next* request's line — exactly where the title walk
+    /// would otherwise absorb it, taking the first request's signature with it.
+    #[test]
+    fn a_gen_block_is_not_pulled_into_the_next_request() {
+        let mut a = HurlEntry::from_fields("First", "GET", "http://h/a", vec![], "");
+        a.generators = vec![("n".to_string(), "uuid".to_string())];
+        let b = HurlEntry::from_fields("Second", "GET", "http://h/b", vec![], "");
+
+        let doc = collection_to_hurl(&[a.clone(), b.clone()]);
+        let parsed = parse_hurl(&doc);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].generators, a.generators);
+        assert!(
+            parsed[1].generators.is_empty(),
+            "the second request must not inherit the first's block"
+        );
+        assert_eq!(parsed[1].title, "Second", "the title must survive intact");
+        assert!(
+            parsed[1].comments.is_empty(),
+            "nor should it arrive as prose: {:?}",
+            parsed[1].comments
+        );
+    }
+
+    /// A disabled request row is `# key: value` and a generator row is
+    /// `# name = expr`; neither may be read as the other, even when they are
+    /// adjacent.
+    #[test]
+    fn a_disabled_row_beside_a_gen_block_stays_a_disabled_row() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.headers = vec![KvRow::toggled("X-Trace", "on", false)];
+        e.generators = vec![("n".to_string(), "uuid".to_string())];
+
+        let text = e.to_hurl();
+        let back = parse_hurl(&text);
+        assert_eq!(back[0].generators, e.generators);
+        assert_eq!(back[0].headers, e.headers);
+        assert_eq!(back[0].to_hurl(), text);
+    }
+
+    /// A count that doesn't describe the lines below it is not a block. The
+    /// rows fall through to the prose scan and round-trip verbatim, so a
+    /// hand-edited or badly merged block degrades to comments rather than
+    /// half-loading — the safe direction for something a request is signed with.
+    #[test]
+    fn a_gen_block_whose_count_is_wrong_is_kept_as_prose_not_half_read() {
+        let text = concat!(
+            "# T\n",
+            "GET http://h/a\n",
+            "# [Gen] 3\n",
+            "# n = uuid\n",
+            "# s = timestamp\n",
+        );
+        let back = parse_hurl(&text);
+        assert!(
+            back[0].generators.is_empty(),
+            "a block claiming 3 rows over 2 must not be trusted"
+        );
+        let out = back[0].to_hurl();
+        for line in ["# [Gen] 3", "# n = uuid", "# s = timestamp"] {
+            assert!(out.contains(line), "{line} was dropped:\n{out}");
+        }
     }
 
     #[test]

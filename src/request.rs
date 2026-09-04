@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
+use crate::generators::GenError;
 use crate::http::ApiResponse;
 use crate::hurl::{
     EntryOutcome, FormField, HurlEntry, KvRow, RunOutput, RunStatus, collection_to_hurl,
@@ -74,6 +75,15 @@ pub enum SubstKind {
     /// Failed to resolve, or a capture not yet initialised from a response
     /// (kept as `{{ VAR }}`, red).
     Failed,
+    /// Produced by the request's `# [Gen]` block at send time.
+    ///
+    /// Kept as `{{ VAR }}` rather than substituted, because the value doesn't
+    /// exist yet and inventing one for the preview would mean a new random
+    /// number or timestamp on every frame — a flickering preview that also
+    /// wouldn't be what gets sent. Coloured as loaded, since it *will* have a
+    /// value; a row that can't evaluate is reported separately (see
+    /// [`generator_problems`]).
+    Computed,
     /// Referenced by the request but defined nowhere at all — no environment
     /// variable, no `[Captures]` name, no captured value (kept as `{{ VAR }}`,
     /// red).
@@ -143,6 +153,21 @@ pub fn subst_map(col: &Collection, env: Option<&Environment>) -> HashMap<String,
                 }
             };
             out.insert(v.key.clone(), info);
+        }
+    }
+
+    // Names the `# [Gen]` block will compute at send time. Inserted before the
+    // captures below so a capture of the same name — which is a real value the
+    // preview can show — still wins.
+    for e in &col.entries {
+        for (name, _) in &e.generators {
+            out.insert(
+                name.clone(),
+                SubstInfo {
+                    shown: None,
+                    kind: SubstKind::Computed,
+                },
+            );
         }
     }
 
@@ -620,6 +645,12 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),
+        // Generators have already been evaluated into the variable set by
+        // `effective_vars`, and their placeholders are ordinary `{{name}}`
+        // references that Hurl resolves from it. Carrying the definitions onto
+        // the run entry would re-emit the block as a comment in text nobody
+        // reads back, and risk them being evaluated twice.
+        generators: Vec::new(),
         // A transient copy that's only executed, never serialized — comments
         // don't affect the run.
         comments: Vec::new(),
@@ -651,16 +682,40 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
 /// later is left as written, exactly as [`substitute`] leaves any unresolved
 /// placeholder.
 ///
+/// The request's `# [Gen]` rows are then evaluated into the same map, *after*
+/// the defaults, so a generator can be written in terms of a declared parameter.
+/// This one seam serves both the preview and the wire: [`resolve_entry`] renders
+/// the preview from this map and [`run_hurl`](crate::hurl::run_hurl) builds
+/// Hurl's `VariableSet` from it, so a computed value cannot show one thing and
+/// send another.
+///
 /// Returns the caller's map untouched (borrowed) when the request declares no
-/// parameters — the overwhelmingly common case, and a send is hot enough that
-/// cloning every variable for nothing is worth avoiding.
+/// parameters and no generators — the overwhelmingly common case, and a send is
+/// hot enough that cloning every variable for nothing is worth avoiding.
 pub fn effective_vars<'a>(
     base: &HurlEntry,
     vars: &'a HashMap<String, String>,
 ) -> Cow<'a, HashMap<String, String>> {
+    effective_vars_reporting(base, vars).0
+}
+
+/// [`effective_vars`], also returning whatever went wrong in the `# [Gen]`
+/// block, so the caller can say so (see [`generator_problems`]).
+///
+/// A computed value needs no separate secret handling even when it is derived
+/// from one: it is only ever put into this map, which goes to `run_hurl` as
+/// variables and is dropped afterwards. It reaches no preview (a generator name
+/// renders as [`SubstKind::Computed`], keeping its braces rather than showing a
+/// value) and no `state.json`. That is the same transient path a resolved
+/// `op://` secret already takes, so an HMAC of a secret is no more exposed than
+/// the secret was.
+pub fn effective_vars_reporting<'a>(
+    base: &HurlEntry,
+    vars: &'a HashMap<String, String>,
+) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
     let defaults = base.variable_defaults();
-    if defaults.is_empty() {
-        return Cow::Borrowed(vars);
+    if defaults.is_empty() && base.generators.is_empty() {
+        return (Cow::Borrowed(vars), Vec::new());
     }
     let mut merged = vars.clone();
     for (name, value) in defaults {
@@ -670,7 +725,15 @@ pub fn effective_vars<'a>(
         let value = substitute(&value, &merged);
         merged.insert(name, value);
     }
-    Cow::Owned(merged)
+    // Evaluated last so a generator may read a declared parameter, and bound
+    // over anything of the same name: a row that computes `nonce` is a
+    // statement that *this* is where `nonce` comes from.
+    let errors = crate::generators::expand(
+        &base.generators,
+        &mut merged,
+        &crate::generators::SystemSource::new(),
+    );
+    (Cow::Owned(merged), errors)
 }
 
 /// Remove the `variable:` rows from a run entry's `[Options]`, having already
@@ -1231,6 +1294,9 @@ fn defined_keys(col: &Collection, env: Option<&Environment>) -> std::collections
     }
     for entry in &col.entries {
         defined.extend(entry.captures.iter().map(|(name, _)| name.clone()));
+        // A `# [Gen]` row defines its name just as surely as a capture does —
+        // it is computed rather than fetched, but `{{sig}}` is not a typo.
+        defined.extend(entry.generators.iter().map(|(name, _)| name.clone()));
     }
     defined.extend(col.captures.keys().cloned());
     defined
@@ -1323,6 +1389,49 @@ pub fn truncated_placeholders_all(col: &Collection) -> Vec<String> {
         }
     }
     out
+}
+
+/// Anything wrong with the selected request's `# [Gen]` block, described for a
+/// status message.
+///
+/// Reported rather than blocking, unlike [`truncated_placeholders`]. A row that
+/// fails binds nothing, so its `{{sig}}` goes on the wire literally and comes
+/// back a loud 401 — the [`undefined_request_keys`] situation, not the
+/// [`body_form_conflicts`] one. The reason is still worth saying at the moment
+/// it happens, because "401" is a poor way to learn you misspelled `hmac_sha256`.
+pub fn generator_problems(col: &Collection, env: Option<&Environment>) -> Vec<GenError> {
+    let Some(entry) = col.entries.get(col.selected_entry) else {
+        return Vec::new();
+    };
+    describe_generator_errors(entry, env, &col.captures)
+}
+
+/// [`generator_problems`] across every entry — used by "Run All".
+pub fn generator_problems_all(col: &Collection, env: Option<&Environment>) -> Vec<GenError> {
+    let mut out: Vec<GenError> = Vec::new();
+    for entry in &col.entries {
+        for d in describe_generator_errors(entry, env, &col.captures) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+fn describe_generator_errors(
+    entry: &crate::hurl::HurlEntry,
+    env: Option<&Environment>,
+    captures: &HashMap<String, String>,
+) -> Vec<GenError> {
+    if entry.generators.is_empty() {
+        return Vec::new();
+    }
+    let vars = collection_vars(env, captures);
+    // Every failure this reports is deterministic — a syntax error, an unknown
+    // function, a bad reference — so evaluating here and again at send time
+    // cannot disagree, even though the random and time values will differ.
+    effective_vars_reporting(entry, &vars).1
 }
 
 /// Render placeholder problems for a status message. A truncation says what it
@@ -1787,6 +1896,121 @@ mod tests {
     }
 
     // ── Captures ──────────────────────────────────────────────────────────
+
+    fn entry_with_generators(url: &str, rows: &[(&str, &str)]) -> HurlEntry {
+        let mut e = HurlEntry {
+            method: "GET".into(),
+            url: url.into(),
+            ..Default::default()
+        };
+        e.generators = rows
+            .iter()
+            .map(|(n, x)| (n.to_string(), x.to_string()))
+            .collect();
+        e
+    }
+
+    /// A name the `# [Gen]` block computes is defined by that block. Before
+    /// `defined_keys` knew about generators, a request that signed itself
+    /// correctly was still reported as referring to an undefined variable.
+    #[test]
+    fn a_generated_name_is_not_reported_as_undefined() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?n={{nonce}}",
+                &[("nonce", "uuid")],
+            )],
+        );
+        assert!(
+            undefined_request_keys(&col, None).is_empty(),
+            "the block defines nonce"
+        );
+        assert!(
+            generator_problems(&col, None).is_empty(),
+            "and the row evaluates"
+        );
+    }
+
+    /// A row that cannot evaluate is *reported*, not blocked: nothing binds
+    /// `sig`, so `{{sig}}` goes out literally and the server rejects it loudly.
+    /// The report exists to name the actual mistake instead of leaving the user
+    /// to infer it from a 401.
+    #[test]
+    fn a_generator_row_that_cannot_evaluate_is_reported() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?s={{sig}}",
+                &[("sig", "hmac_sha526(k, m)")],
+            )],
+        );
+        let problems = generator_problems(&col, None);
+        assert_eq!(problems.len(), 1, "one bad row, one report");
+        assert!(
+            matches!(
+                &problems[0],
+                crate::generators::GenError::UnknownFunction { name, function }
+                    if name == "sig" && function == "hmac_sha526"
+            ),
+            "the report names the row and the misspelling: {:?}",
+            problems[0]
+        );
+    }
+
+    /// Every failing row is reported, not just the first, so a block with two
+    /// mistakes takes one round of fixing rather than two.
+    #[test]
+    fn every_failing_generator_row_is_reported() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/",
+                &[("a", "nope()"), ("b", "uuid"), ("c", "{{")],
+            )],
+        );
+        let problems = generator_problems(&col, None);
+        let rows: Vec<&str> = problems.iter().map(|e| e.row()).collect();
+        assert_eq!(rows, vec!["a", "c"], "b is fine and says nothing");
+    }
+
+    /// `generator_problems` only looks at the selected request; `_all` looks at
+    /// every one, matching the two run commands they back.
+    #[test]
+    fn generator_problems_follow_the_selection() {
+        let mut col = Collection::new(
+            "c".into(),
+            vec![
+                entry_with_generators("https://x/", &[("a", "uuid")]),
+                entry_with_generators("https://y/", &[("b", "nope()")]),
+            ],
+        );
+        col.selected_entry = 0;
+        assert!(
+            generator_problems(&col, None).is_empty(),
+            "entry 0 is sound"
+        );
+        assert_eq!(
+            generator_problems_all(&col, None).len(),
+            1,
+            "Run All still sees entry 1's mistake"
+        );
+    }
+
+    /// A generated name keeps its braces in the preview rather than showing a
+    /// value: the value doesn't exist until the request is sent, and inventing
+    /// one per frame would flicker and still not be what goes on the wire.
+    #[test]
+    fn a_generated_name_previews_as_computed() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators("https://x/", &[("nonce", "uuid")])],
+        );
+        let map = subst_map(&col, None);
+        let info = map.get("nonce").expect("the generator name is known");
+        assert_eq!(info.kind, SubstKind::Computed);
+        assert!(info.shown.is_none(), "no value is invented for the preview");
+    }
 
     #[test]
     fn collection_vars_includes_captures_overriding_env() {

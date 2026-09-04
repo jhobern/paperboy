@@ -641,6 +641,23 @@ pub struct HurlEntry {
     /// `#[serde(default)]` keeps older saved requests loadable.
     #[serde(default)]
     pub reports: Vec<(String, String)>,
+    /// Generator definitions: `(name, expression)` pairs, each computing a value
+    /// for `{{name}}` just before the request is sent — a nonce, a timestamp, an
+    /// HMAC signature. Evaluated by [`crate::generators`].
+    ///
+    /// Stored inside valid Hurl as a `# [Gen] <n>` comment block (see
+    /// [`parse_gen_marker`] and [`parse_gen_row`]), which keeps the file
+    /// portable: every placeholder in the request itself is an ordinary Hurl
+    /// variable, so stock `hurl` parses the file identically and runs it given
+    /// `--variable name=…`. Putting the expression *in* the placeholder was the
+    /// obvious alternative and is not possible — Hurl reads a variable name only
+    /// as far as the first character outside its own set and silently drops the
+    /// rest, so `{{ hmac(k, m) }}` would be sent as the value of `hmac` (see
+    /// [`placeholder_problem`]).
+    ///
+    /// `#[serde(default)]` keeps older saved requests loadable.
+    #[serde(default)]
+    pub generators: Vec<(String, String)>,
     /// Prose comments recovered from a loaded `.hurl` file that aren't captured
     /// by any other field (banners, notes, comments between blocks). Each is
     /// anchored to the block it precedes (see [`CommentAnchor`]) so it
@@ -842,6 +859,45 @@ pub(crate) fn parse_body_marker(line: &str) -> Option<usize> {
 pub(crate) fn decode_body_line(line: &str) -> &str {
     let rest = line.trim_start().strip_prefix('#').unwrap_or("");
     rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// Recognise a `# [Gen] <n>` marker and return the row count it claims.
+///
+/// Counted for the same reason as [`parse_body_marker`], and more urgently: a
+/// generator row is what a request is *signed* with, so a block that has been
+/// hand-edited or badly merged must fail to validate rather than half-load. A
+/// block that doesn't validate falls through to the ordinary prose-comment
+/// scan and round-trips verbatim, so nothing is lost — the definitions simply
+/// stop being live, which is the safe direction to fail in.
+pub(crate) fn parse_gen_marker(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if !rest.get(..5)?.eq_ignore_ascii_case("[gen]") {
+        return None;
+    }
+    rest[5..].trim().parse::<usize>().ok()
+}
+
+/// Parse one `# name = expression` generator row into `(name, expression)`.
+///
+/// `=` rather than the `:` the `# [Reports]` block uses, and that is the whole
+/// point. A disabled request row is written `# key: value` and recovered by
+/// `split_kv`, which splits on the first `:` and requires the key to pass
+/// [`key_problem`]. Using `=` means a generator row can never be read as one:
+/// `sig = hmac_sha256(K, M)` has no colon at all, and `t = date("%H:%M")` — the
+/// awkward case, where the *expression* contains a colon — offers `t = date("%H`
+/// as the key, which contains spaces, `(` and `"` and so is refused. The two
+/// forms stay distinguishable even when a row is separated from its marker.
+///
+/// The name is held to [`is_variable_name`], since its whole purpose is to be
+/// referenced as `{{name}}`.
+pub(crate) fn parse_gen_row(line: &str) -> Option<(String, String)> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    let (name, expr) = rest.split_once('=')?;
+    let (name, expr) = (name.trim(), expr.trim());
+    if !is_variable_name(name) || expr.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), expr.to_string()))
 }
 
 /// Write an authored body as the `# [Body]` block that carries it through a
@@ -1382,6 +1438,18 @@ impl HurlEntry {
             out.push_str("# [Reports]\n");
             for (name, query) in &self.reports {
                 out.push_str(&format!("# {name}: {query}\n"));
+            }
+        }
+        // Generator definitions: the same comment-encoding, but length-delimited
+        // like `# [Body]` rather than closed by adjacency, and written with `=`
+        // so a row parted from its marker can't be read as a disabled request
+        // row (see `parse_gen_row`). Written last so the block sits where
+        // `title_block_top` already refuses to walk, which is what stops it
+        // being absorbed as the *next* request's title.
+        if !self.generators.is_empty() {
+            out.push_str(&format!("# [Gen] {}\n", self.generators.len()));
+            for (name, expr) in &self.generators {
+                out.push_str(&format!("# {name} = {expr}\n"));
             }
         }
         push_comments(&mut out, Trailing);

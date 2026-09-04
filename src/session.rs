@@ -895,12 +895,21 @@ impl Session {
             self.status = Some(Status::TruncatedPlaceholders(truncated));
             return Vec::new();
         }
+        // A `# [Gen]` failure is said in preference to the undefined-variable
+        // report it would otherwise produce: "there is no function called
+        // hmac_sha526" is the same finding as "nothing defines sig", but
+        // actionable.
+        let gen_errors = request::generator_problems(&self.collections[ci], env.as_ref());
         let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.begin_request();
         let selected = self.collections[ci].selected_entry;
         if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
@@ -939,12 +948,17 @@ impl Session {
             self.status = Some(Status::TruncatedPlaceholders(truncated));
             return Vec::new();
         }
+        let gen_errors = request::generator_problems_all(col, env.as_ref());
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;

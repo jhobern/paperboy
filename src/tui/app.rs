@@ -1839,12 +1839,21 @@ impl TuiApp {
             self.status = Some(Status::TruncatedPlaceholders(truncated));
             return;
         }
+        // A `# [Gen]` failure is said in preference to the undefined-variable
+        // report it would otherwise produce: "there is no function called
+        // hmac_sha526" is the same finding as "nothing defines sig", but
+        // actionable.
+        let gen_errors = request::generator_problems(&self.collections[col_idx], env.as_ref());
         let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1901,12 +1910,17 @@ impl TuiApp {
             self.status = Some(Status::TruncatedPlaceholders(truncated));
             return;
         }
+        let gen_errors = request::generator_problems_all(col, env.as_ref());
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.

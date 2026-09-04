@@ -423,6 +423,7 @@ strings! {
     subst_hint_loading => "loading", "en cours", "indlæser";
     subst_hint_missing => "missing", "manquant", "mangler";
     subst_hint_undefined => "undefined", "non défini", "udefineret";
+    subst_hint_computed => "computed at send", "calculé à l'envoi", "beregnes ved afsendelse";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
     env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
@@ -859,6 +860,15 @@ strings! {
     // has to grasp is that the text is not what goes on the wire.
     truncated_placeholder_status => "✖ Not sent — Hurl reads only part of these variable names:", "✖ Non envoyé — Hurl ne lit qu'une partie de ces noms de variables :", "✖ Ikke sendt — Hurl læser kun en del af disse variabelnavne:";
     truncated_placeholder_hint => "Hurl variable names allow only letters, digits, _ and -", "Les noms de variables Hurl n'acceptent que lettres, chiffres, _ et -", "Hurl-variabelnavne tillader kun bogstaver, cifre, _ og -";
+    // The `# [Gen]` block. Each message names the row it belongs to, because a
+    // request may declare several and "one of them is wrong" is not a report.
+    gen_status => "⚠ Computed values not set:", "⚠ Valeurs calculées non définies :", "⚠ Beregnede værdier ikke angivet:";
+    gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
+    gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
+    gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
+    gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
+    gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
+    gen_err_cycle => "{row}: refers to itself, or to a row below it", "{row} : se référence lui-même, ou une ligne en dessous", "{row}: refererer til sig selv eller til en række nedenunder";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -1695,6 +1705,14 @@ pub enum Status {
     /// [`Status::UndefinedVars`]: the request would otherwise be sent, be
     /// answered, and be wrong.
     TruncatedPlaceholders(Vec<String>),
+    /// The request's `# [Gen]` block didn't fully evaluate, so the names it was
+    /// meant to compute are unbound and their `{{…}}` will be sent literally.
+    ///
+    /// Reported, not blocking: an unbound value fails loudly at the server, so
+    /// this is the [`Status::UndefinedVars`] situation rather than the
+    /// [`Status::BodyFormConflict`] one. Said all the same, because "401" is a
+    /// poor way to learn that a function name was misspelled.
+    GeneratorErrors(Vec<crate::generators::GenError>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -2012,6 +2030,48 @@ impl Status {
             }
             Status::BodyFormConflict(names) => {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))
+            }
+            Status::GeneratorErrors(errors) => {
+                use crate::generators::GenError as G;
+                let described: Vec<String> = errors
+                    .iter()
+                    .map(|e| match e {
+                        G::Syntax { name, detail } => s
+                            .gen_err_syntax
+                            .replace("{row}", name)
+                            .replace("{detail}", detail),
+                        G::UnknownFunction { name, function } => s
+                            .gen_err_unknown
+                            .replace("{row}", name)
+                            .replace("{function}", function),
+                        G::Arity {
+                            name,
+                            function,
+                            expected,
+                            got,
+                        } => s
+                            .gen_err_arity
+                            .replace("{row}", name)
+                            .replace("{function}", function)
+                            .replace("{expected}", expected)
+                            .replace("{got}", &got.to_string()),
+                        G::BadArgument {
+                            name,
+                            function,
+                            detail,
+                        } => s
+                            .gen_err_argument
+                            .replace("{row}", name)
+                            .replace("{function}", function)
+                            .replace("{detail}", detail),
+                        G::UndefinedReference { name, reference } => s
+                            .gen_err_undefined
+                            .replace("{row}", name)
+                            .replace("{reference}", reference),
+                        G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
+                    })
+                    .collect();
+                format!("{} {}", s.gen_status, described.join("; "))
             }
             Status::TruncatedPlaceholders(items) => {
                 format!(

@@ -29,6 +29,8 @@ struct SubstSeen {
     pending: bool,
     failed: bool,
     undefined: bool,
+    /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
+    computed: bool,
     shadowed: bool,
 }
 
@@ -36,6 +38,7 @@ impl SubstSeen {
     fn mark(&mut self, kind: SubstKind) {
         match kind {
             SubstKind::Loaded => self.loaded = true,
+            SubstKind::Computed => self.computed = true,
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
@@ -44,7 +47,12 @@ impl SubstSeen {
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed || self.undefined
+        self.loaded
+            || self.literal
+            || self.pending
+            || self.failed
+            || self.undefined
+            || self.computed
     }
 }
 
@@ -54,6 +62,8 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
     match kind {
         SubstKind::Literal => th.subst,
         SubstKind::Loaded => th.ok,
+        // Green like a loaded value: it will have one, once the request is sent.
+        SubstKind::Computed => th.ok,
         SubstKind::Pending => th.pending,
         SubstKind::Failed => th.err,
         SubstKind::Undefined => th.err,
@@ -73,6 +83,7 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
+            (seen.computed, s.subst_hint_computed, th.ok),
         ] {
             if present {
                 ui.colored_label(color, format!("\u{25cf} {word}"));

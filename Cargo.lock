@@ -3335,6 +3335,7 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "egui_extras",
+ "getrandom 0.3.4",
  "hurl",
  "hurl_core",
  "image",

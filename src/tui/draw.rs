@@ -3103,6 +3103,7 @@ fn subst_color(kind: crate::request::SubstKind, th: &Theme) -> Color {
     match kind {
         SubstKind::Literal => th.subst,   // cyan
         SubstKind::Loaded => th.ok,       // green
+        SubstKind::Computed => th.ok,     // green (a value it will have, once sent)
         SubstKind::Pending => th.pending, // orange
         SubstKind::Failed => th.err,      // red
         SubstKind::Undefined => th.err,   // red
@@ -3120,6 +3121,8 @@ struct SubstSeen {
     failed: bool,
     /// At least one referenced `{{ VAR }}` is defined nowhere at all.
     undefined: bool,
+    /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
+    computed: bool,
     /// At least one rendered substitution's Global Environment value is
     /// being shadowed by the collection's linked Environment.
     shadowed: bool,
@@ -3130,6 +3133,7 @@ impl SubstSeen {
         use crate::request::SubstKind;
         match kind {
             SubstKind::Loaded => self.loaded = true,
+            SubstKind::Computed => self.computed = true,
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
@@ -3138,7 +3142,12 @@ impl SubstSeen {
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed || self.undefined
+        self.loaded
+            || self.literal
+            || self.pending
+            || self.failed
+            || self.undefined
+            || self.computed
     }
 }
 
@@ -3604,6 +3613,7 @@ pub(crate) fn draw_collection_main(
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
+            (seen.computed, s.subst_hint_computed, th.ok),
         ];
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (present, word, color) in segments {

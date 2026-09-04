@@ -7,6 +7,7 @@ mod cli;
 mod collection;
 mod env_panel;
 mod environment;
+mod generators;
 mod git_remote;
 // The GUI pulls in eframe/winit/wgpu, which dominate build time, so it is
 // opt-in (`--features gui`). Everything it needs lives under `src/gui`; the

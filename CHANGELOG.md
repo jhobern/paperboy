@@ -12,6 +12,46 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Computed values: a `# [Gen]` block for the things a request has to work
+  out for itself.** Postman collections lean on pre-request scripts for values
+  that cannot be written down in advance — a nonce, a timestamp, a
+  Base64-encoded credential — and until now PaperBoy had no answer for them at
+  all. A request can now carry a short block of assignments, evaluated once
+  each time it is sent:
+
+  ```
+  # [Gen] 2
+  # nonce = random_hex(16)
+  # stamp = timestamp
+  ```
+
+  and use them as ordinary `{{ nonce }}` / `{{ stamp }}` placeholders. Because
+  they *are* ordinary placeholders, the `.hurl` file stays portable: stock
+  `hurl` parses it identically and runs it with `--variable nonce=…`, and a
+  missing one is a loud `Undefined variable` rather than a request that
+  silently goes out wrong. The block lives in comments for the same reason, so
+  nothing outside PaperBoy has to understand it. Rows use `=` rather than `:`
+  so they can never be mistaken for the disabled `# key: value` headers the
+  same comment space already carries, and the block is length-prefixed like
+  `# [Body]`, so a bad merge degrades into prose instead of half-loading.
+
+  Twenty-one functions are available to start with — UUIDs, timestamps and
+  dates, random numbers, hex and alphabets, Base64, URL encoding, case and
+  substring work — and each row may read variables, captures and earlier rows.
+  A row is evaluated once per send, so a nonce that appears in both a header
+  and a signed body is the *same* nonce, which Postman's scripts cannot
+  promise. Values are computed straight into the run, so one derived from a
+  secret is no more exposed than the secret already was: it reaches no preview
+  and no saved state.
+
+  In the request preview a computed name keeps its braces and is coloured as
+  loaded, rather than being flagged as an undefined variable, since the value
+  genuinely doesn't exist until the request is sent — inventing one per frame
+  would flicker and still not be what goes on the wire. A row that cannot be
+  evaluated is reported before sending, naming the row and what is wrong with
+  it, because "there is no function called `hmac_sha526`" is a far better way
+  to learn of a typo than the 401 it would otherwise become.
+
 - **Import every Postman workspace at once.** The wizard could only ever take
   one workspace at a time, which is fine for trying PaperBoy out and useless
   for the thing people actually want it for: leaving Postman. An account with
