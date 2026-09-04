@@ -34,6 +34,27 @@
 //! variable, a request parameter, or an earlier generator. Calls nest, because
 //! signing is built by nesting: `base64(hmac_sha256(K, concat(A, B)))`.
 //!
+//! # Signing
+//!
+//! `md5`/`sha1`/`sha256`/`sha512` hash, `hmac_sha1`/`hmac_sha256`/`hmac_sha512`
+//! sign, each also as a `_b64` variant. The encoding is in the name because a
+//! signature in the wrong one is the right length, entirely plausible to look
+//! at, and rejected with the same 401 as a wrong secret — a default would be a
+//! thing to get wrong silently. Bare is hex, matching `sha256sum` and
+//! CryptoJS's `toString()`, which is what a script being ported from Postman
+//! expects; `_b64` is standard padded Base64, which is what most APIs that
+//! don't want hex want.
+//!
+//! Note that `base64(sha256(m))` is *not* `sha256_b64(m)`: the former encodes
+//! the 64 characters of hex, the latter the 32 bytes they spell. That is what
+//! the `_b64` variants are for.
+//!
+//! What this cannot do is chain a MAC into the *key* of the next one, because
+//! every value here is text and a digest's bytes only survive as hex. AWS
+//! SigV4's four-step key derivation therefore isn't expressible. Nothing is
+//! lost in practice yet: SigV4 also needs a canonical request built from the
+//! live request's headers, which is a different feature entirely.
+//!
 //! Arguments cannot be `{{ … }}` placeholders. PaperBoy's own substitution is
 //! single-pass and its pattern can't nest, so a nested placeholder would never
 //! be expanded; a bare name means the same thing and always works.
@@ -528,6 +549,32 @@ fn call(
             Ok(serde_json::Value::String(args[0].clone()).to_string())
         }
 
+        // ── Hashes and signatures ───────────────────────────────────────
+        // The digest is bytes; the request needs text. Which text is not a
+        // detail — a signature in the wrong encoding is the right length, looks
+        // entirely plausible, and is rejected with the same 401 as a wrong
+        // secret. So the encoding is part of the name rather than a default to
+        // be discovered: bare is hex (what `sha256sum` and CryptoJS's
+        // `toString()` produce, which is what a ported script expects), `_b64`
+        // is standard padded Base64 (what Twilio, AWS and friends want).
+        "md5" | "sha1" | "sha256" | "sha512" | "md5_b64" | "sha1_b64" | "sha256_b64"
+        | "sha512_b64" => {
+            arity("1", args.len() == 1)?;
+            let (alg, as_b64) = split_encoding(function);
+            Ok(encode_digest(&hash_bytes(alg, args[0].as_bytes()), as_b64))
+        }
+        "hmac_sha1" | "hmac_sha256" | "hmac_sha512" | "hmac_sha1_b64" | "hmac_sha256_b64"
+        | "hmac_sha512_b64" => {
+            arity("2", args.len() == 2)?;
+            let (alg, as_b64) = split_encoding(function);
+            let alg = alg.strip_prefix("hmac_").expect("matched an hmac_ name");
+            // Key first, message second — the order every library and every
+            // API's documentation uses. Swapping them yields a signature that
+            // is well-formed and wrong, which is why it is worth stating.
+            let mac = hmac_bytes(alg, args[0].as_bytes(), args[1].as_bytes());
+            Ok(encode_digest(&mac, as_b64))
+        }
+
         // ── Text ────────────────────────────────────────────────────────
         "concat" => Ok(args.concat()),
         "upper" => {
@@ -570,6 +617,20 @@ pub const FUNCTIONS: &[&str] = &[
     "urlencode",
     "urldecode",
     "json_string",
+    "md5",
+    "md5_b64",
+    "sha1",
+    "sha1_b64",
+    "sha256",
+    "sha256_b64",
+    "sha512",
+    "sha512_b64",
+    "hmac_sha1",
+    "hmac_sha1_b64",
+    "hmac_sha256",
+    "hmac_sha256_b64",
+    "hmac_sha512",
+    "hmac_sha512_b64",
     "concat",
     "upper",
     "lower",
@@ -579,6 +640,59 @@ pub const FUNCTIONS: &[&str] = &[
 fn utc(src: &dyn GenSource) -> chrono::DateTime<chrono::Utc> {
     let (secs, nanos) = src.now();
     chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default()
+}
+
+/// Split a hash or MAC function name into the algorithm and whether its result
+/// is wanted as Base64 rather than hex.
+fn split_encoding(function: &str) -> (&str, bool) {
+    match function.strip_suffix("_b64") {
+        Some(alg) => (alg, true),
+        None => (function, false),
+    }
+}
+
+fn encode_digest(bytes: &[u8], as_b64: bool) -> String {
+    if as_b64 {
+        b64(bytes, false)
+    } else {
+        to_hex(bytes)
+    }
+}
+
+fn hash_bytes(alg: &str, msg: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    match alg {
+        "md5" => md5::Md5::digest(msg).to_vec(),
+        "sha1" => sha1::Sha1::digest(msg).to_vec(),
+        "sha256" => sha2::Sha256::digest(msg).to_vec(),
+        "sha512" => sha2::Sha512::digest(msg).to_vec(),
+        other => unreachable!("hash_bytes called with {other}, which `call` does not dispatch"),
+    }
+}
+
+fn hmac_bytes(alg: &str, key: &[u8], msg: &[u8]) -> Vec<u8> {
+    use hmac::Mac;
+    // Written out per algorithm rather than generically: the bounds needed to
+    // abstract over a RustCrypto digest are longer than the three lines they
+    // would save, and there are exactly three.
+    //
+    // `new_from_slice` cannot fail here — HMAC takes a key of any length, first
+    // hashing anything longer than the block size — so the error is unreachable
+    // rather than something to report.
+    macro_rules! mac {
+        ($d:ty) => {{
+            let mut m =
+                hmac::Hmac::<$d>::new_from_slice(key).expect("HMAC accepts a key of any length");
+            m.update(msg);
+            m.finalize().into_bytes().to_vec()
+        }};
+    }
+    match alg {
+        "sha1" => mac!(sha1::Sha1),
+        "sha256" => mac!(sha2::Sha256),
+        "sha512" => mac!(sha2::Sha512),
+        other => unreachable!("hmac_bytes called with {other}, which `call` does not dispatch"),
+    }
 }
 
 fn b64(bytes: &[u8], url_safe: bool) -> String {
@@ -727,6 +841,131 @@ mod tests {
             .collect();
         let errors = expand(&rows, &mut vars, &FakeSource::at(1_700_000_000));
         (vars, errors)
+    }
+
+    /// Published test vectors, not values this implementation produced. A
+    /// signature function that is self-consistently wrong is indistinguishable
+    /// from a correct one until a server rejects it, so the only test worth
+    /// having is one written against numbers from outside this codebase.
+    ///
+    /// Digests are of `"abc"` (FIPS 180-4 / RFC 1321 examples).
+    #[test]
+    fn the_digests_match_their_published_vectors() {
+        let (v, e) = run(&[
+            ("md5", r#"md5("abc")"#),
+            ("sha1", r#"sha1("abc")"#),
+            ("sha256", r#"sha256("abc")"#),
+            ("sha512", r#"sha512("abc")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["md5"], "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(v["sha1"], "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            v["sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            v["sha512"],
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+    }
+
+    /// RFC 2202 (HMAC-SHA1) and RFC 4231 (HMAC-SHA256/512) test case 2:
+    /// key `"Jefe"`, data `"what do ya want for nothing?"`.
+    #[test]
+    fn the_macs_match_their_published_vectors() {
+        let (v, e) = run(&[
+            ("s1", r#"hmac_sha1("Jefe", "what do ya want for nothing?")"#),
+            (
+                "s256",
+                r#"hmac_sha256("Jefe", "what do ya want for nothing?")"#,
+            ),
+            (
+                "s512",
+                r#"hmac_sha512("Jefe", "what do ya want for nothing?")"#,
+            ),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["s1"], "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79");
+        assert_eq!(
+            v["s256"],
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            v["s512"],
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea250554\
+             9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737"
+        );
+    }
+
+    /// `_b64` encodes the *digest bytes*, which is not the same as Base64 of the
+    /// hex text — a distinction worth a test, because getting it wrong produces
+    /// a plausible-looking string that every server rejects.
+    #[test]
+    fn the_b64_variants_encode_the_digest_not_its_hex() {
+        let (v, e) = run(&[
+            ("hex", r#"sha256("abc")"#),
+            ("b64", r#"sha256_b64("abc")"#),
+            ("wrong", r#"base64(sha256("abc"))"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        // Base64 of the SHA-256 digest of "abc" — i.e. of the published
+        // ba7816bf… bytes, not of the 64 characters that spell them.
+        assert_eq!(v["b64"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_ne!(v["b64"], b64(v["hex"].as_bytes(), false));
+        assert_eq!(
+            v["wrong"],
+            b64(v["hex"].as_bytes(), false),
+            "base64() of a hash still encodes the hex text — the reason the \
+             _b64 variants exist"
+        );
+    }
+
+    /// The shape real signing takes: a nonce and a timestamp computed here,
+    /// then signed, with the signature reading the rows above it.
+    #[test]
+    fn a_block_can_sign_the_values_it_just_computed() {
+        let mut vars = HashMap::new();
+        vars.insert("SECRET".to_string(), "s3cr3t".to_string());
+        let (v, e) = run_with(
+            &[
+                ("nonce", "random_hex(16)"),
+                ("stamp", "timestamp"),
+                (
+                    "sig",
+                    r#"hmac_sha256_b64(SECRET, concat(nonce, ":", stamp))"#,
+                ),
+            ],
+            vars,
+        );
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["stamp"], "1700000000");
+        let expected = encode_digest(
+            &hmac_bytes(
+                "sha256",
+                b"s3cr3t",
+                format!("{}:{}", v["nonce"], v["stamp"]).as_bytes(),
+            ),
+            true,
+        );
+        assert_eq!(
+            v["sig"], expected,
+            "the signature covers both computed rows"
+        );
+    }
+
+    /// Arity is checked for the signing functions too — a one-argument
+    /// `hmac_sha256` is a missing key, which must not quietly sign with none.
+    #[test]
+    fn a_mac_with_the_wrong_number_of_arguments_is_refused() {
+        let (v, e) = run(&[("sig", r#"hmac_sha256("only-a-key")"#)]);
+        assert!(!v.contains_key("sig"), "nothing is bound");
+        assert!(
+            matches!(&e[..], [GenError::Arity { function, expected, got, .. }]
+                if function == "hmac_sha256" && expected == "2" && *got == 1),
+            "{e:?}"
+        );
     }
 
     #[test]

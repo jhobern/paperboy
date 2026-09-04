@@ -35,9 +35,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   same comment space already carries, and the block is length-prefixed like
   `# [Body]`, so a bad merge degrades into prose instead of half-loading.
 
-  Twenty-one functions are available to start with — UUIDs, timestamps and
-  dates, random numbers, hex and alphabets, Base64, URL encoding, case and
-  substring work — and each row may read variables, captures and earlier rows.
+  Thirty-five functions are available — UUIDs, timestamps and dates, random
+  numbers, hex and alphabets, Base64, URL encoding, text work, and MD5, SHA-1,
+  SHA-256, SHA-512 and their HMACs — and each row may read variables, captures
+  and earlier rows, so a request can sign the nonce and timestamp it just
+  computed. Hashes and signatures come in hex and `_b64` pairs rather than
+  taking an encoding argument, because a signature in the wrong encoding is the
+  right length, looks entirely plausible, and is rejected with the same 401 as
+  a wrong secret. (For the same reason: `base64(sha256(m))` is not
+  `sha256_b64(m)` — the first encodes the hex text, the second the digest.)
+  All of it is pure Rust, so signing doesn't drag OpenSSL or a C toolchain into
+  a `cargo install`.
   A row is evaluated once per send, so a nonce that appears in both a header
   and a signed body is the *same* nonce, which Postman's scripts cannot
   promise. Values are computed straight into the run, so one derived from a
