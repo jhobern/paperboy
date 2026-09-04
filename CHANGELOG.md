@@ -76,6 +76,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- Single-line fields keep their text colour when focus moves elsewhere. An
+  unfocused field was dimmed, which is also how an *empty* field draws the
+  example of what belongs in it — so a Postman key source, a git URL or a theme
+  name that had been filled in looked unanswered as soon as the user tabbed
+  past it. Focus is now said by the highlight background alone, and dim means
+  only "nobody has typed this yet".
+
 - The saved key references offered under the Postman wizard's key field were
   drawn in the same dim as every placeholder on screen, so the line telling a
   user their old 1Password path is one keystroke away read as ghost text. They

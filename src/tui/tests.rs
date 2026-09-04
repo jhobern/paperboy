@@ -27876,6 +27876,58 @@ fn the_saved_references_hang_off_the_key_field_as_a_dropdown() {
     );
 }
 
+/// An answered field keeps its colour when focus moves on. Dim is the colour
+/// of the placeholder -- of something nobody has typed yet -- so a dim value
+/// read as an empty field the moment the user tabbed away from it.
+#[test]
+fn a_filled_field_does_not_fade_into_looking_like_a_placeholder() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    app.open_postman_wizard();
+    {
+        let w = postman_wizard(&mut app);
+        w.key_source = crate::postman_flow::KeySource::OnePassword;
+        w.key = Editor::new("Engineering/Postman/api-key", false);
+        // Focus sits on the source row, so the key field below is unfocused.
+        w.field = 0;
+    }
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(90, 16)).unwrap();
+    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+
+    let found = (0..buf.area().height).find_map(|y| {
+        let row: String = (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        row.find("Engineering/Postman/api-key")
+            .map(|byte| (row[..byte].chars().count() as u16, y))
+    });
+    let (x, y) = found.expect("the key the user typed is on screen");
+    assert_eq!(
+        buf[(x, y)].fg,
+        th.text,
+        "an unfocused answer is still an answer"
+    );
+    assert_ne!(buf[(x, y)].fg, th.dim, "and is not ghost text");
+
+    // The hint in the still-empty workspace field is the thing that should be
+    // dim -- that is the difference the colour is carrying.
+    let hint = (0..buf.area().height).find_map(|y| {
+        let row: String = (0..buf.area().width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        row.find(s.postman_workspace_hint)
+            .map(|byte| (row[..byte].chars().count() as u16, y))
+    });
+    let (hx, hy) = hint.expect("the empty field shows its example");
+    assert_eq!(buf[(hx, hy)].fg, th.dim, "which is what dim means here");
+}
+
 /// The list is only written once the key has actually worked: a half-typed
 /// item path must never come back as a suggestion.
 #[test]
