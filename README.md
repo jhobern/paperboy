@@ -576,6 +576,10 @@ Open the **Settings** menu with `s`. It has a **Theme** editor (see below) and
   otherwise pop up a **Save / Discard / Cancel** choice (e.g. switching away
   from a Workspace collection with unsaved changes), automatically pick
   **Save** without asking. Leave it off to keep being prompted each time.
+- **Esc discards request edits without asking** (off by default) — Esc on a
+  request form holding unsaved changes normally asks first, since the form has
+  no autosave and F2 is the only thing that persists. Turn this on to get the
+  older behaviour back, where one Esc closes the form and throws the edits away.
 - **Default Request view** — whether the Request panel opens in JSON or Hurl.
 
 ### Themes

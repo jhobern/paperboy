@@ -40,7 +40,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   every remaining workspace, such as a rejected key or an exhausted monthly
   quota, still stops the plan instead of being logged forty times.
 
+### Added
+
+- **A preference for the old Esc behaviour.** Esc on a request form with unsaved
+  edits asks before discarding them, which is the right default for a form with
+  no autosave — but it is also a second keypress in a loop some users run dozens
+  of times an hour, and they had learned Esc as simply "close this". Settings →
+  Preferences → **Esc discards request edits without asking** puts the one-press
+  discard back. Off by default, so nobody gets it by accident.
+
 ### Changed
+
+- **The saved key references are a dropdown hanging off the key field**, like
+  the request wizard's header-name suggestions: anchored under the field, in a
+  bordered popup that says what Enter does, filtered by what has been typed, and
+  dismissed with Esc. As a permanent list inside the form it read as another row
+  of the form — or, drawn dim, as more ghost text.
 
 - **The everyday file pickers sort Postman exports out for themselves.** Postman
   writes collections and environments to the same `.json` extension, and only

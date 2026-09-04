@@ -12,7 +12,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Gauge, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::i18n::Strings;
 use crate::postman_flow::{
@@ -86,8 +86,13 @@ pub(crate) struct PostmanWizard {
     /// to SSM doesn't offer 1Password paths.
     pub(crate) recent: Vec<String>,
     /// `Some` while the recent-keys dropdown has keyboard focus, indexing into
-    /// [`PostmanWizard::recent_entries`].
+    /// [`PostmanWizard::recent_matches`].
     pub(crate) recent_sel: Option<usize>,
+    /// Set by Esc, which dismisses the dropdown without leaving the field.
+    /// Cleared by anything that changes what the list would show -- typing,
+    /// switching source, or coming back to the field -- so the suggestions are
+    /// never gone for good, exactly as the request wizard's dropdown behaves.
+    pub(crate) recent_hidden: bool,
     /// What a finished import landed, kept so the receipt can say it rather
     /// than only naming the folder it wrote.
     pub(crate) done: Option<crate::postman_import::ImportSummary>,
@@ -115,6 +120,7 @@ impl PostmanWizard {
             preview_scroll: 0,
             recent,
             recent_sel: None,
+            recent_hidden: false,
             done: None,
         }
     }
@@ -129,6 +135,29 @@ impl PostmanWizard {
                 (src == self.key_source && !entry.is_empty()).then_some(entry)
             })
             .collect()
+    }
+
+    /// The remembered entries the dropdown is actually offering: those for
+    /// this source, narrowed to what the field already holds. Typing therefore
+    /// filters the list rather than leaving a dozen paths on screen that no
+    /// longer match, and a field holding one of them exactly has nothing left
+    /// to suggest.
+    pub(crate) fn recent_matches(&self) -> Vec<String> {
+        let typed = self.key.text();
+        let typed = typed.trim().to_lowercase();
+        self.recent_entries()
+            .into_iter()
+            .filter(|e| {
+                let e = e.to_lowercase();
+                e != typed && (typed.is_empty() || e.contains(&typed))
+            })
+            .collect()
+    }
+
+    /// Whether the dropdown is on screen: the key field has focus, it has not
+    /// been dismissed, and there is something to offer.
+    pub(crate) fn recent_open(&self) -> bool {
+        self.field == 1 && !self.recent_hidden && !self.recent_matches().is_empty()
     }
 
     pub(crate) fn stage(&self) -> PostmanStage {
@@ -310,11 +339,12 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
             .chain(KeySource::ALL.iter().map(|src| src.field_label(s))),
     );
 
-    // The references this key has been read from before, offered under the key
-    // field: finding the 1Password item path is the tedious half of setting an
-    // import up, and it is the same path every time.
-    let recent = w.recent_entries();
-    let recent_rows = recent.len().min(5) as u16;
+    // The references this key has been read from before, offered *under* the
+    // key field as a dropdown rather than as a permanent list: finding the
+    // 1Password item path is the tedious half of setting an import up, and it
+    // is the same path every time -- but it is a suggestion about one field,
+    // not a fifth row of the form.
+    let recent = w.recent_matches();
 
     // A line under the key field saying what picking this source commits the
     // user to. The picker names four sources but says nothing about what each
@@ -323,17 +353,13 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     let help = w.key_source.field_help(s);
     let width = 66.min(f.area().width);
     let help_rows = wrapped_height(help, width.saturating_sub(2));
-    let area = centered_rect(
-        width,
-        fields.len() as u16 + recent_rows + help_rows + 2,
-        f.area(),
-    );
+    let area = centered_rect(width, fields.len() as u16 + help_rows + 2, f.area());
     f.render_widget(Clear, area);
     let hint = if w.recent_sel.is_some() {
         // While the list has focus the connect hint is describing keys that
         // now do something else: Enter fills the field rather than connecting.
         s.postman_recent_pick_hint.to_string()
-    } else if recent_rows > 0 {
+    } else if !recent.is_empty() {
         format!(
             "{}  \u{b7}  {}",
             s.postman_connect_hint, s.postman_recent_hint
@@ -346,15 +372,14 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
     f.render_widget(block, area);
 
     let all_rows = Layout::vertical([
-        Constraint::Length(1),           // key source
-        Constraint::Length(1),           // key
-        Constraint::Length(help_rows),   // what that source means
-        Constraint::Length(recent_rows), // remembered references
-        Constraint::Length(1),           // workspace
-        Constraint::Length(1),           // host
+        Constraint::Length(1),         // key source
+        Constraint::Length(1),         // key
+        Constraint::Length(help_rows), // what that source means
+        Constraint::Length(1),         // workspace
+        Constraint::Length(1),         // host
     ])
     .split(inner);
-    let rows = [all_rows[0], all_rows[1], all_rows[4], all_rows[5]];
+    let rows = [all_rows[0], all_rows[1], all_rows[3], all_rows[4]];
     for (row, (label, placeholder, idx)) in rows.iter().zip(fields.iter()) {
         let cols =
             Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)]).split(*row);
@@ -395,37 +420,95 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         all_rows[2],
     );
 
-    if recent_rows > 0 {
-        // These are *choices*, not a placeholder. Drawn dim they read as more
-        // ghost text -- the screen already has plenty -- and a user who has
-        // never pressed Down here has no reason to suspect the line under
-        // their key field is a list they can pick from. So each entry gets a
-        // marker in the accent colour, sitting in the label gutter so the
-        // entries themselves stay aligned with the value column, and the text
-        // is drawn at full weight like anything else selectable.
-        let gutter = (label_w as usize).saturating_sub(2);
-        let items: Vec<ListItem> = recent
-            .iter()
-            .take(5)
-            .enumerate()
-            .map(|(i, entry)| {
-                let (marker, text) = if w.recent_sel == Some(i) {
-                    let sel = Style::default()
-                        .bg(th.accent)
-                        .fg(th.bg)
-                        .add_modifier(Modifier::BOLD);
-                    (sel, sel)
-                } else {
-                    (Style::default().fg(th.accent), Style::default().fg(th.text))
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:gutter$}\u{203a} ", ""), marker),
-                    Span::styled(entry.clone(), text),
-                ]))
-            })
-            .collect();
-        f.render_widget(List::new(items), all_rows[3]);
+    if w.recent_open() {
+        // Anchored under the key field, like the request wizard's header-name
+        // dropdown: these are suggestions about one field, and a list living
+        // permanently in the form read as another row of it -- or, drawn dim,
+        // as more ghost text. Last, so it sits over the rows beneath it.
+        let value_col = Layout::horizontal([Constraint::Length(label_w), Constraint::Min(1)])
+            .split(all_rows[1])[1];
+        draw_recent_dropdown(f, w, s, th, value_col, &recent);
     }
+}
+
+/// The saved key references, as a dropdown hanging off the key field.
+///
+/// Deliberately the same object as [`super::new_request::wizard::draw_key_suggestions`]:
+/// a bordered popup saying what Enter does, a `\u{203a}` on the highlighted row,
+/// and a background of its own -- `Clear` alone would let the terminal's
+/// colours through.
+fn draw_recent_dropdown(
+    f: &mut Frame,
+    w: &PostmanWizard,
+    s: &Strings,
+    th: &Theme,
+    anchor: Rect,
+    entries: &[String],
+) {
+    const VISIBLE: usize = 6;
+    let fr = f.area();
+    let content_w = entries.iter().map(|e| e.chars().count()).max().unwrap_or(0) as u16;
+    let width = (content_w + 6).max(anchor.width).max(16).min(fr.width);
+    let rows = entries.len().min(VISIBLE) as u16;
+    let height = (rows + 2).min(fr.height);
+
+    let mut x = anchor.x;
+    if x + width > fr.right() {
+        x = fr.right().saturating_sub(width);
+    }
+    // Below the field where possible, flipped above when there is no room.
+    let y = if anchor.y + 1 + height <= fr.bottom() {
+        anchor.y + 1
+    } else {
+        anchor.y.saturating_sub(height)
+    };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // Enough of a scroll to keep the highlight on screen. Stateless: there is
+    // nowhere else to go in a list of at most ten.
+    let offset = w
+        .recent_sel
+        .map_or(0, |i| i.saturating_sub(VISIBLE - 1))
+        .min(entries.len().saturating_sub(VISIBLE));
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(VISIBLE)
+        .map(|(i, entry)| {
+            let selected = w.recent_sel == Some(i);
+            let style = if selected {
+                Style::default()
+                    .bg(th.accent)
+                    .fg(th.bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(th.text)
+            };
+            let marker = if selected { "\u{203a} " } else { "  " };
+            ListItem::new(Line::styled(format!("{marker}{entry}"), style))
+        })
+        .collect();
+
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().bg(th.panel).fg(th.text))
+                .border_style(Style::default().fg(th.accent))
+                .title(Span::styled(
+                    format!(" {} ", s.suggest_hint),
+                    Style::default().fg(th.dim),
+                )),
+        ),
+        popup,
+    );
 }
 
 fn draw_loading(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title: &str) {

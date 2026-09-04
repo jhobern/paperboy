@@ -64,6 +64,7 @@ strings! {
     pref_item_confirm_delete_request => "Confirm before deleting a (r)equest", "Confirmer avant de supprimer une (r)equête", "Bekræft før sletning af en anmod(n)ing";
     pref_item_always_save => "(A)lways save unsaved changes when prompted", "(T)oujours enregistrer les modifications non enregistrées lorsque demandé", "(G)em altid ugemte ændringer, når du bliver spurgt";
     pref_item_default_view => "Default Request (V)iew", "(V)ue de requête par défaut", "Standard anmodnings(v)isning";
+    pref_item_discard_on_esc => "(E)sc discards request edits without asking", "(É)chap abandonne les modifications sans demander", "(E)sc kasserer ændringer uden at spørge";
     pref_item_run_all_batch => "Run All in (b)atch mode (chains cookies & captures)", "Tout exécuter en mode (b)atch (chaîne cookies et captures)", "Kør alle i (b)atch-tilstand (kæder cookies og optagelser)";
     language_label => "Language", "Langue", "Sprog";
     lang_english => "English", "English", "English";

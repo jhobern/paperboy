@@ -2408,6 +2408,50 @@ fn run_all_batch_mode_toggles_from_preferences_and_round_trips() {
 }
 
 #[test]
+fn the_esc_discard_preference_round_trips() {
+    let mut app = TuiApp::default();
+    assert!(
+        !app.discard_request_edits_on_esc,
+        "off by default: Esc asks before throwing edits away"
+    );
+
+    // Row 6 of the Preferences menu toggles it (Enter and Space both work).
+    app.overlay = Some(Overlay::Preferences(6));
+    press(&mut app, KeyCode::Enter);
+    assert!(app.discard_request_edits_on_esc, "Enter toggles it on");
+    assert!(
+        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        "the highlight stays on the toggle row"
+    );
+    press(&mut app, KeyCode::Char(' '));
+    assert!(!app.discard_request_edits_on_esc, "Space toggles it back");
+
+    // The 'e' mnemonic toggles it from anywhere in the menu.
+    app.overlay = Some(Overlay::Preferences(0));
+    press(&mut app, KeyCode::Char('e'));
+    assert!(app.discard_request_edits_on_esc, "the (e) mnemonic toggles");
+
+    let json = serde_json::to_string(&app.to_persisted()).unwrap();
+    let back: PersistedState = serde_json::from_str(&json).unwrap();
+    let mut restored = TuiApp::default();
+    restored.apply_persisted(back);
+    assert!(
+        restored.discard_request_edits_on_esc,
+        "the choice survives JSON (de)serialization"
+    );
+
+    // A state written before the setting existed still loads, with the safe
+    // answer rather than a deserialization failure.
+    let mut older: serde_json::Value = serde_json::from_str(&json).unwrap();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("discard_request_edits_on_esc");
+    let back: PersistedState = serde_json::from_value(older).unwrap();
+    assert!(!back.discard_request_edits_on_esc, "absent means 'ask'");
+}
+
+#[test]
 fn default_request_view_setting_round_trips() {
     let mut app = TuiApp::default();
     assert_eq!(
@@ -2737,9 +2781,10 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
     press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Esc discards request edits)
+    press(&mut app, KeyCode::Down); // -> sel 7 (Default Request View)
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Down moves to the last item without wrapping past it"
     );
 
@@ -2767,7 +2812,7 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
         "selecting JSON in the submenu sets the view"
     );
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Enter returns to Preferences instead of closing the whole menu"
     );
     assert!(app.confirm_on_exit, "unrelated settings are untouched");
@@ -2775,14 +2820,14 @@ fn preferences_menu_last_item_opens_a_default_request_view_submenu() {
 
     // Re-opening the submenu preselects JSON (index 0) this time, and Esc
     // backs out the same way Enter does (the value's already live).
-    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(6)
+    press(&mut app, KeyCode::Enter); // re-open the submenu from Preferences(7)
     assert!(
         matches!(app.overlay, Some(Overlay::RequestViewMenu(0))),
         "preselects JSON (index 0)"
     );
     press(&mut app, KeyCode::Esc);
     assert!(
-        matches!(app.overlay, Some(Overlay::Preferences(6))),
+        matches!(app.overlay, Some(Overlay::Preferences(7))),
         "Esc backs out to Preferences"
     );
     assert_eq!(
@@ -2807,7 +2852,8 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     press(&mut app, KeyCode::Down); // -> sel 3 (Confirm before deleting a request)
     press(&mut app, KeyCode::Down); // -> sel 4 (Always save when prompted)
     press(&mut app, KeyCode::Down); // -> sel 5 (Run All in batch mode)
-    press(&mut app, KeyCode::Down); // -> sel 6 (Default Request View)
+    press(&mut app, KeyCode::Down); // -> sel 6 (Esc discards request edits)
+    press(&mut app, KeyCode::Down); // -> sel 7 (Default Request View)
     press(&mut app, KeyCode::Enter); // open the submenu, preselects Hurl (1)
     assert_eq!(app.default_request_view, RequestView::Hurl);
 
@@ -2827,7 +2873,7 @@ fn hovering_up_and_down_in_the_request_view_submenu_previews_it_live() {
     // Leaving via Enter keeps whatever was last hovered and returns to
     // Preferences rather than closing the whole wizard-settings menu.
     press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.overlay, Some(Overlay::Preferences(6))));
+    assert!(matches!(app.overlay, Some(Overlay::Preferences(7))));
     assert_eq!(app.default_request_view, RequestView::Hurl);
 }
 
@@ -7038,6 +7084,39 @@ fn esc_on_an_edited_wizard_asks_before_discarding() {
         "the prompt opens on 'keep editing', so Enter on reflex costs nothing"
     );
     assert_eq!(form_ref(&app).name.text(), "h", "the edits are still there");
+}
+
+/// ...unless the user has asked for the old behaviour back. Some people close
+/// far more forms than they lose work in, and had learned Esc as "close this";
+/// the setting is off by default, so nobody gets that by accident.
+#[test]
+fn the_preference_puts_the_one_keypress_discard_back() {
+    let mut app = TuiApp {
+        focus: Pane::List,
+        ..Default::default()
+    };
+    assert!(
+        !app.discard_request_edits_on_esc,
+        "asking first is the default"
+    );
+
+    // Settings -> Preferences -> the Esc row, toggled on.
+    press(&mut app, KeyCode::Char('s'));
+    press(&mut app, KeyCode::Down); // -> Theme
+    press(&mut app, KeyCode::Down); // -> Preferences
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('e')); // the row's mnemonic
+    assert!(app.discard_request_edits_on_esc, "toggled on");
+    press(&mut app, KeyCode::Esc); // back to Settings
+    press(&mut app, KeyCode::Esc); // and out
+
+    press(&mut app, KeyCode::Char('n'));
+    press(&mut app, KeyCode::Char('h')); // type into the Name field
+    press(&mut app, KeyCode::Esc);
+    assert!(
+        app.overlay.is_none(),
+        "one keypress closes the form, edits and all"
+    );
 }
 
 /// ...but an untouched form still closes on one Esc. Prompting when there is
@@ -27727,7 +27806,7 @@ fn a_working_key_reference_is_offered_back_next_time() {
 /// keystroke away read as ghost text they had already filled in. They are
 /// choices: they get a marker and full-weight text.
 #[test]
-fn the_saved_references_look_like_something_you_can_pick() {
+fn the_saved_references_hang_off_the_key_field_as_a_dropdown() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = TuiApp::default();
@@ -27740,31 +27819,60 @@ fn the_saved_references_look_like_something_you_can_pick() {
     let s = Strings::for_language(&Language::English);
     let th = super::theme::theme(&Language::English);
     let mut term = Terminal::new(TestBackend::new(90, 16)).unwrap();
-    term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
-        .unwrap();
-    let buf = term.backend().buffer();
-
-    let (x, y) = (0..buf.area().height)
-        .find_map(|y| {
-            let row: String = (0..buf.area().width)
-                .map(|x| buf[(x, y)].symbol())
-                .collect();
+    let mut render = |app: &mut TuiApp| {
+        term.draw(|f| super::draw::draw_overlay(f, app, &s, &th))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let text: Vec<String> = (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let found = text.iter().enumerate().find_map(|(y, row)| {
             // Cell symbols are one character each here, so a character offset
             // into the row is the column.
             row.find("Private/Postman/credential")
-                .map(|byte| (row[..byte].chars().count() as u16, y))
-        })
-        .expect("the saved reference is on screen");
+                .map(|byte| (row[..byte].chars().count() as u16, y as u16))
+        });
+        (text.join("\n"), found, buf.clone())
+    };
 
-    assert_eq!(
-        buf[(x, y)].fg,
-        th.text,
-        "the suggestion is drawn at full weight, not as ghost text"
+    // The key-source row has focus first, and the dropdown belongs to the key
+    // field: nothing is hanging open over the form.
+    let (_, found, _) = render(&mut app);
+    assert!(found.is_none(), "no dropdown until the key field has focus");
+
+    press(&mut app, KeyCode::Tab);
+    let (screen, found, buf) = render(&mut app);
+    let (x, y) = found.expect("the key field offers what it was given before");
+    assert!(
+        screen.contains(s.suggest_hint),
+        "the popup says what Enter does: {screen}"
     );
     assert_eq!(
-        (buf[(x - 2, y)].symbol(), buf[(x - 2, y)].fg),
-        ("\u{203a}", th.accent),
-        "and is marked as a choice"
+        buf[(x, y)].bg,
+        th.panel,
+        "and paints its own themed background"
+    );
+
+    // Down highlights a row; the highlight is a marker plus the accent, not a
+    // shade of the ghost text every placeholder on the screen is drawn in.
+    press(&mut app, KeyCode::Down);
+    let (_, found, buf) = render(&mut app);
+    let (x, y) = found.expect("still showing");
+    assert_eq!(buf[(x, y)].bg, th.accent, "the highlighted row stands out");
+    assert_eq!(buf[(x - 2, y)].symbol(), "\u{203a}", "and is marked");
+
+    // Typing filters it, exactly as the request wizard's dropdown does, and a
+    // field holding the whole reference has nothing left to suggest.
+    press(&mut app, KeyCode::Esc);
+    type_str(&mut app, "Private/Postman/credential");
+    let (screen, _, _) = render(&mut app);
+    assert!(
+        !screen.contains(s.suggest_hint),
+        "a field holding the whole reference has nothing left to offer: {screen}"
     );
 }
 

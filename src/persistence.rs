@@ -582,6 +582,10 @@ pub struct PersistedState {
     /// rather than streaming per-entry. Off by default (streaming).
     #[serde(default)]
     pub run_all_batch_mode: bool,
+    /// Let Esc throw away a request wizard's unsaved edits without asking
+    /// (Settings → Preferences). Off by default, so the prompt is shown.
+    #[serde(default)]
+    pub discard_request_edits_on_esc: bool,
     /// User-created themes (Settings → Theme). Built-in presets are not stored.
     #[serde(default)]
     pub custom_themes: Vec<crate::tui::theme::ThemeSpec>,
@@ -644,6 +648,7 @@ impl Default for PersistedState {
             report_params: Vec::new(),
             default_request_view: RequestView::default(),
             run_all_batch_mode: false,
+            discard_request_edits_on_esc: false,
             custom_themes: Vec::new(),
             active_theme: None,
             global_envs: Vec::new(),

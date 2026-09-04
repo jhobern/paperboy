@@ -4459,6 +4459,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 mark(app.run_all_batch_mode),
                 s.pref_item_run_all_batch
             );
+            let discard_on_esc_item = format!(
+                "{} {}",
+                mark(app.discard_request_edits_on_esc),
+                s.pref_item_discard_on_esc
+            );
             let items = [
                 exit_item.as_str(),
                 clear_item.as_str(),
@@ -4466,6 +4471,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                 delete_request_item.as_str(),
                 always_save_item.as_str(),
                 run_all_batch_item.as_str(),
+                discard_on_esc_item.as_str(),
                 view_item.as_str(),
             ];
             draw_menu_popup(f, s.preferences_menu, &items, *sel, th, Some(app));

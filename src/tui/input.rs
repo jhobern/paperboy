@@ -28,6 +28,12 @@ use super::theme::THEME_COLOR_COUNT;
 use super::theme_editor::ThemePane;
 use crate::remote_flow::{RemoteKind, WorkspaceGitFilter, WorkspaceGitOrigin};
 use crate::save_flow::SaveTargetKind;
+
+/// Rows of Settings → Preferences, in the order `draw_overlay` lists them.
+/// Named because the submenus have to come *back* to their own row, and a bare
+/// index silently pointed at the wrong setting the moment a row was inserted.
+const PREF_DISCARD_ON_ESC: usize = 6;
+const PREF_DEFAULT_VIEW: usize = 7;
 use crate::tui::clipboard::copy_to_clipboard;
 use tui_panel_select::selection;
 use tui_panel_select::wrapcache::TextPos;
@@ -5713,6 +5719,7 @@ impl TuiApp {
             s.pref_item_confirm_delete_request,
             s.pref_item_always_save,
             s.pref_item_run_all_batch,
+            s.pref_item_discard_on_esc,
             s.pref_item_default_view,
         ];
         match key.code {
@@ -5721,7 +5728,7 @@ impl TuiApp {
                 self.overlay = Some(Overlay::Preferences(sel.saturating_sub(1)));
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.overlay = Some(Overlay::Preferences((sel + 1).min(6)));
+                self.overlay = Some(Overlay::Preferences((sel + 1).min(PREF_DEFAULT_VIEW)));
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_preference_item(sel),
             KeyCode::Char(c) => match mnemonic_index(&items, c) {
@@ -5762,6 +5769,11 @@ impl TuiApp {
             }
             5 => {
                 self.run_all_batch_mode = !self.run_all_batch_mode;
+                self.save_state();
+                self.overlay = Some(Overlay::Preferences(sel));
+            }
+            PREF_DISCARD_ON_ESC => {
+                self.discard_request_edits_on_esc = !self.discard_request_edits_on_esc;
                 self.save_state();
                 self.overlay = Some(Overlay::Preferences(sel));
             }
@@ -5838,7 +5850,7 @@ impl TuiApp {
             // to Preferences afterwards; there's nothing left to
             // "confirm" or "cancel" since the value's already applied.
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                self.overlay = Some(Overlay::Preferences(6))
+                self.overlay = Some(Overlay::Preferences(PREF_DEFAULT_VIEW))
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let new_sel = sel.saturating_sub(1);
@@ -6643,13 +6655,17 @@ impl TuiApp {
             } else if ctype_open {
                 form.ctype_dropdown_hidden = true;
                 form.ctype_hi = None;
-            } else if form.is_dirty() {
+            } else if form.is_dirty() && !self.discard_request_edits_on_esc {
                 // Esc used to throw the whole form away on one keypress, with
                 // no way back — the wizard has no autosave and F2 is the only
                 // thing that persists. Ask first, but only when there is
                 // something to lose: prompting on an untouched form would make
                 // Esc feel broken and train the user to dismiss the prompt
                 // without reading it.
+                //
+                // Settings → Preferences can put the old behaviour back, for
+                // the users who close far more forms than they lose work in
+                // and had learned Esc as "close this".
                 form.confirm_discard = Some(WIZARD_DISCARD_DEFAULT);
             } else {
                 keep = false; // nothing typed — cancel the whole form

@@ -4063,15 +4063,20 @@ impl TuiApp {
         w.remember_step();
         match w.stage() {
             PostmanStage::Connect => match key.code {
-                // While the recent-keys dropdown has focus, Esc backs out of it
-                // rather than leaving the wizard's connect step.
-                KeyCode::Esc if w.recent_sel.is_some() => w.recent_sel = None,
+                // While the saved-references dropdown is showing, Esc dismisses
+                // it rather than leaving the wizard's connect step. It stays
+                // dismissed only until something changes what it would offer.
+                KeyCode::Esc if w.recent_open() => {
+                    w.recent_sel = None;
+                    w.recent_hidden = true;
+                }
                 KeyCode::Esc => return,
                 // On the key field, Down opens (or moves down in) the list of
                 // references this key has been read from before, instead of
                 // jumping to the workspace field.
-                KeyCode::Down if w.field == 1 && !w.recent_entries().is_empty() => {
-                    let last = w.recent_entries().len() - 1;
+                KeyCode::Down if w.field == 1 && !w.recent_matches().is_empty() => {
+                    w.recent_hidden = false;
+                    let last = w.recent_matches().len() - 1;
                     w.recent_sel = Some(w.recent_sel.map_or(0, |i| (i + 1).min(last)));
                 }
                 KeyCode::Up if w.recent_sel.is_some() => {
@@ -4081,10 +4086,15 @@ impl TuiApp {
                 KeyCode::Tab | KeyCode::Down => {
                     w.field = (w.field + 1) % POSTMAN_CONNECT_FIELDS;
                     w.recent_sel = None;
+                    // Coming back to the key field offers the suggestions
+                    // again: a dismissal answered the list that was showing,
+                    // not every list it might ever show.
+                    w.recent_hidden = false;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
                     w.field = (w.field + POSTMAN_CONNECT_FIELDS - 1) % POSTMAN_CONNECT_FIELDS;
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
                 // The key-source row is a choice, so Left/Right change it —
                 // the same gesture that changes the import format two steps
@@ -4092,12 +4102,15 @@ impl TuiApp {
                 KeyCode::Left if w.field == 0 => {
                     w.key_source = w.key_source.cycled(false);
                     // The remembered entries belong to a source; the old
-                    // selection would index into a different list.
+                    // selection would index into a different list, and a
+                    // dismissed list was a different list too.
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
                 KeyCode::Right if w.field == 0 => {
                     w.key_source = w.key_source.cycled(true);
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                 }
                 // Enter inside the dropdown fills the field and stops there,
                 // as the request wizard's suggestion list does. Connecting on
@@ -4108,7 +4121,7 @@ impl TuiApp {
                 KeyCode::Enter if w.recent_sel.is_some() => {
                     if let Some(entry) = w
                         .recent_sel
-                        .and_then(|i| w.recent_entries().get(i).cloned())
+                        .and_then(|i| w.recent_matches().get(i).cloned())
                     {
                         w.key = Editor::new(&entry, false);
                         w.sync_fields();
@@ -4127,9 +4140,11 @@ impl TuiApp {
                 // The source row is a choice, not an editor: there is nothing
                 // for a keystroke to type into.
                 _ if w.field > 0 => {
-                    // Typing anything else closes the dropdown and edits the
-                    // field normally.
+                    // Typing anything else edits the field normally. The
+                    // dropdown follows what is typed rather than closing --
+                    // the text is the filter, as it is in the request wizard.
                     w.recent_sel = None;
+                    w.recent_hidden = false;
                     let ed = match w.field {
                         1 => &mut w.key,
                         2 => &mut w.workspace_ref,
