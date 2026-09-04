@@ -603,7 +603,8 @@ impl TuiApp {
             | MouseScrollTarget::WizardForm
             | MouseScrollTarget::WizardAsserts
             | MouseScrollTarget::WizardCaptures
-            | MouseScrollTarget::WizardReports => {
+            | MouseScrollTarget::WizardReports
+            | MouseScrollTarget::WizardComputed => {
                 self.on_key(Self::mouse_key(if dir < 0 {
                     KeyCode::Up
                 } else {
@@ -3807,6 +3808,15 @@ impl TuiApp {
                 (!n.is_empty() && !e.is_empty()).then_some((n, e))
             })
             .collect();
+        let generators: Vec<(String, String)> = form
+            .generators
+            .iter()
+            .filter_map(|r| {
+                let n = r.name.text().trim().to_string();
+                let e = r.expr.text().trim().to_string();
+                (!n.is_empty() && !e.is_empty()).then_some((n, e))
+            })
+            .collect();
 
         if let Some((ci, ei)) = form.editing {
             let Some(col) = self.collections.get_mut(ci) else {
@@ -3834,7 +3844,8 @@ impl TuiApp {
                 || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
-                || entry.reports != reports;
+                || entry.reports != reports
+                || entry.generators != generators;
             if changed {
                 entry.title = name;
                 entry.method = method;
@@ -3849,6 +3860,7 @@ impl TuiApp {
                 entry.asserts = asserts;
                 entry.captures = captures;
                 entry.reports = reports;
+                entry.generators = generators;
                 entry.modified = true;
             }
             col.invalidate_request_json();
@@ -3870,6 +3882,7 @@ impl TuiApp {
         entry.asserts = asserts;
         entry.captures = captures;
         entry.reports = reports;
+        entry.generators = generators;
         let target = form.target_idx.min(self.collections.len() - 1);
         // Requests added to a real collection (not the Scratch Space, tab 0) are
         // marked so they're distinguishable from those loaded from the file.
@@ -6836,10 +6849,10 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='9') = key.code {
-            // Alt+1..9 jumps directly to a section by number
+        } else if alt && let KeyCode::Char(c @ ('1'..='9' | '0')) = key.code {
+            // Alt+1..9 then Alt+0 jumps directly to a section by number
             // (Headers/Cookies/Queries/Options/Form/Body/Asserts/Captures/
-            // Reports), regardless of the current section-view tab — a
+            // Reports/Computed), regardless of the current section-view tab — a
             // direct-jump complement to Ctrl+Up/Down's sequential one. Alt
             // (not Ctrl) because Ctrl+<digit> has no standard control-code
             // encoding and most terminals only report it with a
@@ -6855,7 +6868,8 @@ impl TuiApp {
                 '6' => WizardTab::Body,
                 '7' => WizardTab::Asserts,
                 '8' => WizardTab::Captures,
-                _ => WizardTab::Reports, // '9'
+                '9' => WizardTab::Reports,
+                _ => WizardTab::Computed, // '0'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -7203,6 +7217,64 @@ impl TuiApp {
                     KeyCode::Backspace => form.reports[i].cell_mut(col).backspace(),
                     KeyCode::Home => form.reports[i].cell_mut(col).home(),
                     KeyCode::End => form.reports[i].cell_mut(col).end(),
+                    _ => {}
+                },
+                NewField::AddComputed => match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        form.generators.push(ReportRow::new());
+                        form.focus = NewField::Computed(form.generators.len() - 1, CapCol::Name);
+                    }
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
+                NewField::Computed(i, col) => match key.code {
+                    KeyCode::Up => {
+                        form.focus = if i > 0 {
+                            NewField::Computed(i - 1, col)
+                        } else {
+                            form.up_into_reports()
+                        };
+                    }
+                    KeyCode::Down => {
+                        form.focus = if i + 1 < form.generators.len() {
+                            NewField::Computed(i + 1, col)
+                        } else {
+                            NewField::AddComputed
+                        };
+                    }
+                    KeyCode::Left => {
+                        let at_start = form.generators[i].cell_mut(col).col == 0;
+                        if !at_start {
+                            if ctrl {
+                                form.generators[i].cell_mut(col).home();
+                            } else {
+                                form.generators[i].cell_mut(col).left();
+                            }
+                        } else if let Some(prev) = form.prev_cap_col(col) {
+                            form.generators[i].cell_mut(prev).end();
+                            form.focus = NewField::Computed(i, prev);
+                        }
+                    }
+                    KeyCode::Right => {
+                        let ed = form.generators[i].cell_mut(col);
+                        let at_end = ed.col >= ed.line_len(ed.row);
+                        if !at_end {
+                            if ctrl {
+                                form.generators[i].cell_mut(col).end();
+                            } else {
+                                form.generators[i].cell_mut(col).right();
+                            }
+                        } else if let Some(next) = form.next_cap_col(col) {
+                            form.generators[i].cell_mut(next).home();
+                            form.focus = NewField::Computed(i, next);
+                        }
+                    }
+                    KeyCode::Enter => form.focus_next(true, true),
+                    KeyCode::Char(ch) => form.generators[i].cell_mut(col).insert(ch),
+                    KeyCode::Backspace => form.generators[i].cell_mut(col).backspace(),
+                    KeyCode::Home => form.generators[i].cell_mut(col).home(),
+                    KeyCode::End => form.generators[i].cell_mut(col).end(),
                     _ => {}
                 },
                 _ => {

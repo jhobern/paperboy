@@ -16,6 +16,15 @@ pub(crate) struct Theme {
     pub(crate) subst: Color,
     /// Colour for a substitution that is still loading (pending secret): orange.
     pub(crate) pending: Color,
+    /// A value the request computes for itself at send time — a `# [Gen]`
+    /// row's result.
+    ///
+    /// Its own colour rather than reusing `ok`: green says "this has a value",
+    /// which for a computed name is not yet true. The placeholder is still
+    /// showing its braces, and the reason is different from every other reason
+    /// braces survive (loading, failed, undefined), so it reads as a fourth
+    /// thing rather than as a green value that inexplicably wasn't substituted.
+    pub(crate) computed: Color,
     /// Background for the app's own Request JSON / Response text selection
     /// highlight. Deliberately a flat, explicit colour rather than
     /// `Modifier::REVERSED` (simple fg/bg inversion): most terminals render
@@ -35,7 +44,7 @@ pub(crate) struct Theme {
 }
 
 /// Number of individually-editable colours in a theme.
-pub(crate) const THEME_COLOR_COUNT: usize = 15;
+pub(crate) const THEME_COLOR_COUNT: usize = 16;
 
 /// A named, serialisable theme definition. Colours are stored as RGB triples
 /// (not `ratatui::Color`) so they persist to `state.json` without depending on
@@ -58,6 +67,8 @@ pub(crate) struct ThemeSpec {
     pub(crate) err: [u8; 3],
     pub(crate) subst: [u8; 3],
     pub(crate) pending: [u8; 3],
+    /// A value computed at send time (see [`Theme::computed`]).
+    pub(crate) computed: [u8; 3],
     pub(crate) select_bg: [u8; 3],
     pub(crate) select_fg: [u8; 3],
     /// The wash behind an editable field.
@@ -98,6 +109,8 @@ impl<'de> Deserialize<'de> for ThemeSpec {
             err: [u8; 3],
             subst: [u8; 3],
             pending: [u8; 3],
+            #[serde(default)]
+            computed: Option<[u8; 3]>,
             select_bg: [u8; 3],
             select_fg: [u8; 3],
             #[serde(default)]
@@ -120,6 +133,10 @@ impl<'de> Deserialize<'de> for ThemeSpec {
             // (`dim`) and the GUI's old one (a shade of `panel`): either
             // extreme would visibly move one of the two front-ends.
             line: r.line.unwrap_or_else(|| blend(r.dim, r.panel, 0.5)),
+            // A theme saved before computed values existed keeps the colour it
+            // was drawn in then, which was `ok`. An upgrade repainting somebody's
+            // custom theme is a worse outcome than a colour they can change.
+            computed: r.computed.unwrap_or(r.ok),
             name: r.name,
             bg: r.bg,
             panel: r.panel,
@@ -149,6 +166,7 @@ impl ThemeSpec {
             err: c(self.err),
             subst: c(self.subst),
             pending: c(self.pending),
+            computed: c(self.computed),
             select_bg: c(self.select_bg),
             select_fg: c(self.select_fg),
             line: c(self.line),
@@ -167,11 +185,12 @@ impl ThemeSpec {
             6 => self.err,
             7 => self.subst,
             8 => self.pending,
-            9 => self.select_bg,
-            10 => self.select_fg,
-            11 => self.field,
-            12 => self.raised,
-            13 => self.sunken,
+            9 => self.computed,
+            10 => self.select_bg,
+            11 => self.select_fg,
+            12 => self.field,
+            13 => self.raised,
+            14 => self.sunken,
             _ => self.line,
         }
     }
@@ -187,11 +206,12 @@ impl ThemeSpec {
             6 => &mut self.err,
             7 => &mut self.subst,
             8 => &mut self.pending,
-            9 => &mut self.select_bg,
-            10 => &mut self.select_fg,
-            11 => &mut self.field,
-            12 => &mut self.raised,
-            13 => &mut self.sunken,
+            9 => &mut self.computed,
+            10 => &mut self.select_bg,
+            11 => &mut self.select_fg,
+            12 => &mut self.field,
+            13 => &mut self.raised,
+            14 => &mut self.sunken,
             _ => &mut self.line,
         };
         *slot = rgb;
@@ -236,6 +256,7 @@ fn graphite() -> ThemeSpec {
         err: [206, 99, 95],
         subst: [112, 172, 182],
         pending: [203, 157, 77],
+        computed: [164, 142, 214],
         select_bg: [58, 86, 120],
         select_fg: [236, 241, 247],
         field: [40, 45, 52],
@@ -259,6 +280,7 @@ fn midnight() -> ThemeSpec {
         err: [214, 104, 104],
         subst: [122, 176, 196],
         pending: [206, 158, 86],
+        computed: [158, 146, 226],
         select_bg: [48, 84, 124],
         select_fg: [234, 242, 252],
         field: [31, 39, 58],
@@ -282,6 +304,7 @@ fn evergreen() -> ThemeSpec {
         err: [206, 104, 96],
         subst: [122, 170, 180],
         pending: [202, 162, 84],
+        computed: [160, 148, 208],
         select_bg: [46, 90, 74],
         select_fg: [234, 244, 238],
         field: [34, 48, 44],
@@ -305,6 +328,7 @@ fn espresso() -> ThemeSpec {
         err: [212, 102, 86],
         subst: [150, 176, 170],
         pending: [216, 170, 90],
+        computed: [188, 156, 216],
         select_bg: [96, 72, 46],
         select_fg: [250, 242, 230],
         field: [49, 40, 34],
@@ -330,6 +354,7 @@ fn daylight() -> ThemeSpec {
         err: [186, 48, 44],
         subst: [18, 114, 124],
         pending: [160, 104, 16],
+        computed: [110, 70, 176],
         select_bg: [196, 220, 246],
         select_fg: [16, 20, 26],
         field: [238, 241, 246],
@@ -352,6 +377,7 @@ fn britannia() -> ThemeSpec {
         err: [226, 92, 88],
         subst: [118, 182, 196],
         pending: [214, 162, 72],
+        computed: [156, 142, 216],
         select_bg: [146, 116, 32],
         select_fg: [252, 248, 236],
         field: [31, 43, 79],
@@ -374,6 +400,7 @@ fn parisian_purple() -> ThemeSpec {
         err: [220, 100, 96],
         subst: [126, 178, 192],
         pending: [212, 164, 80],
+        computed: [210, 146, 198],
         select_bg: [96, 72, 140],
         select_fg: [244, 238, 250],
         field: [51, 42, 74],
@@ -397,6 +424,7 @@ fn dannebrog() -> ThemeSpec {
         err: [226, 96, 92],
         subst: [134, 178, 186],
         pending: [214, 164, 80],
+        computed: [162, 144, 216],
         select_bg: [150, 116, 52],
         select_fg: [252, 246, 236],
         field: [54, 38, 40],
@@ -422,11 +450,12 @@ pub(crate) fn color_label(s: &crate::i18n::Strings, i: usize) -> &'static str {
         6 => s.theme_c_err,
         7 => s.theme_c_subst,
         8 => s.theme_c_pending,
-        9 => s.theme_c_select_bg,
-        10 => s.theme_c_select_fg,
-        11 => s.theme_c_field,
-        12 => s.theme_c_raised,
-        13 => s.theme_c_sunken,
+        9 => s.theme_c_computed,
+        10 => s.theme_c_select_bg,
+        11 => s.theme_c_select_fg,
+        12 => s.theme_c_field,
+        13 => s.theme_c_raised,
+        14 => s.theme_c_sunken,
         _ => s.theme_c_line,
     }
 }
@@ -564,6 +593,9 @@ mod tests {
         assert_eq!(spec.raised, blend([40, 40, 60], [230, 230, 235], 0.06));
         assert_eq!(spec.sunken, blend([20, 20, 30], [0, 0, 0], 0.10));
         assert_eq!(spec.line, blend([140, 140, 150], [40, 40, 60], 0.5));
+        // Computed values were drawn in `ok` before they had a colour of their
+        // own, so a theme written back then keeps looking exactly as it did.
+        assert_eq!(spec.computed, [90, 170, 120]);
     }
 
     /// Every colour is reachable and settable by index, or the theme editors

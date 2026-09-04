@@ -62,8 +62,7 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
     match kind {
         SubstKind::Literal => th.subst,
         SubstKind::Loaded => th.ok,
-        // Green like a loaded value: it will have one, once the request is sent.
-        SubstKind::Computed => th.ok,
+        SubstKind::Computed => th.computed,
         SubstKind::Pending => th.pending,
         SubstKind::Failed => th.err,
         SubstKind::Undefined => th.err,
@@ -83,7 +82,7 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
-            (seen.computed, s.subst_hint_computed, th.ok),
+            (seen.computed, s.subst_hint_computed, th.computed),
         ] {
             if present {
                 ui.colored_label(color, format!("\u{25cf} {word}"));

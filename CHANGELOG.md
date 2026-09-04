@@ -60,6 +60,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   it, because "there is no function called `hmac_sha526`" is a far better way
   to learn of a typo than the 401 it would otherwise become.
 
+  The block is editable as a **Computed** section in the request wizard
+  (`Alt+0`, after Reports), with the same name/expression table the Reports
+  section uses, so a signature can be authored without dropping into the raw
+  file. Computed placeholders now draw in a theme colour of their own rather
+  than borrowing the "loaded" one — the two mean different things, and a
+  request that is waiting on a value it will compute reads differently from one
+  whose variables are already resolved. Themes saved before the colour existed
+  keep their old appearance rather than being repainted by the upgrade.
+
+  Importing from Postman now uses the block where it can. `{{$guid}}`,
+  `{{$randomUUID}}` and `{{$isoTimestamp}}` map to Hurl's own `{{newUuid}}` and
+  `{{newDate}}` and need nothing supplied at all; `{{$timestamp}}` and
+  `{{$randomInt}}` arrive as generated rows and simply work. The remainder are
+  still renamed and reported, because guessing at `$randomFirstName` would send
+  a plausible wrong value, and a request that quietly sends the wrong thing is
+  worse than one that refuses to run. A dynamic variable used twice in a request
+  yields a single row, since a name defined twice is a block whose meaning
+  depends on which row won.
+
 - **Import every Postman workspace at once.** The wizard could only ever take
   one workspace at a time, which is fine for trying PaperBoy out and useless
   for the thing people actually want it for: leaving Postman. An account with

@@ -13751,9 +13751,21 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         "reports start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "the `# [Gen]` block starts empty too"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(new_focus(&app), NewField::Name, "wraps back to the top");
 
     // And Ctrl+Up walks the same chain backward.
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "the `# [Gen]` block starts empty too"
+    );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
@@ -22736,6 +22748,99 @@ fn report_bind_without_collections_is_blocked() {
     assert!(app.overlay.is_none());
 }
 
+// ---- Computed values: the `# [Gen]` block in the request wizard ----
+
+/// Authoring a computed value end to end: reach the section, add a row, type a
+/// name and an expression, save, and find it on the entry — and in the `.hurl`
+/// the entry serialises to, since a block that only exists in memory is a
+/// block that vanishes on the next load.
+#[test]
+fn a_computed_value_authored_in_the_wizard_reaches_the_hurl_file() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    type_str(&mut app, "signed");
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "https://example.test/?n={{nonce}}");
+
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "Alt+0 opens the block"
+    );
+    press(&mut app, KeyCode::Enter); // add a row
+    assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Name));
+    type_str(&mut app, "nonce");
+    press(&mut app, KeyCode::Right); // Name -> Expression
+    type_str(&mut app, "random_hex(16)");
+    press(&mut app, KeyCode::F(2));
+
+    let entry = &app.collections[0].entries[0];
+    assert_eq!(
+        entry.generators,
+        vec![("nonce".to_string(), "random_hex(16)".to_string())]
+    );
+    let hurl = entry.to_hurl();
+    assert!(
+        hurl.contains("# [Gen] 1") && hurl.contains("# nonce = random_hex(16)"),
+        "the block is written to the file: {hurl}"
+    );
+}
+
+/// A half-filled row is dropped rather than saved: a name with no expression
+/// computes nothing, and an expression with no name binds nothing, so either
+/// would be a row that exists only to fail.
+#[test]
+fn a_computed_row_missing_a_half_is_not_saved() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    type_str(&mut app, "half");
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "https://example.test/");
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    press(&mut app, KeyCode::Enter);
+    type_str(&mut app, "nonce"); // name only, no expression
+    press(&mut app, KeyCode::F(2));
+    assert!(
+        app.collections[0].entries[0].generators.is_empty(),
+        "a nameless or expressionless row is not a generator"
+    );
+}
+
+/// Editing an existing request shows the block it already has, rather than
+/// silently dropping it on the next save.
+#[test]
+fn editing_a_request_keeps_the_block_it_arrived_with() {
+    let mut app = TuiApp::default();
+    let mut entry = crate::hurl::HurlEntry {
+        method: "GET".into(),
+        url: "https://example.test/".into(),
+        title: "signed".into(),
+        ..Default::default()
+    };
+    entry.generators = vec![("stamp".to_string(), "timestamp".to_string())];
+    app.collections[0].entries.push(entry);
+    app.collections[0].selected_entry = 0;
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the edit wizard on the selection
+    assert_eq!(
+        form_ref(&app).generators.len(),
+        1,
+        "the wizard loaded the existing block"
+    );
+    assert_eq!(form_ref(&app).generators[0].name.text(), "stamp");
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(
+        app.collections[0].entries[0].generators,
+        vec![("stamp".to_string(), "timestamp".to_string())],
+        "and saving without touching it changes nothing"
+    );
+}
+
 // ---- P1b: [Reports] section authoring in the request wizard ----
 
 #[test]
@@ -22765,10 +22870,12 @@ fn tab_reaches_the_reports_section_after_captures() {
     press(&mut app, KeyCode::Tab); // -> AddCapture
     press(&mut app, KeyCode::Tab); // -> AddReport
     assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::Tab); // -> AddComputed (the `# [Gen]` block)
+    assert_eq!(new_focus(&app), NewField::AddComputed);
     press(&mut app, KeyCode::Tab); // wraps back to Name
     assert_eq!(new_focus(&app), NewField::Name);
-    press(&mut app, KeyCode::BackTab); // Shift+Tab returns to AddReport
-    assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::BackTab); // Shift+Tab returns to AddComputed
+    assert_eq!(new_focus(&app), NewField::AddComputed);
 }
 
 #[test]

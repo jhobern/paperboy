@@ -118,6 +118,9 @@ cargo test                          # add --features gui for the GUI's tests
   collection, loops over environments or data, and writes CSV/JSON/HTML/XLSX.
   Editable as text or as [blocks](#the-papertrail-block-editor); runnable from
   the UI or [headlessly](#reports).
+- **Computed value** — a `# [Gen]` row: an expression evaluated just before a
+  request is sent, supplying the nonces, timestamps and signatures a pre-request
+  script used to. See [Computed values](#computed-values).
 - **Scratch Space** — tab 0. A collection with no file behind it until you save
   it.
 - **Request names encode folders.** `Auth/Tokens/Refresh` browses as a folder
@@ -290,6 +293,75 @@ A variable that is *defined but empty* is not undefined and warns about nothing
 — it substitutes as an empty string. With Basic Auth that produces a
 well-formed request that comes back `401`.
 
+## Computed values
+
+Some values can't be written down: a nonce, a timestamp, an HMAC over the two.
+Postman uses a pre-request script; PaperBoy uses a `# [Gen]` block of named
+expressions, evaluated immediately before the request is sent.
+
+```hurl
+# [Gen] 3
+# nonce = random_hex(16)
+# ts = timestamp
+# sig = hmac_sha256_b64(API_SECRET, concat(nonce, ts))
+POST https://api.example.com/orders
+X-Nonce: {{nonce}}
+X-Timestamp: {{ts}}
+Authorization: HMAC {{sig}}
+```
+
+The expressions stay in comments and the request refers to results as ordinary
+`{{name}}` placeholders, so the file remains a plain `.hurl` file: stock `hurl`
+parses it byte for byte and runs it given `--variable nonce=… --variable sig=…`.
+Nothing else could work — Hurl reads a placeholder only as far as the first
+character outside `A-Za-z0-9_-` and discards the rest silently, so
+`{{ hmac_sha256(K, M) }}` would be sent as the value of `hmac_sha256`. PaperBoy
+now refuses to save such a placeholder rather than let it truncate.
+
+A bare identifier is a variable reference — an environment variable, a request
+parameter, or an earlier row in the same block. Calls nest. Rows are evaluated
+in order and a row may only refer to one above it. Values are computed per run,
+never previewed, and never written to `state.json`; a secret read through
+`{{ op://… }}` is no more exposed by signing with it than by sending it.
+
+Edit the block in the request wizard's **Computed** section (`Alt+0`), or as
+text. Placeholders that a generator will fill render in the theme's *computed*
+colour and keep their braces, because the value doesn't exist yet.
+
+| | |
+|---|---|
+| Time | `timestamp`, `timestamp_ms`, `iso8601`, `date(fmt)` (strftime, UTC) |
+| Random | `uuid`, `counter`, `random_int(lo, hi)`, `random_hex(n)`, `random_alnum(n)`, `random_base64(n)` |
+| Encoding | `base64`, `base64url`, `base64_decode`, `hex`, `urlencode`, `urldecode`, `json_string` |
+| Hashes | `md5`, `sha1`, `sha256`, `sha512` |
+| MACs | `hmac_sha1(key, msg)`, `hmac_sha256`, `hmac_sha512` |
+| Text | `concat(…)`, `upper`, `lower`, `trim` |
+
+Every hash and MAC returns lowercase hex — matching `sha256sum` and CryptoJS's
+`.toString()`, so a ported Postman script lands right — and each has a `_b64`
+variant returning standard padded Base64. The encoding is in the name rather
+than a default because a signature in the wrong one is the right length,
+entirely plausible to look at, and rejected with the same `401` as a wrong
+secret. Note that `base64(sha256(m))` is *not* `sha256_b64(m)`: the first
+encodes 64 hex characters, the second the 32 bytes they spell.
+
+**Canonicalisation is yours.** PaperBoy signs exactly the bytes you assemble; it
+will not build a canonical request from the live headers, so AWS SigV4 and
+friends are out of scope. Chaining a MAC into the *key* of the next one isn't
+expressible either, since every value here is text.
+
+A row that fails — unknown function, wrong arity, a name nothing defines —
+reports rather than blocks the send. It binds nothing, so `{{sig}}` goes out
+literally and comes back a loud `401`, which is easier to diagnose than a
+refusal.
+
+Importing from Postman maps the dynamic variables that have an exact equivalent:
+`$guid`/`$randomUUID` and `$isoTimestamp` become Hurl's own `{{newUuid}}` and
+`{{newDate}}`, while `$timestamp` and `$randomInt` become `[Gen]` rows. The rest
+are renamed and listed in `CONVERSION-NOTES.md` as values you must supply —
+guessing at `$randomFirstName` would send a plausible wrong value, which is
+harder to notice than a request that won't run.
+
 ## Git remotes
 
 Load and save collections, environments and whole workspaces straight from a
@@ -390,6 +462,9 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 - **Collection variables**, which have nowhere to live in a `.hurl` file, as
   `<name> (collection variables).vars` beside the environments.
 - `pm.<store>.set("NAME", body.a.b)` calls in test scripts, as `[Captures]`.
+- **Dynamic variables.** `{{$guid}}` and `{{$isoTimestamp}}` become Hurl's own
+  `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}` and `{{$randomInt}}` become
+  [computed values](#computed-values). The rest are listed as values to supply.
 
 Hurl doesn't cover everything Postman does. Anything dropped — pre-request
 scripts, OAuth 2, GraphQL bodies — is listed per request in

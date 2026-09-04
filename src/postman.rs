@@ -765,13 +765,26 @@ fn walk_items(
             apply_path_variables(&title, &req.url, &mut entry, out);
             apply_oauth2(&title, token_path, auth, &mut entry, tokens, out);
             note_losses(&title, req, &it.event, auth, profile, &entry, out);
-            for name in rename_dynamic_variables(&mut entry) {
+            for (name, fate) in rename_dynamic_variables(&mut entry) {
+                let detail = match fate {
+                    DynamicFate::Builtin(f) => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; Hurl generates the same \
+                         thing, so it became `{{{{{f}}}}}` and still needs nothing supplied"
+                    ),
+                    DynamicFate::Computed(expr) => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; it is now computed by this \
+                         request's `[Gen]` block as `{expr}`, once per send rather than once per \
+                         use"
+                    ),
+                    DynamicFate::Supplied => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; nothing here can produce it, \
+                         so it became the variable `{{{{{plain}}}}}`, which has to be supplied",
+                        plain = name.replace('.', "_")
+                    ),
+                };
                 out.notes.push(ConversionNote {
                     item: title.clone(),
-                    detail: format!(
-                        "Postman generated `{{{{${name}}}}}` for you; Hurl has no equivalent, so it \
-                         became the variable `{{{{{name}}}}}`, which has to be supplied"
-                    ),
+                    detail,
                 });
             }
             out.entries.push(entry);
@@ -1150,31 +1163,84 @@ fn apply_path_variables(
     }
 }
 
-/// Postman's *dynamic variables* — `{{$guid}}`, `{{$randomInt}}`,
-/// `{{$timestamp}}` — are values it generates at send time. Hurl has no such
-/// thing, and worse, a `$` is not legal in a Hurl template name: one
-/// `{{$guid}}` anywhere in a collection made the whole converted file fail to
-/// parse ("parsing template variable"), so every request in it was lost, not
-/// just the one that used it.
+/// What became of one of Postman's *dynamic variables* — `{{$guid}}`,
+/// `{{$timestamp}}`, `{{$randomInt}}` — the values it makes up at send time.
+enum DynamicFate {
+    /// Hurl generates the same thing itself, so the placeholder becomes its
+    /// built-in and needs nothing else. The most portable outcome there is:
+    /// stock `hurl` runs it with no variables supplied at all.
+    Builtin(&'static str),
+    /// A `# [Gen]` row now computes it. Carries the expression written into the
+    /// block.
+    Computed(&'static str),
+    /// Nothing here produces it, so it becomes an ordinary variable the user
+    /// has to supply.
+    Supplied,
+}
+
+/// What PaperBoy can do about `$name`.
 ///
-/// Each is rewritten to an ordinary variable of the same name without the `$`
-/// (`{{$guid}}` → `{{guid}}`), which parses, runs as soon as the value is
-/// supplied, and stays readable as the thing it was. Dotted forms
-/// (`{{$processEnv.HOME}}`) fold their dots into underscores for the same
-/// reason. Returns the names rewritten, so each can be noted.
-fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
+/// Only the handful whose meaning is exact and unambiguous are claimed. Guessing
+/// at `$randomFirstName` would be worse than saying it has to be supplied: a
+/// request that sends a plausible wrong value is harder to notice than one that
+/// refuses to run.
+fn dynamic_fate(name: &str) -> DynamicFate {
+    match name {
+        // Hurl's own generators, so no `# [Gen]` block is needed at all.
+        "guid" | "randomUUID" => DynamicFate::Builtin("newUuid"),
+        "isoTimestamp" => DynamicFate::Builtin("newDate"),
+        // `$timestamp` is Unix *seconds*, which `newDate` is not — it renders
+        // ISO 8601. Close enough to reach for by mistake, so it is spelled out.
+        "timestamp" => DynamicFate::Computed("timestamp"),
+        // Postman documents `$randomInt` as 0 to 1000 inclusive.
+        "randomInt" => DynamicFate::Computed("random_int(0, 1000)"),
+        _ => DynamicFate::Supplied,
+    }
+}
+
+/// Rewrite Postman's dynamic variables into something Hurl can read, and where
+/// possible into something that actually produces a value.
+///
+/// A `$` is not legal in a Hurl template name, and the failure was not local:
+/// one `{{$guid}}` anywhere in a collection made the whole converted file fail
+/// to parse ("parsing template variable"), so every request in it was lost, not
+/// just the one that used it. Renaming is therefore not optional.
+///
+/// Where the value has an exact equivalent it is *supplied* rather than merely
+/// renamed — `{{$guid}}` becomes Hurl's own `{{newUuid}}`, `{{$timestamp}}`
+/// becomes a `# [Gen]` row — so the request runs on import instead of stopping
+/// on a variable nobody can fill in. Everything else keeps its name without the
+/// `$` (`{{$randomFirstName}}` → `{{randomFirstName}}`), which parses and stays
+/// readable as the thing it was; dotted forms (`{{$processEnv.HOME}}`) fold
+/// their dots into underscores for the same reason.
+///
+/// Returns each original `$name` and its fate, so every one can be noted.
+fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<(String, DynamicFate)> {
     static DYNAMIC_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{\{\s*\$([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}").unwrap());
 
-    let mut found: Vec<String> = Vec::new();
+    let mut found: Vec<(String, DynamicFate)> = Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
     let mut fix = |text: &mut String| {
         if !text.contains("{{") {
             return;
         }
         let replaced = DYNAMIC_RE.replace_all(text, |caps: &regex::Captures| {
-            let name = caps[1].replace('.', "_");
-            if !found.contains(&name) {
-                found.push(name.clone());
+            let raw = &caps[1];
+            let fate = dynamic_fate(raw);
+            // The name a `$`-less Hurl template can carry.
+            let plain = raw.replace('.', "_");
+            let name = match fate {
+                DynamicFate::Builtin(f) => f.to_string(),
+                _ => plain.clone(),
+            };
+            if let DynamicFate::Computed(expr) = fate
+                && !rows.iter().any(|(n, _)| *n == name)
+            {
+                rows.push((name.clone(), expr.to_string()));
+            }
+            if !found.iter().any(|(n, _)| n == raw) {
+                found.push((raw.to_string(), fate));
             }
             format!("{{{{{name}}}}}")
         });
@@ -1201,6 +1267,14 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
     if let Some((user, pass)) = entry.basic_auth.as_mut() {
         fix(user);
         fix(pass);
+    }
+    // Appended rather than assigned: a converted entry could already carry a
+    // block from elsewhere, and a name defined twice is a block that reads
+    // differently depending on which row won.
+    for (name, expr) in rows {
+        if !entry.generators.iter().any(|(n, _)| *n == name) {
+            entry.generators.push((name, expr));
+        }
     }
     found
 }
@@ -2963,8 +3037,15 @@ mod inheritance_tests {
         let converted = convert_postman(json);
         let hurl = crate::hurl::collection_to_hurl(&converted.entries);
         assert!(!hurl.contains("{{$"), "a `$` is not a legal name: {hurl}");
-        assert!(hurl.contains("{{guid}}"), "{hurl}");
+        assert!(
+            hurl.contains("{{newUuid}}"),
+            "a GUID is something Hurl generates itself: {hurl}"
+        );
         assert!(hurl.contains("{{timestamp}}"), "{hurl}");
+        assert!(
+            hurl.contains("# [Gen] 1") && hurl.contains("# timestamp = timestamp"),
+            "a Unix timestamp is computed rather than left to be supplied: {hurl}"
+        );
         assert!(hurl.contains("{{processEnv_HOME}}"), "{hurl}");
         assert_eq!(
             crate::hurl::parse_hurl(&hurl).len(),
@@ -2979,7 +3060,70 @@ mod inheritance_tests {
             converted
                 .notes
                 .iter()
-                .any(|n| n.detail.contains("{{guid}}"))
+                .any(|n| n.detail.contains("{{newUuid}}") && n.detail.contains("nothing supplied")),
+            "the GUID note says it needs nothing: {:?}",
+            converted.notes
+        );
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("{{processEnv_HOME}}")
+                    && n.detail.contains("has to be supplied")),
+            "the one nothing can produce still says so: {:?}",
+            converted.notes
+        );
+    }
+
+    /// The values PaperBoy can now actually produce. Before the `# [Gen]`
+    /// block existed every one of these imported as a variable nobody could
+    /// fill in, so the request arrived unrunnable.
+    #[test]
+    fn the_generated_values_paperboy_can_produce_are_produced() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/?n={{$randomInt}}&u={{$randomUUID}}",
+            "header": [ { "key": "X-At", "value": "{{$isoTimestamp}}" } ] } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let entry = &converted.entries[0];
+        assert_eq!(
+            entry.generators,
+            vec![("randomInt".to_string(), "random_int(0, 1000)".to_string())],
+            "only the one Hurl can't generate itself needs a row"
+        );
+        assert!(entry.url.contains("{{newUuid}}"), "{}", entry.url);
+        assert_eq!(entry.headers[0].value, "{{newDate}}");
+
+        // Portability is the whole point of preferring the built-ins: the file
+        // must still read back as Hurl, block and all.
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        let back = crate::hurl::parse_hurl(&hurl);
+        assert_eq!(back.len(), 1, "{:?}", crate::hurl::parse_hurl_error(&hurl));
+        assert_eq!(back[0].generators, entry.generators, "the block survives");
+    }
+
+    /// One `$name` used twice is one row, not two — a name defined twice is a
+    /// block whose meaning depends on which row won.
+    #[test]
+    fn a_generated_value_used_twice_declares_one_row() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/?a={{$timestamp}}&b={{$timestamp}}",
+            "header": [ { "key": "X-At", "value": "{{$timestamp}}" } ] } } ]
+        }"#;
+        let converted = convert_postman(json);
+        assert_eq!(
+            converted.entries[0].generators,
+            vec![("timestamp".to_string(), "timestamp".to_string())]
+        );
+        assert_eq!(
+            converted.notes.len(),
+            1,
+            "and it is reported once: {:?}",
+            converted.notes
         );
     }
 

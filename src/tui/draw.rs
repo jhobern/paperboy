@@ -3101,12 +3101,12 @@ pub(crate) fn draw_env_popup(
 fn subst_color(kind: crate::request::SubstKind, th: &Theme) -> Color {
     use crate::request::SubstKind;
     match kind {
-        SubstKind::Literal => th.subst,   // cyan
-        SubstKind::Loaded => th.ok,       // green
-        SubstKind::Computed => th.ok,     // green (a value it will have, once sent)
-        SubstKind::Pending => th.pending, // orange
-        SubstKind::Failed => th.err,      // red
-        SubstKind::Undefined => th.err,   // red
+        SubstKind::Literal => th.subst,     // cyan
+        SubstKind::Loaded => th.ok,         // green
+        SubstKind::Computed => th.computed, // violet: a value it will have, once sent
+        SubstKind::Pending => th.pending,   // orange
+        SubstKind::Failed => th.err,        // red
+        SubstKind::Undefined => th.err,     // red
     }
 }
 
@@ -3613,7 +3613,7 @@ pub(crate) fn draw_collection_main(
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
-            (seen.computed, s.subst_hint_computed, th.ok),
+            (seen.computed, s.subst_hint_computed, th.computed),
         ];
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (present, word, color) in segments {

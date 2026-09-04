@@ -837,6 +837,7 @@ pub(crate) enum MouseScrollTarget {
     WizardAsserts,
     WizardCaptures,
     WizardReports,
+    WizardComputed,
     OverlayList,
     BrowserList,
     WorkspacePicker,
@@ -928,6 +929,10 @@ impl MouseHitTarget {
             MouseHitTarget::NewRequestField(NewField::Capture(..))
             | MouseHitTarget::NewRequestActivate(NewField::AddCapture) => {
                 Some(MouseScrollTarget::WizardCaptures)
+            }
+            MouseHitTarget::NewRequestField(NewField::Computed(..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddComputed) => {
+                Some(MouseScrollTarget::WizardComputed)
             }
             MouseHitTarget::NewRequestField(NewField::Report(..))
             | MouseHitTarget::NewRequestActivate(NewField::AddReport) => {

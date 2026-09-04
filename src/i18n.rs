@@ -84,6 +84,7 @@ strings! {
     theme_c_err => "Error", "Erreur", "Fejl";
     theme_c_subst => "Substitution", "Substitution", "Substitution";
     theme_c_pending => "Pending", "En attente", "Afventer";
+    theme_c_computed => "Computed", "Calculé", "Beregnet";
     theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
     theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
     theme_c_field => "Field background", "Fond des champs", "Feltbaggrund";
@@ -249,6 +250,7 @@ strings! {
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
     field_reports => "Reports", "Rapports", "Rapporter";
+    field_computed => "Computed", "Calculé", "Beregnet";
     tab_all => "All", "Tout", "Alle";
     hdr_key => "Key", "Clé", "Nøgle";
     hdr_value => "Value", "Valeur", "Værdi";
@@ -285,10 +287,13 @@ strings! {
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
     add_report => "\u{FF0B} Add report field", "\u{FF0B} Ajouter un champ de rapport", "\u{FF0B} Tilføj rapportfelt";
+    add_computed => "\u{FF0B} Add computed value", "\u{FF0B} Ajouter une valeur calculée", "\u{FF0B} Tilføj beregnet værdi";
     cap_name => "Name", "Nom", "Navn";
     cap_expr => "Expression", "Expression", "Udtryk";
     report_name => "Name", "Nom", "Navn";
     report_expr => "Expression", "Expression", "Udtryk";
+    computed_name => "Name", "Nom", "Navn";
+    computed_expr => "Expression", "Expression", "Udtryk";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
