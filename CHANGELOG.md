@@ -86,6 +86,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A `{{ variable.name }}` Hurl would quietly mangle is now refused instead of
+  sent.** Hurl reads a variable name only as far as the first character outside
+  letters, digits, `_` and `-`, and then discards the rest without a word — so
+  `{{ api.key }}` went on the wire as the value of `api`. PaperBoy's own
+  substitution accepts the dotted name happily, which meant the request preview
+  showed the correct value while the server was asked something else entirely,
+  and the only symptom was an answer that made no sense. Sending is now blocked,
+  and the message names the placeholder and what Hurl would have made of it
+  (`{{ api.key }} → api`). A name Hurl can't read at all — `{{ $timestamp }}`
+  pasted out of Postman, say — is caught in the same place, rather than
+  surfacing later as a collection that loads as nothing. Hurl's own
+  `{{ newUuid }}` and `{{ newDate }}` are unaffected.
+
 - The Postman importer's allowance line stopped flickering between two
   unrelated numbers. Postman meters listing calls (10 per 10 seconds) and fetch
   calls (300 per minute) as separate accounts, and an import draws on both

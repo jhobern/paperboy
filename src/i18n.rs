@@ -853,6 +853,12 @@ strings! {
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     body_form_conflict_status => "✖ Not sent — a raw body and form fields can't both be sent:", "✖ Non envoyé — un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble :", "✖ Ikke sendt — en rå brødtekst og formularfelter kan ikke sendes sammen:";
     body_form_conflict_hint => "✖ A raw body and form fields can't both be sent — remove one", "✖ Un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble — supprimez-en un", "✖ En rå brødtekst og formularfelter kan ikke sendes sammen — fjern det ene";
+    // Hurl reads a variable name as far as the first character outside
+    // `A-Z a-z 0-9 _ -` and silently ignores the rest, so `{{ api.key }}` is
+    // sent as the value of `api`. Named as "sent as" because the point the user
+    // has to grasp is that the text is not what goes on the wire.
+    truncated_placeholder_status => "✖ Not sent — Hurl reads only part of these variable names:", "✖ Non envoyé — Hurl ne lit qu'une partie de ces noms de variables :", "✖ Ikke sendt — Hurl læser kun en del af disse variabelnavne:";
+    truncated_placeholder_hint => "Hurl variable names allow only letters, digits, _ and -", "Les noms de variables Hurl n'acceptent que lettres, chiffres, _ et -", "Hurl-variabelnavne tillader kun bogstaver, cifre, _ og -";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -1679,6 +1685,16 @@ pub enum Status {
     /// form). Blocking rather than advisory: the request would otherwise appear
     /// to succeed.
     BodyFormConflict(Vec<String>),
+    /// The run was refused because these placeholders don't mean on the wire
+    /// what they say on the screen: Hurl reads a variable name only as far as
+    /// the first character outside `A-Z a-z 0-9 _ -`, and drops the remainder
+    /// without complaint. Each string is `{{written}} → name` (or just the
+    /// placeholder, when Hurl can't read a name from it at all).
+    ///
+    /// Blocking, like [`Status::BodyFormConflict`] and unlike
+    /// [`Status::UndefinedVars`]: the request would otherwise be sent, be
+    /// answered, and be wrong.
+    TruncatedPlaceholders(Vec<String>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -1996,6 +2012,14 @@ impl Status {
             }
             Status::BodyFormConflict(names) => {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))
+            }
+            Status::TruncatedPlaceholders(items) => {
+                format!(
+                    "{} {} — {}",
+                    s.truncated_placeholder_status,
+                    items.join(", "),
+                    s.truncated_placeholder_hint
+                )
             }
             Status::EnvVarReloading(key) => format!("{} {key}…", s.env_reloading_var),
             Status::EnvActivated(name) => format!("{} {name}", s.env_activated),

@@ -274,6 +274,109 @@ pub fn value_problem(value: &str) -> Option<char> {
         .find(|c| matches!(c, '\n' | '\r' | '\t' | '\\'))
 }
 
+/// What Hurl will make of a `{{…}}` placeholder — which is not always what
+/// PaperBoy makes of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceholderProblem {
+    /// Hurl reads a name off the front and silently drops the rest. Carries the
+    /// placeholder as written and the name Hurl actually resolves.
+    Truncated { written: String, read: String },
+    /// Hurl can't read a name at all, so the whole file fails to parse and the
+    /// collection loads as nothing.
+    Unparsable { written: String },
+}
+
+/// The first character Hurl will carry in a `{{name}}`, per `hurl_core`'s
+/// `parser::expr::variable_name`: alphanumeric (Unicode — `{{Ké}}` is fine),
+/// `_` or `-`. Notably *not* `.`, and not `$`.
+fn hurl_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Characters that don't truncate a placeholder but end the template early, so
+/// the file fails to parse rather than sending the wrong thing.
+///
+/// `hurl_core`'s `parser::string::any_char` refuses these outright, and `#`
+/// additionally closes an unquoted template (it opens a comment). Unquoted is
+/// the only kind that matters here: [`for_each_wire_text`] covers URLs and row
+/// values, which PaperBoy always writes unquoted. Inside a *quoted* template —
+/// an assert, say — `#` is ordinary text, but asserts are stored as raw source
+/// and never scanned.
+///
+/// [`value_problem`] already refuses `\n`, `\r`, `\t` and `\` in a row value,
+/// so for values this is a second line of defence; a URL has no such check.
+fn hurl_template_stopper(c: char) -> bool {
+    matches!(c, '\\' | '\u{8}' | '\n' | '\u{c}' | '\r' | '\t' | '#')
+}
+
+/// How Hurl reads the placeholder whose contents (between the braces) are
+/// `inner`, when that differs from how PaperBoy reads it.
+///
+/// The two really do differ, and dangerously. PaperBoy's own
+/// [`PLACEHOLDER`](crate::environment) pattern takes any brace-free text
+/// between the braces, so `{{ api.key }}` resolves perfectly well in the
+/// request preview. Hurl's grammar is much narrower — a name is a run of
+/// alphanumerics, `_` and `-` — and `hurl_core`'s `templatize` parses the
+/// expression out of the placeholder *without checking that it consumed all of
+/// it*, discarding the remainder without a word. `{{ api.key }}` therefore goes
+/// on the wire as the value of `api`, and `{{ api.key }}` in the preview beside
+/// it says everything is fine.
+///
+/// So this is checked at the point of use rather than left to Hurl: a truncated
+/// placeholder makes a request *succeed* having sent the wrong thing, which is
+/// the same reason [`HurlEntry::body_form_conflict`] blocks a run instead of
+/// warning about it. A name Hurl can't read at all is caught here too, because
+/// the failure it causes is "the collection is empty" several steps away from
+/// the line responsible.
+///
+/// Hurl's own two placeholder functions, `{{ newUuid }}` and `{{ newDate }}`,
+/// are ordinary names to this test and pass it unchanged.
+pub fn placeholder_problem(inner: &str) -> Option<PlaceholderProblem> {
+    let written = format!("{{{{{inner}}}}}");
+    // Hurl skips spaces on both sides of the name. Not tabs: `zero_or_more_spaces`
+    // would take one, but a tab never survives long enough to reach it — it ends
+    // the template first (see `hurl_template_stopper`).
+    let body = inner.trim_matches(' ');
+    if body.chars().any(hurl_template_stopper) {
+        return Some(PlaceholderProblem::Unparsable { written });
+    }
+    let name: String = body.chars().take_while(|c| hurl_name_char(*c)).collect();
+    if name.is_empty() {
+        return Some(PlaceholderProblem::Unparsable { written });
+    }
+    if name.len() == body.len() {
+        return None;
+    }
+    Some(PlaceholderProblem::Truncated {
+        written,
+        read: name,
+    })
+}
+
+/// Every placeholder in `text` that Hurl would read differently from PaperBoy,
+/// in the order written.
+///
+/// The scan mirrors `hurl_core`'s `templatize`: a placeholder opens at `{{` and
+/// closes at the first following `}}`, and anything in between is its contents.
+pub fn placeholder_problems(text: &str) -> Vec<PlaceholderProblem> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            // An unterminated `{{` is a parse error in Hurl, but `key_problem`
+            // already reports that one against the row it appears in; saying it
+            // twice, in two vocabularies, would be worse than saying it once.
+            break;
+        };
+        if let Some(p) = placeholder_problem(&after[..close]) {
+            out.push(p);
+        }
+        rest = &after[close + 2..];
+    }
+    out
+}
+
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
 /// as a real filesystem path (spaces and other characters unescaped, as the
 /// file picker produces), but Hurl's filename grammar requires a backslash
@@ -1835,5 +1938,116 @@ mod tests {
         let back = crate::hurl::parse_hurl(&e.to_hurl());
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].method, "GET");
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    /// What `hurl_core` *actually* does with `{{inner}}`, discovered by asking
+    /// it, rather than by reading its grammar and hoping. Returns the variable
+    /// name Hurl resolves, or `None` if the file doesn't parse.
+    ///
+    /// This is the whole point of the test below: [`placeholder_problem`]
+    /// encodes a rule about someone else's parser, so it is checked against
+    /// that parser. If a future Hurl tightens the grammar (or fixes the silent
+    /// truncation — `templatize` parses the expression out of a placeholder
+    /// without checking it consumed all of it, which is arguably a bug
+    /// upstream), this test fails and says so, instead of PaperBoy quietly
+    /// refusing placeholders that had become perfectly valid.
+    fn hurl_reads(inner: &str) -> Option<String> {
+        let text = format!("GET http://h/{{{{{inner}}}}}\n");
+        let file = hurl_core::parser::parse_hurl_file(&text).ok()?;
+        let url = file.entries[0].request.url.to_string();
+        let start = url.find("{{")?;
+        let rest = &url[start + 2..];
+        let end = rest.find("}}")?;
+        Some(rest[..end].to_string())
+    }
+
+    #[test]
+    fn the_truncation_rule_matches_what_hurl_actually_does() {
+        // Fine: Hurl reads the whole name.
+        for inner in [
+            "TOKEN", " TOKEN ", "api_key", "api-key", "x1", "Ké",
+            // Hurl's own two placeholder functions are ordinary names to this
+            // test, and must not be flagged.
+            "newUuid", "newDate",
+        ] {
+            assert_eq!(
+                placeholder_problem(inner),
+                None,
+                "{inner:?} should be clean"
+            );
+            assert_eq!(
+                hurl_reads(inner).as_deref(),
+                Some(inner.trim_matches([' ', '\t'])),
+                "hurl disagrees about {inner:?}"
+            );
+        }
+
+        // Truncated: Hurl takes a prefix and discards the rest in silence.
+        // `api.key` is the one that matters — PaperBoy's own substitution
+        // resolves it, so preview and wire disagree with nothing to show for it.
+        for (inner, read) in [
+            ("api.key", "api"),
+            (" api.key ", "api"),
+            ("gen.uuid", "gen"),
+            ("a b", "a"),
+            ("hmac(k, m)", "hmac"),
+            ("TOKEN!", "TOKEN"),
+        ] {
+            assert_eq!(
+                placeholder_problem(inner),
+                Some(PlaceholderProblem::Truncated {
+                    written: format!("{{{{{inner}}}}}"),
+                    read: read.to_string(),
+                }),
+                "{inner:?} should be truncated"
+            );
+            assert_eq!(
+                hurl_reads(inner).as_deref(),
+                Some(read),
+                "hurl disagrees about {inner:?}"
+            );
+        }
+
+        // Unparsable: either no name at all, or a character that ends the
+        // template early (a tab, or the `#` that opens a comment) — so the
+        // whole *file* fails to load, which is why this is worth naming at the
+        // placeholder rather than leaving as "the collection is empty".
+        for inner in ["$guid", "", " ", ".x", "!", "\tTOKEN\t", "TOKEN\t", "a#b"] {
+            assert_eq!(
+                placeholder_problem(inner),
+                Some(PlaceholderProblem::Unparsable {
+                    written: format!("{{{{{inner}}}}}"),
+                }),
+                "{inner:?} should be unparsable"
+            );
+            assert_eq!(hurl_reads(inner), None, "hurl disagrees about {inner:?}");
+        }
+    }
+
+    #[test]
+    fn every_placeholder_in_a_line_is_checked_in_order() {
+        let found = placeholder_problems("{{ok}}/{{a.b}}?t={{ok2}}&u={{c.d}}");
+        assert_eq!(
+            found,
+            vec![
+                PlaceholderProblem::Truncated {
+                    written: "{{a.b}}".into(),
+                    read: "a".into()
+                },
+                PlaceholderProblem::Truncated {
+                    written: "{{c.d}}".into(),
+                    read: "c".into()
+                },
+            ]
+        );
+        assert!(placeholder_problems("nothing templated here").is_empty());
+        // An unterminated `{{` is left to `key_problem`, which already reports
+        // it against the row it appears in.
+        assert!(placeholder_problems("{{ unterminated").is_empty());
     }
 }

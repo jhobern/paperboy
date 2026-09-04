@@ -1832,6 +1832,13 @@ impl TuiApp {
             self.status = Some(Status::BodyFormConflict(conflicts));
             return;
         }
+        // Refused for the same reason: a truncated `{{ api.key }}` is sent as
+        // `api` and answered, so nothing about the response says it was wrong.
+        let truncated = request::truncated_placeholders(&self.collections[col_idx]);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
+            return;
+        }
         let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
         self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
@@ -1887,6 +1894,11 @@ impl TuiApp {
         let conflicts = request::body_form_conflicts_all(col);
         if !conflicts.is_empty() {
             self.status = Some(Status::BodyFormConflict(conflicts));
+            return;
+        }
+        let truncated = request::truncated_placeholders_all(col);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
             return;
         }
         let undefined = request::undefined_request_keys_all(col, env.as_ref());

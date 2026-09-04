@@ -12925,6 +12925,77 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ── Placeholders Hurl reads differently ───────────────────────────
+
+/// `{{ api.key }}` is refused rather than sent. PaperBoy's own substitution
+/// resolves the dotted name perfectly well, so the request preview shows the
+/// right value while Hurl puts the value of `api` on the wire — a request that
+/// is answered, and wrong, with nothing anywhere to say so.
+#[test]
+fn sending_a_request_whose_placeholder_hurl_would_truncate_is_refused() {
+    let entry = HurlEntry {
+        title: "Fetch".to_string(),
+        method: "GET".to_string(),
+        url: "http://127.0.0.1:1/x?k={{ api.key }}".to_string(),
+        ..Default::default()
+    };
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+    app.active_tab = 1;
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+
+    match &app.status {
+        Some(crate::i18n::Status::TruncatedPlaceholders(items)) => {
+            // The message has to show what it *becomes*: the whole difficulty
+            // is that the text as written looks correct.
+            assert_eq!(items, &vec!["{{ api.key }} \u{2192} api".to_string()]);
+        }
+        other => panic!("expected the run to be refused, got {other:?}"),
+    }
+    let r = app.response.lock().unwrap();
+    assert!(
+        !r.loading,
+        "must not be left stuck loading on a request that can never be sent correctly"
+    );
+}
+
+/// The names Hurl really does carry must keep working — including its own two
+/// placeholder functions, which are not PaperBoy variables at all.
+#[test]
+fn ordinary_and_built_in_placeholder_names_are_not_refused() {
+    for url in [
+        "http://127.0.0.1:1/x?k={{api_key}}",
+        "http://127.0.0.1:1/x?k={{api-key}}",
+        "http://127.0.0.1:1/x?id={{ newUuid }}",
+    ] {
+        let entry = HurlEntry {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            ..Default::default()
+        };
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("t".to_string(), vec![entry]));
+        app.active_tab = 1;
+        app.focus = Pane::Main;
+
+        app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+
+        assert!(
+            !matches!(
+                app.status,
+                Some(crate::i18n::Status::TruncatedPlaceholders(_))
+            ),
+            "{url} should be allowed through, got {:?}",
+            app.status
+        );
+    }
+}
+
 // ── Body / Form-Multipart conflict ──────────────────────────────────────
 
 /// A body plus form fields is refused before anything is sent. It used to be

@@ -1117,34 +1117,62 @@ pub fn drain_capture_updates(
     !pending.is_empty()
 }
 
-/// Environment variable names referenced (via `{{ KEY }}`) anywhere in `entry`.
-pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<String> {
-    let mut keys = std::collections::HashSet::new();
-    let mut add = |text: &str| keys.extend(crate::environment::referenced_keys(text));
-
-    add(&entry.url);
+/// Every piece of an entry's text that reaches the wire *as a Hurl template* —
+/// so anything scanning for `{{…}}` sees exactly the places a placeholder is
+/// substituted, and no more.
+///
+/// Shared by [`entry_referenced_keys`] and [`entry_placeholder_problems`]
+/// deliberately: the set of fields "a variable can appear in" and the set it is
+/// "checked in" drifting apart would mean a placeholder that resolves but is
+/// never validated, which is the exact bug the validation exists to catch.
+fn for_each_wire_text(entry: &HurlEntry, mut visit: impl FnMut(&str)) {
+    visit(&entry.url);
     for r in entry.headers.iter().chain(&entry.queries) {
-        add(&r.key);
-        add(&r.value);
+        visit(&r.key);
+        visit(&r.value);
     }
     for f in &entry.form_fields {
-        add(&f.key);
-        add(&f.value);
+        visit(&f.key);
+        visit(&f.value);
     }
     for r in &entry.cookies {
-        add(&r.key);
-        add(&r.value);
+        visit(&r.key);
+        visit(&r.value);
     }
     if let Some((u, p)) = &entry.basic_auth {
-        add(u);
-        add(p);
+        visit(u);
+        visit(p);
     }
     // A `{{ var }}` written inside a comment is never sent, so it doesn't
     // count as a use of that variable.
     if let Some(body) = entry.body_wire() {
-        add(&body);
+        visit(&body);
     }
+}
+
+/// Environment variable names referenced (via `{{ KEY }}`) anywhere in `entry`.
+pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    for_each_wire_text(entry, |text| {
+        keys.extend(crate::environment::referenced_keys(text))
+    });
     keys
+}
+
+/// Placeholders in `entry` that Hurl would read differently from PaperBoy — see
+/// [`placeholder_problems`](crate::hurl::placeholder_problems). Deduplicated,
+/// keeping the order written, since the same `{{ api.key }}` typed into three
+/// headers is one mistake and should be said once.
+pub fn entry_placeholder_problems(entry: &HurlEntry) -> Vec<crate::hurl::PlaceholderProblem> {
+    let mut out: Vec<crate::hurl::PlaceholderProblem> = Vec::new();
+    for_each_wire_text(entry, |text| {
+        for p in crate::hurl::placeholder_problems(text) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    });
+    out
 }
 
 /// Secret variables the selected entry needs but that haven't resolved yet.
@@ -1266,6 +1294,48 @@ pub fn body_form_conflicts_all(col: &Collection) -> Vec<String> {
         .iter()
         .filter(|e| e.body_form_conflict())
         .map(request_label)
+        .collect()
+}
+
+/// Placeholders in the selected request that Hurl reads differently from
+/// PaperBoy, rendered for display as `written → read`.
+///
+/// Blocking, for the same reason as [`body_form_conflicts`] and not the same
+/// reason as [`undefined_request_keys`]: an undefined variable goes on the wire
+/// literally and fails loudly, but `{{ api.key }}` goes on the wire as the
+/// value of `api` and the server answers as though it were asked a sensible
+/// question. There is no version of that a user finds by reading the response.
+pub fn truncated_placeholders(col: &Collection) -> Vec<String> {
+    col.entries
+        .get(col.selected_entry)
+        .map(|e| describe_placeholder_problems(&entry_placeholder_problems(e)))
+        .unwrap_or_default()
+}
+
+/// [`truncated_placeholders`] across every entry — used by "Run All".
+pub fn truncated_placeholders_all(col: &Collection) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        for d in describe_placeholder_problems(&entry_placeholder_problems(e)) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Render placeholder problems for a status message. A truncation says what it
+/// becomes (`{{api.key}} → api`), because the whole difficulty of the bug is
+/// that the text looks right; an unparsable one has no "becomes" to show.
+fn describe_placeholder_problems(problems: &[crate::hurl::PlaceholderProblem]) -> Vec<String> {
+    use crate::hurl::PlaceholderProblem as P;
+    problems
+        .iter()
+        .map(|p| match p {
+            P::Truncated { written, read } => format!("{written} → {read}"),
+            P::Unparsable { written } => written.clone(),
+        })
         .collect()
 }
 
