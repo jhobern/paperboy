@@ -71,6 +71,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   options screen's footer says "Space toggle" rather than the vaguer
   "Space change".
 
+- Enter on a saved key reference now fills the field and stops there, the way
+  the request wizard's suggestion dropdown behaves. It used to connect on the
+  same keystroke — one press fewer, but it committed a form the user was still
+  reading, and picking a remembered reference is exactly the moment they want
+  to look at what they picked. The panel's hint says so while the list is open.
+
+- The request wizard's dropdowns (header names, header type, content type) paint
+  the theme's panel colour. `Clear` only resets cells to the *terminal's* default
+  background, so the popups showed whatever colour sat behind the app — a hole
+  in the middle of an otherwise themed screen.
+
 
 ## [0.5.3] - 2026-09-03
 

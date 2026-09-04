@@ -4099,16 +4099,23 @@ impl TuiApp {
                     w.key_source = w.key_source.cycled(true);
                     w.recent_sel = None;
                 }
-                KeyCode::Enter => {
-                    // Picking a remembered reference fills the field and
-                    // connects, rather than making the user press Enter twice.
+                // Enter inside the dropdown fills the field and stops there,
+                // as the request wizard's suggestion list does. Connecting on
+                // the same keystroke saved a keypress but committed a form the
+                // user was still reading: the key is the first of three fields,
+                // and picking a remembered reference is precisely the moment
+                // they want to look at what they picked.
+                KeyCode::Enter if w.recent_sel.is_some() => {
                     if let Some(entry) = w
                         .recent_sel
                         .and_then(|i| w.recent_entries().get(i).cloned())
                     {
                         w.key = Editor::new(&entry, false);
+                        w.sync_fields();
                     }
                     w.recent_sel = None;
+                }
+                KeyCode::Enter => {
                     w.sync_fields();
                     w.flow.submit_connect(&s);
                     // A typed workspace id skips the listing and lands straight

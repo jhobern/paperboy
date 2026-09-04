@@ -329,7 +329,11 @@ fn draw_connect(f: &mut Frame, w: &PostmanWizard, s: &Strings, th: &Theme, title
         f.area(),
     );
     f.render_widget(Clear, area);
-    let hint = if recent_rows > 0 {
+    let hint = if w.recent_sel.is_some() {
+        // While the list has focus the connect hint is describing keys that
+        // now do something else: Enter fills the field rather than connecting.
+        s.postman_recent_pick_hint.to_string()
+    } else if recent_rows > 0 {
         format!(
             "{}  \u{b7}  {}",
             s.postman_connect_hint, s.postman_recent_hint

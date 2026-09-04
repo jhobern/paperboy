@@ -2015,6 +2015,45 @@ fn key_cell_shows_a_prepopulated_dropdown() {
     assert_eq!(dd.unwrap().1, COMMON_HEADERS.to_vec());
 }
 
+/// The suggestion popup drew on whatever `Clear` left behind, which is the
+/// *terminal's* default background rather than the theme's — a hole of some
+/// unrelated colour in the middle of an otherwise themed screen. Every other
+/// dialog paints `th.panel`; so does this.
+#[test]
+fn the_suggestion_dropdown_is_painted_in_the_theme() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_header(&mut app);
+    assert!(form_ref(&app).key_dropdown().is_some());
+
+    let s = Strings::for_language(&Language::English);
+    let th = super::theme::theme(&Language::English);
+    let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+    // Twice: the popup is anchored to the Key cell's rect, which the first
+    // frame is what records.
+    for _ in 0..2 {
+        term.draw(|f| super::draw::draw_overlay(f, &mut app, &s, &th))
+            .unwrap();
+    }
+    let buf = term.backend().buffer();
+
+    let (x, y) = (0..buf.area().height)
+        .find_map(|y| {
+            let row: String = (0..buf.area().width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            row.find("Accept-Charset")
+                .map(|byte| (row[..byte].chars().count() as u16, y))
+        })
+        .expect("the dropdown is on screen");
+    assert_eq!(
+        buf[(x, y)].bg,
+        th.panel,
+        "an unhighlighted suggestion sits on the theme's panel colour"
+    );
+}
+
 #[test]
 fn dropdown_filters_as_you_type_and_enter_fills_the_key() {
     let mut app = TuiApp::default();
@@ -27657,7 +27696,11 @@ fn a_working_key_reference_is_offered_back_next_time() {
         "only the references belonging to the chosen source are offered"
     );
 
-    // Down opens the list, Enter takes the highlighted one into the field.
+    // Down opens the list, Enter takes the highlighted one into the field —
+    // and stops there. It used to connect on the same keystroke, which
+    // committed a form the user was still reading: the key is the first of
+    // three fields, and picking a remembered reference is exactly when they
+    // want to look at what they picked.
     press(&mut app, KeyCode::Tab);
     press(&mut app, KeyCode::Down);
     assert_eq!(postman_wizard(&mut app).recent_sel, Some(0));
@@ -27665,6 +27708,10 @@ fn a_working_key_reference_is_offered_back_next_time() {
     let w = postman_wizard(&mut app);
     assert_eq!(w.key.text(), "Private/Postman/credential");
     assert_eq!(w.recent_sel, None);
+    assert!(
+        matches!(w.stage(), crate::tui::postman::PostmanStage::Connect),
+        "filling the field is not submitting the form"
+    );
 
     // Switching source switches the list with it.
     let w = postman_wizard(&mut app);
