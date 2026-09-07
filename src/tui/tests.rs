@@ -22807,8 +22807,13 @@ fn the_expression_cell_suggests_generator_functions() {
     let form = form_ref(&app);
     assert_eq!(
         form.generators[0].expr.text(),
-        "hmac_sha256(",
+        "hmac_sha256()",
         "the signature is what is read; the call is what is typed"
+    );
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 12),
+        "the caret waits between the brackets, on the first argument"
     );
 }
 
@@ -22836,7 +22841,12 @@ fn a_suggestion_replaces_only_the_word_being_typed() {
     assert_eq!(dd.1, vec!["sha256(text)", "sha256_b64(text)"]);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
-    assert_eq!(form_ref(&app).generators[0].expr.text(), "concat(sha256(");
+    let form = form_ref(&app);
+    assert_eq!(form.generators[0].expr.text(), "concat(sha256()");
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 14)
+    );
 }
 
 /// The dropdown has to be able to close, or it reads as the editor refusing

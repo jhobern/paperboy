@@ -192,6 +192,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   row now defines its name for its own request and for the ones after it, the
   same way a capture does.
 
+- **Choosing a function writes the whole call, where the caret is.** Picking
+  one from the list left a half-written `sha256(` tacked onto the *end* of the
+  expression — so completing inside `base64(` produced `base64(sha256(`, with
+  two brackets to close by hand and a fault reported until they were. Both
+  editors now write `sha256()` at the caret, replacing the part-typed name, and
+  leave the caret between the brackets ready for the argument; in the GUI the
+  field takes focus back, so the next keystroke goes where it was aimed.
+
 - **A report run refuses a request whose computed value failed.** It evaluated
   the block, threw the errors away, and sent the request with `{{sig}}` still
   in it — a 401 whose cause was three screens away, on the one path that by

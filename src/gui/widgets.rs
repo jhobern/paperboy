@@ -847,29 +847,40 @@ pub fn computed_editor(
                     // there is no horizontal scrollbar to get them back.
                     let f_w = button_width(ui, FUNCTIONS_BUTTON);
                     let val_w = (ui.available_width() - x_w - f_w - 24.0).max(40.0);
-                    if wrapping_field_font(
+                    let field = wrapping_field_font(
                         ui,
                         val_w,
                         &mut rows[i].1,
                         s.computed_expr,
                         theme.text,
                         egui::TextStyle::Monospace,
-                    )
-                    .changed()
-                    {
+                    );
+                    if field.changed() {
                         changed = true;
                     }
                     // Thirty-five functions is more than anyone will remember
                     // the spelling of, and the arguments are the whole reason
-                    // to look one up. Appended rather than replacing the cell:
-                    // an expression is often a call inside a call.
+                    // to look one up. Chosen from the menu, one is written in
+                    // where the caret is — an expression is often a call inside
+                    // a call, so appending to the end would be wrong as often
+                    // as it was right.
                     ui.menu_button(RichText::new(FUNCTIONS_BUTTON).color(theme.dim), |ui| {
                         egui::ScrollArea::vertical()
                             .max_height(320.0)
                             .show(ui, |ui| {
                                 for f in crate::generators::FUNCTIONS {
                                     if ui.button(RichText::new(f.signature).monospace()).clicked() {
-                                        rows[i].1.push_str(&completion(f));
+                                        let at = caret_of(ui.ctx(), field.id);
+                                        let (text, caret) = insert_call(&rows[i].1, at, f);
+                                        rows[i].1 = text;
+                                        // The caret goes between the brackets,
+                                        // and the field takes focus back: the
+                                        // next thing to do is type the first
+                                        // argument, and a menu that leaves the
+                                        // user to click back into the cell has
+                                        // done half the job.
+                                        set_caret(ui.ctx(), field.id, caret);
+                                        ui.ctx().memory_mut(|m| m.request_focus(field.id));
                                         changed = true;
                                         ui.close();
                                     }
@@ -922,15 +933,63 @@ pub fn computed_editor(
 /// mark in every language. What it means is on hover.
 const FUNCTIONS_BUTTON: &str = "\u{0192}";
 
-/// What choosing a function from the menu adds: the call, with an opening
-/// bracket only where an argument is required — a function that needs none is
-/// complete as its bare name.
-fn completion(f: &crate::generators::GenFunction) -> String {
-    if f.min_args == 0 {
+/// Where the caret is in the text field `id`, as a character index, if it has
+/// been in one. `None` before the field has ever been clicked into, which is
+/// exactly when "the end" is the right guess.
+fn caret_of(ctx: &egui::Context, id: egui::Id) -> Option<usize> {
+    egui::TextEdit::load_state(ctx, id)
+        .and_then(|s| s.cursor.char_range())
+        .map(|r| r.primary.index.0)
+}
+
+/// Put the caret at character `index` in the text field `id`.
+fn set_caret(ctx: &egui::Context, id: egui::Id, index: usize) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(index),
+            )));
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+}
+
+/// Write `f`'s call into `text` at the caret, returning the new text and where
+/// the caret should land.
+///
+/// The word the caret is in is *replaced*, so choosing `sha256` after typing
+/// `sha` leaves one `sha256` rather than `shasha256`, and the rest of the
+/// expression around it is untouched. A function that takes an argument is
+/// written with both brackets and the caret between them: an unclosed one is
+/// an expression the user has to go back and finish, and the editor would call
+/// it a syntax error in the meantime. One that takes nothing is complete as its
+/// bare name, which is how the block already reads `stamp = timestamp`.
+fn insert_call(
+    text: &str,
+    caret: Option<usize>,
+    f: &crate::generators::GenFunction,
+) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let at = caret.unwrap_or(chars.len()).min(chars.len());
+    let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let mut start = at;
+    while start > 0 && word(&chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < chars.len() && word(&chars[end]) {
+        end += 1;
+    }
+    let call = if f.min_args == 0 {
         f.name.to_string()
     } else {
-        format!("{}(", f.name)
-    }
+        format!("{}()", f.name)
+    };
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(&call);
+    out.extend(chars[end..].iter());
+    let inside = usize::from(f.min_args > 0);
+    (out, start + f.name.chars().count() + inside)
 }
 
 pub fn pair_editor(
@@ -2265,4 +2324,38 @@ fn shade(ctx: &egui::Context, title: &str) {
                 .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
             ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
         });
+}
+
+#[cfg(test)]
+mod function_menu_tests {
+    use super::insert_call;
+    use crate::generators::function;
+
+    #[test]
+    fn a_chosen_function_lands_at_the_caret_with_the_caret_inside_its_brackets() {
+        let f = function("sha256").expect("sha256 is a generator function");
+        // Caret between the two brackets of the outer call: the inner call is
+        // written there, not tacked onto the end.
+        let (text, caret) = insert_call("base64()", Some(7), f);
+        assert_eq!(text, "base64(sha256())");
+        assert_eq!(caret, 14);
+        assert_eq!(&text[..caret], "base64(sha256(");
+    }
+
+    #[test]
+    fn a_half_typed_name_is_replaced_rather_than_doubled() {
+        let f = function("uuid").expect("uuid is a generator function");
+        let (text, caret) = insert_call("id = uu", Some(7), f);
+        assert_eq!(text, "id = uuid");
+        // Nothing to type inside, so the caret sits after the name.
+        assert_eq!(caret, 9);
+    }
+
+    #[test]
+    fn a_field_never_clicked_into_appends() {
+        let f = function("uuid").expect("uuid is a generator function");
+        let (text, caret) = insert_call("", None, f);
+        assert_eq!(text, "uuid");
+        assert_eq!(caret, 4);
+    }
 }

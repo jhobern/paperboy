@@ -445,17 +445,21 @@ fn gen_word(text: &str) -> (usize, &str) {
     (at, &text[at..])
 }
 
-/// What a chosen signature puts in the cell: the name, with an opening bracket
-/// when the function needs an argument. A function that takes none — or takes
-/// one only optionally — is complete as its bare name, and a trailing `(` there
-/// would be an expression the user has to finish before anything runs.
-fn gen_completion(signature: &str) -> String {
+/// What a chosen signature puts in the cell, and how far into it the caret
+/// should then sit.
+///
+/// A function that needs an argument is written with *both* brackets and the
+/// caret between them, so the next keystroke is the argument: a lone `(` would
+/// leave an unfinished expression that the block reports as a fault until the
+/// user closes it themselves. One that takes none — or takes one only
+/// optionally — is complete as its bare name, caret after it.
+fn gen_completion(signature: &str) -> (String, usize) {
     match signature.split_once('(') {
         Some((name, rest)) if !rest.starts_with(')') && !rest.starts_with('[') => {
-            format!("{name}(")
+            (format!("{name}()"), name.chars().count() + 1)
         }
-        Some((name, _)) => name.to_string(),
-        None => signature.to_string(),
+        Some((name, _)) => (name.to_string(), name.chars().count()),
+        None => (signature.to_string(), signature.chars().count()),
     }
 }
 
@@ -1206,11 +1210,16 @@ impl NewReq {
                     let text = row.expr.text();
                     let (at, word) = gen_word(&text);
                     let end = at + word.len();
-                    let mut done = String::with_capacity(text.len() + name.len());
+                    let (call, caret) = gen_completion(name);
+                    let mut done = String::with_capacity(text.len() + call.len());
                     done.push_str(&text[..at]);
-                    done.push_str(&gen_completion(name));
+                    done.push_str(&call);
                     done.push_str(&text[end..]);
                     row.expr = Editor::new(&done, false);
+                    // Editor::new leaves the caret at the end of the text, which
+                    // is past the tail of the expression the completion was
+                    // written into the middle of.
+                    row.expr.set_cursor(0, text[..at].chars().count() + caret);
                 }
             }
             _ => {}
