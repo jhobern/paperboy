@@ -2465,4 +2465,69 @@ mod computed_tests {
             "and the offending name, painted: {out:?}"
         );
     }
+
+    /// The function menu is the last thing in a row and the row has no
+    /// horizontal scrollbar, so a field that claims the whole width does not
+    /// merely look untidy — it puts the menu somewhere the user cannot reach.
+    #[test]
+    fn the_function_menu_stays_inside_the_panel() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![
+            ("transaction_id".into(), "uuid".into()),
+            ("retries".into(), "0".into()),
+        ];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let width = 900.0;
+        let mut placed = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            placed = placed_text(&full.shapes);
+        }
+        let menus: Vec<&(String, egui::Rect)> = placed
+            .iter()
+            .filter(|(t, _)| t.contains('\u{0192}'))
+            .collect();
+        assert_eq!(menus.len(), 2, "one per row: {placed:?}");
+        for (label, rect) in menus {
+            assert!(
+                rect.max.x <= width,
+                "{label} is off the right edge at {rect:?}"
+            );
+        }
+    }
+
+    /// Every string a frame painted, with where it was painted.
+    fn placed_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
 }

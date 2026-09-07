@@ -904,7 +904,7 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
-    gui_computed_functions => "\u{0192} Functions", "\u{0192} Fonctions", "\u{0192} Funktioner";
+    gui_computed_functions => "Insert a function", "Insérer une fonction", "Indsæt en funktion";
     gui_computed_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_computed_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs calculées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der beregnes hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";

@@ -841,7 +841,12 @@ pub fn computed_editor(
                     if sized_key(ui, key_w, &mut rows[i].0, s.computed_name, theme.text).changed() {
                         changed = true;
                     }
-                    let val_w = (ui.available_width() - x_w * 3.0 - 8.0).max(40.0);
+                    // Both buttons to the right are reserved before the field
+                    // is sized: an infinite-width field laid out left to right
+                    // claims the whole row and shoves them off the edge, and
+                    // there is no horizontal scrollbar to get them back.
+                    let f_w = button_width(ui, FUNCTIONS_BUTTON);
+                    let val_w = (ui.available_width() - x_w - f_w - 24.0).max(40.0);
                     if wrapping_field_font(
                         ui,
                         val_w,
@@ -854,6 +859,25 @@ pub fn computed_editor(
                     {
                         changed = true;
                     }
+                    // Thirty-five functions is more than anyone will remember
+                    // the spelling of, and the arguments are the whole reason
+                    // to look one up. Appended rather than replacing the cell:
+                    // an expression is often a call inside a call.
+                    ui.menu_button(RichText::new(FUNCTIONS_BUTTON).color(theme.dim), |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for f in crate::generators::FUNCTIONS {
+                                    if ui.button(RichText::new(f.signature).monospace()).clicked() {
+                                        rows[i].1.push_str(&completion(f));
+                                        changed = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    })
+                    .response
+                    .on_hover_text(s.gui_computed_functions);
                     let hit = flat_buttons(ui, |ui| {
                         ui.add_sized(
                             [x_w, row_h],
@@ -863,29 +887,6 @@ pub fn computed_editor(
                     if hit.clicked() {
                         remove = Some(i);
                     }
-                    // Thirty-five functions is more than anyone will remember
-                    // the spelling of, and the arguments are the whole reason
-                    // to look one up. Appended rather than replacing the cell:
-                    // an expression is often a call inside a call.
-                    ui.menu_button(
-                        RichText::new(s.gui_computed_functions).color(theme.dim),
-                        |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(320.0)
-                                .show(ui, |ui| {
-                                    for f in crate::generators::FUNCTIONS {
-                                        if ui
-                                            .button(RichText::new(f.signature).monospace())
-                                            .clicked()
-                                        {
-                                            rows[i].1.push_str(&completion(f));
-                                            changed = true;
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                        },
-                    );
                 });
             }
         });
@@ -915,6 +916,11 @@ pub fn computed_editor(
     }
     changed
 }
+
+/// The function menu's label. A symbol rather than a word: it sits at the end
+/// of a row whose expression field should have the width, and it is the same
+/// mark in every language. What it means is on hover.
+const FUNCTIONS_BUTTON: &str = "\u{0192}";
 
 /// What choosing a function from the menu adds: the call, with an opening
 /// bracket only where an argument is required — a function that needs none is
