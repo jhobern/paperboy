@@ -1131,7 +1131,7 @@ impl HurlEntry {
     /// Hurl reads such a row as an assignment that wins over anything the
     /// caller passed in; PaperBoy reads it as a *default* — the value used only
     /// when nobody else binds the name (see
-    /// [`crate::request::effective_vars`]). That flip is what lets one request
+    /// [`crate::request::effective_vars_reporting`]). That flip is what lets one request
     /// serve both audiences: opened on its own it runs with the author's sample
     /// value, and driven from a PaperTrail loop (`FOR FILE IN FILES …`) it takes
     /// the loop's value, with neither side editing the other's file. The

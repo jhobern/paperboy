@@ -604,8 +604,8 @@ strings! {
     help_grammar_envs => "loop over environments (BASELINE/COMPARISON to diff)", "boucler sur des environnements (BASELINE/COMPARISON pour comparer)", "gennemløb miljøer (BASELINE/COMPARISON for at sammenligne)";
     help_grammar_baseline_file => "use a saved .baseline snapshot as a role instead of a live env", "utiliser un instantané .baseline enregistré comme rôle au lieu d'un environnement", "brug et gemt .baseline-øjebliksbillede som rolle i stedet for et live-miljø";
     help_grammar_result => "diff column: candidate vs baseline env, per reported field", "colonne de différence : candidat vs référence, par champ rapporté", "forskelskolonne: kandidat vs. reference, pr. rapporteret felt";
-    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 opret · Esc annuller";
-    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 gem · Esc annuller";
+    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-0 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-0 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-0 hop til · ^Enter/F2 opret · Esc annuller";
+    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-0 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-0 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-0 hop til · ^Enter/F2 gem · Esc annuller";
     raw_mode_hint => "Edit the raw Hurl text · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le texte Hurl brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå Hurl-tekst · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     raw_json_hint => "Edit the raw JSON · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le JSON brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå JSON · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     ctrl_enter_key => "^Enter", "^Entrée", "^Enter";
@@ -849,6 +849,7 @@ strings! {
     gui_sec_cookies => "Cookies", "Cookies", "Cookies";
     gui_sec_options => "Options", "Options", "Indstillinger";
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
+    gui_sec_computed => "Computed", "Calculé", "Beregnet";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
     // The two representations the Raw Request view can show. Both are format
@@ -903,6 +904,9 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
+    gui_computed_functions => "\u{0192} Functions", "\u{0192} Fonctions", "\u{0192} Funktioner";
+    gui_computed_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
+    gui_computed_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs calculées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der beregnes hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
     gui_add_assert => "+ Add assert", "+ Ajouter une assertion", "+ Tilføj assertion";
     gui_add_field => "+ Add field", "+ Ajouter un champ", "+ Tilføj felt";

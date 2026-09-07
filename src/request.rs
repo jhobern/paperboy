@@ -646,7 +646,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),
         // Generators have already been evaluated into the variable set by
-        // `effective_vars`, and their placeholders are ordinary `{{name}}`
+        // `effective_vars_reporting`, and their placeholders are ordinary `{{name}}`
         // references that Hurl resolves from it. Carrying the definitions onto
         // the run entry would re-emit the block as a comment in text nobody
         // reads back, and risk them being evaluated twice.
@@ -661,46 +661,11 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
     }
 }
 
-/// Layer a request's own declared parameters (`[Options] variable: NAME=value`,
-/// see [`HurlEntry::variable_defaults`]) *under* the caller's `vars`, producing
-/// the variable set the request actually runs with.
-///
-/// Precedence is the whole point: a declared parameter is a **default**, so it
-/// fills in only the names nobody else bound. Opened on its own, a request runs
-/// with the author's sample value; driven from a PaperTrail loop that binds
-/// `FILE`, it runs with the loop's value and the default stands aside. Hurl's
-/// native reading of the same line is the opposite (the entry option overwrites
-/// the run's variables), which is why the row is also stripped from the entry
-/// text before it is handed to the runner — see [`strip_variable_options`].
-///
-/// A default's own value is substituted against the caller's variables first,
-/// so one parameter can be expressed in terms of another (`variable:
-/// FILE={{SAMPLES}}/invoice.pdf`). Defaults are applied in written order and an
-/// earlier one is visible to a later one, which makes that composition
-/// predictable rather than order-of-iteration luck. Nothing is applied
-/// recursively: a default referencing a name that is itself only defaulted
-/// later is left as written, exactly as [`substitute`] leaves any unresolved
-/// placeholder.
-///
-/// The request's `# [Gen]` rows are then evaluated into the same map, *after*
-/// the defaults, so a generator can be written in terms of a declared parameter.
-/// This one seam serves both the preview and the wire: [`resolve_entry`] renders
-/// the preview from this map and [`run_hurl`](crate::hurl::run_hurl) builds
-/// Hurl's `VariableSet` from it, so a computed value cannot show one thing and
-/// send another.
-///
-/// Returns the caller's map untouched (borrowed) when the request declares no
-/// parameters and no generators — the overwhelmingly common case, and a send is
-/// hot enough that cloning every variable for nothing is worth avoiding.
-pub fn effective_vars<'a>(
-    base: &HurlEntry,
-    vars: &'a HashMap<String, String>,
-) -> Cow<'a, HashMap<String, String>> {
-    effective_vars_reporting(base, vars).0
-}
-
-/// [`effective_vars`], also returning whatever went wrong in the `# [Gen]`
-/// block, so the caller can say so (see [`generator_problems`]).
+/// The variables a request actually runs with: those it is given, plus its own
+/// declared parameter defaults, plus its `# [Gen]` rows evaluated over both.
+/// Also returns whatever went wrong in the block, so the caller can say so
+/// (see [`generator_problems`]) rather than sending a request whose signature
+/// is still `{{sig}}`.
 ///
 /// A computed value needs no separate secret handling even when it is derived
 /// from one: it is only ever put into this map, which goes to `run_hurl` as
@@ -737,7 +702,7 @@ pub fn effective_vars_reporting<'a>(
 }
 
 /// Remove the `variable:` rows from a run entry's `[Options]`, having already
-/// folded them into the variable set via [`effective_vars`].
+/// folded them into the variable set via [`effective_vars_reporting`].
 ///
 /// Left in, they would undo the default semantics for everything
 /// [`resolve_entry`] does not substitute in Rust — `[Captures]` and `[Asserts]`
@@ -828,7 +793,22 @@ pub fn run_resolved_entry(
             error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
         };
     }
-    let vars = effective_vars(base, vars);
+    let (vars, gen_errors) = effective_vars_reporting(base, vars);
+    // A failed `[Gen]` row is left unbound, so going on would send the request
+    // with `{{sig}}` where the signature should be — a 401 whose cause is three
+    // screens away. The interactive send refuses for this reason; a report run
+    // has to refuse too, or the one path nobody is watching becomes the one
+    // that lies. Reported in English like `UNREADABLE_REQUEST_ERROR`: this is
+    // the front-end-agnostic layer and has no `Strings`, and the alternative —
+    // a `RunOutput` that carries the errors structurally — is a wider change
+    // than the message is worth.
+    if !gen_errors.is_empty() {
+        let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        return RunOutput {
+            entries: vec![],
+            error: Some(crate::i18n::describe_gen_errors(&english, &gen_errors).join("; ")),
+        };
+    }
     let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
     run_entry.captures.extend(extra_captures.iter().cloned());
@@ -2296,7 +2276,7 @@ mod tests {
         let entry = param_entry("FILE", "./samples/invoice.pdf");
         let vars = HashMap::new();
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(
             effective.get("FILE"),
@@ -2318,7 +2298,7 @@ mod tests {
         let entry = param_entry("FILE", "./samples/invoice.pdf");
         let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(effective.get("FILE"), Some(&"./inbox/real.pdf".to_string()));
     }
@@ -2391,7 +2371,7 @@ mod tests {
             .push(KvRow::new("variable", "DOC={{SAMPLES}}/invoice.pdf"));
         let vars = HashMap::from([("ROOT".to_string(), "/srv".to_string())]);
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(effective.get("SAMPLES"), Some(&"/srv/samples".to_string()));
         assert_eq!(
@@ -2430,7 +2410,7 @@ mod tests {
         let vars = HashMap::from([("TOKEN".to_string(), "abc".to_string())]);
 
         assert!(matches!(
-            effective_vars(&entry, &vars),
+            effective_vars_reporting(&entry, &vars).0,
             std::borrow::Cow::Borrowed(_)
         ));
     }
@@ -2456,5 +2436,26 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A failed `[Gen]` row leaves its name unbound, so running on would send
+    /// `{{sig}}` where a signature belongs. The interactive send refuses; the
+    /// report runner used to throw the errors away and send it anyway, which
+    /// is the one path with nobody watching.
+    #[test]
+    fn a_request_whose_computed_value_failed_is_not_sent() {
+        let entry = HurlEntry {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:9/{{sig}}".to_string(),
+            generators: vec![("sig".to_string(), "hmac_sha526(k, m)".to_string())],
+            ..Default::default()
+        };
+        let out = run_resolved_entry(&entry, &HashMap::new(), None, &[]);
+        assert!(out.entries.is_empty(), "nothing was sent");
+        let error = out.error.unwrap_or_default();
+        assert!(
+            error.contains("hmac_sha526"),
+            "and the reason names the row's fault: {error}"
+        );
     }
 }

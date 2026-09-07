@@ -22789,6 +22789,102 @@ fn a_computed_value_authored_in_the_wizard_reaches_the_hurl_file() {
     );
 }
 
+/// Thirty-five functions is more than anyone will remember the spelling of,
+/// and a misspelt one is only found when the request comes back 401. The
+/// expression cell offers them as you type, with their arguments named.
+#[test]
+fn the_expression_cell_suggests_generator_functions() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "hmac_sha2");
+    let dd = form_ref(&app).key_dropdown().expect("suggestions");
+    assert_eq!(
+        dd.1,
+        vec!["hmac_sha256(key, message)", "hmac_sha256_b64(key, message)"]
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let form = form_ref(&app);
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "hmac_sha256(",
+        "the signature is what is read; the call is what is typed"
+    );
+}
+
+/// A function that needs no argument is complete as its bare name — a
+/// trailing `(` would be an expression the user has to go back and finish.
+#[test]
+fn accepting_a_function_that_takes_nothing_leaves_no_open_bracket() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uui");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "uuid");
+}
+
+/// An expression is not one name the way a header is, so only the word being
+/// typed may be replaced: completing inside `concat(` must leave the `concat(`
+/// alone.
+#[test]
+fn a_suggestion_replaces_only_the_word_being_typed() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "concat(sha25");
+    let dd = form_ref(&app).key_dropdown().expect("suggestions");
+    assert_eq!(dd.1, vec!["sha256(text)", "sha256_b64(text)"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "concat(sha256(");
+}
+
+/// The dropdown has to be able to close, or it reads as the editor refusing
+/// what was typed: a name typed out in full with nothing else beginning that
+/// way has nothing left to offer.
+#[test]
+fn a_finished_function_name_closes_the_suggestions() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "iso8601");
+    assert!(form_ref(&app).key_dropdown().is_none());
+}
+
+/// A mistyped function name is a 401 twenty minutes later if nothing says so
+/// while it is still a typo. The section says it as the row is written.
+#[test]
+fn a_computed_row_that_cannot_run_says_so_while_it_is_being_typed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "hmac_sha526(k, m)");
+    let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let painted: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        painted.contains("no function called"),
+        "expected the fault beside the section label, painted:\n{painted}"
+    );
+}
+
+/// Reach a `[Gen]` row's Expression cell in a new request.
+fn open_form_on_computed_expression(app: &mut TuiApp) {
+    press(app, KeyCode::Char('n'));
+    type_str(app, "gen");
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    press(app, KeyCode::Enter); // add a row
+    type_str(app, "value");
+    press(app, KeyCode::Right); // Name -> Expression
+    assert_eq!(new_focus(app), NewField::Computed(0, CapCol::Expr));
+}
+
 /// A half-filled row is dropped rather than saved: a name with no expression
 /// computes nothing, and an expression with no name binds nothing, so either
 /// would be a row that exists only to fail.

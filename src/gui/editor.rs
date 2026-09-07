@@ -551,6 +551,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let options_n = entry.options.len();
         let asserts_n = entry.asserts.len();
         let captures_n = entry.captures.len();
+        let computed_n = entry.generators.len();
         let has_body = entry
             .body_src
             .as_ref()
@@ -596,6 +597,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     "{}{}",
                     st.gui_sec_captures,
                     widgets::count_suffix(captures_n)
+                ),
+            ),
+            (
+                EditorSection::Computed,
+                format!(
+                    "{}{}",
+                    st.gui_sec_computed,
+                    widgets::count_suffix(computed_n)
                 ),
             ),
             (EditorSection::Code, st.gui_sec_code.to_string()),
@@ -677,7 +686,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         // The combined view stacks every section, mirroring the
                         // TUI wizard's default "All" tab so the whole request is
                         // visible and editable without switching tabs.
-                        const STACK: [EditorSection; 8] = [
+                        const STACK: [EditorSection; 9] = [
                             EditorSection::Params,
                             EditorSection::Headers,
                             EditorSection::Body,
@@ -686,6 +695,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             EditorSection::Options,
                             EditorSection::Asserts,
                             EditorSection::Captures,
+                            EditorSection::Computed,
                         ];
                         for (i, sec) in STACK.iter().enumerate() {
                             if i > 0 {
@@ -856,6 +866,7 @@ fn section_title(section: EditorSection, s: &Strings) -> &'static str {
         EditorSection::Options => s.gui_sec_options,
         EditorSection::Asserts => s.gui_sec_asserts,
         EditorSection::Captures => s.gui_sec_captures,
+        EditorSection::Computed => s.gui_sec_computed,
         EditorSection::Code => s.gui_sec_code,
     }
 }
@@ -1235,6 +1246,12 @@ fn draw_section(
                 st.hdr_name,
                 st.hdr_query,
             ) {
+                changed = true;
+            }
+        }
+        EditorSection::Computed => {
+            ui.label(RichText::new(st.gui_computed_help).color(theme.dim));
+            if widgets::computed_editor(ui, theme, st, &mut entry.generators) {
                 changed = true;
             }
         }
@@ -2300,7 +2317,7 @@ mod unreadable_tests {
     use crate::gui::app::GuiApp;
     use crate::i18n::Language;
 
-    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    pub(super) fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
@@ -2355,6 +2372,97 @@ mod unreadable_tests {
         assert!(
             out.iter().any(|t| t.contains("[Captures]")),
             "expected the request's own text, painted: {out:?}"
+        );
+    }
+}
+
+/// The request editor's Computed section: the `# [Gen]` block, authored
+/// rather than imported.
+#[cfg(test)]
+mod computed_tests {
+    use super::unreadable_tests::painted;
+    use super::*;
+    use crate::i18n::Language;
+
+    /// The GUI could open a request carrying a `# [Gen]` block, save it, and
+    /// never show it — the block survived only because the editor writes back
+    /// what it parsed. A computed value is authored, not just imported, so it
+    /// needs a section of its own like every other part of the request.
+    #[test]
+    fn the_editor_has_a_section_for_computed_values() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![("nonce".into(), "random_hex(16)".into())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_sec_computed)),
+            "expected the section tab, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("random_hex(16)")),
+            "expected the row itself, painted: {out:?}"
+        );
+    }
+
+    /// The same warning the terminal UI gives while the row is being typed,
+    /// so neither front-end lets a block that cannot run reach a send.
+    #[test]
+    fn the_computed_section_says_when_a_row_cannot_run() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![("sig".into(), "hmac_sha526(k, m)".into())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_computed_faults)),
+            "expected the heading, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("hmac_sha526")),
+            "and the offending name, painted: {out:?}"
         );
     }
 }

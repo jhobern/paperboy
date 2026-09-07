@@ -95,6 +95,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the RFC 4231 test vector — a signing implementation that is self-consistently
   wrong passes every test written from its own output.
 
+- **Computed values are something you write, not just something an import
+  leaves behind.** The GUI could open a request carrying a `# [Gen]` block and
+  never show it — the block survived only because the editor writes back what
+  it parsed — so the GUI editor now has a **Computed** section beside Asserts
+  and Captures, with the same name/expression table the terminal UI has.
+
+  Both editors now offer the functions as you type. The terminal wizard
+  completes the word being typed in an expression cell — including one inside
+  another call, so `concat(sha` still finds `sha256` — and the GUI has a
+  function menu on each row. Either way what is offered is the *signature*:
+  thirty-five functions is more than anyone will remember the spelling of, and
+  `hmac_sha256(key, message)` says which argument comes first, which the name
+  alone does not.
+
+  And both say what is wrong with a row while it is still a typo: an unknown
+  function, the wrong number of arguments, an expression that doesn't parse.
+  Not a name the block cannot see — an editor is often open on a request whose
+  environment isn't loaded, and flagging `{{ api_key }}` there would train the
+  user to ignore the one part of this that is always a real mistake.
+
 - **Postman's pre-request and test scripts now carry across as far as Hurl can
   state them.** They used to be dropped whole, with a note. A pre-request
   script's `pm.environment.set` / `pm.collectionVariables.set` / `pm.variables.set`
@@ -162,6 +182,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   of times an hour, and they had learned Esc as simply "close this". Settings →
   Preferences → **Esc discards request edits without asking** puts the one-press
   discard back. Off by default, so nobody gets it by accident.
+
+### Fixed
+
+- **A computed value no longer reads as an undefined one.** A report that used
+  a name the request computes was warned about on every validation — "may not
+  be set", of a value that is set, by the request, every time it is sent — and
+  a panel full of warnings nobody can act on is a panel nobody reads. A `[Gen]`
+  row now defines its name for its own request and for the ones after it, the
+  same way a capture does.
+
+- **A report run refuses a request whose computed value failed.** It evaluated
+  the block, threw the errors away, and sent the request with `{{sig}}` still
+  in it — a 401 whose cause was three screens away, on the one path that by
+  definition has nobody watching. The interactive send already refused; now
+  both do, naming the row and what is wrong with it.
 
 ### Changed
 

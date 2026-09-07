@@ -352,6 +352,84 @@ pub fn expand(
     errors
 }
 
+/// Everything wrong with a block that can be known without running it: rows
+/// that don't parse, functions that don't exist, and calls with the wrong
+/// number of arguments.
+///
+/// Deliberately *not* undefined references: an editor is often open on a
+/// request whose environment isn't loaded, and flagging `{{ api_key }}` as a
+/// fault there would train the user to ignore the one part of this that is
+/// always a real mistake.
+pub fn check(rows: &[(String, String)]) -> Vec<GenError> {
+    fn walk(expr: &Expr, row: &str, out: &mut Vec<GenError>) {
+        match expr {
+            Expr::Text(_) | Expr::Number(_) => {}
+            Expr::Reference(name) => {
+                // A bare name is either a zero-argument call or a reference to
+                // a variable, and only the first can be checked here.
+                if let Some(f) = function(name)
+                    && f.min_args > 0
+                {
+                    out.push(GenError::Arity {
+                        name: row.to_string(),
+                        function: name.clone(),
+                        expected: expected_arity(f),
+                        got: 0,
+                    });
+                }
+            }
+            Expr::Call {
+                function: fname,
+                args,
+            } => {
+                match function(fname) {
+                    None => out.push(GenError::UnknownFunction {
+                        name: row.to_string(),
+                        function: fname.clone(),
+                    }),
+                    Some(f) => {
+                        if args.len() < f.min_args || f.max_args.is_some_and(|m| args.len() > m) {
+                            out.push(GenError::Arity {
+                                name: row.to_string(),
+                                function: fname.clone(),
+                                expected: expected_arity(f),
+                                got: args.len(),
+                            });
+                        }
+                    }
+                }
+                for a in args {
+                    walk(a, row, out);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (name, source) in rows {
+        if name.trim().is_empty() && source.trim().is_empty() {
+            continue;
+        }
+        match Parser::new(source).parse_all() {
+            Err(detail) => out.push(GenError::Syntax {
+                name: name.clone(),
+                detail,
+            }),
+            Ok(expr) => walk(&expr, name, &mut out),
+        }
+    }
+    out
+}
+
+/// How an arity reads in a message: the same words [`call`] uses.
+fn expected_arity(f: &GenFunction) -> String {
+    match (f.min_args, f.max_args) {
+        (lo, Some(hi)) if lo == hi => lo.to_string(),
+        (lo, Some(hi)) => format!("{lo} or {hi}"),
+        (lo, None) => format!("{lo} or more"),
+    }
+}
+
 /// Evaluate one expression. `declared` is every generator name in the block and
 /// `done` those already evaluated, which is how a row referring to itself or to
 /// a row below it is told apart from one referring to an environment variable
@@ -374,7 +452,7 @@ fn eval(
             // variable of the same name: it is small, fixed and documented,
             // whereas resolving it by whichever happens to exist would make the
             // meaning of a row depend on the loaded environment.
-            if FUNCTIONS.contains(&name.as_str()) {
+            if is_function(name.as_str()) {
                 return call(name, &[], row, src);
             }
             if declared.contains(&name.as_str()) && !done.contains(&name.as_str()) {
@@ -397,7 +475,7 @@ fn eval(
             // way round, `hmac_sha526(key, body)` complains that nothing defines
             // `key` — true, but it sends the user looking at their environment
             // for a fault that is a typo in the function name.
-            if !FUNCTIONS.contains(&function.as_str()) {
+            if !is_function(function.as_str()) {
                 return Err(GenError::UnknownFunction {
                     name: row.to_string(),
                     function: function.clone(),
@@ -597,46 +675,259 @@ fn call(
     }
 }
 
-/// Every function name, for the wizard's suggestions and for documentation.
-/// Kept beside [`call`] so a function added there is offered here.
-pub const FUNCTIONS: &[&str] = &[
-    "timestamp",
-    "timestamp_ms",
-    "iso8601",
-    "date",
-    "uuid",
-    "counter",
-    "random_int",
-    "random_hex",
-    "random_alnum",
-    "random_base64",
-    "base64",
-    "base64url",
-    "base64_decode",
-    "hex",
-    "urlencode",
-    "urldecode",
-    "json_string",
-    "md5",
-    "md5_b64",
-    "sha1",
-    "sha1_b64",
-    "sha256",
-    "sha256_b64",
-    "sha512",
-    "sha512_b64",
-    "hmac_sha1",
-    "hmac_sha1_b64",
-    "hmac_sha256",
-    "hmac_sha256_b64",
-    "hmac_sha512",
-    "hmac_sha512_b64",
-    "concat",
-    "upper",
-    "lower",
-    "trim",
+/// One generator function, as the editors offer it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GenFunction {
+    /// The name as written in a row.
+    pub name: &'static str,
+    /// How to call it, argument names included, with optional arguments in
+    /// square brackets. Deliberately *not* translated: these are identifiers
+    /// the user types, and a translated `hmac_sha256(clé, message)` would be a
+    /// call that does not work.
+    pub signature: &'static str,
+    /// How many arguments it must have, and at most may have (`None` for a
+    /// function that takes any number). Stated here so an editor can say
+    /// "takes 2" while typing rather than leaving it to the send, and checked
+    /// against [`call`] by a test — two places that disagreed about arity
+    /// would be worse than one.
+    pub min_args: usize,
+    pub max_args: Option<usize>,
+}
+
+/// Every generator function, for the editors' suggestions and for
+/// documentation. Kept beside [`call`] so a function added there is offered
+/// here, which a test enforces in both directions.
+pub const FUNCTIONS: &[GenFunction] = &[
+    GenFunction {
+        name: "timestamp",
+        signature: "timestamp([offset_seconds])",
+        min_args: 0,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "timestamp_ms",
+        signature: "timestamp_ms()",
+        min_args: 0,
+        max_args: Some(0),
+    },
+    GenFunction {
+        name: "iso8601",
+        signature: "iso8601()",
+        min_args: 0,
+        max_args: Some(0),
+    },
+    GenFunction {
+        name: "date",
+        signature: "date(format)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "uuid",
+        signature: "uuid()",
+        min_args: 0,
+        max_args: Some(0),
+    },
+    GenFunction {
+        name: "counter",
+        signature: "counter()",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "random_int",
+        signature: "random_int(low, high)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "random_hex",
+        signature: "random_hex(length)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "random_alnum",
+        signature: "random_alnum(length)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "random_base64",
+        signature: "random_base64(bytes)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "base64",
+        signature: "base64(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "base64url",
+        signature: "base64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "base64_decode",
+        signature: "base64_decode(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "hex",
+        signature: "hex(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "urlencode",
+        signature: "urlencode(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "urldecode",
+        signature: "urldecode(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "json_string",
+        signature: "json_string(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "md5",
+        signature: "md5(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "md5_b64",
+        signature: "md5_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha1",
+        signature: "sha1(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha1_b64",
+        signature: "sha1_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha256",
+        signature: "sha256(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha256_b64",
+        signature: "sha256_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha512",
+        signature: "sha512(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "sha512_b64",
+        signature: "sha512_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "hmac_sha1",
+        signature: "hmac_sha1(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "hmac_sha1_b64",
+        signature: "hmac_sha1_b64(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "hmac_sha256",
+        signature: "hmac_sha256(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "hmac_sha256_b64",
+        signature: "hmac_sha256_b64(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "hmac_sha512",
+        signature: "hmac_sha512(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "hmac_sha512_b64",
+        signature: "hmac_sha512_b64(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+    },
+    GenFunction {
+        name: "concat",
+        signature: "concat(a, b, …)",
+        min_args: 0,
+        max_args: None,
+    },
+    GenFunction {
+        name: "upper",
+        signature: "upper(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "lower",
+        signature: "lower(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
+    GenFunction {
+        name: "trim",
+        signature: "trim(text)",
+        min_args: 1,
+        max_args: Some(1),
+    },
 ];
 
+/// The function called `name`, if there is one.
+pub fn function(name: &str) -> Option<&'static GenFunction> {
+    FUNCTIONS.iter().find(|f| f.name == name)
+}
+
+/// The names alone, for a lookup that does not care how a function is called.
+pub fn is_function(name: &str) -> bool {
+    FUNCTIONS.iter().any(|f| f.name == name)
+}
+
+/// The functions whose name begins with `prefix`, in table order, for a
+/// completion list. An empty prefix offers everything.
+pub fn functions_starting_with(prefix: &str) -> impl Iterator<Item = &'static GenFunction> {
+    let prefix = prefix.to_ascii_lowercase();
+    FUNCTIONS
+        .iter()
+        .filter(move |f| f.name.starts_with(prefix.as_str()))
+}
 fn utc(src: &dyn GenSource) -> chrono::DateTime<chrono::Utc> {
     let (secs, nanos) = src.now();
     chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default()
@@ -1239,5 +1530,64 @@ mod tests {
         );
         assert!(e.is_empty(), "{e:?}");
         assert_eq!(v["out"], "{{OTHER}}");
+    }
+
+    /// The table and the implementation must agree about how a function is
+    /// called: an editor that offers `hmac_sha256(key, message)` while `call`
+    /// wants three arguments teaches the user something false, and the lesson
+    /// is only corrected by a failed request.
+    #[test]
+    fn every_function_is_called_the_way_the_table_says() {
+        let src = FakeSource::at(1_700_000_000);
+        let arg = |n: usize| vec!["1".to_string(); n];
+        let is_arity = |e: &GenError| matches!(e, GenError::Arity { .. });
+        for f in FUNCTIONS {
+            assert!(
+                f.signature.starts_with(f.name),
+                "{}'s signature must name it: {}",
+                f.name,
+                f.signature
+            );
+            if f.min_args > 0 {
+                let e = call(f.name, &arg(f.min_args - 1), "row", &src)
+                    .expect_err(&format!("{} accepted too few arguments", f.name));
+                assert!(is_arity(&e), "{}: {e:?}", f.name);
+            }
+            if let Some(max) = f.max_args {
+                let e = call(f.name, &arg(max + 1), "row", &src)
+                    .expect_err(&format!("{} accepted too many arguments", f.name));
+                assert!(is_arity(&e), "{}: {e:?}", f.name);
+            }
+            // The right number may still be the wrong *value* — `date("1")` is
+            // a format string that formats nothing — so only arity is asserted.
+            if let Err(e) = call(f.name, &arg(f.min_args), "row", &src) {
+                assert!(!is_arity(&e), "{} rejected its own arity: {e:?}", f.name);
+            }
+        }
+    }
+
+    /// What an editor can say before anything is sent, and what it must not:
+    /// a name that does not exist is always wrong, a variable it cannot see
+    /// is not.
+    #[test]
+    fn checking_a_block_finds_typos_but_not_missing_variables() {
+        let rows: Vec<(String, String)> = [
+            ("a", "hmac_sha526(k, m)"),
+            ("b", "random_int(1)"),
+            ("c", "sha256("),
+            ("d", "hmac_sha256(api_key, nothing_defines_this)"),
+            ("e", "uuid"),
+            ("", ""),
+        ]
+        .iter()
+        .map(|(n, x)| (n.to_string(), x.to_string()))
+        .collect();
+        let found = check(&rows);
+        let named: Vec<&str> = found.iter().map(|e| e.row()).collect();
+        assert_eq!(
+            named,
+            vec!["a", "b", "c"],
+            "an unknown function, a wrong arity and a syntax error — no more: {found:?}"
+        );
     }
 }

@@ -742,7 +742,9 @@ impl TuiApp {
             if form.focus != prev_focus {
                 form.suggest_hi = None;
                 let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
-                    if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                    if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()))
+                    || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
+                    if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
                 let landed_on_kind = matches!(form.focus, NewField::FormField(i, FormCol::Kind)
                     if form.form_fields.get(i).is_some());

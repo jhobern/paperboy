@@ -30,6 +30,7 @@ pub enum EditorSection {
     Options,
     Asserts,
     Captures,
+    Computed,
     Code,
 }
 

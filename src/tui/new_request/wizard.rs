@@ -431,6 +431,34 @@ impl WizardTab {
 
 /// `ctx` values for [`NewReq::dropdown_scroll`], so the two dropdowns that
 /// share it don't inherit each other's viewport.
+
+/// The identifier being typed at the end of a `[Gen]` expression, and where it
+/// starts. Scanning back from the end rather than taking the whole cell is what
+/// lets a suggestion be accepted inside `concat(sha` without eating the rest.
+fn gen_word(text: &str) -> (usize, &str) {
+    let at = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    (at, &text[at..])
+}
+
+/// What a chosen signature puts in the cell: the name, with an opening bracket
+/// when the function needs an argument. A function that takes none — or takes
+/// one only optionally — is complete as its bare name, and a trailing `(` there
+/// would be an expression the user has to finish before anything runs.
+fn gen_completion(signature: &str) -> String {
+    match signature.split_once('(') {
+        Some((name, rest)) if !rest.starts_with(')') && !rest.starts_with('[') => {
+            format!("{name}(")
+        }
+        Some((name, _)) => name.to_string(),
+        None => signature.to_string(),
+    }
+}
+
 const KEY_DROPDOWN: u64 = 1;
 const CTYPE_DROPDOWN: u64 = 2;
 
@@ -499,6 +527,11 @@ pub(crate) struct NewReq {
     /// Set during draw: screen rect of the focused Key cell, so the suggestion
     /// dropdown can be anchored beneath it.
     pub(crate) key_cell_rect: std::cell::Cell<Option<Rect>>,
+    /// Where the focused `[Gen]` Expression cell was last drawn, so the
+    /// function dropdown can anchor beneath it. Kept apart from
+    /// [`Self::key_cell_rect`] because the All tab stacks both tables in one
+    /// frame and each clears its own anchor as it draws.
+    pub(crate) gen_cell_rect: std::cell::Cell<Option<Rect>>,
     /// Set during draw: screen rect of the focused Form Kind cell, so its
     /// Text/File dropdown can be anchored beneath it.
     pub(crate) kind_cell_rect: std::cell::Cell<Option<Rect>>,
@@ -887,6 +920,7 @@ impl NewReq {
             ctype_dropdown_hidden: false,
             ctype_hi: None,
             key_cell_rect: std::cell::Cell::new(None),
+            gen_cell_rect: std::cell::Cell::new(None),
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             form_desc_visible: std::cell::Cell::new(true),
@@ -1065,6 +1099,7 @@ impl NewReq {
             ctype_dropdown_hidden: false,
             ctype_hi: None,
             key_cell_rect: std::cell::Cell::new(None),
+            gen_cell_rect: std::cell::Cell::new(None),
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             form_desc_visible: std::cell::Cell::new(true),
@@ -1104,6 +1139,9 @@ impl NewReq {
     /// [`Self::key_dropdown`] and to decide whether Enter should be able to
     /// reveal a dropdown that arrow-key navigation auto-hid.
     fn key_suggestions(&self) -> Option<(usize, Vec<&'static str>)> {
+        if let NewField::Computed(i, CapCol::Expr) = self.focus {
+            return self.gen_suggestions(i);
+        }
         let NewField::Kvd(KvdKind::Header, i, HdrCol::Key) = self.focus else {
             return None;
         };
@@ -1111,6 +1149,28 @@ impl NewReq {
         let sugs = filter_headers(&text);
         let single_exact = sugs.len() == 1 && sugs[0].eq_ignore_ascii_case(text.trim());
         (!sugs.is_empty() && !single_exact).then_some((i, sugs))
+    }
+
+    /// The generator functions matching what is being typed in `[Gen]` row
+    /// `i`'s expression, offered as their signatures: the argument names are
+    /// the whole reason to look, and `hmac_sha256` alone does not say what it
+    /// wants first. Only the *word being typed* filters, so a function can
+    /// still be completed inside `concat(upper(` — an expression is not one
+    /// name the way a header is.
+    fn gen_suggestions(&self, i: usize) -> Option<(usize, Vec<&'static str>)> {
+        let text = self.generators.get(i)?.expr.text();
+        let word = gen_word(&text).1;
+        if word.is_empty() {
+            return None;
+        }
+        let sugs: Vec<&'static str> = crate::generators::functions_starting_with(word)
+            .map(|f| f.signature)
+            .collect();
+        // A name already typed in full has nothing left to offer, and a
+        // dropdown that will not close reads as the editor refusing to accept
+        // what was typed.
+        let done = sugs.len() == 1 && crate::generators::is_function(word);
+        (!sugs.is_empty() && !done).then_some((i, sugs))
     }
 
     /// The suggestion dropdown for the focused Key cell, if it should be shown:
@@ -1132,10 +1192,28 @@ impl NewReq {
 
     /// Fill the focused Key cell with header `name` and close the dropdown.
     pub(crate) fn accept_suggestion(&mut self, name: &str) {
-        if let NewField::Kvd(KvdKind::Header, i, HdrCol::Key) = self.focus
-            && let Some(row) = self.headers.get_mut(i)
-        {
-            row.key = Editor::new(name, false);
+        match self.focus {
+            NewField::Kvd(KvdKind::Header, i, HdrCol::Key) => {
+                if let Some(row) = self.headers.get_mut(i) {
+                    row.key = Editor::new(name, false);
+                }
+            }
+            // The suggestion is a signature; what goes in the cell is the call.
+            // Only the word being typed is replaced — the rest of the
+            // expression around it is the user's.
+            NewField::Computed(i, CapCol::Expr) => {
+                if let Some(row) = self.generators.get_mut(i) {
+                    let text = row.expr.text();
+                    let (at, word) = gen_word(&text);
+                    let end = at + word.len();
+                    let mut done = String::with_capacity(text.len() + name.len());
+                    done.push_str(&text[..at]);
+                    done.push_str(&gen_completion(name));
+                    done.push_str(&text[end..]);
+                    row.expr = Editor::new(&done, false);
+                }
+            }
+            _ => {}
         }
         self.suggest_hi = None;
         self.suggest_hidden = true;
@@ -1350,6 +1428,16 @@ impl NewReq {
 
     /// True when every `# [Gen]` row is blank — the section is then skipped
     /// when tabbing past it.
+    /// The `[Gen]` rows as the evaluator takes them, blank ones left out —
+    /// a row still being typed is not yet a mistake.
+    pub(crate) fn generator_rows(&self) -> Vec<(String, String)> {
+        self.generators
+            .iter()
+            .filter(|r| !r.is_blank())
+            .map(|r| (r.name.text(), r.expr.text()))
+            .collect()
+    }
+
     pub(crate) fn generators_blank(&self) -> bool {
         self.generators.iter().all(ReportRow::is_blank)
     }
@@ -2952,7 +3040,31 @@ fn draw_computed_section(
 ) {
     let focused =
         matches!(form.focus, NewField::Computed(..)) || form.focus == NewField::AddComputed;
-    draw_section_label(f, label, s.field_computed, focused, th);
+    // A block that cannot run is said so here rather than at send time: a
+    // mistyped function name is otherwise a 401 twenty minutes later, and this
+    // is the screen on which it is still just a typo. Only the first fault is
+    // shown — the label is one line, and the rest follow as each is fixed.
+    let faults = crate::generators::check(&form.generator_rows());
+    match faults.first() {
+        None => draw_section_label(f, label, s.field_computed, focused, th),
+        Some(fault) => {
+            let (fg, bg) = section_label_colors(focused, th);
+            let detail = crate::i18n::describe_gen_errors(s, std::slice::from_ref(fault))
+                .pop()
+                .unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", s.field_computed),
+                        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(detail, Style::default().fg(th.err).bg(bg)),
+                ]))
+                .style(Style::default().bg(bg)),
+                label,
+            );
+        }
+    }
     draw_computed_table_with_hits(f, table, form, s, th, app);
 }
 
@@ -3223,7 +3335,11 @@ pub(crate) fn draw_key_suggestions(
     let Some((_, sugs)) = form.key_dropdown() else {
         return;
     };
-    let Some(anchor) = form.key_cell_rect.get() else {
+    let anchor = match form.focus {
+        NewField::Computed(_, CapCol::Expr) => form.gen_cell_rect.get(),
+        _ => form.key_cell_rect.get(),
+    };
+    let Some(anchor) = anchor else {
         return;
     };
     let fr = f.area();
@@ -4518,6 +4634,7 @@ pub(crate) fn draw_computed_table_with_hits(
         NewField::Computed(i, _) => Some(i),
         _ => None,
     };
+    form.gen_cell_rect.set(None);
     let Some((table_area, header_rect, data_rects, add_rect, scrolling, start)) =
         windowed_table_rows(
             area,
@@ -4582,14 +4699,13 @@ pub(crate) fn draw_computed_table_with_hits(
                 MouseHitTarget::NewRequestField(NewField::Computed(i, CapCol::Expr)),
             );
         }
-        draw_header_cell(
-            f,
-            cells[1],
-            &row.expr,
-            form.focus == NewField::Computed(i, CapCol::Expr),
-            true,
-            th,
-        );
+        let expr_focused = form.focus == NewField::Computed(i, CapCol::Expr);
+        draw_header_cell(f, cells[1], &row.expr, expr_focused, true, th);
+        // Remembered so the function dropdown can anchor beneath the cell,
+        // which is drawn later, on top of the form.
+        if expr_focused {
+            form.gen_cell_rect.set(Some(cells[1]));
+        }
     }
 
     let add_focused = form.focus == NewField::AddComputed;

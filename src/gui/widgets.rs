@@ -812,6 +812,121 @@ pub fn kv_editor(
 
 /// An editable table of `(name, value)` pairs without an enabled flag
 /// (captures, reports). Returns true if anything changed.
+/// The `# [Gen]` table: `Name | Expression`, with a function menu on each row
+/// and, under it, everything wrong with the block that can be known without
+/// sending anything.
+///
+/// A near-copy of [`pair_editor`] rather than a flag on it: the extra column
+/// and the fault list are most of what this draws, and the expression column is
+/// monospaced because it is code.
+pub fn computed_editor(
+    ui: &mut egui::Ui,
+    theme: &GuiTheme,
+    s: &Strings,
+    rows: &mut Vec<(String, String)>,
+) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    let key_w = split_key_width(ui, 42.0);
+    let x_w = remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    ui.push_id("computed", |ui| {
+        table_rows(ui, |ui| {
+            table_row(ui, |ui| {
+                sized_header(ui, theme, s.computed_name, key_w);
+                column_header(ui, theme, s.computed_expr);
+            });
+            for i in 0..rows.len() {
+                table_row(ui, |ui| {
+                    if sized_key(ui, key_w, &mut rows[i].0, s.computed_name, theme.text).changed() {
+                        changed = true;
+                    }
+                    let val_w = (ui.available_width() - x_w * 3.0 - 8.0).max(40.0);
+                    if wrapping_field_font(
+                        ui,
+                        val_w,
+                        &mut rows[i].1,
+                        s.computed_expr,
+                        theme.text,
+                        egui::TextStyle::Monospace,
+                    )
+                    .changed()
+                    {
+                        changed = true;
+                    }
+                    let hit = flat_buttons(ui, |ui| {
+                        ui.add_sized(
+                            [x_w, row_h],
+                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                        )
+                    });
+                    if hit.clicked() {
+                        remove = Some(i);
+                    }
+                    // Thirty-five functions is more than anyone will remember
+                    // the spelling of, and the arguments are the whole reason
+                    // to look one up. Appended rather than replacing the cell:
+                    // an expression is often a call inside a call.
+                    ui.menu_button(
+                        RichText::new(s.gui_computed_functions).color(theme.dim),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    for f in crate::generators::FUNCTIONS {
+                                        if ui
+                                            .button(RichText::new(f.signature).monospace())
+                                            .clicked()
+                                        {
+                                            rows[i].1.push_str(&completion(f));
+                                            changed = true;
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                        },
+                    );
+                });
+            }
+        });
+    });
+    if let Some(i) = remove {
+        rows.remove(i);
+        changed = true;
+    }
+    if ui.button(s.gui_add).clicked() {
+        rows.push((String::new(), String::new()));
+        changed = true;
+    }
+    // Said here rather than at send time: a mistyped function name is a 401
+    // twenty minutes later, and this is the screen where it can still be a
+    // typo the user simply fixes.
+    let faults = crate::generators::check(rows);
+    if !faults.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(s.gui_computed_faults)
+                .color(theme.err)
+                .strong(),
+        );
+        for line in crate::i18n::describe_gen_errors(s, &faults) {
+            ui.label(RichText::new(line).color(theme.err));
+        }
+    }
+    changed
+}
+
+/// What choosing a function from the menu adds: the call, with an opening
+/// bracket only where an argument is required — a function that needs none is
+/// complete as its bare name.
+fn completion(f: &crate::generators::GenFunction) -> String {
+    if f.min_args == 0 {
+        f.name.to_string()
+    } else {
+        format!("{}(", f.name)
+    }
+}
+
 pub fn pair_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,

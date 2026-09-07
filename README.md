@@ -159,8 +159,8 @@ In the request wizard:
 
 | Key | Action |
 |---|---|
-| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Form│Body│Asserts│Captures`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
-| `Alt+1`–`6` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
+| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Queries│Options│Form│Body│Asserts│Captures│Reports│Computed`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
+| `Alt+1`–`9`, `Alt+0` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
 | `Ctrl+↑`/`↓` | Previous / next section |
 | `Ctrl+D` / `Ctrl+E` | Delete a row / toggle its enabled checkbox |
 | `←` from a Key cell | Reach the enabled checkbox — it's the leftmost column |
@@ -324,9 +324,13 @@ in order and a row may only refer to one above it. Values are computed per run,
 never previewed, and never written to `state.json`; a secret read through
 `{{ op://… }}` is no more exposed by signing with it than by sending it.
 
-Edit the block in the request wizard's **Computed** section (`Alt+0`), or as
-text. Placeholders that a generator will fill render in the theme's *computed*
-colour and keep their braces, because the value doesn't exist yet.
+Edit the block in the request wizard's **Computed** section (`Alt+0`), in the
+GUI editor's **Computed** tab, or as text. Both editors offer the functions as
+you type — with their arguments named — and say what is wrong with a row while
+it is still a typo rather than leaving it to be a 401: an unknown function, the
+wrong number of arguments, an expression that doesn't parse. Placeholders that a
+generator will fill render in the theme's *computed* colour and keep their
+braces, because the value doesn't exist yet.
 
 | | |
 |---|---|
