@@ -163,6 +163,7 @@ In the request wizard:
 | `Alt+1`–`9`, `Alt+0` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
 | `Ctrl+↑`/`↓` | Previous / next section |
 | `Ctrl+D` / `Ctrl+E` | Delete a row / toggle its enabled checkbox |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo within the focused text cell |
 | `←` from a Key cell | Reach the enabled checkbox — it's the leftmost column |
 | `Ctrl+F` or `Enter` on a File value | Open a file picker |
 | `F2`, `Ctrl+Enter` | Save |

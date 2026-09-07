@@ -4729,6 +4729,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_editing,
                         &[
                             ("", s.help_row_toggle_delete),
+                            ("Ctrl+Z", s.help_text_undo),
                             ("y", s.help_copy_selection),
                             ("Ctrl+C", s.help_ctrl_c),
                             ("c (Response pane)", s.help_compact),

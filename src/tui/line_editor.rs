@@ -196,7 +196,14 @@ impl Editor {
     }
 
     /// Insert `ch` at the cursor and advance one column.
+    ///
+    /// Records its own undo run, so history is kept for every caller — the
+    /// key wrappers below, and the hosts that reach past them and drive an
+    /// editor a primitive at a time (the request wizard's table cells do).
+    /// Recording is idempotent within a run: a wrapper that has already opened
+    /// an Insert run adds nothing here.
     pub fn insert(&mut self, ch: char) {
+        self.record_edit(EditKind::Insert);
         let idx = Self::byte_idx(&self.lines[self.row], self.col);
         self.lines[self.row].insert(idx, ch);
         self.col += 1;
@@ -268,6 +275,7 @@ impl Editor {
         if !self.multiline {
             return;
         }
+        self.record_edit(EditKind::Insert);
         let idx = Self::byte_idx(&self.lines[self.row], self.col);
         let tail = self.lines[self.row].split_off(idx);
         self.lines.insert(self.row + 1, tail);
@@ -278,6 +286,7 @@ impl Editor {
     /// Delete the character before the cursor, joining with the previous line
     /// when at column 0.
     pub fn backspace(&mut self) {
+        self.record_edit(EditKind::Delete);
         if self.col > 0 {
             let start = Self::byte_idx(&self.lines[self.row], self.col - 1);
             let end = Self::byte_idx(&self.lines[self.row], self.col);
@@ -380,6 +389,15 @@ impl Editor {
     }
 
     /// End any coalesced edit run without recording a checkpoint, so the next
+    /// edit starts a fresh undo step. Called on cursor movement, and by a host
+    /// when focus leaves the field: coming back to a cell and typing again is
+    /// a second run, not a continuation of the first, and one undo should take
+    /// back only what was just typed.
+    pub fn end_run(&mut self) {
+        self.break_run();
+    }
+
+    /// End any coalesced edit run without recording a checkpoint, so the next
     /// edit starts a fresh undo step. Called on cursor movement.
     fn break_run(&mut self) {
         self.coalesce = None;
@@ -418,6 +436,7 @@ impl Editor {
 
     /// Move the cursor one character left (wrapping to the previous line end).
     pub fn left(&mut self) {
+        self.break_run();
         if self.col > 0 {
             self.col -= 1;
         } else if self.row > 0 {
@@ -428,6 +447,7 @@ impl Editor {
 
     /// Move the cursor one character right (wrapping to the next line start).
     pub fn right(&mut self) {
+        self.break_run();
         if self.col < self.line_len(self.row) {
             self.col += 1;
         } else if self.row + 1 < self.lines.len() {
@@ -438,6 +458,7 @@ impl Editor {
 
     /// Move the cursor up one line, clamping the column to the new line length.
     pub fn up(&mut self) {
+        self.break_run();
         if self.row > 0 {
             self.row -= 1;
             self.col = self.col.min(self.line_len(self.row));
@@ -446,6 +467,7 @@ impl Editor {
 
     /// Move the cursor down one line, clamping the column to the new line length.
     pub fn down(&mut self) {
+        self.break_run();
         if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = self.col.min(self.line_len(self.row));
@@ -454,11 +476,13 @@ impl Editor {
 
     /// Move the cursor to column 0 of the current line.
     pub fn home(&mut self) {
+        self.break_run();
         self.col = 0;
     }
 
     /// Move the cursor to the end of the current line.
     pub fn end(&mut self) {
+        self.break_run();
         self.col = self.line_len(self.row);
     }
 

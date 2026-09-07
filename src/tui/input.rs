@@ -6718,7 +6718,14 @@ impl TuiApp {
                 let name = sugs[k];
                 form.accept_suggestion(name);
             }
-            form.focus_next(true, true);
+            // Accepting a header name finishes the cell, so focus moves on.
+            // Accepting a function does not: what went in is `sha256()` with
+            // the caret between the brackets, and the argument still has to be
+            // typed — leaving the cell would abandon the call half-written, in
+            // a row the block then reports as a fault.
+            if !matches!(form.focus, NewField::Computed(_, CapCol::Expr)) {
+                form.focus_next(true, true);
+            }
         } else if !ctrl && kind_open && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             // Step through Text → File → Base64 File (Down) or the
             // reverse (Up), clamped at the ends like a small list.
@@ -6832,6 +6839,25 @@ impl TuiApp {
             // text-entry cell, so the brackets can still be typed into
             // URLs, JSON bodies, header/cookie/form values, etc.
             form.cycle_view_tab(key.code == KeyCode::Char(']'));
+        } else if ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
+            // Ctrl+Z undoes within the focused text cell, Ctrl+Shift+Z redoes —
+            // the same binding the report editor and the main view's text panes
+            // use, and the one every text field anywhere has. The wizard's
+            // fields bound neither, which mattered most where an edit isn't
+            // something the user typed one character at a time: accepting a
+            // function suggestion rewrites the cell in one go, and without undo
+            // there was no way back to what was being typed.
+            //
+            // Per-cell, because that is where the history lives: each cell is
+            // its own [`Editor`] with its own stack, so this undoes the field
+            // you are in and never reaches into one you have left.
+            if let Some(ed) = form.active_editor() {
+                if shift {
+                    ed.redo();
+                } else {
+                    ed.undo();
+                }
+            }
         } else if ctrl && key.code == KeyCode::Char('d') {
             // Delete the focused Header/Cookie/Form/Assert/Capture row;
             // focus moves to the row sliding into its place, or the
@@ -7395,6 +7421,14 @@ impl TuiApp {
                 } else {
                     form.view_tab.last_field()
                 };
+            }
+            // Leaving a cell ends its undo run: coming back to it and typing
+            // again is a second step, and one Ctrl+Z should take back only
+            // what was just typed rather than everything the cell ever held.
+            if form.focus != prev_focus
+                && let Some(ed) = form.editor_at(prev_focus)
+            {
+                ed.end_run();
             }
             if typed_in_key {
                 form.suggest_hi = None;

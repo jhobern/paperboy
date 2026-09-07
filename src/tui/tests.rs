@@ -33222,3 +33222,70 @@ fn a_reorder_undone_after_switching_workspace_files_away_and_back_clears_the_mar
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(test)]
+mod wizard_undo_tests {
+    use super::*;
+
+    fn ctrl(app: &mut TuiApp, code: KeyCode, shift: bool) {
+        let mut m = KeyModifiers::CONTROL;
+        if shift {
+            m |= KeyModifiers::SHIFT;
+        }
+        app.on_key(KeyEvent::new(code, m));
+    }
+
+    /// Every other text surface in the app undoes with Ctrl+Z; the wizard's
+    /// fields bound nothing at all, which was worst where an edit isn't
+    /// something typed a character at a time — accepting a function suggestion
+    /// rewrites the cell in one go.
+    #[test]
+    fn ctrl_z_undoes_within_the_focused_wizard_cell() {
+        let mut app = TuiApp::default();
+        open_form_on_computed_expression(&mut app);
+        type_str(&mut app, "concat(sha25");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(form_ref(&app).generators[0].expr.text(), "concat(sha256()");
+
+        ctrl(&mut app, KeyCode::Char('z'), false);
+        assert_eq!(
+            form_ref(&app).generators[0].expr.text(),
+            "concat(sha25",
+            "one undo takes back the accepted suggestion"
+        );
+        ctrl(&mut app, KeyCode::Char('Z'), true);
+        assert_eq!(
+            form_ref(&app).generators[0].expr.text(),
+            "concat(sha256()",
+            "and Ctrl+Shift+Z puts it back"
+        );
+    }
+
+    /// The history is per cell, because that is where it is kept: undoing in
+    /// the cell you are in must not reach into one you have left.
+    #[test]
+    fn undo_belongs_to_the_cell_the_focus_is_in() {
+        let mut app = TuiApp::default();
+        open_form_on_computed_expression(&mut app);
+        type_str(&mut app, "uuid");
+        // Back to the Name cell of the same row and type there. (Left would
+        // only move the caret within the expression — a cell's own ←/→ step
+        // between cells at its edges, and the caret is at the end of "uuid".)
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Name));
+        type_str(&mut app, "_id");
+        ctrl(&mut app, KeyCode::Char('z'), false);
+        let form = form_ref(&app);
+        assert_eq!(
+            form.generators[0].name.text(),
+            "value",
+            "the Name cell undid the run typed into it"
+        );
+        assert_eq!(
+            form.generators[0].expr.text(),
+            "uuid",
+            "the expression beside it is untouched"
+        );
+    }
+}

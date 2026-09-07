@@ -204,6 +204,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   past it to whatever the field last held — usually nothing — with no way to
   return.
 
+- **The request wizard's text fields undo.** They bound Ctrl+Z to nothing at
+  all — every other text surface in the app has undone since 0.4 — and they
+  recorded no history either, because a wizard cell is driven a keystroke at a
+  time rather than through the shared editor key handler. Typing runs are now
+  recorded by the editor itself, so `Ctrl+Z` / `Ctrl+Shift+Z` step back and
+  forward in whichever cell has focus, one typing run at a time. Leaving a cell
+  ends its run, so coming back and typing more is its own step.
+
+- **Accepting a function suggestion no longer jumps out of the cell.** Focus
+  moved on to the next field the way it does after a header name — but a
+  header name is a finished value and `sha256()` is not, so the caret waiting
+  between the brackets was abandoned along with the call.
+
 - **"Revert to saved" is offered on a plain collection's requests, not only a
   workspace's.** Discarding one request's edits was reachable by right-click in
   a workspace tree and nowhere else, so a collection opened as a single file

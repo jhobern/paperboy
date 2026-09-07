@@ -1380,7 +1380,16 @@ impl NewReq {
 
     /// The text editor for the focused field, if it is a text field.
     pub(crate) fn active_editor(&mut self) -> Option<&mut Editor> {
-        match self.focus {
+        self.editor_at(self.focus)
+    }
+
+    /// The [`Editor`] behind `field`, if that field is a text-entry one.
+    ///
+    /// Separate from [`active_editor`](Self::active_editor) so a host can also
+    /// reach the field focus has just *left* — which is where an undo run has
+    /// to be ended, so typing after coming back to a cell is its own step.
+    pub(crate) fn editor_at(&mut self, field: NewField) -> Option<&mut Editor> {
+        match field {
             NewField::Name => Some(&mut self.name),
             NewField::Url => Some(&mut self.url),
             NewField::Body => Some(&mut self.body),
