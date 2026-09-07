@@ -245,6 +245,24 @@ impl Editor {
         }
     }
 
+    /// Replace the whole buffer with `text` and leave the caret at
+    /// `(row, col)`, as a single undo step.
+    ///
+    /// The alternative — building a fresh [`Editor`] over the new text — is
+    /// what accepting a completion used to do, and it threw the undo history
+    /// away with the old editor: a programmatic edit the user cannot take back
+    /// is worse than one they never asked for.
+    pub fn replace_text(&mut self, text: &str, row: usize, col: usize) {
+        self.checkpoint();
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(|l| l.to_string()).collect()
+        };
+        self.set_cursor(row, col);
+        self.coalesce = None;
+    }
+
     /// Split the current line at the cursor (no-op in single-line mode).
     pub fn newline(&mut self) {
         if !self.multiline {

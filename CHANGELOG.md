@@ -192,13 +192,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   row now defines its name for its own request and for the ones after it, the
   same way a capture does.
 
-- **Choosing a function writes the whole call, where the caret is.** Picking
-  one from the list left a half-written `sha256(` tacked onto the *end* of the
-  expression — so completing inside `base64(` produced `base64(sha256(`, with
-  two brackets to close by hand and a fault reported until they were. Both
-  editors now write `sha256()` at the caret, replacing the part-typed name, and
-  leave the caret between the brackets ready for the argument; in the GUI the
-  field takes focus back, so the next keystroke goes where it was aimed.
+- **Choosing a function writes the whole call, where the caret is — and
+  Ctrl+Z takes it back.** Picking one from the list left a half-written
+  `sha256(` tacked onto the *end* of the expression, so completing inside
+  `base64(` produced `base64(sha256(`, with two brackets to close by hand and a
+  fault reported until they were. Both editors now write `sha256()` at the
+  caret, replacing the part-typed name, and leave the caret between the
+  brackets ready for the argument; in the GUI the field takes focus back, so
+  the next keystroke goes where it was aimed. Undo works through it too: the
+  insert is recorded as one reversible step, where before Ctrl+Z jumped back
+  past it to whatever the field last held — usually nothing — with no way to
+  return.
+
+- **"Revert to saved" is offered on a plain collection's requests, not only a
+  workspace's.** Discarding one request's edits was reachable by right-click in
+  a workspace tree and nowhere else, so a collection opened as a single file
+  had no way back to what was on disk short of closing the tab and losing every
+  other edit with it. The same item — same confirmation, since a revert has no
+  undo — now sits below Delete on any edited request whose collection has a
+  file behind it.
 
 - **A report run refuses a request whose computed value failed.** It evaluated
   the block, threw the errors away, and sent the request with `{{sig}}` still

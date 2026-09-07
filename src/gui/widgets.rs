@@ -845,7 +845,7 @@ pub fn computed_editor(
                     // is sized: an infinite-width field laid out left to right
                     // claims the whole row and shoves them off the edge, and
                     // there is no horizontal scrollbar to get them back.
-                    let f_w = button_width(ui, FUNCTIONS_BUTTON);
+                    let f_w = button_width(ui, s.gui_computed_fn_button);
                     let val_w = (ui.available_width() - x_w - f_w - 24.0).max(40.0);
                     let field = wrapping_field_font(
                         ui,
@@ -864,29 +864,33 @@ pub fn computed_editor(
                     // where the caret is — an expression is often a call inside
                     // a call, so appending to the end would be wrong as often
                     // as it was right.
-                    ui.menu_button(RichText::new(FUNCTIONS_BUTTON).color(theme.dim), |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(320.0)
-                            .show(ui, |ui| {
-                                for f in crate::generators::FUNCTIONS {
-                                    if ui.button(RichText::new(f.signature).monospace()).clicked() {
-                                        let at = caret_of(ui.ctx(), field.id);
-                                        let (text, caret) = insert_call(&rows[i].1, at, f);
-                                        rows[i].1 = text;
-                                        // The caret goes between the brackets,
-                                        // and the field takes focus back: the
-                                        // next thing to do is type the first
-                                        // argument, and a menu that leaves the
-                                        // user to click back into the cell has
-                                        // done half the job.
-                                        set_caret(ui.ctx(), field.id, caret);
-                                        ui.ctx().memory_mut(|m| m.request_focus(field.id));
-                                        changed = true;
-                                        ui.close();
+                    ui.menu_button(
+                        RichText::new(s.gui_computed_fn_button).color(theme.dim),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    for f in crate::generators::FUNCTIONS {
+                                        if ui
+                                            .button(RichText::new(f.signature).monospace())
+                                            .clicked()
+                                        {
+                                            // The caret ends up between the
+                                            // brackets, and the field takes
+                                            // focus back: the next thing to do
+                                            // is type the first argument, and a
+                                            // menu that leaves the user to
+                                            // click back into the cell has done
+                                            // half the job.
+                                            write_call(ui.ctx(), field.id, &mut rows[i].1, f);
+                                            ui.ctx().memory_mut(|m| m.request_focus(field.id));
+                                            changed = true;
+                                            ui.close();
+                                        }
                                     }
-                                }
-                            });
-                    })
+                                });
+                        },
+                    )
                     .response
                     .on_hover_text(s.gui_computed_functions);
                     let hit = flat_buttons(ui, |ui| {
@@ -928,30 +932,43 @@ pub fn computed_editor(
     changed
 }
 
-/// The function menu's label. A symbol rather than a word: it sits at the end
-/// of a row whose expression field should have the width, and it is the same
-/// mark in every language. What it means is on hover.
-const FUNCTIONS_BUTTON: &str = "\u{0192}";
-
-/// Where the caret is in the text field `id`, as a character index, if it has
-/// been in one. `None` before the field has ever been clicked into, which is
-/// exactly when "the end" is the right guess.
-fn caret_of(ctx: &egui::Context, id: egui::Id) -> Option<usize> {
-    egui::TextEdit::load_state(ctx, id)
-        .and_then(|s| s.cursor.char_range())
-        .map(|r| r.primary.index.0)
-}
-
-/// Put the caret at character `index` in the text field `id`.
-fn set_caret(ctx: &egui::Context, id: egui::Id, index: usize) {
-    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
-        state
-            .cursor
-            .set_char_range(Some(egui::text::CCursorRange::one(
-                egui::text::CCursor::new(index),
-            )));
-        egui::TextEdit::store_state(ctx, id, state);
-    }
+/// Write `f`'s call into the text field `id`, at the caret.
+///
+/// Everything the field's own state has to be told about an edit made behind
+/// its back happens here:
+///
+/// * the caret, which egui keeps per-field and would otherwise stay where it
+///   was — pointing into text that has since moved;
+/// * an undo point holding the text *before* the insert. egui only records one
+///   once the text has sat still for a moment, so a menu insert lands inside
+///   that window: Ctrl+Z would jump back past it to whatever was last stable —
+///   usually the empty cell — with no redo to come back by. Recording the
+///   pre-insert state makes the insert one reversible step like a typed one.
+///
+/// With no state stored — a cell never clicked into — there is no caret to
+/// insert at and no history to preserve, so the call goes on the end.
+fn write_call(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    f: &crate::generators::GenFunction,
+) {
+    use egui::text::{CCursor, CCursorRange};
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
+        (*text, _) = insert_call(text, None, f);
+        return;
+    };
+    let range = state.cursor.char_range();
+    let at_end = CCursorRange::one(CCursor::new(text.chars().count()));
+    let mut undoer = state.undoer();
+    undoer.add_undo(&(range.unwrap_or(at_end), text.clone()));
+    state.set_undoer(undoer);
+    let (out, caret) = insert_call(text, range.map(|r| r.primary.index.0), f);
+    *text = out;
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+    egui::TextEdit::store_state(ctx, id, state);
 }
 
 /// Write `f`'s call into `text` at the caret, returning the new text and where
@@ -2328,7 +2345,7 @@ fn shade(ctx: &egui::Context, title: &str) {
 
 #[cfg(test)]
 mod function_menu_tests {
-    use super::insert_call;
+    use super::{egui, insert_call};
     use crate::generators::function;
 
     #[test]
@@ -2349,6 +2366,44 @@ mod function_menu_tests {
         assert_eq!(text, "id = uuid");
         // Nothing to type inside, so the caret sits after the name.
         assert_eq!(caret, 9);
+    }
+
+    /// An edit made behind a text field's back is outside egui's own undo
+    /// bookkeeping, which only records a point once the text has been still for
+    /// a moment: without an explicit one, Ctrl+Z after choosing a function
+    /// jumped back past the insert to whatever was last stable — usually an
+    /// empty cell — and there was no redo to come back by.
+    #[test]
+    fn choosing_a_function_leaves_something_for_ctrl_z_to_undo() {
+        use egui::text::{CCursor, CCursorRange};
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("expr");
+        let mut state = egui::widgets::text_edit::TextEditState::default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(7))));
+        egui::TextEdit::store_state(&ctx, id, state);
+
+        let mut text = "base64()".to_string();
+        let f = function("sha256").expect("sha256 is a generator function");
+        super::write_call(&ctx, id, &mut text, f);
+        assert_eq!(text, "base64(sha256())");
+
+        let state = egui::TextEdit::load_state(&ctx, id).expect("state was stored");
+        assert_eq!(
+            state.cursor.char_range().map(|r| r.primary.index.0),
+            Some(14),
+            "the caret waits inside the call that was written"
+        );
+        let now = (
+            CCursorRange::one(CCursor::new(14)),
+            "base64(sha256())".to_string(),
+        );
+        assert_eq!(
+            state.undoer().undo(&now).map(|(_, t)| t.as_str()),
+            Some("base64()"),
+            "one undo goes back to the expression as it was"
+        );
     }
 
     #[test]

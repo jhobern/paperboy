@@ -326,7 +326,10 @@ never previewed, and never written to `state.json`; a secret read through
 
 Edit the block in the request wizard's **Computed** section (`Alt+0`), in the
 GUI editor's **Computed** tab, or as text. Both editors offer the functions as
-you type — with their arguments named — and say what is wrong with a row while
+you type — with their arguments named — and the GUI's **Function…** menu lists
+them all; either way the call is written at the caret, over any part-typed
+name, with the caret left between the brackets. Both say what is wrong with a
+row while
 it is still a typo rather than leaving it to be a 401: an unknown function, the
 wrong number of arguments, an expression that doesn't parse. Placeholders that a
 generator will fill render in the theme's *computed* colour and keep their

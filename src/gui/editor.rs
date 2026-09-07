@@ -2500,10 +2500,9 @@ mod computed_tests {
             let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
             placed = placed_text(&full.shapes);
         }
-        let menus: Vec<&(String, egui::Rect)> = placed
-            .iter()
-            .filter(|(t, _)| t.contains('\u{0192}'))
-            .collect();
+        let label = app.strings.gui_computed_fn_button;
+        let menus: Vec<&(String, egui::Rect)> =
+            placed.iter().filter(|(t, _)| t.contains(label)).collect();
         assert_eq!(menus.len(), 2, "one per row: {placed:?}");
         for (label, rect) in menus {
             assert!(

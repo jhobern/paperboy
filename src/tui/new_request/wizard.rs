@@ -1215,11 +1215,14 @@ impl NewReq {
                     done.push_str(&text[..at]);
                     done.push_str(&call);
                     done.push_str(&text[end..]);
-                    row.expr = Editor::new(&done, false);
-                    // Editor::new leaves the caret at the end of the text, which
-                    // is past the tail of the expression the completion was
-                    // written into the middle of.
-                    row.expr.set_cursor(0, text[..at].chars().count() + caret);
+                    // Replaced in place rather than rebuilt: a fresh Editor
+                    // starts with an empty undo stack, so Ctrl+Z after
+                    // accepting a suggestion would have nothing to go back to.
+                    // The caret lands inside the call rather than at the end of
+                    // the text — the completion went into the middle of an
+                    // expression.
+                    row.expr
+                        .replace_text(&done, 0, text[..at].chars().count() + caret);
                 }
             }
             _ => {}

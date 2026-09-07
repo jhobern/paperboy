@@ -22817,6 +22817,33 @@ fn the_expression_cell_suggests_generator_functions() {
     );
 }
 
+/// Accepting a suggestion used to rebuild the cell's editor over the new text,
+/// which threw the undo history away with the old one: whatever had been typed
+/// before it was gone for good, with nothing left to step back to. (The
+/// wizard's table cells don't bind Ctrl+Z themselves yet — this checks the
+/// history the cell keeps, which is what such a binding would undo through.)
+#[test]
+fn accepting_a_function_leaves_the_cell_something_to_undo() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "concat(sha25");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_mut() else {
+        panic!("the wizard is open");
+    };
+    assert_eq!(form.generators[0].expr.text(), "concat(sha256()");
+    assert!(
+        form.generators[0].expr.undo(),
+        "there is a step to take back"
+    );
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "concat(sha25",
+        "one undo puts back what was being typed"
+    );
+}
+
 /// A function that needs no argument is complete as its bare name — a
 /// trailing `(` would be an expression the user has to go back and finish.
 #[test]

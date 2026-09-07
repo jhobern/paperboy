@@ -905,6 +905,7 @@ strings! {
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
     gui_computed_functions => "Insert a function", "Insérer une fonction", "Indsæt en funktion";
+    gui_computed_fn_button => "Function…", "Fonction…", "Funktion…";
     gui_computed_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_computed_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs calculées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der beregnes hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
