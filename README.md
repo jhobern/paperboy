@@ -475,9 +475,23 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 - **Dynamic variables.** `{{$guid}}` and `{{$isoTimestamp}}` become Hurl's own
   `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}` and `{{$randomInt}}` become
   [computed values](#computed-values). The rest are listed as values to supply.
+- **Pre-request scripts**, as far as they reduce to values PaperBoy can compute:
+  `pm.environment.set("id", uuid.v4())`, `Date.now()`,
+  `Math.floor(Date.now() / 1000)`, `new Date().toISOString()`,
+  `pm.variables.replaceIn("{{$guid}}")` and literals become
+  [computed values](#computed-values).
+- **Test scripts**, as the status and assertions they always make:
+  `pm.response.to.have.status(400)` becomes the request's expected status, and
+  `pm.expect(...)` checks on the body, headers and response time become
+  `[Asserts]`. Only checks that run *unconditionally* are taken — anything
+  inside an `if`, a loop or a helper function is left for you, since an
+  assertion that was meant for one branch fails every run.
+- **Scripts on a folder or on the collection**, which Postman runs for every
+  request inside; they are converted for each request they cover, and reported
+  once against the folder that holds them.
 
-Hurl doesn't cover everything Postman does. Anything dropped — pre-request
-scripts, OAuth 2, GraphQL bodies — is listed per request in
+Hurl doesn't cover everything Postman does. Anything dropped — the rest of a
+script, OAuth 2, GraphQL bodies — is listed per request in
 `CONVERSION-NOTES.md` at the root of the import; no file means nothing was lost.
 A collection this build can't read is written out as its original JSON, so
 converting can't cost you data.

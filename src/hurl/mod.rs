@@ -16,8 +16,8 @@ mod stage;
 pub use entry::{
     CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KeyProblem, KvRow, METHODS,
     ParamNameError, PlaceholderProblem, RunStatus, check_parameter_name, collection_to_hurl,
-    key_problem, method_rgb, placeholder_problems, status_eq_code, suggest_parameter_name,
-    value_problem,
+    is_variable_name, key_problem, method_rgb, placeholder_problems, status_eq_code,
+    suggest_parameter_name, value_problem,
 };
 pub(crate) use parser::parse_file_form_value;
 pub use parser::{parse_hurl, parse_hurl_error};

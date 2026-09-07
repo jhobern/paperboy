@@ -95,6 +95,39 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the RFC 4231 test vector — a signing implementation that is self-consistently
   wrong passes every test written from its own output.
 
+- **Postman's pre-request and test scripts now carry across as far as Hurl can
+  state them.** They used to be dropped whole, with a note. A pre-request
+  script's `pm.environment.set` / `pm.collectionVariables.set` / `pm.variables.set`
+  assignments now become `[Gen]` rows where the value is one PaperBoy can
+  compute — `uuid.v4()`, `Date.now()`, `Math.floor(Date.now() / 1000)`,
+  `new Date().toISOString()`, `pm.variables.replaceIn('{{$guid}}')`, and plain
+  literals — so the nonce and stamp a collection is built around survive the
+  import. A test script's `pm.response.to.have.status(…)` becomes the request's
+  expected status, and `pm.expect(…)` checks on the body, headers and response
+  time become `[Asserts]`.
+
+  Only assertions the script runs *every* time are taken. Anything inside an
+  `if`, a loop or a helper function is left out, however plainly it reads: a
+  collection that asserts "Matched" down one branch and "NotMatched" down the
+  other would otherwise import as a request that fails whichever way the
+  response goes, which is worse than importing no assertion at all. A
+  `pm.test(…, () => { … })` callback body is the exception, since it always
+  runs.
+
+  Scripts declared on a **folder or on the collection** are now read as well.
+  Postman runs them for every request inside, and PaperBoy was reading only the
+  request's own — so a collection whose ninety-five requests get their
+  transaction id from one folder script imported with none of them having one.
+  A note about an inherited script is filed against the folder that holds it,
+  once, rather than repeated under every request that inherits it.
+
+  A script that chose what ran next (`pm.execution.setNextRequest`) is called
+  out separately: it is a lost *order*, not a lost assertion, and every request
+  in such a collection still looks correct while the run does something else.
+  And an empty script tab — Postman writes `"exec": [""]` for one that was
+  opened and never used — no longer reports a script as lost when there was
+  never one there.
+
 - **Import every Postman workspace at once.** The wizard could only ever take
   one workspace at a time, which is fine for trying PaperBoy out and useless
   for the thing people actually want it for: leaving Postman. An account with
@@ -122,8 +155,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   run — an account is not a migration's fault. Anything that would fail for
   every remaining workspace, such as a rejected key or an exhausted monthly
   quota, still stops the plan instead of being logged forty times.
-
-### Added
 
 - **A preference for the old Esc behaviour.** Esc on a request form with unsaved
   edits asks before discarding them, which is the right default for a form with
