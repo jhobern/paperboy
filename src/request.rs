@@ -158,9 +158,26 @@ pub fn subst_map(col: &Collection, env: Option<&Environment>) -> HashMap<String,
         }
     }
 
-    // Names the `# [Gen]` block will compute at send time. Inserted before the
-    // captures below so a capture of the same name — which is a real value the
-    // preview can show — still wins.
+    // A capture that has produced a value is loaded → green (overrides env).
+    for (k, val) in &col.captures {
+        out.insert(
+            k.clone(),
+            SubstInfo {
+                shown: Some(val.clone()),
+                kind: SubstKind::Loaded,
+            },
+        );
+    }
+
+    // Names an entry's own `# [Gen]` block computes, applied *last* so they win
+    // over `col.captures`. This branch merges a completed send's generated
+    // values into `CaptureUpdate::values`, so from the first send onwards a
+    // generator name is also present in `col.captures` with its value — and a
+    // computed value must never be shown: it may be an HMAC of a secret (unlike
+    // an environment secret, a capture is rendered in the clear), and the
+    // preview would in any case be a lie, showing the *previous* send's nonce
+    // while the next send computes a fresh one. Rendered as `{{name}}` in the
+    // computed colour instead, whatever `col.captures` holds.
     for e in &col.entries {
         for (name, _) in &e.generators {
             out.insert(
@@ -171,17 +188,6 @@ pub fn subst_map(col: &Collection, env: Option<&Environment>) -> HashMap<String,
                 },
             );
         }
-    }
-
-    // A capture that has produced a value is loaded → green (overrides env).
-    for (k, val) in &col.captures {
-        out.insert(
-            k.clone(),
-            SubstInfo {
-                shown: Some(val.clone()),
-                kind: SubstKind::Loaded,
-            },
-        );
     }
 
     out
@@ -1110,7 +1116,14 @@ pub fn run_all_entries(
             // a `RefCell` is enough to let the two closures share it.
             let generated: Rc<RefCell<HashMap<String, String>>> = Rc::default();
             let record_gen = Rc::clone(&generated);
-            crate::hurl::run::run_hurl_streaming_with(
+            // A block that fails to evaluate leaves its `{{name}}` unbound, so
+            // the request goes out with a literal placeholder and Hurl aborts it
+            // on `Undefined variable` — three screens from the real cause. The
+            // actual generator error was previously discarded here; collect it
+            // so it can be surfaced as the run's error below.
+            let gen_errors: Rc<RefCell<Vec<crate::generators::GenError>>> = Rc::default();
+            let record_errs = Rc::clone(&gen_errors);
+            let mut streamed = crate::hurl::run::run_hurl_streaming_with(
                 &content,
                 &vars,
                 run_root,
@@ -1122,11 +1135,12 @@ pub fn run_all_entries(
                         return Vec::new();
                     }
                     let mut merged = known.clone();
-                    crate::generators::expand(
+                    let errs = crate::generators::expand(
                         &entry.generators,
                         &mut merged,
                         &crate::generators::SystemSource::new(),
                     );
+                    record_errs.borrow_mut().extend(errs);
                     let bound: Vec<(String, String)> = entry
                         .generators
                         .iter()
@@ -1156,7 +1170,20 @@ pub fn run_all_entries(
                         responses: responses.clone(),
                     });
                 },
-            )
+            );
+            // Prefer the generator error over Hurl's downstream `Undefined
+            // variable`: the unbound placeholder is a symptom, the failed block
+            // is the cause. Only when the run itself reported nothing else.
+            if streamed.error.is_none() {
+                let errs = gen_errors.borrow();
+                if !errs.is_empty() {
+                    let english =
+                        crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                    streamed.error =
+                        Some(crate::i18n::describe_gen_errors(&english, &errs).join("; "));
+                }
+            }
+            streamed
         };
         if let Some(dir) = &staged_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -1527,6 +1554,15 @@ pub struct BatchGenerators {
     /// so the caller warns rather than silently sending one request's nonce
     /// with another's signature.
     pub collisions: Vec<String>,
+    /// Names a `# [Gen]` block computes that an environment variable (or a
+    /// carried-over capture) *already* binds. A streaming run shadows the
+    /// environment value only from the computing request onwards; a batch run
+    /// shares one value set across the whole file, so binding the computed value
+    /// up front would rewrite it for the requests *above* the generator too —
+    /// requests that may have no block at all. Batch therefore leaves the
+    /// environment value in place (see [`expand_batch_generators`]) and lists
+    /// the name here so the user is told their generator did nothing in batch.
+    pub shadowed: Vec<String>,
 }
 
 /// Evaluate every entry's `# [Gen]` block once, for a batch (whole-file) run.
@@ -1541,6 +1577,7 @@ pub fn expand_batch_generators(
     let mut bound = HashMap::new();
     let mut errors = Vec::new();
     let mut collisions: Vec<String> = Vec::new();
+    let mut shadowed: Vec<String> = Vec::new();
     // Which request first claimed each name, so a second claim is recognised
     // as a collision rather than as the same request being listed twice (a
     // repeated name *within* one block is that block's own business).
@@ -1574,6 +1611,17 @@ pub fn expand_batch_generators(
                 _ => {}
             }
             claimed.entry(name.clone()).or_insert(i);
+            // A name the *environment* already binds is left alone: overriding
+            // it here would rewrite it for every request in the file, including
+            // the ones above this generator that never asked. Streaming would
+            // shadow it only from here on, which one shared value set can't
+            // reproduce — so keep the environment value and warn instead.
+            if vars.contains_key(name) {
+                if !shadowed.contains(name) {
+                    shadowed.push(name.clone());
+                }
+                continue;
+            }
             if let Some(v) = merged.get(name) {
                 bound.entry(name.clone()).or_insert_with(|| v.clone());
             }
@@ -1584,6 +1632,7 @@ pub fn expand_batch_generators(
         bound,
         errors,
         collisions,
+        shadowed,
     }
 }
 
@@ -1607,6 +1656,27 @@ pub fn generator_collisions(col: &Collection) -> Vec<String> {
                 }
             } else {
                 claimed.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// The `# [Gen]` names a batch run would compute over a value the environment
+/// (or a carried-over capture) already binds.
+///
+/// Only a batch run has to care (see [`BatchGenerators::shadowed`]): it shares
+/// one value set, so it leaves the environment value in place for the whole
+/// file rather than rewriting it for the requests above the generator. The
+/// front-ends call this to warn before starting such a run — the computed value
+/// won't be used, and dropping `--batch` is usually the fix.
+pub fn generator_env_shadows(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let vars = collection_vars(env, &col.captures);
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        for (name, _) in &e.generators {
+            if vars.contains_key(name) && !out.contains(name) {
+                out.push(name.clone());
             }
         }
     }
@@ -2776,6 +2846,280 @@ mod tests {
         assert!(
             error.contains("hmac_sha526"),
             "and the reason names the row's fault: {error}"
+        );
+    }
+
+    /// A pinned clock and "random" source, so a computed value can be asserted.
+    struct Fixed;
+    impl crate::generators::GenSource for Fixed {
+        fn now(&self) -> (i64, u32) {
+            (1_700_000_000, 0)
+        }
+        fn fill_random(&self, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+        }
+        fn counter(&self, _name: &str) -> u64 {
+            1
+        }
+    }
+
+    /// A tiny loopback HTTP server that records the request bytes it was sent,
+    /// so a test can assert on what actually reached the wire. Returns the bound
+    /// port and a handle to the recorded requests.
+    fn recording_server(responses: usize) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for _ in 0..responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                record
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = sock.flush();
+            }
+        });
+        (port, seen)
+    }
+
+    /// A computed value must never reach the request preview: a generator name
+    /// keeps its `{{braces}}` in the *computed* colour, even after the block's
+    /// last result has been merged into `Collection::captures`. Otherwise an
+    /// HMAC-of-a-secret would be shown in plaintext, and the preview would show
+    /// the previous send's value while the next send computes a fresh one.
+    #[test]
+    fn a_computed_value_never_reaches_the_preview() {
+        let mut col = Collection::new("c".to_string(), vec![]);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://h/a",
+            vec![KvRow::new("Authorization", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(API_SECRET, "canonical")"#.to_string(),
+        )];
+        col.entries.push(e);
+
+        // What a completed send leaves behind: the block's result folded into
+        // the captures.
+        col.captures.insert(
+            "sig".to_string(),
+            "9f8e7d6c5b4a-hmac-of-a-secret".to_string(),
+        );
+
+        let map = subst_map(&col, None);
+        assert_eq!(
+            map["sig"].kind,
+            SubstKind::Computed,
+            "a name the block defines stays Computed even when captured"
+        );
+        let shown = subst_display("Authorization: {{sig}}", &map);
+        assert_eq!(
+            shown, "Authorization: {{sig}}",
+            "the preview keeps the braces rather than showing the value"
+        );
+    }
+
+    /// A whole-collection run must let a generator read its own request's
+    /// `[Options] variable:` rows, exactly as a single send does — otherwise a
+    /// signature over a declared key binds nothing and `{{sig}}` goes out
+    /// literally. The streaming path now layers the entry's own defaults before
+    /// evaluating the block.
+    #[test]
+    fn a_generator_sees_its_own_requests_parameters_in_a_run_all() {
+        let (port, seen) = recording_server(1);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            &format!("http://127.0.0.1:{port}/orders"),
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.options = vec![KvRow::new("variable", "SAMPLE_KEY=s3cret")];
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(SAMPLE_KEY, "m")"#.to_string(),
+        )];
+
+        // What a single send computes, for reference — this one always worked.
+        let empty = HashMap::new();
+        let (vars, errs) = effective_vars_reporting(&e, &empty);
+        assert!(errs.is_empty(), "a single send resolves it: {errs:?}");
+        let expected = vars["sig"].clone();
+
+        // What "Run All" / `paperboy -c` do: the block is evaluated in
+        // `before_entry`, over what the run has bound at that moment — which now
+        // includes the entry's own `[Options] variable:` rows.
+        let entries = vec![e];
+        let content = collection_to_hurl(&entries);
+        let gen_errors: std::rc::Rc<std::cell::RefCell<Vec<crate::generators::GenError>>> =
+            std::rc::Rc::default();
+        let record_errs = std::rc::Rc::clone(&gen_errors);
+        let out = crate::hurl::run::run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            move |i, known| {
+                let entry = &entries[i];
+                let mut merged = known.clone();
+                record_errs.borrow_mut().extend(crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                ));
+                entry
+                    .generators
+                    .iter()
+                    .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
+                    .collect()
+            },
+            |_| {},
+        );
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            sent.contains(&format!("X-Sig: {expected}")),
+            "the run must send the signature a single send would (`{expected}`).\n\
+             errors: {:?}\nrun error: {:?}\nwire:\n{sent}",
+            gen_errors.borrow(),
+            out.error
+        );
+    }
+
+    /// The pre-flight panel and the run it precedes must agree about a block:
+    /// both now apply the request's own `[Options] variable:` rows before
+    /// evaluating, so a signature over a declared key is clean in both.
+    #[test]
+    fn the_run_all_preflight_agrees_with_the_run() {
+        let mut e = HurlEntry::from_fields("Signed", "GET", "http://127.0.0.1:1/x", vec![], "");
+        e.options = vec![KvRow::new("variable", "SAMPLE_KEY=s3cret")];
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(SAMPLE_KEY, "m")"#.to_string(),
+        )];
+        let col = Collection::new("c".to_string(), vec![e.clone()]);
+
+        // What the panel says before the run.
+        let preflight = generator_problems_all(&col, None);
+        // What the run's `before_entry` hook now sees: the entry's own defaults
+        // layered in first (mirroring the fixed streaming path), then the block.
+        let mut merged: HashMap<String, String> = HashMap::new();
+        for (name, value) in e.variable_defaults() {
+            merged.entry(name).or_insert(value);
+        }
+        let at_run_time = crate::generators::expand(&e.generators, &mut merged, &Fixed);
+
+        assert_eq!(
+            preflight.len(),
+            at_run_time.len(),
+            "pre-flight: {preflight:?}\nat run time: {at_run_time:?}"
+        );
+        assert!(preflight.is_empty() && at_run_time.is_empty());
+    }
+
+    /// A batch run must not rewrite an environment variable behind the back of a
+    /// request that has no `# [Gen]` block. Batch shares one value set, so a
+    /// name a *later* request computes would otherwise replace the environment
+    /// value for the requests above it too. Batch leaves the environment value
+    /// in place and records the name in `shadowed` so the user is told.
+    #[test]
+    fn batch_does_not_rewrite_an_earlier_requests_variable() {
+        let (port, seen) = recording_server(2);
+        let first = HurlEntry::from_fields(
+            "Reads TOKEN",
+            "GET",
+            &format!("http://127.0.0.1:{port}/first"),
+            vec![KvRow::new("X-Token", "{{TOKEN}}")],
+            "",
+        );
+        let mut second = HurlEntry::from_fields(
+            "Computes TOKEN",
+            "GET",
+            &format!("http://127.0.0.1:{port}/second"),
+            vec![KvRow::new("X-Token", "{{TOKEN}}")],
+            "",
+        );
+        second.generators = vec![(
+            "TOKEN".to_string(),
+            r#""computed-by-request-two""#.to_string(),
+        )];
+
+        let entries = vec![first, second];
+        let mut vars = HashMap::new();
+        vars.insert("TOKEN".to_string(), "from-the-environment".to_string());
+
+        let blocks = expand_batch_generators(&entries, &vars, &Fixed);
+        assert_eq!(
+            blocks.shadowed,
+            vec!["TOKEN".to_string()],
+            "the environment binding of TOKEN is reported as shadowed, not rewritten"
+        );
+        assert!(
+            !blocks.bound.contains_key("TOKEN"),
+            "the computed value is not bound over the environment for the whole file"
+        );
+        vars.extend(blocks.bound.clone());
+        let content = collection_to_hurl(&entries);
+        let _ = crate::hurl::run_hurl(&content, &vars, None);
+
+        let sent = seen.lock().unwrap().join("\n");
+        let first_req = sent.split("GET /second").next().unwrap_or("").to_string();
+        assert!(
+            first_req.contains("X-Token: from-the-environment"),
+            "the first request keeps the environment's TOKEN.\nwire:\n{sent}"
+        );
+    }
+
+    /// A wholly blank generator row is a row still being typed, not a mistake:
+    /// [`effective_vars_reporting`] (the send) must ignore it just as the
+    /// editor's `check` does, so a half-typed row never blocks the send with a
+    /// message that names no row.
+    #[test]
+    fn a_blank_row_does_not_block_the_send() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![
+            ("nonce".to_string(), "uuid".to_string()),
+            (String::new(), String::new()),
+        ];
+        let vars = HashMap::new();
+        let (_, errors) = effective_vars_reporting(&e, &vars);
+        assert!(
+            errors.is_empty(),
+            "a row the editor is still waiting on must not refuse the send: {errors:?}"
+        );
+    }
+
+    /// `counter(name)` must count *across* sends, per the README: the counter
+    /// state lives in a process-global table, not on the per-send
+    /// `SystemSource`, so two sends of the same request draw different values.
+    #[test]
+    fn a_counter_counts_across_sends() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![(
+            "page".to_string(),
+            r#"counter("request-test-counter")"#.to_string(),
+        )];
+        let empty = HashMap::new();
+        let first = effective_vars_reporting(&e, &empty).0["page"].clone();
+        let second = effective_vars_reporting(&e, &empty).0["page"].clone();
+        assert_ne!(
+            first, second,
+            "two sends of the same request drew the same counter value ({first})"
         );
     }
 }

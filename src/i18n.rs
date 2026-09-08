@@ -905,6 +905,8 @@ strings! {
     // the two titles would make the line twice as long.
     gen_collision => "⚠ Both requests compute {name} — in one batch they share the first value", "⚠ Les deux requêtes calculent {name} — dans un même lot elles partagent la première valeur", "⚠ Begge anmodninger beregner {name} — i én batch deler de den første værdi";
     cli_gen_collision => "more than one request computes {name}: in --batch they share the first value (drop --batch to give each its own)", "plusieurs requêtes calculent {name} : avec --batch elles partagent la première valeur (retirez --batch pour que chacune ait la sienne)", "flere anmodninger beregner {name}: med --batch deler de den første værdi (fjern --batch for at give hver sin egen)";
+    gen_shadow => "⚠ {name} is set by the environment — in one batch the computed value is not used", "⚠ {name} est défini par l'environnement — dans un même lot la valeur calculée n'est pas utilisée", "⚠ {name} er sat af miljøet — i én batch bruges den beregnede værdi ikke";
+    cli_gen_shadow => "{name} is set by the environment: in --batch the computed value is not used (drop --batch to let it override from its request on)", "{name} est défini par l'environnement : avec --batch la valeur calculée n'est pas utilisée (retirez --batch pour qu'elle prenne effet à partir de sa requête)", "{name} er sat af miljøet: med --batch bruges den beregnede værdi ikke (fjern --batch for at lade den tage over fra sin anmodning)";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -1767,6 +1769,11 @@ pub enum Status {
     /// A batch "Run All" is about to give two requests one value for a name
     /// they each compute. Carries the colliding names.
     GeneratorCollisions(Vec<String>),
+    /// A batch "Run All" is about to leave an environment value in place where a
+    /// request's `# [Gen]` block meant to override it — batch shares one value
+    /// set, so the computed value would rewrite requests above the generator too
+    /// and is dropped instead. Carries the shadowed names.
+    GeneratorShadows(Vec<String>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -2099,6 +2106,11 @@ impl Status {
             Status::GeneratorCollisions(names) => names
                 .iter()
                 .map(|n| s.gen_collision.replace("{name}", n))
+                .collect::<Vec<_>>()
+                .join("; "),
+            Status::GeneratorShadows(names) => names
+                .iter()
+                .map(|n| s.gen_shadow.replace("{name}", n))
                 .collect::<Vec<_>>()
                 .join("; "),
             Status::TruncatedPlaceholders(items) => {

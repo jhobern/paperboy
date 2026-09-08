@@ -244,6 +244,20 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 )
             );
         }
+        // A generator whose name the environment already binds computes nothing
+        // in batch: one shared value set can't shadow the value from this
+        // request on without rewriting it for the requests above too, so the
+        // environment value stands. Say so — dropping `--batch` is the fix.
+        for name in &blocks.shadowed {
+            eprintln!(
+                "{}",
+                paint(
+                    color,
+                    Hue::Yellow,
+                    &format!("  ! {}", strings.cli_gen_shadow.replace("{name}", name))
+                )
+            );
+        }
         vars.extend(blocks.bound);
         let out = run_hurl(&run_content, &vars, file_root);
         for eo in out.entries.iter() {
