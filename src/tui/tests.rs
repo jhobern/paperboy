@@ -18250,8 +18250,14 @@ fn run_entry_reports_undefined_variables_without_blocking() {
         app.status
     );
     // Reported, not blocked: a literal `{{ MISSING }}` is valid Hurl to send.
+    //
+    // Asked of the receiver rather than of the `loading` flag: the send runs on
+    // a background thread that clears the flag the moment it finishes, and
+    // `192.0.2.1` fails instantly on a host with no route to it — so reading
+    // the flag is a race that loses under load. The receiver is registered by
+    // `run_entry` itself and stays put.
     assert!(
-        app.response.lock().unwrap().loading,
+        !app.pending_captures.is_empty(),
         "the request must still have been sent"
     );
 }
