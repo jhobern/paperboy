@@ -766,6 +766,23 @@ strings! {
     report_setting_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     report_setting_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
+    // The Response pane's "assert this / capture this" palette (`a`). Built
+    // from what the server actually replied, so the wording talks about the
+    // response rather than about Hurl.
+    probe_pick_subject_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
+    probe_pick_verb_title => "What about it?", "Que vérifier ?", "Hvad med det?";
+    probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
+    probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
+    probe_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
+    probe_menu_no_response => "Send the request first — there's no response to build from", "Envoyez d'abord la requête — aucune réponse sur laquelle s'appuyer", "Send forespørgslen først — der er intet svar at bygge på";
+    probe_verb_capture => "keep it in a variable…", "le garder dans une variable…", "gem det i en variabel…";
+    probe_verb_unavailable => "(not expressible in Hurl)", "(inexprimable en Hurl)", "(kan ikke udtrykkes i Hurl)";
+    probe_capture_name_title => "Variable name", "Nom de la variable", "Variabelnavn";
+    probe_assert_added => "Assert added:", "Vérification ajoutée :", "Kontrol tilføjet:";
+    probe_status_set => "Expected status set to", "Statut attendu défini à", "Forventet status sat til";
+    probe_capture_added => "Capture added:", "Capture ajoutée :", "Opsamling tilføjet:";
+    probe_already_there => "That one is already on the request", "Celle-ci est déjà sur la requête", "Den er der allerede på forespørgslen";
+    help_text_probe => "Assert/capture from the response", "Vérifier/capturer depuis la réponse", "Kontrollér/opsaml fra svaret";
     report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
     report_node_name_none => "pick a request", "choisir une requête", "vælg en forespørgsel";
@@ -1674,6 +1691,17 @@ pub enum Status {
     ReportBindNoCollections,
     /// Text was copied to the clipboard (a selection or a whole-panel copy).
     Copied,
+    /// An `[Asserts]` line was built from the response and added to the
+    /// request; holds the line, so the confirmation shows what was written
+    /// rather than just that something was.
+    ProbeAssertAdded(String),
+    /// The expected status was taken from the response; holds the code.
+    ProbeStatusSet(u16),
+    /// A `[Captures]` row was built from the response; holds the variable name.
+    ProbeCaptureAdded(String),
+    /// The assert or capture chosen is already on the request, so nothing was
+    /// added. Said out loud: silently doing nothing reads as a broken key.
+    ProbeAlreadyThere,
     /// The active collection has no remembered git origin, so "Save to Git"
     /// can't be opened.
     NoGitOrigin,
@@ -2013,6 +2041,10 @@ impl Status {
             Status::Loaded => s.file_loaded.to_string(),
             Status::Cleared => s.clear_all_done.to_string(),
             Status::Copied => s.copied_to_clipboard.to_string(),
+            Status::ProbeAssertAdded(line) => format!("{} {line}", s.probe_assert_added),
+            Status::ProbeStatusSet(code) => format!("{} {code}", s.probe_status_set),
+            Status::ProbeCaptureAdded(name) => format!("{} {name}", s.probe_capture_added),
+            Status::ProbeAlreadyThere => s.probe_already_there.to_string(),
             Status::NoResponse => s.file_no_response.to_string(),
             Status::NotCollection => s.file_not_collection.to_string(),
             Status::NotEnvironment => s.file_not_environment.to_string(),

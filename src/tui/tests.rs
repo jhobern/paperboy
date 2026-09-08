@@ -33289,3 +33289,184 @@ mod wizard_undo_tests {
         );
     }
 }
+
+/// The Response pane's assert/capture palette (`a`) — the "I can see the value,
+/// make it a test" path that used to mean typing a jsonpath in by hand.
+mod probe_menu_tests {
+    use super::*;
+    use crate::tui::app::{Overlay, PromptKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A request with a JSON reply already in hand, focused on the Response
+    /// pane — the state the palette is opened from.
+    fn app_with_response(body: &str) -> TuiApp {
+        let mut app = TuiApp::default();
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry {
+            title: "Login".into(),
+            method: "POST".into(),
+            url: "https://api.test/login".into(),
+            ..Default::default()
+        });
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 201,
+            status_text: "Created".into(),
+            body: body.into(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            duration_ms: Some(120),
+            ..Default::default()
+        });
+        app.focus = Pane::Response;
+        app
+    }
+
+    fn menu(app: &TuiApp) -> &crate::tui::probe_menu::ProbeMenu {
+        match app.overlay.as_ref() {
+            Some(Overlay::ProbeMenu(m)) => m,
+            _ => panic!("expected the probe menu overlay to be open"),
+        }
+    }
+
+    #[test]
+    fn pointing_at_a_value_writes_the_assert_for_it() {
+        let mut app = app_with_response(r#"{"token":"abc","user":{"id":7}}"#);
+        press(&mut app, KeyCode::Char('a'));
+        // Type the field name to bring it to the top, exactly as the hint says.
+        type_str(&mut app, "token");
+        assert_eq!(
+            crate::tui::probe_menu::subject_label(&menu(&app).choice().unwrap().subject),
+            "$.token"
+        );
+        press(&mut app, KeyCode::Enter);
+        // Step two offers the value that actually came back, first.
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.asserts, [r#"jsonpath "$.token" == "abc""#]);
+        assert!(entry.modified);
+        assert!(app.overlay.is_none());
+    }
+
+    /// The status has a line of its own in Hurl, so choosing it must not add a
+    /// second, competing claim in `[Asserts]`.
+    #[test]
+    fn the_status_goes_on_the_http_line_not_into_asserts() {
+        let mut app = app_with_response("{}");
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "status");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.expected_status, Some(201));
+        assert!(entry.asserts.is_empty());
+    }
+
+    #[test]
+    fn capturing_asks_for_a_name_and_suggests_one_from_the_field() {
+        let mut app = app_with_response(r#"{"data":{"access_token":"ey.."}}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "access_token");
+        press(&mut app, KeyCode::Enter);
+        // Walk to the capture row, which is always last.
+        let rows = menu(&app).verbs.len();
+        for _ in 0..rows {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        match app.overlay.as_ref() {
+            Some(Overlay::Prompt { kind, editor, .. }) => {
+                assert!(matches!(kind, PromptKind::ProbeCapture { .. }));
+                assert_eq!(editor.text(), "access_token");
+            }
+            _ => panic!("expected the capture-name prompt to be open"),
+        }
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(
+            entry.captures,
+            [(
+                "access_token".to_string(),
+                "jsonpath \"$.data.access_token\"".to_string()
+            )]
+        );
+        assert!(entry.modified);
+    }
+
+    /// Esc backs out one decision at a time: "not that assert, but still an
+    /// assert" is the common correction, and closing the whole palette would
+    /// mean re-finding the field.
+    #[test]
+    fn escape_steps_back_to_the_value_list_before_closing() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "$.a");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(menu(&app).step, crate::tui::probe_menu::ProbeStep::PickVerb);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            menu(&app).step,
+            crate::tui::probe_menu::ProbeStep::PickSubject
+        );
+        // The filter survives the step back, so the list is where it was.
+        assert_eq!(menu(&app).filter, "$.a");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+    }
+
+    /// Every row is derived from a reply; without one the palette would be an
+    /// empty box with no explanation.
+    #[test]
+    fn there_is_nothing_to_build_from_before_the_request_is_sent() {
+        let mut app = app_with_response("{}");
+        let ci = app.active_tab;
+        app.collections[ci].entries[0].last_response = None;
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.overlay.is_none());
+        assert!(matches!(app.status, Some(Status::NoResponse)));
+    }
+
+    /// Choosing the same assert twice is a no-op that says so — silently doing
+    /// nothing reads as a broken key.
+    #[test]
+    fn the_same_assert_is_not_added_twice() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('a'));
+            type_str(&mut app, "$.a");
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.collections[app.active_tab].entries[0].asserts.len(), 1);
+        assert!(matches!(app.status, Some(Status::ProbeAlreadyThere)));
+    }
+
+    /// A reply that isn't JSON still has a status, headers and its own text.
+    #[test]
+    fn a_non_json_reply_falls_back_to_the_headers_and_the_text() {
+        let mut app = app_with_response("<html>nope</html>");
+        press(&mut app, KeyCode::Char('a'));
+        let labels: Vec<String> = menu(&app)
+            .visible()
+            .iter()
+            .map(|p| crate::tui::probe_menu::subject_label(&p.subject))
+            .collect();
+        assert!(labels.contains(&"header Content-Type".to_string()));
+        assert!(labels.contains(&"body".to_string()));
+        assert!(!labels.iter().any(|l| l.starts_with('$')));
+    }
+
+    /// The palette draws both columns, so a row settles "is this the field I
+    /// mean?" without opening it.
+    #[test]
+    fn the_list_shows_each_value_beside_its_path() {
+        let mut app = app_with_response(r#"{"token":"abcdef"}"#);
+        press(&mut app, KeyCode::Char('a'));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("$.token"), "{text}");
+        assert!(text.contains("abcdef"), "{text}");
+    }
+}

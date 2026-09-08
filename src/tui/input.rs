@@ -650,6 +650,7 @@ impl TuiApp {
             Some(Overlay::EnvCollision(collision)) => collision.sel = row,
             Some(Overlay::ReportColumns(picker)) => picker.selected = row,
             Some(Overlay::ReportBind(picker)) => picker.selected = row,
+            Some(Overlay::ProbeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportSettingMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
@@ -1650,6 +1651,7 @@ impl TuiApp {
             } => self.result_cell_popup_key_handler(key, title, content, panel),
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
+            Overlay::ProbeMenu(menu) => self.probe_menu_key_handler(key, menu),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
             Overlay::ReportSettingMenu(menu) => self.report_setting_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
@@ -1810,6 +1812,18 @@ impl TuiApp {
             // values, the redirect chain) and a third tab shouldn't need a
             // third key. Scoped to the Response pane so `i` stays free
             // elsewhere.
+            // `a` (Response pane) opens the assert/capture palette: pick a
+            // value the reply carried, then say what should be true of it next
+            // time — or keep it in a variable for the next request. This is the
+            // one action in the app that writes to the *request* from the
+            // response, which is why it lives on the response's own pane rather
+            // than in the wizard: the values it offers only exist here.
+            //
+            // Scoped to the Response pane so `a` stays free elsewhere (it adds
+            // a node in the report editor).
+            KeyCode::Char('a') if !ctrl && self.focus == Pane::Response => {
+                self.open_probe_menu();
+            }
             KeyCode::Char('i') if !ctrl && self.focus == Pane::Response => {
                 self.cycle_response_section(true);
             }

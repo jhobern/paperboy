@@ -1661,6 +1661,132 @@ fn draw_report_setting_menu_overlay(
     }
 }
 
+/// Draw the Response pane's assert/capture palette ([`Overlay::ProbeMenu`]).
+///
+/// Two columns on step one — what the value is called, and what it currently
+/// is — because a path on its own rarely settles "is this the field I mean?",
+/// and the value is what the offered equality assert will contain. Step two
+/// shows the assert lines themselves, verbatim, so the row is a preview of the
+/// text about to be written into the file.
+fn draw_probe_menu_overlay(
+    f: &mut Frame,
+    menu: &super::probe_menu::ProbeMenu,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::probe_menu::{ProbeStep, subject_label, value_preview, verb_label};
+    let step_one = menu.step == ProbeStep::PickSubject;
+    // The typed filter goes in the title, where it reads as part of the
+    // question rather than as another row of the list.
+    let typed = if menu.filter.is_empty() || !step_one {
+        String::new()
+    } else {
+        format!("  /{}", menu.filter)
+    };
+    let hint = if step_one {
+        s.probe_menu_hint
+    } else {
+        s.probe_verb_hint
+    };
+    let title = format!("{}{typed}  ({hint})", menu.title(s));
+    let visible = menu.visible();
+    let n = menu.row_count().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 100);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    let row_style = |i: usize| {
+        if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        }
+    };
+    if menu.row_count() == 0 {
+        // Say so rather than drawing an empty box, which reads as "broken"
+        // instead of "nothing matches".
+        lines.push(Line::from(Span::styled(
+            s.probe_menu_no_match.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    if step_one {
+        // The name column is as wide as the longest visible name, capped so a
+        // deeply nested path can't push every value off the right edge.
+        let name_w = visible
+            .iter()
+            .map(|p| subject_label(&p.subject).chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(inner_w.saturating_sub(12).max(8));
+        for (i, probe) in visible.iter().enumerate().skip(scroll).take(inner_h) {
+            let name = subject_label(&probe.subject);
+            let name = if name.chars().count() > name_w {
+                // Truncate from the *left*: the tail of a jsonpath is the field
+                // being named, and the head is shared with its neighbours.
+                let tail: String = name
+                    .chars()
+                    .skip(name.chars().count() - name_w.saturating_sub(1))
+                    .collect();
+                format!("…{tail}")
+            } else {
+                format!("{name:name_w$}")
+            };
+            let value = value_preview(
+                probe.value.as_ref(),
+                inner_w.saturating_sub(name_w + 2).max(4),
+            );
+            let style = row_style(i);
+            lines.push(Line::from(vec![
+                Span::styled(name, style),
+                Span::styled("  ", style),
+                Span::styled(
+                    value,
+                    if i == menu.selected {
+                        style
+                    } else {
+                        Style::default().fg(th.dim)
+                    },
+                ),
+            ]));
+        }
+    } else {
+        let subject = menu.chosen.as_ref().map(|p| p.subject.clone());
+        for (i, verb) in menu.verbs.iter().enumerate().skip(scroll).take(inner_h) {
+            let label = match &subject {
+                Some(subject) => verb_label(subject, verb, s),
+                None => String::new(),
+            };
+            lines.push(Line::from(Span::styled(label, row_style(i))));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..menu.row_count().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+}
+
 /// Draw the node editor's insert / request-pick palette
 /// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
 /// adding, request titles when choosing a request name.
@@ -4732,6 +4858,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Ctrl+Z", s.help_text_undo),
                             ("y", s.help_copy_selection),
                             ("Ctrl+C", s.help_ctrl_c),
+                            ("a (Response pane)", s.help_text_probe),
                             ("c (Response pane)", s.help_compact),
                             ("i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
@@ -5149,6 +5276,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportBind(picker) => {
             draw_report_bind_overlay(f, picker, s, th, Some(app));
+        }
+        Overlay::ProbeMenu(menu) => {
+            draw_probe_menu_overlay(f, menu, s, th, Some(app));
         }
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th, Some(app));

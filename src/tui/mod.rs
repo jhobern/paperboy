@@ -13,6 +13,7 @@ mod line_editor;
 mod listscroll;
 mod new_request;
 mod postman;
+mod probe_menu;
 pub(crate) mod remote;
 // Shared with the GUI (`gui::report_editor`'s Source view) so a PaperTrail
 // script is coloured identically in both front-ends: it produces `ratatui`

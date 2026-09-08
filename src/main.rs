@@ -24,6 +24,7 @@ mod postman_api;
 mod postman_cli;
 mod postman_flow;
 mod postman_import;
+mod probe;
 mod remote_flow;
 mod report;
 mod report_cli;

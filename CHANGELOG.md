@@ -12,6 +12,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Asserts and captures built from the response you just got.** Every API
+  client but this one lets you look at a reply and say "check that next time";
+  PaperBoy made you read the jsonpath off the screen and type it back into the
+  wizard, which is slow and is the easiest place in the app to introduce a typo
+  that later looks like a server fault. With a response on screen, `a` in the
+  Response pane now opens a two-step palette: choose a value the server
+  actually sent — the status, the duration, any header, any value in a JSON
+  body, each listed beside what it currently is — then choose what to say about
+  it. The rows in the second step are the Hurl lines themselves, so the choice
+  is a preview of the text about to be written. Typing narrows the list, and
+  whatever is selected in the body seeds the filter, so highlighting a token
+  opens the list on the field holding it.
+
+  The last row on every value is *keep it in a variable*: it adds a
+  `[Captures]` row under a name derived from the field (`$.data.access_token` →
+  `access_token`), which is the whole of the "log in, then use the token"
+  workflow in three keystrokes. Choosing the status sets the `HTTP <status>`
+  line rather than adding a second, competing claim in `[Asserts]`, and an
+  assert already on the request is reported rather than silently duplicated.
+
+  The vocabulary and the emitter are shared with the Postman importer, so an
+  assert converted from a `pm.expect(...)` and one built here are spelled
+  identically.
+
 - **Computed values: a `# [Gen]` block for the things a request has to work
   out for itself.** Postman collections lean on pre-request scripts for values
   that cannot be written down in advance — a nonce, a timestamp, a

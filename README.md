@@ -149,6 +149,7 @@ Press `?` or `F1` for the full, current key list. The essentials:
 | `Alt+↑`/`↓` | Reorder requests — the order `Alt+F5` and the CLI follow |
 | `m` / `c` | Move / copy a request to another collection in the workspace |
 | `p` (Requests) | Link an environment to this collection |
+| `a` (Response) | Build an assert or a capture from what came back |
 | `a` (Env pane) | Make an environment active |
 | `r` (Env pane) | Retry a failed secret lookup |
 | `w` (Workspace tab) | Reopen the file-tree picker |
@@ -179,6 +180,17 @@ Worth knowing:
   (relative to the collection's directory, matching where Hurl looks). A
   `Base64 File` field is encoded at send time behind a configurable prefix, so
   `data:image/png;base64,` yields a ready-made data URI.
+- **Asserts and captures can be built from a response.** With a reply on
+  screen, `a` in the Response pane opens a two-step palette: pick a value the
+  server actually sent — status, duration, any header, any value in the JSON
+  body, listed beside what it currently is — then pick what to say about it.
+  The rows are the Hurl lines themselves (`jsonpath "$.data.token" == "ey…"`),
+  so what you choose is what gets written. Typing narrows the list, and
+  anything selected in the body pre-fills the filter. The last row on every
+  value is *keep it in a variable*, which adds a `[Captures]` row under a name
+  taken from the field itself — the fastest way to chain one request into the
+  next. Choosing the status sets the `HTTP <status>` line rather than adding a
+  competing assert.
 - **The request preview substitutes `{{ VAR }}`** and colours each by status —
   green loaded, cyan literal, orange loading, red missing — while the editor
   keeps the original text. Secrets are masked as eight dots.

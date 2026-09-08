@@ -15,6 +15,10 @@ use serde_json::Value;
 use crate::hurl::{
     CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl,
 };
+// The assert vocabulary is shared with the response-side builder: an assert
+// imported from a Postman test and one built by pointing at a response are the
+// same thing said twice, and one emitter keeps them spelled identically.
+use crate::probe::{Predicate, Subject, assert_line, push_key};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -2153,30 +2157,6 @@ static STATUS_CALL_RE: LazyLock<Regex> =
 // including whatever we failed to translate.
 static TEST_CALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"pm\.test\s*\(").unwrap());
 
-/// What a Chai tail like `.to.equal("x")` asserts about its subject.
-enum Predicate {
-    Eq(String),
-    Ne(String),
-    Contains(String),
-    Gt(String),
-    Lt(String),
-    /// `.to.be.empty` / `.is.not.empty` — the bool is whether emptiness is what
-    /// is expected.
-    Empty(bool),
-}
-
-/// What a `pm.expect(...)` argument is talking about.
-enum Subject {
-    Status,
-    Duration,
-    /// A response header, by name.
-    Header(String),
-    /// A jsonpath into the response body.
-    Json(String),
-    /// The same, asserted on its `.length`.
-    JsonCount(String),
-}
-
 /// The `HTTP <status>` line and `[Asserts]` a `test` script reduces to, plus
 /// whether anything in it did not reduce.
 ///
@@ -2271,37 +2251,6 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
 
     let residue = has_uncovered_pm_code(&code, &in_string, &covered);
     (status, asserts, residue)
-}
-
-/// The Hurl `[Asserts]` line a subject and predicate spell, or `None` for a
-/// pairing Hurl has no query or predicate for.
-fn assert_line(subject: Subject, predicate: Predicate) -> Option<String> {
-    let query = match &subject {
-        Subject::Status | Subject::Duration => "duration".to_string(),
-        Subject::Header(name) => format!("header \"{name}\""),
-        Subject::Json(path) => format!("jsonpath \"{path}\""),
-        Subject::JsonCount(path) => format!("jsonpath \"{path}\" count"),
-    };
-    // A count is a number, so only the numeric predicates mean anything on it;
-    // `contains` on a count would be nonsense Hurl accepts the shape of.
-    let numeric = matches!(subject, Subject::Duration | Subject::JsonCount(_));
-    let line = match predicate {
-        Predicate::Eq(v) => format!("{query} == {v}"),
-        Predicate::Ne(v) => format!("{query} != {v}"),
-        Predicate::Gt(v) => format!("{query} > {v}"),
-        Predicate::Lt(v) => format!("{query} < {v}"),
-        Predicate::Contains(v) if !numeric => format!("{query} contains {v}"),
-        Predicate::Empty(true) if !numeric => format!("{query} isEmpty"),
-        Predicate::Empty(false) if !numeric => format!("{query} not isEmpty"),
-        _ => return None,
-    };
-    match subject {
-        // A bare `duration` assert only makes sense for a time bound; the
-        // status has its own line and never reaches here.
-        Subject::Status => None,
-        Subject::Duration if !matches!(line.split(' ').nth(1), Some("<" | ">" | "==")) => None,
-        _ => Some(line),
-    }
 }
 
 /// What `pm.expect(<expr>)` is asserting about, for the expressions that name
@@ -2621,20 +2570,6 @@ fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
         }
     }
     Some(path)
-}
-
-/// Append a jsonpath key: a plain identifier as `.name`, anything else bracket-
-/// quoted (`['a-b']`) so the path stays valid.
-fn push_key(path: &mut String, key: &str) {
-    let simple = !key.is_empty()
-        && !key.starts_with(|c: char| c.is_ascii_digit())
-        && key.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if simple {
-        path.push('.');
-        path.push_str(key);
-    } else {
-        path.push_str(&format!("['{key}']"));
-    }
 }
 
 /// Strip matching single or double quotes, returning the inner text.

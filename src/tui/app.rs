@@ -161,6 +161,15 @@ pub(crate) enum PromptKind {
     /// live in the global list, not per-collection.
     EnvValue(u64, usize),
     RenameTab(usize),
+    /// Naming the variable a response-built `[Captures]` row will use (see
+    /// [`crate::tui::probe_menu`]). The collection is addressed by id rather
+    /// than tab index because the prompt outlives the menu that opened it, and
+    /// a tab reorder in between must not redirect the row.
+    ProbeCapture {
+        collection_id: u64,
+        entry: usize,
+        subject: Box<crate::probe::Subject>,
+    },
     /// Renaming a Global Environment (F2 while the Global Environments list
     /// or its entries popup is focused), addressed by env id.
     RenameEnv(u64),
@@ -550,6 +559,10 @@ pub(crate) enum Overlay {
         secret_checkbox: Option<bool>,
     },
     Browser(FileAction, Box<FileExplorer>),
+    /// The Response pane's assert/capture palette (`a`): a two-step list over
+    /// [`crate::probe`] — pick a value the reply carries, then pick what to say
+    /// about it. See [`crate::tui::probe_menu::ProbeMenu`].
+    ProbeMenu(Box<crate::tui::probe_menu::ProbeMenu>),
     NewRequest(Box<NewReq>),
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
@@ -2131,6 +2144,11 @@ impl TuiApp {
                         .push(spawn_resolution(env_id, vec![secret]));
                 }
             }
+            PromptKind::ProbeCapture {
+                collection_id,
+                entry,
+                subject,
+            } => self.finish_probe_capture(collection_id, entry, &subject, &text),
             PromptKind::RenameEnv(env_id) => {
                 if !text.trim().is_empty()
                     && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
