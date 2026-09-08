@@ -812,6 +812,14 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
 /// The request is named by the leaf of its title, so one buried three folders
 /// deep is asked about by the name on its row rather than its whole path.
 fn ask_revert_request(app: &mut GuiApp, ci: usize, path: PathBuf, i: usize) {
+    // A request the file has never held -- one added in this session, or a
+    // duplicate still sharing its original's identity -- has no saved version
+    // of its own to go back to. Say so instead of asking the user to confirm a
+    // revert that would then quietly do nothing.
+    if app.session.collections[ci].saved_position_of(i).is_none() {
+        app.session.status = Some(crate::i18n::Status::RequestHasNoSavedVersion);
+        return;
+    }
     let name = app.session.collections[ci]
         .entries
         .get(i)
@@ -4476,6 +4484,26 @@ mod revert_menu_tests {
             }
             _ => panic!("a revert must be confirmed, since it has no undo"),
         }
+
+        // A request the file has never held has nothing to revert *to*. Asking
+        // the user to confirm a revert that then quietly does nothing is the
+        // worst of both: they commit to losing edits, and keep them.
+        app.dialog = None;
+        app.session.collections[ci]
+            .entries
+            .push(crate::hurl::HurlEntry {
+                method: "GET".into(),
+                url: "https://example.com/new".into(),
+                user_added: true,
+                ..Default::default()
+            });
+        let added = app.session.collections[ci].entries.len() - 1;
+        super::ask_revert_request(&mut app, ci, path.clone(), added);
+        assert!(app.dialog.is_none(), "nothing to confirm");
+        assert!(matches!(
+            app.session.status,
+            Some(crate::i18n::Status::RequestHasNoSavedVersion)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -389,6 +389,28 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   instead of closing it and writing nothing, and a `204 No Content` — which has
   a status and headers worth asserting on — offers the button at all.
 
+- **The Computed table's cells stay with their rows.** In the GUI, a cell was
+  identified by where it sat, so deleting a row moved the row below it into the
+  deleted row's editing state — cursor, selection and undo history — and
+  switching request while a cell was focused carried that state onto whatever
+  row now sat in that position. Cells are now keyed by the request they belong
+  to and by their own contents. A bad variable name is flagged as you type
+  rather than at send time.
+
+  In the terminal wizard, function completion now works inside a call you have
+  already accepted (`concat(sha` finds `sha256`), suggests functions whose
+  arguments are all optional, and writes the completion at the caret instead of
+  at the end of the cell. A single edit is a single undo step again — pressing
+  Enter recorded two identical checkpoints, so the first Ctrl+Z appeared to do
+  nothing.
+
+- **"Revert to saved" says no before you commit, not after.** A request the
+  file has never held — one added in this session, or a duplicate that still
+  shares its original's identity — has no saved version of its own to go back
+  to. Both front-ends asked for confirmation anyway and then did nothing, which
+  reads as a broken command. They now say so up front, through the same check
+  the revert itself uses, so the two cannot drift apart.
+
 - **A run reports every pre-flight warning, not just the first.** A broken
   generator hid a batch collision behind it, so fixing what the status line
   complained about surfaced the next problem and the same run failed twice over

@@ -4221,7 +4221,7 @@ impl TuiApp {
         // to (`Collection::revert_request` returns `None` for exactly these).
         // Say so up front rather than confirming a revert we know can't happen
         // and then reporting "nothing to revert" after the user commits.
-        if !self.request_has_saved_version(ci, ei) {
+        if self.collections[ci].saved_position_of(ei).is_none() {
             self.status = Some(Status::RequestHasNoSavedVersion);
             return;
         }
@@ -4229,35 +4229,6 @@ impl TuiApp {
             action: ConfirmAction::RevertRequest(ci, ei),
             sel: 1,
         });
-    }
-
-    /// Whether the request at `ei` in collection `ci` has a saved on-disk
-    /// version that a revert could restore — a non-mutating pre-check for
-    /// [`Self::begin_revert_request`] so it never confirms a revert that
-    /// [`Collection::revert_request`] would then decline.
-    ///
-    /// Mirrors that method's cheap, IO-free guards (a stamped, unique identity
-    /// that the file's baseline still knows). The remaining reasons it can
-    /// decline — the file changed or can't be read since — need the file
-    /// itself, so they stay where the read happens; a confirmed revert that
-    /// hits one still falls back to a "nothing to revert" status.
-    fn request_has_saved_version(&self, ci: usize, ei: usize) -> bool {
-        let Some(c) = self.collections.get(ci) else {
-            return false;
-        };
-        if c.path.is_none() {
-            return false;
-        }
-        let Some(uid) = c.entries.get(ei).map(|e| e.uid) else {
-            return false;
-        };
-        // Zero is "never stamped" (a freshly built request); more than one
-        // entry answering to a stamp is a duplicate still sharing its
-        // original's — neither can be matched to the file confidently.
-        if uid == 0 || c.entries.iter().filter(|e| e.uid == uid).count() != 1 {
-            return false;
-        }
-        c.structure_baseline.contains(&uid)
     }
 
     /// `Ctrl+R` in the entries popup: revert the whole environment to its last

@@ -1133,7 +1133,13 @@ fn revert_to_saved_dialog(
             if ui.button(go).clicked() {
                 match entry {
                     Some(ei) => {
-                        app.session.collections[ci].revert_request(ei);
+                        // Declining here means the file changed under us since
+                        // the pre-check; the dialog has already been confirmed,
+                        // so the status line is the only place left to say so.
+                        app.session.status = match app.session.collections[ci].revert_request(ei) {
+                            Some(_) => Some(crate::i18n::Status::RequestReverted(name.clone())),
+                            None => Some(crate::i18n::Status::NothingToRevert),
+                        };
                     }
                     None => {
                         let _ = app.session.collections[ci].revert_workspace_file(&path);

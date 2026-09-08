@@ -1351,14 +1351,8 @@ impl Collection {
     /// The other entries and their edits are untouched.
     pub fn revert_request(&mut self, ei: usize) -> Option<String> {
         let path = self.path.clone()?;
-        let uid = self.entries.get(ei)?.uid;
-        // A duplicate is a clone, and so carries its original's stamp until the
-        // file is saved. Two entries answering to one identity means we cannot
-        // say which of them the file's entry belongs to, so we decline.
-        if uid == 0 || self.entries.iter().filter(|e| e.uid == uid).count() != 1 {
-            return None;
-        }
-        let di = self.structure_baseline.iter().position(|u| *u == uid)?;
+        let di = self.saved_position_of(ei)?;
+        let uid = self.entries[ei].uid;
         let content = std::fs::read_to_string(&path).ok()?;
         let mut disk = crate::postman::parse_collection(&content);
         // The baseline describes the file as it was when we last agreed with
@@ -1377,6 +1371,30 @@ impl Collection {
         self.invalidate_request_json();
         self.sync_folder_to_selected();
         Some(method)
+    }
+
+    /// Where the request at `ei` sits in the file this collection was loaded
+    /// from, if it can be matched to it at all.
+    ///
+    /// Split out of [`Self::revert_request`] because the front-ends need to ask
+    /// the same question *before* they offer to revert: confirming a revert and
+    /// only then reporting "nothing to revert" makes the user commit to
+    /// something that was never going to happen. Every reason to decline that
+    /// can be answered without reading the file is answered here, so the two
+    /// cannot drift apart; the rest (the file changed, or can't be read since)
+    /// necessarily stays with the read.
+    pub fn saved_position_of(&self, ei: usize) -> Option<usize> {
+        self.path.as_ref()?;
+        let uid = self.entries.get(ei)?.uid;
+        // Zero is "never stamped" -- a request built in this session, which the
+        // file has never held. A duplicate is a clone, and so carries its
+        // original's stamp until the file is saved: two entries answering to
+        // one identity means we cannot say which of them the file's entry
+        // belongs to, so we decline.
+        if uid == 0 || self.entries.iter().filter(|e| e.uid == uid).count() != 1 {
+            return None;
+        }
+        self.structure_baseline.iter().position(|u| *u == uid)
     }
 
     /// Throw away every in-memory edit to the workspace collection file at
