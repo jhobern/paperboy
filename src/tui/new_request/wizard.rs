@@ -432,34 +432,46 @@ impl WizardTab {
 /// `ctx` values for [`NewReq::dropdown_scroll`], so the two dropdowns that
 /// share it don't inherit each other's viewport.
 
-/// The identifier being typed at the end of a `[Gen]` expression, and where it
-/// starts. Scanning back from the end rather than taking the whole cell is what
-/// lets a suggestion be accepted inside `concat(sha` without eating the rest.
-fn gen_word(text: &str) -> (usize, &str) {
-    let at = text
-        .char_indices()
-        .rev()
-        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    (at, &text[at..])
+/// The identifier being typed at the caret in a `[Gen]` expression: the char
+/// range `[start, end)` of the word straddling `col`, and the word itself.
+///
+/// Scanning outward from the caret in *both* directions — not back from the end
+/// of the whole cell — is what lets a suggestion be accepted inside an existing
+/// call. Accepting one writes `name()` with the caret between the brackets, so
+/// there is always a `)` to the right of the caret; a scan from the end would
+/// find that `)` first and call the trailing word empty, and no further
+/// function could ever be completed inside `base64(sha│)`. The GUI's
+/// `insert_call` scans from the caret for the same reason.
+fn gen_word(text: &str, col: usize) -> (usize, usize, String) {
+    let chars: Vec<char> = text.chars().collect();
+    let at = col.min(chars.len());
+    let is_word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let mut start = at;
+    while start > 0 && is_word(&chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < chars.len() && is_word(&chars[end]) {
+        end += 1;
+    }
+    (start, end, chars[start..end].iter().collect())
 }
 
-/// What a chosen signature puts in the cell, and how far into it the caret
-/// should then sit.
+/// What accepting function `f` puts in the cell in place of the word at the
+/// caret, and how far into it the caret should then sit.
 ///
-/// A function that needs an argument is written with *both* brackets and the
-/// caret between them, so the next keystroke is the argument: a lone `(` would
-/// leave an unfinished expression that the block reports as a fault until the
-/// user closes it themselves. One that takes none — or takes one only
-/// optionally — is complete as its bare name, caret after it.
-fn gen_completion(signature: &str) -> (String, usize) {
-    match signature.split_once('(') {
-        Some((name, rest)) if !rest.starts_with(')') && !rest.starts_with('[') => {
-            (format!("{name}()"), name.chars().count() + 1)
-        }
-        Some((name, _)) => (name.to_string(), name.chars().count()),
-        None => (signature.to_string(), signature.chars().count()),
+/// Keyed off `f.min_args`, exactly as the GUI's `insert_call` is, rather than
+/// off the wording of the signature: a function that needs an argument is
+/// written with *both* brackets and the caret between them, so the next
+/// keystroke is the argument and the block doesn't report an unclosed `(` as a
+/// fault; one that needs none is complete as its bare name, caret after it.
+/// Reading `min_args` instead of parsing `signature` keeps this in step with
+/// the GUI even if a signature is ever reworded.
+fn gen_completion(f: &crate::generators::GenFunction) -> (String, usize) {
+    if f.min_args == 0 {
+        (f.name.to_string(), f.name.chars().count())
+    } else {
+        (format!("{}()", f.name), f.name.chars().count() + 1)
     }
 }
 
@@ -1158,22 +1170,23 @@ impl NewReq {
     /// The generator functions matching what is being typed in `[Gen]` row
     /// `i`'s expression, offered as their signatures: the argument names are
     /// the whole reason to look, and `hmac_sha256` alone does not say what it
-    /// wants first. Only the *word being typed* filters, so a function can
+    /// wants first. Only the word *at the caret* filters, so a function can
     /// still be completed inside `concat(upper(` — an expression is not one
     /// name the way a header is.
     fn gen_suggestions(&self, i: usize) -> Option<(usize, Vec<&'static str>)> {
-        let text = self.generators.get(i)?.expr.text();
-        let word = gen_word(&text).1;
+        let row = self.generators.get(i)?;
+        let text = row.expr.text();
+        let word = gen_word(&text, row.expr.col).2;
         if word.is_empty() {
             return None;
         }
-        let sugs: Vec<&'static str> = crate::generators::functions_starting_with(word)
+        let sugs: Vec<&'static str> = crate::generators::functions_starting_with(&word)
             .map(|f| f.signature)
             .collect();
         // A name already typed in full has nothing left to offer, and a
         // dropdown that will not close reads as the editor refusing to accept
         // what was typed.
-        let done = sugs.len() == 1 && crate::generators::is_function(word);
+        let done = sugs.len() == 1 && crate::generators::is_function(&word);
         (!sugs.is_empty() && !done).then_some((i, sugs))
     }
 
@@ -1203,26 +1216,34 @@ impl NewReq {
                 }
             }
             // The suggestion is a signature; what goes in the cell is the call.
-            // Only the word being typed is replaced — the rest of the
+            // Only the word straddling the caret is replaced — the rest of the
             // expression around it is the user's.
             NewField::Computed(i, CapCol::Expr) => {
+                // `name` is the signature the dropdown showed; the call to
+                // write, and whether it needs brackets, come from the function
+                // it names — read from `min_args`, as the GUI does.
+                let Some(f) = crate::generators::FUNCTIONS
+                    .iter()
+                    .find(|f| f.signature == name)
+                else {
+                    return;
+                };
                 if let Some(row) = self.generators.get_mut(i) {
                     let text = row.expr.text();
-                    let (at, word) = gen_word(&text);
-                    let end = at + word.len();
-                    let (call, caret) = gen_completion(name);
-                    let mut done = String::with_capacity(text.len() + call.len());
-                    done.push_str(&text[..at]);
+                    let chars: Vec<char> = text.chars().collect();
+                    let (start, end, _word) = gen_word(&text, row.expr.col);
+                    let (call, caret) = gen_completion(f);
+                    let mut done = String::new();
+                    done.extend(chars[..start].iter());
                     done.push_str(&call);
-                    done.push_str(&text[end..]);
+                    done.extend(chars[end..].iter());
                     // Replaced in place rather than rebuilt: a fresh Editor
                     // starts with an empty undo stack, so Ctrl+Z after
                     // accepting a suggestion would have nothing to go back to.
                     // The caret lands inside the call rather than at the end of
                     // the text — the completion went into the middle of an
                     // expression.
-                    row.expr
-                        .replace_text(&done, 0, text[..at].chars().count() + caret);
+                    row.expr.replace_text(&done, 0, start + caret);
                 }
             }
             _ => {}

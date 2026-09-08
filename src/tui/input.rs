@@ -4215,10 +4215,49 @@ impl TuiApp {
             return;
         }
         let ei = self.collections[ci].selected_entry;
+        // The collection has a file and this request is edited, but that is not
+        // enough: a request just added to it, or a duplicate that still shares
+        // its original's identity, has no saved version of its *own* to go back
+        // to (`Collection::revert_request` returns `None` for exactly these).
+        // Say so up front rather than confirming a revert we know can't happen
+        // and then reporting "nothing to revert" after the user commits.
+        if !self.request_has_saved_version(ci, ei) {
+            self.status = Some(Status::RequestHasNoSavedVersion);
+            return;
+        }
         self.overlay = Some(Overlay::Confirm {
             action: ConfirmAction::RevertRequest(ci, ei),
             sel: 1,
         });
+    }
+
+    /// Whether the request at `ei` in collection `ci` has a saved on-disk
+    /// version that a revert could restore — a non-mutating pre-check for
+    /// [`Self::begin_revert_request`] so it never confirms a revert that
+    /// [`Collection::revert_request`] would then decline.
+    ///
+    /// Mirrors that method's cheap, IO-free guards (a stamped, unique identity
+    /// that the file's baseline still knows). The remaining reasons it can
+    /// decline — the file changed or can't be read since — need the file
+    /// itself, so they stay where the read happens; a confirmed revert that
+    /// hits one still falls back to a "nothing to revert" status.
+    fn request_has_saved_version(&self, ci: usize, ei: usize) -> bool {
+        let Some(c) = self.collections.get(ci) else {
+            return false;
+        };
+        if c.path.is_none() {
+            return false;
+        }
+        let Some(uid) = c.entries.get(ei).map(|e| e.uid) else {
+            return false;
+        };
+        // Zero is "never stamped" (a freshly built request); more than one
+        // entry answering to a stamp is a duplicate still sharing its
+        // original's — neither can be matched to the file confidently.
+        if uid == 0 || c.entries.iter().filter(|e| e.uid == uid).count() != 1 {
+            return false;
+        }
+        c.structure_baseline.contains(&uid)
     }
 
     /// `Ctrl+R` in the entries popup: revert the whole environment to its last
@@ -7396,7 +7435,17 @@ impl TuiApp {
                 }
             }
             // Typing in the Key cell (re)opens the dropdown for the new text.
-            if let NewField::Kvd(KvdKind::Header, _, HdrCol::Key) = form.focus
+            // The Computed expression cell shares the same suggestion machinery
+            // (its function menu), so typing there must re-offer the matches
+            // too — including after Esc has dismissed the list, which is what
+            // makes continuing to type bring it back rather than trapping the
+            // user until they leave the cell and return.
+            if matches!(form.focus, NewField::Kvd(KvdKind::Header, _, HdrCol::Key))
+                && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+            {
+                typed_in_key = true;
+            }
+            if matches!(form.focus, NewField::Computed(_, CapCol::Expr))
                 && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
             {
                 typed_in_key = true;
@@ -7451,12 +7500,16 @@ impl TuiApp {
                 // Moving to a different field resets the highlight, but
                 // only auto-*shows* the dropdown when landing on an
                 // empty Key cell (e.g. a freshly added header row).
-                // Arrowing onto a Key cell that already has text must
-                // not immediately trap Down/Up in the dropdown; Enter
-                // can still reveal it explicitly (`reveal_key_dropdown`).
+                // Arrowing onto a Key cell — or a Computed expression cell —
+                // that already has text must not immediately trap Down/Up in
+                // the dropdown; Enter can still reveal it explicitly
+                // (`reveal_key_dropdown`). This mirrors the mouse-focus path in
+                // `focus_new_request_field`.
                 form.suggest_hi = None;
                 let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
-                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()))
+                    || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
+                            if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
             }
             if form.focus != prev_focus {
