@@ -25,6 +25,7 @@
 //! hand-built one are spelled identically, and there is a single place where
 //! Hurl's assert grammar is known.
 
+use crate::i18n::Strings;
 use serde_json::Value;
 use std::ops::Range;
 
@@ -189,6 +190,18 @@ pub fn literal(v: &Value) -> Option<String> {
         Value::String(s) => Some(format!("\"{}\"", escape_hurl(s))),
         Value::Array(_) | Value::Object(_) => None,
     }
+}
+
+/// What the second step can do with the chosen subject.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Verb {
+    /// Append this line to `[Asserts]`.
+    Assert(Predicate),
+    /// Set the entry's expected status, which lives on the `HTTP <status>`
+    /// line rather than in `[Asserts]` — Hurl's own placement for it.
+    ExpectStatus(u16),
+    /// Add a `[Captures]` row, after asking for the variable name.
+    Capture,
 }
 
 /// One assertable thing in a response, with the value that actually came back.
@@ -633,6 +646,95 @@ impl Scan<'_> {
             }
         }
         None
+    }
+}
+
+/// The verbs worth offering for a subject.
+///
+/// `selection` is the text highlighted in the response panel, which is the only
+/// possible source of a literal for a body that isn't JSON: there is no value
+/// to pre-fill from, so `body contains …` is offered only when the user has
+/// already pointed at the text they mean.
+pub(crate) fn verbs_for(probe: &Probe, selection: Option<&str>) -> Vec<Verb> {
+    let mut out = Vec::new();
+    for predicate in default_predicates(probe) {
+        match (&probe.subject, &predicate) {
+            (Subject::Status, Predicate::Eq(v)) => match v.parse::<u16>() {
+                Ok(code) => out.push(Verb::ExpectStatus(code)),
+                Err(_) => continue,
+            },
+            (Subject::Body, Predicate::Contains(_)) => {
+                let Some(text) = selection.map(str::trim).filter(|t| !t.is_empty()) else {
+                    continue;
+                };
+                out.push(Verb::Assert(Predicate::Contains(
+                    literal(&serde_json::Value::String(text.to_string())).unwrap_or_default(),
+                )));
+            }
+            _ => {
+                // Anything Hurl has no spelling for is dropped rather than
+                // shown as a row that produces nothing when chosen.
+                if assert_line(probe.subject.clone(), predicate.clone()).is_some() {
+                    out.push(Verb::Assert(predicate));
+                }
+            }
+        }
+    }
+    // Capturing is offered wherever there is a query to capture — which is
+    // everywhere except the body-as-text fallback, where the "value" is the
+    // whole reply and no variable wants that.
+    if !matches!(probe.subject, Subject::Body) {
+        out.push(Verb::Capture);
+    }
+    out
+}
+
+/// How a subject reads in the picker: the jsonpath for a body value, and a
+/// worded form for the parts of the exchange that aren't one.
+pub(crate) fn subject_label(subject: &Subject) -> String {
+    match subject {
+        Subject::Json(path) => path.clone(),
+        Subject::JsonCount(path) => format!("{path} []"),
+        Subject::Header(name) => format!("header {name}"),
+        Subject::Status => "status".to_string(),
+        Subject::Duration => "duration".to_string(),
+        Subject::Body => "body".to_string(),
+    }
+}
+
+/// The observed value, shortened to fit a row.
+///
+/// Shown next to every subject because the path alone rarely settles "is this
+/// the field I'm looking at?", and because the value is what the offered
+/// equality assert is going to contain.
+pub(crate) fn value_preview(value: Option<&serde_json::Value>, max: usize) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let raw = match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(m) => format!("{{{}}}", m.len()),
+        serde_json::Value::Array(a) => format!("[{}]", a.len()),
+        other => other.to_string(),
+    };
+    // One line: a preview that wraps would push the rows below it off the
+    // bottom of a list whose whole job is to be scanned.
+    let raw = raw.replace(['\n', '\r', '\t'], " ");
+    if max == usize::MAX || raw.chars().count() <= max {
+        return raw;
+    }
+    let head: String = raw.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// How a verb reads in step two: the assert line itself, so the row shows
+/// exactly what will be written to the file.
+pub(crate) fn verb_label(subject: &Subject, verb: &Verb, s: &Strings) -> String {
+    match verb {
+        Verb::Assert(predicate) => assert_line(subject.clone(), predicate.clone())
+            .unwrap_or_else(|| s.probe_verb_unavailable.to_string()),
+        Verb::ExpectStatus(code) => format!("HTTP {code}"),
+        Verb::Capture => s.probe_verb_capture.to_string(),
     }
 }
 

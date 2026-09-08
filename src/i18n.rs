@@ -774,7 +774,6 @@ strings! {
     probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
     probe_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
-    probe_menu_no_response => "Send the request first — there's no response to build from", "Envoyez d'abord la requête — aucune réponse sur laquelle s'appuyer", "Send forespørgslen først — der er intet svar at bygge på";
     probe_verb_capture => "keep it in a variable…", "le garder dans une variable…", "gem det i en variabel…";
     probe_verb_unavailable => "(not expressible in Hurl)", "(inexprimable en Hurl)", "(kan ikke udtrykkes i Hurl)";
     probe_capture_name_title => "Variable name", "Nom de la variable", "Variabelnavn";
@@ -783,6 +782,13 @@ strings! {
     probe_capture_added => "Capture added:", "Capture ajoutée :", "Opsamling tilføjet:";
     probe_already_there => "That one is already on the request", "Celle-ci est déjà sur la requête", "Den er der allerede på forespørgslen";
     help_text_probe => "Assert/capture from the response", "Vérifier/capturer depuis la réponse", "Kontrollér/opsaml fra svaret";
+    gui_probe_button => "Assert…", "Vérifier…", "Kontrollér…";
+    gui_probe_button_hint => "Build an assert or a capture from this response", "Construire une vérification ou une capture depuis cette réponse", "Byg en kontrol eller opsamling ud fra dette svar";
+    gui_probe_assert_this => "Assert this…", "Vérifier ceci…", "Kontrollér dette…";
+    gui_probe_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
+    gui_probe_back => "‹ Back", "‹ Retour", "‹ Tilbage";
+    gui_probe_add => "Add", "Ajouter", "Tilføj";
+    gui_probe_filter_hint => "filter by name or value", "filtrer par nom ou valeur", "filtrér efter navn eller værdi";
     report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
     report_node_name_none => "pick a request", "choisir une requête", "vælg en forespørgsel";

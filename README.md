@@ -228,6 +228,13 @@ the same three languages. What differs:
   are text. Globally: `F5`/`Ctrl+Enter` run, `Ctrl+S`/`Ctrl+Shift+S` save,
   `Ctrl+W` closes, `Ctrl+Z` undoes a delete, `Alt+F` opens the File menu, `F1`
   shows every shortcut.
+- **Asserts and captures are built by right-clicking the response.** Click a
+  value in the body and choose *Assert this…* — the field under the caret is
+  worked out from the raw JSON, so it works on a minified body as well as a
+  pretty-printed one. Right-clicking a header row does the same for that
+  header, and the **Assert…** button beside Copy opens the same builder on the
+  whole list of values the reply carried. The list is filterable by name or by
+  value, and "keep it in a variable" adds the `[Captures]` row.
 - **The File menu is grouped by verb** (New / Import / Open / Save). Open ▸
   Collection and Load ▸ Environment take Postman exports too — they work out
   what the file holds. Every dialog reopens where you left it.

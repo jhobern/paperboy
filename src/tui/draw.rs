@@ -1675,7 +1675,8 @@ fn draw_probe_menu_overlay(
     th: &Theme,
     app: Option<&TuiApp>,
 ) {
-    use super::probe_menu::{ProbeStep, subject_label, value_preview, verb_label};
+    use super::probe_menu::ProbeStep;
+    use crate::probe::{subject_label, value_preview, verb_label};
     let step_one = menu.step == ProbeStep::PickSubject;
     // The typed filter goes in the title, where it reads as part of the
     // question rather than as another row of the list.

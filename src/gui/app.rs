@@ -57,6 +57,10 @@ pub enum Dialog {
         range: Option<std::ops::Range<usize>>,
         name: String,
     },
+    /// Building an `[Asserts]` line or a `[Captures]` row out of the response
+    /// on screen (right-click in the response viewer). See
+    /// [`super::probe::ProbeBuilder`].
+    ProbeBuilder(Box<super::probe::ProbeBuilder>),
     /// The theme editor.
     Theme(Box<super::menu::ThemeEditState>),
     /// Simple text prompt (base URL, new env name, …).

@@ -52,6 +52,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_body,
         lbl_headers,
         lbl_asserts,
+        lbl_probe,
+        lbl_probe_hint,
+        lbl_probe_this,
     ) = {
         let s = &app.strings;
         (
@@ -69,6 +72,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_sec_body,
             s.gui_sec_headers,
             s.gui_sec_asserts,
+            s.gui_probe_button,
+            s.gui_probe_button_hint,
+            s.gui_probe_assert_this,
         )
     };
 
@@ -104,6 +110,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     };
 
     // ── Status line ───────────────────────────────────────────────────────
+    // What a right-click (or the Assert… button) asked for, applied once the
+    // panel's closures have released their borrow of the app: `Some(None)`
+    // opens the builder on the whole list, `Some(Some(probe))` on one value.
+    let mut open_probe: Option<Option<crate::probe::Probe>> = None;
+    let raw_body = body.to_string();
+    let compact = app.response_compact;
     ui.horizontal(|ui| {
         if loading {
             ui.spinner();
@@ -131,6 +143,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 ui.colored_label(theme.dim, format!("{} B", body.len()));
                 if ui.button(lbl_copy).on_hover_text(lbl_copy_body).clicked() {
                     ui.ctx().copy_text(body.to_string());
+                }
+                // Right-clicking a value is the quick way in, but it is also
+                // invisible: the button is what tells anyone the feature is
+                // here at all, and it opens the same builder on the full list.
+                if ui.button(lbl_probe).on_hover_text(lbl_probe_hint).clicked() {
+                    open_probe = Some(None);
                 }
                 // Compact toggle — only meaningful on the Body section. It is
                 // display-only: the Copy button above always yields the full
@@ -199,13 +217,23 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // read-only while remaining interactive - which is what
                     // gives it selection, word-on-double-click and Ctrl+C.
                     // `interactive(false)` takes those away too.
-                    ui.add(
+                    let field = ui.add(
                         egui::TextEdit::multiline(&mut text.as_str())
                             .id(egui::Id::new("resp_body"))
                             .code_editor()
                             .desired_width(f32::INFINITY)
                             .desired_rows(12),
                     );
+                    // The caret is read *after* the field has been drawn, from
+                    // the state egui stored under the field's own id — the same
+                    // trick the request editor's "Extract to parameter…" uses.
+                    field.context_menu(|ui| {
+                        if ui.button(lbl_probe_this).clicked() {
+                            open_probe =
+                                Some(super::probe::pointed_in(ui.ctx(), &raw_body, compact));
+                            ui.close();
+                        }
+                    });
                 }
             }
             ResponseSection::Headers => {
@@ -220,8 +248,23 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         .striped(true)
                         .show(ui, |ui| {
                             for (k, v) in &headers {
-                                ui.label(RichText::new(k).strong().color(theme.accent));
-                                ui.label(RichText::new(v).monospace().color(theme.text));
+                                let name = ui.label(RichText::new(k).strong().color(theme.accent));
+                                let value =
+                                    ui.label(RichText::new(v).monospace().color(theme.text));
+                                // Either half of the row is the same subject:
+                                // aiming at the name or at the value is the
+                                // same intention.
+                                for resp in [&name, &value] {
+                                    resp.context_menu(|ui| {
+                                        if ui.button(lbl_probe_this).clicked() {
+                                            open_probe = Some(Some(crate::probe::Probe {
+                                                subject: crate::probe::Subject::Header(k.clone()),
+                                                value: Some(serde_json::Value::String(v.clone())),
+                                            }));
+                                            ui.close();
+                                        }
+                                    });
+                                }
                                 ui.end_row();
                             }
                         });
@@ -252,6 +295,75 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 }
             }
         });
+
+    if let Some(pointed) = open_probe {
+        super::probe::open(app, ui.ctx(), pointed);
+    }
+}
+
+#[cfg(test)]
+mod probe_button_tests {
+    use super::*;
+    use crate::gui::app::GuiApp;
+    use crate::gui::theme::GuiTheme;
+    use crate::hurl::HurlEntry;
+    use eframe::egui;
+
+    /// The right-click route is invisible; the button is what says the feature
+    /// exists. It shares a right-to-left row with Copy, where a widget that
+    /// doesn't fit is simply never painted rather than clipped — so this checks
+    /// it is on screen and inside the panel, not merely that it was added.
+    #[test]
+    fn the_assert_button_is_painted_inside_the_panel() {
+        let mut entry = HurlEntry {
+            title: "Login".to_string(),
+            ..Default::default()
+        };
+        entry.last_response = Some(ApiResponse {
+            status: 200,
+            body: std::sync::Arc::from(r#"{"token":"abc"}"#),
+            ..Default::default()
+        });
+        let mut session = Session::default();
+        session.collections.clear();
+        session.collections.push(crate::collection::Collection::new(
+            "api".into(),
+            vec![entry],
+        ));
+        let mut app = GuiApp::for_test(session);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let width = 900.0;
+        let mut placed = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            placed = full.shapes.iter().flat_map(|c| flatten(&c.shape)).collect();
+        }
+        let label = app.strings.gui_probe_button;
+        let hit = placed
+            .iter()
+            .find(|(t, _)| t.contains(label))
+            .unwrap_or_else(|| panic!("the {label} button was never painted: {placed:?}"));
+        assert!(hit.1.max.x <= width, "{label} is off the right edge");
+    }
+
+    fn flatten(shape: &egui::epaint::Shape) -> Vec<(String, egui::Rect)> {
+        match shape {
+            egui::epaint::Shape::Text(t) => {
+                vec![(t.galley.text().to_string(), t.visual_bounding_rect())]
+            }
+            egui::epaint::Shape::Vec(v) => v.iter().flat_map(flatten).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

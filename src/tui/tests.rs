@@ -33337,7 +33337,7 @@ mod probe_menu_tests {
         // Type the field name to bring it to the top, exactly as the hint says.
         type_str(&mut app, "token");
         assert_eq!(
-            crate::tui::probe_menu::subject_label(&menu(&app).choice().unwrap().subject),
+            crate::probe::subject_label(&menu(&app).choice().unwrap().subject),
             "$.token"
         );
         press(&mut app, KeyCode::Enter);
@@ -33450,7 +33450,7 @@ mod probe_menu_tests {
         let labels: Vec<String> = menu(&app)
             .visible()
             .iter()
-            .map(|p| crate::tui::probe_menu::subject_label(&p.subject))
+            .map(|p| crate::probe::subject_label(&p.subject))
             .collect();
         assert!(labels.contains(&"header Content-Type".to_string()));
         assert!(labels.contains(&"body".to_string()));

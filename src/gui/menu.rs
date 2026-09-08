@@ -701,6 +701,7 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             name,
         } => extract_parameter_dialog(app, ctx, ci, entry, target, value, range, name),
         Dialog::Prompt { kind, text } => prompt_dialog(app, ctx, kind, text),
+        Dialog::ProbeBuilder(builder) => probe_builder_dialog(app, ctx, builder),
         Dialog::Theme(state) => theme_dialog(app, ctx, *state),
         Dialog::CloseGitWorkspace { ci, root } => close_git_workspace_dialog(app, ctx, ci, root),
         Dialog::UnsavedQuit { count, tabs } => unsaved_quit_dialog(app, ctx, count, tabs),
@@ -733,6 +734,141 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         }
         Dialog::Shortcuts => shortcuts_dialog(app, ctx),
     }
+}
+
+/// The response viewer's assert/capture builder.
+///
+/// Two steps in one window: choose a value the server actually sent, then
+/// choose what to say about it. The second step's rows are the Hurl lines
+/// themselves, so what is chosen is a preview of what gets written. Opened by
+/// right-clicking the response body (which pre-selects the value under the
+/// caret) or from the Assert… button (which starts on the list).
+fn probe_builder_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    mut builder: Box<super::probe::ProbeBuilder>,
+) {
+    let title = app.strings.gui_probe_title;
+    let (lbl_back, lbl_add, lbl_cancel, lbl_filter, lbl_name) = (
+        app.strings.gui_probe_back,
+        app.strings.gui_probe_add,
+        app.strings.gui_cancel,
+        app.strings.gui_probe_filter_hint,
+        app.strings.probe_capture_name_title,
+    );
+    let strings = crate::i18n::Strings::for_language(&app.session.language);
+    let dim = app.theme.dim;
+    // What the frame decided, applied after it closes: the dialog body borrows
+    // `builder`, and applying writes through `app` to the same session the
+    // rows were built from.
+    let mut chosen_subject: Option<crate::probe::Probe> = None;
+    let mut back = false;
+    let mut chosen_verb: Option<crate::probe::Verb> = None;
+    let mut start_capture = false;
+    let selection = builder.selection.clone();
+    let frame = modal(ctx, title, |ui| {
+        let mut keep = true;
+        match (builder.chosen.clone(), builder.capture_name.clone()) {
+            // Step one: which value?
+            (None, _) => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut builder.filter)
+                        .desired_width(420.0)
+                        .hint_text(lbl_filter),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for probe in builder.visible() {
+                            let row = super::probe::subject_row(probe);
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new(row).monospace())
+                                        .frame(false),
+                                )
+                                .clicked()
+                            {
+                                chosen_subject = Some((*probe).clone());
+                            }
+                        }
+                    });
+            }
+            // Step three: what should the captured value be called?
+            (Some(probe), Some(mut name)) => {
+                ui.colored_label(dim, crate::probe::subject_label(&probe.subject));
+                ui.add_space(4.0);
+                ui.colored_label(dim, lbl_name);
+                let resp = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                builder.capture_name = Some(name);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(lbl_back).clicked() {
+                        back = true;
+                    }
+                    if ui.button(lbl_add).clicked() || submit {
+                        chosen_verb = Some(crate::probe::Verb::Capture);
+                    }
+                    if ui.button(lbl_cancel).clicked() {
+                        keep = false;
+                    }
+                });
+            }
+            // Step two: what about it?
+            (Some(probe), None) => {
+                ui.colored_label(dim, crate::probe::subject_label(&probe.subject));
+                ui.add_space(4.0);
+                for verb in &builder.verbs {
+                    let row = super::probe::verb_row(&probe.subject, verb, &strings);
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new(row).monospace()).frame(false))
+                        .clicked()
+                    {
+                        match verb {
+                            crate::probe::Verb::Capture => start_capture = true,
+                            other => chosen_verb = Some(other.clone()),
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(lbl_back).clicked() {
+                        back = true;
+                    }
+                    if ui.button(lbl_cancel).clicked() {
+                        keep = false;
+                    }
+                });
+            }
+        }
+        keep
+    });
+    // A frame egui never drew is not an answer: keep the dialog open.
+    if frame.dismissed || !frame.inner_or(true) {
+        return;
+    }
+    if let Some(probe) = chosen_subject {
+        builder.verbs = crate::probe::verbs_for(&probe, selection.as_deref());
+        builder.chosen = Some(probe);
+    } else if back {
+        // Back from the name field returns to the verbs, not all the way out:
+        // one step per press, like the terminal UI's Esc.
+        if builder.capture_name.take().is_none() {
+            builder.chosen = None;
+            builder.verbs.clear();
+        }
+    } else if start_capture {
+        let subject = builder.chosen.as_ref().map(|p| p.subject.clone());
+        if let Some(subject) = subject {
+            builder.capture_name = Some(super::probe::suggested_name(app, &builder, &subject));
+        }
+    } else if let Some(verb) = chosen_verb {
+        let name = builder.capture_name.clone().unwrap_or_default();
+        super::probe::apply(app, &builder, &verb, &name);
+        return;
+    }
+    app.dialog = Some(Dialog::ProbeBuilder(builder));
 }
 
 /// Confirm deleting a request. Gated on `confirm_on_delete_request`; the delete

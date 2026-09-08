@@ -36,6 +36,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   assert converted from a `pm.expect(...)` and one built here are spelled
   identically.
 
+  In the GUI the same builder is a right-click away: *Assert this…* on a value
+  in the response body resolves the field under the caret from the raw JSON —
+  so it works on a minified body as well as a pretty-printed one — and an
+  **Assert…** button beside Copy opens it on the full list. Right-clicking a
+  header row offers the same for that header.
+
 - **Computed values: a `# [Gen]` block for the things a request has to work
   out for itself.** Postman collections lean on pre-request scripts for values
   that cannot be written down in advance — a nonce, a timestamp, a

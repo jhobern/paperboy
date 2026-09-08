@@ -17,6 +17,7 @@ mod filepick;
 mod icons;
 mod menu;
 mod postman;
+mod probe;
 mod remote;
 mod report_editor;
 mod report_run;
