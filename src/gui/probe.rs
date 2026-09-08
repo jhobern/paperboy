@@ -40,6 +40,9 @@ pub(crate) struct ProbeBuilder {
     pub(super) verbs: Vec<Verb>,
     /// The variable name being typed, once "keep it in a variable" is chosen.
     pub(super) capture_name: Option<String>,
+    /// Set when Add was pressed on an empty name: the name step shows why the
+    /// row was not written instead of the dialog vanishing silently.
+    pub(super) name_required: bool,
     /// Text selected in the body when the dialog opened — the only possible
     /// literal for a `body contains` on a reply that isn't JSON.
     pub(super) selection: Option<String>,
@@ -103,6 +106,7 @@ pub(super) fn open(app: &mut GuiApp, ctx: &egui::Context, pointed_at: Option<Pro
         chosen: None,
         verbs: Vec::new(),
         capture_name: None,
+        name_required: false,
         selection: selection.clone(),
     };
     if let Some(probe) = pointed_at {
@@ -431,6 +435,7 @@ mod tests {
             chosen: None,
             verbs: Vec::new(),
             capture_name: None,
+            name_required: false,
             selection: None,
         }
     }
