@@ -7435,7 +7435,17 @@ impl TuiApp {
                 }
             }
             // Typing in the Key cell (re)opens the dropdown for the new text.
-            if let NewField::Kvd(KvdKind::Header, _, HdrCol::Key) = form.focus
+            // The Computed expression cell shares the same suggestion machinery
+            // (its function menu), so typing there must re-offer the matches
+            // too — including after Esc has dismissed the list, which is what
+            // makes continuing to type bring it back rather than trapping the
+            // user until they leave the cell and return.
+            if matches!(form.focus, NewField::Kvd(KvdKind::Header, _, HdrCol::Key))
+                && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+            {
+                typed_in_key = true;
+            }
+            if matches!(form.focus, NewField::Computed(_, CapCol::Expr))
                 && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
             {
                 typed_in_key = true;
@@ -7490,12 +7500,16 @@ impl TuiApp {
                 // Moving to a different field resets the highlight, but
                 // only auto-*shows* the dropdown when landing on an
                 // empty Key cell (e.g. a freshly added header row).
-                // Arrowing onto a Key cell that already has text must
-                // not immediately trap Down/Up in the dropdown; Enter
-                // can still reveal it explicitly (`reveal_key_dropdown`).
+                // Arrowing onto a Key cell — or a Computed expression cell —
+                // that already has text must not immediately trap Down/Up in
+                // the dropdown; Enter can still reveal it explicitly
+                // (`reveal_key_dropdown`). This mirrors the mouse-focus path in
+                // `focus_new_request_field`.
                 form.suggest_hi = None;
                 let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
-                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()))
+                    || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
+                            if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
             }
             if form.focus != prev_focus {

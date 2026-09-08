@@ -22993,8 +22993,102 @@ fn a_computed_row_missing_a_half_is_not_saved() {
     );
 }
 
-/// Editing an existing request shows the block it already has, rather than
-/// silently dropping it on the next save.
+/// `counter` takes a name (`min_args: 1`), so choosing it from the menu must
+/// write `counter()` with the caret between the brackets — ready for the
+/// argument — not the bare `counter` it used to write when the signature
+/// advertised zero arguments while `call` demanded one, which landed a row that
+/// could never run. The completion reads `min_args`, as the GUI does, so the
+/// two front-ends cannot disagree if a signature is reworded.
+#[test]
+fn choosing_counter_from_the_suggestions_writes_a_runnable_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "coun");
+    let sugs: Vec<&str> = crate::generators::functions_starting_with("coun")
+        .map(|f| f.signature)
+        .collect();
+    assert_eq!(sugs, vec!["counter(name)"], "the menu offers this");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let form = form_ref(&app);
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "counter()",
+        "a function that needs an argument is written with both brackets"
+    );
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 8),
+        "the caret waits between the brackets, on the argument"
+    );
+}
+
+/// Arrowing onto a Computed expression cell that already holds a part-typed
+/// name must not auto-open the function dropdown: if it did, the Down pressed
+/// to reach the next row would be swallowed by the list instead. Mirrors the
+/// header Key cell's behaviour, which the mouse path already had.
+#[test]
+fn arrowing_onto_a_populated_expression_cell_does_not_trap_the_arrow_keys() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "sha"); // a name still being typed, dropdown open
+    press(&mut app, KeyCode::Esc); // dismiss the list, leaving the text
+    press(&mut app, KeyCode::Down); // the list is closed, so Down leaves the cell
+    assert_eq!(new_focus(&app), NewField::AddComputed);
+    press(&mut app, KeyCode::Up); // arrow back ONTO the populated cell
+    assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Expr));
+    press(&mut app, KeyCode::Down); // meant to move on again
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "Down moved into the auto-opened suggestion list instead of the next row"
+    );
+}
+
+/// After Esc dismisses the function list, typing more of the name must bring
+/// it back — the same `typed_in_key` bookkeeping the header Key cell has.
+#[test]
+fn typing_after_escaping_the_function_list_offers_suggestions_again() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "sha");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "the list is showing while the name is being typed"
+    );
+    press(&mut app, KeyCode::Esc); // dismiss it
+    assert!(form_ref(&app).key_dropdown().is_none());
+    type_str(&mut app, "2"); // keep typing: "sha2"
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "typing more of a function name must re-offer the matches"
+    );
+}
+
+/// Accepting a call leaves the caret between the brackets, with a `)` to its
+/// right. A function must still be completable there — as `gen_suggestions`'
+/// own doc promises ("completed inside `concat(upper(`") — which needs the
+/// word to be found by scanning from the caret, not back from the end of the
+/// cell (where the `)` would make the trailing word empty).
+#[test]
+fn a_function_can_be_completed_inside_an_existing_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    // Accept `base64()` from the menu: the caret lands inside it.
+    type_str(&mut app, "base6");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "base64()");
+    // Now start typing the inner function.
+    type_str(&mut app, "sha");
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "base64(sha)");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "typing a function name inside an accepted call offers nothing: cell is {:?}",
+        form_ref(&app).generators[0].expr.text()
+    );
+}
+
 #[test]
 fn editing_a_request_keeps_the_block_it_arrived_with() {
     let mut app = TuiApp::default();
