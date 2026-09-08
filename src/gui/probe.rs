@@ -24,7 +24,13 @@ pub(crate) struct ProbeBuilder {
     /// The collection, by runtime id: the dialog outlives the frame that
     /// opened it, and a tab reorder in between must not redirect the write.
     pub(super) collection_id: u64,
+    /// The entry's index *and* its stable [`HurlEntry::uid`]. The id is what
+    /// the write actually addresses (see [`apply`]); the index is only a
+    /// fallback for an entry that has never been stamped (uid 0). Pinning by
+    /// index alone let a reload or reorder that renumbers the requests land the
+    /// assert on whatever now sits at that position.
     pub(super) entry: usize,
+    pub(super) entry_uid: u64,
     /// Everything the response offers, unfiltered.
     pub(super) subjects: Vec<Probe>,
     pub(super) filter: String,
@@ -87,9 +93,11 @@ pub(super) fn open(app: &mut GuiApp, ctx: &egui::Context, pointed_at: Option<Pro
         return;
     }
     let selection = body_selection(app, ctx);
+    let entry_uid = col.entries.get(entry).map(|e| e.uid).unwrap_or(0);
     let mut builder = ProbeBuilder {
         collection_id: col.id,
         entry,
+        entry_uid,
         subjects,
         filter: String::new(),
         chosen: None,
@@ -104,11 +112,35 @@ pub(super) fn open(app: &mut GuiApp, ctx: &egui::Context, pointed_at: Option<Pro
     app.dialog = Some(Dialog::ProbeBuilder(Box::new(builder)));
 }
 
+/// The egui id the response body `TextEdit` is drawn under — and read back
+/// from. It carries the selected entry's identity so a selection made in one
+/// reply cannot be read back as the *next* reply's: egui keeps cursor state per
+/// widget id, and a constant id let one request's selection outlive it and be
+/// sliced out of another request's body.
+///
+/// Keyed on the stable [`HurlEntry::uid`] where it exists, and on the index as
+/// a fallback for an entry that has never been stamped (uid 0); the index is
+/// included regardless so even two unstamped entries get distinct ids.
+pub(super) fn body_field_id(app: &GuiApp) -> egui::Id {
+    let (uid, idx) = app
+        .session
+        .collections
+        .get(app.active_ci())
+        .map(|c| {
+            (
+                c.entries.get(c.selected_entry).map(|e| e.uid).unwrap_or(0),
+                c.selected_entry,
+            )
+        })
+        .unwrap_or((0, 0));
+    egui::Id::new(("resp_body", uid, idx))
+}
+
 /// Whatever is selected in the response body field, when it is a single line
 /// of it. Used as the literal for `body contains …`, and as the dialog's
 /// opening filter.
 fn body_selection(app: &GuiApp, ctx: &egui::Context) -> Option<String> {
-    let state = egui::TextEdit::load_state(ctx, egui::Id::new("resp_body"))?;
+    let state = egui::TextEdit::load_state(ctx, body_field_id(app))?;
     let range = state.cursor.char_range()?.as_sorted_char_range();
     if range.start.0 >= range.end.0 {
         return None;
@@ -119,14 +151,84 @@ fn body_selection(app: &GuiApp, ctx: &egui::Context) -> Option<String> {
         .get(app.active_ci())
         .and_then(|c| c.entries.get(c.selected_entry))
         .and_then(|e| e.last_response.as_ref())
-        .map(|r| r.body.to_string())?;
-    let text: String = body
-        .chars()
-        .skip(range.start.0)
-        .take(range.end.0 - range.start.0)
-        .collect();
+        .map(|r| r.body.clone())?;
+    // The field is handed the *compacted* text when Compact is on, so the char
+    // range indexes that, not the raw body. Slicing the raw body with those
+    // offsets diverges from the first elided literal onwards and quotes the
+    // wrong text. Translate the range back through the compaction map so the
+    // literal is the untruncated value that actually occurs in the reply — the
+    // same expansion the terminal UI does on copy (`resp_full_selected_parts`).
+    let text = if app.response_compact {
+        selection_from_compacted(&body, range.start.0, range.end.0)?
+    } else {
+        body.chars()
+            .skip(range.start.0)
+            .take(range.end.0 - range.start.0)
+            .collect()
+    };
     let text = text.trim().to_string();
     (!text.is_empty() && !text.contains('\n')).then_some(text)
+}
+
+/// Translate a char range taken from the *compacted* body view back to the
+/// slice of the raw body it stands for. A position inside a shortened literal
+/// maps to the start of the elided run, so a selection that spans a whole
+/// compacted literal expands to that literal's full, untruncated text.
+fn selection_from_compacted(raw: &str, start: usize, end: usize) -> Option<String> {
+    let (compacted, maps) = crate::shared_utils::compact_long_strings_mapped(raw);
+    let full_start = compacted_to_raw_offset(&compacted, &maps, raw, start);
+    let full_end = compacted_to_raw_offset(&compacted, &maps, raw, end);
+    if full_start >= full_end {
+        return None;
+    }
+    Some(
+        raw.chars()
+            .skip(full_start)
+            .take(full_end - full_start)
+            .collect(),
+    )
+}
+
+/// A flat char offset into the compacted text, translated to a flat char offset
+/// into the raw body. Compaction never adds or removes newlines, so the line
+/// index is shared and only the column needs mapping.
+fn compacted_to_raw_offset(compacted: &str, maps: &[Vec<usize>], raw: &str, pos: usize) -> usize {
+    let (line, col) = flat_to_line_col(compacted, pos);
+    let full_col = match maps.get(line) {
+        Some(map) if !map.is_empty() => map[col.min(map.len() - 1)],
+        _ => col,
+    };
+    line_col_to_flat(raw, line, full_col)
+}
+
+/// A flat char offset into `text` as a `(line, column)` pair.
+fn flat_to_line_col(text: &str, offset: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for (count, ch) in text.chars().enumerate() {
+        if count == offset {
+            return (line, col);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// A `(line, column)` pair in `text` as a flat char offset.
+fn line_col_to_flat(text: &str, target_line: usize, target_col: usize) -> usize {
+    let mut offset = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        if i == target_line {
+            return offset + target_col;
+        }
+        offset += line.chars().count() + 1;
+    }
+    offset
 }
 
 /// The value the caret (or the start of the selection) sits on in the response
@@ -139,11 +241,16 @@ fn body_selection(app: &GuiApp, ctx: &egui::Context) -> Option<String> {
 ///
 /// Takes the body rather than reading it off the app because it is called from
 /// inside the response panel's own closures, which already hold the borrow.
-pub(super) fn pointed_in(ctx: &egui::Context, body: &str, compact: bool) -> Option<Probe> {
+pub(super) fn pointed_in(
+    ctx: &egui::Context,
+    body: &str,
+    compact: bool,
+    id: egui::Id,
+) -> Option<Probe> {
     if compact {
         return None;
     }
-    let state = egui::TextEdit::load_state(ctx, egui::Id::new("resp_body"))?;
+    let state = egui::TextEdit::load_state(ctx, id)?;
     let range = state.cursor.char_range()?.as_sorted_char_range();
     let offset = body
         .char_indices()
@@ -155,9 +262,13 @@ pub(super) fn pointed_in(ctx: &egui::Context, body: &str, compact: bool) -> Opti
 
 /// Write the chosen verb onto the request the response came from.
 ///
-/// Every index is re-checked rather than trusted: the user can switch request,
-/// reorder tabs or close the collection while the dialog is up, and writing an
-/// assert into whatever now sits at that position would be silent corruption.
+/// The collection *and* the entry are re-resolved rather than trusted: the
+/// user can switch request, reorder tabs, reload the file or close the
+/// collection while the dialog is up, and writing an assert into whatever now
+/// sits at that position would be silent corruption. The collection is matched
+/// by runtime id and the entry by its stable [`HurlEntry::uid`] (falling back
+/// to the index only for an entry that was never stamped), so a reload or
+/// reorder that renumbers the requests can't redirect the write.
 pub(super) fn apply(app: &mut GuiApp, builder: &ProbeBuilder, verb: &Verb, name: &str) -> bool {
     let Some(probe) = builder.chosen.as_ref() else {
         return false;
@@ -173,7 +284,7 @@ pub(super) fn apply(app: &mut GuiApp, builder: &ProbeBuilder, verb: &Verb, name:
     let Some(col) = app.session.collections.get_mut(ci) else {
         return false;
     };
-    let Some(target) = col.entries.get_mut(builder.entry) else {
+    let Some(target) = find_entry_mut(col, builder.entry_uid, builder.entry) else {
         return false;
     };
     let changed = match verb {
@@ -221,6 +332,39 @@ pub(super) fn apply(app: &mut GuiApp, builder: &ProbeBuilder, verb: &Verb, name:
     changed
 }
 
+/// Resolve the entry the builder targets by its stable [`HurlEntry::uid`],
+/// falling back to the index only for an unstamped entry (uid 0). A uid that no
+/// longer resolves to exactly one entry (deleted, or duplicated by a clone)
+/// declines rather than guess.
+fn find_entry_mut(
+    col: &mut crate::collection::Collection,
+    uid: u64,
+    idx: usize,
+) -> Option<&mut crate::hurl::HurlEntry> {
+    if uid != 0 {
+        return match col.entries.iter().filter(|e| e.uid == uid).count() {
+            1 => col.entries.iter_mut().find(|e| e.uid == uid),
+            _ => None,
+        };
+    }
+    col.entries.get_mut(idx)
+}
+
+/// The immutable twin of [`find_entry_mut`], for read-only lookups.
+fn find_entry<'a>(
+    col: &'a crate::collection::Collection,
+    uid: u64,
+    idx: usize,
+) -> Option<&'a crate::hurl::HurlEntry> {
+    if uid != 0 {
+        return match col.entries.iter().filter(|e| e.uid == uid).count() {
+            1 => col.entries.iter().find(|e| e.uid == uid),
+            _ => None,
+        };
+    }
+    col.entries.get(idx)
+}
+
 /// A name for a capture of this subject that isn't already taken on the entry.
 pub(super) fn suggested_name(app: &GuiApp, builder: &ProbeBuilder, subject: &Subject) -> String {
     let taken: Vec<String> = app
@@ -228,7 +372,7 @@ pub(super) fn suggested_name(app: &GuiApp, builder: &ProbeBuilder, subject: &Sub
         .collections
         .iter()
         .find(|c| c.id == builder.collection_id)
-        .and_then(|c| c.entries.get(builder.entry))
+        .and_then(|c| find_entry(c, builder.entry_uid, builder.entry))
         .map(|e| e.captures.iter().map(|(n, _)| n.clone()).collect())
         .unwrap_or_default();
     probe::suggest_name(subject, &taken)
@@ -281,6 +425,7 @@ mod tests {
         ProbeBuilder {
             collection_id: app.session.collections[0].id,
             entry: 0,
+            entry_uid: app.session.collections[0].entries[0].uid,
             subjects: probe::probes(201, Some(90), &[], body),
             filter: String::new(),
             chosen: None,
@@ -409,5 +554,244 @@ mod tests {
         });
         assert!(row.contains("$.token"), "{row}");
         assert!(row.contains("abcdef"), "{row}");
+    }
+}
+
+/// Tests that drive the real response panel with simulated pointer events and
+/// read back what was painted — the only way to exercise the caret-resolution
+/// and drag-selection this module does, which live entirely in state egui
+/// stores as it lays the panel out. Harness in [`crate::gui::probe_test_support`].
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+    use crate::gui::app::Dialog;
+    use crate::gui::probe_test_support::*;
+    use crate::hurl::HurlEntry;
+    use eframe::egui;
+
+    /// The question the whole right-click route rests on: `pointed_in` treats
+    /// `CCursor.index` as a *character* index and walks `char_indices()` to
+    /// turn it into a byte offset for `probe_at`. If egui were handing back
+    /// byte offsets that walk would over-shoot on any multi-byte body. Clicks —
+    /// with real pointer events, through the real panel — inside `"abcdef"` on
+    /// a body whose earlier fields are full of accents, CJK and an emoji.
+    #[test]
+    fn the_caret_is_a_char_index_and_the_conversion_is_load_bearing() {
+        let body = "{\n  \"note\": \"héllo wörld 🚀 中文中文\",\n  \"token\": \"abcdef\"\n}";
+        let target_at = body.find("abcdef").unwrap();
+        let chars_before = body[..target_at].chars().count();
+        assert!(
+            target_at > chars_before,
+            "the fixture must have multi-byte text before the target ({target_at} bytes, {chars_before} chars)"
+        );
+
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let (pos, galley) = painted
+            .iter()
+            .find(|(_, g)| g.text().contains("abcdef"))
+            .expect("the body was never painted");
+        let aim = body[..target_at + 2].chars().count();
+        let target = *pos
+            + galley
+                .pos_from_cursor(egui::text::CCursor::new(aim))
+                .center()
+                .to_vec2();
+
+        let (press, release) = click_events(target, egui::PointerButton::Secondary);
+        panel_frame(&mut app, &ctx, press);
+        panel_frame(&mut app, &ctx, release);
+
+        let id = body_field_id(&app);
+        let range = egui::TextEdit::load_state(&ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .expect("the click left no caret");
+        let index = range.as_sorted_char_range().start.0;
+        assert_eq!(
+            index, aim,
+            "egui handed back a byte offset, not a character index"
+        );
+
+        let resolved = pointed_in(&ctx, body, false, id);
+        let as_bytes = crate::probe::probe_at(body, index);
+        assert_ne!(
+            format!("{resolved:?}"),
+            format!("{as_bytes:?}"),
+            "the two readings agree on this fixture, so it proves nothing"
+        );
+        let subject = resolved.expect("nothing under the caret").subject;
+        assert_eq!(
+            crate::probe::subject_label(&subject),
+            "$.token",
+            "clicked inside \"abcdef\" but the builder targeted a different field"
+        );
+    }
+
+    /// `pointed_in` refuses to resolve offsets while Compact is on, because
+    /// compaction rewrites the text. `body_selection` — which supplies the
+    /// literal for `body contains "…"` — must not slice the *raw* body with
+    /// offsets taken from the *compacted* one; it translates them back instead.
+    #[test]
+    fn a_selection_made_in_the_compacted_view_quotes_the_wrong_text() {
+        let raw = format!(r#"{{"a":"{}","tail":"WANTED"}}"#, "x".repeat(80));
+        let mut app = app_with(&raw, vec![], 200);
+        app.response_compact = true;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let shown = crate::shared_utils::compact_long_strings(&raw);
+        let (pos, galley) = painted
+            .iter()
+            .find(|(_, g)| g.text() == shown)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the compacted body was never painted: {:?}",
+                    texts(&painted)
+                )
+            });
+
+        let at = shown.find("WANTED").unwrap();
+        let start = shown[..at].chars().count();
+        let p = |i: usize| {
+            *pos + galley
+                .pos_from_cursor(egui::text::CCursor::new(i))
+                .center()
+                .to_vec2()
+        };
+        let (from, to) = (p(start), p(start + "WANTED".len()));
+        let down = egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let up = egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from), down]);
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+        panel_frame(&mut app, &ctx, vec![up]);
+
+        let selected: String = {
+            let range = egui::TextEdit::load_state(&ctx, body_field_id(&app))
+                .and_then(|s| s.cursor.char_range())
+                .expect("no selection")
+                .as_sorted_char_range();
+            shown
+                .chars()
+                .skip(range.start.0)
+                .take(range.end.0 - range.start.0)
+                .collect()
+        };
+
+        open(&mut app, &ctx, None);
+        let Some(Dialog::ProbeBuilder(b)) = &app.dialog else {
+            panic!("the builder did not open");
+        };
+        assert_eq!(
+            b.selection.as_deref(),
+            Some(selected.trim()),
+            "the `body contains` literal is not the text that was selected"
+        );
+    }
+
+    /// The response body field is drawn under a per-request id, so egui's
+    /// cursor state does not survive a change of request: a selection made in
+    /// one reply must not be applied, unchecked, to the *next* reply's body.
+    #[test]
+    fn a_selection_survives_into_the_next_request_and_quotes_its_body_instead() {
+        let first = r#"{"one":"AAAAAAAAAA","two":"SELECTME"}"#;
+        let second = r#"{"one":"BBBBBBBBBB","two":"different"}"#;
+        let mut app = app_with(first, vec![], 200);
+        let mut other = HurlEntry {
+            title: "Other".to_string(),
+            ..Default::default()
+        };
+        other.last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            body: std::sync::Arc::from(second),
+            ..Default::default()
+        });
+        app.session.collections[0].entries.push(other);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let (pos, galley) = painted
+            .iter()
+            .find(|(_, g)| g.text() == first)
+            .expect("body not painted");
+        let at = first.find("SELECTME").unwrap();
+        let p = |i: usize| {
+            *pos + galley
+                .pos_from_cursor(egui::text::CCursor::new(i))
+                .center()
+                .to_vec2()
+        };
+        let (from, to) = (p(at), p(at + "SELECTME".len()));
+        let down = egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let up = egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from), down]);
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(to)]);
+        panel_frame(&mut app, &ctx, vec![up]);
+
+        app.session.collections[0].selected_entry = 1;
+        panel_frame(&mut app, &ctx, vec![]);
+        open(&mut app, &ctx, None);
+        let Some(Dialog::ProbeBuilder(b)) = &app.dialog else {
+            panic!("the builder did not open");
+        };
+        assert_eq!(
+            b.selection, None,
+            "a selection made in another request's body was offered as this one's literal"
+        );
+    }
+
+    /// The collection is pinned by runtime id because the dialog outlives the
+    /// frame that opened it — and the entry within it is pinned by its stable
+    /// `uid`, so a reorder (or a reload of the file in a different order) while
+    /// the builder is up cannot send the assert to a different request.
+    #[test]
+    fn reordering_requests_while_the_builder_is_open_writes_the_assert_elsewhere() {
+        let body = r#"{"token":"abc"}"#;
+        let mut app = app_with(body, vec![], 200);
+        let first = HurlEntry {
+            title: "Ping".to_string(),
+            ..Default::default()
+        };
+        app.session.collections[0].entries.insert(0, first);
+        app.session.collections[0].selected_entry = 1;
+        let ctx = themed_ctx();
+        let target = crate::probe::probes(200, None, &[], body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        open(&mut app, &ctx, Some(target));
+        let Some(Dialog::ProbeBuilder(b)) = app.dialog.take() else {
+            panic!("no builder");
+        };
+        app.session.collections[0].entries.swap(0, 1);
+        let verb = b.verbs[0].clone();
+        apply(&mut app, &b, &verb, "");
+        let ping = &app.session.collections[0].entries[1];
+        assert!(
+            ping.asserts.is_empty(),
+            "the assert landed on {:?}, which never made that request",
+            ping.title
+        );
     }
 }

@@ -2440,6 +2440,53 @@ fn file_stem(path: &str) -> String {
 /// UI's `theme_editor::color_label`, reading the same `Strings` fields).
 use crate::theme::color_label;
 
+/// The probe builder's modal, driven through the real dialog layer with
+/// simulated clicks. Harness in [`crate::gui::probe_test_support`].
+#[cfg(test)]
+mod probe_dialog_tests {
+    use crate::gui::probe_test_support::*;
+    use eframe::egui;
+
+    /// The subject list is a filter field over rows of monospace text with no
+    /// width cap on the path column. On a small window the dialog must still
+    /// paint inside the screen.
+    #[test]
+    fn the_builder_fits_a_small_window() {
+        let deep = format!(
+            r#"{{"{}":{{"{}":"{}"}}}}"#,
+            "a_very_long_field_name_indeed".repeat(2),
+            "another_long_nested_field_name".repeat(2),
+            "v".repeat(200)
+        );
+        let mut app = app_with(&deep, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+        let screen = egui::vec2(520.0, 380.0);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            let full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), screen)),
+                    ..Default::default()
+                },
+                |ui| super::show_dialog(&mut app, ui.ctx()),
+            );
+            painted = collect(&full);
+        }
+        let overflow: Vec<(String, f32)> = painted
+            .iter()
+            .map(|(p, g)| (g.text().to_string(), p.x + g.size().x))
+            .filter(|(_, right)| *right > screen.x)
+            .collect();
+        assert!(
+            overflow.is_empty(),
+            "the builder paints past the right edge of a {}x{} window: {overflow:?}",
+            screen.x,
+            screen.y
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

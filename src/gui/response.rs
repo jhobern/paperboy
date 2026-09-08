@@ -114,8 +114,15 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // panel's closures have released their borrow of the app: `Some(None)`
     // opens the builder on the whole list, `Some(Some(probe))` on one value.
     let mut open_probe: Option<Option<crate::probe::Probe>> = None;
-    let raw_body = body.to_string();
+    // Clone the `Arc`, not the bytes: the context-menu closure below only needs
+    // to borrow the body on a right-click, but this line runs on every repaint.
+    // `body.to_string()` here was a full-body memcpy per frame on large replies.
+    let raw_body = body.clone();
     let compact = app.response_compact;
+    // The body field is keyed per request so a selection can't survive into the
+    // next one (egui keeps cursor state per widget id); the reader must use the
+    // same id.
+    let body_id = super::probe::body_field_id(app);
     ui.horizontal(|ui| {
         if loading {
             ui.spinner();
@@ -144,26 +151,30 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 if ui.button(lbl_copy).on_hover_text(lbl_copy_body).clicked() {
                     ui.ctx().copy_text(body.to_string());
                 }
-                // Right-clicking a value is the quick way in, but it is also
-                // invisible: the button is what tells anyone the feature is
-                // here at all, and it opens the same builder on the full list.
-                if ui.button(lbl_probe).on_hover_text(lbl_probe_hint).clicked() {
-                    open_probe = Some(None);
+            }
+            // Gated on `sent`, not on a non-empty body: a 204 (or any reply with
+            // no body) still has a status and headers to assert on, and the
+            // status is the one subject that sets the HTTP line. Right-clicking
+            // a value is the quick way in, but it is also invisible: the button
+            // is what tells anyone the feature is here at all, and it opens the
+            // same builder on the full list.
+            if sent && ui.button(lbl_probe).on_hover_text(lbl_probe_hint).clicked() {
+                open_probe = Some(None);
+            }
+            // Compact toggle — only meaningful on the Body section, and only
+            // when there is a body to compact. It is display-only: the Copy
+            // button above always yields the full body, so a copied value is
+            // never truncated.
+            if !body.is_empty() && app.response_section == ResponseSection::Body {
+                let mut compact = app.response_compact;
+                if ui
+                    .selectable_label(compact, lbl_compact)
+                    .on_hover_text(lbl_compact_hint)
+                    .clicked()
+                {
+                    compact = !compact;
                 }
-                // Compact toggle — only meaningful on the Body section. It is
-                // display-only: the Copy button above always yields the full
-                // body, so a copied value is never truncated.
-                if app.response_section == ResponseSection::Body {
-                    let mut compact = app.response_compact;
-                    if ui
-                        .selectable_label(compact, lbl_compact)
-                        .on_hover_text(lbl_compact_hint)
-                        .clicked()
-                    {
-                        compact = !compact;
-                    }
-                    app.response_compact = compact;
-                }
+                app.response_compact = compact;
             }
         });
     });
@@ -219,7 +230,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // `interactive(false)` takes those away too.
                     let field = ui.add(
                         egui::TextEdit::multiline(&mut text.as_str())
-                            .id(egui::Id::new("resp_body"))
+                            .id(body_id)
                             .code_editor()
                             .desired_width(f32::INFINITY)
                             .desired_rows(12),
@@ -229,8 +240,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // trick the request editor's "Extract to parameter…" uses.
                     field.context_menu(|ui| {
                         if ui.button(lbl_probe_this).clicked() {
-                            open_probe =
-                                Some(super::probe::pointed_in(ui.ctx(), &raw_body, compact));
+                            open_probe = Some(super::probe::pointed_in(
+                                ui.ctx(),
+                                &raw_body,
+                                compact,
+                                body_id,
+                            ));
                             ui.close();
                         }
                     });
@@ -362,6 +377,78 @@ mod probe_button_tests {
             }
             egui::epaint::Shape::Vec(v) => v.iter().flat_map(flatten).collect(),
             _ => Vec::new(),
+        }
+    }
+}
+
+/// The two ways into the builder from the response panel — the Assert… button
+/// and a right-click on a header row — driven through the real panel with
+/// simulated pointer events. Harness in [`crate::gui::probe_test_support`].
+#[cfg(test)]
+mod probe_route_tests {
+    use crate::gui::app::{Dialog, ResponseSection};
+    use crate::gui::probe_test_support::*;
+    use eframe::egui;
+
+    /// The Assert… button is gated on whether the request was *sent*, not on a
+    /// non-empty body: a 204 has no body to right-click, but its status (and
+    /// every header) is a perfectly good subject — and the status is the one
+    /// verb that sets `expected_status`, which is exactly what a 204 wants.
+    #[test]
+    fn a_204_offers_no_way_into_the_builder() {
+        let mut app = app_with("", vec![("X-Trace".into(), "abc".into())], 204);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let seen = texts(&painted);
+        let subjects = crate::probe::probes(204, Some(12), &[], "");
+        assert!(
+            seen.iter()
+                .any(|t| t.contains(app.strings.gui_probe_button)),
+            "no Assert… button on a reply with no body, though it has {} subjects",
+            subjects.len()
+        );
+    }
+
+    /// The headers section has no Assert… button, but its rows are
+    /// right-clickable — this pins the working route so the 204 gap above is
+    /// clearly about the button and not about the feature.
+    #[test]
+    fn a_header_row_still_opens_the_builder_on_that_header() {
+        let mut app = app_with(
+            r#"{"a":1}"#,
+            vec![
+                ("X-Request-Id".into(), "r-42".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            200,
+        );
+        app.response_section = ResponseSection::Headers;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let row = centre_of(&painted, "application/json");
+        let (press, release) = click_events(row, egui::PointerButton::Secondary);
+        panel_frame(&mut app, &ctx, press);
+        let mut painted = panel_frame(&mut app, &ctx, release);
+        for _ in 0..3 {
+            painted = panel_frame(&mut app, &ctx, vec![]);
+        }
+        let item = centre_of(&painted, app.strings.gui_probe_assert_this);
+        let (press, release) = click_events(item, egui::PointerButton::Primary);
+        panel_frame(&mut app, &ctx, press);
+        panel_frame(&mut app, &ctx, release);
+        panel_frame(&mut app, &ctx, vec![]);
+        match &app.dialog {
+            Some(Dialog::ProbeBuilder(b)) => {
+                let chosen = b.chosen.as_ref().expect("no subject chosen");
+                assert_eq!(
+                    crate::probe::subject_label(&chosen.subject),
+                    "header Content-Type",
+                    "the second row's menu targeted another row"
+                );
+            }
+            _ => panic!("the header right-click did not open the builder"),
         }
     }
 }
@@ -506,7 +593,10 @@ mod tests {
         frame(&mut app, click_at(pos));
         frame(&mut app, click_at(pos));
 
-        let state = egui::text_edit::TextEditState::load(&ctx, egui::Id::new("resp_body"))
+        // The body field is now keyed per request (so a selection can't leak
+        // into the next one); read the state back under that same id.
+        let id = crate::gui::probe::body_field_id(&app);
+        let state = egui::text_edit::TextEditState::load(&ctx, id)
             .expect("the body must be a real, interactive TextEdit");
         let range = state
             .cursor
