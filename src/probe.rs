@@ -61,8 +61,14 @@ impl Subject {
             Subject::Status => "status".to_string(),
             Subject::Duration => "duration".to_string(),
             Subject::Header(name) => format!("header \"{}\"", escape_hurl(name)),
-            Subject::Json(path) => format!("jsonpath \"{path}\""),
-            Subject::JsonCount(path) => format!("jsonpath \"{path}\" count"),
+            // The path is already escaped for the *jsonpath* grammar by
+            // `push_key`, but it is about to be written inside a Hurl
+            // double-quoted string, which has escapes of its own. Both layers
+            // have to be satisfied or a key holding a quote ends the string
+            // early (the file stops parsing) and a key holding a backslash
+            // arrives at the evaluator as some other character entirely.
+            Subject::Json(path) => format!("jsonpath \"{}\"", escape_hurl(path)),
+            Subject::JsonCount(path) => format!("jsonpath \"{}\" count", escape_hurl(path)),
             Subject::Body => "body".to_string(),
         }
     }
@@ -169,6 +175,14 @@ fn escape_hurl(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // A Hurl quoted string is a template: `{{name}}` in it is read as
+            // a placeholder and compared against the *variable* `name`, and an
+            // unbalanced `{{` stops the whole file parsing. Response bodies
+            // carry such text routinely (any CMS or notification API), so the
+            // brace is escaped back into a plain character. Hurl's templatiser
+            // looks at the source spelling of each character, so an escaped
+            // brace can never start a placeholder.
+            '{' => out.push_str("\\u{007b}"),
             // Anything else non-printable would be invisible in the file and
             // indistinguishable from the character next to it when read back.
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{{{:04x}}}", c as u32)),
@@ -186,10 +200,55 @@ pub fn literal(v: &Value) -> Option<String> {
     match v {
         Value::Null => Some("null".to_string()),
         Value::Bool(b) => Some(b.to_string()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => plain_number(n),
         Value::String(s) => Some(format!("\"{}\"", escape_hurl(s))),
         Value::Array(_) | Value::Object(_) => None,
     }
+}
+
+/// A JSON number written the only way Hurl can read it: plain decimal.
+///
+/// Hurl's number grammar has no exponent, but `JSON.stringify` and Python's
+/// `json.dumps` both emit one for small and large floats, so a reply carrying
+/// `1.5e-3` would otherwise produce an assert line that stops the *whole
+/// collection file* parsing — every request in it, not just this assert.
+/// Serde's own rendering is used where it is already plain, and expanded here
+/// where it is not. A number too big to write out in full declines instead:
+/// the palette still offers `exists`, which is honest, where a rounded
+/// comparison would quietly assert something the response never said.
+fn plain_number(n: &serde_json::Number) -> Option<String> {
+    let s = n.to_string();
+    let Some((mantissa, exponent)) = s.split_once(['e', 'E']) else {
+        return Some(s);
+    };
+    let exponent: i32 = exponent.parse().ok()?;
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{whole}{fraction}");
+    // Where the point sits once the exponent has been applied, counted in
+    // digits from the left. It can land outside the digits at either end,
+    // which is what the padding below is for.
+    let point = whole.len() as i32 + exponent;
+    // Refuse anything that would need more than a line's worth of zeroes.
+    // `1e300` is a number no assertion is meaningfully written against.
+    if point.abs() > 40 {
+        return None;
+    }
+    let mut out = if point <= 0 {
+        format!("0.{}{}", "0".repeat(-point as usize), digits)
+    } else if point as usize >= digits.len() {
+        format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
+    } else {
+        let (l, r) = digits.split_at(point as usize);
+        format!("{l}.{r}")
+    };
+    if out.contains('.') {
+        out = out.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    Some(format!("{sign}{out}"))
 }
 
 /// What the second step can do with the chosen subject.
@@ -1010,6 +1069,117 @@ mod tests {
         let p = probe_at(body, body.find("\\u00e9").unwrap()).unwrap();
         assert_eq!(p.subject, Subject::Json("$['a-b'].c".into()));
         assert_eq!(p.value, Some(json!("é \"q\"")));
+    }
+
+    /// Whether an `[Asserts]` line is something Hurl itself can read. A line
+    /// that only PaperBoy can parse is worse than no line at all: hurl refuses
+    /// the file, so every request in the collection stops running.
+    fn hurl_reads(line: &str) -> Result<(), String> {
+        let text = format!("GET http://h/a\nHTTP 200\n[Asserts]\n{line}\n");
+        hurl_core::parser::parse_hurl_file(&text)
+            .map(|_| ())
+            .map_err(|e| format!("{:?} at {:?}", e.kind, e.pos))
+    }
+
+    #[test]
+    fn a_key_hurl_would_choke_on_is_escaped_for_both_layers() {
+        for (body, key) in [
+            (r#"{"a\"b":1}"#, "a\"b"),
+            (r#"{"a\\b":1}"#, "a\\b"),
+            (r#"{"a\nb":1}"#, "a\nb"),
+        ] {
+            let subject = Subject::Json({
+                let mut path = "$".to_string();
+                push_key(&mut path, key);
+                path
+            });
+            let line = assert_line(subject, Predicate::Eq("1".into())).unwrap();
+            assert!(hurl_reads(&line).is_ok(), "{line}: {:?}", hurl_reads(&line));
+        }
+    }
+
+    #[test]
+    fn a_backslash_in_a_key_reaches_the_evaluator_unchanged() {
+        // The dangerous half of the same bug: this one parses, so nothing
+        // complains, and the query silently selects a key that is not there.
+        let mut path = "$".to_string();
+        push_key(&mut path, "a\\b");
+        let line = assert_line(Subject::Json(path.clone()), Predicate::Eq("1".into())).unwrap();
+        let text = format!("GET http://h/a\nHTTP 200\n[Asserts]\n{line}\n");
+        let file = hurl_core::parser::parse_hurl_file(&text).unwrap();
+        let source = format!("{:?}", file);
+        assert!(
+            source.contains(&format!("value: {path:?}")),
+            "the evaluator must receive the path we built, not a decoded copy: {line}"
+        );
+    }
+
+    #[test]
+    fn a_response_value_that_looks_like_a_placeholder_is_compared_as_text() {
+        let line = assert_line(
+            Subject::Json("$.greeting".into()),
+            Predicate::Eq(literal(&json!("Hello {{ user.name }}")).unwrap()),
+        )
+        .unwrap();
+        assert!(hurl_reads(&line).is_ok(), "{line}");
+        let text = format!("GET http://h/a\nHTTP 200\n[Asserts]\n{line}\n");
+        let file = hurl_core::parser::parse_hurl_file(&text).unwrap();
+        assert!(
+            !format!("{:?}", file).contains("Placeholder"),
+            "the value came back as a template, not as text: {line}"
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_brace_pair_still_leaves_a_readable_file() {
+        let line = assert_line(
+            Subject::Json("$.greeting".into()),
+            Predicate::Eq(literal(&json!("Hello {{ user.name }")).unwrap()),
+        )
+        .unwrap();
+        assert!(hurl_reads(&line).is_ok(), "{line}");
+    }
+
+    #[test]
+    fn every_number_a_response_can_carry_becomes_a_line_hurl_reads() {
+        for body in [
+            r#"{"n":1.5e-3}"#,
+            r#"{"n":1e10}"#,
+            r#"{"n":1E+2}"#,
+            r#"{"n":-2.5E3}"#,
+            r#"{"n":0.0015}"#,
+            r#"{"n":3.14}"#,
+            r#"{"n":12345678901234567890}"#,
+            r#"{"n":-0}"#,
+        ] {
+            let probe = probes(0, None, &[], body)
+                .into_iter()
+                .find(|p| matches!(&p.subject, Subject::Json(p) if p == "$.n"))
+                .unwrap();
+            let line =
+                assert_line(probe.subject.clone(), default_predicates(&probe)[0].clone()).unwrap();
+            assert!(hurl_reads(&line).is_ok(), "{body} -> {line}");
+        }
+    }
+
+    #[test]
+    fn an_expanded_number_still_says_what_the_response_said() {
+        for (src, want) in [
+            ("1.5e-3", "0.0015"),
+            ("1e10", "10000000000"),
+            ("1E+2", "100"),
+            ("-2.5E3", "-2500"),
+            ("3.14", "3.14"),
+        ] {
+            let v: Value = serde_json::from_str(src).unwrap();
+            assert_eq!(literal(&v).as_deref(), Some(want), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_number_too_big_to_write_out_declines_rather_than_rounding() {
+        let v: Value = serde_json::from_str("1e300").unwrap();
+        assert_eq!(literal(&v), None);
     }
 
     #[test]
