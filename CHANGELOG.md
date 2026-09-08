@@ -212,6 +212,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   will, and a name built at run time is not in the file to reorder at all. One
   note covering all four sent every reader looking for the wrong fix.
 
+- **A note about a folder's script is filed against the folder again.** The
+  test asking whether a request had a script of its own answered "yes" for a
+  request carrying its own assertions *and* an inherited jump, so the folder's
+  problem was reported once per request underneath it — eighteen identical
+  notes on a real collection. Each note now goes to whoever actually wrote the
+  script it came from.
+
 - **`$randomAlphaNumeric` is computed rather than left to be supplied**, as the
   one character Postman documents it to be. The `pm.variables.replaceIn` table
   is now read off the same list as plain placeholders, so the two can no longer

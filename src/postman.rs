@@ -1553,13 +1553,29 @@ fn note_losses(
     // assertion but a lost *order*: a collection whose scripts choose what runs
     // next does not do the same thing when it is run top to bottom, and the
     // requests themselves look perfectly correct while it happens.
-    for listen in ["prerequest", "test"] {
-        let script = script_text(events, listen);
+    // Read one event at a time rather than the concatenated script, so the note
+    // is filed against whoever actually wrote the call. `script_owner` can't
+    // help here: it asks whether the request has a script *at all*, and a
+    // request that carries its own assertions alongside an inherited jump would
+    // claim the folder's problem as its own — which is how one folder script
+    // produced eighteen identical notes on a real collection.
+    for e in events {
+        if e.listen != "prerequest" && e.listen != "test" {
+            continue;
+        }
+        let script = e
+            .script
+            .exec
+            .iter()
+            .map(|l| l.trim_end_matches('\r'))
+            .collect::<Vec<_>>()
+            .join("\n");
         if !script.contains("setNextRequest") {
             continue;
         }
+        let owner = e.inherited.then(|| e.owner.clone());
         for detail in next_request_fates(&script, title) {
-            push_note(out, title, owned_by(listen), detail);
+            push_note(out, title, owner.clone(), detail);
         }
     }
 }
@@ -5040,6 +5056,33 @@ mod script_tests {
             serde_json::to_string(script).unwrap()
         );
         convert_postman(&json).entries[0].asserts.clone()
+    }
+
+    /// The jump lives in the folder's script, but each request also carries a
+    /// test script of its own — so the "does this request have a script?"
+    /// question said the folder's problem belonged to every request under it.
+    /// On the collection this was found in, one folder script produced
+    /// eighteen identical notes.
+    #[test]
+    fn an_inherited_jump_is_reported_once_against_the_folder() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"F","event":[{"listen":"test","script":{"exec":[
+             "pm.execution.setNextRequest('poll');"]}}],
+           "item":[
+             {"name":"a","event":[{"listen":"test","script":{"exec":[
+                "pm.test('t', () => { pm.response.to.have.status(200); });"]}}],
+              "request":{"method":"GET","url":"https://h/a"}},
+             {"name":"b","event":[{"listen":"test","script":{"exec":[
+                "pm.test('t', () => { pm.response.to.have.status(200); });"]}}],
+              "request":{"method":"GET","url":"https://h/b"}}]}]}"#;
+        let c = convert_postman(json);
+        let jumps: Vec<&ConversionNote> = c
+            .notes
+            .iter()
+            .filter(|n| n.detail.contains("`poll`"))
+            .collect();
+        assert_eq!(jumps.len(), 1, "{:?}", c.notes);
+        assert_eq!(jumps[0].item, "F", "filed against the folder that wrote it");
     }
 
     fn next_request_notes(title: &str, script: &str) -> Vec<String> {
