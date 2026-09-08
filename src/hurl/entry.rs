@@ -888,16 +888,39 @@ pub(crate) fn parse_gen_marker(line: &str) -> Option<usize> {
 /// as the key, which contains spaces, `(` and `"` and so is refused. The two
 /// forms stay distinguishable even when a row is separated from its marker.
 ///
-/// The name is held to [`is_variable_name`], since its whole purpose is to be
-/// referenced as `{{name}}`.
+/// The name is *not* held to [`is_variable_name`]. Neither editor validates a
+/// generator name (the GUI adds a blank `("", "")` row on **+ Add**; the TUI
+/// wizard only trims), so a name the user is allowed to type — `api.key`, say —
+/// must still round-trip, or the whole block (every good row beside it) is lost
+/// on the next load. The reader therefore accepts exactly what the writer
+/// commits ([`gen_row_persistable`]): any non-blank name and expression. A name
+/// that Hurl would then truncate in a `{{…}}` placeholder is a real problem,
+/// but it is caught by [`crate::request::truncated_placeholders`] where it can
+/// be explained — not by silently deleting the block that carries it.
 pub(crate) fn parse_gen_row(line: &str) -> Option<(String, String)> {
     let rest = line.trim_start().strip_prefix('#')?.trim_start();
     let (name, expr) = rest.split_once('=')?;
     let (name, expr) = (name.trim(), expr.trim());
-    if !is_variable_name(name) || expr.is_empty() {
+    if !gen_row_persistable(name, expr) {
         return None;
     }
     Some((name.to_string(), expr.to_string()))
+}
+
+/// Whether a `(name, expression)` generator row can be written to a `.hurl`
+/// file and read back unchanged.
+///
+/// The one invariant that keeps a block alive across a save: the writer
+/// ([`to_hurl`](HurlEntry::to_hurl)) must never commit a row [`parse_gen_row`]
+/// would refuse, because the block is claimed all-or-nothing by its declared
+/// row count — one unreadable row and every good row beside it is discarded.
+/// A row is round-trippable when both halves carry text and the name holds no
+/// `=` (which the reader splits on) — so a half-typed `("", "")` is simply
+/// dropped, taking the block's row count down with it, rather than poisoning it.
+pub(crate) fn gen_row_persistable(name: &str, expr: &str) -> bool {
+    let name = name.trim();
+    let expr = expr.trim();
+    !name.is_empty() && !expr.is_empty() && !name.contains('=')
 }
 
 /// Write an authored body as the `# [Body]` block that carries it through a
@@ -1446,9 +1469,19 @@ impl HurlEntry {
         // row (see `parse_gen_row`). Written last so the block sits where
         // `title_block_top` already refuses to walk, which is what stops it
         // being absorbed as the *next* request's title.
-        if !self.generators.is_empty() {
-            out.push_str(&format!("# [Gen] {}\n", self.generators.len()));
-            for (name, expr) in &self.generators {
+        //
+        // Only rows that read back are written, and the count is of those — a
+        // half-typed `("", "")` row the editor left behind is dropped here
+        // rather than committed as a line `parse_gen_row` refuses, which would
+        // fail the count check and silently discard the whole block on load.
+        let writable: Vec<&(String, String)> = self
+            .generators
+            .iter()
+            .filter(|(name, expr)| gen_row_persistable(name, expr))
+            .collect();
+        if !writable.is_empty() {
+            out.push_str(&format!("# [Gen] {}\n", writable.len()));
+            for (name, expr) in writable {
                 out.push_str(&format!("# {name} = {expr}\n"));
             }
         }

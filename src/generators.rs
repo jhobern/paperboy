@@ -146,6 +146,20 @@ enum Expr {
 // raised after parsing, not parse failures. A combinator stack would add a
 // translation layer between its errors and those without removing any work.
 
+/// The deepest a `call(call(call(…)))` may nest before parsing gives up with a
+/// normal error.
+///
+/// Parsing, [`check`] and [`eval`] are all mutually recursive over nesting, on
+/// a stack of a few MiB, so a long enough line — a few thousand `concat(` —
+/// overflows it. A stack overflow is `SIGABRT`, not a panic: nothing catches
+/// it, the whole process (and, since [`check`] runs on every keystroke, the
+/// whole app) dies, and the "salvage what parses" recovery never runs. A limit
+/// here is the one choke point that protects all three, because neither `check`
+/// nor `eval` can be handed a tree the parser refused to build. The value is
+/// far below where the stack is at risk and far above any real signing
+/// expression (`base64(hmac_sha256(k, concat(a, b)))` is four deep).
+const MAX_DEPTH: usize = 256;
+
 struct Parser<'a> {
     rest: &'a str,
 }
@@ -164,7 +178,7 @@ impl<'a> Parser<'a> {
     /// mistake `hurl_core`'s own placeholder parser makes, and the one this
     /// whole feature exists to work around.
     fn parse_all(mut self) -> Result<Expr, String> {
-        let expr = self.expr()?;
+        let expr = self.expr(0)?;
         self.skip_space();
         if !self.rest.is_empty() {
             return Err(format!("unexpected `{}`", self.rest.trim()));
@@ -172,13 +186,20 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    fn expr(&mut self) -> Result<Expr, String> {
+    fn expr(&mut self, depth: usize) -> Result<Expr, String> {
+        // Bound the recursion before descending, so a hostile line is a normal
+        // error rather than a stack overflow (see [`MAX_DEPTH`]). `depth` counts
+        // *nesting*, not siblings: each argument of a call is parsed one level
+        // deeper, but the arguments of the same call are all at the same level.
+        if depth > MAX_DEPTH {
+            return Err("expression nests too deeply".to_string());
+        }
         self.skip_space();
         match self.rest.chars().next() {
             None => Err("expression is empty".to_string()),
             Some('"') => self.string(),
             Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            Some(c) if is_name_char(c) => self.ident_or_call(),
+            Some(c) if is_name_char(c) => self.ident_or_call(depth),
             Some(c) => Err(format!("unexpected `{c}`")),
         }
     }
@@ -222,7 +243,7 @@ impl<'a> Parser<'a> {
         Ok(Expr::Number(num.to_string()))
     }
 
-    fn ident_or_call(&mut self) -> Result<Expr, String> {
+    fn ident_or_call(&mut self, depth: usize) -> Result<Expr, String> {
         let end = self
             .rest
             .find(|c: char| !is_name_char(c))
@@ -245,7 +266,7 @@ impl<'a> Parser<'a> {
             });
         }
         loop {
-            args.push(self.expr()?);
+            args.push(self.expr(depth + 1)?);
             self.skip_space();
             match self.rest.chars().next() {
                 Some(',') => self.rest = &self.rest[1..],
@@ -272,16 +293,37 @@ fn is_name_char(c: char) -> bool {
 
 // ── The outside world ───────────────────────────────────────────────────
 
-/// The real clock, the real random source, and per-run counters.
+/// The real clock, the real random source, and the process's named counters.
+///
+/// `SystemSource` is deliberately cheap to build — a fresh one is made for
+/// almost every send, because the clock and the random source are stateless and
+/// re-reading them each time is exactly right. The counter is the exception: it
+/// must give "the next value of the named counter" *across* sends, or
+/// `counter("page")` returns `1` for ever and can never count a paginated
+/// crawl. So the counter state does not live on the instance — it lives in one
+/// process-wide table (`process_counters`) that every `SystemSource` shares.
+///
+/// Why a process global rather than session state: the value is a live
+/// sequence, not a setting. It must never reach `state.json` (it names no
+/// secret, but persisting it would make a reloaded session silently resume a
+/// half-finished crawl), and it wants to be shared by every collection open in
+/// the process, which a global is and a per-collection field is not. It resets
+/// on restart, which is the documented "starting at 1".
 #[derive(Default)]
-pub struct SystemSource {
-    counters: std::sync::Mutex<HashMap<String, u64>>,
-}
+pub struct SystemSource;
 
 impl SystemSource {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
+}
+
+/// The one table of named counters shared by every [`SystemSource`] in the
+/// process. In memory only, never serialised (see the type's own note).
+fn process_counters() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 impl GenSource for SystemSource {
@@ -298,7 +340,7 @@ impl GenSource for SystemSource {
     }
 
     fn counter(&self, name: &str) -> u64 {
-        let mut counters = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counters = process_counters().lock().unwrap_or_else(|e| e.into_inner());
         let next = counters.entry(name.to_string()).or_insert(0);
         *next += 1;
         *next
@@ -331,6 +373,14 @@ pub fn expand(
     let mut done: Vec<&str> = Vec::new();
 
     for (name, source) in rows {
+        // A wholly blank row is a row the editor is still waiting on, not a
+        // mistake — exactly as [`check`] treats it. The two must agree: `check`
+        // runs in the editor while `expand` runs on send, and a row `check`
+        // calls fine but `expand` rejects would make a request silently
+        // unsendable with a message that names no row.
+        if name.trim().is_empty() && source.trim().is_empty() {
+            continue;
+        }
         let expr = match Parser::new(source).parse_all() {
             Ok(e) => e,
             Err(detail) => {
@@ -516,9 +566,15 @@ fn call(
     };
     // A size or offset written into a request, so it is read strictly: a
     // silently clamped length makes a nonce shorter than the author asked for.
+    //
+    // The message names the argument rather than quoting its value: an argument
+    // here can be the resolved form of a secret (`random_hex(API_SECRET)`), and
+    // this text reaches the status bar, the CLI's stderr and CI logs — the one
+    // place in this feature that must never carry a secret in the clear (it is
+    // why the runner is handed `variables.secrets()`).
     let count = |s: &String| -> Result<usize, GenError> {
         s.parse::<usize>()
-            .map_err(|_| bad(format!("`{s}` is not a whole number")))
+            .map_err(|_| bad("the length must be a whole number".to_string()))
     };
 
     match function {
@@ -529,9 +585,18 @@ fn call(
                 None => 0,
                 Some(a) => a
                     .parse::<i64>()
-                    .map_err(|_| bad(format!("`{a}` is not a whole number of seconds")))?,
+                    .map_err(|_| bad("the offset must be a whole number of seconds".to_string()))?,
             };
-            Ok((src.now().0 + offset).to_string())
+            // Checked so a huge offset is a normal `BadArgument`, not a debug
+            // panic / release wraparound: the panic would land on the send
+            // thread, which then never clears `loading` and the UI spins for
+            // ever.
+            let stamp = src
+                .now()
+                .0
+                .checked_add(offset)
+                .ok_or_else(|| bad("the offset is too large".to_string()))?;
+            Ok(stamp.to_string())
         }
         "timestamp_ms" => {
             arity("0", args.is_empty())?;
@@ -560,10 +625,10 @@ fn call(
             arity("2", args.len() == 2)?;
             let lo = args[0]
                 .parse::<i64>()
-                .map_err(|_| bad(format!("`{}` is not a whole number", args[0])))?;
+                .map_err(|_| bad("the low bound must be a whole number".to_string()))?;
             let hi = args[1]
                 .parse::<i64>()
-                .map_err(|_| bad(format!("`{}` is not a whole number", args[1])))?;
+                .map_err(|_| bad("the high bound must be a whole number".to_string()))?;
             if lo > hi {
                 return Err(bad(format!("{lo} is greater than {hi}")));
             }
@@ -730,7 +795,7 @@ pub const FUNCTIONS: &[GenFunction] = &[
     },
     GenFunction {
         name: "counter",
-        signature: "counter()",
+        signature: "counter(name)",
         min_args: 1,
         max_args: Some(1),
     },
@@ -1548,6 +1613,27 @@ mod tests {
                 f.name,
                 f.signature
             );
+            // The signature is not just a label: both editors write it into the
+            // cell as the starting point for a call, so it has to *be* a call
+            // that `call` accepts. `counter()` used to advertise zero arguments
+            // while `min_args` was 1, so completing it wrote a bare `counter`
+            // that the next `check` rejected. Count the mandatory arguments the
+            // signature spells (the ones outside `[optional]` brackets) and hold
+            // them to `min_args`.
+            let inside = f
+                .signature
+                .split_once('(')
+                .and_then(|(_, rest)| rest.strip_suffix(')'))
+                .unwrap_or("");
+            let written = inside.split(',').filter(|a| !a.trim().is_empty()).count();
+            let optional = inside.matches('[').count();
+            assert!(
+                written.saturating_sub(optional) >= f.min_args,
+                "{}: the editors write `{}`, which `call` refuses — it wants {} argument(s)",
+                f.name,
+                f.signature,
+                f.min_args
+            );
             if f.min_args > 0 {
                 let e = call(f.name, &arg(f.min_args - 1), "row", &src)
                     .expect_err(&format!("{} accepted too few arguments", f.name));
@@ -1589,5 +1675,97 @@ mod tests {
             vec!["a", "b", "c"],
             "an unknown function, a wrong arity and a syntax error — no more: {found:?}"
         );
+    }
+
+    /// A wholly blank row is the same to [`check`] (the editor) and to
+    /// [`expand`] (the send): a row still being typed, ignored by both. When
+    /// they disagreed, the editor showed no fault while the send was refused by
+    /// a message that named no row.
+    #[test]
+    fn check_and_expand_agree_about_a_blank_row() {
+        let rows = vec![(String::new(), String::new())];
+        let found = check(&rows);
+        let mut vars = HashMap::new();
+        let raised = expand(&rows, &mut vars, &FakeSource::at(1_700_000_000));
+        assert_eq!(
+            found.len(),
+            raised.len(),
+            "check(): {found:?}\nexpand(): {raised:?}"
+        );
+        assert!(found.is_empty() && raised.is_empty());
+    }
+
+    /// Parsing, checking and evaluating are mutually recursive over nesting
+    /// depth. A long enough line must be a normal error, not the stack overflow
+    /// (a `SIGABRT` nothing catches) it used to be — [`check`] runs on every
+    /// keystroke, so a crafted or corrupted collection could otherwise kill the
+    /// app outright.
+    #[test]
+    fn deep_nesting_is_an_error_not_an_abort() {
+        let expr = format!("{}\"x\"{}", "concat(".repeat(4000), ")".repeat(4000));
+        let rows = vec![("a".to_string(), expr)];
+        let found = check(&rows);
+        assert!(
+            matches!(found.first(), Some(GenError::Syntax { .. })),
+            "deep nesting must be a syntax error: {found:?}"
+        );
+        // And the same on the send path, which shares the parser.
+        let mut vars = HashMap::new();
+        let raised = expand(&rows, &mut vars, &FakeSource::at(0));
+        assert!(matches!(raised.first(), Some(GenError::Syntax { .. })));
+    }
+
+    /// A `timestamp` offset that doesn't fit in the clock is a `BadArgument`,
+    /// like every other numeric argument — not a debug panic / release
+    /// wraparound. The panic used to land on the send thread, which then never
+    /// cleared `loading` and left the UI spinning.
+    #[test]
+    fn a_huge_timestamp_offset_is_an_error_not_a_panic() {
+        let rows = vec![("t".to_string(), format!("timestamp({})", i64::MAX))];
+        let mut vars = HashMap::new();
+        let errors = expand(&rows, &mut vars, &FakeSource::at(1_700_000_000));
+        assert!(
+            matches!(errors.first(), Some(GenError::BadArgument { .. })),
+            "{errors:?}"
+        );
+    }
+
+    /// Error text reaches the status bar, the CLI's stderr and CI logs, so it
+    /// must never quote a resolved argument: the arguments this feature handles
+    /// include secrets.
+    #[test]
+    fn an_error_message_never_quotes_a_secrets_value() {
+        let rows = vec![("n".to_string(), "random_hex(API_SECRET)".to_string())];
+        let mut vars = HashMap::new();
+        vars.insert("API_SECRET".to_string(), "hunter2-the-real-key".to_string());
+        let errors = expand(&rows, &mut vars, &FakeSource::at(0));
+        let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let said = crate::i18n::describe_gen_errors(&english, &errors).join("; ");
+        assert!(
+            !said.contains("hunter2-the-real-key"),
+            "the message quotes the secret it was given: {said}"
+        );
+    }
+
+    /// The signature both editors write into a cell has to be a call that
+    /// works: `counter()` advertised zero arguments while `call` wanted one.
+    #[test]
+    fn every_signature_in_the_table_is_a_call_that_works() {
+        for f in FUNCTIONS {
+            let inside = f
+                .signature
+                .split_once('(')
+                .and_then(|(_, rest)| rest.strip_suffix(')'))
+                .unwrap_or("");
+            let written = inside.split(',').filter(|a| !a.trim().is_empty()).count();
+            let optional = inside.matches('[').count();
+            assert!(
+                written.saturating_sub(optional) >= f.min_args,
+                "{}: the editors write `{}`, which `call` refuses — it wants {} argument(s)",
+                f.name,
+                f.signature,
+                f.min_args
+            );
+        }
     }
 }

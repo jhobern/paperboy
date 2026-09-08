@@ -958,12 +958,21 @@ impl Session {
         } else {
             Vec::new()
         };
+        // Same reasoning as collisions: only batch shares one value set, so
+        // only batch drops a generator that an environment value already binds.
+        let shadows = if self.run_all_batch_mode {
+            request::generator_env_shadows(col, env.as_ref())
+        } else {
+            Vec::new()
+        };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
         self.status = if !gen_errors.is_empty() {
             Some(Status::GeneratorErrors(gen_errors))
         } else if !collisions.is_empty() {
             Some(Status::GeneratorCollisions(collisions))
+        } else if !shadows.is_empty() {
+            Some(Status::GeneratorShadows(shadows))
         } else {
             (!undefined.is_empty()).then_some(Status::UndefinedVars {
                 keys: undefined,

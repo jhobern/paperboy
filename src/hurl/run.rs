@@ -179,6 +179,23 @@ pub fn run_hurl(
     RunOutput { entries, error }
 }
 
+/// The `variable:` `[Options]` a parsed Hurl entry declares, as `(name, value)`
+/// pairs — the defaults a `# [Gen]` block is allowed to read (see the streaming
+/// runner above). Placeholder-valued definitions are rendered as written; a
+/// literal like `SAMPLE_KEY=s3cret` comes back verbatim.
+fn entry_variable_defaults(entry: &hurl_core::ast::Entry) -> Vec<(String, String)> {
+    use hurl_core::ast::OptionKind;
+    entry
+        .request
+        .options()
+        .iter()
+        .filter_map(|opt| match &opt.kind {
+            OptionKind::Variable(def) => Some((def.name.clone(), def.value.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Like [`run_hurl`], but invokes `on_entry` immediately after each request
 /// finishes, instead of only returning once the whole collection has run — so a
 /// caller can stream results out as they happen — and gives `before_entry` a
@@ -230,10 +247,23 @@ pub fn run_hurl_streaming_with(
     let total = hurl_file.entries.len();
 
     for i in 1..=total {
-        let known: HashMap<String, String> = variables
+        let mut known: HashMap<String, String> = variables
             .iter()
             .map(|(k, v)| (k.clone(), v.value().to_string()))
             .collect();
+        // Layer this entry's own `[Options] variable:` rows in as defaults
+        // before the block is evaluated, so a generator can read a parameter
+        // the request declares — `sig = hmac_sha256(SAMPLE_KEY, "m")` with
+        // `[Options] variable: SAMPLE_KEY=…`. A single send does exactly this
+        // (`effective_vars_reporting` folds the defaults in first); without it
+        // the block was evaluated before Hurl applies the option, failed on the
+        // undefined name, and the request went out with a literal `{{sig}}`.
+        // Layered into a *copy* only, not into `variables`: the surviving option
+        // rows are still applied by Hurl during the run, and binding them here
+        // would leak a per-entry default into later entries.
+        for (name, value) in entry_variable_defaults(&hurl_file.entries[i - 1]) {
+            known.entry(name).or_insert(value);
+        }
         for (k, v) in before_entry(i - 1, &known) {
             variables.insert(k, Value::String(v));
         }
