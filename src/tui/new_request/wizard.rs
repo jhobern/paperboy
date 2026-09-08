@@ -384,7 +384,7 @@ impl WizardTab {
             WizardTab::Asserts => s.field_asserts,
             WizardTab::Captures => s.field_captures,
             WizardTab::Reports => s.field_reports,
-            WizardTab::Computed => s.field_computed,
+            WizardTab::Computed => s.field_generated,
         }
     }
 
@@ -2343,7 +2343,7 @@ fn all_section_empty_meta(
         6 => (s.field_asserts, s.add_assert, NewField::AddAssert),
         7 => (s.field_captures, s.add_capture, NewField::AddCapture),
         8 => (s.field_reports, s.add_report, NewField::AddReport),
-        9 => (s.field_computed, s.add_computed, NewField::AddComputed),
+        9 => (s.field_generated, s.add_generated, NewField::AddComputed),
         _ => (
             s.field_headers,
             s.add_header,
@@ -2367,7 +2367,7 @@ fn empty_section_add_col(s: &Strings) -> usize {
         s.field_asserts,
         s.field_captures,
         s.field_reports,
-        s.field_computed,
+        s.field_generated,
     ]
     .iter()
     .map(|l| Span::raw(*l).width())
@@ -3135,7 +3135,7 @@ fn draw_computed_section(
     // shown — the label is one line, and the rest follow as each is fixed.
     let faults = crate::generators::check(&form.generator_rows());
     match faults.first() {
-        None => draw_section_label(f, label, s.field_computed, focused, th),
+        None => draw_section_label(f, label, s.field_generated, focused, th),
         Some(fault) => {
             let (fg, bg) = section_label_colors(focused, th);
             let detail = crate::i18n::describe_gen_errors(s, std::slice::from_ref(fault))
@@ -3146,12 +3146,12 @@ fn draw_computed_section(
             // sentence ended mid-word and read as a *different*, shorter
             // complaint -- "unknown function" with the name it objects to cut
             // off. The ellipsis at least says there is more.
-            let room = (label.width as usize).saturating_sub(s.field_computed.chars().count() + 1);
+            let room = (label.width as usize).saturating_sub(s.field_generated.chars().count() + 1);
             let detail = crate::shared_utils::truncate_to_width(&detail, room);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!("{} ", s.field_computed),
+                        format!("{} ", s.field_generated),
                         Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(detail, Style::default().fg(th.err).bg(bg)),
@@ -4767,15 +4767,15 @@ pub(crate) fn draw_computed_table_with_hits(
 
     if let Some(hrect) = header_rect {
         let hcells = cell_rects(hrect);
-        f.render_widget(lbl(s.computed_name), hcells[0]);
+        f.render_widget(lbl(s.generated_name), hcells[0]);
         // The column header carries the way in to the function list: a cell
         // that completes what you type is no use to someone who does not know
         // there is anything to type, and this is the only place they are
         // already looking.
         let expr_label = if matches!(form.focus, NewField::Computed(_, CapCol::Expr)) {
-            s.computed_fn_hint
+            s.generated_fn_hint
         } else {
-            s.computed_expr
+            s.generated_expr
         };
         f.render_widget(lbl(expr_label), hcells[1]);
     }
@@ -4816,7 +4816,7 @@ pub(crate) fn draw_computed_table_with_hits(
     let add_focused = form.focus == NewField::AddComputed;
     f.render_widget(
         Paragraph::new(Span::styled(
-            s.add_computed.to_string(),
+            s.add_generated.to_string(),
             Style::default()
                 .fg(if add_focused { th.accent } else { th.dim })
                 .add_modifier(Modifier::BOLD),

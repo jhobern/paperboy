@@ -450,7 +450,7 @@ pub(crate) fn color_label(s: &crate::i18n::Strings, i: usize) -> &'static str {
         6 => s.theme_c_err,
         7 => s.theme_c_subst,
         8 => s.theme_c_pending,
-        9 => s.theme_c_computed,
+        9 => s.theme_c_generated,
         10 => s.theme_c_select_bg,
         11 => s.theme_c_select_fg,
         12 => s.theme_c_field,

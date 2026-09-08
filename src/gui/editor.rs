@@ -82,7 +82,7 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
-            (seen.computed, s.subst_hint_computed, th.computed),
+            (seen.computed, s.subst_hint_generated, th.computed),
         ] {
             if present {
                 ui.colored_label(color, format!("\u{25cf} {word}"));
@@ -603,7 +603,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 EditorSection::Computed,
                 format!(
                     "{}{}",
-                    st.gui_sec_computed,
+                    st.gui_sec_generated,
                     widgets::count_suffix(computed_n)
                 ),
             ),
@@ -866,7 +866,7 @@ fn section_title(section: EditorSection, s: &Strings) -> &'static str {
         EditorSection::Options => s.gui_sec_options,
         EditorSection::Asserts => s.gui_sec_asserts,
         EditorSection::Captures => s.gui_sec_captures,
-        EditorSection::Computed => s.gui_sec_computed,
+        EditorSection::Computed => s.gui_sec_generated,
         EditorSection::Code => s.gui_sec_code,
     }
 }
@@ -1262,7 +1262,7 @@ fn draw_section(
             }
         }
         EditorSection::Computed => {
-            ui.label(RichText::new(st.gui_computed_help).color(theme.dim));
+            ui.label(RichText::new(st.gui_generated_help).color(theme.dim));
             if widgets::computed_editor(ui, theme, st, req, &mut entry.generators) {
                 changed = true;
             }
@@ -2429,7 +2429,7 @@ mod computed_tests {
             out = painted(&full.shapes);
         }
         assert!(
-            out.iter().any(|t| t.contains(st.gui_sec_computed)),
+            out.iter().any(|t| t.contains(st.gui_sec_generated)),
             "expected the section tab, painted: {out:?}"
         );
         assert!(
@@ -2469,7 +2469,7 @@ mod computed_tests {
             out = painted(&full.shapes);
         }
         assert!(
-            out.iter().any(|t| t.contains(st.gui_computed_faults)),
+            out.iter().any(|t| t.contains(st.gui_generated_faults)),
             "expected the heading, painted: {out:?}"
         );
         assert!(
@@ -2512,7 +2512,7 @@ mod computed_tests {
             let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
             placed = placed_text(&full.shapes);
         }
-        let label = app.strings.gui_computed_fn_button;
+        let label = app.strings.gui_generated_fn_button;
         let menus: Vec<&(String, egui::Rect)> =
             placed.iter().filter(|(t, _)| t.contains(label)).collect();
         assert_eq!(menus.len(), 2, "one per row: {placed:?}");
@@ -2522,6 +2522,72 @@ mod computed_tests {
                 "{label} is off the right edge at {rect:?}"
             );
         }
+    }
+
+    /// The Insert button is drawn flush against the expression field so the
+    /// two read as one control. Floating free in the row it looked like a
+    /// separate command -- and a separate command beside a filled-in field
+    /// reads as one that replaces it, which this does not do.
+    #[test]
+    fn the_insert_button_touches_the_expression_field() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::from_fields("t", "GET", "http://h/a", vec![], "");
+        entry.generators = vec![("nonce".to_string(), "uuid".to_string())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut full = None;
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            full = Some(ctx.run_ui(input, |u| super::ui(&mut app, u)));
+        }
+        let full = full.unwrap();
+        let button = placed_text(&full.shapes)
+            .into_iter()
+            .find(|(t, _)| t.contains(app.strings.gui_generated_fn_button))
+            .expect("no Insert button")
+            .1;
+        // The expression field is the widest text-input background on the row
+        // the button sits on: fields are drawn with egui's `extreme_bg_color`.
+        let field = crate::gui::probe_test_support::fills(&full)
+            .into_iter()
+            .filter(|(r, _)| {
+                r.min.y < button.center().y
+                    && r.max.y > button.center().y
+                    && r.max.x <= button.min.x + 1.0
+            })
+            .max_by(|a, b| a.0.width().total_cmp(&b.0.width()))
+            .expect("no field on the button's row");
+        let (field_rect, field_bg) = field;
+        // The button's own background, not the label inside it: what has to sit
+        // against the field is the edge the eye sees.
+        let (button_rect, button_bg) = crate::gui::probe_test_support::fills(&full)
+            .into_iter()
+            .filter(|(r, _)| r.contains(button.center()))
+            .min_by(|a, b| a.0.area().total_cmp(&b.0.area()))
+            .expect("the button has no background");
+        let gap = button_rect.min.x - field_rect.max.x;
+        assert!(
+            (0.0..=8.0).contains(&gap),
+            "the button should sit against the field it belongs to, but the gap \
+             is {gap} (field {field_rect:?}, button {button_rect:?})"
+        );
+        // And it is painted in the field's colour rather than a button's, so
+        // the pair reads as one control.
+        assert_eq!(
+            button_bg, field_bg,
+            "the button should be painted in the field's colour"
+        );
     }
 
     /// A row whose name isn't a variable Hurl can resolve is dropped when the

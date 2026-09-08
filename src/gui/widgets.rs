@@ -876,8 +876,8 @@ pub fn computed_editor(
     ui.push_id(req.with("computed"), |ui| {
         table_rows(ui, |ui| {
             table_row(ui, |ui| {
-                sized_header(ui, theme, s.computed_name, key_w);
-                column_header(ui, theme, s.computed_expr);
+                sized_header(ui, theme, s.generated_name, key_w);
+                column_header(ui, theme, s.generated_expr);
             });
             for i in 0..rows.len() {
                 table_row(ui, |ui| {
@@ -908,7 +908,7 @@ pub fn computed_editor(
                         ui,
                         key_w,
                         &mut rows[i].0,
-                        s.computed_name,
+                        s.generated_name,
                         name_color,
                         egui::TextStyle::Body,
                         Some(name_id),
@@ -917,19 +917,44 @@ pub fn computed_editor(
                         changed = true;
                     }
                     if bad_name {
-                        k.on_hover_text(s.gui_computed_bad_name);
+                        k.on_hover_text(s.gui_generated_bad_name);
                     }
                     // Both buttons to the right are reserved before the field
                     // is sized: an infinite-width field laid out left to right
                     // claims the whole row and shoves them off the edge, and
                     // there is no horizontal scrollbar to get them back.
-                    let f_w = button_width(ui, s.gui_computed_fn_button);
-                    let val_w = (ui.available_width() - x_w - f_w - 24.0).max(40.0);
+                    let f_w = button_width(ui, s.gui_generated_fn_button);
+                    let val_w = (ui.available_width() - x_w - f_w - 16.0).max(40.0);
+                    // Closed up against the field, and painted in the field's
+                    // own colour rather than a button's, so the two read as one
+                    // control. The gap is restored before the delete button,
+                    // which *is* a separate command and should look like one.
+                    //
+                    // They cannot be made to touch exactly: a `TextEdit` paints
+                    // its frame inset from the rect it allocated, egui clamps a
+                    // negative item spacing away, and this row sits in a
+                    // container that sizes itself to its content -- so widening
+                    // the field to cover the difference just moves everything
+                    // along. Same colour, same height, minimum spacing is what
+                    // is achievable, and it is enough to read as one thing.
+                    //
+                    // Set *before* the field: egui applies the spacing that was
+                    // in force when the widget before the gap was placed, so
+                    // closing it after the field has been added does nothing.
+                    let gap = ui.spacing().item_spacing.x;
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    // The colour a `TextEdit` actually paints, which is not
+                    // `extreme_bg_color`: the theme gives fields their own,
+                    // lighter wash (see `GuiTheme::apply`).
+                    let field_bg = ui
+                        .visuals()
+                        .text_edit_bg_color
+                        .unwrap_or(ui.visuals().extreme_bg_color);
                     let field = wrapping_field_font_id(
                         ui,
                         val_w,
                         &mut rows[i].1,
-                        s.computed_expr,
+                        s.generated_expr,
                         theme.text,
                         egui::TextStyle::Monospace,
                         Some(expr_id),
@@ -937,6 +962,14 @@ pub fn computed_editor(
                     if field.changed() {
                         changed = true;
                     }
+                    // The button is drawn flush against the field's right edge
+                    // so the two read as one control -- the combobox idiom.
+                    // Floating free in the row it looked like a separate
+                    // command, and a separate command beside a filled-in field
+                    // reads as one that *replaces* it. It does not: it inserts
+                    // at the caret (see `write_call`), which is the useful
+                    // behaviour when the expression is a call inside a call.
+                    //
                     // Thirty-five functions is more than anyone will remember
                     // the spelling of, and the arguments are the whole reason
                     // to look one up. Chosen from the menu, one is written in
@@ -949,9 +982,10 @@ pub fn computed_editor(
                     // part of. `flat_buttons` + an explicit height is how every
                     // other control that shares a row with a field is drawn.
                     let menu = flat_buttons(ui, |ui| {
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = field_bg;
                         egui::containers::menu::MenuButton::from_button(
                             egui::Button::new(
-                                RichText::new(s.gui_computed_fn_button).color(theme.dim),
+                                RichText::new(s.gui_generated_fn_button).color(theme.dim),
                             )
                             .min_size(egui::vec2(f_w, row_h)),
                         )
@@ -1002,7 +1036,8 @@ pub fn computed_editor(
                         })
                         .0
                     });
-                    menu.on_hover_text(s.gui_computed_functions);
+                    menu.on_hover_text(s.gui_generated_functions);
+                    ui.spacing_mut().item_spacing.x = gap;
                     let hit = flat_buttons(ui, |ui| {
                         ui.add_sized(
                             [x_w, row_h],
@@ -1031,7 +1066,7 @@ pub fn computed_editor(
     if !faults.is_empty() {
         ui.add_space(6.0);
         ui.label(
-            RichText::new(s.gui_computed_faults)
+            RichText::new(s.gui_generated_faults)
                 .color(theme.err)
                 .strong(),
         );

@@ -84,7 +84,7 @@ strings! {
     theme_c_err => "Error", "Erreur", "Fejl";
     theme_c_subst => "Substitution", "Substitution", "Substitution";
     theme_c_pending => "Pending", "En attente", "Afventer";
-    theme_c_computed => "Computed", "Calculé", "Beregnet";
+    theme_c_generated => "Generated", "Généré", "Genereret";
     theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
     theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
     theme_c_field => "Field background", "Fond des champs", "Feltbaggrund";
@@ -249,7 +249,7 @@ strings! {
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
     field_reports => "Reports", "Rapports", "Rapporter";
-    field_computed => "Computed", "Calculé", "Beregnet";
+    field_generated => "Generated", "Généré", "Genereret";
     tab_all => "All", "Tout", "Alle";
     hdr_key => "Key", "Clé", "Nøgle";
     hdr_value => "Value", "Valeur", "Værdi";
@@ -286,14 +286,14 @@ strings! {
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
     add_report => "\u{FF0B} Add report field", "\u{FF0B} Ajouter un champ de rapport", "\u{FF0B} Tilføj rapportfelt";
-    add_computed => "\u{FF0B} Add computed value", "\u{FF0B} Ajouter une valeur calculée", "\u{FF0B} Tilføj beregnet værdi";
+    add_generated => "\u{FF0B} Add generated value", "\u{FF0B} Ajouter une valeur générée", "\u{FF0B} Tilføj genereret værdi";
     cap_name => "Name", "Nom", "Navn";
     cap_expr => "Expression", "Expression", "Udtryk";
     report_name => "Name", "Nom", "Navn";
     report_expr => "Expression", "Expression", "Udtryk";
-    computed_name => "Name", "Nom", "Navn";
-    computed_expr => "Expression", "Expression", "Udtryk";
-    computed_fn_hint => "Expression   (Enter lists the functions)", "Expression   (Entrée affiche les fonctions)", "Udtryk   (Enter viser funktionerne)";
+    generated_name => "Name", "Nom", "Navn";
+    generated_expr => "Expression", "Expression", "Udtryk";
+    generated_fn_hint => "Expression   (Enter lists the functions)", "Expression   (Entrée affiche les fonctions)", "Udtryk   (Enter viser funktionerne)";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
@@ -428,7 +428,7 @@ strings! {
     subst_hint_loading => "loading", "en cours", "indlæser";
     subst_hint_missing => "missing", "manquant", "mangler";
     subst_hint_undefined => "undefined", "non défini", "udefineret";
-    subst_hint_computed => "computed", "calculé", "beregnet";
+    subst_hint_generated => "generated", "généré", "genereret";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
     env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
@@ -893,7 +893,7 @@ strings! {
     gui_sec_cookies => "Cookies", "Cookies", "Cookies";
     gui_sec_options => "Options", "Options", "Indstillinger";
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
-    gui_sec_computed => "Computed", "Calculé", "Beregnet";
+    gui_sec_generated => "Generated", "Généré", "Genereret";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
     // The two representations the Raw Request view can show. Both are format
@@ -912,7 +912,7 @@ strings! {
     truncated_placeholder_hint => "Hurl variable names allow only letters, digits, _ and -", "Les noms de variables Hurl n'acceptent que lettres, chiffres, _ et -", "Hurl-variabelnavne tillader kun bogstaver, cifre, _ og -";
     // The `# [Gen]` block. Each message names the row it belongs to, because a
     // request may declare several and "one of them is wrong" is not a report.
-    gen_status => "⚠ Computed values not set:", "⚠ Valeurs calculées non définies :", "⚠ Beregnede værdier ikke angivet:";
+    gen_status => "⚠ Generated values not set:", "⚠ Valeurs générées non définies :", "⚠ Genererede værdier ikke angivet:";
     gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
     gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
     gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
@@ -925,8 +925,8 @@ strings! {
     // the two titles would make the line twice as long.
     gen_collision => "⚠ Both requests compute {name} — in one batch they share the first value", "⚠ Les deux requêtes calculent {name} — dans un même lot elles partagent la première valeur", "⚠ Begge anmodninger beregner {name} — i én batch deler de den første værdi";
     cli_gen_collision => "more than one request computes {name}: in --batch they share the first value (drop --batch to give each its own)", "plusieurs requêtes calculent {name} : avec --batch elles partagent la première valeur (retirez --batch pour que chacune ait la sienne)", "flere anmodninger beregner {name}: med --batch deler de den første værdi (fjern --batch for at give hver sin egen)";
-    gen_shadow => "⚠ {name} is set by the environment — in one batch the computed value is not used", "⚠ {name} est défini par l'environnement — dans un même lot la valeur calculée n'est pas utilisée", "⚠ {name} er sat af miljøet — i én batch bruges den beregnede værdi ikke";
-    cli_gen_shadow => "{name} is set by the environment: in --batch the computed value is not used (drop --batch to let it override from its request on)", "{name} est défini par l'environnement : avec --batch la valeur calculée n'est pas utilisée (retirez --batch pour qu'elle prenne effet à partir de sa requête)", "{name} er sat af miljøet: med --batch bruges den beregnede værdi ikke (fjern --batch for at lade den tage over fra sin anmodning)";
+    gen_shadow => "⚠ {name} is set by the environment — in one batch the generated value is not used", "⚠ {name} est défini par l'environnement — dans un même lot la valeur générée n'est pas utilisée", "⚠ {name} er sat af miljøet — i én batch bruges den genererede værdi ikke";
+    cli_gen_shadow => "{name} is set by the environment: in --batch the generated value is not used (drop --batch to let it override from its request on)", "{name} est défini par l'environnement : avec --batch la valeur générée n'est pas utilisée (retirez --batch pour qu'elle prenne effet à partir de sa requête)", "{name} er sat af miljøet: med --batch bruges den genererede værdi ikke (fjern --batch for at lade den tage over fra sin anmodning)";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -956,11 +956,11 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
-    gui_computed_functions => "Insert a function", "Insérer une fonction", "Indsæt en funktion";
-    gui_computed_fn_button => "Function…", "Fonction…", "Funktion…";
-    gui_computed_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
-    gui_computed_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
-    gui_computed_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs calculées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der beregnes hver gang anmodningen sendes, brugt som {{ name }}";
+    gui_generated_functions => "Insert a function call where the caret is", "Insère un appel de fonction à l'emplacement du curseur", "Indsætter et funktionskald hvor markøren står";
+    gui_generated_fn_button => "\u{192} Insert…", "\u{192} Insérer…", "\u{192} Indsæt…";
+    gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
+    gui_generated_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
+    gui_generated_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs générées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der genereres hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
     gui_add_assert => "+ Add assert", "+ Ajouter une assertion", "+ Tilføj assertion";
     gui_add_field => "+ Add field", "+ Ajouter un champ", "+ Tilføj felt";

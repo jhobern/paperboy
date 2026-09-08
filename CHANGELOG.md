@@ -204,6 +204,24 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   when it closed. Nesting is still unlimited, and requests still run in the
   file's order regardless of how the tree is folded.
 
+### Changed
+
+- **One word for the feature: "Generated".** The file marker has always been
+  `# [Gen]`, the module is `generators.rs` and the errors are `GenError`, but
+  the screen said *Computed* — so the thing you read about in the README and
+  the thing you clicked on had different names. The user-facing wording is now
+  *Generated* throughout (section tab, the ＋ button, the substitution legend,
+  the theme colour), in all three languages. The marker in the file is
+  unchanged, so existing `.hurl` files are unaffected.
+
+- **The function menu says what it does, and sits where it acts.** The button
+  beside an expression was labelled `Function…` and floated in the middle of
+  the row, which reads as a command that *replaces* the field. It doesn't: it
+  inserts at the caret, which is what makes it useful while building a call
+  inside a call. It is now `ƒ Insert…`, drawn against the field in the field's
+  own colour so the two read as one control, and its hover text says the
+  insertion happens where the caret is.
+
 ### Fixed
 
 - **A folder's requests are drawn under that folder.** A `.hurl` file is free to

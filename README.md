@@ -118,9 +118,9 @@ cargo test                          # add --features gui for the GUI's tests
   collection, loops over environments or data, and writes CSV/JSON/HTML/XLSX.
   Editable as text or as [blocks](#the-papertrail-block-editor); runnable from
   the UI or [headlessly](#reports).
-- **Computed value** — a `# [Gen]` row: an expression evaluated just before a
+- **Generated value** — a `# [Gen]` row: an expression evaluated just before a
   request is sent, supplying the nonces, timestamps and signatures a pre-request
-  script used to. See [Computed values](#computed-values).
+  script used to. See [Generated values](#generated-values).
 - **Scratch Space** — tab 0. A collection with no file behind it until you save
   it.
 - **Request names encode folders.** `Auth/Tokens/Refresh` browses as a folder
@@ -160,7 +160,7 @@ In the request wizard:
 
 | Key | Action |
 |---|---|
-| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Queries│Options│Form│Body│Asserts│Captures│Reports│Computed`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
+| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Queries│Options│Form│Body│Asserts│Captures│Reports│Generated`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
 | `Alt+1`–`9`, `Alt+0` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
 | `Ctrl+↑`/`↓` | Previous / next section |
 | `Ctrl+D` / `Ctrl+E` | Delete a row / toggle its enabled checkbox |
@@ -313,7 +313,7 @@ A variable that is *defined but empty* is not undefined and warns about nothing
 — it substitutes as an empty string. With Basic Auth that produces a
 well-formed request that comes back `401`.
 
-## Computed values
+## Generated values
 
 Some values can't be written down: a nonce, a timestamp, an HMAC over the two.
 Postman uses a pre-request script; PaperBoy uses a `# [Gen]` block of named
@@ -376,15 +376,15 @@ time it is evaluated and keeps going for as long as PaperBoy is open, so sending
 the same request three times gives 1, 2, 3. It is a sequence, not a setting, and
 is not saved — a restarted PaperBoy counts from 1 again.
 
-Edit the block in the request wizard's **Computed** section (`Alt+0`), in the
-GUI editor's **Computed** tab, or as text. Both editors offer the functions as
+Edit the block in the request wizard's **Generated** section (`Alt+0`), in the
+GUI editor's **Generated** tab, or as text. Both editors offer the functions as
 you type — with their arguments named — and the GUI's **Function…** menu lists
 them all; either way the call is written at the caret, over any part-typed
 name, with the caret left between the brackets. Both say what is wrong with a
 row while
 it is still a typo rather than leaving it to be a 401: an unknown function, the
 wrong number of arguments, an expression that doesn't parse. Placeholders that a
-generator will fill render in the theme's *computed* colour and keep their
+generator will fill render in the theme's *generated* colour and keep their
 braces, because the value doesn't exist yet.
 
 | | |
@@ -534,13 +534,13 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 - `pm.<store>.set("NAME", body.a.b)` calls in test scripts, as `[Captures]`.
 - **Dynamic variables.** `{{$guid}}` and `{{$isoTimestamp}}` become Hurl's own
   `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}`, `{{$randomInt}}` and
-  `{{$randomAlphaNumeric}}` become [computed values](#computed-values). The rest
+  `{{$randomAlphaNumeric}}` become [generated values](#generated-values). The rest
   are listed as values to supply.
 - **Pre-request scripts**, as far as they reduce to values PaperBoy can compute:
   `pm.environment.set("id", uuid.v4())`, `Date.now()`,
   `Math.floor(Date.now() / 1000)`, `new Date().toISOString()`,
   `pm.variables.replaceIn("{{$guid}}")` and literals become
-  [computed values](#computed-values).
+  [generated values](#generated-values).
 - **Test scripts**, as the status and assertions they always make:
   `pm.response.to.have.status(400)` becomes the request's expected status, and
   `pm.expect(...)` checks on the body, headers and response time become
