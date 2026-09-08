@@ -46,6 +46,17 @@ pub(crate) struct ProbeBuilder {
     /// Text selected in the body when the dialog opened — the only possible
     /// literal for a `body contains` on a reply that isn't JSON.
     pub(super) selection: Option<String>,
+    /// Which row of the value list is picked out, as an index into
+    /// [`Self::visible`]. Picking and *acting* are separate: a list where the
+    /// first click commits gives no way to look at a row before choosing it,
+    /// and no way to change your mind.
+    pub(super) selected: usize,
+    /// The same for the verb list.
+    pub(super) selected_verb: usize,
+    /// The subject the response body is currently highlighting. Kept so the
+    /// highlight is written only when it changes: rewriting the field's
+    /// selection every frame would fight anything else that touches it.
+    pub(super) highlighted: Option<Subject>,
 }
 
 impl ProbeBuilder {
@@ -108,6 +119,9 @@ pub(super) fn open(app: &mut GuiApp, ctx: &egui::Context, pointed_at: Option<Pro
         capture_name: None,
         name_required: false,
         selection: selection.clone(),
+        selected: 0,
+        selected_verb: 0,
+        highlighted: None,
     };
     if let Some(probe) = pointed_at {
         builder.verbs = probe::verbs_for(&probe, selection.as_deref());
@@ -233,6 +247,120 @@ fn line_col_to_flat(text: &str, target_line: usize, target_col: usize) -> usize 
         offset += line.chars().count() + 1;
     }
     offset
+}
+
+/// The raw body of the response the builder was opened on.
+fn builder_body(app: &GuiApp) -> Option<std::sync::Arc<str>> {
+    app.session
+        .collections
+        .get(app.active_ci())
+        .and_then(|c| c.entries.get(c.selected_entry))
+        .and_then(|e| e.last_response.as_ref())
+        .map(|r| r.body.clone())
+}
+
+/// Show, in the response body itself, which value the builder is talking about.
+///
+/// A dialog naming `$.data[0].token` beside a body holding six plausible tokens
+/// is a puzzle the user has to solve by reading. Highlighting is done by
+/// setting the body field's own selection rather than painting over it, so the
+/// highlight is a real selection: Ctrl+C copies exactly the value being
+/// asserted on, which is the thing anyone looking at it wants next.
+///
+/// A no-op for subjects that are not written in the body (the status, a
+/// header, the body as a whole) and while the value is off in a part of the
+/// text the compact view rewrites beyond recognition.
+pub(super) fn highlight(app: &GuiApp, ctx: &egui::Context, subject: &Subject) {
+    let Some(body) = builder_body(app) else {
+        return;
+    };
+    let Some(range) = value_char_range(&body, subject, app.response_compact) else {
+        return;
+    };
+    let id = body_field_id(app);
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
+        return;
+    };
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(range.0),
+            egui::text::CCursor::new(range.1),
+        )));
+    state.store(ctx, id);
+}
+
+/// The char range of `subject`'s value *as the body field currently shows it* —
+/// which is the compacted text when Compact is on, so the range has to be
+/// mapped through the same compaction map the selection reader uses in reverse.
+fn value_char_range(body: &str, subject: &Subject, compact: bool) -> Option<(usize, usize)> {
+    let span = probe::span_of(body, subject)?;
+    let start = body[..span.start].chars().count();
+    let end = start + body[span.clone()].chars().count();
+    if !compact {
+        return Some((start, end));
+    }
+    let (compacted, maps) = crate::shared_utils::compact_long_strings_mapped(body);
+    Some((
+        raw_to_compacted_offset(&compacted, &maps, body, start),
+        raw_to_compacted_offset(&compacted, &maps, body, end),
+    ))
+}
+
+/// The inverse of [`compacted_to_raw_offset`]: a flat char offset into the raw
+/// body, as one into the compacted view. A raw position inside an elided run
+/// maps to the compacted position that run was shortened to, so a highlight
+/// over a shortened literal covers the whole of what is shown of it.
+fn raw_to_compacted_offset(compacted: &str, maps: &[Vec<usize>], raw: &str, pos: usize) -> usize {
+    let (line, col) = flat_to_line_col(raw, pos);
+    let compact_col = match maps.get(line) {
+        Some(map) if !map.is_empty() => {
+            // The map is ascending (compacted column -> raw column), so the
+            // last entry at or before this raw column is where it now sits.
+            map.iter()
+                .rposition(|raw_col| *raw_col <= col)
+                .unwrap_or(map.len() - 1)
+        }
+        _ => col,
+    };
+    line_col_to_flat(compacted, line, compact_col)
+}
+
+/// The exact text of the value a probe is about, for copying: the raw bytes as
+/// the server wrote them for anything in the body, and the observed value
+/// otherwise.
+///
+/// The raw slice rather than a re-serialised value because "copy this section"
+/// means the section on screen — the same quoting, the same number spelling,
+/// the same key order.
+pub(super) fn value_text(app: &GuiApp, probe: &Probe) -> Option<String> {
+    match builder_body(app) {
+        Some(body) => raw_value_text(&body, probe),
+        None => plain_value_text(probe),
+    }
+}
+
+/// [`value_text`] against a body already in hand — the response panel's own
+/// closures hold it, and re-reading it through the app would need a second
+/// borrow of something they have already borrowed.
+pub(super) fn raw_value_text(body: &str, probe: &Probe) -> Option<String> {
+    if let Some(span) = probe::span_of(body, &probe.subject) {
+        return Some(body[span].to_string());
+    }
+    if matches!(probe.subject, Subject::Body) {
+        return Some(body.to_string());
+    }
+    plain_value_text(probe)
+}
+
+/// A subject with nothing in the body to point at -- a header, the status --
+/// copies the value that was observed. A string copies unquoted: what is wanted
+/// on the clipboard is the token, not a JSON literal of it.
+fn plain_value_text(probe: &Probe) -> Option<String> {
+    match probe.value.as_ref()? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        v => Some(v.to_string()),
+    }
 }
 
 /// The value the caret (or the start of the selection) sits on in the response
@@ -437,6 +565,9 @@ mod tests {
             capture_name: None,
             name_required: false,
             selection: None,
+            selected: 0,
+            selected_verb: 0,
+            highlighted: None,
         }
     }
 

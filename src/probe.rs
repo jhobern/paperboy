@@ -765,6 +765,46 @@ impl Scan<'_> {
     }
 }
 
+/// Where in the raw body the value at `path` is written — the reverse of
+/// [`probe_at`].
+///
+/// Pointing at a value gives you a path; showing which value a path *means*
+/// gives it back. A builder that names `$.data[0].token` and a body on screen
+/// holding six plausible tokens is a puzzle the user has to solve by reading;
+/// with the span, the front-end can simply highlight the one it is talking
+/// about (and offer to copy exactly those bytes).
+///
+/// Both spans a scan records for a field — the key and the value — carry the
+/// same path, because clicking either is how people point at a field. Here the
+/// *value* is wanted: highlighting the name would say the assert is about the
+/// name. It is the last one recorded for the path, since a value's span is
+/// pushed after everything inside it.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn span_of(body: &str, subject: &Subject) -> Option<Range<usize>> {
+    let wanted = match subject {
+        Subject::Json(p) | Subject::JsonCount(p) => p,
+        // A header or the status is not written in the body at all, and the
+        // whole body needs no highlight to find it.
+        _ => return None,
+    };
+    // Parsed first for the same reason `probe_at` does it: the hand scan is a
+    // span map, not a validator, and it will happily map the first token of
+    // something that is not JSON at all.
+    serde_json::from_str::<Value>(body).ok()?;
+    let mut spans: Vec<(Range<usize>, String)> = Vec::new();
+    let mut scan = Scan {
+        s: body.as_bytes(),
+        i: 0,
+    };
+    scan.ws();
+    scan.value(&mut String::from("$"), 0, &mut spans)?;
+    spans
+        .into_iter()
+        .filter(|(_, p)| p == wanted)
+        .next_back()
+        .map(|(r, _)| r)
+}
+
 /// The verbs worth offering for a subject.
 ///
 /// `selection` is the text highlighted in the response panel, which is the only
@@ -868,6 +908,66 @@ mod tests {
                 other => other.query(),
             })
             .collect()
+    }
+
+    /// The span is the *value*, not the key that names it: highlighting the
+    /// name would say the assert is about the name.
+    #[test]
+    fn a_path_points_back_at_the_bytes_it_came_from() {
+        let body = r#"{"status":"ok","token":"abc","n":[1,2]}"#;
+        let at = |path: &str| {
+            let r = span_of(body, &Subject::Json(path.to_string())).expect(path);
+            body[r].to_string()
+        };
+        assert_eq!(at("$.token"), r#""abc""#);
+        assert_eq!(at("$.status"), r#""ok""#);
+        assert_eq!(at("$.n[1]"), "2");
+        assert_eq!(
+            span_of(body, &Subject::JsonCount("$.n".into())).map(|r| body[r].to_string()),
+            Some("[1,2]".to_string())
+        );
+        assert_eq!(span_of(body, &Subject::Json("$.nope".into())), None);
+        // A subject that is not written in the body has no span to give.
+        assert_eq!(span_of(body, &Subject::Header("X".into())), None);
+        assert_eq!(span_of(body, &Subject::Status), None);
+        assert_eq!(span_of("not json", &Subject::Json("$".into())), None);
+    }
+
+    /// Pointing at a value and asking where it is are two halves of one map,
+    /// so every offset in a span must resolve back to the path it came from.
+    #[test]
+    fn the_span_and_the_offset_agree_with_each_other() {
+        let body = r#"{"a":{"b":[{"c":"x"}]},"d":12}"#;
+        for path in ["$.a.b[0].c", "$.d", "$.a"] {
+            let subject = Subject::Json(path.to_string());
+            let span = span_of(body, &subject).expect(path);
+            let back = probe_at(body, span.start).expect(path);
+            let back = match back.subject {
+                Subject::Json(p) | Subject::JsonCount(p) => p,
+                other => other.query(),
+            };
+            assert_eq!(back, path);
+        }
+    }
+
+    /// A key holding a quote or a dot is bracket-quoted in the path; the
+    /// reverse lookup has to spell it the same way or the highlight lands
+    /// nowhere.
+    #[test]
+    fn an_awkward_key_still_maps_back_to_its_value() {
+        let body = r#"{"a.b":1,"c\"d":2}"#;
+        let mut p1 = "$".to_string();
+        push_key(&mut p1, "a.b");
+        let mut p2 = "$".to_string();
+        push_key(&mut p2, "c\"d");
+        assert_eq!(
+            span_of(body, &Subject::Json(p1)).map(|r| body[r].to_string()),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            span_of(body, &Subject::Json(p2)).map(|r| body[r].to_string()),
+            Some("2".to_string())
+        );
     }
 
     #[test]

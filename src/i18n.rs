@@ -776,7 +776,7 @@ strings! {
     probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
     probe_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
-    probe_verb_capture => "keep it in a variable…", "le garder dans une variable…", "gem det i en variabel…";
+    probe_verb_capture => "capture it into a variable for later requests…", "le capturer dans une variable pour les requêtes suivantes…", "opsaml det i en variabel til senere forespørgsler…";
     probe_verb_unavailable => "(not expressible in Hurl)", "(inexprimable en Hurl)", "(kan ikke udtrykkes i Hurl)";
     probe_capture_name_title => "Variable name", "Nom de la variable", "Variabelnavn";
     probe_assert_added => "Assert added:", "Vérification ajoutée :", "Kontrol tilføjet:";
@@ -792,6 +792,17 @@ strings! {
     gui_probe_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
     gui_probe_back => "‹ Back", "‹ Retour", "‹ Tilbage";
     gui_probe_add => "Add", "Ajouter", "Tilføj";
+    gui_probe_step_subject => "1. Pick a value from the response", "1. Choisissez une valeur de la réponse", "1. Vælg en værdi fra svaret";
+    gui_probe_step_subject_hint => "The value you pick is highlighted in the response below.", "La valeur choisie est mise en évidence dans la réponse ci-dessous.", "Den valgte værdi fremhæves i svaret nedenfor.";
+    gui_probe_step_verb => "2. Say what should be true about it", "2. Indiquez ce qui doit être vrai à son sujet", "2. Angiv hvad der skal gælde for den";
+    gui_probe_step_verb_hint => "The line you pick is written to this request, and checked every time it runs.", "La ligne choisie est écrite dans cette requête et vérifiée à chaque exécution.", "Den valgte linje skrives til denne forespørgsel og kontrolleres ved hver kørsel.";
+    gui_probe_step_name => "3. Name the variable", "3. Nommez la variable", "3. Navngiv variablen";
+    gui_probe_step_name_hint => "A [Captures] row stores this value when the request runs. Later requests use it as a placeholder.", "Une ligne [Captures] enregistre cette valeur lors de l’exécution. Les requêtes suivantes l’utilisent comme espace réservé.", "En [Captures]-række gemmer værdien, når forespørgslen kører. Senere forespørgsler bruger den som pladsholder.";
+    gui_probe_selected => "Selected", "Sélection", "Valgt";
+    gui_probe_copy_value => "Copy value", "Copier la valeur", "Kopiér værdi";
+    gui_probe_copy_value_hint => "Copy exactly this value from the response", "Copier exactement cette valeur de la réponse", "Kopiér præcis denne værdi fra svaret";
+    gui_probe_next => "Next ›", "Suivant ›", "Næste ›";
+    gui_probe_copy_this => "Copy this value", "Copier cette valeur", "Kopiér denne værdi";
     gui_probe_filter_hint => "filter by name or value", "filtrer par nom ou valeur", "filtrér efter navn eller værdi";
     gui_probe_name_required => "Name the variable before adding it.", "Nommez la variable avant de l'ajouter.", "Navngiv variablen, før du tilføjer den.";
     report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";

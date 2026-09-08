@@ -55,6 +55,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_probe,
         lbl_probe_hint,
         lbl_probe_this,
+        lbl_copy_this,
     ) = {
         let s = &app.strings;
         (
@@ -75,6 +76,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_probe_button,
             s.gui_probe_button_hint,
             s.gui_probe_assert_this,
+            s.gui_probe_copy_this,
         )
     };
 
@@ -114,6 +116,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // panel's closures have released their borrow of the app: `Some(None)`
     // opens the builder on the whole list, `Some(Some(probe))` on one value.
     let mut open_probe: Option<Option<crate::probe::Probe>> = None;
+    // Set by "Copy this value": the status line is written after the panel's
+    // closures have released their borrow of the app.
+    let mut copied = false;
     // Clone the `Arc`, not the bytes: the context-menu closure below only needs
     // to borrow the body on a right-click, but this line runs on every repaint.
     // `body.to_string()` here was a full-body memcpy per frame on large replies.
@@ -134,11 +139,25 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             );
         } else if status > 0 {
             let col = status_color(&theme, status);
-            ui.label(
+            let line = ui.label(
                 RichText::new(format!("{status} {status_text}"))
                     .strong()
                     .color(col),
             );
+            // The status is the only subject with nothing in the body to aim
+            // at, so without this the sole way to assert on it is to find it at
+            // the top of the builder's list — which nobody looking straight at
+            // "200 OK" thinks to do. Right-clicking what you mean works here
+            // exactly as it does on a header row or a body value.
+            line.context_menu(|ui| {
+                if ui.button(lbl_probe_this).clicked() {
+                    open_probe = Some(Some(crate::probe::Probe {
+                        subject: crate::probe::Subject::Status,
+                        value: Some(serde_json::Value::from(status)),
+                    }));
+                    ui.close();
+                }
+            });
         } else {
             ui.colored_label(theme.dim, lbl_no_response);
         }
@@ -248,6 +267,23 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             ));
                             ui.close();
                         }
+                        // Isolating the value under the caret is what the
+                        // assert builder already does; copying it is the other
+                        // thing anyone who has just isolated a value wants, and
+                        // hand-selecting a token out of a minified body is
+                        // exactly the fiddly job this avoids. Copies the raw
+                        // bytes, so a compacted view still yields the real
+                        // value rather than the shortened one on screen.
+                        if ui.button(lbl_copy_this).clicked() {
+                            if let Some(text) =
+                                super::probe::pointed_in(ui.ctx(), &raw_body, compact, body_id)
+                                    .and_then(|p| super::probe::raw_value_text(&raw_body, &p))
+                            {
+                                ui.ctx().copy_text(text);
+                                copied = true;
+                            }
+                            ui.close();
+                        }
                     });
                 }
             }
@@ -313,6 +349,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
 
     if let Some(pointed) = open_probe {
         super::probe::open(app, ui.ctx(), pointed);
+    }
+    if copied {
+        app.session.status = Some(crate::i18n::Status::Copied);
     }
 }
 
@@ -408,6 +447,37 @@ mod probe_route_tests {
             "no Assert… button on a reply with no body, though it has {} subjects",
             subjects.len()
         );
+    }
+
+    /// The status has no text in the body to aim at, so the status line itself
+    /// is the thing to right-click. Without this the only route to `HTTP 201`
+    /// is the top row of the builder's list, which is not where anyone reading
+    /// "201 Created" looks.
+    #[test]
+    fn the_status_line_opens_the_builder_on_the_status() {
+        let mut app = app_with(r#"{"a":1}"#, vec![], 201);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let line = centre_of(&painted, "201");
+        let (press, release) = click_events(line, egui::PointerButton::Secondary);
+        panel_frame(&mut app, &ctx, press);
+        let mut painted = panel_frame(&mut app, &ctx, release);
+        for _ in 0..3 {
+            painted = panel_frame(&mut app, &ctx, vec![]);
+        }
+        let item = centre_of(&painted, app.strings.gui_probe_assert_this);
+        let (press, release) = click_events(item, egui::PointerButton::Primary);
+        panel_frame(&mut app, &ctx, press);
+        panel_frame(&mut app, &ctx, release);
+        panel_frame(&mut app, &ctx, vec![]);
+        match &app.dialog {
+            Some(Dialog::ProbeBuilder(b)) => {
+                let chosen = b.chosen.as_ref().expect("no subject chosen");
+                assert_eq!(crate::probe::subject_label(&chosen.subject), "status");
+            }
+            _ => panic!("right-clicking the status line did not open the builder"),
+        }
     }
 
     /// The headers section has no Assert… button, but its rows are
