@@ -12,6 +12,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A computed value outlives the request that computed it.** A `# [Gen]` block
+  is PaperBoy's pre-request script, and the point of signing a request with a
+  `nonce` is usually that the *next* request quotes it back. Until now the
+  block's results were used for the one send and thrown away, so the second
+  request had nothing to substitute. They now go back into the collection
+  alongside `[Captures]` values, which is what makes "run the next one on its
+  own" work. Still memory only — a computed value can be an HMAC of a secret,
+  and is in any case good for about one request — so nothing new reaches
+  `state.json`.
+
+### Fixed
+
+- **"Run All" ignored `# [Gen]` blocks entirely.** A collection whose requests
+  signed themselves ran correctly one request at a time and sent a literal
+  `{{sig}}` when run as a whole, which comes back as an unexplained 401. Run
+  All now evaluates each block the same way the headless runner does.
+
+- **A batch run silently gave two requests one nonce.** Batch is a single Hurl
+  call over the whole file, so it has one variable set: where two requests each
+  compute a `nonce`, they share the first one's value and the second request's
+  signature is computed over the wrong input. Nothing said so. Both front-ends
+  now name the colliding rows before starting a batch Run All, and `--batch`
+  prints the same warning — pointing out that a streaming run gives each
+  request its own.
+
 - **Asserts and captures built from the response you just got.** Every API
   client but this one lets you look at a reply and say "check that next time";
   PaperBoy made you read the jsonpath off the screen and type it back into the

@@ -949,10 +949,21 @@ impl Session {
             return Vec::new();
         }
         let gen_errors = request::generator_problems_all(col, env.as_ref());
+        // Only batch shares one variable set across the file, so only batch
+        // turns two requests computing the same name into one value for both.
+        // Reported, not refused: sharing is occasionally what was meant, and
+        // the run is about to happen either way.
+        let collisions = if self.run_all_batch_mode {
+            request::generator_collisions(col)
+        } else {
+            Vec::new()
+        };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
         self.status = if !gen_errors.is_empty() {
             Some(Status::GeneratorErrors(gen_errors))
+        } else if !collisions.is_empty() {
+            Some(Status::GeneratorCollisions(collisions))
         } else {
             (!undefined.is_empty()).then_some(Status::UndefinedVars {
                 keys: undefined,

@@ -442,6 +442,7 @@ fn sanitise(s: &str) -> String {
 /// clicked the name of" is what is meant. An offset in the whitespace between
 /// values, or past the end of the JSON, returns the innermost container that
 /// encloses it.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn probe_at(body: &str, offset: usize) -> Option<Probe> {
     let value: Value = serde_json::from_str(body).ok()?;
     let mut spans: Vec<(Range<usize>, String)> = Vec::new();
@@ -473,6 +474,7 @@ pub fn probe_at(body: &str, offset: usize) -> Option<Probe> {
 /// Only paths this module produced are ever passed in, so the accepted grammar
 /// is exactly what [`push_key`] emits — `.key`, `['key']`, `[0]` — rather than
 /// jsonpath at large.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn value_at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = root;
     let mut s = path.strip_prefix('$')?;
@@ -501,6 +503,7 @@ fn value_at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// Read a `['key']` segment body, undoing [`push_key`]'s escapes, and return
 /// the key plus the rest of the path after the closing `]`.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn unescape_bracket_key(s: &str) -> Option<(String, &str)> {
     let mut key = String::new();
     let mut it = s.char_indices();
@@ -520,11 +523,13 @@ fn unescape_bracket_key(s: &str) -> Option<(String, &str)> {
 /// parsed by `serde_json` before this runs (see [`probe_at`]), so it is known
 /// to be well-formed and this pass only has to find the boundaries, not
 /// validate them.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 struct Scan<'a> {
     s: &'a [u8],
     i: usize,
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 impl Scan<'_> {
     fn ws(&mut self) {
         while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {

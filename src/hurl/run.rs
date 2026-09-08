@@ -180,8 +180,9 @@ pub fn run_hurl(
 }
 
 /// Like [`run_hurl`], but invokes `on_entry` immediately after each request
-/// finishes, instead of only returning once the whole collection has run —
-/// so a caller (the CLI) can stream results out as they happen.
+/// finishes, instead of only returning once the whole collection has run — so a
+/// caller can stream results out as they happen — and gives `before_entry` a
+/// chance to bind extra variables just before each entry runs.
 ///
 /// Each entry runs via its own [`runner::run_entries`] call, windowed to just
 /// that one entry (`from_entry`/`to_entry`); `[Captures]` still flow from one
@@ -191,22 +192,11 @@ pub fn run_hurl(
 /// remembered from `Set-Cookie` response headers) does *not* carry across
 /// entries in this mode, since each call starts a fresh HTTP client — an
 /// explicit `[Cookies]` section on a request is unaffected either way.
-pub fn run_hurl_streaming(
-    content: &str,
-    vars: &HashMap<String, String>,
-    file_root: Option<&Path>,
-    on_entry: impl FnMut(&EntryOutcome),
-) -> RunOutput {
-    run_hurl_streaming_with(content, vars, file_root, |_, _| Vec::new(), on_entry)
-}
-
-/// [`run_hurl_streaming`], with a chance to bind extra variables just before
-/// each entry runs.
 ///
 /// `before_entry` is called with the entry's zero-based index and everything
 /// currently bound — the environment, plus whatever earlier entries captured —
 /// and whatever it returns is bound over the top for that entry onwards. This
-/// is how a `# [Gen]` block reaches the headless runner: the block belongs to
+/// is how a `# [Gen]` block reaches a whole-collection run: the block belongs to
 /// one request and is evaluated per send, so it cannot be folded into the run's
 /// variables up front, and evaluating it here is also what lets a generator
 /// read a value an earlier request captured.
@@ -285,7 +275,7 @@ pub fn run_hurl_streaming_with(
 
 /// Map one runner [`EntryResult`] to the app's [`EntryOutcome`], returning it
 /// alongside its own concise error (if any) for the caller to fold into the
-/// whole run's status. Shared by [`run_hurl`] and [`run_hurl_streaming`] so
+/// whole run's status. Shared by [`run_hurl`] and [`run_hurl_streaming_with`] so
 /// both stay in lockstep on exactly what gets surfaced from a Hurl result.
 fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<String>) {
     let (method, url) = e

@@ -3,7 +3,9 @@
 //! building / running, so both front-ends behave identically.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,7 +20,7 @@ use crate::generators::GenError;
 use crate::http::ApiResponse;
 use crate::hurl::{
     EntryOutcome, FormField, HurlEntry, KvRow, RunOutput, RunStatus, collection_to_hurl,
-    expand_base64_form_fields, run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
+    expand_base64_form_fields, run_hurl, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -779,6 +781,26 @@ pub fn run_resolved_entry(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> RunOutput {
+    run_resolved_entry_reporting(base, vars, file_root, extra_captures).0
+}
+
+/// [`run_resolved_entry`], also handing back what the request's `# [Gen]` block
+/// computed for *this* send.
+///
+/// A generator is the pre-request script's job: a request that signs itself
+/// computes a `nonce` the request after it is expected to echo. Re-evaluating
+/// the block to find that value would produce a different `uuid` and a later
+/// `timestamp` than the one actually sent, so the values have to travel out of
+/// the send that made them. The caller merges them where captures go
+/// ([`CaptureUpdate::values`]), which is memory only — a computed value still
+/// reaches no `state.json`, since it may be an HMAC of a secret and is in any
+/// case usually good for one request.
+pub fn run_resolved_entry_reporting(
+    base: &HurlEntry,
+    vars: &HashMap<String, String>,
+    file_root: Option<&std::path::Path>,
+    extra_captures: &[(String, String)],
+) -> (RunOutput, HashMap<String, String>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
@@ -788,10 +810,13 @@ pub fn run_resolved_entry(
     // Handing it to the runner would produce a parse error naming a line
     // number in a document the user never sees, so say what is actually wrong.
     if base.is_unreadable() {
-        return RunOutput {
-            entries: vec![],
-            error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
-        };
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+            },
+            HashMap::new(),
+        );
     }
     let (vars, gen_errors) = effective_vars_reporting(base, vars);
     // A failed `[Gen]` row is left unbound, so going on would send the request
@@ -804,11 +829,22 @@ pub fn run_resolved_entry(
     // than the message is worth.
     if !gen_errors.is_empty() {
         let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
-        return RunOutput {
-            entries: vec![],
-            error: Some(crate::i18n::describe_gen_errors(&english, &gen_errors).join("; ")),
-        };
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(crate::i18n::describe_gen_errors(&english, &gen_errors).join("; ")),
+            },
+            HashMap::new(),
+        );
     }
+    // Read off the block's results *before* the borrow of `vars` ends: these
+    // are the values this send actually used, not what a second evaluation
+    // would produce.
+    let generated: HashMap<String, String> = base
+        .generators
+        .iter()
+        .filter_map(|(name, _)| vars.get(name).map(|v| (name.clone(), v.clone())))
+        .collect();
     let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
     run_entry.captures.extend(extra_captures.iter().cloned());
@@ -816,10 +852,13 @@ pub fn run_resolved_entry(
 
     let mut entries = [run_entry];
     if let Err(e) = expand_base64_form_fields(&mut entries, file_root) {
-        return RunOutput {
-            entries: vec![],
-            error: Some(format!("Base64 file error: {e}")),
-        };
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(format!("Base64 file error: {e}")),
+            },
+            generated,
+        );
     }
     let staged_dir = stage_out_of_scope_form_files(&mut entries, file_root).unwrap_or_default();
     let mut run_entry = entries.into_iter().next().unwrap();
@@ -831,7 +870,7 @@ pub fn run_resolved_entry(
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
-    out
+    (out, generated)
 }
 
 /// Why a request that could not be read cannot be sent. Front-end agnostic, so
@@ -889,7 +928,8 @@ pub fn run_collection(
         // and the report interpreter stay in exact lockstep. A base64/staging
         // failure comes back as `RunOutput { entries: [], error }` and surfaces
         // via the `None` arm below.
-        let out = run_resolved_entry(&base, &vars, file_root.as_deref(), &[]);
+        let (out, generated) =
+            run_resolved_entry_reporting(&base, &vars, file_root.as_deref(), &[]);
         let mut r = state.lock().unwrap();
         r.loading = false;
         match out.entries.into_iter().next() {
@@ -902,7 +942,12 @@ pub fn run_collection(
                 r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
-                let values: HashMap<String, String> = eo.captures.into_iter().collect();
+                // The block's values go back with the captures, so the next
+                // request sees a `nonce` this one computed exactly the way it
+                // sees a token this one captured. A `[Captures]` row of the
+                // same name is the later, more specific statement and wins.
+                let mut values: HashMap<String, String> = generated;
+                values.extend(eo.captures);
                 let _ = tx.send(CaptureUpdate {
                     col_id,
                     entry_idx,
@@ -1026,6 +1071,25 @@ pub fn run_all_entries(
         let mut captures: HashMap<String, String> = HashMap::new();
         let mut responses: Vec<Option<ApiResponse>> = vec![None; total];
 
+        // `# [Gen]` blocks. Same split as the headless runner: batch has no
+        // per-request moment to evaluate anything in, so everything is bound
+        // once up front (and a name two requests compute collapses to one
+        // value — the caller warns before starting such a run); streaming
+        // evaluates each block in its own window, which is also what lets a
+        // generator read a value an earlier request captured.
+        let mut vars = vars;
+        if batch {
+            let blocks = expand_batch_generators(
+                &run_entries,
+                &vars,
+                &crate::generators::SystemSource::new(),
+            );
+            // Bound *and* reported back as captures: a computed value is as
+            // much a result of the run as a `[Captures]` row, and the request
+            // after it — run on its own afterwards — needs to see it.
+            captures.extend(blocks.bound.iter().map(|(k, v)| (k.clone(), v.clone())));
+            vars.extend(blocks.bound);
+        }
         let out = if batch {
             run_hurl(&content, &vars, run_root)
         } else {
@@ -1040,19 +1104,59 @@ pub fn run_all_entries(
             // not the outcome's ordinal: `[Options] repeat`/`retry` make one
             // request produce several. Trusting the ordinal slid every later
             // result up and dropped the last one off the end.
-            run_hurl_streaming(&content, &vars, run_root, |eo| {
-                if let Some(&at) = run_positions.get(eo.entry_index) {
-                    results[at] = Some(eo.ok);
-                    captures.extend(eo.captures.iter().cloned());
-                    responses[at] = Some(entry_response(eo));
-                }
-                let _ = tx.send(BatchRunUpdate {
-                    col_id,
-                    results: results.clone(),
-                    captures: captures.clone(),
-                    responses: responses.clone(),
-                });
-            })
+            let gen_entries = run_entries.clone();
+            // Written by the before-each-entry hook and read by the
+            // after-each-entry one; both run on this thread, one at a time, so
+            // a `RefCell` is enough to let the two closures share it.
+            let generated: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+            let record_gen = Rc::clone(&generated);
+            crate::hurl::run::run_hurl_streaming_with(
+                &content,
+                &vars,
+                run_root,
+                |i, known| {
+                    let Some(entry) = gen_entries.get(i) else {
+                        return Vec::new();
+                    };
+                    if entry.generators.is_empty() {
+                        return Vec::new();
+                    }
+                    let mut merged = known.clone();
+                    crate::generators::expand(
+                        &entry.generators,
+                        &mut merged,
+                        &crate::generators::SystemSource::new(),
+                    );
+                    let bound: Vec<(String, String)> = entry
+                        .generators
+                        .iter()
+                        .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
+                        .collect();
+                    record_gen.borrow_mut().extend(bound.iter().cloned());
+                    bound
+                },
+                |eo| {
+                    if let Some(&at) = run_positions.get(eo.entry_index) {
+                        results[at] = Some(eo.ok);
+                        // Computed values first so a `[Captures]` row of the same
+                        // name — the later, more specific statement — still wins.
+                        captures.extend(
+                            generated
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone())),
+                        );
+                        captures.extend(eo.captures.iter().cloned());
+                        responses[at] = Some(entry_response(eo));
+                    }
+                    let _ = tx.send(BatchRunUpdate {
+                        col_id,
+                        results: results.clone(),
+                        captures: captures.clone(),
+                        responses: responses.clone(),
+                    });
+                },
+            )
         };
         if let Some(dir) = &staged_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -1393,6 +1497,116 @@ pub fn generator_problems_all(col: &Collection, env: Option<&Environment>) -> Ve
         for d in describe_generator_errors(entry, env, &col.captures) {
             if !out.contains(&d) {
                 out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Everything a whole-file run needs to know about the `# [Gen]` blocks it is
+/// about to carry.
+///
+/// A block belongs to one request and is evaluated per send, which a streaming
+/// run can honour (each entry gets its own window) but a batch run cannot: batch
+/// is a single Hurl call over the whole file, so there is no "before this
+/// request" moment to evaluate anything in. Everything is therefore evaluated
+/// once, up front, against the environment alone — and a name two requests each
+/// compute collapses to one value for both, which is the [`collisions`] list.
+///
+/// [`collisions`]: BatchGenerators::collisions
+pub struct BatchGenerators {
+    /// The names bound for the run. Where two requests compute the same name
+    /// the first request's value is kept, matching the order Hurl would have
+    /// run them in.
+    pub bound: HashMap<String, String>,
+    /// What failed, per request, paired with that request's title so the
+    /// caller can say which one it was.
+    pub errors: Vec<(String, Vec<GenError>)>,
+    /// Names computed by more than one request. In a streaming run each of
+    /// those requests gets its own value; in a batch run they share the first,
+    /// so the caller warns rather than silently sending one request's nonce
+    /// with another's signature.
+    pub collisions: Vec<String>,
+}
+
+/// Evaluate every entry's `# [Gen]` block once, for a batch (whole-file) run.
+///
+/// Shared by the headless runner and "Run All" in batch mode so the two cannot
+/// drift on which value a name ends up with.
+pub fn expand_batch_generators(
+    entries: &[crate::hurl::HurlEntry],
+    vars: &HashMap<String, String>,
+    src: &dyn crate::generators::GenSource,
+) -> BatchGenerators {
+    let mut bound = HashMap::new();
+    let mut errors = Vec::new();
+    let mut collisions: Vec<String> = Vec::new();
+    // Which request first claimed each name, so a second claim is recognised
+    // as a collision rather than as the same request being listed twice (a
+    // repeated name *within* one block is that block's own business).
+    let mut claimed: HashMap<String, usize> = HashMap::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        if e.generators.is_empty() {
+            continue;
+        }
+        // Each block is evaluated against the environment plus what earlier
+        // blocks bound — not against the run's own captures, which do not
+        // exist yet in a batch run.
+        let mut merged = vars.clone();
+        merged.extend(
+            bound
+                .iter()
+                .map(|(k, v): (&String, &String)| (k.clone(), v.clone())),
+        );
+        let errs = crate::generators::expand(&e.generators, &mut merged, src);
+        if !errs.is_empty() {
+            errors.push((e.title.clone(), errs));
+        }
+        for (name, _) in &e.generators {
+            match claimed.get(name) {
+                Some(&first) if first != i => {
+                    if !collisions.contains(name) {
+                        collisions.push(name.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            claimed.entry(name.clone()).or_insert(i);
+            if let Some(v) = merged.get(name) {
+                bound.entry(name.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    BatchGenerators {
+        bound,
+        errors,
+        collisions,
+    }
+}
+
+/// The `# [Gen]` names more than one request in the collection computes.
+///
+/// Only a batch run has to care (see [`BatchGenerators::collisions`]); the
+/// front-ends call this to warn before starting one.
+pub fn generator_collisions(col: &Collection) -> Vec<String> {
+    let mut claimed: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        let mut seen_here: Vec<&str> = Vec::new();
+        for (name, _) in &e.generators {
+            if seen_here.contains(&name.as_str()) {
+                continue;
+            }
+            seen_here.push(name);
+            if claimed.contains(&name.as_str()) {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            } else {
+                claimed.push(name);
             }
         }
     }
@@ -1888,6 +2102,112 @@ mod tests {
             .map(|(n, x)| (n.to_string(), x.to_string()))
             .collect();
         e
+    }
+
+    // ── Whole-file `# [Gen]` handling ──────────────────────────────────
+
+    /// A batch run has one variable set for the whole file, so two requests
+    /// that each compute `nonce` cannot each have their own. Silently picking
+    /// one is how a signature ends up computed over the other request's nonce,
+    /// so the collision is named and the caller warns.
+    #[test]
+    fn two_requests_computing_one_name_collide_in_a_batch_run() {
+        let entries = vec![
+            entry_with_generators("https://x/", &[("nonce", "\"first\"")]),
+            entry_with_generators("https://y/", &[("nonce", "\"second\"")]),
+        ];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.collisions, vec!["nonce".to_string()]);
+        assert_eq!(
+            blocks.bound.get("nonce").map(String::as_str),
+            Some("first"),
+            "the first request in the file keeps its value"
+        );
+        assert!(blocks.errors.is_empty(), "{:?}", blocks.errors);
+    }
+
+    /// Only a *second request* claiming the name is a collision. One request
+    /// listing a name twice is that block's own business, and reporting it as
+    /// a batch-only hazard would send the user looking for a request that
+    /// isn't there.
+    #[test]
+    fn one_request_is_never_in_collision_with_itself() {
+        let entries = vec![entry_with_generators(
+            "https://x/",
+            &[("n", "\"a\""), ("n", "\"b\"")],
+        )];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert!(blocks.collisions.is_empty(), "{:?}", blocks.collisions);
+    }
+
+    /// A later block may read what an earlier one computed — the same reading
+    /// streaming gives, so moving between the two modes doesn't change which
+    /// names resolve.
+    #[test]
+    fn a_later_gen_block_can_read_an_earlier_one_in_batch() {
+        let entries = vec![
+            entry_with_generators("https://x/", &[("base", "\"abc\"")]),
+            entry_with_generators("https://y/", &[("derived", "base")]),
+        ];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.bound.get("derived").map(String::as_str), Some("abc"));
+    }
+
+    /// Failures are reported per request: "one of them is wrong" is not a
+    /// report when the file has thirty requests in it.
+    #[test]
+    fn a_failing_block_is_reported_against_its_own_request() {
+        let mut bad = entry_with_generators("https://y/", &[("sig", "nope()")]);
+        bad.title = "Sign".into();
+        let entries = vec![entry_with_generators("https://x/", &[("n", "uuid")]), bad];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.errors.len(), 1);
+        assert_eq!(blocks.errors[0].0, "Sign");
+    }
+
+    /// The pre-flight warning the front-ends show, which reads the collection
+    /// rather than evaluating anything.
+    #[test]
+    fn generator_collisions_names_only_what_two_requests_share() {
+        let col = Collection::new(
+            "c".into(),
+            vec![
+                entry_with_generators("https://x/", &[("nonce", "uuid"), ("ts", "timestamp")]),
+                entry_with_generators("https://y/", &[("nonce", "uuid")]),
+            ],
+        );
+        assert_eq!(generator_collisions(&col), vec!["nonce".to_string()]);
+    }
+
+    /// A computed value is a result of the send, not a detail of it: the
+    /// request after the one that signed itself has to be able to echo the
+    /// nonce, so the value has to travel out of the send that made it rather
+    /// than be recomputed (which would produce a different `uuid`).
+    #[test]
+    fn a_send_hands_back_what_its_gen_block_computed() {
+        let entry = entry_with_generators("https://127.0.0.1:1/", &[("nonce", "\"fixed\"")]);
+        let (_out, generated) = run_resolved_entry_reporting(&entry, &HashMap::new(), None, &[]);
+        assert_eq!(
+            generated.get("nonce").map(String::as_str),
+            Some("fixed"),
+            "the connection failing doesn't unmake the value it was sent with"
+        );
     }
 
     /// A name the `# [Gen]` block computes is defined by that block. Before

@@ -344,6 +344,21 @@ in order and a row may only refer to one above it. Values are computed per run,
 never previewed, and never written to `state.json`; a secret read through
 `{{ op://… }}` is no more exposed by signing with it than by sending it.
 
+What a block computes stays available to the rest of the session, exactly as a
+`[Captures]` value does: sign a request, and the request after it can echo the
+same `{{nonce}}` — including when you run it on its own. (Memory only, for the
+reason above: a fresh PaperBoy computes fresh values.) A `[Captures]` row of
+the same name is the later, more specific statement and wins.
+
+One request per name, though. "Run All" and `paperboy -c` normally run one
+request at a time, so each block is evaluated in its own window and two
+requests may each have their own `nonce`. A **batch** run (the `--batch` flag,
+or the Run All batch preference) is a single Hurl call over the whole file with
+one variable set, so there the two share the first request's value — a
+signature computed over another request's nonce. Both front-ends say so before
+starting such a run, and `--batch` prints the warning too; the fix is usually
+to not use batch.
+
 Edit the block in the request wizard's **Computed** section (`Alt+0`), in the
 GUI editor's **Computed** tab, or as text. Both editors offer the functions as
 you type — with their arguments named — and the GUI's **Function…** menu lists

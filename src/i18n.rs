@@ -899,6 +899,12 @@ strings! {
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
     gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
     gen_err_cycle => "{row}: refers to itself, or to a row below it", "{row} : se référence lui-même, ou une ligne en dessous", "{row}: refererer til sig selv eller til en række nedenunder";
+    // A batch run has one shared variable set, so two requests that each
+    // compute `nonce` get one value between them. Worth naming the row rather
+    // than the requests: the user knows where their own `nonce` rows are, and
+    // the two titles would make the line twice as long.
+    gen_collision => "⚠ Both requests compute {name} — in one batch they share the first value", "⚠ Les deux requêtes calculent {name} — dans un même lot elles partagent la première valeur", "⚠ Begge anmodninger beregner {name} — i én batch deler de den første værdi";
+    cli_gen_collision => "more than one request computes {name}: in --batch they share the first value (drop --batch to give each its own)", "plusieurs requêtes calculent {name} : avec --batch elles partagent la première valeur (retirez --batch pour que chacune ait la sienne)", "flere anmodninger beregner {name}: med --batch deler de den første værdi (fjern --batch for at give hver sin egen)";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -1758,6 +1764,9 @@ pub enum Status {
     /// [`Status::BodyFormConflict`] one. Said all the same, because "401" is a
     /// poor way to learn that a function name was misspelled.
     GeneratorErrors(Vec<crate::generators::GenError>),
+    /// A batch "Run All" is about to give two requests one value for a name
+    /// they each compute. Carries the colliding names.
+    GeneratorCollisions(Vec<String>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -2087,6 +2096,11 @@ impl Status {
                     describe_gen_errors(s, errors).join("; ")
                 )
             }
+            Status::GeneratorCollisions(names) => names
+                .iter()
+                .map(|n| s.gen_collision.replace("{name}", n))
+                .collect::<Vec<_>>()
+                .join("; "),
             Status::TruncatedPlaceholders(items) => {
                 format!(
                     "{} {} — {}",

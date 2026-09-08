@@ -1929,10 +1929,20 @@ impl TuiApp {
             return;
         }
         let gen_errors = request::generator_problems_all(col, env.as_ref());
+        // Batch alone shares one variable set across the file, so batch alone
+        // makes two requests computing the same name settle on one value.
+        // Reported rather than refused: it is occasionally what was meant.
+        let collisions = if self.run_all_batch_mode {
+            request::generator_collisions(col)
+        } else {
+            Vec::new()
+        };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
         self.status = if !gen_errors.is_empty() {
             Some(Status::GeneratorErrors(gen_errors))
+        } else if !collisions.is_empty() {
+            Some(Status::GeneratorCollisions(collisions))
         } else {
             (!undefined.is_empty()).then_some(Status::UndefinedVars {
                 keys: undefined,

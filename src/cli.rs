@@ -1,7 +1,7 @@
 //! Headless CLI runner: `paperboy -c collection.hurl [-e env.vars] [--batch]`.
 //!
 //! Parsing, HTTP and `[Captures]`/`[Asserts]` evaluation are all delegated to
-//! the Hurl runner (via [`crate::hurl::run_hurl`] / [`crate::hurl::run_hurl_streaming`]);
+//! the Hurl runner (via [`crate::hurl::run_hurl`] / [`crate::hurl::run_hurl_streaming_with`]);
 //! this module only handles file I/O, environment loading and formatting the
 //! results.
 
@@ -25,7 +25,7 @@ use crate::shared_utils::stem;
 /// By default each request's result is printed as soon as it finishes
 /// (`batch: false`); `batch: true` waits for the whole collection to run
 /// (the original behaviour), which is the only mode that preserves Hurl's
-/// automatic cookie jar across every request — see [`run_hurl_streaming`]'s
+/// automatic cookie jar across every request — see [`run_hurl_streaming_with`]'s
 /// docs for why streaming mode can't do that too.
 pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i32 {
     let col_content = match fs::read_to_string(&collection_path) {
@@ -224,20 +224,27 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
 
     let out = if batch {
         let mut vars = vars.clone();
-        for e in &gen_entries {
-            if e.generators.is_empty() {
-                continue;
-            }
-            let mut merged = vars.clone();
-            let errors =
-                crate::generators::expand(&e.generators, &mut merged, &SystemSource::new());
-            report_gen(&e.title, &errors);
-            for (name, _) in &e.generators {
-                if let Some(v) = merged.get(name) {
-                    vars.entry(name.clone()).or_insert_with(|| v.clone());
-                }
-            }
+        let blocks =
+            crate::request::expand_batch_generators(&gen_entries, &vars, &SystemSource::new());
+        for (title, errors) in &blocks.errors {
+            report_gen(title, errors);
         }
+        // Said out loud rather than silently resolved: in batch the two
+        // requests share one value, so the second one's signature is computed
+        // over the first one's nonce. Streaming (the default) gives each its
+        // own, so the fix is usually to drop `--batch` — which is what the
+        // message suggests.
+        for name in &blocks.collisions {
+            eprintln!(
+                "{}",
+                paint(
+                    color,
+                    Hue::Yellow,
+                    &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
+                )
+            );
+        }
+        vars.extend(blocks.bound);
         let out = run_hurl(&run_content, &vars, file_root);
         for eo in out.entries.iter() {
             print_entry(
