@@ -22986,10 +22986,14 @@ fn an_empty_expression_cell_lists_every_function_on_enter() {
     let (_, sugs) = form_ref(&app)
         .key_dropdown()
         .expect("Enter on an empty expression cell offered nothing");
+    let listed: usize = crate::generators::FUNCTIONS
+        .iter()
+        .map(|f| 1 + f.examples.len())
+        .sum();
     assert_eq!(
         sugs.len(),
-        crate::generators::FUNCTIONS.len(),
-        "the list is meant to be the whole catalogue"
+        listed,
+        "the list is meant to be the whole catalogue, examples included"
     );
     assert_eq!(
         new_focus(&app),
@@ -23002,6 +23006,44 @@ fn an_empty_expression_cell_lists_every_function_on_enter() {
     assert!(
         expr.starts_with(crate::generators::FUNCTIONS[0].name),
         "picking from the catalogue wrote {expr:?}"
+    );
+}
+
+/// `date(format)` names its argument and says nothing whatever about what a
+/// format is, and the failure it produces -- "date takes 1 arguments, not 0" --
+/// says less. The catalogue therefore carries whole working calls beside the
+/// signature, and picking one writes it as it stands with the caret after it:
+/// there is no argument left to fill in.
+#[test]
+fn the_catalogue_offers_ready_made_date_formats() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    press(&mut app, KeyCode::Enter);
+    type_str(&mut app, "date");
+    let sugs = form_ref(&app).key_dropdown().expect("no matches").1;
+    let example = crate::generators::FUNCTIONS
+        .iter()
+        .find(|f| f.name == "date")
+        .expect("no date function")
+        .examples[0];
+    assert!(
+        sugs.contains(&example),
+        "the date row offered no formats at all: {sugs:?}"
+    );
+    // Down onto the signature, again onto the first example, then take it.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let row = &form_ref(&app).generators[0];
+    assert_eq!(
+        row.expr.text(),
+        example,
+        "picking a format wrote something else"
+    );
+    assert_eq!(
+        row.expr.col,
+        example.chars().count(),
+        "the caret was left inside a call that is already finished"
     );
 }
 

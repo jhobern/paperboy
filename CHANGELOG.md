@@ -235,6 +235,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   list rather than the whole palette. Typing still reaches a header by name
   without opening the group first.
 
+- **The response says what "Assert this…" means before it is clicked.** The
+  body is a wall of near-identical tokens, and a few pixels of pointer travel
+  is the difference between a key, its value and the object around them.
+  Hovering the body now washes the whole JSON value under the pointer in the
+  accent colour, and the menu that opens acts on exactly what was lit. Header
+  rows light in full — either half is the same subject — for the same reason.
+
+- **The computed-values catalogue offers ready-made date formats.**
+  `date(format)` named its argument and said nothing about what a format is,
+  and the failure it produced — "date takes 1 arguments, not 0" — said less.
+  There are some forty strftime specifiers, so the list is a handful of whole
+  working calls (`date("%Y-%m-%d")`, `date("%d/%m/%Y")`, an ISO timestamp and
+  so on) shown under the signature in both front-ends; picking one writes it
+  complete. They double as examples of the syntax for anyone who wants a
+  format that isn't offered.
+
+- **The Function… button lines up with the row it is in.** It kept its default
+  button padding, so it top-aligned against the fields beside it and hung below
+  them — it is now sized and de-padded like the delete button on the same row.
+
 - **The strip below the last row follows the theme.** A terminal window is
   rarely a whole number of character cells tall, and the leftover band at the
   bottom is not addressable — it kept the emulator's own background under an

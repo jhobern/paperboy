@@ -943,9 +943,19 @@ pub fn computed_editor(
                     // where the caret is — an expression is often a call inside
                     // a call, so appending to the end would be wrong as often
                     // as it was right.
-                    ui.menu_button(
-                        RichText::new(s.gui_computed_fn_button).color(theme.dim),
-                        |ui| {
+                    // Sized and de-padded like the delete button beside it: a
+                    // default egui button is taller than a text field, and left
+                    // to itself it top-aligns and hangs below the row it is
+                    // part of. `flat_buttons` + an explicit height is how every
+                    // other control that shares a row with a field is drawn.
+                    let menu = flat_buttons(ui, |ui| {
+                        egui::containers::menu::MenuButton::from_button(
+                            egui::Button::new(
+                                RichText::new(s.gui_computed_fn_button).color(theme.dim),
+                            )
+                            .min_size(egui::vec2(f_w, row_h)),
+                        )
+                        .ui(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .max_height(320.0)
                                 .show(ui, |ui| {
@@ -966,12 +976,33 @@ pub fn computed_editor(
                                             changed = true;
                                             ui.close();
                                         }
+                                        // Ready-made calls sit under the
+                                        // signature they belong to rather than
+                                        // behind a submenu: `date(format)` is
+                                        // the row that fails to explain itself,
+                                        // and an explanation one more click
+                                        // away is one nobody finds.
+                                        for ex in f.examples {
+                                            if ui
+                                                .button(
+                                                    RichText::new(format!("    {ex}"))
+                                                        .monospace()
+                                                        .color(theme.dim),
+                                                )
+                                                .clicked()
+                                            {
+                                                write_text(ui.ctx(), field.id, &mut rows[i].1, ex);
+                                                ui.ctx().memory_mut(|m| m.request_focus(field.id));
+                                                changed = true;
+                                                ui.close();
+                                            }
+                                        }
                                     }
                                 });
-                        },
-                    )
-                    .response
-                    .on_hover_text(s.gui_computed_functions);
+                        })
+                        .0
+                    });
+                    menu.on_hover_text(s.gui_computed_functions);
                     let hit = flat_buttons(ui, |ui| {
                         ui.add_sized(
                             [x_w, row_h],
@@ -1011,10 +1042,34 @@ pub fn computed_editor(
     changed
 }
 
-/// Write `f`'s call into the text field `id`, at the caret.
+/// Write `f`'s call into the text field `id`, at the caret, with the caret left
+/// between the brackets ready for the first argument.
+fn write_call(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    f: &crate::generators::GenFunction,
+) {
+    insert_at_caret(ctx, id, text, |text, caret| insert_call(text, caret, f));
+}
+
+/// Write a ready-made call (a [`GenFunction::examples`] entry) into the field.
 ///
-/// Everything the field's own state has to be told about an edit made behind
-/// its back happens here:
+/// The same caret and undo care as [`write_call`], but the caret lands after
+/// the whole call rather than inside the brackets: an example arrives complete,
+/// so the next thing to do is carry on writing the expression around it, not
+/// fill in an argument that is already there.
+fn write_text(ctx: &egui::Context, id: egui::Id, text: &mut String, call: &str) {
+    insert_at_caret(ctx, id, text, |text, caret| {
+        let (out, start, _) = replace_word(text, caret, call);
+        (out, start + call.chars().count())
+    });
+}
+
+/// The shared half of [`write_call`] and [`write_text`]: apply an edit made
+/// behind the field's back, and tell the field's own state about it.
+///
+/// Everything a field has to be told happens here:
 ///
 /// * the caret, which egui keeps per-field and would otherwise stay where it
 ///   was — pointing into text that has since moved;
@@ -1025,16 +1080,16 @@ pub fn computed_editor(
 ///   pre-insert state makes the insert one reversible step like a typed one.
 ///
 /// With no state stored — a cell never clicked into — there is no caret to
-/// insert at and no history to preserve, so the call goes on the end.
-fn write_call(
+/// insert at and no history to preserve, so the edit goes on the end.
+fn insert_at_caret(
     ctx: &egui::Context,
     id: egui::Id,
     text: &mut String,
-    f: &crate::generators::GenFunction,
+    edit: impl Fn(&str, Option<usize>) -> (String, usize),
 ) {
     use egui::text::{CCursor, CCursorRange};
     let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
-        (*text, _) = insert_call(text, None, f);
+        (*text, _) = edit(text, None);
         return;
     };
     let range = state.cursor.char_range();
@@ -1042,12 +1097,36 @@ fn write_call(
     let mut undoer = state.undoer();
     undoer.add_undo(&(range.unwrap_or(at_end), text.clone()));
     state.set_undoer(undoer);
-    let (out, caret) = insert_call(text, range.map(|r| r.primary.index.0), f);
+    let (out, caret) = edit(text, range.map(|r| r.primary.index.0));
     *text = out;
     state
         .cursor
         .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
     egui::TextEdit::store_state(ctx, id, state);
+}
+
+/// Replace the word the caret sits in with `with`, returning the new text and
+/// where that word began.
+///
+/// The word is *replaced* so choosing `sha256` after typing `sha` leaves one
+/// `sha256` rather than `shasha256`, and the rest of the expression around it
+/// is untouched.
+fn replace_word(text: &str, caret: Option<usize>, with: &str) -> (String, usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let at = caret.unwrap_or(chars.len()).min(chars.len());
+    let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let mut start = at;
+    while start > 0 && word(&chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < chars.len() && word(&chars[end]) {
+        end += 1;
+    }
+    let mut out: String = chars[..start].iter().collect();
+    out.push_str(with);
+    out.extend(chars[end..].iter());
+    (out, start, end)
 }
 
 /// Write `f`'s call into `text` at the caret, returning the new text and where
@@ -1065,25 +1144,12 @@ fn insert_call(
     caret: Option<usize>,
     f: &crate::generators::GenFunction,
 ) -> (String, usize) {
-    let chars: Vec<char> = text.chars().collect();
-    let at = caret.unwrap_or(chars.len()).min(chars.len());
-    let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
-    let mut start = at;
-    while start > 0 && word(&chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = at;
-    while end < chars.len() && word(&chars[end]) {
-        end += 1;
-    }
     let call = if f.min_args == 0 {
         f.name.to_string()
     } else {
         format!("{}()", f.name)
     };
-    let mut out: String = chars[..start].iter().collect();
-    out.push_str(&call);
-    out.extend(chars[end..].iter());
+    let (out, start, _) = replace_word(text, caret, &call);
     let inside = usize::from(f.min_args > 0);
     (out, start + f.name.chars().count() + inside)
 }

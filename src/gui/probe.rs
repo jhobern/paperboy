@@ -392,6 +392,93 @@ pub(super) fn pointed_in(
     probe::probe_at(body, offset)
 }
 
+/// The value the *mouse* is over in the laid-out body, as a subject.
+///
+/// The caret answers "what did I click on"; this answers "what am I about to
+/// click on", which is what a highlight has to follow to be worth anything.
+/// Same refusal in the compact view as [`pointed_in`], and for the same
+/// reason: the shown text is not the body, so an offset into it names the
+/// wrong field.
+pub(super) fn hovered_in(
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    pointer: egui::Pos2,
+    body: &str,
+    compact: bool,
+) -> Option<Probe> {
+    if compact {
+        return None;
+    }
+    let cursor = galley.cursor_from_pos(pointer - galley_pos);
+    let offset = char_to_byte(body, cursor.index.0)?;
+    probe::probe_at(body, offset)
+}
+
+/// The byte offset of char number `n`, or the end of the string for the one
+/// position past the last char.
+fn char_to_byte(body: &str, n: usize) -> Option<usize> {
+    body.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(body.len()))
+        .nth(n)
+}
+
+/// Wash over `subject`'s value where the body field has laid it out.
+///
+/// Painted rather than selected: [`highlight`] sets the field's real selection
+/// so the value can be copied, which is right for the value the *dialog* is
+/// discussing but wrong for one the mouse is merely passing over -- stealing
+/// the selection on hover would destroy a selection the user made by hand, and
+/// do it on every mouse move.
+///
+/// Returns the rows it painted so a caller can tell whether anything was shown.
+pub(super) fn paint_span(
+    painter: &egui::Painter,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    body: &str,
+    subject: &Subject,
+    compact: bool,
+    colour: egui::Color32,
+) -> usize {
+    let Some((start, end)) = value_char_range(body, subject, compact) else {
+        return 0;
+    };
+    if end <= start {
+        return 0;
+    }
+    let a = galley.layout_from_cursor(egui::text::CCursor::new(start));
+    let b = galley.layout_from_cursor(egui::text::CCursor::new(end));
+    let mut painted = 0;
+    for r in a.row..=b.row {
+        let Some(row) = galley.rows.get(r) else { break };
+        // A value can span rows (an object, an array, a wrapped string), so
+        // each row is filled from where the span enters it to where it leaves:
+        // the row's own edges in between.
+        let left = if r == a.row {
+            galley.pos_from_layout_cursor(&a).left()
+        } else {
+            row.rect().left()
+        };
+        let right = if r == b.row {
+            galley.pos_from_layout_cursor(&b).left()
+        } else {
+            row.rect().right()
+        };
+        if right <= left {
+            continue;
+        }
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(left, row.rect().top()),
+            egui::pos2(right, row.rect().bottom()),
+        )
+        .translate(galley_pos.to_vec2());
+        painter.rect_filled(rect, 2.0, colour);
+        painted += 1;
+    }
+    painted
+}
+
 /// Write the chosen verb onto the request the response came from.
 ///
 /// The collection *and* the entry are re-resolved rather than trusted: the

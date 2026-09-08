@@ -757,6 +757,20 @@ pub struct GenFunction {
     /// would be worse than one.
     pub min_args: usize,
     pub max_args: Option<usize>,
+    /// Complete calls to offer beside the signature, for a function whose
+    /// argument is a small language of its own.
+    ///
+    /// `date(format)` names the argument without saying a word about what a
+    /// format looks like, and the failure -- "date takes 1 arguments, not 0" --
+    /// says even less. There are some forty strftime specifiers, so listing
+    /// them all would be a reference manual in a dropdown; a handful of whole,
+    /// working calls is what someone reaching for a date actually wants, and
+    /// each one doubles as an example of the syntax for anyone who then wants
+    /// something else.
+    ///
+    /// Untranslated for the same reason as `signature`: they are text the user
+    /// is about to run.
+    pub examples: &'static [&'static str],
 }
 
 /// Every generator function, for the editors' suggestions and for
@@ -768,210 +782,254 @@ pub const FUNCTIONS: &[GenFunction] = &[
         signature: "timestamp([offset_seconds])",
         min_args: 0,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "timestamp_ms",
         signature: "timestamp_ms()",
         min_args: 0,
         max_args: Some(0),
+        examples: &[],
     },
     GenFunction {
         name: "iso8601",
         signature: "iso8601()",
         min_args: 0,
         max_args: Some(0),
+        examples: &[],
     },
     GenFunction {
         name: "date",
         signature: "date(format)",
         min_args: 1,
         max_args: Some(1),
+        // Dates first, then times, then the two run together: the order
+        // someone scanning for "the one I mean" reads in.
+        examples: &[
+            r#"date("%Y-%m-%d")"#,
+            r#"date("%d/%m/%Y")"#,
+            r#"date("%d %b %Y")"#,
+            r#"date("%Y-%m-%dT%H:%M:%SZ")"#,
+            r#"date("%H:%M:%S")"#,
+            r#"date("%Y%m%d%H%M%S")"#,
+        ],
     },
     GenFunction {
         name: "uuid",
         signature: "uuid()",
         min_args: 0,
         max_args: Some(0),
+        examples: &[],
     },
     GenFunction {
         name: "counter",
         signature: "counter(name)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "random_int",
         signature: "random_int(low, high)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "random_hex",
         signature: "random_hex(length)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "random_alnum",
         signature: "random_alnum(length)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "random_base64",
         signature: "random_base64(bytes)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "base64",
         signature: "base64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "base64url",
         signature: "base64url(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "base64_decode",
         signature: "base64_decode(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "hex",
         signature: "hex(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "urlencode",
         signature: "urlencode(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "urldecode",
         signature: "urldecode(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "json_string",
         signature: "json_string(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "md5",
         signature: "md5(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "md5_b64",
         signature: "md5_b64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha1",
         signature: "sha1(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha1_b64",
         signature: "sha1_b64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha256",
         signature: "sha256(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha256_b64",
         signature: "sha256_b64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha512",
         signature: "sha512(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "sha512_b64",
         signature: "sha512_b64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha1",
         signature: "hmac_sha1(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha1_b64",
         signature: "hmac_sha1_b64(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha256",
         signature: "hmac_sha256(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha256_b64",
         signature: "hmac_sha256_b64(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha512",
         signature: "hmac_sha512(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "hmac_sha512_b64",
         signature: "hmac_sha512_b64(key, message)",
         min_args: 2,
         max_args: Some(2),
+        examples: &[],
     },
     GenFunction {
         name: "concat",
         signature: "concat(a, b, …)",
         min_args: 0,
         max_args: None,
+        examples: &[],
     },
     GenFunction {
         name: "upper",
         signature: "upper(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "lower",
         signature: "lower(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
     GenFunction {
         name: "trim",
         signature: "trim(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
     },
 ];
 
@@ -1400,6 +1458,38 @@ mod tests {
         assert_eq!(parse(r#""a\\b""#), Ok(Expr::Text("a\\b".into())));
         // The characters that mark up the .hurl file are ordinary here.
         assert_eq!(parse(r#""a#b:c""#), Ok(Expr::Text("a#b:c".into())));
+    }
+
+    /// An example is offered as a thing to click, so it has to be a call that
+    /// runs: one with a stale name, the wrong arity or a format string the
+    /// formatter chokes on would put a broken expression into the user's
+    /// request under the guise of help.
+    #[test]
+    fn every_offered_example_is_a_call_that_works() {
+        for f in FUNCTIONS {
+            for ex in f.examples {
+                assert!(
+                    ex.starts_with(f.name),
+                    "{ex:?} is offered under {} but does not call it",
+                    f.name
+                );
+                let (vars, errors) = run(&[("v", ex)]);
+                assert!(errors.is_empty(), "{ex:?} did not run: {errors:?}");
+                assert!(
+                    !vars["v"].is_empty(),
+                    "{ex:?} ran but produced nothing at all"
+                );
+                // A strftime typo is not an error to chrono -- an unknown
+                // specifier is copied through verbatim -- so a percent sign
+                // surviving into the output means the pattern was not
+                // understood.
+                assert!(
+                    !vars["v"].contains('%'),
+                    "{ex:?} produced {:?}, so part of the format was not understood",
+                    vars["v"]
+                );
+            }
+        }
     }
 
     #[test]

@@ -99,6 +99,46 @@ pub(crate) fn centre_of(painted: &Painted, needle: &str) -> egui::Pos2 {
     *pos + egui::vec2(g.size().x / 2.0, g.size().y / 2.0)
 }
 
+/// Every filled rectangle one frame painted -- how a highlight shows up, since
+/// it is a wash under the text rather than any text of its own.
+pub(crate) fn fills(full: &egui::FullOutput) -> Vec<(egui::Rect, egui::Color32)> {
+    fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::epaint::Shape::Rect(r) => out.push((r.rect, r.fill)),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for c in &full.shapes {
+        walk(&c.shape, &mut out);
+    }
+    out
+}
+
+/// One frame of the response panel, keeping everything it drew.
+pub(crate) fn panel_output(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    ctx.run_ui(input(events), |ui| super::response::ui(app, ui))
+}
+
+/// Where a *substring* of a painted run sits -- `centre_of` finds the run, but
+/// the response body is one galley holding the whole reply, and aiming the
+/// mouse at one token in it needs the position of that token.
+pub(crate) fn pos_in_text(painted: &Painted, needle: &str) -> egui::Pos2 {
+    let (pos, g) = painted
+        .iter()
+        .find(|(_, g)| g.text().contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} was never painted: {:?}", texts(painted)));
+    let byte = g.text().find(needle).expect("found it once already");
+    let chars = g.text()[..byte].chars().count() + needle.chars().count() / 2;
+    let at = g.pos_from_cursor(egui::text::CCursor::new(chars));
+    *pos + at.center().to_vec2()
+}
+
 pub(crate) fn app_with(body: &str, headers: Vec<(String, String)>, status: u16) -> GuiApp {
     let mut entry = HurlEntry {
         title: "Login".to_string(),

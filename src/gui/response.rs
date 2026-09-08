@@ -35,6 +35,16 @@ fn selected_response(session: &Session, ci: usize) -> (Option<&ApiResponse>, boo
     (entry.and_then(|e| e.last_response.as_ref()), loading)
 }
 
+/// The colour a hovered subject is washed in, wherever it is drawn.
+///
+/// One definition for the body and the headers so the two tabs cannot drift
+/// apart, and thin enough (alpha 56) that the text underneath stays legible --
+/// the point is to say *which* value, not to hide it.
+pub(super) fn wash(theme: &super::theme::GuiTheme) -> egui::Color32 {
+    let c = theme.accent;
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 56)
+}
+
 pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let theme = app.theme;
     let (
@@ -128,6 +138,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // next one (egui keeps cursor state per widget id); the reader must use the
     // same id.
     let body_id = super::probe::body_field_id(app);
+    // Where the body field parks the value the pointer was on when a context
+    // menu was opened (see the body arm below).
+    let aim_id = body_id.with("aim");
     ui.horizontal(|ui| {
         if loading {
             ui.spinner();
@@ -247,24 +260,68 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // read-only while remaining interactive - which is what
                     // gives it selection, word-on-double-click and Ctrl+C.
                     // `interactive(false)` takes those away too.
-                    let field = ui.add(
-                        egui::TextEdit::multiline(&mut text.as_str())
-                            .id(body_id)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(12),
-                    );
+                    let out = egui::TextEdit::multiline(&mut text.as_str())
+                        .id(body_id)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(12)
+                        .show(ui);
+                    let field = out.response.clone();
+                    // What the mouse is over, resolved to a whole JSON value.
+                    // A right-click menu that says "Assert this..." has to make
+                    // "this" visible *before* it is clicked: the body is a wall
+                    // of near-identical tokens, and the difference between
+                    // aiming at a key, its value and the object around them is
+                    // a few pixels of pointer travel.
+                    let aimed = ui
+                        .ctx()
+                        .pointer_hover_pos()
+                        .filter(|_| field.hovered())
+                        .and_then(|pos| {
+                            super::probe::hovered_in(
+                                &out.galley,
+                                out.galley_pos,
+                                pos,
+                                &raw_body,
+                                compact,
+                            )
+                        });
+                    // Opening the menu takes the pointer off the text, so the
+                    // aim is frozen at the click and held while the menu is up
+                    // -- otherwise the highlight vanishes at the exact moment
+                    // the user is reading the menu that acts on it.
+                    if field.secondary_clicked() {
+                        ui.data_mut(|d| d.insert_temp(aim_id, aimed.clone()));
+                    }
+                    let shown = if field.context_menu_opened() {
+                        ui.data_mut(|d| d.get_temp::<Option<crate::probe::Probe>>(aim_id))
+                            .flatten()
+                    } else {
+                        aimed
+                    };
+                    if let Some(probe) = &shown {
+                        super::probe::paint_span(
+                            ui.painter(),
+                            &out.galley,
+                            out.galley_pos,
+                            &raw_body,
+                            &probe.subject,
+                            compact,
+                            wash(&theme),
+                        );
+                    }
                     // The caret is read *after* the field has been drawn, from
                     // the state egui stored under the field's own id — the same
                     // trick the request editor's "Extract to parameter…" uses.
                     field.context_menu(|ui| {
                         if ui.button(lbl_probe_this).clicked() {
-                            open_probe = Some(super::probe::pointed_in(
-                                ui.ctx(),
-                                &raw_body,
-                                compact,
-                                body_id,
-                            ));
+                            // The value that was highlighted under the pointer,
+                            // so the menu acts on what it showed. The caret is
+                            // the fallback for a menu opened from the keyboard,
+                            // where there is no pointer to have aimed with.
+                            open_probe = Some(shown.clone().or_else(|| {
+                                super::probe::pointed_in(ui.ctx(), &raw_body, compact, body_id)
+                            }));
                             ui.close();
                         }
                         // Isolating the value under the caret is what the
@@ -275,9 +332,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         // bytes, so a compacted view still yields the real
                         // value rather than the shortened one on screen.
                         if ui.button(lbl_copy_this).clicked() {
-                            if let Some(text) =
-                                super::probe::pointed_in(ui.ctx(), &raw_body, compact, body_id)
-                                    .and_then(|p| super::probe::raw_value_text(&raw_body, &p))
+                            if let Some(text) = shown
+                                .clone()
+                                .or_else(|| {
+                                    super::probe::pointed_in(ui.ctx(), &raw_body, compact, body_id)
+                                })
+                                .and_then(|p| super::probe::raw_value_text(&raw_body, &p))
                             {
                                 ui.ctx().copy_text(text);
                                 copied = true;
@@ -304,7 +364,21 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     ui.label(RichText::new(v).monospace().color(theme.text));
                                 // Either half of the row is the same subject:
                                 // aiming at the name or at the value is the
-                                // same intention.
+                                // same intention -- so either half hovered
+                                // lights the whole row, for the same reason the
+                                // body highlights the value under the pointer:
+                                // "Assert this..." has to say which "this".
+                                if name.hovered()
+                                    || value.hovered()
+                                    || name.context_menu_opened()
+                                    || value.context_menu_opened()
+                                {
+                                    ui.painter().rect_filled(
+                                        name.rect.union(value.rect).expand2(egui::vec2(4.0, 1.0)),
+                                        2.0,
+                                        wash(&theme),
+                                    );
+                                }
                                 for resp in [&name, &value] {
                                     resp.context_menu(|ui| {
                                         if ui.button(lbl_probe_this).clicked() {
@@ -478,6 +552,106 @@ mod probe_route_tests {
             }
             _ => panic!("right-clicking the status line did not open the builder"),
         }
+    }
+
+    /// A menu that says "Assert this…" has to show what "this" is *before*
+    /// it is opened: the body is a wall of near-identical tokens and a few
+    /// pixels of pointer travel is the difference between a key, its value and
+    /// the object around them. The wash follows the pointer, and it covers the
+    /// value it is over rather than some other part of the reply.
+    #[test]
+    fn hovering_the_body_washes_the_value_under_the_pointer() {
+        let body = "{\n  \"status\": \"success\",\n  \"token\": \"abc123\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let at = pos_in_text(&painted, "success");
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let washes: Vec<_> = fills(&full)
+            .into_iter()
+            .filter(|(r, c)| *c == super::wash(&app.theme) && r.contains(at))
+            .collect();
+        assert!(
+            !washes.is_empty(),
+            "nothing was highlighted under the pointer"
+        );
+        // The wash is the *value*, not the whole line: it must not reach back
+        // over the key that names it.
+        let key = pos_in_text(&painted, "status");
+        assert!(
+            washes.iter().all(|(r, _)| !r.contains(key)),
+            "the highlight swallowed the key as well as the value"
+        );
+    }
+
+    /// The pointer moving to another token moves the highlight with it --
+    /// otherwise the first thing hovered would be highlighted for ever and the
+    /// menu would act on something else entirely.
+    #[test]
+    fn the_wash_follows_the_pointer_to_the_next_value() {
+        let body = "{\n  \"status\": \"success\",\n  \"token\": \"abc123\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let first = pos_in_text(&painted, "success");
+        let second = pos_in_text(&painted, "abc123");
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(first)]);
+        panel_output(&mut app, &ctx, vec![]);
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(second)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let washes: Vec<_> = fills(&full)
+            .into_iter()
+            .filter(|(_, c)| *c == super::wash(&app.theme))
+            .collect();
+        assert!(
+            washes.iter().any(|(r, _)| r.contains(second)),
+            "the second value was not highlighted"
+        );
+        assert!(
+            washes.iter().all(|(r, _)| !r.contains(first)),
+            "the first value stayed highlighted after the pointer left it"
+        );
+    }
+
+    /// The same promise on the headers tab: hovering either half of a row
+    /// lights the whole row, because either half is the same subject and the
+    /// menu that opens from it asserts on the pair.
+    #[test]
+    fn hovering_a_header_lights_the_whole_row() {
+        let mut app = app_with(
+            r#"{"a":1}"#,
+            vec![
+                ("X-Request-Id".into(), "r-42".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            200,
+        );
+        app.response_section = ResponseSection::Headers;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let value = centre_of(&painted, "application/json");
+        let name = centre_of(&painted, "Content-Type");
+        let other = centre_of(&painted, "r-42");
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(value)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let washes: Vec<_> = fills(&full)
+            .into_iter()
+            .filter(|(_, c)| c.a() > 0 && c.a() < 255)
+            .collect();
+        assert!(
+            washes
+                .iter()
+                .any(|(r, _)| r.contains(value) && r.contains(name)),
+            "hovering the value did not light the name beside it"
+        );
+        assert!(
+            washes.iter().all(|(r, _)| !r.contains(other)),
+            "the highlight reached a row the pointer was nowhere near"
+        );
     }
 
     /// The headers section has no Assert… button, but its rows are

@@ -1193,8 +1193,11 @@ impl NewReq {
         if word.is_empty() && !self.gen_browse {
             return None;
         }
+        // Each function's signature, then any ready-made calls it offers --
+        // `date(format)` names its argument without saying what a format looks
+        // like, and a whole working call is the answer to that.
         let sugs: Vec<&'static str> = crate::generators::functions_starting_with(&word)
-            .map(|f| f.signature)
+            .flat_map(|f| std::iter::once(f.signature).chain(f.examples.iter().copied()))
             .collect();
         // A name already typed in full has nothing left to offer, and a
         // dropdown that will not close reads as the editor refusing to accept
@@ -1235,17 +1238,27 @@ impl NewReq {
                 // `name` is the signature the dropdown showed; the call to
                 // write, and whether it needs brackets, come from the function
                 // it names — read from `min_args`, as the GUI does.
-                let Some(f) = crate::generators::FUNCTIONS
+                // A ready-made example is written as it stands, with the
+                // caret after it: there is no argument left to type, so
+                // dropping the caret into the middle of a finished call would
+                // only be in the way.
+                let picked = crate::generators::FUNCTIONS
                     .iter()
                     .find(|f| f.signature == name)
-                else {
+                    .map(|f| gen_completion(f))
+                    .or_else(|| {
+                        crate::generators::FUNCTIONS
+                            .iter()
+                            .find(|f| f.examples.contains(&name))
+                            .map(|_| (name.to_string(), name.chars().count()))
+                    });
+                let Some((call, caret)) = picked else {
                     return;
                 };
                 if let Some(row) = self.generators.get_mut(i) {
                     let text = row.expr.text();
                     let chars: Vec<char> = text.chars().collect();
                     let (start, end, _word) = gen_word(&text, row.expr.col);
-                    let (call, caret) = gen_completion(f);
                     let mut done = String::new();
                     done.extend(chars[..start].iter());
                     done.push_str(&call);
