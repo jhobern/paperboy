@@ -188,7 +188,44 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   opened and never used — no longer reports a script as lost when there was
   never one there.
 
+- **The Requests list is a folder tree, so more than one folder can be open at
+  once.** A collection with folders behaved like a directory browser: entering
+  one replaced the list with its contents, and the way to see the request next
+  to it in a sibling folder was to walk back out and down again. Real imports
+  are not shaped for that — an imported Postman collection is mostly folders,
+  and comparing two of them is the normal thing to want. The list now draws the
+  same expand/collapse tree the Workspace pane and the GUI already use:
+  `Enter`/`→` opens the folder under the cursor and leaves it open, `←` or
+  `Backspace` closes it, everything stays indented in place, and any number of
+  folders can be open at the same time. Closing a folder also closes what was
+  open inside it, so reopening it doesn't unfold three levels nobody asked for.
+  Which folders are open isn't saved — a restored session opens the ones around
+  the request it restores, which is the answer that is right whatever was open
+  when it closed. Nesting is still unlimited, and requests still run in the
+  file's order regardless of how the tree is folded.
+
 ### Fixed
+
+- **A folder's requests are drawn under that folder.** A `.hurl` file is free to
+  interleave folders — `Auth/Login`, `Users/List`, `Auth/Logout` is a perfectly
+  ordinary import — and the tree drew each request where the file listed it, so
+  the second `Auth` request appeared below the `Users` row, apparently inside a
+  folder it is not in. Each folder's requests are now gathered under its row.
+  The order requests *run* in is unchanged: it is the file's, whatever the tree
+  looks like.
+
+- **The substitution legend reads as a legend again.** The computed-value
+  colour was labelled `computed at send` among a row of one-word labels
+  (`loaded`, `literal`, `missing`), where it was three times the width of its
+  neighbours in a pane that has none to spare. It is now `computed`; none of
+  the other labels explain their timing either.
+
+- **The terminal-background match was being read from a blank screen.** The
+  colour used to extend PaperBoy's background into the strip below the last row
+  was sampled after `Terminal::draw` returned — by which point ratatui has
+  swapped its buffers and cleared the one it hands back, so the sample was
+  always empty and the strip kept the terminal's own colour. It is now read
+  from the frame while it is still being drawn.
 
 - **The assert builder says what it is asking, and shows it in the response.**
   The dialog listed rows of `jsonpath "$…"` with nothing to say what the

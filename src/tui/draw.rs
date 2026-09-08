@@ -137,11 +137,8 @@ pub(crate) const ENV_ICON: &str = "\u{1F310}"; // 🌐
 /// `depth` on workspace rows drives `"  ".repeat(depth)` indentation in the
 /// rendered list.
 enum LeftRow {
-    Up,
-    /// Non-workspace virtual folder (title-encoded); always flat, no expand
-    /// state, rendered with FOLDER_ICON.
-    Folder(String),
-    /// Workspace filesystem folder; indented by `depth * 2` spaces and
+    /// An expandable folder: a workspace's directory on disk, or a
+    /// collection's title-encoded one. Indented by `depth * 2` spaces and
     /// rendered with an expand/collapse chevron.
     WsFolder {
         name: String,
@@ -292,12 +289,23 @@ impl LeftRow {
                 })
                 .collect()
         } else {
+            // A collection's title-encoded folders draw exactly like a
+            // workspace's real ones -- same chevron, same indentation. They
+            // behave the same way now, and a user has no reason to care that
+            // one kind is a directory and the other is a `/` in a name.
+            let entries = &col.entries;
             col.rows()
                 .into_iter()
-                .map(|r| match r {
-                    tree::Row::Up => LeftRow::Up,
-                    tree::Row::Folder(name) => LeftRow::Folder(name),
-                    tree::Row::Entry(idx) => LeftRow::Entry { idx, depth: 0 },
+                .map(|r| {
+                    let depth = r.depth(entries);
+                    match r {
+                        tree::Row::Folder { path, expanded } => LeftRow::WsFolder {
+                            name: path.last().cloned().unwrap_or_default(),
+                            depth,
+                            expanded,
+                        },
+                        tree::Row::Entry(idx) => LeftRow::Entry { idx, depth },
+                    }
                 })
                 .collect()
         }
@@ -2327,15 +2335,6 @@ pub(crate) fn draw_collection_left(
         .iter()
         .enumerate()
         .map(|(i, row)| match row {
-            LeftRow::Up => ListItem::new(Line::from(Span::styled(
-                s.list_up_row.to_string(),
-                Style::default().fg(th.dim),
-            ))),
-            // Non-workspace virtual folder (title-encoded); no indentation.
-            LeftRow::Folder(name) => ListItem::new(Line::from(Span::styled(
-                format!("{FOLDER_ICON} {name}/"),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ))),
             // Workspace filesystem folder with expand/collapse chevron and
             // depth-based indentation.
             LeftRow::WsFolder {
@@ -2577,7 +2576,7 @@ pub(crate) fn draw_collection_left(
         } else {
             items
         };
-    let mut title = if ci == 0 {
+    let title = if ci == 0 {
         s.tab_request.to_string()
     } else {
         // Unlike the tab bar (which always shows the tab's own, renameable
@@ -2595,13 +2594,9 @@ pub(crate) fn draw_collection_left(
         };
         format!("{}{}", tab_icons(col), display_name)
     };
-    // Non-workspace tabs show the current in-collection folder path as a
-    // breadcrumb (the title-encoded virtual folder from `col.folder`).
-    // Workspace tabs use a real expand/collapse tree — there is no single
-    // "current folder" to display, so the breadcrumb is omitted there.
-    if !col.is_workspace() && !col.folder.is_empty() {
-        title = format!("{title} › {}", col.folder.join(" › "));
-    }
+    // No breadcrumb on either kind of tab: both draw a real expand/collapse
+    // tree, so there is no single "current folder" to name — the open folders
+    // are on the screen, indented, saying it better than a title could.
     // A collection linked to a Global Environment shows that environment's
     // name (green, joined by a link icon) in this panel's title bar, so
     // it's visible at a glance which environment its requests will

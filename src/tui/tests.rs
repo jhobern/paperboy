@@ -15186,23 +15186,17 @@ fn collection_with_folders() -> Collection {
     )
 }
 
-/// The row index of the "Up" row in `col`'s current folder view.
-fn row_of_up(col: &Collection) -> usize {
+/// The row index of the folder row at `path` (a slash path) in `col`'s tree.
+fn row_of_folder(col: &Collection, path: &str) -> usize {
+    let want: Vec<String> = path.split('/').map(str::to_string).collect();
     col.rows()
         .iter()
-        .position(|r| matches!(r, crate::tree::Row::Up))
-        .expect("no Up row")
+        .position(|r| matches!(r, crate::tree::Row::Folder { path, .. } if *path == want))
+        .unwrap_or_else(|| panic!("no folder row {path:?}"))
 }
 
-/// The row index of the `Folder(name)` row in `col`'s current folder view.
-fn row_of_folder(col: &Collection, name: &str) -> usize {
-    col.rows()
-        .iter()
-        .position(|r| matches!(r, crate::tree::Row::Folder(n) if n == name))
-        .unwrap_or_else(|| panic!("no Folder({name}) row"))
-}
-
-/// The row index of the entry titled `title` in `col`'s current folder view.
+/// The row index of the entry titled `title`, which must be visible: a
+/// request inside a closed folder has no row at all.
 fn row_of_entry(col: &Collection, title: &str) -> usize {
     let idx = col
         .entries
@@ -15212,7 +15206,7 @@ fn row_of_entry(col: &Collection, title: &str) -> usize {
     col.rows()
         .iter()
         .position(|r| matches!(r, crate::tree::Row::Entry(i) if *i == idx))
-        .unwrap_or_else(|| panic!("entry {title:?} is not visible in the current folder"))
+        .unwrap_or_else(|| panic!("entry {title:?} is not visible: is its folder closed?"))
 }
 
 /// Arrow keys step through folder and entry rows alike, but `selected_entry`
@@ -15247,47 +15241,78 @@ fn arrows_step_through_folder_and_entry_rows_at_the_root() {
 }
 
 #[test]
-fn enter_descends_into_a_folder_and_backspace_ascends() {
+fn enter_expands_a_folder_in_place_and_backspace_collapses_it() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
-    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
+    let folder_row = row_of_folder(&app.collections[0], "A");
+    app.collections[0].list_cursor = folder_row;
 
     press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        app.collections[0].folder,
-        vec!["A".to_string()],
-        "Enter descends into the folder"
+    assert!(
+        app.collections[0].expanded.contains(&vec!["A".to_string()]),
+        "Enter opens the folder"
     );
     assert_eq!(
-        app.collections[0].list_cursor, 0,
-        "cursor resets on entering a folder"
+        app.collections[0].list_cursor, folder_row,
+        "the folder stays where it was, so the cursor does too"
     );
     assert!(
         app.overlay.is_none(),
-        "descending into a folder must not open the wizard"
+        "opening a folder must not open the wizard"
     );
+    // Its contents are now rows of their own, drawn under it.
+    assert!(row_of_entry(&app.collections[0], "A/one") > folder_row);
 
-    // Ascend back out with Backspace (a shortcut for the Up row).
     press(&mut app, KeyCode::Backspace);
     assert!(
-        app.collections[0].folder.is_empty(),
-        "Backspace ascends back to the root"
+        app.collections[0].expanded.is_empty(),
+        "Backspace closes it again"
     );
 }
 
+/// The whole point of the tree over the old breadcrumb list: opening one
+/// folder does not close another.
 #[test]
-fn enter_on_the_up_row_ascends_to_the_parent_folder() {
+fn two_folders_can_be_open_at_the_same_time() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].entries.push(HurlEntry::from_fields(
+        "C/far",
+        "GET",
+        "http://h/far",
+        vec![],
+        "",
+    ));
     app.focus = Pane::List;
-    app.collections[0].list_cursor = row_of_up(&app.collections[0]);
 
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
+    press(&mut app, KeyCode::Enter);
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "C");
+    press(&mut app, KeyCode::Enter);
+
+    // Both sets of children are on screen at once.
+    row_of_entry(&app.collections[0], "A/one");
+    row_of_entry(&app.collections[0], "C/far");
+}
+
+/// Closing a folder shuts what was open inside it, so reopening it doesn't
+/// unfold three levels the user never asked for again.
+#[test]
+fn closing_a_folder_closes_the_folders_inside_it() {
+    let mut app = TuiApp::default();
+    app.collections[0] = collection_with_folders();
+    app.focus = Pane::List;
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0]
+        .expanded
+        .insert(vec!["A".to_string(), "B".to_string()]);
+
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
     press(&mut app, KeyCode::Enter);
     assert!(
-        app.collections[0].folder.is_empty(),
-        "Enter on the Up row goes back to the root"
+        app.collections[0].expanded.is_empty(),
+        "A/B closed along with A"
     );
 }
 
@@ -15295,7 +15320,7 @@ fn enter_on_the_up_row_ascends_to_the_parent_folder() {
 fn enter_on_a_request_row_inside_a_folder_still_opens_the_edit_wizard() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
     app.collections[0].list_cursor = row_of_entry(&app.collections[0], "A/one");
     app.collections[0].selected_entry = app.collections[0]
@@ -15313,7 +15338,7 @@ fn enter_on_a_request_row_inside_a_folder_still_opens_the_edit_wizard() {
 }
 
 #[test]
-fn delete_is_a_no_op_on_a_folder_or_up_row() {
+fn delete_is_a_no_op_on_a_folder_row() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
@@ -15328,21 +15353,18 @@ fn delete_is_a_no_op_on_a_folder_or_up_row() {
         "deleting a folder row is a no-op"
     );
 
-    app.collections[0].folder = vec!["A".to_string()];
-    app.collections[0].list_cursor = row_of_up(&app.collections[0]);
+    // And on a nested folder row, reached by opening its parent.
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A/B");
     press(&mut app, KeyCode::Char('x'));
-    assert_eq!(
-        app.collections[0].entries.len(),
-        before,
-        "deleting the Up row is a no-op"
-    );
+    assert_eq!(app.collections[0].entries.len(), before);
 }
 
 #[test]
-fn delete_removes_a_request_row_while_browsing_a_folder() {
+fn delete_removes_a_request_row_inside_an_open_folder() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
     app.collections[0].list_cursor = row_of_entry(&app.collections[0], "A/one");
     app.collections[0].selected_entry = app.collections[0]
@@ -15373,7 +15395,7 @@ fn delete_removes_a_request_row_while_browsing_a_folder() {
 }
 
 #[test]
-fn requests_list_breadcrumb_shows_the_current_folder() {
+fn the_requests_list_draws_open_folders_indented_in_place() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let th = super::theme::theme(&Language::English);
@@ -15381,25 +15403,38 @@ fn requests_list_breadcrumb_shows_the_current_folder() {
 
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0]
+        .expanded
+        .insert(vec!["A".to_string(), "B".to_string()]);
     app.focus = Pane::List;
 
     let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 0, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
+    let line = |needle: &str| {
+        out.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{out}"))
+            .to_string()
+    };
+    let indent = |l: &str| l.trim_start_matches(['│', ' ']).len();
+    let (a, b, deep) = (line(" A"), line(" B"), line("deep"));
     assert!(
-        out.contains("A") && out.contains("B"),
-        "the breadcrumb shows the nested folder path:\n{out}"
+        indent(&a) > indent(&b) && indent(&b) > indent(&deep),
+        "each level is drawn one step further in:\n{out}"
     );
 }
 
 #[test]
-fn new_request_prefills_the_current_folder_in_the_name_field() {
+fn new_request_prefills_the_folder_under_the_cursor_in_the_name_field() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
+    // Pointing at the A/B folder row: a new request belongs in it.
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A/B");
 
     press(&mut app, KeyCode::Char('n'));
     match &app.overlay {
@@ -15407,7 +15442,7 @@ fn new_request_prefills_the_current_folder_in_the_name_field() {
             assert_eq!(
                 form.name.text(),
                 "A/B/",
-                "the Name field is prefilled with the current folder"
+                "the Name field is prefilled with the folder under the cursor"
             );
         }
         _ => panic!("expected the New Request form to open"),
@@ -15415,11 +15450,12 @@ fn new_request_prefills_the_current_folder_in_the_name_field() {
 }
 
 #[test]
-fn persisted_state_resyncs_the_folder_view_after_reload() {
+fn persisted_state_reopens_the_folders_around_the_selected_request() {
     // A persisted collection whose `selected_entry` points at a deeply
-    // nested request must resync `folder`/`list_cursor` on load, so the
-    // Requests list opens already browsing the right folder instead of
-    // showing the root view with a stale cursor.
+    // nested request must reopen the folders around it on load, so the
+    // Requests list shows the selected row instead of a closed tree with a
+    // stale cursor. The open set itself is never persisted -- it is derived
+    // from the selection, which is.
     let mut col = collection_with_folders();
     col.selected_entry = col
         .entries
@@ -15428,13 +15464,23 @@ fn persisted_state_resyncs_the_folder_view_after_reload() {
         .unwrap();
     // Simulate a fresh load where the view-layer fields haven't been
     // computed yet (as if freshly deserialized).
-    col.folder = vec![];
+    col.expanded.clear();
     col.list_cursor = 0;
 
     let persisted = crate::persistence::PersistedTab::from_collection(&col, None);
     let (restored, _pending) = persisted.into_collection(None);
 
-    assert_eq!(restored.folder, vec!["A".to_string(), "B".to_string()]);
+    assert!(restored.expanded.contains(&vec!["A".to_string()]));
+    assert!(
+        restored
+            .expanded
+            .contains(&vec!["A".to_string(), "B".to_string()])
+    );
+    assert_eq!(
+        restored.rows().get(restored.list_cursor),
+        Some(&crate::tree::Row::Entry(restored.selected_entry)),
+        "and the cursor is on the selected request"
+    );
 }
 
 #[test]
@@ -32305,9 +32351,9 @@ fn reordering_inside_a_folder_steps_over_requests_from_other_folders() {
         entry_named("Users/List"),
         entry_named("Auth/Logout"),
     ];
-    // Browse into Auth, where the rows are Up, Login, Logout.
-    app.collections[ci].folder = vec!["Auth".into()];
-    app.collections[ci].list_cursor = 2; // Logout
+    // Open Auth, where the rows are Auth, Login, Logout, Users.
+    app.collections[ci].expanded.insert(vec!["Auth".into()]);
+    app.collections[ci].list_cursor = row_of_entry(&app.collections[ci], "Auth/Logout");
     app.collections[ci].selected_entry = 2;
     app.focus = Pane::List;
 
@@ -32443,10 +32489,11 @@ fn clearing_the_filter_follows_the_request_that_was_found() {
 
     press(&mut app, KeyCode::Esc);
 
-    assert_eq!(
-        app.collections[ci].folder,
-        vec!["Auth".to_string()],
-        "the list is now browsing the folder the match lives in"
+    assert!(
+        app.collections[ci]
+            .expanded
+            .contains(&vec!["Auth".to_string()]),
+        "the folder the match lives in has been opened around it"
     );
     assert_eq!(app.collections[ci].selected_entry, 1);
     let cursor = app.collections[ci].list_cursor;

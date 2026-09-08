@@ -414,12 +414,15 @@ pub struct Collection {
     /// Values captured from responses (Hurl `[Captures]`), available as
     /// `{{ name }}` in subsequent requests. Runtime-only (not persisted).
     pub captures: HashMap<String, String>,
-    /// The folder currently being browsed in the Requests list, encoded as a
-    /// breadcrumb path (root = empty). Requests are grouped into folders by
-    /// splitting their `title` on `/` (see [`crate::tree`]) — this is purely
-    /// view state, never persisted, and is kept in sync with `selected_entry`
-    /// whenever it changes outside of normal list navigation.
-    pub folder: Vec<String>,
+    /// The folders currently open in the Requests list, each as a full path
+    /// from the root. Requests are grouped into folders by splitting their
+    /// `title` on `/` (see [`crate::tree`]).
+    ///
+    /// Purely view state, never persisted: a restored session re-derives it
+    /// from the selected request, which is the one folder the user is
+    /// guaranteed to want open. Anything else would either hide what they were
+    /// looking at or restore a shape of the tree they had since left behind.
+    pub expanded: HashSet<Vec<String>>,
     /// Index into the current folder's rows (see [`crate::tree::rows_for`]),
     /// i.e. which row is highlighted in the Requests list. Not persisted.
     pub list_cursor: usize,
@@ -624,7 +627,7 @@ impl Collection {
             request_json_buf: String::new(),
             request_json_for: None,
             captures: HashMap::new(),
-            folder: Vec::new(),
+            expanded: HashSet::new(),
             list_cursor: 0,
             list_query: String::new(),
             list_sort: tree::SortMode::default(),
@@ -677,17 +680,51 @@ impl Collection {
         self.request_json_for = None;
     }
 
-    /// The rows to show in the Requests list: the folder currently being
-    /// browsed, or — while a filter is typed — every match across the whole
-    /// collection.
+    /// The rows to show in the Requests list: the folder tree with whatever is
+    /// open in it, or — while a filter is typed — every match across the whole
+    /// collection, flat.
+    ///
+    /// Only the flat list is sorted. A tree sorted as one sequence would tear
+    /// requests away from the folders they are drawn under; the GUI sorts its
+    /// own tree a level at a time, and the terminal UI leaves the order the
+    /// file's, which is the order Run All uses.
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows = if self.list_filter_active() {
-            tree::rows_matching(&self.entries, &self.list_query)
+        if self.list_filter_active() {
+            let mut rows = tree::rows_matching(&self.entries, &self.list_query);
+            tree::sort_rows(&mut rows, &self.entries, self.list_sort);
+            return rows;
+        }
+        tree::rows_for(&self.entries, &self.expanded)
+    }
+
+    /// The folder a new request made from the list should land in: the folder
+    /// under the cursor, or the one holding the request under it.
+    ///
+    /// The old breadcrumb model had one obvious answer -- the folder being
+    /// browsed. In a tree the answer is what the cursor is pointing at, which
+    /// is the same thing anyone looking at the screen would say.
+    pub fn cursor_folder(&self) -> Vec<String> {
+        match self.rows().get(self.list_cursor) {
+            Some(Row::Folder { path, .. }) => path.clone(),
+            Some(Row::Entry(i)) => tree::folder_of(&self.entries, *i),
+            None => Vec::new(),
+        }
+    }
+
+    /// Open or close the folder at `path`, closing every folder inside it too.
+    ///
+    /// Collapsing a folder shuts what was open within it rather than
+    /// remembering it: reopening a folder to find three levels of it already
+    /// unfolded is not what "open this folder" means, and the memory would be
+    /// invisible state the user cannot see to correct.
+    pub fn toggle_folder(&mut self, path: &[String]) {
+        let path = path.to_vec();
+        if self.expanded.remove(&path) {
+            self.expanded
+                .retain(|open| !(open.len() > path.len() && open[..path.len()] == path[..]));
         } else {
-            tree::rows_for(&self.entries, &self.folder)
-        };
-        tree::sort_rows(&mut rows, &self.entries, self.list_sort);
-        rows
+            self.expanded.insert(path);
+        }
     }
 
     /// How many rows the left-hand list pane is showing, whichever kind of tab
@@ -1706,21 +1743,29 @@ impl Collection {
                 .min(self.entries.len().saturating_sub(1));
             self.selected_entry = idx;
             if !self.entries.is_empty() {
-                self.folder = tree::folder_of(&self.entries, idx);
+                self.reveal(idx);
             }
             self.sync_ws_cursor();
             return;
         }
         if self.entries.is_empty() {
-            self.folder = Vec::new();
+            self.expanded.clear();
             self.list_cursor = 0;
             return;
         }
         let idx = self.selected_entry.min(self.entries.len() - 1);
         self.selected_entry = idx;
-        self.folder = tree::folder_of(&self.entries, idx);
+        self.reveal(idx);
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
+    }
+
+    /// Open every folder above `entries[idx]`, so a request that is selected
+    /// is a request that can be seen. Nothing else is closed: the user's other
+    /// open folders are theirs.
+    pub fn reveal(&mut self, idx: usize) {
+        self.expanded
+            .extend(tree::ancestors_of(&tree::folder_of(&self.entries, idx)));
     }
 
     /// Remove the entry at `idx`, recording it (with the index it came from)

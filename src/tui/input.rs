@@ -2136,12 +2136,10 @@ impl TuiApp {
             // A no-op on a tab that isn't Workspace-bound (creating a new
             // Workspace tab is only done via File → Load → "(W)orkspace…").
             KeyCode::Char('w') => self.open_workspace_picker_for_active_tab(),
-            // Backspace is a shortcut for Enter on the Requests list's "up"
-            // row: go up a folder without needing it highlighted first.
-            KeyCode::Backspace
-                if self.focus == Pane::List
-                    && !self.collections[self.active_tab].folder.is_empty() =>
-            {
+            // Backspace closes the folder the cursor is in and moves onto its
+            // row -- the way out of a folder, now that there is no "up" row to
+            // press Enter on.
+            KeyCode::Backspace if self.focus == Pane::List && self.list_can_go_up() => {
                 self.list_folder_up(self.active_tab);
             }
             KeyCode::Char('n') => {
@@ -2171,7 +2169,7 @@ impl TuiApp {
                 // Prefill the Name field with the folder currently being
                 // browsed, so saving without editing it creates the request
                 // right where the user is looking, e.g. "Auth/" + typed name.
-                let folder = &self.collections[self.active_tab].folder;
+                let folder = &self.collections[self.active_tab].cursor_folder();
                 if !folder.is_empty() {
                     form.name = Editor::new(&format!("{}/", folder.join("/")), false);
                 }
@@ -2231,6 +2229,15 @@ impl TuiApp {
                 let ci = self.active_tab;
                 if self.collections[ci].is_workspace() {
                     self.on_left_workspace_list(ci);
+                } else if self.list_on_open_folder(ci) || self.list_hscroll == 0 {
+                    // A folder closes; a request scrolls its URL back to the
+                    // start and only then steps out of the folder it is in.
+                    // Both are what Left means where the cursor is: there is
+                    // nothing to scroll on a folder row, and a URL scrolled
+                    // half-way is exactly what the user is reading.
+                    if self.list_can_go_up() {
+                        self.list_folder_up(ci);
+                    }
                 } else {
                     self.scroll_list_h(-4);
                 }
@@ -2241,6 +2248,23 @@ impl TuiApp {
                 // collection), matching a file browser; otherwise it
                 // horizontally scrolls the selected request's URL.
                 let ci = self.active_tab;
+                // On an ordinary tab, Right opens the folder under the cursor
+                // -- the mirror of Left, and what a file tree does -- and
+                // scrolls the URL anywhere else.
+                if !self.collections[ci].is_workspace() {
+                    let col = &self.collections[ci];
+                    if let Some(crate::tree::Row::Folder {
+                        path,
+                        expanded: false,
+                    }) = col.rows().get(col.list_cursor)
+                    {
+                        let path = path.clone();
+                        self.list_folder_toggle(ci, path);
+                    } else {
+                        self.scroll_list_h(4);
+                    }
+                    return;
+                }
                 let col = &self.collections[ci];
                 let row = col
                     .is_workspace()
@@ -2986,18 +3010,62 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Ascend to the parent folder in the Requests list (Enter on the "up" row).
-    fn list_folder_up(&mut self, ci: usize) {
-        let col = &mut self.collections[ci];
-        col.folder.pop();
-        col.list_cursor = 0;
+    /// Whether the Requests-list cursor is sitting on an *open* folder row.
+    fn list_on_open_folder(&self, ci: usize) -> bool {
+        let col = &self.collections[ci];
+        matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Folder { expanded: true, .. })
+        )
     }
 
-    /// Descend into a subfolder in the Requests list (Enter on a folder row).
-    fn list_folder_down(&mut self, ci: usize, name: String) {
+    /// Whether the cursor is somewhere there is a folder to close: inside one,
+    /// or on an open one.
+    fn list_can_go_up(&self) -> bool {
+        let col = &self.collections[self.active_tab];
+        if col.is_workspace() || col.list_filter_active() {
+            return false;
+        }
+        !col.cursor_folder().is_empty()
+    }
+
+    /// Close the folder the cursor is in, and put the cursor on it.
+    ///
+    /// Left (and Backspace) on a row inside a folder closes the folder *around*
+    /// it rather than the row's own -- which is what "go up" meant in the old
+    /// breadcrumb list and what a file tree does everywhere else. On an open
+    /// folder row it closes that folder instead, since that is the folder the
+    /// cursor is pointing at.
+    fn list_folder_up(&mut self, ci: usize) {
         let col = &mut self.collections[ci];
-        col.folder.push(name);
-        col.list_cursor = 0;
+        let on_open_folder = matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Folder { expanded: true, .. })
+        );
+        let folder = col.cursor_folder();
+        let target = if on_open_folder {
+            folder
+        } else {
+            let mut up = folder;
+            up.pop();
+            up
+        };
+        if target.is_empty() {
+            return;
+        }
+        col.toggle_folder(&target);
+        // The folder just closed is where the cursor belongs: its contents,
+        // wherever the cursor was among them, are no longer on the screen.
+        col.list_cursor = col
+            .rows()
+            .iter()
+            .position(|r| matches!(r, crate::tree::Row::Folder { path, .. } if *path == target))
+            .unwrap_or(0);
+    }
+
+    /// Open or close the folder under the cursor, leaving the cursor on it.
+    fn list_folder_toggle(&mut self, ci: usize, path: Vec<String>) {
+        self.collections[ci].toggle_folder(&path);
     }
 
     /// Handle Enter on a Workspace tab's file-tree list row.
@@ -3604,8 +3672,10 @@ impl TuiApp {
                     .rows()
                     .get(self.collections[ci].list_cursor)
                 {
-                    Some(crate::tree::Row::Up) => self.list_folder_up(ci),
-                    Some(crate::tree::Row::Folder(name)) => self.list_folder_down(ci, name.clone()),
+                    Some(crate::tree::Row::Folder { path, .. }) => {
+                        let path = path.clone();
+                        self.list_folder_toggle(ci, path);
+                    }
                     Some(crate::tree::Row::Entry(_)) => {
                         // Entering a request focuses the panel showing it and
                         // opens the edit wizard (same as pressing Enter again
