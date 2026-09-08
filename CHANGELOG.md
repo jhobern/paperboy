@@ -240,7 +240,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   bottom is not addressable — it kept the emulator's own background under an
   otherwise themed screen. PaperBoy now tells the terminal what its background
   is (OSC 11), updates it whenever the theme changes, and puts it back on exit
-  and on a panic. Terminals that don't implement it are unaffected.
+  and on a panic. The colour sent is the one on the bottom row of the frame —
+  the footer's panel shade — rather than the theme's window background, which
+  this layout covers everywhere and so never actually shows. Terminals that
+  don't implement it are unaffected, and the emulator's own scrollbar is its
+  chrome and stays in its own colours.
 
 - **Postman deep-equality assertions carry across.**
   `pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' })` is an

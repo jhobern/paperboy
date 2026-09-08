@@ -67,11 +67,14 @@ pub fn run() -> io::Result<()> {
     }));
     let mut terminal_bg: Option<(u8, u8, u8)> = None;
     let result = loop {
-        // Before the frame, so the strip and the screen change together.
-        term_bg::sync(app.theme().bg, &mut terminal_bg);
         if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
             break Err(e);
         }
+        // After the frame, because the colour to match is the one that was
+        // just drawn on the bottom row -- the footer's `panel`, not the
+        // theme's `bg`, which nothing in this layout leaves uncovered.
+        let bottom = term_bg::bottom_row_bg(terminal.current_buffer_mut());
+        term_bg::sync(bottom, &mut terminal_bg);
         // Apply any background secret-resolution results (non-blocking).
         app.poll_env_updates();
         // Apply completed response captures so later requests can use them.
