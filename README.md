@@ -338,6 +338,11 @@ character outside `A-Za-z0-9_-` and discards the rest silently, so
 `{{ hmac_sha256(K, M) }}` would be sent as the value of `hmac_sha256`. PaperBoy
 now refuses to save such a placeholder rather than let it truncate.
 
+The block may sit above the request line, as here, or immediately below it;
+both are read. PaperBoy writes it below when it saves, so a hand-written file
+in the other order moves its block down the first time it is saved and is
+otherwise unchanged.
+
 A bare identifier is a variable reference — an environment variable, a request
 parameter, or an earlier row in the same block. Calls nest. Rows are evaluated
 in order and a row may only refer to one above it. Values are computed per run,
@@ -358,6 +363,18 @@ one variable set, so there the two share the first request's value — a
 signature computed over another request's nonce. Both front-ends say so before
 starting such a run, and `--batch` prints the warning too; the fix is usually
 to not use batch.
+
+The same applies to a name the environment already defines. Running one request
+at a time, a block's value overrides the environment's from that request
+onwards; a batch has one variable set for the whole file, so it cannot override
+from partway through without changing what the *earlier* requests send. Batch
+therefore leaves the environment's value in place and says which names it
+did that to.
+
+`counter` counts within the process, not within a run: it starts at 1 the first
+time it is evaluated and keeps going for as long as PaperBoy is open, so sending
+the same request three times gives 1, 2, 3. It is a sequence, not a setting, and
+is not saved — a restarted PaperBoy counts from 1 again.
 
 Edit the block in the request wizard's **Computed** section (`Alt+0`), in the
 GUI editor's **Computed** tab, or as text. Both editors offer the functions as

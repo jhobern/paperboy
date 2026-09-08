@@ -322,6 +322,69 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   allowed — building a request that the check above then refuses to send. It is
   now held to the same rule at the point the name is typed.
 
+- **An assert built from a response is one stock `hurl` can read.** A field
+  name holding a quote, a backslash or a newline was escaped for the Hurl
+  string but not for the jsonpath inside it, so a capture on `a"b` produced a
+  file that either refused to parse or — worse — parsed into a query for a key
+  that is not there and quietly matched nothing. A response value containing
+  `{` was another: written literally, it became a Hurl template, and the
+  request asserted against whatever that template expanded to. Both are now
+  escaped at both layers, and every generated line is parsed back with Hurl's
+  own parser as part of the test suite.
+
+- **A number in exponent notation is asserted as the number.** A response
+  saying `1e3` produced `jsonpath "$.n" == 1e3`, which Hurl does not read as a
+  number; the value is now written out in full. Something too large to spell
+  that way offers `exists` instead of an `==` that would quietly assert a
+  rounded value the server never sent.
+
+- **"Revert to saved" reverts the request you asked for.** It matched by
+  position in the list, so reverting after adding, deleting or reordering
+  anything restored a *different* request's text over the selected one. It now
+  resolves the request through the identity it was loaded with, and declines —
+  saying so — where that is ambiguous, such as an unsaved duplicate that still
+  shares its original's identity.
+
+- **The Postman importer no longer mis-reads the scripts it converts.** The
+  pass over a script's JavaScript was defeated by ordinary code: a regex
+  literal containing a brace ended the enclosing block early, so whole folders
+  of assertions were silently dropped — importing a real 98-request collection
+  now yields 46 asserts where it yielded 16. A string containing an escaped
+  quote ended in the wrong place, taking the rest of the statement with it.
+  Assertions inside a condition were taken as unconditional in several shapes
+  the earlier check missed, which is exactly the case that imports as a request
+  failing whichever way the response goes. And the notes explaining what was
+  dropped are attributed to the script that actually contained it.
+
+- **A generator can no longer hang or crash the run that evaluates it.** A row
+  referring to itself, directly or around a cycle, recursed until the stack ran
+  out; nesting is now bounded and reported as the error it is. `timestamp`
+  arithmetic that overflowed panicked rather than complaining. And a `# [Gen]`
+  block written above its request line — the layout this README's own example
+  uses — was parsed into the *previous* request's title; both positions are now
+  read, and the block is written below the line on save.
+
+- **The assert/capture palette says what it needs and shows where it is.**
+  `a` with nothing to build from reported "No response to save.", which is
+  about a file rather than about the request that has not been sent yet. A key
+  with nothing to do on the palette's second step used to close the palette and
+  leak the *next* keystroke into the main view, so typing "contains" out of
+  habit threw away the field just chosen and opened the New Request wizard on
+  the `n`. A list longer than its box now says how far down it is, `a` is
+  advertised in the Response footer where it works, and capturing a field that
+  is already captured offers the name it already has rather than writing the
+  same jsonpath under a second one.
+
+- **A run reports every pre-flight warning, not just the first.** A broken
+  generator hid a batch collision behind it, so fixing what the status line
+  complained about surfaced the next problem and the same run failed twice over
+  one set of mistakes.
+
+- **The request list marks the requests that compute values**, and the wizard's
+  computed-error line ends in an ellipsis rather than being cut mid-sentence by
+  the edge of a narrow terminal — a truncated "unknown function" reads as a
+  different, shorter complaint.
+
 
 ## [0.5.4] - 2026-09-04
 
