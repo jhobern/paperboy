@@ -67,13 +67,19 @@ pub fn run() -> io::Result<()> {
     }));
     let mut terminal_bg: Option<(u8, u8, u8)> = None;
     let result = loop {
-        if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
+        // The colour to match is the one on the bottom row of the frame -- the
+        // footer's `panel`, not the theme's `bg`, which nothing in this layout
+        // leaves uncovered. Read *inside* the closure: `draw` swaps the two
+        // buffers on its way out and clears the one it hands back, so asking
+        // the terminal for its current buffer afterwards yields a blank screen
+        // and a colour of `Reset`.
+        let mut bottom = ratatui::style::Color::Reset;
+        if let Err(e) = terminal.draw(|f| {
+            draw(f, &mut app);
+            bottom = term_bg::bottom_row_bg(f.buffer_mut());
+        }) {
             break Err(e);
         }
-        // After the frame, because the colour to match is the one that was
-        // just drawn on the bottom row -- the footer's `panel`, not the
-        // theme's `bg`, which nothing in this layout leaves uncovered.
-        let bottom = term_bg::bottom_row_bg(terminal.current_buffer_mut());
         term_bg::sync(bottom, &mut terminal_bg);
         // Apply any background secret-resolution results (non-blocking).
         app.poll_env_updates();

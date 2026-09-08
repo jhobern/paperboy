@@ -140,6 +140,36 @@ mod tests {
         );
     }
 
+    /// Where the colour is read from is load-bearing: `Terminal::draw` swaps
+    /// its two buffers on the way out and clears the one it then calls
+    /// "current", so reading the bottom row *after* the draw returns a blank
+    /// screen -- every cell `Reset`, nothing worth sending, and the strip left
+    /// in the emulator's own colour. It has to be read inside the closure,
+    /// from the frame's own buffer.
+    #[test]
+    fn the_colour_must_be_read_from_the_frame_not_from_the_terminal_after() {
+        use ratatui::widgets::Block;
+        use ratatui::{Terminal, backend::TestBackend};
+        let panel = Color::Rgb(31, 35, 40);
+        let mut term = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let mut inside = Color::Reset;
+        term.draw(|f| {
+            f.render_widget(
+                Block::default().style(ratatui::style::Style::default().bg(panel)),
+                f.area(),
+            );
+            inside = bottom_row_bg(f.buffer_mut());
+        })
+        .unwrap();
+        assert_eq!(inside, panel, "the frame's own bottom row was not read");
+        assert_eq!(
+            bottom_row_bg(term.current_buffer_mut()),
+            Color::Reset,
+            "the post-draw buffer has stopped being blank -- the comment above \
+             (and the reason for reading inside the closure) needs revisiting"
+        );
+    }
+
     /// The strip has to follow a theme change, or switching themes leaves the
     /// bottom of the window in the previous one -- the same bug, one theme
     /// late. Equally, an unchanged theme must not write an escape sequence
