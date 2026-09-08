@@ -443,18 +443,7 @@ impl WizardTab {
 /// function could ever be completed inside `base64(sha│)`. The GUI's
 /// `insert_call` scans from the caret for the same reason.
 fn gen_word(text: &str, col: usize) -> (usize, usize, String) {
-    let chars: Vec<char> = text.chars().collect();
-    let at = col.min(chars.len());
-    let is_word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
-    let mut start = at;
-    while start > 0 && is_word(&chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = at;
-    while end < chars.len() && is_word(&chars[end]) {
-        end += 1;
-    }
-    (start, end, chars[start..end].iter().collect())
+    crate::generators::word_at(text, Some(col))
 }
 
 /// What accepting function `f` puts in the cell in place of the word at the
@@ -468,11 +457,7 @@ fn gen_word(text: &str, col: usize) -> (usize, usize, String) {
 /// Reading `min_args` instead of parsing `signature` keeps this in step with
 /// the GUI even if a signature is ever reworded.
 fn gen_completion(f: &crate::generators::GenFunction) -> (String, usize) {
-    if f.min_args == 0 {
-        (f.name.to_string(), f.name.chars().count())
-    } else {
-        (format!("{}()", f.name), f.name.chars().count() + 1)
-    }
+    crate::generators::completion(f)
 }
 
 const KEY_DROPDOWN: u64 = 1;
@@ -1190,20 +1175,9 @@ impl NewReq {
         let row = self.generators.get(i)?;
         let text = row.expr.text();
         let word = gen_word(&text, row.expr.col).2;
-        if word.is_empty() && !self.gen_browse {
-            return None;
-        }
-        // Each function's signature, then any ready-made calls it offers --
-        // `date(format)` names its argument without saying what a format looks
-        // like, and a whole working call is the answer to that.
-        let sugs: Vec<&'static str> = crate::generators::functions_starting_with(&word)
-            .flat_map(|f| std::iter::once(f.signature).chain(f.examples.iter().copied()))
-            .collect();
-        // A name already typed in full has nothing left to offer, and a
-        // dropdown that will not close reads as the editor refusing to accept
-        // what was typed.
-        let done = sugs.len() == 1 && crate::generators::is_function(&word);
-        (!sugs.is_empty() && !done).then_some((i, sugs))
+        // The list itself is `generators::suggestions_for_word`, shared with
+        // the GUI so the two front-ends offer the same thing at the same time.
+        crate::generators::suggestions_for_word(&word, self.gen_browse).map(|sugs| (i, sugs))
     }
 
     /// The suggestion dropdown for the focused Key cell, if it should be shown:
@@ -1242,16 +1216,13 @@ impl NewReq {
                 // caret after it: there is no argument left to type, so
                 // dropping the caret into the middle of a finished call would
                 // only be in the way.
-                let picked = crate::generators::FUNCTIONS
-                    .iter()
-                    .find(|f| f.signature == name)
-                    .map(|f| gen_completion(f))
-                    .or_else(|| {
-                        crate::generators::FUNCTIONS
-                            .iter()
-                            .find(|f| f.examples.contains(&name))
-                            .map(|_| (name.to_string(), name.chars().count()))
-                    });
+                let picked = crate::generators::function_for_suggestion(name).map(|f| {
+                    if f.signature == name {
+                        gen_completion(f)
+                    } else {
+                        (name.to_string(), name.chars().count())
+                    }
+                });
                 let Some((call, caret)) = picked else {
                     return;
                 };

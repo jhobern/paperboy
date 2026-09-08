@@ -218,9 +218,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   beside an expression was labelled `Function…` and floated in the middle of
   the row, which reads as a command that *replaces* the field. It doesn't: it
   inserts at the caret, which is what makes it useful while building a call
-  inside a call. It is now `ƒ Insert…`, drawn against the field in the field's
-  own colour so the two read as one control, and its hover text says the
-  insertion happens where the caret is.
+  inside a call. It is now drawn against the field in the field's own colour so
+  the two read as one control, and its hover text says what it offers.
+
+- **Typing in a generated-value expression offers the functions that match.**
+  Thirty-five functions is more than a menu is good for: you have to recognise
+  the name you want in a list, when what you actually have in mind is the first
+  three letters of it. The desktop expression field now completes as you type,
+  exactly as the terminal wizard's already did — the same list, from the same
+  table, so the two front-ends cannot drift. ↑↓ move through it, Enter or Tab
+  accepts, Esc puts it away without leaving the field, and the list follows the
+  *word the caret is in*, so completing the inner call of `base64(up` does not
+  throw the outer one away. The button beside the field is now a bare `ƒ`, for
+  when you want to browse everything rather than filter.
 
 ### Fixed
 

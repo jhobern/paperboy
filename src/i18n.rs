@@ -956,8 +956,8 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
-    gui_generated_functions => "Insert a function call where the caret is", "Insère un appel de fonction à l'emplacement du curseur", "Indsætter et funktionskald hvor markøren står";
-    gui_generated_fn_button => "\u{192} Insert…", "\u{192} Insérer…", "\u{192} Indsæt…";
+    gui_generated_functions => "All the functions. Typing in the field offers the ones that match.", "Toutes les fonctions. La saisie dans le champ propose celles qui correspondent.", "Alle funktionerne. Når du skriver i feltet, foreslås dem der passer.";
+    gui_generated_fn_button => "\u{192}", "\u{192}", "\u{192}";
     gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
     gui_generated_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_generated_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs générées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der genereres hver gang anmodningen sendes, brugt som {{ name }}";

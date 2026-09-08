@@ -950,6 +950,16 @@ pub fn computed_editor(
                         .visuals()
                         .text_edit_bg_color
                         .unwrap_or(ui.visuals().extreme_bg_color);
+                    // The completion list for what is being typed, worked out
+                    // *before* the field is drawn: its keys (↑↓, Enter, Esc)
+                    // have to be taken out of the queue before the `TextEdit`
+                    // gets them, or Up and Down move the caret instead of the
+                    // selection.
+                    let mut sugg = suggest_state(ui, expr_id, &rows[i].1);
+                    if sugg.take_keys(ui) {
+                        changed = true;
+                    }
+                    sugg.apply(ui.ctx(), expr_id, &mut rows[i].1);
                     let field = wrapping_field_font_id(
                         ui,
                         val_w,
@@ -960,6 +970,9 @@ pub fn computed_editor(
                         Some(expr_id),
                     );
                     if field.changed() {
+                        changed = true;
+                    }
+                    if sugg.show(ui, theme, &field, expr_id, &mut rows[i].1) {
                         changed = true;
                     }
                     // The button is drawn flush against the field's right edge
@@ -1079,6 +1092,224 @@ pub fn computed_editor(
 
 /// Write `f`'s call into the text field `id`, at the caret, with the caret left
 /// between the brackets ready for the first argument.
+/// The state of one expression field's completion list, for the frame being
+/// drawn.
+///
+/// A struct rather than a handful of locals because the work is split either
+/// side of the field: the keys have to be taken before the `TextEdit` is added
+/// (or ↑↓ move the caret instead of the selection) while the popup can only be
+/// placed once there is a field rect to hang it under.
+#[derive(Clone)]
+struct Suggest {
+    /// The field the list belongs to.
+    id: egui::Id,
+    /// Whether the field had focus on the previous frame, which is how an
+    /// Escape that egui has already acted on is recognised (see below).
+    had_focus: bool,
+    /// The word the caret is in, which is what the list is filtered by.
+    word: String,
+    /// The rows on offer: signatures, each followed by its ready-made calls.
+    rows: Vec<&'static str>,
+    /// Which row is highlighted.
+    sel: usize,
+    /// The word the user dismissed the list for. Kept as the *word* rather than
+    /// a flag so typing another character brings the list back: Esc means "not
+    /// for this", not "never again".
+    dismissed_for: Option<String>,
+    /// A row accepted by the keyboard this frame, to write into the field
+    /// before it is drawn so the change is on screen immediately.
+    accepted: Option<&'static str>,
+}
+
+impl Default for Suggest {
+    fn default() -> Self {
+        Self {
+            id: egui::Id::NULL,
+            had_focus: false,
+            word: String::new(),
+            rows: Vec::new(),
+            sel: 0,
+            dismissed_for: None,
+            accepted: None,
+        }
+    }
+}
+
+/// Where the caret is in the field with `id`, if egui knows.
+fn caret_of(ctx: &egui::Context, id: egui::Id) -> Option<usize> {
+    let state = egui::TextEdit::load_state(ctx, id)?;
+    state.cursor.char_range().map(|r| r.primary.index.0)
+}
+
+/// Read (and re-derive) the completion state for the expression field `id`.
+///
+/// Only ever offered while the field has focus: a list hanging under a field
+/// nobody is typing in is in the way of the row below it.
+fn suggest_state(ui: &egui::Ui, id: egui::Id, text: &str) -> Suggest {
+    let mut st: Suggest = ui
+        .data(|d| d.get_temp::<Suggest>(id.with("suggest")))
+        .unwrap_or_default();
+    st.accepted = None;
+    st.id = id;
+    let mut focused = ui.memory(|m| m.has_focus(id));
+    // egui takes a text field's focus away on Escape at the start of the pass,
+    // before any widget runs -- so a key consumed here is consumed too late,
+    // and the list would close only as a side effect of the field going quiet.
+    // Recognise that case from the outside (focus was here last frame, is gone
+    // this frame, and Escape was pressed) and put it back: Escape while the
+    // list is up means "not this suggestion", not "stop typing". A second
+    // Escape, with the list closed, leaves the field the usual way.
+    if !focused && st.had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.ctx().memory_mut(|m| m.request_focus(id));
+        focused = true;
+        st.dismissed_for = Some(crate::generators::word_at(text, caret_of(ui.ctx(), id)).2);
+    }
+    st.had_focus = focused;
+    st.word = crate::generators::word_at(text, caret_of(ui.ctx(), id)).2;
+    // The same list, from the same table, as the terminal wizard's dropdown.
+    st.rows = if focused {
+        crate::generators::suggestions_for_word(&st.word, false).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if st.dismissed_for.as_deref() != Some(st.word.as_str()) {
+        st.dismissed_for = None;
+    }
+    st.sel = st.sel.min(st.rows.len().saturating_sub(1));
+    st
+}
+
+impl Suggest {
+    /// Whether the list is on screen, and so owns its keys.
+    fn open(&self) -> bool {
+        !self.rows.is_empty() && self.dismissed_for.is_none()
+    }
+
+    /// Take the keys the list answers to out of the queue before the field can
+    /// read them. Returns whether a row was accepted.
+    ///
+    /// Enter and Tab both accept: Enter is what the terminal wizard uses, and
+    /// Tab is what every other completion in every other editor uses. The field
+    /// is a multiline `TextEdit` with `return_key(None)`, so neither is being
+    /// stolen from anything.
+    fn take_keys(&mut self, ui: &egui::Ui) -> bool {
+        if !self.open() {
+            return false;
+        }
+        let n = self.rows.len();
+        let (mut down, mut up, mut accept, mut dismiss) = (false, false, false, false);
+        ui.input_mut(|i| {
+            use egui::{Key, Modifiers};
+            down = i.consume_key(Modifiers::NONE, Key::ArrowDown);
+            up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
+            accept = i.consume_key(Modifiers::NONE, Key::Enter)
+                || i.consume_key(Modifiers::NONE, Key::Tab);
+            dismiss = i.consume_key(Modifiers::NONE, Key::Escape);
+        });
+        if down {
+            self.sel = (self.sel + 1) % n;
+        }
+        if up {
+            self.sel = (self.sel + n - 1) % n;
+        }
+        if dismiss {
+            self.dismissed_for = Some(self.word.clone());
+            // egui surrenders a text field's focus on Escape before any widget
+            // runs, so consuming the key here is not enough -- the focus has
+            // already gone by the time we see it. Ask for it back: Escape while
+            // the list is up means "not this suggestion", not "stop typing".
+            // A second Escape, with the list closed, leaves the field as usual.
+            ui.ctx().memory_mut(|m| m.request_focus(self.id));
+        }
+        if accept {
+            self.accepted = self.rows.get(self.sel).copied();
+        }
+        self.accepted.is_some()
+    }
+
+    /// Write an accepted row into the field, before it is drawn.
+    fn apply(&mut self, ctx: &egui::Context, id: egui::Id, text: &mut String) {
+        let Some(row) = self.accepted.take() else {
+            return;
+        };
+        accept_suggestion(ctx, id, text, row);
+        // Focus stays in the field: the next thing to do is type the argument,
+        // and a completion that leaves the user to click back into the cell has
+        // done half the job.
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.rows.clear();
+    }
+
+    /// Draw the list under `field`, and act on a click. Returns whether the
+    /// text changed.
+    fn show(
+        &mut self,
+        ui: &egui::Ui,
+        theme: &GuiTheme,
+        field: &egui::Response,
+        id: egui::Id,
+        text: &mut String,
+    ) -> bool {
+        let open = self.open();
+        let mut picked: Option<&'static str> = None;
+        if open {
+            egui::Popup::from_response(field)
+                .id(id.with("suggest-popup"))
+                .open(true)
+                .align(egui::RectAlign::BOTTOM_START)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (k, row) in self.rows.iter().enumerate() {
+                                // An example is drawn dimmed and indented under the
+                                // signature it belongs to, exactly as the ƒ menu
+                                // and the terminal wizard draw it.
+                                let is_example = !crate::generators::FUNCTIONS
+                                    .iter()
+                                    .any(|f| f.signature == *row);
+                                let label = if is_example {
+                                    RichText::new(format!("    {row}"))
+                                        .monospace()
+                                        .color(theme.dim)
+                                } else {
+                                    RichText::new(*row).monospace()
+                                };
+                                if ui
+                                    .add(egui::Button::selectable(k == self.sel, label))
+                                    .clicked()
+                                {
+                                    picked = Some(row);
+                                }
+                            }
+                        });
+                });
+        }
+        if let Some(row) = picked {
+            accept_suggestion(ui.ctx(), id, text, row);
+            ui.ctx().memory_mut(|m| m.request_focus(id));
+            self.rows.clear();
+        }
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(id.with("suggest"), self.clone()));
+        picked.is_some()
+    }
+}
+
+/// Write the suggestion `row` into `text`: a signature becomes the call it
+/// describes, a ready-made example goes in as it stands.
+fn accept_suggestion(ctx: &egui::Context, id: egui::Id, text: &mut String, row: &str) {
+    let Some(f) = crate::generators::function_for_suggestion(row) else {
+        return;
+    };
+    if f.signature == row {
+        write_call(ctx, id, text, f);
+    } else {
+        write_text(ctx, id, text, row);
+    }
+}
+
 fn write_call(
     ctx: &egui::Context,
     id: egui::Id,

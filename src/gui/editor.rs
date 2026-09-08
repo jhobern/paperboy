@@ -2867,13 +2867,13 @@ mod computed_cell_undo_tests {
         out
     }
 
-    struct Harness {
+    pub(super) struct Harness {
         ctx: egui::Context,
         t: f64,
     }
 
     impl Harness {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let ctx = egui::Context::default();
             GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
             Self { ctx, t: 0.0 }
@@ -2881,7 +2881,7 @@ mod computed_cell_undo_tests {
 
         /// One frame, `dt` seconds after the last (egui's text undoer only
         /// records a state once the text has been still for a moment).
-        fn frame(
+        pub(super) fn frame(
             &mut self,
             app: &mut GuiApp,
             events: Vec<egui::Event>,
@@ -2907,7 +2907,7 @@ mod computed_cell_undo_tests {
             }
         }
 
-        fn click_text(&mut self, app: &mut GuiApp, needle: &str) {
+        pub(super) fn click_text(&mut self, app: &mut GuiApp, needle: &str) {
             let mut at = None;
             for _ in 0..3 {
                 at = self
@@ -3105,6 +3105,168 @@ mod computed_cell_undo_tests {
         assert_eq!(
             app.session.collections[0].entries[1].headers[0].value, "bravo",
             "Ctrl+Z in the second request rewrote its header with the first request's value"
+        );
+    }
+}
+
+/// The completion list on a `[Gen]` expression field.
+///
+/// The terminal wizard has always offered one; the GUI only had a menu of all
+/// thirty-five functions, which is a poor way to find the one whose name you
+/// half remember. These drive the field the way a user does -- click into it,
+/// type, press a key -- because the whole point is that the list answers the
+/// keyboard *before* the text field does.
+#[cfg(test)]
+mod computed_suggestion_tests {
+    use super::*;
+
+    fn app_with_row(name: &str, expr: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![(name.to_string(), expr.to_string())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn expr(app: &GuiApp) -> String {
+        app.session.collections[0].entries[0].generators[0]
+            .1
+            .clone()
+    }
+
+    fn key(k: egui::Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+            egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// Reuses the undo tests' harness: same context, same frame loop, same
+    /// click-on-painted-text.
+    use super::computed_cell_undo_tests::Harness;
+
+    #[test]
+    fn typing_a_prefix_offers_the_functions_that_match() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("sha256(")),
+            "no suggestion list under the field: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("uuid")),
+            "the list should be filtered by what was typed: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn enter_accepts_the_highlighted_suggestion() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert!(
+            expr(&app).starts_with("sha1("),
+            "Enter should have written the first match in, but the field says {:?}",
+            expr(&app)
+        );
+    }
+
+    /// Down moves the highlight, so the second match is reachable without the
+    /// mouse.
+    #[test]
+    fn down_then_enter_takes_the_next_suggestion() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_ne!(
+            expr(&app),
+            "sha",
+            "the second suggestion was never accepted"
+        );
+        assert!(
+            !expr(&app).starts_with("sha1("),
+            "Down should have moved past the first match, got {:?}",
+            expr(&app)
+        );
+    }
+
+    /// Esc means "not for this word", not "never again": another keystroke
+    /// brings the list back, or it would be a one-way door out of the feature.
+    #[test]
+    fn escape_dismisses_the_list_until_the_word_changes() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        // The click lands mid-word; put the caret at the end so the character
+        // typed further down extends the word instead of splitting it.
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        let before = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            before.iter().any(|(t, _)| t.contains("sha256(")),
+            "the list should have been up before Esc"
+        );
+        h.frame(&mut app, key(egui::Key::Escape), 0.05);
+        let after = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            !after.iter().any(|(t, _)| t.contains("sha256(")),
+            "Esc should have closed the list: {:?}",
+            after.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        let back = h.frame(&mut app, vec![egui::Event::Text("2".into())], 0.05);
+        let back = if back.iter().any(|(t, _)| t.contains("sha256(")) {
+            back
+        } else {
+            h.frame(&mut app, vec![], 0.05)
+        };
+        assert!(
+            back.iter().any(|(t, _)| t.contains("sha256(")),
+            "typing another character should offer the list again: {:?}",
+            back.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// The list follows the caret's word, not the whole cell: an expression is
+    /// often a call inside a call, and completing the outer one would throw the
+    /// inner one away.
+    #[test]
+    fn the_list_follows_the_word_the_caret_is_in() {
+        let mut app = app_with_row("v", "base64(up");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "base64(up");
+        // The click lands mid-text; End puts the caret in the *inner* word,
+        // which is the case the whole rule exists for.
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("upper(")),
+            "the word under the caret should drive the list: {texts:?}"
         );
     }
 }

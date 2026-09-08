@@ -1051,6 +1051,81 @@ pub fn functions_starting_with(prefix: &str) -> impl Iterator<Item = &'static Ge
         .iter()
         .filter(move |f| f.name.starts_with(prefix.as_str()))
 }
+/// The word straddling `caret` in a `[Gen]` expression: where it starts, where
+/// it ends, and the word itself.
+///
+/// A word here is what a function name may be made of, so the caret in
+/// `concat(upper(na|me))` picks out `name` and not the whole expression. An
+/// expression is not one name the way a header is: completion has to work
+/// inside a call, because that is where the nesting this feature exists for
+/// puts it.
+pub fn word_at(text: &str, caret: Option<usize>) -> (usize, usize, String) {
+    let chars: Vec<char> = text.chars().collect();
+    let at = caret.unwrap_or(chars.len()).min(chars.len());
+    let is_word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
+    let mut start = at;
+    while start > 0 && is_word(&chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = at;
+    while end < chars.len() && is_word(&chars[end]) {
+        end += 1;
+    }
+    (start, end, chars[start..end].iter().collect())
+}
+
+/// The completion list to offer for `word`: each matching function's signature,
+/// followed by any ready-made calls it offers. `None` when there is nothing
+/// worth showing.
+///
+/// `browse` is "the user asked for the list" (the ƒ button, or Enter in the
+/// terminal wizard) rather than "the user is typing": it is the only thing that
+/// makes an empty word offer the whole catalogue, because a list that appeared
+/// over an empty cell on its own would be in the way of every other way of
+/// filling it in.
+///
+/// A name already typed in full and matching nothing else offers nothing: a
+/// dropdown that will not close reads as the editor refusing what was typed.
+///
+/// Shared by both front-ends deliberately. They had the same list built twice
+/// from the same table, which is how the two came to disagree about when it
+/// should appear.
+pub fn suggestions_for_word(word: &str, browse: bool) -> Option<Vec<&'static str>> {
+    if word.is_empty() && !browse {
+        return None;
+    }
+    let sugs: Vec<&'static str> = functions_starting_with(word)
+        .flat_map(|f| std::iter::once(f.signature).chain(f.examples.iter().copied()))
+        .collect();
+    let done = sugs.len() == 1 && is_function(word);
+    (!sugs.is_empty() && !done).then_some(sugs)
+}
+
+/// What accepting function `f` puts in place of the word at the caret, and how
+/// far into that text the caret should then sit.
+///
+/// Keyed off `min_args` rather than the wording of the signature: a function
+/// that needs an argument is written with *both* brackets and the caret between
+/// them, so the next keystroke is the argument and the block doesn't report an
+/// unclosed `(` as a fault; one that needs none is complete as its bare name,
+/// which is how a block already reads `stamp = timestamp`.
+pub fn completion(f: &GenFunction) -> (String, usize) {
+    if f.min_args == 0 {
+        (f.name.to_string(), f.name.chars().count())
+    } else {
+        (format!("{}()", f.name), f.name.chars().count() + 1)
+    }
+}
+
+/// The function a suggestion row names, whether the row is a signature or one
+/// of the ready-made example calls listed under it.
+pub fn function_for_suggestion(row: &str) -> Option<&'static GenFunction> {
+    FUNCTIONS
+        .iter()
+        .find(|f| f.signature == row)
+        .or_else(|| FUNCTIONS.iter().find(|f| f.examples.contains(&row)))
+}
+
 fn utc(src: &dyn GenSource) -> chrono::DateTime<chrono::Utc> {
     let (secs, nanos) = src.now();
     chrono::DateTime::from_timestamp(secs, nanos).unwrap_or_default()
