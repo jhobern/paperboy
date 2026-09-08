@@ -792,6 +792,7 @@ strings! {
     gui_probe_back => "‹ Back", "‹ Retour", "‹ Tilbage";
     gui_probe_add => "Add", "Ajouter", "Tilføj";
     gui_probe_filter_hint => "filter by name or value", "filtrer par nom ou valeur", "filtrér efter navn eller værdi";
+    gui_probe_name_required => "Name the variable before adding it.", "Nommez la variable avant de l'ajouter.", "Navngiv variablen, før du tilføjer den.";
     report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
     report_node_name_none => "pick a request", "choisir une requête", "vælg en forespørgsel";

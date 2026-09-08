@@ -749,15 +749,17 @@ fn probe_builder_dialog(
     mut builder: Box<super::probe::ProbeBuilder>,
 ) {
     let title = app.strings.gui_probe_title;
-    let (lbl_back, lbl_add, lbl_cancel, lbl_filter, lbl_name) = (
+    let (lbl_back, lbl_add, lbl_cancel, lbl_filter, lbl_name, lbl_name_required) = (
         app.strings.gui_probe_back,
         app.strings.gui_probe_add,
         app.strings.gui_cancel,
         app.strings.gui_probe_filter_hint,
         app.strings.probe_capture_name_title,
+        app.strings.gui_probe_name_required,
     );
     let strings = crate::i18n::Strings::for_language(&app.session.language);
     let dim = app.theme.dim;
+    let err = app.theme.err;
     // What the frame decided, applied after it closes: the dialog body borrows
     // `builder`, and applying writes through `app` to the same session the
     // rows were built from.
@@ -802,6 +804,11 @@ fn probe_builder_dialog(
                 let resp = ui.add(egui::TextEdit::singleline(&mut name).desired_width(320.0));
                 let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 builder.capture_name = Some(name);
+                // Set when Add was pressed on an empty name: say why nothing was
+                // written rather than let the whole dialog vanish silently.
+                if builder.name_required {
+                    ui.colored_label(err, lbl_name_required);
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button(lbl_back).clicked() {
@@ -861,12 +868,21 @@ fn probe_builder_dialog(
     } else if start_capture {
         let subject = builder.chosen.as_ref().map(|p| p.subject.clone());
         if let Some(subject) = subject {
+            builder.name_required = false;
             builder.capture_name = Some(super::probe::suggested_name(app, &builder, &subject));
         }
     } else if let Some(verb) = chosen_verb {
         let name = builder.capture_name.clone().unwrap_or_default();
-        super::probe::apply(app, &builder, &verb, &name);
-        return;
+        // An empty capture name is refused by `apply`; closing the dialog on
+        // that refusal threw away three steps of work with nothing to show for
+        // it. Keep the dialog up and flag why. Any other outcome — written, or
+        // a duplicate that is already there — is done, so close.
+        if matches!(verb, crate::probe::Verb::Capture) && name.trim().is_empty() {
+            builder.name_required = true;
+        } else {
+            super::probe::apply(app, &builder, &verb, &name);
+            return;
+        }
     }
     app.dialog = Some(Dialog::ProbeBuilder(builder));
 }
@@ -2439,6 +2455,90 @@ fn file_stem(path: &str) -> String {
 /// The i18n label for the `i`th editable theme colour (mirrors the terminal
 /// UI's `theme_editor::color_label`, reading the same `Strings` fields).
 use crate::theme::color_label;
+
+/// The probe builder's modal, driven through the real dialog layer with
+/// simulated clicks. Harness in [`crate::gui::probe_test_support`].
+#[cfg(test)]
+mod probe_dialog_tests {
+    use crate::gui::app::Dialog;
+    use crate::gui::probe_test_support::*;
+    use eframe::egui;
+
+    /// Clearing the suggested name and pressing Add must not throw the dialog
+    /// away: `apply` refuses an empty name, and the caller used to `return`
+    /// either way, losing three steps of work with nothing written. Now the
+    /// dialog stays up and says why.
+    #[test]
+    fn add_with_an_empty_capture_name_loses_the_dialog() {
+        let body = r#"{"token":"abc"}"#;
+        let mut app = app_with(body, vec![], 200);
+        let probe = crate::probe::probes(200, None, &[], body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, Some(probe));
+        if let Some(Dialog::ProbeBuilder(b)) = &mut app.dialog {
+            b.capture_name = Some(String::new());
+        }
+
+        dialog_frame(&mut app, &ctx, vec![]);
+        let painted = dialog_frame(&mut app, &ctx, vec![]);
+        let add = centre_of(&painted, app.strings.gui_probe_add);
+        let (press, release) = click_events(add, egui::PointerButton::Primary);
+        dialog_frame(&mut app, &ctx, press);
+        dialog_frame(&mut app, &ctx, release);
+
+        let captures = app.session.collections[0].entries[0].captures.clone();
+        assert!(
+            captures.is_empty(),
+            "an empty name should not write a capture"
+        );
+        assert!(
+            app.dialog.is_some(),
+            "Add with an empty name threw the dialog away and wrote nothing"
+        );
+    }
+
+    /// The subject list is a filter field over rows of monospace text with no
+    /// width cap on the path column. On a small window the dialog must still
+    /// paint inside the screen.
+    #[test]
+    fn the_builder_fits_a_small_window() {
+        let deep = format!(
+            r#"{{"{}":{{"{}":"{}"}}}}"#,
+            "a_very_long_field_name_indeed".repeat(2),
+            "another_long_nested_field_name".repeat(2),
+            "v".repeat(200)
+        );
+        let mut app = app_with(&deep, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+        let screen = egui::vec2(520.0, 380.0);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            let full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), screen)),
+                    ..Default::default()
+                },
+                |ui| super::show_dialog(&mut app, ui.ctx()),
+            );
+            painted = collect(&full);
+        }
+        let overflow: Vec<(String, f32)> = painted
+            .iter()
+            .map(|(p, g)| (g.text().to_string(), p.x + g.size().x))
+            .filter(|(_, right)| *right > screen.x)
+            .collect();
+        assert!(
+            overflow.is_empty(),
+            "the builder paints past the right edge of a {}x{} window: {overflow:?}",
+            screen.x,
+            screen.y
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
