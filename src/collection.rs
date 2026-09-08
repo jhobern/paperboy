@@ -1331,23 +1331,49 @@ impl Collection {
         entries.get(idx).is_some_and(|e| e.user_added || e.modified)
     }
 
-    /// Discard request `ei`'s in-memory edits by reloading that single entry,
-    /// from the same position, out of this collection's on-disk file (#19).
+    /// Discard request `ei`'s in-memory edits by reloading that single entry
+    /// out of this collection's on-disk file (#19).
+    ///
+    /// The entry is found on disk by the identity it has carried since the list
+    /// and the file last agreed ([`HurlEntry::uid`]), *not* by its position.
+    /// Position is only the same thing while nothing structural has happened,
+    /// and reverting is offered from the same menu as Duplicate and drag-
+    /// reorder: with an unsaved duplicate above it, request B sat at index 1 in
+    /// memory and index 2 on disk, so reverting B restored C over the top of it
+    /// and B's edits were gone — a silent, unrecoverable loss of exactly the
+    /// work the user was trying to keep.
     ///
     /// Returns the reverted request's HTTP method on success, or `None` when
     /// there's nothing to revert to — the collection has no file (scratch), the
-    /// file can't be read/parsed, or it holds no entry at that position (e.g. a
-    /// never-saved request). The other entries and their edits are untouched.
+    /// file can't be read/parsed, the entry was never saved (a new request, or
+    /// a duplicate that still shares its original's identity), or the file has
+    /// since changed underneath us so no entry can be confidently matched.
+    /// The other entries and their edits are untouched.
     pub fn revert_request(&mut self, ei: usize) -> Option<String> {
         let path = self.path.clone()?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let mut disk = crate::postman::parse_collection(&content);
-        if ei >= disk.len() || ei >= self.entries.len() {
+        let uid = self.entries.get(ei)?.uid;
+        // A duplicate is a clone, and so carries its original's stamp until the
+        // file is saved. Two entries answering to one identity means we cannot
+        // say which of them the file's entry belongs to, so we decline.
+        if uid == 0 || self.entries.iter().filter(|e| e.uid == uid).count() != 1 {
             return None;
         }
-        let entry = disk.swap_remove(ei);
+        let di = self.structure_baseline.iter().position(|u| *u == uid)?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut disk = crate::postman::parse_collection(&content);
+        // The baseline describes the file as it was when we last agreed with
+        // it. If the file has grown or shrunk since, the position we just
+        // looked up means nothing any more.
+        if disk.len() != self.structure_baseline.len() || di >= disk.len() {
+            return None;
+        }
+        let entry = disk.swap_remove(di);
         let method = entry.method.clone();
-        self.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
+        // A freshly parsed entry is clean (not modified/added) but carries no
+        // stamp; it has to keep the one it is replacing, or the list would
+        // suddenly read as structurally different from the file it just came
+        // from and the collection would claim unsaved changes it doesn't have.
+        self.entries[ei] = HurlEntry { uid, ..entry };
         self.invalidate_request_json();
         self.sync_folder_to_selected();
         Some(method)
@@ -2085,6 +2111,97 @@ mod revert_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Three requests on disk; the list is then rearranged in memory without
+    /// saving. Reverting has to follow the *request*, not its position — the
+    /// menu that offers Revert also offers Duplicate and drag-reorder, so the
+    /// two disagree routinely, and restoring the wrong entry destroys the edits
+    /// the user was trying to keep with no way back.
+    fn three_on_disk(name: &str) -> (PathBuf, Collection) {
+        let root = tmp_root(name);
+        let file = root.join("c.hurl");
+        fs::write(
+            &file,
+            "# A\nGET https://h/a\n\n# B\nGET https://h/b\n\n# C\nGET https://h/c\n",
+        )
+        .unwrap();
+        let mut col = Collection::new(
+            "c".into(),
+            crate::postman::parse_collection(&fs::read_to_string(&file).unwrap()),
+        );
+        col.path = Some(file.clone());
+        col.reset_structure_baseline();
+        (file, col)
+    }
+
+    #[test]
+    fn reverting_after_an_unsaved_duplicate_restores_the_request_that_was_asked_for() {
+        let (_file, mut col) = three_on_disk("dup");
+        // Duplicate A, unsaved: B now sits at index 2 in memory, index 1 on disk.
+        let copy = col.entries[0].clone();
+        col.entries.insert(1, copy);
+        let bi = 2;
+        assert_eq!(col.entries[bi].title, "B");
+        col.entries[bi].url = "https://h/b-EDITED".into();
+        col.entries[bi].modified = true;
+
+        col.revert_request(bi);
+
+        assert_eq!(col.entries[bi].title, "B", "reverting B must restore B");
+        assert_eq!(col.entries[bi].url, "https://h/b");
+        let titles: Vec<_> = col.entries.iter().map(|e| e.title.clone()).collect();
+        assert_eq!(titles, ["A", "A", "B", "C"], "no other request may change");
+    }
+
+    #[test]
+    fn reverting_after_an_unsaved_reorder_restores_the_request_that_was_asked_for() {
+        let (_file, mut col) = three_on_disk("reorder");
+        col.entries.swap(0, 1); // B, A, C in memory; A, B, C on disk
+        col.entries[0].url = "https://h/b-EDITED".into();
+        col.entries[0].modified = true;
+
+        col.revert_request(0);
+
+        assert_eq!(col.entries[0].title, "B");
+        assert_eq!(col.entries[0].url, "https://h/b");
+    }
+
+    #[test]
+    fn reverting_the_last_request_after_an_insertion_still_reverts_it() {
+        let (_file, mut col) = three_on_disk("shifted");
+        let copy = col.entries[0].clone();
+        col.entries.insert(0, copy); // C is now index 3, past the end of the file
+        let ci = 3;
+        assert_eq!(col.entries[ci].title, "C");
+        col.entries[ci].url = "https://h/c-EDITED".into();
+        col.entries[ci].modified = true;
+
+        assert_eq!(col.revert_request(ci).as_deref(), Some("GET"));
+        assert_eq!(col.entries[ci].url, "https://h/c");
+    }
+
+    #[test]
+    fn a_request_with_no_saved_version_reverts_to_nothing() {
+        let (_file, mut col) = three_on_disk("unsaved");
+        let mut fresh = col.entries[0].clone();
+        fresh.uid = 0; // never in the list that was saved
+        fresh.user_added = true;
+        col.entries.push(fresh);
+        assert_eq!(col.revert_request(3), None);
+        assert_eq!(col.entries.len(), 4, "the request must still be there");
+    }
+
+    #[test]
+    fn reverting_leaves_the_list_agreeing_with_the_file() {
+        let (_file, mut col) = three_on_disk("clean");
+        col.entries[1].url = "https://h/b-EDITED".into();
+        col.entries[1].modified = true;
+        col.revert_request(1);
+        assert!(
+            !col.has_unsaved_edits(),
+            "a reverted collection with no other edits has nothing left to save"
+        );
     }
 
     /// A file edited and then switched away from keeps its edits in
