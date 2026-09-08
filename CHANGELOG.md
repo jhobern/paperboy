@@ -375,6 +375,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   is already captured offers the name it already has rather than writing the
   same jsonpath under a second one.
 
+- **The GUI's assert builder quotes the response, not the view of it.** With
+  the Compact overview on, a selection in the body produced a `body contains`
+  holding the *shortened* text — `"aneh...ureol"` — which no reply ever
+  contains, so the assert could only fail. The selection is now translated back
+  through the same shortening map, so a partial selection inside a compacted
+  string expands to the text the server actually sent. The response body's
+  cursor state is also per-request now: selecting a value, sending a different
+  request and right-clicking used to build an assert out of the previous
+  reply's selection. A request is addressed by its identity rather than its
+  position, so a builder left open across a reorder writes where it was opened.
+  An empty capture name keeps the dialog open and says the name is needed
+  instead of closing it and writing nothing, and a `204 No Content` — which has
+  a status and headers worth asserting on — offers the button at all.
+
 - **A run reports every pre-flight warning, not just the first.** A broken
   generator hid a batch collision behind it, so fixing what the status line
   complained about surfaced the next problem and the same run failed twice over
