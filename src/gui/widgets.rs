@@ -238,6 +238,27 @@ pub fn wrapping_field_font(
     color: Color32,
     font: egui::TextStyle,
 ) -> egui::Response {
+    wrapping_field_font_id(ui, width, text, hint, color, font, None)
+}
+
+/// [`wrapping_field_font`] with an explicit widget id.
+///
+/// A `TextEdit` with no id of its own is identified by where it lands in the
+/// layout — which is fine until a *table* of them shuffles: delete a row and
+/// the one below slides into its id, inheriting its caret and its undo history
+/// (egui keys both by widget id). Rows the user can add, delete and reorder —
+/// the `[Gen]` block — pass a stable per-row, per-request id here so a cell's
+/// history follows the row, not the slot. Everything else passes `None` and
+/// keeps the positional id it always had.
+pub fn wrapping_field_font_id(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+    font: egui::TextStyle,
+    id: Option<egui::Id>,
+) -> egui::Response {
     // A `TextEdit`'s `desired_width` is the width of the *text*: its margin is
     // added on top. Asking for the caller's width therefore claimed a few
     // pixels more than the column reserved, so a filled table laid its columns
@@ -257,15 +278,17 @@ pub fn wrapping_field_font(
         .fonts_mut(|f| f.layout(text.clone(), font_id, color, text_w).size().y)
         + TEXT_EDIT_MARGIN;
     let field = |ui: &mut egui::Ui, text: &mut String| {
-        ui.add(
-            egui::TextEdit::multiline(text)
-                .hint_text(hint)
-                .text_color(color)
-                .desired_width(text_w)
-                .desired_rows(1)
-                .return_key(None)
-                .font(font.clone()),
-        )
+        let mut edit = egui::TextEdit::multiline(text)
+            .hint_text(hint)
+            .text_color(color)
+            .desired_width(text_w)
+            .desired_rows(1)
+            .return_key(None)
+            .font(font.clone());
+        if let Some(id) = id {
+            edit = edit.id(id);
+        }
+        ui.add(edit)
     };
     flat_fields(ui, |ui| {
         // A value that fits is drawn exactly as it always was: no viewport, no
@@ -812,6 +835,19 @@ pub fn kv_editor(
 
 /// An editable table of `(name, value)` pairs without an enabled flag
 /// (captures, reports). Returns true if anything changed.
+/// A per-row anchor for a `[Gen]` cell's widget id, taken from its *neighbour*
+/// cell's text (the name cell anchors on the expression and vice versa) so that
+/// typing in a cell never changes that cell's own id. Whitespace-only text
+/// doesn't count as content — an empty neighbour falls back to the row index so
+/// two blank rows don't hash to the same id and clash.
+fn neighbour_key(neighbour: &str, i: usize) -> egui::Id {
+    if neighbour.trim().is_empty() {
+        egui::Id::new(("row", i))
+    } else {
+        egui::Id::new(("neighbour", neighbour))
+    }
+}
+
 /// The `# [Gen]` table: `Name | Expression`, with a function menu on each row
 /// and, under it, everything wrong with the block that can be known without
 /// sending anything.
@@ -823,6 +859,13 @@ pub fn computed_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,
     s: &Strings,
+    // A stable identity for the request whose block this is. The per-cell ids
+    // below hang off it so a `[Gen]` cell's caret and undo history (which egui
+    // keys by widget id) belong to *this request's* row rather than to the
+    // slot: without it, switching to another request in the list handed its
+    // first row the previous request's undo stack, and Ctrl+Z wrote one
+    // request's expression into the other.
+    req: egui::Id,
     rows: &mut Vec<(String, String)>,
 ) -> bool {
     let mut changed = false;
@@ -830,7 +873,7 @@ pub fn computed_editor(
     let key_w = split_key_width(ui, 42.0);
     let x_w = remove_width(ui);
     let row_h = ui.spacing().interact_size.y;
-    ui.push_id("computed", |ui| {
+    ui.push_id(req.with("computed"), |ui| {
         table_rows(ui, |ui| {
             table_row(ui, |ui| {
                 sized_header(ui, theme, s.computed_name, key_w);
@@ -838,8 +881,43 @@ pub fn computed_editor(
             });
             for i in 0..rows.len() {
                 table_row(ui, |ui| {
-                    if sized_key(ui, key_w, &mut rows[i].0, s.computed_name, theme.text).changed() {
+                    // Per-row, per-request cell ids that follow the *row*, not
+                    // its position, so a row keeps its caret and undo history
+                    // when one above it is deleted and it slides up a slot.
+                    // Each cell is keyed by the *other* cell's text — the name
+                    // cell by the expression, the expression cell by the name —
+                    // so typing in one never moves the id of the cell being
+                    // typed in (which would drop focus every keystroke), while
+                    // still giving the row a content identity that survives a
+                    // deletion. An empty neighbour falls back to the row index
+                    // so two blank rows don't collide.
+                    let name_anchor = neighbour_key(&rows[i].1, i);
+                    let expr_anchor = neighbour_key(&rows[i].0, i);
+                    let name_id = req.with(("computed-name", name_anchor));
+                    let expr_id = req.with(("computed-expr", expr_anchor));
+                    // A name that isn't a variable Hurl will resolve, or a name
+                    // left blank beside a filled-in expression, is a row that
+                    // vanishes on save (the block only keeps readable rows), so
+                    // flag it in the error colour where it is typed rather than
+                    // letting it disappear silently.
+                    let name = rows[i].0.trim();
+                    let bad_name = (!name.is_empty() && !crate::hurl::is_variable_name(name))
+                        || (name.is_empty() && !rows[i].1.trim().is_empty());
+                    let name_color = if bad_name { theme.err } else { theme.text };
+                    let k = wrapping_field_font_id(
+                        ui,
+                        key_w,
+                        &mut rows[i].0,
+                        s.computed_name,
+                        name_color,
+                        egui::TextStyle::Body,
+                        Some(name_id),
+                    );
+                    if k.changed() {
                         changed = true;
+                    }
+                    if bad_name {
+                        k.on_hover_text(s.gui_computed_bad_name);
                     }
                     // Both buttons to the right are reserved before the field
                     // is sized: an infinite-width field laid out left to right
@@ -847,13 +925,14 @@ pub fn computed_editor(
                     // there is no horizontal scrollbar to get them back.
                     let f_w = button_width(ui, s.gui_computed_fn_button);
                     let val_w = (ui.available_width() - x_w - f_w - 24.0).max(40.0);
-                    let field = wrapping_field_font(
+                    let field = wrapping_field_font_id(
                         ui,
                         val_w,
                         &mut rows[i].1,
                         s.computed_expr,
                         theme.text,
                         egui::TextStyle::Monospace,
+                        Some(expr_id),
                     );
                     if field.changed() {
                         changed = true;

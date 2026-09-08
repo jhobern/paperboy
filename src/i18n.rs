@@ -939,6 +939,7 @@ strings! {
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
     gui_computed_functions => "Insert a function", "Insérer une fonction", "Indsæt en funktion";
     gui_computed_fn_button => "Function…", "Fonction…", "Funktion…";
+    gui_computed_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
     gui_computed_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_computed_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs calculées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der beregnes hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";

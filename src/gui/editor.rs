@@ -1001,6 +1001,18 @@ fn draw_section(
 ) -> bool {
     let mut changed = false;
     let ex_label = st.gui_extract_parameter;
+    // A stable identity for this request, mixed into every row table's ids so
+    // a cell's caret and undo history (which egui keys by widget id) belong to
+    // this request rather than to the table slot — otherwise switching to
+    // another request in the list hands its first row the previous request's
+    // undo stack. Named the way `body_mode` names a request.
+    let req = egui::Id::new((
+        "req",
+        entry.uid,
+        entry.title.as_str(),
+        entry.method.as_str(),
+        entry.url.as_str(),
+    ));
     match section {
         EditorSection::All | EditorSection::Code => {}
         EditorSection::Params => {
@@ -1010,7 +1022,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "params",
+                ("params", req),
                 &mut entry.queries,
                 st.gui_hint_key,
                 st.gui_hint_value,
@@ -1030,7 +1042,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "headers",
+                ("headers", req),
                 &mut entry.headers,
                 st.gui_hint_header,
                 st.gui_hint_value,
@@ -1160,7 +1172,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "cookies",
+                ("cookies", req),
                 &mut entry.cookies,
                 st.gui_hint_name,
                 st.gui_hint_value,
@@ -1198,7 +1210,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "options",
+                ("options", req),
                 &mut entry.options,
                 st.gui_hint_option,
                 st.gui_hint_value,
@@ -1239,7 +1251,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "captures",
+                ("captures", req),
                 &mut entry.captures,
                 st.gui_hint_name,
                 st.gui_hint_query,
@@ -1251,7 +1263,7 @@ fn draw_section(
         }
         EditorSection::Computed => {
             ui.label(RichText::new(st.gui_computed_help).color(theme.dim));
-            if widgets::computed_editor(ui, theme, st, &mut entry.generators) {
+            if widgets::computed_editor(ui, theme, st, req, &mut entry.generators) {
                 changed = true;
             }
         }
@@ -2512,6 +2524,77 @@ mod computed_tests {
         }
     }
 
+    /// A row whose name isn't a variable Hurl can resolve is dropped when the
+    /// block is saved. Rather than let the user's typing vanish silently, the
+    /// name is painted in the error colour the moment it stops being valid.
+    #[test]
+    fn a_name_that_is_not_a_variable_is_painted_as_an_error() {
+        fn coloured(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Color32)>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        let colour = t
+                            .galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|s| s.format.color)
+                            .unwrap_or(egui::Color32::PLACEHOLDER);
+                        out.push((t.galley.text().to_string(), colour));
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for c in shapes {
+                walk(&c.shape, &mut out);
+            }
+            out
+        }
+
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        // A valid name and an invalid one, side by side.
+        entry.generators = vec![
+            ("good".into(), "uuid".into()),
+            ("no spaces".into(), "uuid".into()),
+        ];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = coloured(&full.shapes);
+        }
+        let err = th.err;
+        let good = out
+            .iter()
+            .find(|(t, _)| t == "good")
+            .expect("valid name painted");
+        let bad = out
+            .iter()
+            .find(|(t, _)| t == "no spaces")
+            .expect("invalid name painted");
+        assert_ne!(good.1, err, "a valid name is not flagged");
+        assert_eq!(bad.1, err, "an invalid name is painted in the error colour");
+    }
+
     /// Every string a frame painted, with where it was painted.
     fn placed_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
         fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
@@ -2528,5 +2611,434 @@ mod computed_tests {
             walk(&c.shape, &mut out);
         }
         out
+    }
+}
+
+/// A `[Gen]` cell's caret and undo history live in egui's per-widget state, so
+/// the widget id must belong to the *row* (and the *request*), not to the table
+/// slot the row currently occupies. These check that deleting a row above, or
+/// switching to another request, doesn't hand a cell someone else's history.
+#[cfg(test)]
+mod computed_cell_identity_tests {
+    use super::*;
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn placed(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// Click into the expression cell holding `needle` and return the id egui
+    /// gave that text field.
+    fn focus_cell(app: &mut GuiApp, ctx: &egui::Context, needle: &str) -> egui::Id {
+        let mut at = None;
+        for _ in 0..3 {
+            let out = ctx.run_ui(raw(vec![]), |u| super::ui(app, u));
+            at = placed(&out.shapes)
+                .into_iter()
+                .find(|(t, _)| t == needle)
+                .map(|(_, r)| r.center());
+        }
+        let at = at.unwrap_or_else(|| panic!("{needle} was never painted"));
+        let _ = ctx.run_ui(raw(click(at)), |u| super::ui(app, u));
+        let _ = ctx.run_ui(raw(vec![]), |u| super::ui(app, u));
+        ctx.memory(|m| m.focused())
+            .unwrap_or_else(|| panic!("clicking {needle} focused nothing"))
+    }
+
+    /// The row a cell's undo history belongs to must be the row, not the slot:
+    /// after the first row is removed, the second slides up into its widget id
+    /// and — with it — its caret and its undo stack.
+    #[test]
+    fn a_removed_rows_undo_history_is_not_inherited_by_the_row_below() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+
+        let first_id = focus_cell(&mut app, &ctx, "uuid");
+        let second_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_ne!(first_id, second_id, "two rows, two fields");
+
+        // Remove the first row — exactly what its ✕ does.
+        app.session.collections[0].entries[0].generators.remove(0);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw(vec![]), |u| super::ui(&mut app, u));
+        }
+        let moved_up_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_eq!(
+            moved_up_id, second_id,
+            "the surviving row kept its own field identity (id {second_id:?} vs {moved_up_id:?}); \
+             if this fails it has inherited the deleted row's ({first_id:?})"
+        );
+    }
+
+    /// The same question asked of the state itself: whatever egui remembers for
+    /// the slot the deleted row occupied must not now be driving the row that
+    /// took its place.
+    #[test]
+    fn the_surviving_row_does_not_inherit_the_deleted_rows_caret() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+
+        let first_id = focus_cell(&mut app, &ctx, "uuid");
+        // Park a caret at char 4 (end of "uuid") in the first row's cell.
+        let mut st = egui::TextEdit::load_state(&ctx, first_id).expect("state for a focused field");
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(4),
+        )));
+        egui::TextEdit::store_state(&ctx, first_id, st);
+
+        app.session.collections[0].entries[0].generators.remove(0);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw(vec![]), |u| super::ui(&mut app, u));
+        }
+        let now_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_ne!(
+            now_id, first_id,
+            "the row that moved up is being drawn with the deleted row's field state"
+        );
+    }
+}
+
+/// The user-visible end of the id-inheritance problem: Ctrl+Z in a row that
+/// survived a deletion — or in another request's row — must not pull in the
+/// expression that used to live in that slot.
+#[cfg(test)]
+mod computed_cell_undo_tests {
+    use super::*;
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn placed(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    struct Harness {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+            Self { ctx, t: 0.0 }
+        }
+
+        /// One frame, `dt` seconds after the last (egui's text undoer only
+        /// records a state once the text has been still for a moment).
+        fn frame(
+            &mut self,
+            app: &mut GuiApp,
+            events: Vec<egui::Event>,
+            dt: f64,
+        ) -> Vec<(String, egui::Rect)> {
+            self.t += dt;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let out = self.ctx.run_ui(input, |u| super::ui(app, u));
+            placed(&out.shapes)
+        }
+
+        fn settle(&mut self, app: &mut GuiApp) {
+            for _ in 0..6 {
+                self.frame(app, vec![], 0.4);
+            }
+        }
+
+        fn click_text(&mut self, app: &mut GuiApp, needle: &str) {
+            let mut at = None;
+            for _ in 0..3 {
+                at = self
+                    .frame(app, vec![], 0.05)
+                    .into_iter()
+                    .find(|(t, _)| t == needle)
+                    .map(|(_, r)| r.center());
+            }
+            let at = at.unwrap_or_else(|| panic!("{needle} was never painted"));
+            let ev = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            self.frame(app, ev, 0.05);
+            self.frame(app, vec![], 0.05);
+        }
+    }
+
+    fn rows(app: &GuiApp) -> Vec<(String, String)> {
+        app.session.collections[0].entries[0].generators.clone()
+    }
+
+    #[test]
+    fn ctrl_z_after_deleting_a_row_does_not_resurrect_it_into_the_row_below() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let mut h = Harness::new();
+
+        // Edit the first row a little, so egui has an undo history for its cell.
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        let edited = rows(&app)[0].1.clone();
+        assert_ne!(edited, "uuid", "the first row was edited");
+
+        // Delete the first row (its ✕) and act straight away, the way a user
+        // does: click the row below and press Ctrl+Z.
+        app.session.collections[0].entries[0].generators.remove(0);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            rows(&app),
+            vec![("stamp".to_string(), "timestamp".to_string())]
+        );
+
+        // Now undo inside the row that is left.
+        h.click_text(&mut app, "timestamp");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.settle(&mut app);
+        assert_eq!(
+            rows(&app)[0].1,
+            "timestamp",
+            "Ctrl+Z in the surviving row rewrote it with the deleted row's expression"
+        );
+    }
+
+    /// The same positional identity, one level worse: the widget id of a
+    /// `[Gen]` cell must be per *request*, not per slot, so switching to another
+    /// request in the list doesn't hand its first row the previous request's
+    /// caret and undo history — and let Ctrl+Z write one request's expression
+    /// into the other.
+    #[test]
+    fn switching_requests_does_not_carry_a_cells_undo_history_across() {
+        let mut session = crate::session::Session::default();
+        let mk = |title: &str, row: (&str, &str)| {
+            let mut e = HurlEntry::default();
+            e.method = "GET".into();
+            e.url = "https://h/a".into();
+            e.title = title.into();
+            e.generators = vec![(row.0.to_string(), row.1.to_string())];
+            e
+        };
+        session.collections[0].entries = vec![
+            mk("First", ("nonce", "uuid")),
+            mk("Second", ("stamp", "timestamp")),
+        ];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let mut h = Harness::new();
+
+        // Edit the first request's row, so its cell has an undo history.
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        assert_ne!(
+            app.session.collections[0].entries[0].generators[0].1, "uuid",
+            "the first request's row was edited"
+        );
+
+        // Switch to the other request and undo in *its* expression cell.
+        app.session.collections[0].selected_entry = 1;
+        h.frame(&mut app, vec![], 0.05);
+        h.click_text(&mut app, "timestamp");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            app.session.collections[0].entries[1].generators[0].1, "timestamp",
+            "Ctrl+Z in the second request rewrote its row with the first request's expression"
+        );
+    }
+
+    /// Is the hazard peculiar to the new Computed table, or does the same
+    /// gesture cross requests in an older one? Headers, same steps — kept as a
+    /// control now that request identity is mixed into every row table's ids.
+    #[test]
+    fn switching_requests_does_not_carry_a_header_cells_undo_history_across() {
+        let mut session = crate::session::Session::default();
+        let mk = |title: &str, v: &str| {
+            let mut e = HurlEntry::default();
+            e.method = "GET".into();
+            e.url = "https://h/a".into();
+            e.title = title.into();
+            e.headers = vec![crate::hurl::KvRow {
+                key: "X-Thing".into(),
+                value: v.into(),
+                enabled: true,
+                ..Default::default()
+            }];
+            e
+        };
+        session.collections[0].entries = vec![mk("First", "alpha"), mk("Second", "bravo")];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Headers;
+        let mut h = Harness::new();
+
+        h.click_text(&mut app, "alpha");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        assert_ne!(
+            app.session.collections[0].entries[0].headers[0].value,
+            "alpha"
+        );
+
+        app.session.collections[0].selected_entry = 1;
+        h.frame(&mut app, vec![], 0.05);
+        h.click_text(&mut app, "bravo");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            app.session.collections[0].entries[1].headers[0].value, "bravo",
+            "Ctrl+Z in the second request rewrote its header with the first request's value"
+        );
     }
 }
