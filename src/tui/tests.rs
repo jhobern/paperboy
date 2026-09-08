@@ -10741,6 +10741,49 @@ fn ctrl_r_on_an_unmodified_or_scratch_request_is_a_noop() {
     ));
 }
 
+/// Ctrl+R on a request that was just added to a saved collection but never
+/// written must not offer a confirmation it can't honour: the request has no
+/// saved version of its own (its identity isn't in the file yet), so it says so
+/// plainly instead of confirming and then reporting "nothing to revert".
+#[test]
+fn ctrl_r_on_a_never_saved_new_request_says_there_is_no_saved_version() {
+    let dir = temp_dir("revnew");
+    let path = dir.join("api.hurl");
+
+    let mut app = TuiApp::default();
+    let e0 = HurlEntry::from_fields("first", "GET", "http://h/orig", vec![], "");
+    app.collections
+        .push(Collection::new("api".into(), vec![e0]));
+    app.active_tab = 1;
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    // Add a brand-new request (unstamped, so uid == 0) and edit into it. It has
+    // never been written, so there is nothing on disk to revert it to.
+    {
+        let col = &mut app.collections[1];
+        let mut fresh = HurlEntry::from_fields("brand new", "GET", "http://h/new", vec![], "");
+        fresh.modified = true;
+        col.entries.push(fresh);
+        col.selected_entry = col.entries.len() - 1;
+    }
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation is offered for a request with no saved version"
+    );
+    assert!(
+        matches!(
+            app.status,
+            Some(crate::i18n::Status::RequestHasNoSavedVersion)
+        ),
+        "it says plainly there is no saved version, status was {:?}",
+        app.status
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Ctrl+R in the entries popup reverts the whole environment to its last saved
 /// values (after confirmation): edited vars go back to the saved value and
 /// user-added vars are dropped.

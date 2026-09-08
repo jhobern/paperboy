@@ -706,6 +706,7 @@ strings! {
     status_file_reverted => "file reverted to last saved:", "fichier rétabli à la dernière sauvegarde :", "fil gendannet til sidst gemte:";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
     status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
+    status_request_no_saved_version => "This request has no saved version to revert to yet", "Cette requête n'a pas encore de version enregistrée à rétablir", "Denne anmodning har endnu ingen gemt version at gendanne til";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
     report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · Esc source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · Échap source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · Esc kilde";
@@ -1990,6 +1991,12 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// `Ctrl+R` on a request that has no saved version to go back to: one just
+    /// added to a saved collection but never written, or a duplicate that still
+    /// shares its original's identity. Distinct from [`Self::NothingToRevert`]
+    /// so the message can say *why* rather than offering — then failing — a
+    /// confirmation the request can't honour.
+    RequestHasNoSavedVersion,
     /// Leftover `# [Body]` notes were taken back as the request's body.
     NotesAdopted,
     /// Leftover `# [Body]` notes were deleted, leaving the body as it was.
@@ -2251,6 +2258,7 @@ impl Status {
             Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::RequestHasNoSavedVersion => s.status_request_no_saved_version.to_string(),
             Status::NotesAdopted => s.notes_adopted.to_string(),
             Status::NotesDiscarded => s.notes_discarded.to_string(),
             Status::NotesAppliedFromRaw => s.notes_applied_from_raw.to_string(),
