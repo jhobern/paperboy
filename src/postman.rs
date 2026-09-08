@@ -1287,6 +1287,9 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<(String, DynamicFate)>
 
     let mut found: Vec<(String, DynamicFate)> = Vec::new();
     let mut rows: Vec<(String, String)> = Vec::new();
+    // The `[Gen]` rows this entry already carries — from its own pre-request
+    // script — so a dynamic variable does not silently reuse one of them.
+    let existing: Vec<(String, String)> = entry.generators.clone();
     let mut fix = |text: &mut String| {
         if !text.contains("{{") {
             return;
@@ -1298,13 +1301,43 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<(String, DynamicFate)>
             let plain = raw.replace('.', "_");
             let name = match fate {
                 DynamicFate::Builtin(f) => f.to_string(),
-                _ => plain.clone(),
+                DynamicFate::Computed(expr) => {
+                    // The row that computes this value. If a row of the wanted
+                    // name already exists — here or in a `[Gen]` block this
+                    // entry carries — with a *different* expression, pointing
+                    // the placeholder at it would resolve to that other value.
+                    // `{{$timestamp}}` (Unix seconds) folding onto a script's
+                    // millisecond `timestamp` row is exactly the silent
+                    // wrong-value the note then mis-describes. So a fresh name
+                    // (`timestamp_1`) is taken and the placeholder points at it.
+                    let taken = |n: &str| {
+                        existing
+                            .iter()
+                            .chain(rows.iter())
+                            .find(|(name, _)| name == n)
+                            .map(|(_, e)| e.clone())
+                    };
+                    let mut candidate = plain.clone();
+                    let mut suffix = 0;
+                    loop {
+                        match taken(&candidate) {
+                            None => {
+                                rows.push((candidate.clone(), expr.to_string()));
+                                break;
+                            }
+                            // Same expression already: reuse the row rather than
+                            // add a duplicate.
+                            Some(e) if e == expr => break,
+                            Some(_) => {
+                                suffix += 1;
+                                candidate = format!("{plain}_{suffix}");
+                            }
+                        }
+                    }
+                    candidate
+                }
+                DynamicFate::Supplied => plain.clone(),
             };
-            if let DynamicFate::Computed(expr) = fate
-                && !rows.iter().any(|(n, _)| *n == name)
-            {
-                rows.push((name.clone(), expr.to_string()));
-            }
             if !found.iter().any(|(n, _)| n == raw) {
                 found.push((raw.to_string(), fate));
             }
@@ -1476,7 +1509,14 @@ fn note_losses(
     // against the folder holding it instead, once — the alternative is the same
     // sentence repeated under every request in the folder, which reads as many
     // problems rather than the one it is.
-    let owned_by = |listen: &str| script_owner(events, listen);
+    //
+    // Crucially the kept/residue is computed *per owner*, not over the merged
+    // script. The converters run over folder+request together, so when the
+    // *folder's* part is what failed to convert, blaming the leftover on the
+    // request put "; the rest of it was dropped" under sixteen of FMS's
+    // ninety-eight requests whose own scripts convert completely. Each owning
+    // event is reduced on its own and filed against whoever wrote it — the same
+    // thing the `setNextRequest` loop below already does deliberately.
     let scope = |owner: &Option<String>| match owner {
         None => "this request's",
         Some(_) => "this folder's",
@@ -1485,9 +1525,8 @@ fn note_losses(
         None => "",
         Some(_) => ", and it runs for every request inside",
     };
-    if has_script(events, "prerequest") {
-        let owner = owned_by("prerequest");
-        let (rows, residue) = generators_from_events(events);
+    for (owner, group) in owner_groups(events, "prerequest") {
+        let (rows, residue) = generators_from_events(&group);
         let detail = if rows.is_empty() {
             // Worth naming the `[Gen]` block even when nothing translated: this
             // note is the moment the user learns the script is gone, and most
@@ -1516,12 +1555,12 @@ fn note_losses(
         };
         push_note(out, title, owner, detail);
     }
-    if has_script(events, "test") {
-        let owner = owned_by("test");
-        let (status, asserts, residue) = asserts_from_events(events);
+    for (owner, group) in owner_groups(events, "test") {
+        let captures = captures_from_events(&group);
+        let (status, asserts, residue) = asserts_from_events(&group);
         let mut kept: Vec<String> = Vec::new();
-        if !entry.captures.is_empty() {
-            kept.push(format!("{} [Captures]", entry.captures.len()));
+        if !captures.is_empty() {
+            kept.push(format!("{} [Captures]", captures.len()));
         }
         if status.is_some() {
             kept.push("the status it expects".to_string());
@@ -1554,10 +1593,10 @@ fn note_losses(
     // next does not do the same thing when it is run top to bottom, and the
     // requests themselves look perfectly correct while it happens.
     // Read one event at a time rather than the concatenated script, so the note
-    // is filed against whoever actually wrote the call. `script_owner` can't
-    // help here: it asks whether the request has a script *at all*, and a
-    // request that carries its own assertions alongside an inherited jump would
-    // claim the folder's problem as its own — which is how one folder script
+    // is filed against whoever actually wrote the call — the same per-owner
+    // reduction the script notes above now do. Filing an inherited jump against
+    // the request that carries its own assertions alongside it would claim the
+    // folder's problem as the request's, which is how one folder script once
     // produced eighteen identical notes on a real collection.
     for e in events {
         if e.listen != "prerequest" && e.listen != "test" {
@@ -1647,7 +1686,8 @@ fn next_request_fates(script: &str, title: &str) -> Vec<String> {
 
 /// File a note against the request, or — when the script that caused it came
 /// from an enclosing folder — against that folder, and only once. `owner` is
-/// the breadcrumb from [`script_owner`]; an empty one is the collection.
+/// `None` for a script the request declares itself, otherwise the breadcrumb of
+/// the folder (or collection) that does; an empty breadcrumb is the collection.
 fn push_note(out: &mut ConvertedCollection, title: &str, owner: Option<String>, detail: String) {
     let item = owner.unwrap_or_else(|| title.to_string());
     if out
@@ -1660,21 +1700,30 @@ fn push_note(out: &mut ConvertedCollection, title: &str, owner: Option<String>, 
     out.notes.push(ConversionNote { item, detail });
 }
 
-/// Where a note about this script belongs: `None` when the request declares one
-/// of its own, otherwise the breadcrumb of the folder that does (empty for the
-/// collection). A script the request does not own is one the reader will not
-/// find by opening the request, and it is one thing to fix rather than one per
-/// request that inherits it.
-fn script_owner(events: &[Event], listen: &str) -> Option<String> {
-    if !script_is_inherited(events, listen) {
-        return None;
+/// The `listen` scripts in force here, grouped by who wrote them, so each part
+/// can be reduced on its own and its note filed against its owner.
+///
+/// Each group is `(owner, events)`: `None` for the request's own scripts (the
+/// note reads "this request's" and is filed against the request), or
+/// `Some(breadcrumb)` for a folder's or the collection's (the note reads "this
+/// folder's" and is filed against that folder, once for every request that
+/// inherits it). Groups with no actual code are dropped — Postman writes an
+/// empty script tab on nearly every request, and a note for each is noise that
+/// buries the two that matter.
+fn owner_groups(events: &[Event], listen: &str) -> Vec<(Option<String>, Vec<Event>)> {
+    let mut groups: Vec<(Option<String>, Vec<Event>)> = Vec::new();
+    for e in events.iter().filter(|e| e.listen == listen) {
+        let key = e.inherited.then(|| e.owner.clone());
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(e.clone()),
+            None => groups.push((key, vec![e.clone()])),
+        }
     }
-    events
-        .iter()
-        .find(|e| e.listen == listen && !e.script.exec.join("").trim().is_empty())
-        .map(|e| e.owner.clone())
+    groups
+        .into_iter()
+        .filter(|(_, group)| has_script(group, listen))
+        .collect()
 }
-
 /// `a`, `a and b`, `a, b and c` — the readable spelling of a short list.
 fn and_list(items: &[&str]) -> String {
     match items {
@@ -1899,26 +1948,10 @@ fn has_script(events: &[Event], listen: &str) -> bool {
     !script_text(events, listen).trim().is_empty()
 }
 
-/// Whether the `listen` script in force here comes only from a folder or the
-/// collection rather than from the request itself — which is worth saying in a
-/// note, since it sends the reader somewhere else to look.
-fn script_is_inherited(events: &[Event], listen: &str) -> bool {
-    let own: Vec<Event> = events.iter().filter(|e| !e.inherited).cloned().collect();
-    has_script(events, listen) && !has_script(&own, listen)
-}
-
 // `var/let/const X = pm.response.json()` — `X` is the parsed-body variable
 // whose accessor chains map to jsonpaths.
 static JSON_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:var|let|const)\s+(\w+)\s*=\s*pm\.response\.json\s*\(\s*\)").unwrap()
-});
-
-// `pm.<store>.set("NAME", <value>)` for the variable stores Postman exposes.
-static SET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"pm\.(?:environment|collectionVariables|globals|variables)\.set\(\s*['"]([^'"]+)['"]\s*,\s*([^)]+)\)"#,
-    )
-    .unwrap()
 });
 
 /// Best-effort scrape of a request's `test` scripts into `[Captures]`: each
@@ -1926,15 +1959,18 @@ static SET_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// is the `pm.response.json()` variable becomes `NAME = jsonpath "$.a.b"`.
 /// Calls that don't reduce to a plain accessor chain are skipped rather than
 /// failing the import.
+///
+/// This uses [`find_calls`] and [`capture_from_call`] — the *same* balanced-
+/// paren parser, root list and conditional gate [`asserts_from_events`] uses to
+/// decide which `set` calls it has "covered". The two once disagreed: the
+/// coverage side added `pm.response.json()` as a root and read the whole call,
+/// while this side used a `[^)]+` regex that stopped at the first `)`, so
+/// `pm.response.json().token` was marked covered and then captured *nothing* —
+/// no capture, and no note either, on a report that claimed a clean import. A
+/// single shared decision keeps coverage and conversion from ever diverging.
 fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
-    let script = events
-        .iter()
-        .filter(|e| e.listen == "test")
-        .flat_map(|e| e.script.exec.iter())
-        .map(|l| l.trim_end_matches('\r'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if script.is_empty() {
+    let script = script_text(events, "test");
+    if script.trim().is_empty() {
         return Vec::new();
     }
     // Read the script as code, not as text: a `pm.environment.set(...)` line
@@ -1944,29 +1980,74 @@ fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
     // requests interpolate, a spurious `token` capture changes the bytes those
     // requests send. A wrong capture is far worse than a missing one.
     let (code, in_string) = strip_js_noise(&script);
+    let conditional = conditional_mask(&code);
+    let roots = capture_roots(&code);
 
-    // Response-body variable name(s); default to the near-universal `jsonData`
-    // when the script assigns the body to nothing we recognise.
+    let mut caps: Vec<(String, String)> = Vec::new();
+    for call in find_calls(&code, &in_string, &SET_CALL_RE) {
+        let Some((name, query)) = capture_from_call(&call, &code, &conditional, &roots) else {
+            continue;
+        };
+        // The script ran top to bottom and the last write won. A name captured
+        // twice does not read as two rows: `[Captures]` would store the second
+        // over the first anyway, and a note saying "2 [Captures]" for one
+        // stored value is a lie. The row is replaced, exactly as the `[Gen]`
+        // path does for the same reason.
+        match caps.iter_mut().find(|(n, _)| *n == name) {
+            Some(row) => row.1 = query,
+            None => caps.push((name, query)),
+        }
+    }
+    caps
+}
+
+/// The response-body roots a `test` script's accessor chains resolve against:
+/// every `var body = pm.response.json()` name, plus the near-universal
+/// `jsonData` and the bare `pm.response.json()` (the body with no variable in
+/// between). [`captures_from_events`] and [`asserts_from_events`] must build
+/// this identically, or a `set` one covers is not a capture the other emits.
+fn capture_roots(code: &str) -> Vec<String> {
     let mut roots: Vec<String> = JSON_VAR_RE
-        .captures_iter(&code)
+        .captures_iter(code)
         .map(|c| c[1].to_string())
         .collect();
-    if roots.is_empty() {
-        roots.push("jsonData".to_string());
+    roots.push("jsonData".to_string());
+    roots.push("pm.response.json()".to_string());
+    roots
+}
+
+/// The `[Captures]` row a single `pm.<store>.set(...)` call becomes, or `None`
+/// when it cannot become one — the sole authority on which `set` calls turn
+/// into captures.
+///
+/// A call is refused (and so left as residue, to be noted) when it is guarded
+/// by a conditional (Hurl captures unconditionally, so a guarded one would run
+/// where the guard said it should not — and, worse, error whenever the guarded
+/// path was not taken), when its name is not one Hurl can carry (an invalid
+/// name is written into the file and then silently deleted the first time it is
+/// reopened), or when its value is not a plain accessor chain.
+fn capture_from_call(
+    call: &CallSite,
+    code: &str,
+    conditional: &[bool],
+    roots: &[String],
+) -> Option<(String, String)> {
+    if call.args.len() != 2 {
+        return None;
     }
-    SET_RE
-        .captures_iter(&code)
-        .filter(|c| {
-            // The call itself must be code. Its *arguments* are quoted, so
-            // only the position the match starts at can be judged.
-            c.get(0)
-                .is_some_and(|m| !in_string.get(m.start()).copied().unwrap_or(false))
-        })
-        .filter_map(|c| {
-            let path = accessor_to_jsonpath(c[2].trim(), &roots)?;
-            Some((c[1].to_string(), format!("jsonpath \"{path}\"")))
-        })
-        .collect()
+    if conditional.get(call.start).copied().unwrap_or(false) || !starts_statement(code, call.start)
+    {
+        return None;
+    }
+    let name = unquote(call.args[0].trim())?;
+    // A name Hurl's grammar rejects is written into `[Captures]` and then
+    // dropped the first time the file is reopened, while the note claims it
+    // became a capture. The `[Gen]` path already filters the same way.
+    if !crate::hurl::is_variable_name(name) {
+        return None;
+    }
+    let path = accessor_to_jsonpath(&compact_code(call.args[1]), roots)?;
+    Some((name.to_string(), format!("jsonpath \"{path}\"")))
 }
 
 /// One real (unquoted, uncommented) call found in a script: the byte range it
@@ -2079,6 +2160,44 @@ fn compact(code: &str) -> String {
     code.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Like [`compact`], but leaves the inside of string literals alone.
+///
+/// Whitespace only ever muddies the *shape* of an expression, so it is safe to
+/// drop between tokens — but a space inside a quoted key or value is data.
+/// `pm.expect(jsonData['full name'])` names a field that really is called
+/// `full name`, and `pm.response.headers.get('X Weird')` a header that really
+/// has a space; compacting straight through the quotes turned both into a query
+/// for a field that does not exist, and the assert then failed against a
+/// perfectly correct response. This keeps everything inside `'…'`, `"…"` or
+/// `` `…` `` verbatim while stripping the whitespace around it.
+fn compact_code(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in code.chars() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            _ if c.is_whitespace() => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Whether any `pm.` call in the script was left untranslated — the signal that
 /// the note has to say the rest was dropped. `covered` holds the byte ranges
 /// already accounted for.
@@ -2119,6 +2238,7 @@ fn generators_from_events(events: &[Event]) -> (Vec<(String, String)>, bool) {
         return (Vec::new(), false);
     }
     let (code, in_string) = strip_js_noise(&script);
+    let conditional = conditional_mask(&code);
     let mut aliases: Vec<String> = UUID_REQUIRE_RE
         .captures_iter(&code)
         .map(|c| c[1].to_string())
@@ -2134,6 +2254,17 @@ fn generators_from_events(events: &[Event]) -> (Vec<(String, String)>, bool) {
     let mut rows: Vec<(String, String)> = Vec::new();
     for call in find_calls(&code, &in_string, &SET_CALL_RE) {
         if call.args.len() != 2 {
+            continue;
+        }
+        // Only unconditional sets become rows, exactly as `[Asserts]` takes only
+        // unconditional assertions and for the same reason. Postman's ubiquitous
+        // `if (!pm.environment.get('id')) { pm.environment.set('id', uuid()); }`
+        // means "set it *once*"; taken unconditionally it becomes a fresh id on
+        // every send. A guarded set is left uncovered, so it is noted rather than
+        // silently made unconditional.
+        if conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start)
+        {
             continue;
         }
         let Some(name) = unquote(call.args[0].trim()) else {
@@ -2176,7 +2307,7 @@ fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
         // backslash cannot be written down as one and is left to the note.
         return (!text.contains(['"', '\\'])).then(|| format!("\"{text}\""));
     }
-    if value.parse::<f64>().is_ok() {
+    if is_hurl_number(value) {
         return Some(value.to_string());
     }
     // Whitespace-free, so `new Date().getTime()` and `new Date( ).getTime( )`
@@ -2254,14 +2385,10 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
     let (code, in_string) = strip_js_noise(&script);
     let conditional = conditional_mask(&code);
 
-    let mut roots: Vec<String> = JSON_VAR_RE
-        .captures_iter(&code)
-        .map(|c| c[1].to_string())
-        .collect();
-    roots.push("jsonData".to_string());
-    // `pm.expect(pm.response.json().a.b)` — the body without a variable in
-    // between, which reads as a root of its own once whitespace is gone.
-    roots.push("pm.response.json()".to_string());
+    // Built identically to [`captures_from_events`], so that whether a `set`
+    // call is "covered" here and whether it becomes a capture there are one
+    // decision, not two that can drift apart.
+    let roots = capture_roots(&code);
 
     // Scaffolding that is not "something we failed to translate": the wrapper,
     // the body variable, and the `pm.<store>.set` calls `captures_from_events`
@@ -2271,11 +2398,13 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
         .chain(JSON_VAR_RE.find_iter(&code))
         .map(|m| (m.start(), m.end()))
         .collect();
+    // A `set` call counts as covered only when it actually becomes a capture —
+    // the very same test `captures_from_events` applies. Marking a call covered
+    // that then captured nothing (a guarded set, an invalid name, or a value
+    // `[^)]+` cut off at the first `)`) left no residue and so no note, on a
+    // report that claimed a clean conversion.
     for call in find_calls(&code, &in_string, &SET_CALL_RE) {
-        if call.args.len() == 2
-            && unquote(call.args[0].trim())
-                .is_some_and(|_| accessor_to_jsonpath(&compact(call.args[1]), &roots).is_some())
-        {
+        if capture_from_call(&call, &code, &conditional, &roots).is_some() {
             covered.push((call.start, call.end));
         }
     }
@@ -2292,8 +2421,13 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
         let Some(code_num) = call.args.first().and_then(|a| a.trim().parse::<u16>().ok()) else {
             continue;
         };
-        status.get_or_insert(code_num);
-        covered.push((call.start, call.end));
+        // Only the status actually adopted is covered. A second, *different*
+        // status is a check the collection made that the import would silently
+        // drop — so it is left as residue, and the note says the rest was
+        // dropped, rather than quietly asserting the weaker of the two.
+        if status.get_or_insert(code_num) == &code_num {
+            covered.push((call.start, call.end));
+        }
     }
 
     for call in find_calls(&code, &in_string, &EXPECT_RE) {
@@ -2304,7 +2438,7 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
             continue;
         }
         let tail_end = statement_end(&code, call.end);
-        let Some(subject) = expect_subject(&compact(call.args[0]), &roots) else {
+        let Some(subject) = expect_subject(&compact_code(call.args[0]), &roots) else {
             continue;
         };
         // A deep equality against an object or array literal. Hurl has no
@@ -2335,8 +2469,14 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
         };
         match (subject, predicate) {
             (Subject::Status, Predicate::Eq(v)) => match v.parse::<u16>() {
+                // As above: a second, differing status is left uncovered so it
+                // is noted, rather than silently discarded in favour of the
+                // first.
                 Ok(n) => {
-                    status.get_or_insert(n);
+                    if status.get_or_insert(n) == &n {
+                        covered.push((call.start, tail_end));
+                    }
+                    continue;
                 }
                 Err(_) => continue,
             },
@@ -2450,13 +2590,36 @@ fn hurl_literal(value: &str) -> Option<String> {
     if let Some(text) = unquote(value) {
         // Hurl quoted strings take `\"` and `\\`, but a literal needing them is
         // rare enough that dropping the assert (and saying so) beats getting the
-        // escaping subtly wrong.
-        return (!text.contains(['"', '\\'])).then(|| format!("\"{text}\""));
+        // escaping subtly wrong. `{{` is refused for the same reason: Hurl would
+        // read it as a template and compare against a substituted value, so a
+        // literal carrying one is left to the note rather than mis-asserted.
+        return (!text.contains(['"', '\\']) && !text.contains("{{"))
+            .then(|| format!("\"{text}\""));
     }
     if matches!(value, "true" | "false" | "null") {
         return Some(value.to_string());
     }
-    value.parse::<f64>().ok().map(|_| value.to_string())
+    // Only a number Hurl's predicate grammar can actually read. `f64::parse`
+    // also accepts `1e3`, `.5`, `Infinity` and `NaN`, none of which Hurl will
+    // parse — the assert was written, the note claimed it, and it vanished (or
+    // broke the whole file) the first time the collection was reopened.
+    is_hurl_number(value).then(|| value.to_string())
+}
+
+/// Whether `value` is a number Hurl's predicate grammar accepts: an optional
+/// leading `-`, one or more digits, and — if there is a `.` — one or more
+/// digits after it. No exponent, no bare `.5`, no `Infinity`/`NaN`.
+fn is_hurl_number(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let mut parts = digits.splitn(2, '.');
+    let int = parts.next().unwrap_or("");
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(frac) => !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()),
+    }
 }
 
 /// Whether the call at `start` begins its own statement: nothing but whitespace
@@ -2470,10 +2633,82 @@ fn starts_statement(code: &str, start: usize) -> bool {
     // as "nothing in front of it", so the very first line of a script was
     // exempt from the whole rule — `if (ok) pm.expect(…)` written on line one
     // imported as an unconditional assert.
-    let from = code[..start]
-        .rfind([';', '{', '}', '\n'])
-        .map_or(0, |i| i + 1);
-    code[from..start].trim().is_empty()
+    let boundary = code[..start].rfind([';', '{', '}', '\n']);
+    let from = boundary.map_or(0, |i| i + 1);
+    if !code[from..start].trim().is_empty() {
+        return false;
+    }
+    // A brace-less guard split over two lines is still a guard:
+    //
+    // ```js
+    // if (jsonData.ok)
+    //     pm.expect(...)
+    // ```
+    //
+    // The newline in front of the call looks like the end of a statement, but
+    // it is the middle of one. When the boundary is a newline, look back past
+    // the whitespace to the real code before it, and if that is the head of a
+    // brace-less `if`/`for`/`while`/`else`/`do`, the call is its guarded body.
+    if boundary.is_some_and(|i| code.as_bytes()[i] == b'\n') {
+        let head = code[..boundary.unwrap()].trim_end();
+        if ends_with_guard_head(head) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `head` — the code on the line(s) before a brace-less body — ends in
+/// a guard whose body is what follows: `else`, `do`, or `if`/`for`/`while (…)`.
+fn ends_with_guard_head(head: &str) -> bool {
+    let word_before = |s: &str| -> String {
+        s.chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    };
+    // A bare `else` or `do` with only its body to come.
+    let last_word = word_before(head);
+    if matches!(last_word.as_str(), "else" | "do") {
+        return true;
+    }
+    // `if (...)`, `for (...)`, `while (...)`: the keyword is what sits before
+    // the parenthesised condition this `)` closes.
+    if head.ends_with(')')
+        && let Some(open) = matching_open_paren(head)
+    {
+        let keyword = word_before(head[..open].trim_end());
+        return matches!(keyword.as_str(), "if" | "for" | "while");
+    }
+    false
+}
+
+/// The index of the `(` matched by the final `)` of `s`, scanning back and
+/// counting depth. Strings have already been left in place by
+/// [`strip_js_noise`], so a `)` quoted in one is a rare source of a wrong
+/// match — acceptable for a heuristic whose only job is to spot a guard head.
+fn matching_open_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// One past the end of the statement beginning at `from`: the next `;` or
@@ -2580,25 +2815,40 @@ fn opens_test_callback(code: &str, parens: &[usize], at: usize) -> bool {
     if !matches!(name.as_str(), "pm.test" | "pm.it") {
         return false;
     }
+    // The text between `pm.test(` and this `{` must be *only* a callback
+    // header — the name argument, a comma, and the callback's own signature —
+    // and nothing more. Testing merely that it `contains("function(")` and
+    // `ends_with(')')` matched the *inner* `{` of an `if` inside a
+    // `function () {}` callback too (`("t",function(){if(jsonData.ok)` both
+    // contains `function(` and ends with `)`), so the guard block was taken as
+    // unconditional and everything in it imported unconditionally. An arrow
+    // header ends with `=>`; a `function` header ends right after its own
+    // parameter list.
+    static TEST_CALLBACK_HEADER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\(.*,(?:async)?function\*?\([^)]*\)$").unwrap());
     let between = compact(&code[open..at]);
-    between.ends_with("=>") || (between.contains("function(") && between.ends_with(')'))
+    between.ends_with("=>") || TEST_CALLBACK_HEADER.is_match(&between)
 }
 
-/// Blank out JavaScript comments and report which bytes sit inside a string
-/// literal.
+/// Blank out JavaScript comments and regex literals, and report which bytes sit
+/// inside a string literal.
 ///
-/// The returned text is the same length as the input — comments become spaces,
-/// keeping newlines — so a match offset in it means the same thing in the
-/// original. The scanner is deliberately small: it understands `//`, `/* */`,
-/// `'`/`"`/backtick strings and backslash escapes, which is everything needed
-/// to tell "this call is real code" from "this call is text". It does not try
-/// to be a JavaScript parser — a regex over a scripting language is a
-/// heuristic either way, and the point here is only to stop the obvious
-/// false positives.
+/// The returned text is the same length as the input — comments and regex
+/// literals become spaces, keeping newlines — so a match offset in it means the
+/// same thing in the original. The scanner is deliberately small: it
+/// understands `//`, `/* */`, `'`/`"`/backtick strings, backslash escapes and
+/// `/regex/` literals, which is everything needed to tell "this call is real
+/// code" from "this is text or a pattern". It does not try to be a JavaScript
+/// parser — a regex over a scripting language is a heuristic either way, and
+/// the point here is only to stop the obvious false positives.
 ///
-/// A regex literal (`/foo/`) is not recognised, so its contents are read as
-/// code; that can only ever cause a `pm...set(...)` *inside a regex* to be
-/// picked up, which is not a thing anybody writes.
+/// Blanking regex literals is not cosmetic. A pattern like `/\{([^}]*)\}/` holds
+/// one `{` and two `}`; read as code, the extra `}` pops the enclosing `if`
+/// block in [`conditional_mask`], and every statement after it reads as
+/// unconditional. The mirror — an unmatched `{` in `const re = /\{/;` — hides
+/// every assertion after it instead. A `/` is taken to open a regex only in
+/// expression position (at the start, or after `(`, `,`, `=`, `:`, `[`, `!`,
+/// `&`, `|`, `{`, `;`, `?`, or `return`); after a value or `)` it is division.
 fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
     #[derive(PartialEq)]
     enum St {
@@ -2606,11 +2856,13 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
         Line,
         Block,
         Str(char),
+        Regex,
     }
     let mut out = String::with_capacity(script.len());
     let mut in_string = Vec::with_capacity(script.len());
     let mut st = St::Code;
     let mut escaped = false;
+    let mut regex_class = false;
     let mut chars = script.chars().peekable();
     while let Some(c) = chars.next() {
         let (keep, quoted) = match st {
@@ -2621,6 +2873,12 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
                 }
                 '/' if chars.peek() == Some(&'*') => {
                     st = St::Block;
+                    (false, false)
+                }
+                '/' if regex_position(&out, &in_string) => {
+                    st = St::Regex;
+                    escaped = false;
+                    regex_class = false;
                     (false, false)
                 }
                 '\'' | '"' | '`' => {
@@ -2660,6 +2918,31 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
                 }
                 (true, true)
             }
+            St::Regex => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '[' {
+                    regex_class = true;
+                } else if c == ']' {
+                    regex_class = false;
+                } else if c == '\n' {
+                    // An unterminated regex at end of line is a typo (or a `/`
+                    // we misjudged); don't swallow the rest of the script.
+                    st = St::Code;
+                } else if c == '/' && !regex_class {
+                    // End of the pattern. Its flags (`gimsuy`) are letters that
+                    // would read back as an identifier, so blank them too.
+                    while chars.peek().is_some_and(|p| p.is_ascii_alphabetic()) {
+                        chars.next();
+                        out.push(' ');
+                        in_string.push(false);
+                    }
+                    st = St::Code;
+                }
+                (false, false)
+            }
         };
         // A blanked character becomes a single space, which can shorten
         // `out` — that is fine, because the flags are pushed to match `out`,
@@ -2672,6 +2955,54 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
     }
     debug_assert_eq!(out.len(), in_string.len());
     (out, in_string)
+}
+
+/// Whether a `/` reached with this code emitted so far opens a regex literal
+/// rather than being a division. True in expression position: at the very
+/// start, after an operator or opener, or after a keyword like `return` that a
+/// value follows — false after a value, an identifier, or a closing bracket.
+fn regex_position(out: &str, in_string: &[bool]) -> bool {
+    // The last emitted character that is real code (not inside a string, not a
+    // blanked comment/regex, not whitespace).
+    let last = out
+        .char_indices()
+        .rev()
+        .find(|&(i, ch)| !ch.is_whitespace() && !in_string.get(i).copied().unwrap_or(false))
+        .map(|(_, ch)| ch);
+    match last {
+        None => true,
+        Some(c) if "(,=:[!&|{;?".contains(c) => true,
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => {
+            // A keyword that a value follows means expression position; a plain
+            // identifier or number means the `/` divides it.
+            let word: String = out
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            matches!(
+                word.as_str(),
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "do"
+                    | "else"
+                    | "case"
+                    | "void"
+                    | "delete"
+                    | "new"
+                    | "throw"
+                    | "yield"
+                    | "await"
+            )
+        }
+        Some(_) => false,
+    }
 }
 
 /// Convert a JS accessor chain rooted at one of `roots`
@@ -2734,6 +3065,7 @@ fn js_literal(src: &str) -> Option<Value> {
                 // Re-emit as a double-quoted JSON string, escaping what JSON
                 // requires and un-escaping the `\'` that only mattered inside
                 // single quotes.
+                let str_start = out.len();
                 out.push('"');
                 let mut closed = false;
                 while let Some((_, d)) = chars.next() {
@@ -2762,6 +3094,15 @@ fn js_literal(src: &str) -> Option<Value> {
                     return None;
                 }
                 out.push('"');
+                // A `{{…}}` inside the string would be read back as a Hurl
+                // template when the leaf became an assert, comparing the
+                // response against a *substituted* value (or erroring on an
+                // undefined variable) for a body that was correct. `[Gen]`/
+                // `[Asserts]` have no way to escape it, so the whole literal is
+                // declined and left to the note.
+                if out[str_start..].contains("{{") {
+                    return None;
+                }
             }
             // An unquoted key: a bare identifier immediately followed by `:`.
             c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
@@ -2804,13 +3145,34 @@ fn js_literal(src: &str) -> Option<Value> {
     serde_json::from_str(&out).ok()
 }
 
+/// A single string literal's inner text, or `None` when `s` is not exactly one
+/// string.
+///
+/// It is not enough that the first and last characters are the same quote: `'a'
+/// + x + 'b'` starts and ends with `'` yet is a *concatenation*, and reading it
+/// as the one string `a' + x + 'b` fed a wrong value straight into a `[Gen]`
+/// row or an assert. So the opening quote is scanned to its real terminator
+/// (respecting `\` escapes); only when that terminator is the final character
+/// is this one string.
 fn unquote(s: &str) -> Option<&str> {
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
-        Some(&s[1..s.len() - 1])
-    } else {
-        None
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
     }
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == quote {
+            // The closing quote must be the last byte, or what follows it
+            // (`+ x + '…'`, `.trim()`, …) makes this more than one string.
+            return (i == bytes.len() - 1).then(|| &s[1..i]);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -5087,5 +5449,673 @@ mod script_tests {
 
     fn next_request_notes(title: &str, script: &str) -> Vec<String> {
         super::next_request_fates(script, title)
+    }
+}
+
+/// Regressions for fourteen defects the Postman importer once had, each of
+/// which either sent or asserted a value the collection never meant, or filed
+/// a loss against the wrong item. Every test asserts the *correct* behaviour
+/// and keeps a negative control alongside it, so a fix that over-corrects fails
+/// here just as surely as one that under-corrects.
+#[cfg(test)]
+mod defect_regressions {
+    use super::*;
+
+    fn j(s: &str) -> String {
+        s.lines()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// One request with an optional `prerequest` and/or `test` script, a URL
+    /// and a title (the breadcrumb Postman would address it by).
+    fn conv(pre: &str, test: &str, url: &str, title: &str) -> ConvertedCollection {
+        let mut ev = Vec::new();
+        if !pre.is_empty() {
+            ev.push(format!(
+                r#"{{"listen":"prerequest","script":{{"exec":[{}]}}}}"#,
+                j(pre)
+            ));
+        }
+        if !test.is_empty() {
+            ev.push(format!(
+                r#"{{"listen":"test","script":{{"exec":[{}]}}}}"#,
+                j(test)
+            ));
+        }
+        convert_postman(&format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"{title}","event":[{}],"request":{{"method":"GET","url":"{url}"}}}}]}}"#,
+            ev.join(",")
+        ))
+    }
+
+    // P1 — an `if` inside a `function () {}` test callback is conditional.
+    #[test]
+    fn a_guard_inside_a_function_test_callback_is_not_hoisted() {
+        let c = conv(
+            "",
+            "pm.test('t', function () {\n  if (jsonData.ok) {\n    pm.expect(jsonData.name).to.equal('Ada');\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "guarded assert hoisted: {:?}",
+            c.entries[0].asserts
+        );
+        // A guarded status line is likewise not adopted.
+        let st = conv(
+            "",
+            "pm.test('t', function () {\n  if (ok) {\n    pm.response.to.have.status(500);\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(st.entries[0].expected_status, None);
+        // And a guarded jump reads as a sometimes-jump, not an always-jump.
+        let nx = conv(
+            "",
+            "pm.test('t', function () {\n  if (bad) {\n    postman.setNextRequest('Retry');\n  }\n});",
+            "https://h/x",
+            "Login",
+        );
+        assert!(
+            nx.notes
+                .iter()
+                .any(|n| n.detail.contains("sometimes jumped to `Retry`")),
+            "{:?}",
+            nx.notes
+        );
+        // Control: a plain `function () {}` callback body is still taken — the
+        // fix must narrow, not disable, callback detection.
+        let plain = conv(
+            "",
+            "pm.test('t', function () {\n  pm.expect(jsonData.name).to.equal('Ada');\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            plain.entries[0].asserts,
+            vec!["jsonpath \"$.name\" == \"Ada\"".to_string()]
+        );
+        // Control: the arrow spelling of the same guard was always refused.
+        let arrow = conv(
+            "",
+            "pm.test('t', () => {\n  if (jsonData.ok) {\n    pm.expect(jsonData.name).to.equal('Ada');\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert!(arrow.entries[0].asserts.is_empty());
+    }
+
+    // P2 — a brace-less guard split over two lines is still a guard.
+    #[test]
+    fn a_brace_less_guard_split_across_lines_is_still_conditional() {
+        let c = conv(
+            "",
+            "if (jsonData.ok)\n    pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "{:?}",
+            c.entries[0].asserts
+        );
+        let e = conv(
+            "",
+            "if (jsonData.ok) {\n} else\n  pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            e.entries[0].asserts.is_empty(),
+            "{:?}",
+            e.entries[0].asserts
+        );
+        let f = conv(
+            "",
+            "for (const x of jsonData.items)\n  pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            f.entries[0].asserts.is_empty(),
+            "{:?}",
+            f.entries[0].asserts
+        );
+        // Control: an ordinary statement after a newline is still taken.
+        let ok = conv(
+            "",
+            "const a = 1;\npm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].asserts,
+            vec!["jsonpath \"$.name\" == \"Ada\"".to_string()]
+        );
+        // Control: the same guard on one line was always refused.
+        let one = conv(
+            "",
+            "if (jsonData.ok) pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(one.entries[0].asserts.is_empty());
+    }
+
+    // P3 — `unquote` accepts one string, never a concatenation.
+    #[test]
+    fn a_string_concatenation_is_not_read_as_one_string() {
+        assert_eq!(unquote("'Not' + ' ' + 'Found'"), None);
+        assert_eq!(unquote("'Found'"), Some("Found"));
+        assert_eq!(unquote("'it\\'s'"), Some("it\\'s"));
+        // The concatenated predicate is declined, not asserted as a wrong value.
+        let a = conv(
+            "",
+            "pm.expect(jsonData.name).to.equal('Not' + ' ' + 'Found');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            a.entries[0].asserts.is_empty(),
+            "{:?}",
+            a.entries[0].asserts
+        );
+        assert!(a.notes.iter().any(|n| n.detail.contains("dropped")));
+        // A concatenated `[Gen]` value — actually *sent* — is declined too.
+        let g = conv(
+            "pm.environment.set('key', 'abc' + '-' + 'def');",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "{:?}",
+            g.entries[0].generators
+        );
+        // Control: a plain quoted value still converts.
+        let ok = conv(
+            "pm.environment.set('key', 'abcdef');",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("key".to_string(), "\"abcdef\"".to_string())]
+        );
+    }
+
+    // P4 — a space inside a quoted subject key or header name survives.
+    #[test]
+    fn a_space_in_a_subject_key_or_header_name_survives() {
+        let k = conv(
+            "",
+            "pm.expect(jsonData['full name']).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            k.entries[0].asserts,
+            vec!["jsonpath \"$['full name']\" == \"Ada\"".to_string()]
+        );
+        let h = conv(
+            "",
+            "pm.expect(pm.response.headers.get('X Weird')).to.equal('a');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            h.entries[0].asserts,
+            vec!["header \"X Weird\" == \"a\"".to_string()]
+        );
+        // Control: the predicate side already kept its spaces.
+        let p = conv(
+            "",
+            "pm.expect(jsonData.msg).to.equal('Not Found');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            p.entries[0].asserts,
+            vec!["jsonpath \"$.msg\" == \"Not Found\"".to_string()]
+        );
+    }
+
+    // P5 — a capture over `pm.response.json()` is actually captured, not marked
+    // covered and silently lost.
+    #[test]
+    fn a_capture_over_response_json_is_captured_not_lost() {
+        let c = conv(
+            "",
+            "pm.test('ok', function () { pm.response.to.have.status(200); });\npm.environment.set('token', pm.response.json().token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+        assert_eq!(c.entries[0].expected_status, Some(200));
+        // Coverage and conversion cannot diverge: what is covered here really is
+        // a capture, so the note counts it.
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("[Captures]")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    // P6 — `[Gen]` rows and `[Captures]` are only taken from unconditional code.
+    #[test]
+    fn a_conditional_generator_or_capture_is_left_as_residue() {
+        let g = conv(
+            "if (!pm.environment.get('id')) { pm.environment.set('id', require('uuid').v4()); }",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "guarded set-once became an unconditional row: {:?}",
+            g.entries[0].generators
+        );
+        assert!(g.notes.iter().any(|n| n.detail.contains("dropped")));
+        let e = conv(
+            "if (a) {\n  pm.environment.set('id', 1);\n} else {\n  pm.environment.set('id', 2);\n}",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            e.entries[0].generators.is_empty(),
+            "an if/else silently picked a branch: {:?}",
+            e.entries[0].generators
+        );
+        let c = conv(
+            "",
+            "if (pm.response.code === 200) {\n  pm.environment.set('token', jsonData.token);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "a guarded capture would error whenever the guard was not taken: {:?}",
+            c.entries[0].captures
+        );
+        assert!(c.notes.iter().any(|n| n.detail.contains("dropped")));
+        // Controls: the unconditional forms still convert.
+        let okg = conv(
+            "pm.environment.set('id', require('uuid').v4());",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            okg.entries[0].generators,
+            vec![("id".to_string(), "uuid".to_string())]
+        );
+        let okc = conv(
+            "",
+            "pm.environment.set('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            okc.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    // P7 — a capture name Hurl cannot carry is refused, not written and later
+    // silently deleted.
+    #[test]
+    fn an_invalid_capture_name_is_refused() {
+        let c = conv(
+            "",
+            "pm.environment.set('my token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "{:?}",
+            c.entries[0].captures
+        );
+        assert!(c.notes.iter().any(|n| n.detail.contains("dropped")));
+        let hurl = crate::hurl::collection_to_hurl(&c.entries);
+        assert!(
+            !hurl.contains("my token: jsonpath"),
+            "an invalid name was written into the file: {hurl}"
+        );
+        assert_eq!(crate::hurl::parse_hurl(&hurl).len(), 1);
+        // Control: a valid name is captured.
+        let ok = conv(
+            "",
+            "pm.environment.set('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    // P8 — a dynamic variable does not fold onto an existing, differing `[Gen]`
+    // row and take its value.
+    #[test]
+    fn a_dynamic_variable_does_not_reuse_a_differing_gen_row() {
+        let c = conv(
+            "pm.environment.set('timestamp', Date.now());",
+            "",
+            "https://h/x?t={{$timestamp}}",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].generators,
+            vec![
+                ("timestamp".to_string(), "timestamp_ms".to_string()),
+                ("timestamp_1".to_string(), "timestamp".to_string()),
+            ]
+        );
+        assert_eq!(c.entries[0].url, "https://h/x?t={{timestamp_1}}");
+        assert!(
+            c.notes.iter().any(|n| n
+                .detail
+                .contains("computed by this request's `[Gen]` block as `timestamp`")),
+            "{:?}",
+            c.notes
+        );
+        // Control: with no clash, the natural name is used.
+        let ok = conv("", "", "https://h/x?t={{$timestamp}}", "x");
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("timestamp".to_string(), "timestamp".to_string())]
+        );
+        assert_eq!(ok.entries[0].url, "https://h/x?t={{timestamp}}");
+    }
+
+    // P9 — a brace inside a regex literal does not shift the block stack.
+    #[test]
+    fn a_brace_in_a_regex_literal_does_not_shift_the_block_stack() {
+        let c = conv(
+            "",
+            "if (bad) {\n    const m = pm.response.text().match(/\\{([^}]*)\\}/);\n    pm.expect(jsonData.a).to.equal(1);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "the extra `}}` popped the if and hoisted a guarded assert: {:?}",
+            c.entries[0].asserts
+        );
+        // The mirror: an unmatched `{` in a folder script must not hide the
+        // request's own assertions.
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"F","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                "item":[{{"name":"r","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                  "request":{{"method":"GET","url":"https://h/x"}}}}]}}]}}"#,
+            j("const re = /\\{/;"),
+            j("pm.expect(jsonData.a).to.equal(1);")
+        );
+        let f = convert_postman(&json);
+        assert_eq!(
+            f.entries[0].asserts,
+            vec!["jsonpath \"$.a\" == 1".to_string()]
+        );
+        // Control: a `/` that is really division is not read as a regex.
+        let d = conv(
+            "",
+            "const half = total / 2;\nif (bad) {\n  pm.expect(jsonData.a).to.equal(1);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            d.entries[0].asserts.is_empty(),
+            "{:?}",
+            d.entries[0].asserts
+        );
+    }
+
+    // P10 — a number Hurl's grammar cannot read is not asserted or emitted.
+    #[test]
+    fn a_number_hurl_cannot_read_is_declined() {
+        for src in ["1e3", ".5", "Infinity", "NaN"] {
+            let c = conv(
+                "",
+                &format!("pm.expect(jsonData.a).to.equal({src});"),
+                "https://h/x",
+                "x",
+            );
+            assert!(
+                c.entries[0].asserts.is_empty(),
+                "{src} was asserted: {:?}",
+                c.entries[0].asserts
+            );
+        }
+        // Controls: ordinary numbers still convert and read back.
+        for (src, line) in [
+            ("200", "jsonpath \"$.a\" == 200"),
+            ("1.5", "jsonpath \"$.a\" == 1.5"),
+            ("-3", "jsonpath \"$.a\" == -3"),
+        ] {
+            let c = conv(
+                "",
+                &format!("pm.expect(jsonData.a).to.equal({src});"),
+                "https://h/x",
+                "x",
+            );
+            assert_eq!(c.entries[0].asserts, vec![line.to_string()], "{src}");
+            let back = crate::hurl::parse_hurl(&crate::hurl::collection_to_hurl(&c.entries));
+            assert_eq!(back[0].asserts, c.entries[0].asserts, "{src} round-trips");
+        }
+        // The generator side: an unreadable number is declined, and every row
+        // the importer does emit passes `generators::check`.
+        let g = conv("pm.environment.set('n', 1e3);", "", "https://h/x", "x");
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "{:?}",
+            g.entries[0].generators
+        );
+        let ok = conv("pm.environment.set('n', 5);", "", "https://h/x", "x");
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("n".to_string(), "5".to_string())]
+        );
+        assert!(crate::generators::check(&ok.entries[0].generators).is_empty());
+    }
+
+    // P11 — a second, differing expected status is kept as residue, not
+    // silently discarded.
+    #[test]
+    fn a_second_differing_status_is_noted_not_dropped_silently() {
+        let c = conv(
+            "",
+            "pm.test('a', () => { pm.response.to.have.status(200); });\npm.test('b', () => { pm.expect(pm.response.code).to.equal(201); });",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(c.entries[0].expected_status, Some(200));
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("the rest of it was dropped")),
+            "the losing status left no note: {:?}",
+            c.notes
+        );
+        // Control: a second *matching* status is not residue.
+        let ok = conv(
+            "",
+            "pm.test('a', () => { pm.response.to.have.status(200); });\npm.test('b', () => { pm.expect(pm.response.code).to.equal(200); });",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(ok.entries[0].expected_status, Some(200));
+        assert!(
+            !ok.notes
+                .iter()
+                .any(|n| n.detail.contains("the rest of it was dropped")),
+            "{:?}",
+            ok.notes
+        );
+    }
+
+    // P12 — an inherited script's losses are filed against the folder that
+    // wrote them, not the request that only inherits them.
+    #[test]
+    fn a_folder_scripts_residue_is_filed_against_the_folder() {
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"F","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                "item":[{{"name":"r","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                  "request":{{"method":"GET","url":"https://h/x"}}}}]}}]}}"#,
+            j("const t = pm.environment.get('x');\npm.cookies.clear();"),
+            j("pm.test('t', () => { pm.expect(jsonData.a).to.equal(1); });")
+        );
+        let c = convert_postman(&json);
+        assert_eq!(c.notes.len(), 2, "{:?}", c.notes);
+        // The request's own note is clean — its script converted completely.
+        let req = c
+            .notes
+            .iter()
+            .find(|n| n.item == "F/r")
+            .expect("request note missing");
+        assert!(
+            req.detail
+                .contains("this request's test script became 1 [Asserts]"),
+            "{:?}",
+            req
+        );
+        assert!(
+            !req.detail.contains("the rest of it was dropped"),
+            "the folder's loss was blamed on the request: {:?}",
+            req
+        );
+        // The folder's own loss is filed against the folder.
+        let folder = c
+            .notes
+            .iter()
+            .find(|n| n.item == "F")
+            .expect("folder note missing");
+        assert!(
+            folder
+                .detail
+                .contains("this folder's test script was dropped"),
+            "{:?}",
+            folder
+        );
+    }
+
+    // P13 — a `{{` in an assert literal is refused, not read back as a Hurl
+    // template.
+    #[test]
+    fn a_template_looking_literal_is_not_asserted() {
+        let c = conv(
+            "",
+            "pm.expect(jsonData.a).to.equal('id {{x}} here');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "{:?}",
+            c.entries[0].asserts
+        );
+        let d = conv(
+            "",
+            "pm.expect(jsonData).to.eql({ a: 'x {{y}} z' });",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            d.entries[0].asserts.is_empty(),
+            "{:?}",
+            d.entries[0].asserts
+        );
+        // Control: an ordinary string is asserted.
+        let ok = conv(
+            "",
+            "pm.expect(jsonData.a).to.equal('plain');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].asserts,
+            vec!["jsonpath \"$.a\" == \"plain\"".to_string()]
+        );
+    }
+
+    // P14 — a capture name defined twice keeps only the last write, as the
+    // generator path does — not two rows the file cannot hold.
+    #[test]
+    fn a_capture_name_defined_twice_keeps_only_the_last() {
+        let c = conv(
+            "",
+            "pm.environment.set('id', jsonData.a);\npm.environment.set('id', jsonData.b);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("id".to_string(), "jsonpath \"$.b\"".to_string())]
+        );
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("1 [Captures]")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    /// Controls that must keep converting correctly — if any of these changes,
+    /// a fix has over-reached.
+    #[test]
+    fn controls_still_convert_correctly() {
+        let a = conv(
+            "",
+            "pm.test('t', () => {\n  pm.expect(pm.response.code).to.equal(400);\n  pm.expect(pm.response.json()).to.eql({ Message: 'The request is invalid.', ModelState: { 'body.Image': ['too big',] } });\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(a.entries[0].expected_status, Some(400));
+        assert_eq!(
+            a.entries[0].asserts,
+            vec![
+                "jsonpath \"$.Message\" == \"The request is invalid.\"".to_string(),
+                "jsonpath \"$.ModelState['body.Image']\" count == 1".to_string(),
+                "jsonpath \"$.ModelState['body.Image'][0]\" == \"too big\"".to_string(),
+            ]
+        );
+        // A helper called from top level is still conditional (only a `pm.test`
+        // callback body is unconditional).
+        let helper = conv(
+            "",
+            "const check = (b) => { pm.expect(b.a).to.equal('one'); };\ncheck(jsonData);",
+            "https://h/x",
+            "x",
+        );
+        assert!(helper.entries[0].asserts.is_empty());
+        // Chai `.to.equal` on an object is reference equality, never a deep one.
+        let equal_obj = conv(
+            "",
+            "pm.expect(jsonData).to.equal({ a: 1 });",
+            "https://h/x",
+            "x",
+        );
+        assert!(equal_obj.entries[0].asserts.is_empty());
+        // `.to.eql({})` asserts nothing about the body, so it is left as residue.
+        let empty_obj = conv("", "pm.expect(jsonData).to.eql({});", "https://h/x", "x");
+        assert!(empty_obj.entries[0].asserts.is_empty());
+        assert!(
+            empty_obj
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("nothing in it reduced"))
+        );
     }
 }
