@@ -3073,6 +3073,13 @@ fn draw_computed_section(
             let detail = crate::i18n::describe_gen_errors(s, std::slice::from_ref(fault))
                 .pop()
                 .unwrap_or_default();
+            // Clipped to what the label rect can hold, with an ellipsis. A
+            // Paragraph simply drops the overflow, so on a narrow terminal the
+            // sentence ended mid-word and read as a *different*, shorter
+            // complaint -- "unknown function" with the name it objects to cut
+            // off. The ellipsis at least says there is more.
+            let room = (label.width as usize).saturating_sub(s.field_computed.chars().count() + 1);
+            let detail = crate::shared_utils::truncate_to_width(&detail, room);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(

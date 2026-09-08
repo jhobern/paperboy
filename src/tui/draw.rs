@@ -1690,7 +1690,6 @@ fn draw_probe_menu_overlay(
     } else {
         s.probe_verb_hint
     };
-    let title = format!("{}{typed}  ({hint})", menu.title(s));
     let visible = menu.visible();
     let n = menu.row_count().max(1);
     let box_w = f.area().width.saturating_sub(6).clamp(40, 100);
@@ -1700,6 +1699,16 @@ fn draw_probe_menu_overlay(
     let inner_h = area.height.saturating_sub(2) as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+    // A JSON body of any size gives more rows than fit, and a list that scrolls
+    // with no sign of it looks like the whole list: "7/214" is the difference
+    // between "that field is not offered" and "keep pressing Down". Only shown
+    // while something is actually off-screen, so short lists stay quiet.
+    let position = if menu.row_count() > inner_h {
+        format!("  {}/{}", menu.selected + 1, menu.row_count())
+    } else {
+        String::new()
+    };
+    let title = format!("{}{typed}{position}  ({hint})", menu.title(s));
     let mut lines: Vec<Line> = Vec::new();
     let row_style = |i: usize| {
         if i == menu.selected {
@@ -2278,12 +2287,22 @@ pub(crate) fn draw_collection_left(
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
     let smap = crate::request::subst_map(col, env.as_ref());
+    // A request that computes values behaves differently from its neighbours --
+    // it can fail before it is even sent, and its URL holds a value that does
+    // not exist yet -- but the list said nothing about it, so the one request
+    // in a collection that had a `# [Gen]` block looked exactly like the rest.
+    // The column only appears when some request in this tab has one, so
+    // collections that compute nothing keep the width for their URLs.
+    let any_computed = col.entries.iter().any(|e| !e.generators.is_empty());
     // Columns available for the URL text (after the border, user-added marker
     // and the fixed method column). The selected row is shown highlighted
     // rather than with a leftmost caret, so no column is reserved for one.
     // Recorded so h-scrolling can be clamped to stop once the URL's end is
     // visible (no blank overscroll).
-    let url_w = list_area.width.saturating_sub(2 + 2 + 5);
+    // The computed column, when shown, takes two more of them.
+    let url_w = list_area
+        .width
+        .saturating_sub(2 + 2 + 5 + if any_computed { 2 } else { 0 });
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -2477,6 +2496,15 @@ pub(crate) fn draw_collection_left(
                 // dotted marker while a run is still in progress; blank
                 // until a batch run has actually covered this entry.
                 spans.push(run_marker_span(e.last_run, th));
+                if any_computed {
+                    // ƒ, in the same violet the request preview paints computed
+                    // substitutions in, so the two read as one idea.
+                    spans.push(if e.generators.is_empty() {
+                        Span::raw("  ")
+                    } else {
+                        Span::styled("\u{0192} ", Style::default().fg(th.computed))
+                    });
+                }
                 // Show the request's name when it has one; otherwise fall back
                 // to the URL. A title encodes a folder path (`Auth/Login`), and
                 // those folders are already rows in the tree, so only the leaf
@@ -4322,6 +4350,19 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     // only shown) while the Response pane holds focus, on the Body section.
     if app.focus == Pane::Response && app.response_section == ResponseSection::Body {
         hint.push(format!("c {}", s.foot_compact));
+    }
+    // `a` builds an assert or a capture out of the reply under the cursor. It
+    // is the only entry point to that palette, and a key nothing advertises is
+    // a key nobody finds -- but it is worth a footer slot only while there is
+    // a response for it to read.
+    if app.focus == Pane::Response
+        && app
+            .collections
+            .get(app.active_tab)
+            .and_then(|c| c.entries.get(c.selected_entry))
+            .is_some_and(|e| e.last_response.is_some())
+    {
+        hint.push(format!("a {}", s.foot_probe));
     }
     // `i` steps the Response section tabs — likewise only meaningful (and only
     // shown) while the Response pane holds focus.

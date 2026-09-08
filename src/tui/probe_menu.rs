@@ -149,7 +149,7 @@ impl crate::tui::app::TuiApp {
             .get(entry_idx)
             .and_then(|e| e.last_response.as_ref())
         else {
-            self.status = Some(crate::i18n::Status::NoResponse);
+            self.status = Some(crate::i18n::Status::ProbeNoResponse);
             return;
         };
         let subjects = probe::probes(
@@ -159,7 +159,7 @@ impl crate::tui::app::TuiApp {
             &response.body,
         );
         if subjects.is_empty() {
-            self.status = Some(crate::i18n::Status::NoResponse);
+            self.status = Some(crate::i18n::Status::ProbeNothingToProbe);
             return;
         }
         // A selection is the user having already pointed at the value they
@@ -255,7 +255,19 @@ impl crate::tui::app::TuiApp {
                 self.overlay = Some(Overlay::ProbeMenu(menu));
             }
             KeyCode::Enter => self.apply_probe_verb(*menu),
-            // Esc / anything else: cancel (the overlay was already taken).
+            // Esc closes from step one (step two retreats, above).
+            KeyCode::Esc => {}
+            // On step two the list takes no filter, so a letter has nothing to
+            // do — but falling through to the cancel arm meant it silently
+            // threw away the subject the user had just hunted down, and the
+            // *next* keystroke landed in the main view: typing "contains" out
+            // of habit dismissed the palette, opened the New Request wizard on
+            // the `n`, and typed the rest into its name field. A key with
+            // nothing to do should do nothing.
+            _ if menu.step == ProbeStep::PickVerb => {
+                self.overlay = Some(Overlay::ProbeMenu(menu));
+            }
+            // Step one: anything else cancels (the overlay was already taken).
             _ => {}
         }
     }
@@ -315,12 +327,21 @@ impl crate::tui::app::TuiApp {
     /// Ask for the variable name a capture should use, pre-filled with one
     /// derived from the field itself.
     fn open_probe_capture_prompt(&mut self, ci: usize, entry: usize, subject: Subject) {
-        let taken: Vec<String> = self.collections[ci].entries[entry]
-            .captures
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        let name = probe::suggest_name(&subject, &taken);
+        let captures = &self.collections[ci].entries[entry].captures;
+        // Capturing a field that is already captured suggests the name it
+        // already has. Suggesting a *fresh* name instead (`token_2`, because
+        // `token` was taken) wrote the same query twice under two names, which
+        // is not a thing anyone means to do; offering the existing name makes
+        // the default answer a no-op, and typing over it is still a deliberate
+        // second alias.
+        let query = probe::capture_row(&subject, "").1;
+        let name = match captures.iter().find(|(_, q)| q == &query) {
+            Some((existing, _)) => existing.clone(),
+            None => {
+                let taken: Vec<String> = captures.iter().map(|(n, _)| n.clone()).collect();
+                probe::suggest_name(&subject, &taken)
+            }
+        };
         let s = Strings::for_language(&self.language);
         let collection_id = self.collections[ci].id;
         self.overlay = Some(Overlay::Prompt {

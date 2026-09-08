@@ -16803,7 +16803,6 @@ fn workspace_bound_tabs_show_the_folder_icon_in_the_tab_bar_and_list_title() {
 #[test]
 fn a_workspace_tab_advertises_the_w_shortcut_in_the_footer() {
     use crate::i18n::{Language, Strings};
-    use ratatui::{Terminal, backend::TestBackend};
     let s = Strings::for_language(&Language::English);
     let dir = workspace_temp_dir("title_hint");
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
@@ -31663,6 +31662,48 @@ fn ctrl_w_still_closes_the_tab_from_any_pane() {
     }
 }
 
+/// The palette on `a` is the only way to reach the assert/capture builder, and
+/// a key nothing advertises is a key nobody finds — but it is only worth a
+/// footer slot while there is a response for it to read.
+#[test]
+fn the_response_footer_advertises_the_assert_palette_once_there_is_a_response() {
+    let mut app = app_with_response_body("{}");
+    app.focus = Pane::Response;
+    let s = Strings::for_language(&Language::English);
+    assert!(
+        render_footer(&mut app).contains(&format!("a {}", s.foot_probe)),
+        "the palette is advertised where it works"
+    );
+    let ci = app.active_tab;
+    app.collections[ci].entries[0].last_response = None;
+    assert!(
+        !render_footer(&mut app).contains(&format!("a {}", s.foot_probe)),
+        "and not before the request has been sent"
+    );
+}
+
+/// A request that computes values can fail before it is even sent, and its URL
+/// holds a value that does not exist yet — but the list used to show it exactly
+/// like its neighbours. The column only appears where something in the tab
+/// computes, so collections that don't keep the room for their URLs.
+#[test]
+fn the_request_list_marks_the_requests_that_compute_values() {
+    fn list_text(app: &mut TuiApp) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    }
+    let mut app = app_with_response_body("{}");
+    assert!(!list_text(&mut app).contains('\u{0192}'));
+    let ci = app.active_tab;
+    app.collections[ci].entries[0].generators = vec![("nonce".into(), "uuid()".into())];
+    assert!(
+        list_text(&mut app).contains('\u{0192}'),
+        "the computing request is marked"
+    );
+}
+
 /// The footer is one line, and at 80 columns it was being truncated before it
 /// reached the PaperBoy-specific hints. Arrow keys moving a highlight and Enter
 /// opening it are the two most universal conventions there are, so they no
@@ -33430,7 +33471,65 @@ mod probe_menu_tests {
         app.collections[ci].entries[0].last_response = None;
         press(&mut app, KeyCode::Char('a'));
         assert!(app.overlay.is_none());
-        assert!(matches!(app.status, Some(Status::NoResponse)));
+        // Not the generic "no response to save": the palette says what the
+        // user has to do next, which is send the request.
+        assert!(matches!(app.status, Some(Status::ProbeNoResponse)));
+    }
+
+    /// A letter on step two has nothing to do, and doing nothing is the whole
+    /// point: it used to fall into the cancel arm, throwing away the field the
+    /// user had just hunted down *and* leaking the next keystroke into the main
+    /// view, where typing "contains" out of habit opened the New Request
+    /// wizard on the `n`.
+    #[test]
+    fn a_letter_on_the_verb_list_is_ignored_rather_than_closing_the_palette() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "$.a");
+        press(&mut app, KeyCode::Enter);
+        let before = menu(&app).selected;
+        for c in "contains".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(menu(&app).step, crate::tui::probe_menu::ProbeStep::PickVerb);
+        assert_eq!(menu(&app).selected, before, "the pick is where it was");
+        // Nothing leaked past the overlay: no wizard, no new request.
+        assert_eq!(app.collections[app.active_tab].entries.len(), 1);
+        // Esc still backs out one step, then closes.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            menu(&app).step,
+            crate::tui::probe_menu::ProbeStep::PickSubject
+        );
+    }
+
+    /// Capturing a field that is already captured offers the name it already
+    /// has. The old suggestion dodged the taken name (`token_2`) and wrote the
+    /// same jsonpath twice under two names, which nobody means to do.
+    #[test]
+    fn capturing_the_same_field_twice_offers_the_name_it_already_has() {
+        let mut app = app_with_response(r#"{"data":{"access_token":"ey.."}}"#);
+        let capture = |app: &mut TuiApp| {
+            press(app, KeyCode::Char('a'));
+            type_str(app, "access_token");
+            press(app, KeyCode::Enter);
+            let rows = menu(app).verbs.len();
+            for _ in 0..rows {
+                press(app, KeyCode::Down);
+            }
+            press(app, KeyCode::Enter);
+        };
+        capture(&mut app);
+        press(&mut app, KeyCode::Enter);
+        capture(&mut app);
+        match app.overlay.as_ref() {
+            Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "access_token"),
+            _ => panic!("expected the capture-name prompt to be open"),
+        }
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.captures.len(), 1, "one row, not two aliases");
+        assert!(matches!(app.status, Some(Status::ProbeAlreadyThere)));
     }
 
     /// Choosing the same assert twice is a no-op that says so — silently doing
@@ -33461,6 +33560,39 @@ mod probe_menu_tests {
         assert!(labels.contains(&"header Content-Type".to_string()));
         assert!(labels.contains(&"body".to_string()));
         assert!(!labels.iter().any(|l| l.starts_with('$')));
+    }
+
+    /// A list taller than the box scrolls, and a list that scrolls with no sign
+    /// of it reads as the whole list — "that field isn't offered" instead of
+    /// "keep pressing Down".
+    #[test]
+    fn a_scrolling_subject_list_says_where_in_it_the_cursor_is() {
+        let body = format!(
+            "{{{}}}",
+            (0..40)
+                .map(|i| format!("\"f{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut app = app_with_response(&body);
+        press(&mut app, KeyCode::Char('a'));
+        let total = menu(&app).row_count();
+        let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains(&format!("1/{total}")), "{text}");
+        press(&mut app, KeyCode::Down);
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains(&format!("2/{total}")), "{text}");
+        // A list that fits says nothing, so the short cases stay quiet.
+        let mut small = app_with_response(r#"{"a":1}"#);
+        press(&mut small, KeyCode::Char('a'));
+        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut small))
+            .unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(!text.contains("1/"), "{text}");
     }
 
     /// The palette draws both columns, so a row settles "is this the field I

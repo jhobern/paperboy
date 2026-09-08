@@ -449,6 +449,7 @@ strings! {
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
     foot_compact => "compact", "compact", "kompakt";
+    foot_probe => "assert/capture", "vérifier/capturer", "kontrollér/opsaml";
     foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
@@ -780,6 +781,8 @@ strings! {
     probe_assert_added => "Assert added:", "Vérification ajoutée :", "Kontrol tilføjet:";
     probe_status_set => "Expected status set to", "Statut attendu défini à", "Forventet status sat til";
     probe_capture_added => "Capture added:", "Capture ajoutée :", "Opsamling tilføjet:";
+    probe_no_response => "Send the request first — asserts are built from a response", "Envoyez d’abord la requête — les vérifications se construisent à partir d’une réponse", "Send forespørgslen først — kontroller bygges ud fra et svar";
+    probe_nothing_to_probe => "Nothing in this response can be asserted on", "Rien dans cette réponse ne peut être vérifié", "Intet i dette svar kan kontrolleres";
     probe_already_there => "That one is already on the request", "Celle-ci est déjà sur la requête", "Den er der allerede på forespørgslen";
     help_text_probe => "Assert/capture from the response", "Vérifier/capturer depuis la réponse", "Kontrollér/opsaml fra svaret";
     gui_probe_button => "Assert…", "Vérifier…", "Kontrollér…";
@@ -1716,6 +1719,14 @@ pub enum Status {
     /// The assert or capture chosen is already on the request, so nothing was
     /// added. Said out loud: silently doing nothing reads as a broken key.
     ProbeAlreadyThere,
+    /// `a` was pressed before the request had been sent. Distinct from
+    /// `NoResponse` (a *save* with nothing to write): the palette's problem is
+    /// not that a file is missing but that there is nothing to build from yet,
+    /// and saying so is the difference between a dead key and an instruction.
+    ProbeNoResponse,
+    /// A response arrived but offered no subjects -- an empty body with no
+    /// headers worth asserting on.
+    ProbeNothingToProbe,
     /// The active collection has no remembered git origin, so "Save to Git"
     /// can't be opened.
     NoGitOrigin,
@@ -1774,6 +1785,13 @@ pub enum Status {
     /// set, so the computed value would rewrite requests above the generator too
     /// and is dropped instead. Carries the shadowed names.
     GeneratorShadows(Vec<String>),
+    /// Several pre-flight warnings at once. A run-all can trip more than one --
+    /// a broken generator *and* a batch collision, say -- and the old chain of
+    /// `else if`s showed the first and hid the rest, so fixing the one you were
+    /// told about surfaced another and the run failed twice for what was
+    /// always one problem set. Kept as a list of the real statuses so each
+    /// still renders its own wording.
+    PreflightWarnings(Vec<Status>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -2013,6 +2031,20 @@ pub enum Status {
     WorkspaceTreeFilter(bool),
 }
 
+/// Fold the pre-flight warnings a run tripped into one status.
+///
+/// A run can trip several at once, and reporting only the first meant fixing
+/// what you were told about surfaced the next one — the same run failing twice
+/// over one problem set. One warning still reports as itself so the wording
+/// (and the tests that read it) is unchanged.
+pub fn preflight_status(warnings: Vec<Status>) -> Option<Status> {
+    match warnings.len() {
+        0 => None,
+        1 => warnings.into_iter().next(),
+        _ => Some(Status::PreflightWarnings(warnings)),
+    }
+}
+
 impl Status {
     /// Whether this represents a successful outcome (green) vs a problem (red).
     pub fn is_ok(&self) -> bool {
@@ -2067,6 +2099,8 @@ impl Status {
             Status::ProbeStatusSet(code) => format!("{} {code}", s.probe_status_set),
             Status::ProbeCaptureAdded(name) => format!("{} {name}", s.probe_capture_added),
             Status::ProbeAlreadyThere => s.probe_already_there.to_string(),
+            Status::ProbeNoResponse => s.probe_no_response.to_string(),
+            Status::ProbeNothingToProbe => s.probe_nothing_to_probe.to_string(),
             Status::NoResponse => s.file_no_response.to_string(),
             Status::NotCollection => s.file_not_collection.to_string(),
             Status::NotEnvironment => s.file_not_environment.to_string(),
@@ -2108,6 +2142,13 @@ impl Status {
                 .map(|n| s.gen_collision.replace("{name}", n))
                 .collect::<Vec<_>>()
                 .join("; "),
+            // Joined with a separator rather than newlines: the status line is
+            // one line, and the wrapping it already does is per-line.
+            Status::PreflightWarnings(list) => list
+                .iter()
+                .map(|st| st.text(s))
+                .collect::<Vec<_>>()
+                .join(" · "),
             Status::GeneratorShadows(names) => names
                 .iter()
                 .map(|n| s.gen_shadow.replace("{name}", n))
@@ -2274,6 +2315,28 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run can trip more than one pre-flight warning at once. Reporting only
+    /// the first meant fixing what you were told about surfaced the next one,
+    /// so the same run failed twice over one problem set.
+    #[test]
+    fn several_preflight_warnings_are_reported_together() {
+        let en = Strings::for_language(&Language::English);
+        let collisions = Status::GeneratorCollisions(vec!["nonce".into()]);
+        let shadows = Status::GeneratorShadows(vec!["token".into()]);
+        let both = preflight_status(vec![collisions.clone(), shadows.clone()]).unwrap();
+        let text = both.text(&en);
+        assert!(text.contains("nonce"), "{text}");
+        assert!(text.contains("token"), "{text}");
+        // A single warning still reports as itself, unchanged.
+        assert_eq!(
+            preflight_status(vec![shadows.clone()]).unwrap().text(&en),
+            shadows.text(&en)
+        );
+        assert!(preflight_status(Vec::new()).is_none());
+        // Warnings are problems, so the line stays red.
+        assert!(!both.is_ok());
+    }
 
     #[test]
     fn status_text_follows_the_current_language() {

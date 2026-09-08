@@ -1083,7 +1083,9 @@ mod tests {
 
     #[test]
     fn a_key_hurl_would_choke_on_is_escaped_for_both_layers() {
-        for (body, key) in [
+        // The body is the JSON each key was read out of, kept beside it so the
+        // case reads as a real response rather than an invented string.
+        for (_body, key) in [
             (r#"{"a\"b":1}"#, "a\"b"),
             (r#"{"a\\b":1}"#, "a\\b"),
             (r#"{"a\nb":1}"#, "a\nb"),

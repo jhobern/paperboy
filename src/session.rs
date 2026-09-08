@@ -967,18 +967,23 @@ impl Session {
         };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
-        self.status = if !gen_errors.is_empty() {
-            Some(Status::GeneratorErrors(gen_errors))
-        } else if !collisions.is_empty() {
-            Some(Status::GeneratorCollisions(collisions))
-        } else if !shadows.is_empty() {
-            Some(Status::GeneratorShadows(shadows))
-        } else {
-            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+        let mut warnings = Vec::new();
+        if !gen_errors.is_empty() {
+            warnings.push(Status::GeneratorErrors(gen_errors));
+        }
+        if !collisions.is_empty() {
+            warnings.push(Status::GeneratorCollisions(collisions));
+        }
+        if !shadows.is_empty() {
+            warnings.push(Status::GeneratorShadows(shadows));
+        }
+        if !undefined.is_empty() {
+            warnings.push(Status::UndefinedVars {
                 keys: undefined,
                 in_envs,
-            })
-        };
+            });
+        }
+        self.status = crate::i18n::preflight_status(warnings);
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;
