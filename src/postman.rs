@@ -1257,6 +1257,9 @@ fn dynamic_fate(name: &str) -> DynamicFate {
         "timestamp" => DynamicFate::Computed("timestamp"),
         // Postman documents `$randomInt` as 0 to 1000 inclusive.
         "randomInt" => DynamicFate::Computed("random_int(0, 1000)"),
+        // …and `$randomAlphaNumeric` as exactly one character, which is easy
+        // to misread as "some" and is why the length is written out.
+        "randomAlphaNumeric" => DynamicFate::Computed("random_alnum(1)"),
         _ => DynamicFate::Supplied,
     }
 }
@@ -1550,20 +1553,80 @@ fn note_losses(
     // assertion but a lost *order*: a collection whose scripts choose what runs
     // next does not do the same thing when it is run top to bottom, and the
     // requests themselves look perfectly correct while it happens.
-    if let Some(listen) = ["prerequest", "test"]
-        .iter()
-        .find(|l| script_text(events, l).contains("setNextRequest"))
-    {
-        push_note(
-            out,
-            title,
-            owned_by(listen),
-            "a script chose which request ran next (`pm.execution.setNextRequest`); PaperBoy runs \
-             a collection in file order, so check the order — and whether a request meant to be \
-             skipped or repeated still is"
-                .into(),
-        );
+    for listen in ["prerequest", "test"] {
+        let script = script_text(events, listen);
+        if !script.contains("setNextRequest") {
+            continue;
+        }
+        for detail in next_request_fates(&script, title) {
+            push_note(out, title, owned_by(listen), detail);
+        }
     }
+}
+
+// `pm.execution.setNextRequest(` and the older `postman.setNextRequest(`.
+static NEXT_CALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pm\.execution|postman|pm)\.setNextRequest\s*\(").unwrap());
+
+/// What each `setNextRequest` in a script was doing, said in terms the reader
+/// can act on.
+///
+/// This is a lost *order*, not a lost assertion: the requests themselves look
+/// perfectly correct while the collection quietly does something else. PaperBoy
+/// runs a collection in file order, and PaperTrail — which does drive requests
+/// in a written order — has no branching either, so none of these can be
+/// converted. What they can be is named: the four shapes below are four
+/// different problems with four different fixes, and the one note they used to
+/// share sent every reader looking for the wrong one.
+fn next_request_fates(script: &str, title: &str) -> Vec<String> {
+    let (code, in_string) = strip_js_noise(script);
+    let conditional = conditional_mask(&code);
+    // The request's own name as the script would have written it: Postman
+    // addresses a request by its bare name, while `title` is the breadcrumb
+    // the import builds from the folders around it.
+    let own = title.rsplit('/').next().unwrap_or(title).trim();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |d: String| {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    };
+    for call in find_calls(&code, &in_string, &NEXT_CALL_RE) {
+        let Some(arg) = call.args.first().map(|a| a.trim()) else {
+            continue;
+        };
+        let guarded = conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start);
+        match unquote(arg) {
+            Some(name) if name.trim() == own => push(format!(
+                "this request ran itself again (`setNextRequest(\"{own}\")`) — that is a polling \
+                 loop, which Hurl writes as `[Options] retry: <n>` plus the assert that has to \
+                 pass in the end, rather than as a repeated request"
+            )),
+            Some(name) if guarded => push(format!(
+                "a script sometimes jumped to `{name}` instead of carrying on; PaperBoy runs a \
+                 collection in file order and has no way to say \"only sometimes\", so check \
+                 whether `{name}` is where it needs to be"
+            )),
+            Some(name) => push(format!(
+                "a script always ran `{name}` next, whatever follows this request in the file; \
+                 move `{name}` after this request, or write the order out in a PaperTrail flow \
+                 (`REQUEST` lines run in the order you write them)"
+            )),
+            None if arg == "null" => push(
+                "a script stopped the run here (`setNextRequest(null)`); nothing after this \
+                 request ran, and in PaperBoy it will"
+                    .into(),
+            ),
+            None => push(
+                "a script chose the next request by a name it worked out as it ran, so what runs \
+                 next isn't in the file at all; PaperBoy runs a collection in file order"
+                    .into(),
+            ),
+        }
+    }
+    out
 }
 
 /// File a note against the request, or — when the script that caused it came
@@ -2131,16 +2194,17 @@ fn replaced_dynamic(compacted: &str) -> Option<String> {
     let inner = compacted
         .strip_prefix("pm.variables.replaceIn(")?
         .strip_suffix(')')?;
-    let name = unquote(inner)?
-        .strip_prefix("{{$")?
-        .strip_suffix("}}")?
-        .to_string();
-    match name.as_str() {
-        "guid" | "randomUUID" => Some("uuid".to_string()),
-        "timestamp" => Some("timestamp".to_string()),
-        "isoTimestamp" => Some("iso8601".to_string()),
-        "randomInt" => Some("random_int(0, 1000)".to_string()),
-        _ => None,
+    let name = unquote(inner)?.strip_prefix("{{$")?.strip_suffix("}}")?;
+    // Read off `dynamic_fate` rather than repeated, so the two cannot come to
+    // disagree about which names PaperBoy claims. The difference is only that
+    // this is a *generator expression*, where Hurl's own `{{newUuid}}` is not
+    // available — so a `Builtin` is spelled as the equivalent function.
+    match dynamic_fate(name) {
+        DynamicFate::Builtin("newUuid") => Some("uuid".to_string()),
+        DynamicFate::Builtin("newDate") => Some("iso8601".to_string()),
+        DynamicFate::Builtin(_) => None,
+        DynamicFate::Computed(expr) => Some(expr.to_string()),
+        DynamicFate::Supplied => None,
     }
 }
 
@@ -2224,10 +2288,33 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
             continue;
         }
         let tail_end = statement_end(&code, call.end);
-        let Some(predicate) = parse_tail(&code[call.end..tail_end]) else {
+        let Some(subject) = expect_subject(&compact(call.args[0]), &roots) else {
             continue;
         };
-        let Some(subject) = expect_subject(&compact(call.args[0]), &roots) else {
+        // A deep equality against an object or array literal. Hurl has no
+        // predicate that takes a document, so it is spelled out one leaf at a
+        // time — which the reader gets the better of, since a failure then
+        // names the field that differed.
+        if let Subject::Json(path) = &subject
+            && let Some(value) = deep_expectation(&code[call.end..tail_end])
+        {
+            let lines = crate::probe::deep_equality(path, &value);
+            // An empty expansion is `{}` or a document of nothing but
+            // expressions: saying nothing about the body is not the assertion
+            // that was written, so it is left as residue to be noted.
+            if !lines.is_empty() {
+                for (s, p) in lines {
+                    if let Some(line) = assert_line(s, p)
+                        && !asserts.contains(&line)
+                    {
+                        asserts.push(line);
+                    }
+                }
+                covered.push((call.start, tail_end));
+                continue;
+            }
+        }
+        let Some(predicate) = parse_tail(&code[call.end..tail_end]) else {
             continue;
         };
         match (subject, predicate) {
@@ -2276,10 +2363,41 @@ fn expect_subject(compacted: &str, roots: &[String]) -> Option<Subject> {
     accessor_to_jsonpath(compacted, roots).map(Subject::Json)
 }
 
+/// The document a Chai deep-equality tail compares against, when the tail is
+/// one and the document is written out in full.
+///
+/// Only the *deep* spellings count. `.to.equal({…})` in Chai is reference
+/// equality, which no two separately-parsed documents ever satisfy, so a
+/// collection using it is asserting something that was already failing — and
+/// importing it as a deep equality would quietly change what the test means.
+fn deep_expectation(tail: &str) -> Option<Value> {
+    // `.to.deep.include` is deliberately absent: on an array it means "contains
+    // this element", which is not what a per-index expansion says.
+    let (head, inner) = split_chai_call(tail)?;
+    matches!(
+        head.as_str(),
+        ".to.eql(" | ".to.deep.equal(" | ".to.deep.eql("
+    )
+    .then(|| js_literal(inner))
+    .flatten()
+}
+
+/// Split a Chai tail into its whitespace-free call chain (up to and including
+/// the opening bracket) and the argument text *as written*.
+///
+/// The argument is deliberately not compacted: `compact` removes whitespace
+/// everywhere, including inside string literals, so reading
+/// `.to.equal("Not Found")` off compacted text asserts `"NotFound"` — an
+/// assert that fails on a response that was correct.
+fn split_chai_call(tail: &str) -> Option<(String, &str)> {
+    let t = tail.trim().trim_end_matches(';').trim_end();
+    let inner = t.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    Some((compact(&inner[..=open]), &inner[open + 1..]))
+}
+
 /// Read a Chai tail (`.to.equal("x")`, `.is.not.empty`) as a predicate.
 fn parse_tail(tail: &str) -> Option<Predicate> {
-    let t = compact(tail);
-    let t = t.trim_end_matches(';');
     // Longest first: `.to.not.equal(` also starts with `.to.`.
     let calls: [(&str, fn(String) -> Predicate); 12] = [
         (".to.not.be.equal(", Predicate::Ne),
@@ -2295,14 +2413,14 @@ fn parse_tail(tail: &str) -> Option<Predicate> {
         (".to.be.above(", Predicate::Gt),
         (".to.be.below(", Predicate::Lt),
     ];
-    for (head, make) in calls {
-        if let Some(rest) = t.strip_prefix(head)
-            && let Some(inner) = rest.strip_suffix(')')
-        {
-            return hurl_literal(inner).map(make);
+    if let Some((call, inner)) = split_chai_call(tail) {
+        for (head, make) in calls {
+            if call == head {
+                return hurl_literal(inner).map(make);
+            }
         }
     }
-    match t {
+    match compact(tail).trim_end_matches(';') {
         ".to.be.empty" | ".is.empty" => Some(Predicate::Empty(true)),
         ".to.not.be.empty" | ".is.not.empty" => Some(Predicate::Empty(false)),
         _ => None,
@@ -2332,9 +2450,14 @@ fn hurl_literal(value: &str) -> Option<String> {
 /// its own — `if (x) pm.expect(...)` and `x ? pm.expect(...) : y` both put
 /// something in front of the call, and both mean "sometimes".
 fn starts_statement(code: &str, start: usize) -> bool {
-    code[..start]
+    // "Or the start of the script": a boundary that is *missing* used to read
+    // as "nothing in front of it", so the very first line of a script was
+    // exempt from the whole rule — `if (ok) pm.expect(…)` written on line one
+    // imported as an unconditional assert.
+    let from = code[..start]
         .rfind([';', '{', '}', '\n'])
-        .is_none_or(|i| code[i + 1..start].trim().is_empty())
+        .map_or(0, |i| i + 1);
+    code[from..start].trim().is_empty()
 }
 
 /// One past the end of the statement beginning at `from`: the next `;` or
@@ -2573,6 +2696,98 @@ fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
 }
 
 /// Strip matching single or double quotes, returning the inner text.
+/// A JavaScript object or array literal as the JSON value it stands for, or
+/// `None` for anything whose value the text alone doesn't fix.
+///
+/// `pm.expect(x).to.eql({ id: 1, name: 'a' })` is a perfectly ordinary Postman
+/// assertion, and its argument is *nearly* JSON: what stops `serde_json`
+/// reading it is unquoted keys, single quotes and a trailing comma. Those three
+/// are normalised here. Anything else — a nested expression, a template
+/// literal, a function call — makes the whole literal unreadable rather than
+/// half-read, because half a deep equality is an assertion nobody wrote.
+fn js_literal(src: &str) -> Option<Value> {
+    let src = src.trim();
+    if !(src.starts_with('{') || src.starts_with('[')) {
+        return None;
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                // Re-emit as a double-quoted JSON string, escaping what JSON
+                // requires and un-escaping the `\'` that only mattered inside
+                // single quotes.
+                out.push('"');
+                let mut closed = false;
+                while let Some((_, d)) = chars.next() {
+                    match d {
+                        '\\' => {
+                            let (_, e) = chars.next()?;
+                            match e {
+                                '\'' => out.push('\''),
+                                '"' => out.push_str("\\\""),
+                                other => {
+                                    out.push('\\');
+                                    out.push(other);
+                                }
+                            }
+                        }
+                        d if d == c => {
+                            closed = true;
+                            break;
+                        }
+                        '"' => out.push_str("\\\""),
+                        '\n' => return None,
+                        other => out.push(other),
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                out.push('"');
+            }
+            // An unquoted key: a bare identifier immediately followed by `:`.
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let start = i;
+                let mut end = i + c.len_utf8();
+                while let Some(&(j, d)) = chars.peek() {
+                    if d.is_ascii_alphanumeric() || d == '_' || d == '$' {
+                        end = j + d.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let word = &src[start..end];
+                let followed_by_colon = src[end..].trim_start().starts_with(':');
+                match word {
+                    // Bare words that are values, not keys.
+                    "true" | "false" | "null" if !followed_by_colon => out.push_str(word),
+                    _ if followed_by_colon => {
+                        out.push('"');
+                        out.push_str(word);
+                        out.push('"');
+                    }
+                    // A bare identifier used as a *value* is a variable, whose
+                    // contents the export doesn't say.
+                    _ => return None,
+                }
+            }
+            // A trailing comma before the closing bracket is legal JS and not
+            // legal JSON.
+            ',' => {
+                if src[i + 1..].trim_start().starts_with(['}', ']']) {
+                    continue;
+                }
+                out.push(',');
+            }
+            other => out.push(other),
+        }
+    }
+    serde_json::from_str(&out).ok()
+}
+
 fn unquote(s: &str) -> Option<&str> {
     let b = s.as_bytes();
     if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
@@ -4622,19 +4837,212 @@ mod script_tests {
 
     /// A collection whose scripts pick the next request does not do the same
     /// thing run top to bottom, and every request in it still looks right.
+    ///
+    /// A *guarded* jump is the "only sometimes" case, which neither file order
+    /// nor a PaperTrail flow can express.
     #[test]
     fn a_script_choosing_the_next_request_is_reported_as_lost_order() {
+        let notes = next_request_notes(
+            "x",
+            "if (pm.response.code === 202) pm.execution.setNextRequest('poll');",
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("sometimes jumped to `poll`") && d.contains("file order")),
+            "{notes:?}"
+        );
+    }
+
+    /// The four shapes are four different problems. Lumping them into one note
+    /// sent the reader looking for the wrong fix — most of all for a polling
+    /// loop, which Hurl expresses directly and which the old note never
+    /// mentioned.
+    #[test]
+    fn a_request_that_reran_itself_is_named_as_a_polling_loop() {
+        let notes = next_request_notes(
+            "get_result",
+            "if (!done) { pm.execution.setNextRequest('get_result'); }",
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("polling loop") && d.contains("retry")),
+            "{notes:?}"
+        );
+    }
+
+    /// An unconditional jump *is* an order, and an order is the one thing here
+    /// that can be written down — so the note says where.
+    #[test]
+    fn an_unconditional_jump_is_reported_as_an_order_to_write_down() {
+        let notes = next_request_notes("submit", "pm.execution.setNextRequest('get_result');");
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("always ran `get_result` next") && d.contains("PaperTrail")),
+            "{notes:?}"
+        );
+    }
+
+    /// `setNextRequest(null)` ends the run. On import the requests after it
+    /// start running, which is a behaviour change in the direction of doing
+    /// *more*, so it is worth its own sentence.
+    #[test]
+    fn stopping_the_run_is_reported_as_the_requests_after_it_now_running() {
+        let notes = next_request_notes("x", "pm.execution.setNextRequest(null);");
+        assert!(
+            notes.iter().any(|d| d.contains("stopped the run here")),
+            "{notes:?}"
+        );
+    }
+
+    /// A name built at run time isn't in the file at all, so there is nothing
+    /// to reorder — a different problem from a jump to a name we can see.
+    #[test]
+    fn a_computed_next_request_name_is_reported_as_not_being_in_the_file() {
+        let notes = next_request_notes("x", "pm.execution.setNextRequest('Test Case ' + (n + 1));");
+        assert!(
+            notes.iter().any(|d| d.contains("worked out as it ran")),
+            "{notes:?}"
+        );
+    }
+
+    /// The old note fired once per script; these fire once per distinct shape,
+    /// so a loop written twice doesn't read as two findings.
+    #[test]
+    fn the_same_jump_twice_is_one_note() {
+        let notes = next_request_notes(
+            "x",
+            "pm.execution.setNextRequest('a');\npm.execution.setNextRequest('a');",
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+    }
+
+    /// Postman documents `$randomAlphaNumeric` as *one* character. Left
+    /// unclaimed it became a variable the user had to supply, on a request that
+    /// otherwise ran on import.
+    #[test]
+    fn random_alpha_numeric_is_computed_rather_than_left_to_be_supplied() {
         let json = r#"{"info":{"name":"d","schema":"x"},"item":[
-          {"name":"x","event":[{"listen":"test","script":{"exec":[
-             "if (pm.response.code === 202) pm.execution.setNextRequest('poll');"]}}],
+          {"name":"x","request":{"method":"GET","url":"https://h/x?c={{$randomAlphaNumeric}}"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0].generators.contains(&(
+                "randomAlphaNumeric".to_string(),
+                "random_alnum(1)".to_string()
+            )),
+            "{:?}",
+            c.entries[0].generators
+        );
+    }
+
+    /// The `pm.variables.replaceIn` table used to be a second, hand-kept copy
+    /// of the same list, so a name added to one was silently absent from the
+    /// other.
+    #[test]
+    fn replace_in_claims_the_same_names_as_a_plain_placeholder() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('c', pm.variables.replaceIn('{{$randomAlphaNumeric}}'));"]}}],
            "request":{"method":"GET","url":"https://h/x"}}]}"#;
         let c = convert_postman(json);
         assert!(
-            c.notes
-                .iter()
-                .any(|n| n.detail.contains("setNextRequest") && n.detail.contains("file order")),
+            c.entries[0]
+                .generators
+                .contains(&("c".to_string(), "random_alnum(1)".to_string())),
             "{:?}",
-            c.notes
+            c.entries[0].generators
         );
+    }
+
+    // ── Deep equality ──────────────────────────────────────────────────
+
+    /// `.to.eql({…})` is an ordinary Postman assertion and its argument is not
+    /// a scalar, so the whole test used to be dropped. Hurl has no predicate
+    /// that takes a document, so it is spelled out one leaf at a time — which
+    /// also makes the failure name the field that differed.
+    #[test]
+    fn a_deep_equality_against_an_object_becomes_one_assert_per_leaf() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' }); });",
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.user.id\" == 7".to_string()),
+            "{asserts:?}"
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.user.name\" == \"Ada\"".to_string()),
+            "{asserts:?}"
+        );
+    }
+
+    /// An array's length is pinned as well as its elements: per-index asserts
+    /// alone pass on a longer list that happens to start the same way, which is
+    /// not what a deep equality says.
+    #[test]
+    fn a_deep_equality_against_an_array_pins_its_length_too() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().ids).to.eql([1, 2]); });",
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.ids\" count == 2".to_string()),
+            "{asserts:?}"
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.ids[0]\" == 1".to_string()),
+            "{asserts:?}"
+        );
+    }
+
+    /// A literal holding a variable says nothing the file can be checked
+    /// against, and half a deep equality is an assertion nobody wrote — so it
+    /// is dropped whole and noted, not partly imported.
+    #[test]
+    fn a_deep_equality_holding_an_expression_is_not_half_imported() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.eql({ id: expectedId }); });",
+        );
+        assert!(asserts.is_empty(), "{asserts:?}");
+    }
+
+    /// Chai's `.to.equal` on an object is *reference* equality, which two
+    /// separately-parsed documents never satisfy. Importing it as a deep
+    /// equality would quietly change what the test means.
+    #[test]
+    fn a_shallow_equal_against_an_object_is_not_read_as_a_deep_one() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.equal({ id: 7 }); });",
+        );
+        assert!(asserts.is_empty(), "{asserts:?}");
+    }
+
+    /// `compact` drops whitespace everywhere, including inside string
+    /// literals, so reading a tail off compacted text turned
+    /// `.to.equal("Not Found")` into an assert for `"NotFound"` — one that
+    /// fails on a perfectly correct response.
+    #[test]
+    fn a_space_inside_an_expected_string_survives() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().msg).to.equal('Not Found'); });",
+        );
+        assert_eq!(
+            asserts,
+            vec!["jsonpath \"$.msg\" == \"Not Found\"".to_string()]
+        );
+    }
+
+    fn asserts_of(script: &str) -> Vec<String> {
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"x","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+               "request":{{"method":"GET","url":"https://h/x"}}}}]}}"#,
+            serde_json::to_string(script).unwrap()
+        );
+        convert_postman(&json).entries[0].asserts.clone()
+    }
+
+    fn next_request_notes(title: &str, script: &str) -> Vec<String> {
+        super::next_request_fates(script, title)
     }
 }

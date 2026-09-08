@@ -315,6 +315,58 @@ fn walk(v: &Value, path: &mut String, depth: usize, out: &mut Vec<Probe>) {
     }
 }
 
+/// Every assert needed to say "this part of the body deep-equals `value`".
+///
+/// Hurl has no predicate that takes an object, so a deep equality has to be
+/// spelled out one leaf at a time — which is also what makes a failure
+/// readable: the report names the field that differed rather than printing two
+/// documents side by side. An array additionally gets its length pinned, since
+/// per-index asserts alone would pass on a longer list that happens to start
+/// the same way.
+///
+/// Paths are built here rather than by the caller so the spelling
+/// (`$.a.b[0]`, and the bracket form for a key that needs it) stays identical
+/// to the one [`probes`] offers.
+pub fn deep_equality(base: &str, value: &Value) -> Vec<(Subject, Predicate)> {
+    let mut out = Vec::new();
+    let mut path = base.to_string();
+    deep_walk(value, &mut path, 0, &mut out);
+    out
+}
+
+fn deep_walk(v: &Value, path: &mut String, depth: usize, out: &mut Vec<(Subject, Predicate)>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    match v {
+        Value::Array(items) => {
+            out.push((
+                Subject::JsonCount(path.clone()),
+                Predicate::Eq(items.len().to_string()),
+            ));
+            for (i, item) in items.iter().enumerate() {
+                let mark = path.len();
+                path.push_str(&format!("[{i}]"));
+                deep_walk(item, path, depth + 1, out);
+                path.truncate(mark);
+            }
+        }
+        Value::Object(map) => {
+            for (k, item) in map {
+                let mark = path.len();
+                push_key(path, k);
+                deep_walk(item, path, depth + 1, out);
+                path.truncate(mark);
+            }
+        }
+        scalar => {
+            if let Some(lit) = literal(scalar) {
+                out.push((Subject::Json(path.clone()), Predicate::Eq(lit)));
+            }
+        }
+    }
+}
+
 /// The predicates worth offering for a probe, best first.
 ///
 /// "Best" is the equality against the value that just came back: the common

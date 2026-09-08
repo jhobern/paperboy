@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.5.4] - 2026-09-04
+## [0.5.5] - 2026-09-08
 
 ### Added
 
@@ -21,21 +21,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   own" work. Still memory only — a computed value can be an HMAC of a secret,
   and is in any case good for about one request — so nothing new reaches
   `state.json`.
-
-### Fixed
-
-- **"Run All" ignored `# [Gen]` blocks entirely.** A collection whose requests
-  signed themselves ran correctly one request at a time and sent a literal
-  `{{sig}}` when run as a whole, which comes back as an unexplained 401. Run
-  All now evaluates each block the same way the headless runner does.
-
-- **A batch run silently gave two requests one nonce.** Batch is a single Hurl
-  call over the whole file, so it has one variable set: where two requests each
-  compute a `nonce`, they share the first one's value and the second request's
-  signature is computed over the wrong input. Nothing said so. Both front-ends
-  now name the colliding rows before starting a batch Run All, and `--batch`
-  prints the same warning — pointing out that a streaming run gives each
-  request its own.
 
 - **Asserts and captures built from the response you just got.** Every API
   client but this one lets you look at a reply and say "check that next time";
@@ -203,42 +188,58 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   opened and never used — no longer reports a script as lost when there was
   never one there.
 
-- **Import every Postman workspace at once.** The wizard could only ever take
-  one workspace at a time, which is fine for trying PaperBoy out and useless
-  for the thing people actually want it for: leaving Postman. An account with
-  forty workspaces meant forty passes through the same four steps, re-entering
-  the key, the destination and the format each time. Both front-ends can now
-  take the lot — `Ctrl+A` on the workspace list in the terminal UI (`Ctrl`,
-  because every printable key on that screen types into the filter), an
-  **Import all** button beside **Next** in the GUI — and the headless import
-  has `--postman-all` to match. Everything the list is *showing* is imported,
-  so a filtered list imports what it shows rather than quietly taking more
-  than was asked for.
-
-  Each workspace lands in its own folder inside the destination, keeping the
-  `Collections/` + `Environments/` layout a single import has always produced;
-  two workspaces that both hold a "Billing API" therefore keep both, rather
-  than one being renamed to " (2)" with nothing to say which it came from. Two
-  workspaces that share a *name* get separate folders too.
-
-  The whole run still goes through one importer and one confirmation step: the
-  rate-limit pacer's picture of the account's real budget is worth more the
-  more calls are left to make, and the estimate, the ETA and the monthly-budget
-  warning now cover the entire import, so backing out before a forty-workspace
-  download still costs nothing. A workspace with nothing in it is dropped, and
-  one the key has lost access to is reported and skipped rather than ending the
-  run — an account is not a migration's fault. Anything that would fail for
-  every remaining workspace, such as a rejected key or an exhausted monthly
-  quota, still stops the plan instead of being logged forty times.
-
-- **A preference for the old Esc behaviour.** Esc on a request form with unsaved
-  edits asks before discarding them, which is the right default for a form with
-  no autosave — but it is also a second keypress in a loop some users run dozens
-  of times an hour, and they had learned Esc as simply "close this". Settings →
-  Preferences → **Esc discards request edits without asking** puts the one-press
-  discard back. Off by default, so nobody gets it by accident.
-
 ### Fixed
+
+- **Postman deep-equality assertions carry across.**
+  `pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' })` is an
+  ordinary Postman test whose argument is not a scalar, so the whole thing used
+  to be dropped. Hurl has no predicate that takes a document, so it is now
+  written out one leaf at a time (`jsonpath "$.user.id" == 7`, …) — which is
+  also the better report, since a failure names the field that differed rather
+  than printing two documents side by side. An array's length is pinned too,
+  because per-index asserts alone pass on a longer list that starts the same
+  way. A literal holding an expression is still dropped whole and noted: half a
+  deep equality is an assertion nobody wrote. Chai's `.to.equal` on an object is
+  *reference* equality, which no two parsed documents satisfy, so it is
+  deliberately not read as a deep one.
+
+- **`setNextRequest` is now four notes, not one.** A script choosing what runs
+  next is a lost *order*, and there are four different orders with four
+  different fixes: a request that re-ran itself is a polling loop (Hurl writes
+  that as `[Options] retry`), an unconditional jump is an order you can write
+  down (in the file, or as `REQUEST` lines in a PaperTrail flow),
+  `setNextRequest(null)` means the requests after it did *not* run and now
+  will, and a name built at run time is not in the file to reorder at all. One
+  note covering all four sent every reader looking for the wrong fix.
+
+- **`$randomAlphaNumeric` is computed rather than left to be supplied**, as the
+  one character Postman documents it to be. The `pm.variables.replaceIn` table
+  is now read off the same list as plain placeholders, so the two can no longer
+  come to disagree about which names PaperBoy claims.
+
+- **"Run All" ignored `# [Gen]` blocks entirely.** A collection whose requests
+  signed themselves ran correctly one request at a time and sent a literal
+  `{{sig}}` when run as a whole, which comes back as an unexplained 401. Run
+  All now evaluates each block the same way the headless runner does.
+
+- **A Postman assertion on the first line of a script escaped the "only
+  sometimes" rule.** `if (ok) pm.expect(…)` written as line one imported as an
+  unconditional assert, because the guard looked for the end of a previous
+  statement and read *no previous statement* as *nothing in front of it*. An
+  assertion that only sometimes applies, imported as one that always does,
+  turns a passing collection into a failing one.
+
+- **An expected string's spaces survive the import.** Tails were read off
+  whitespace-stripped text, so `.to.equal("Not Found")` became an assert for
+  `"NotFound"` — one that fails on a perfectly correct response.
+
+- **A batch run silently gave two requests one nonce.** Batch is a single Hurl
+  call over the whole file, so it has one variable set: where two requests each
+  compute a `nonce`, they share the first one's value and the second request's
+  signature is computed over the wrong input. Nothing said so. Both front-ends
+  now name the colliding rows before starting a batch Run All, and `--batch`
+  prints the same warning — pointing out that a streaming run gives each
+  request its own.
 
 - **A computed value no longer reads as an undefined one.** A report that used
   a name the request computes was warned about on every validation — "may not
@@ -286,8 +287,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   definition has nobody watching. The interactive send already refused; now
   both do, naming the row and what is wrong with it.
 
-### Changed
-
 - **The README is a third of its former length.** It had grown to 9,000 words
   of prose aimed at nobody in particular, and a reference nobody finishes is not
   a reference. It is now written for people who already know what an HTTP client
@@ -297,6 +296,68 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   prerequisites, that a loaded environment substitutes nothing until it is
   activated or linked, that a temporary git workspace is never cleaned up — are
   still there.
+
+- **A `{{ variable.name }}` Hurl would quietly mangle is now refused instead of
+  sent.** Hurl reads a variable name only as far as the first character outside
+  letters, digits, `_` and `-`, and then discards the rest without a word — so
+  `{{ api.key }}` went on the wire as the value of `api`. PaperBoy's own
+  substitution accepts the dotted name happily, which meant the request preview
+  showed the correct value while the server was asked something else entirely,
+  and the only symptom was an answer that made no sense. Sending is now blocked,
+  and the message names the placeholder and what Hurl would have made of it
+  (`{{ api.key }} → api`). A name Hurl can't read at all — `{{ $timestamp }}`
+  pasted out of Postman, say — is caught in the same place, rather than
+  surfacing later as a collection that loads as nothing. Hurl's own
+  `{{ newUuid }}` and `{{ newDate }}` are unaffected.
+
+- **"Extract to parameter" no longer offers a name Hurl can't use.** The prompt
+  accepted anything PaperBoy's own substitution would match, so `api.key` was
+  allowed — building a request that the check above then refuses to send. It is
+  now held to the same rule at the point the name is typed.
+
+
+## [0.5.4] - 2026-09-04
+
+### Added
+
+- **Import every Postman workspace at once.** The wizard could only ever take
+  one workspace at a time, which is fine for trying PaperBoy out and useless
+  for the thing people actually want it for: leaving Postman. An account with
+  forty workspaces meant forty passes through the same four steps, re-entering
+  the key, the destination and the format each time. Both front-ends can now
+  take the lot — `Ctrl+A` on the workspace list in the terminal UI (`Ctrl`,
+  because every printable key on that screen types into the filter), an
+  **Import all** button beside **Next** in the GUI — and the headless import
+  has `--postman-all` to match. Everything the list is *showing* is imported,
+  so a filtered list imports what it shows rather than quietly taking more
+  than was asked for.
+
+  Each workspace lands in its own folder inside the destination, keeping the
+  `Collections/` + `Environments/` layout a single import has always produced;
+  two workspaces that both hold a "Billing API" therefore keep both, rather
+  than one being renamed to " (2)" with nothing to say which it came from. Two
+  workspaces that share a *name* get separate folders too.
+
+  The whole run still goes through one importer and one confirmation step: the
+  rate-limit pacer's picture of the account's real budget is worth more the
+  more calls are left to make, and the estimate, the ETA and the monthly-budget
+  warning now cover the entire import, so backing out before a forty-workspace
+  download still costs nothing. A workspace with nothing in it is dropped, and
+  one the key has lost access to is reported and skipped rather than ending the
+  run — an account is not a migration's fault. Anything that would fail for
+  every remaining workspace, such as a rejected key or an exhausted monthly
+  quota, still stops the plan instead of being logged forty times.
+
+### Added
+
+- **A preference for the old Esc behaviour.** Esc on a request form with unsaved
+  edits asks before discarding them, which is the right default for a form with
+  no autosave — but it is also a second keypress in a loop some users run dozens
+  of times an hour, and they had learned Esc as simply "close this". Settings →
+  Preferences → **Esc discards request edits without asking** puts the one-press
+  discard back. Off by default, so nobody gets it by accident.
+
+### Changed
 
 - **The saved key references are a dropdown hanging off the key field**, like
   the request wizard's header-name suggestions: anchored under the field, in a
@@ -322,24 +383,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   clocks now start when the key arrives.
 
 ### Fixed
-
-- **A `{{ variable.name }}` Hurl would quietly mangle is now refused instead of
-  sent.** Hurl reads a variable name only as far as the first character outside
-  letters, digits, `_` and `-`, and then discards the rest without a word — so
-  `{{ api.key }}` went on the wire as the value of `api`. PaperBoy's own
-  substitution accepts the dotted name happily, which meant the request preview
-  showed the correct value while the server was asked something else entirely,
-  and the only symptom was an answer that made no sense. Sending is now blocked,
-  and the message names the placeholder and what Hurl would have made of it
-  (`{{ api.key }} → api`). A name Hurl can't read at all — `{{ $timestamp }}`
-  pasted out of Postman, say — is caught in the same place, rather than
-  surfacing later as a collection that loads as nothing. Hurl's own
-  `{{ newUuid }}` and `{{ newDate }}` are unaffected.
-
-- **"Extract to parameter" no longer offers a name Hurl can't use.** The prompt
-  accepted anything PaperBoy's own substitution would match, so `api.key` was
-  allowed — building a request that the check above then refuses to send. It is
-  now held to the same rule at the point the name is typed.
 
 - The Postman importer's allowance line stopped flickering between two
   unrelated numbers. Postman meters listing calls (10 per 10 seconds) and fetch

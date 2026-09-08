@@ -396,8 +396,8 @@ The block works headlessly too. `paperboy -c …` evaluates each request's rows
 in its own window, so a generator can read a value an earlier request captured
 and two requests each get their own nonce. `--batch` is a single Hurl call over
 the whole file and has no such window: there every block is evaluated once
-before the run, and a name computed by two requests takes the first one's value
-for both.
+before the run, a name computed by two requests takes the first one's value for
+both, and the run says so before it starts.
 
 A row that fails — unknown function, wrong arity, a name nothing defines —
 reports rather than blocks the send. It binds nothing, so `{{sig}}` goes out
@@ -406,7 +406,8 @@ refusal.
 
 Importing from Postman maps the dynamic variables that have an exact equivalent:
 `$guid`/`$randomUUID` and `$isoTimestamp` become Hurl's own `{{newUuid}}` and
-`{{newDate}}`, while `$timestamp` and `$randomInt` become `[Gen]` rows. The rest
+`{{newDate}}`, while `$timestamp`, `$randomInt` and `$randomAlphaNumeric` become
+`[Gen]` rows. The rest
 are renamed and listed in `CONVERSION-NOTES.md` as values you must supply —
 guessing at `$randomFirstName` would send a plausible wrong value, which is
 harder to notice than a request that won't run.
@@ -515,8 +516,9 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
   `<name> (collection variables).vars` beside the environments.
 - `pm.<store>.set("NAME", body.a.b)` calls in test scripts, as `[Captures]`.
 - **Dynamic variables.** `{{$guid}}` and `{{$isoTimestamp}}` become Hurl's own
-  `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}` and `{{$randomInt}}` become
-  [computed values](#computed-values). The rest are listed as values to supply.
+  `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}`, `{{$randomInt}}` and
+  `{{$randomAlphaNumeric}}` become [computed values](#computed-values). The rest
+  are listed as values to supply.
 - **Pre-request scripts**, as far as they reduce to values PaperBoy can compute:
   `pm.environment.set("id", uuid.v4())`, `Date.now()`,
   `Math.floor(Date.now() / 1000)`, `new Date().toISOString()`,
@@ -525,9 +527,19 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 - **Test scripts**, as the status and assertions they always make:
   `pm.response.to.have.status(400)` becomes the request's expected status, and
   `pm.expect(...)` checks on the body, headers and response time become
-  `[Asserts]`. Only checks that run *unconditionally* are taken — anything
-  inside an `if`, a loop or a helper function is left for you, since an
+  `[Asserts]`. A deep equality against a literal document
+  (`.to.eql({ id: 7, name: "Ada" })`) is written out one leaf at a time, since
+  Hurl has no predicate that takes a document — which also makes a failure name
+  the field that differed. Only checks that run *unconditionally* are taken —
+  anything inside an `if`, a loop or a helper function is left for you, since an
   assertion that was meant for one branch fails every run.
+- **`setNextRequest`**, as a note saying which of the four things it was doing:
+  polling (which Hurl writes as `[Options] retry`), an order you can write down
+  in the file or as `REQUEST` lines in a
+  [PaperTrail flow](#the-papertrail-block-editor), a run that stopped early, or
+  a request name built as the script ran. PaperBoy runs a
+  collection in file order, so none of them convert — but they are four
+  different problems with four different fixes.
 - **Scripts on a folder or on the collection**, which Postman runs for every
   request inside; they are converted for each request they cover, and reported
   once against the folder that holds them.
