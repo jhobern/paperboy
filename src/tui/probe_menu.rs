@@ -26,6 +26,34 @@ pub(crate) enum ProbeStep {
     PickVerb,
 }
 
+/// One row of step one: a subject, or the door to the response's headers.
+pub(crate) enum ProbeRow<'a> {
+    /// The collapsed headers, carrying how many are behind it.
+    Headers(usize),
+    Subject(&'a Probe),
+}
+
+impl ProbeRow<'_> {
+    /// The row's left-hand column.
+    pub(crate) fn label(&self, s: &Strings) -> String {
+        match self {
+            ProbeRow::Headers(_) => s.probe_headers_group.to_string(),
+            ProbeRow::Subject(p) => subject_label(&p.subject),
+        }
+    }
+
+    /// The row's right-hand column: what the value is, or how many headers
+    /// are waiting behind the group row.
+    pub(crate) fn value(&self, width: usize, s: &Strings) -> String {
+        match self {
+            ProbeRow::Headers(n) => {
+                crate::i18n::fill(s.probe_headers_group_count, &[&n.to_string()])
+            }
+            ProbeRow::Subject(p) => value_preview(p.value.as_ref(), width),
+        }
+    }
+}
+
 /// State of the assert/capture palette.
 pub(crate) struct ProbeMenu {
     pub(crate) step: ProbeStep,
@@ -47,6 +75,15 @@ pub(crate) struct ProbeMenu {
     pub(crate) collection_id: u64,
     /// Which request in that collection, by its position at open time.
     pub(crate) entry: usize,
+    /// Whether the header rows are showing on their own.
+    ///
+    /// A reply carries a dozen headers nobody came here for, and listed flat
+    /// they pushed the body -- the reason the palette was opened -- off the
+    /// bottom of the screen. So they collapse to one row that opens them, in
+    /// the place they used to occupy. Typing a filter shows matching headers
+    /// straight away: someone who types "content-type" knows what they want
+    /// and should not have to open a group first.
+    pub(crate) headers_open: bool,
     /// Text the user had selected in the response panel when the menu opened.
     /// It seeds the filter (so selecting a token narrows straight to the field
     /// holding it) and supplies the literal for a `body contains` on a reply
@@ -60,20 +97,49 @@ impl ProbeMenu {
     /// Case-insensitive substring, matched against both the path and the value:
     /// "I can see `4f2a…` on screen, which field is that?" is as common a way
     /// in as knowing the field's name.
-    pub(crate) fn visible(&self) -> Vec<&Probe> {
+    pub(crate) fn visible(&self) -> Vec<ProbeRow<'_>> {
+        let matching: Vec<&Probe> = self.subjects.iter().filter(|p| self.matches(p)).collect();
+        let is_header = |p: &&Probe| matches!(p.subject, Subject::Header(_));
+        if self.headers_open {
+            return matching
+                .into_iter()
+                .filter(is_header)
+                .map(ProbeRow::Subject)
+                .collect();
+        }
+        if !self.filter.is_empty() {
+            return matching.into_iter().map(ProbeRow::Subject).collect();
+        }
+        let headers = matching.iter().copied().filter(|p| is_header(&p)).count();
+        let mut out = Vec::new();
+        let mut group_placed = false;
+        for probe in matching {
+            if matches!(probe.subject, Subject::Header(_)) {
+                // One row where the headers were, so the list keeps its order:
+                // status, duration, headers, then the body.
+                if !group_placed {
+                    out.push(ProbeRow::Headers(headers));
+                    group_placed = true;
+                }
+                continue;
+            }
+            out.push(ProbeRow::Subject(probe));
+        }
+        out
+    }
+
+    /// Whether a subject survives the typed filter.
+    fn matches(&self, probe: &Probe) -> bool {
         if self.filter.is_empty() {
-            return self.subjects.iter().collect();
+            return true;
         }
         let needle = self.filter.to_lowercase();
-        self.subjects
-            .iter()
-            .filter(|p| {
-                subject_label(&p.subject).to_lowercase().contains(&needle)
-                    || value_preview(p.value.as_ref(), usize::MAX)
-                        .to_lowercase()
-                        .contains(&needle)
-            })
-            .collect()
+        subject_label(&probe.subject)
+            .to_lowercase()
+            .contains(&needle)
+            || value_preview(probe.value.as_ref(), usize::MAX)
+                .to_lowercase()
+                .contains(&needle)
     }
 
     /// The number of rows currently on screen, whichever step is showing.
@@ -84,9 +150,21 @@ impl ProbeMenu {
         }
     }
 
-    /// The subject the cursor is on, or `None` when the filter matches nothing.
+    /// The subject the cursor is on, or `None` on the headers group (which is
+    /// not a subject) or when the filter matches nothing.
     pub(crate) fn choice(&self) -> Option<Probe> {
-        self.visible().get(self.selected).map(|p| (*p).clone())
+        match self.visible().get(self.selected) {
+            Some(ProbeRow::Subject(p)) => Some((*p).clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the cursor is on the row that opens the headers.
+    pub(crate) fn on_headers_group(&self) -> bool {
+        matches!(
+            self.visible().get(self.selected),
+            Some(ProbeRow::Headers(_))
+        )
     }
 
     /// Keep the cursor on a row that exists after the filter changed. It goes
@@ -99,6 +177,9 @@ impl ProbeMenu {
     /// The overlay title for the current step.
     pub(crate) fn title(&self, s: &Strings) -> String {
         match (&self.step, &self.chosen) {
+            (ProbeStep::PickSubject, _) if self.headers_open => {
+                s.probe_pick_header_title.to_string()
+            }
             (ProbeStep::PickSubject, _) => s.probe_pick_subject_title.to_string(),
             (ProbeStep::PickVerb, Some(p)) => subject_label(&p.subject),
             (ProbeStep::PickVerb, None) => s.probe_pick_verb_title.to_string(),
@@ -108,6 +189,13 @@ impl ProbeMenu {
     /// Move to step two on the chosen subject, or stay put when the filter
     /// matches nothing (there is no subject to say anything about).
     pub(crate) fn advance(&mut self) -> bool {
+        // The headers row is a door, not a subject: it opens the list it
+        // stands for and stays on step one.
+        if self.on_headers_group() {
+            self.headers_open = true;
+            self.selected = 0;
+            return false;
+        }
         let Some(chosen) = self.choice() else {
             return false;
         };
@@ -127,6 +215,13 @@ impl ProbeMenu {
         self.step = ProbeStep::PickSubject;
         self.chosen = None;
         self.verbs.clear();
+        self.selected = 0;
+    }
+
+    /// Back out of the opened header list to the whole response.
+    pub(crate) fn close_headers(&mut self) {
+        self.headers_open = false;
+        self.filter.clear();
         self.selected = 0;
     }
 }
@@ -180,6 +275,7 @@ impl crate::tui::app::TuiApp {
             selected: 0,
             collection_id: col.id,
             entry: entry_idx,
+            headers_open: false,
             selection: selection.clone(),
         };
         // Only if it actually narrows to something: a seed that matches nothing
@@ -255,6 +351,12 @@ impl crate::tui::app::TuiApp {
                 self.overlay = Some(Overlay::ProbeMenu(menu));
             }
             KeyCode::Enter => self.apply_probe_verb(*menu),
+            // Esc backs out of the opened headers before it closes anything:
+            // one press undoes one step, as it does on step two.
+            KeyCode::Esc if menu.headers_open => {
+                menu.close_headers();
+                self.overlay = Some(Overlay::ProbeMenu(menu));
+            }
             // Esc closes from step one (step two retreats, above).
             KeyCode::Esc => {}
             // On step two the list takes no filter, so a letter has nothing to

@@ -747,6 +747,7 @@ impl TuiApp {
                     || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
                     if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
+                form.gen_browse = false;
                 let landed_on_kind = matches!(form.focus, NewField::FormField(i, FormCol::Kind)
                     if form.form_fields.get(i).is_some());
                 form.kind_dropdown_hidden = landed_on_kind;
@@ -1828,6 +1829,18 @@ impl TuiApp {
                 self.cycle_response_section(true);
             }
             KeyCode::Char('I') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(false);
+            }
+            // The section tabs are a row of tabs, and Left/Right are what moves
+            // along a row of tabs everywhere else in the app (the collection tab
+            // bar, the environment panel). Nothing else claimed them in this
+            // pane -- the body scrolls with Up/Down -- so the obvious key does
+            // the obvious thing, and `i`/`I` stay as they were for anyone who
+            // has learned them.
+            KeyCode::Right if !ctrl && !shift && self.focus == Pane::Response => {
+                self.cycle_response_section(true);
+            }
+            KeyCode::Left if !ctrl && !shift && self.focus == Pane::Response => {
                 self.cycle_response_section(false);
             }
             // Shift+Arrow moves the *end* of an active selection, letting
@@ -6668,6 +6681,18 @@ impl TuiApp {
         if reveal_ctype_dropdown {
             form.ctype_dropdown_hidden = false;
         }
+        // Enter on an expression cell with nothing half-typed opens the function
+        // catalogue. Typing the first letters of a name you already know still
+        // works exactly as before; this is for the far commoner case of not
+        // knowing what there is to type. Enter rather than Down, because Down
+        // is how the rows are moved between and must stay that.
+        let open_gen_browse =
+            !submit && !ctrl && key.code == KeyCode::Enter && form.gen_browse_openable();
+        if open_gen_browse {
+            form.gen_browse = true;
+            form.suggest_hidden = false;
+            form.suggest_hi = Some(0);
+        }
         let dropdown = form.key_dropdown();
         let dropdown_open = dropdown.is_some();
         let sug_len = dropdown.as_ref().map(|(_, s)| s.len()).unwrap_or(0);
@@ -6689,6 +6714,7 @@ impl TuiApp {
                 // Dismiss the suggestion dropdown but keep the form open.
                 form.suggest_hidden = true;
                 form.suggest_hi = None;
+                form.gen_browse = false;
             } else if kind_open {
                 form.kind_dropdown_hidden = true;
             } else if ctype_open {
@@ -6721,7 +6747,11 @@ impl TuiApp {
                 do_submit = true;
                 keep = false;
             }
-        } else if reveal_key_dropdown || reveal_kind_dropdown || reveal_ctype_dropdown {
+        } else if open_gen_browse
+            || reveal_key_dropdown
+            || reveal_kind_dropdown
+            || reveal_ctype_dropdown
+        {
             // The dropdown was just revealed above; stay put so the
             // user can browse it with Down/Up instead of also
             // advancing focus like a normal Enter would.
@@ -7482,6 +7512,7 @@ impl TuiApp {
                     || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
                             if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
+                form.gen_browse = false;
             }
             if form.focus != prev_focus {
                 // Moving onto (or off of) the Kind cell resets its

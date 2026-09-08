@@ -523,6 +523,17 @@ pub(crate) struct NewReq {
     /// True once the user has dismissed the dropdown with Esc; reset when they
     /// type or move to a different field.
     pub(crate) suggest_hidden: bool,
+    /// Whether the `[Gen]` expression cell is showing the whole function
+    /// catalogue rather than the matches for a half-typed name.
+    ///
+    /// Completion-as-you-type only helps someone who already knows a function
+    /// is called `hmac_sha256`; there was nothing in the terminal UI that would
+    /// *show* you the thirty-odd functions, the way the GUI's function menu
+    /// does. Enter (or Down) on an expression cell opens the list; typing then
+    /// narrows it in the usual way. Not on by default, because a list that
+    /// covers the form the moment a cell is focused is in the way of everyone
+    /// who came to type an expression they already know.
+    pub(crate) gen_browse: bool,
     /// Where the key-suggestion and content-type dropdowns are scrolled to,
     /// carried between frames (see [`ListScroll`]); both cap at eight rows and
     /// scroll beyond that, and only one is ever open at a time.
@@ -931,6 +942,7 @@ impl NewReq {
             extract: None,
             suggest_hi: None,
             suggest_hidden: false,
+            gen_browse: false,
             dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
@@ -1110,6 +1122,7 @@ impl NewReq {
             extract: None,
             suggest_hi: None,
             suggest_hidden: false,
+            gen_browse: false,
             dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
@@ -1177,7 +1190,7 @@ impl NewReq {
         let row = self.generators.get(i)?;
         let text = row.expr.text();
         let word = gen_word(&text, row.expr.col).2;
-        if word.is_empty() {
+        if word.is_empty() && !self.gen_browse {
             return None;
         }
         let sugs: Vec<&'static str> = crate::generators::functions_starting_with(&word)
@@ -1250,6 +1263,27 @@ impl NewReq {
         }
         self.suggest_hi = None;
         self.suggest_hidden = true;
+        self.gen_browse = false;
+    }
+
+    /// Whether Enter on the focused cell should open the function catalogue
+    /// rather than move on: an expression cell with nothing to complete yet.
+    pub(crate) fn gen_browse_openable(&self) -> bool {
+        let NewField::Computed(i, CapCol::Expr) = self.focus else {
+            return false;
+        };
+        // Not once it has been dismissed (Esc means "not now", and reopening
+        // on the next keypress makes Esc look broken), and not with a name
+        // half-typed -- that is what completion is for, and the catalogue
+        // would replace the matches with everything.
+        if self.gen_browse || self.suggest_hidden {
+            return false;
+        }
+        let Some(row) = self.generators.get(i) else {
+            return false;
+        };
+        let text = row.expr.text();
+        gen_word(&text, row.expr.col).2.is_empty()
     }
 
     /// Whether the Form Kind (Text/File) dropdown should currently be shown:
@@ -4721,7 +4755,16 @@ pub(crate) fn draw_computed_table_with_hits(
     if let Some(hrect) = header_rect {
         let hcells = cell_rects(hrect);
         f.render_widget(lbl(s.computed_name), hcells[0]);
-        f.render_widget(lbl(s.computed_expr), hcells[1]);
+        // The column header carries the way in to the function list: a cell
+        // that completes what you type is no use to someone who does not know
+        // there is anything to type, and this is the only place they are
+        // already looking.
+        let expr_label = if matches!(form.focus, NewField::Computed(_, CapCol::Expr)) {
+            s.computed_fn_hint
+        } else {
+            s.computed_expr
+        };
+        f.render_widget(lbl(expr_label), hcells[1]);
     }
 
     for (slot, row_area) in data_rects.iter().enumerate() {

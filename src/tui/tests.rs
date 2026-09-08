@@ -22970,6 +22970,63 @@ fn open_form_on_computed_expression(app: &mut TuiApp) {
     assert_eq!(new_focus(app), NewField::Computed(0, CapCol::Expr));
 }
 
+/// Completion helps someone who already knows a function is called
+/// `hmac_sha256`. Nothing in the terminal UI would *show* you the thirty-odd
+/// functions the way the GUI's function menu does, so an expression cell with
+/// nothing typed in it yet lists them all on Enter.
+#[test]
+fn an_empty_expression_cell_lists_every_function_on_enter() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    assert!(
+        form_ref(&app).key_dropdown().is_none(),
+        "the catalogue opened over the form before it was asked for"
+    );
+    press(&mut app, KeyCode::Enter);
+    let (_, sugs) = form_ref(&app)
+        .key_dropdown()
+        .expect("Enter on an empty expression cell offered nothing");
+    assert_eq!(
+        sugs.len(),
+        crate::generators::FUNCTIONS.len(),
+        "the list is meant to be the whole catalogue"
+    );
+    assert_eq!(
+        new_focus(&app),
+        NewField::Computed(0, CapCol::Expr),
+        "Enter moved on instead of opening the list"
+    );
+    // And choosing one writes the call, exactly as completing a typed name does.
+    press(&mut app, KeyCode::Enter);
+    let expr = form_ref(&app).generators[0].expr.text();
+    assert!(
+        expr.starts_with(crate::generators::FUNCTIONS[0].name),
+        "picking from the catalogue wrote {expr:?}"
+    );
+}
+
+/// Typing narrows the catalogue like any other filter, and Esc means "not
+/// now" -- pressing Enter again would reopen it, but arrowing away must not.
+#[test]
+fn the_function_catalogue_narrows_as_it_is_typed_and_closes_on_escape() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    press(&mut app, KeyCode::Enter);
+    let all = form_ref(&app).key_dropdown().expect("no catalogue").1.len();
+    type_str(&mut app, "sha");
+    let narrowed = form_ref(&app).key_dropdown().expect("no matches").1;
+    assert!(
+        narrowed.len() < all && narrowed.iter().all(|sig| sig.starts_with("sha")),
+        "typing did not narrow the catalogue: {narrowed:?}"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(form_ref(&app).key_dropdown().is_none());
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "Esc closed the whole form"
+    );
+}
+
 /// A half-filled row is dropped rather than saved: a name with no expression
 /// computes nothing, and an expression with no name binds nothing, so either
 /// would be a row that exists only to fail.
@@ -31583,6 +31640,31 @@ fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
     );
 }
 
+/// The section tabs are a row of tabs, and Left/Right are what moves along a
+/// row of tabs everywhere else in the app. Nothing else claimed the arrows in
+/// this pane, so the obvious key does the obvious thing -- `i` was a shortcut
+/// nobody would guess.
+#[test]
+fn the_arrows_step_the_response_section_tabs() {
+    let mut app = app_with_response_headers("{}", &[("content-type", "application/json")]);
+    assert_eq!(app.response_section, ResponseSection::Body);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.response_section, ResponseSection::Headers);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Body,
+        "the left arrow steps the ring backwards"
+    );
+    // The footer teaches the arrows rather than the letter.
+    let s = Strings::for_language(&app.language);
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains('\u{2190}') && foot.contains(s.foot_response_section),
+        "the footer does not advertise the arrows: {foot:?}"
+    );
+}
+
 /// The section keys are scoped to the Response pane, so `i` stays free for
 /// every other panel — the same rule `c` (compact) already follows.
 #[test]
@@ -33688,15 +33770,62 @@ mod probe_menu_tests {
     #[test]
     fn a_non_json_reply_falls_back_to_the_headers_and_the_text() {
         let mut app = app_with_response("<html>nope</html>");
+        let s = Strings::for_language(&app.language);
         press(&mut app, KeyCode::Char('a'));
-        let labels: Vec<String> = menu(&app)
-            .visible()
-            .iter()
-            .map(|p| crate::probe::subject_label(&p.subject))
-            .collect();
-        assert!(labels.contains(&"header Content-Type".to_string()));
+        let labels: Vec<String> = menu(&app).visible().iter().map(|r| r.label(&s)).collect();
+        assert!(labels.contains(&s.probe_headers_group.to_string()));
         assert!(labels.contains(&"body".to_string()));
         assert!(!labels.iter().any(|l| l.starts_with('$')));
+    }
+
+    /// A reply carries a dozen headers nobody opened the palette for, and
+    /// listed flat they push the body off the bottom of the box. They collapse
+    /// to one row that opens them, and Esc closes that list again rather than
+    /// the whole palette.
+    #[test]
+    fn the_headers_collapse_to_one_row_that_opens_them() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        let s = Strings::for_language(&app.language);
+        press(&mut app, KeyCode::Char('a'));
+        let labels = |app: &TuiApp| -> Vec<String> {
+            menu(app).visible().iter().map(|r| r.label(&s)).collect()
+        };
+        assert!(
+            !labels(&app).iter().any(|l| l.starts_with("header ")),
+            "the headers were listed flat: {:?}",
+            labels(&app)
+        );
+        let group = labels(&app)
+            .iter()
+            .position(|l| l == s.probe_headers_group)
+            .expect("no row to open the headers with");
+        for _ in 0..group {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            labels(&app).iter().all(|l| l.starts_with("header ")),
+            "opening the group showed something other than headers: {:?}",
+            labels(&app)
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.overlay.is_some(),
+            "Esc closed the palette instead of the header list"
+        );
+        assert!(labels(&app).iter().any(|l| l.starts_with('$')));
+    }
+
+    /// Someone who types a header's name knows what they want: the filter
+    /// reaches headers without the group having to be opened first.
+    #[test]
+    fn typing_a_header_name_finds_it_without_opening_the_group() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        let s = Strings::for_language(&app.language);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "content-type");
+        let labels: Vec<String> = menu(&app).visible().iter().map(|r| r.label(&s)).collect();
+        assert_eq!(labels, vec!["header Content-Type".to_string()]);
     }
 
     /// A list taller than the box scrolls, and a list that scrolls with no sign

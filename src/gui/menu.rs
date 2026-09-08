@@ -774,6 +774,7 @@ fn probe_builder_dialog(
     let mut chosen_verb: Option<crate::probe::Verb> = None;
     let mut start_capture = false;
     let mut copy: Option<crate::probe::Probe> = None;
+    let mut hovered: Option<crate::probe::Subject> = None;
     let selection = builder.selection.clone();
     // Wide enough that the title fits its own bar: an egui window shrinks to
     // its content, and this one's content is a list of short rows, so the
@@ -814,6 +815,12 @@ fn probe_builder_dialog(
                         // line. What the row is for is being scannable; the
                         // whole value is a highlight and a Copy value away.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        // egui grows a hovered widget by a pixel, which in a
+                        // list of rows means the row under the pointer -- and
+                        // everything below it -- shifts as the pointer crosses
+                        // it. Aiming at a moving row is exactly what this list
+                        // must not ask for.
+                        steady_rows(ui);
                         for (i, probe) in rows.iter().enumerate() {
                             let row = super::probe::subject_row(probe);
                             let widget = ui.selectable_label(
@@ -822,6 +829,13 @@ fn probe_builder_dialog(
                             );
                             if widget.clicked() {
                                 clicked = Some(i);
+                            }
+                            // Merely pointing at a row highlights its value in
+                            // the response: the fastest way to answer "which of
+                            // these is $.data[0].token?" is to run the pointer
+                            // down the list and watch the body.
+                            if widget.hovered() {
+                                hovered = Some(probe.subject.clone());
                             }
                             // A double-click is the shortcut for people who
                             // already know which row they want.
@@ -839,7 +853,7 @@ fn probe_builder_dialog(
                 }
                 let picked = rows.get(builder.selected).cloned();
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                centred_row(ui, &[l.next, l.copy, l.cancel], |ui| {
                     if ui
                         .add_enabled(picked.is_some(), egui::Button::new(l.next))
                         .clicked()
@@ -890,11 +904,11 @@ fn probe_builder_dialog(
                     ui.colored_label(err, l.name_required);
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                centred_row(ui, &[l.back, l.add_capture, l.copy, l.cancel], |ui| {
                     if ui.button(l.back).clicked() {
                         back = true;
                     }
-                    if ui.button(l.add).clicked() || submit {
+                    if ui.button(l.add_capture).clicked() || submit {
                         chosen_verb = Some(crate::probe::Verb::Capture);
                     }
                     if ui.button(l.copy).on_hover_text(l.copy_hint).clicked() {
@@ -925,6 +939,12 @@ fn probe_builder_dialog(
                         // line. What the row is for is being scannable; the
                         // whole value is a highlight and a Copy value away.
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        // egui grows a hovered widget by a pixel, which in a
+                        // list of rows means the row under the pointer -- and
+                        // everything below it -- shifts as the pointer crosses
+                        // it. Aiming at a moving row is exactly what this list
+                        // must not ask for.
+                        steady_rows(ui);
                         for (i, verb) in builder.verbs.iter().enumerate() {
                             let row = super::probe::verb_row(&probe.subject, verb, &strings);
                             let widget = ui.selectable_label(
@@ -946,12 +966,19 @@ fn probe_builder_dialog(
                 if enter {
                     advance = true;
                 }
+                // Choosing a capture is not the end of the dialog -- it still
+                // needs a name -- so the button says so rather than promising
+                // to add something and then asking another question.
+                let commit = match builder.verbs.get(builder.selected_verb) {
+                    Some(crate::probe::Verb::Capture) => l.next,
+                    _ => l.add_assert,
+                };
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                centred_row(ui, &[l.back, commit, l.copy, l.cancel], |ui| {
                     if ui.button(l.back).clicked() {
                         back = true;
                     }
-                    if ui.button(l.add).clicked() {
+                    if ui.button(commit).clicked() {
                         advance = true;
                     }
                     if ui.button(l.copy).on_hover_text(l.copy_hint).clicked() {
@@ -1020,10 +1047,8 @@ fn probe_builder_dialog(
     // Show which value the dialog is talking about, in the response itself.
     // Only on a change: rewriting the field's selection every frame would take
     // it away from anything else that touches it.
-    let showing = builder
-        .chosen
-        .as_ref()
-        .map(|p| p.subject.clone())
+    let showing = hovered
+        .or_else(|| builder.chosen.as_ref().map(|p| p.subject.clone()))
         .or_else(|| {
             builder
                 .visible()
@@ -1043,7 +1068,8 @@ fn probe_builder_dialog(
 /// the builder mutably without holding a second borrow of the app.
 struct ProbeLabels {
     back: &'static str,
-    add: &'static str,
+    add_assert: &'static str,
+    add_capture: &'static str,
     cancel: &'static str,
     filter: &'static str,
     name: &'static str,
@@ -1064,7 +1090,8 @@ impl ProbeLabels {
     fn new(app: &GuiApp) -> Self {
         Self {
             back: app.strings.gui_probe_back,
-            add: app.strings.gui_probe_add,
+            add_assert: app.strings.gui_probe_add_assert,
+            add_capture: app.strings.gui_probe_add_capture,
             cancel: app.strings.gui_cancel,
             filter: app.strings.gui_probe_filter_hint,
             name: app.strings.probe_capture_name_title,
@@ -1112,6 +1139,62 @@ fn chosen_value(
         if !value.is_empty() {
             ui.label(egui::RichText::new(value).monospace().color(dim));
         }
+    });
+}
+
+/// Rows that do not move when the pointer crosses them.
+///
+/// egui expands a hovered (and a pressed) widget by a pixel, which is a nice
+/// touch on a button and unusable in a list: the row under the pointer grows,
+/// pushing every row below it down, so the thing being aimed at moves out from
+/// under the aim.
+fn steady_rows(ui: &mut egui::Ui) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.hovered.expansion = 0.0;
+    widgets.active.expansion = 0.0;
+    // A `selectable_label` is a `Button`, and a button's outline is part of
+    // what it measures. An *unselected, unhovered* row is the one state egui
+    // draws with no frame at all, so any stroke width on the others made the
+    // row grow the moment it was hovered or selected -- pushing every row
+    // below it down, under a pointer that was aiming at one of them. Both
+    // states still read clearly through their fill.
+    for state in [
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.bg_stroke.width = 0.0;
+    }
+}
+
+/// A row of buttons centred in the dialog rather than left-aligned against it.
+///
+/// egui lays a `horizontal` out from the left edge, and the width has to be
+/// known before the buttons are added to place them anywhere else -- so the
+/// labels are measured first, in the same text style the buttons will use.
+fn centred_row(ui: &mut egui::Ui, labels: &[&str], add: impl FnOnce(&mut egui::Ui)) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let padding = ui.spacing().button_padding.x * 2.0;
+    let gap = ui.spacing().item_spacing.x;
+    let width: f32 = labels
+        .iter()
+        .map(|t| {
+            let galley = ui.painter().layout_no_wrap(
+                t.to_string(),
+                font.clone(),
+                egui::Color32::PLACEHOLDER,
+            );
+            galley.size().x + padding
+        })
+        .sum::<f32>()
+        + gap * labels.len().saturating_sub(1) as f32;
+    ui.horizontal(|ui| {
+        let slack = ui.available_width() - width;
+        if slack > 0.0 {
+            ui.add_space(slack / 2.0);
+        }
+        add(ui);
     });
 }
 
@@ -2736,7 +2819,7 @@ mod probe_dialog_tests {
 
         dialog_frame(&mut app, &ctx, vec![]);
         let painted = dialog_frame(&mut app, &ctx, vec![]);
-        let add = centre_of(&painted, app.strings.gui_probe_add);
+        let add = centre_of(&painted, app.strings.gui_probe_add_capture);
         let (press, release) = click_events(add, egui::PointerButton::Primary);
         dialog_frame(&mut app, &ctx, press);
         dialog_frame(&mut app, &ctx, release);
@@ -2902,6 +2985,66 @@ mod probe_dialog_tests {
         assert!(
             wrapped.is_empty(),
             "an assert row wrapped onto a second line: {wrapped:?}"
+        );
+    }
+
+    /// Hovering a row must not move the rows. A list that shifts under the
+    /// pointer is unusable for aiming at anything.
+    #[test]
+    fn hovering_a_row_does_not_move_the_list() {
+        let token = "PVmx3If8pKT2OFZttbomJuZqTdQpL3dXeNEDB5Opl0vBwXUYtjG3Mo6WkGmp";
+        let body = format!(r#"{{"token":"{token}","other":"{token}"}}"#);
+        let mut app = app_with(&body, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            painted = dialog_frame(&mut app, &ctx, vec![]);
+        }
+        let before: Vec<(String, egui::Pos2)> = painted
+            .iter()
+            .map(|(p, g)| (g.text().to_string(), *p))
+            .collect();
+        let row = centre_of(&painted, "$.token");
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            let p = dialog_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(row)]);
+            after = p.iter().map(|(p, g)| (g.text().to_string(), *p)).collect();
+        }
+        assert_eq!(before, after, "hovering a row moved the list");
+    }
+
+    /// Pointing at a row is enough to show its value in the response: running
+    /// the pointer down the list and watching the body is the quickest way to
+    /// tell six similar-looking tokens apart.
+    #[test]
+    fn hovering_a_row_highlights_that_value_in_the_body() {
+        let body = "{\n  \"first\": \"one\",\n  \"token\": \"abc\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        super::super::probe::open(&mut app, &ctx, None);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            painted = dialog_frame(&mut app, &ctx, vec![]);
+        }
+        let row = centre_of(&painted, "$.token");
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(row)]);
+        }
+
+        let range = egui::TextEdit::load_state(&ctx, super::super::probe::body_field_id(&app))
+            .and_then(|s| s.cursor.char_range())
+            .expect("hovering highlighted nothing")
+            .as_sorted_char_range();
+        let selected: String = body
+            .chars()
+            .skip(range.start.0)
+            .take(range.end.0 - range.start.0)
+            .collect();
+        assert_eq!(
+            selected, "\"abc\"",
+            "the hovered row highlighted the wrong part of the body"
         );
     }
 

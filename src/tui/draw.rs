@@ -1676,7 +1676,7 @@ fn draw_probe_menu_overlay(
     app: Option<&TuiApp>,
 ) {
     use super::probe_menu::ProbeStep;
-    use crate::probe::{subject_label, value_preview, verb_label};
+    use crate::probe::verb_label;
     let step_one = menu.step == ProbeStep::PickSubject;
     // The typed filter goes in the title, where it reads as part of the
     // question rather than as another row of the list.
@@ -1733,12 +1733,12 @@ fn draw_probe_menu_overlay(
         // deeply nested path can't push every value off the right edge.
         let name_w = visible
             .iter()
-            .map(|p| subject_label(&p.subject).chars().count())
+            .map(|row| row.label(s).chars().count())
             .max()
             .unwrap_or(0)
             .min(inner_w.saturating_sub(12).max(8));
-        for (i, probe) in visible.iter().enumerate().skip(scroll).take(inner_h) {
-            let name = subject_label(&probe.subject);
+        for (i, row) in visible.iter().enumerate().skip(scroll).take(inner_h) {
+            let name = row.label(s);
             let name = if name.chars().count() > name_w {
                 // Truncate from the *left*: the tail of a jsonpath is the field
                 // being named, and the head is shared with its neighbours.
@@ -1750,10 +1750,7 @@ fn draw_probe_menu_overlay(
             } else {
                 format!("{name:name_w$}")
             };
-            let value = value_preview(
-                probe.value.as_ref(),
-                inner_w.saturating_sub(name_w + 2).max(4),
-            );
+            let value = row.value(inner_w.saturating_sub(name_w + 2).max(4), s);
             let style = row_style(i);
             lines.push(Line::from(vec![
                 Span::styled(name, style),
@@ -4364,10 +4361,12 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     {
         hint.push(format!("a {}", s.foot_probe));
     }
-    // `i` steps the Response section tabs — likewise only meaningful (and only
-    // shown) while the Response pane holds focus.
+    // The arrows step the Response section tabs — likewise only meaningful (and
+    // only shown) while the Response pane holds focus. Advertised as the arrows
+    // rather than as `i`: a footer is where a key is learned, and "←/→" needs no
+    // learning at all.
     if app.focus == Pane::Response {
-        hint.push(format!("i {}", s.foot_response_section));
+        hint.push(format!("\u{2190}/\u{2192} {}", s.foot_response_section));
     }
     // `c` duplicates the highlighted request — but only where there is a
     // request under the cursor to duplicate; on a folder or "up" row it does
@@ -4902,7 +4901,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Ctrl+C", s.help_ctrl_c),
                             ("a (Response pane)", s.help_text_probe),
                             ("c (Response pane)", s.help_compact),
-                            ("i (Response pane)", s.help_response_section),
+                            ("\u{2192} / i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],

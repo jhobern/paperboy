@@ -294,6 +294,7 @@ strings! {
     report_expr => "Expression", "Expression", "Udtryk";
     computed_name => "Name", "Nom", "Navn";
     computed_expr => "Expression", "Expression", "Udtryk";
+    computed_fn_hint => "Expression   (Enter lists the functions)", "Expression   (Entrée affiche les fonctions)", "Udtryk   (Enter viser funktionerne)";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
@@ -543,7 +544,7 @@ strings! {
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
     help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
-    help_response_section => "step the Response section tabs (Body / Headers); Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); Skift+I går tilbage";
+    help_response_section => "step the Response section tabs (Body / Headers); \u{2190} or Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; \u{2190} ou Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); \u{2190} eller Skift+I går tilbage";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";
@@ -772,6 +773,9 @@ strings! {
     // from what the server actually replied, so the wording talks about the
     // response rather than about Hurl.
     probe_pick_subject_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
+    probe_pick_header_title => "Which response header?", "Quel en-tête de réponse ?", "Hvilken svar-header?";
+    probe_headers_group => "headers", "en-têtes", "headers";
+    probe_headers_group_count => "{0} headers — Enter to list them", "{0} en-têtes — Entrée pour les afficher", "{0} headers — Enter for at vise dem";
     probe_pick_verb_title => "What about it?", "Que vérifier ?", "Hvad med det?";
     probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
@@ -791,7 +795,8 @@ strings! {
     gui_probe_assert_this => "Assert this…", "Vérifier ceci…", "Kontrollér dette…";
     gui_probe_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
     gui_probe_back => "‹ Back", "‹ Retour", "‹ Tilbage";
-    gui_probe_add => "Add", "Ajouter", "Tilføj";
+    gui_probe_add_assert => "Add this check", "Ajouter cette vérification", "Tilføj denne kontrol";
+    gui_probe_add_capture => "Add capture", "Ajouter la capture", "Tilføj opsamling";
     gui_probe_step_subject => "1. Pick a value from the response", "1. Choisissez une valeur de la réponse", "1. Vælg en værdi fra svaret";
     gui_probe_step_subject_hint => "The value you pick is highlighted in the response below.", "La valeur choisie est mise en évidence dans la réponse ci-dessous.", "Den valgte værdi fremhæves i svaret nedenfor.";
     gui_probe_step_verb => "2. Say what should be true about it", "2. Indiquez ce qui doit être vrai à son sujet", "2. Angiv hvad der skal gælde for den";

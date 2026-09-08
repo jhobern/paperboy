@@ -190,6 +190,58 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The assert builder says what it is asking, and shows it in the response.**
+  The dialog listed rows of `jsonpath "$…"` with nothing to say what the
+  question was, and acted on the first click, so a row could not be looked at
+  before it was chosen. Each step now leads with what it is asking and what the
+  answer will do; rows are selected first and committed by a button, a
+  double-click or Enter; and whichever value is under the pointer or the cursor
+  is highlighted in the response body itself — as a real selection, so Ctrl+C
+  yields exactly that value. A *Copy value* button, and a *Copy this value* item
+  on the response's own context menu, reuse the same section-isolating logic for
+  the far commoner case of just wanting the value. The buttons name what they
+  do (*Add this check*, *Add capture*) and sit centred under the list.
+
+- **The builder's rows no longer wrap, jitter or lose their title.** A long
+  bearer token holds no break opportunity, so a wrapped row tore the literal off
+  after its opening quote and left a `"` alone on a line; rows are now clipped
+  with an ellipsis. A hovered or selected row picked up an outline that the
+  resting state does not have, and grew by it — moving the row under the pointer
+  and every row below it. And egui shrinks a window to its content, which elided
+  this one's title to "Assert or capture from the res…", on the one dialog whose
+  whole job is to say what it is for.
+
+- **The terminal UI can browse the computed-value functions.** The expression
+  cell completed a name you had started typing, which is no use to anyone who
+  does not know there is a `hmac_sha256` to type — the GUI has had a function
+  menu all along. Enter on an empty expression cell now lists every function
+  with its arguments; typing narrows the list, Enter writes the call with the
+  caret on the first argument, and Esc dismisses it. The column header says so,
+  because that is where anyone stuck is already looking.
+
+- **The Response section tabs step with the arrow keys.** They are a row of
+  tabs, and Left/Right are what moves along a row of tabs everywhere else in
+  the app; `i` was a shortcut nobody would guess, and is still there for anyone
+  who learned it.
+
+- **The response's status can be right-clicked.** It is the one subject with
+  nothing in the body to aim at, so the only route to `HTTP 201` was the top row
+  of the builder's list — not where anyone reading "201 Created" looks.
+
+- **The terminal UI's header rows no longer bury the body.** A reply carries a
+  dozen headers nobody opened the palette for, and listed flat they pushed the
+  body — the reason it was opened — off the bottom of the box. They collapse to
+  one row that opens them, in the place they used to occupy, and Esc closes that
+  list rather than the whole palette. Typing still reaches a header by name
+  without opening the group first.
+
+- **The strip below the last row follows the theme.** A terminal window is
+  rarely a whole number of character cells tall, and the leftover band at the
+  bottom is not addressable — it kept the emulator's own background under an
+  otherwise themed screen. PaperBoy now tells the terminal what its background
+  is (OSC 11), updates it whenever the theme changes, and puts it back on exit
+  and on a panic. Terminals that don't implement it are unaffected.
+
 - **Postman deep-equality assertions carry across.**
   `pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' })` is an
   ordinary Postman test whose argument is not a scalar, so the whole thing used

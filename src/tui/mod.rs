@@ -22,6 +22,7 @@ pub(crate) mod remote;
 pub(crate) mod report_highlight;
 mod report_nodes;
 mod reports;
+pub(crate) mod term_bg;
 #[cfg(test)]
 mod tests;
 pub(crate) mod theme;
@@ -54,7 +55,20 @@ pub fn run() -> io::Result<()> {
 
     let mut app = TuiApp::restored();
     app.enhanced_keys = enhanced;
+    // A window is rarely a whole number of rows tall, and the part-row at the
+    // bottom belongs to the terminal, not to us: it keeps the emulator's own
+    // background unless the emulator is told what ours is. The panic hook the
+    // guard installed has already run by the time this one does, so the reset
+    // joins the rest of the teardown rather than replacing any of it.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        term_bg::reset();
+        previous_hook(info);
+    }));
+    let mut terminal_bg: Option<(u8, u8, u8)> = None;
     let result = loop {
+        // Before the frame, so the strip and the screen change together.
+        term_bg::sync(app.theme().bg, &mut terminal_bg);
         if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
             break Err(e);
         }
@@ -177,6 +191,7 @@ pub fn run() -> io::Result<()> {
         }
     };
 
+    term_bg::reset();
     drop(guard); // pops keyboard-enhancement flags + disables mouse capture
     ratatui::restore();
     result
