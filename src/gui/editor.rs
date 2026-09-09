@@ -1331,30 +1331,42 @@ fn assert_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
-    for i in 0..asserts.len() {
-        // Pin the remove ✕ to the right and let the value fill everything to its
-        // left: an infinite-width field laid out left-to-right would instead
-        // claim the whole row and shove the ✕ off the edge (see `kv_editor`).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                .clicked()
-            {
-                remove = Some(i);
-            }
-            let r = widgets::wrapping_field_font(
-                ui,
-                ui.available_width(),
-                &mut asserts[i],
-                s.gui_hint_assert,
-                theme.text,
-                egui::TextStyle::Monospace,
-            );
-            if r.changed() {
-                changed = true;
-            }
-        });
-    }
+    // Reserve the ✕'s width and give the field the rest, rather than laying the
+    // row out right-to-left (see `pair_editor`). A right-to-left child region
+    // takes the whole remaining height of the panel and centres its content in
+    // it, which stranded a single assert in the middle of the tab and pushed
+    // "+ Add assert" off the bottom; it also right-aligns the field, so the
+    // margin `wrapping_field_font` doesn't use showed up as a left indent that
+    // the neighbouring tables don't have.
+    let x_w = widgets::remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    widgets::table_rows(ui, |ui| {
+        for i in 0..asserts.len() {
+            widgets::table_row(ui, |ui| {
+                let val_w = (ui.available_width() - x_w - 8.0).max(40.0);
+                let r = widgets::wrapping_field_font(
+                    ui,
+                    val_w,
+                    &mut asserts[i],
+                    s.gui_hint_assert,
+                    theme.text,
+                    egui::TextStyle::Monospace,
+                );
+                if r.changed() {
+                    changed = true;
+                }
+                let hit = widgets::flat_buttons(ui, |ui| {
+                    ui.add_sized(
+                        [x_w, row_h],
+                        egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                    )
+                });
+                if hit.clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+    });
     if let Some(i) = remove {
         asserts.remove(i);
         changed = true;
@@ -3491,6 +3503,85 @@ mod computed_suggestion_tests {
         assert!(
             texts.iter().any(|t| t.contains("upper(")),
             "the word under the caret should drive the list: {texts:?}"
+        );
+    }
+}
+
+/// The `[Asserts]` section is a plain list of rows, so it has to sit at the top
+/// of the tab like every other table — and leave "+ Add assert" on screen.
+#[cfg(test)]
+mod assert_layout_tests {
+    use super::computed_cell_undo_tests::Harness;
+    use super::*;
+
+    fn app_with_asserts(rows: &[&str]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.asserts = rows.iter().map(|r| r.to_string()).collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Asserts;
+        app
+    }
+
+    #[test]
+    fn one_assert_keeps_the_add_button_in_view() {
+        let mut app = app_with_asserts(&["jsonpath \"$.a\" exists"]);
+        let mut h = Harness::new();
+        let placed = h.frame(&mut app, vec![], 0.1);
+        let st = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let row = placed
+            .iter()
+            .find(|(t, _)| t.starts_with("jsonpath"))
+            .expect("the assert row should be painted")
+            .1;
+        let add = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_add_assert)
+            .expect("the add button should be painted")
+            .1;
+        let status = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_expected_status)
+            .expect("the status label should be painted")
+            .1;
+        // A single row used to be centred in the whole tab, which left the
+        // button (and everything under it) below the bottom of the window.
+        assert!(
+            add.min.y - row.max.y < 40.0,
+            "the add button should follow the row: row {row:?}, add {add:?}"
+        );
+        assert!(
+            status.max.y < 700.0,
+            "the rest of the section should stay on screen: {status:?}"
+        );
+    }
+
+    #[test]
+    fn an_assert_starts_where_the_help_above_it_starts() {
+        let mut app = app_with_asserts(&["jsonpath \"$.a\" exists"]);
+        let mut h = Harness::new();
+        let placed = h.frame(&mut app, vec![], 0.1);
+        let st = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let help = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_response_assertions)
+            .expect("the help line should be painted")
+            .1;
+        let row = placed
+            .iter()
+            .find(|(t, _)| t.starts_with("jsonpath"))
+            .expect("the assert row should be painted")
+            .1;
+        // Only the text edit's own margin should separate them; a right-aligned
+        // field left its unused width as a visible indent instead.
+        assert!(
+            row.min.x - help.min.x < 6.0,
+            "the assert field should line up with the section: help {help:?}, row {row:?}"
         );
     }
 }

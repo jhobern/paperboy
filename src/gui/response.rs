@@ -353,43 +353,54 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 } else if headers.is_empty() {
                     ui.colored_label(theme.dim, lbl_no_headers);
                 } else {
+                    // The band a row occupies, taken from the panel rather
+                    // than from the two labels: a header row *is* the full
+                    // width of the list (that is what the striping says), so
+                    // the gap between the columns and the space after a short
+                    // value belong to the row too. Aiming at them used to hit
+                    // nothing at all -- no highlight, and a right-click that
+                    // offered no assert -- which made the target the text
+                    // rather than the row it is in.
+                    let band = ui.max_rect().x_range();
                     egui::Grid::new("resp_headers")
                         .num_columns(2)
                         .spacing([12.0, 4.0])
                         .striped(true)
                         .show(ui, |ui| {
-                            for (k, v) in &headers {
+                            for (i, (k, v)) in headers.iter().enumerate() {
                                 let name = ui.label(RichText::new(k).strong().color(theme.accent));
                                 let value =
                                     ui.label(RichText::new(v).monospace().color(theme.text));
-                                // Either half of the row is the same subject:
-                                // aiming at the name or at the value is the
-                                // same intention -- so either half hovered
-                                // lights the whole row, for the same reason the
-                                // body highlights the value under the pointer:
-                                // "Assert this..." has to say which "this".
-                                if name.hovered()
-                                    || value.hovered()
-                                    || name.context_menu_opened()
-                                    || value.context_menu_opened()
-                                {
-                                    ui.painter().rect_filled(
-                                        name.rect.union(value.rect).expand2(egui::vec2(4.0, 1.0)),
-                                        2.0,
-                                        wash(&theme),
-                                    );
+                                let row_rect = egui::Rect::from_x_y_ranges(
+                                    band,
+                                    name.rect.union(value.rect).y_range(),
+                                )
+                                .expand2(egui::vec2(0.0, 2.0));
+                                // Interacted with as one thing, after both
+                                // labels: the whole row is a single subject, so
+                                // it hovers and opens its menu as a single
+                                // widget. Keyed by position, since a response
+                                // may repeat a header name.
+                                let row = ui.interact(
+                                    row_rect,
+                                    ui.id().with(("resp_header_row", i)),
+                                    egui::Sense::click(),
+                                );
+                                // Lit for the same reason the body highlights
+                                // the value under the pointer: "Assert this..."
+                                // has to say which "this".
+                                if row.hovered() || row.context_menu_opened() {
+                                    ui.painter().rect_filled(row_rect, 2.0, wash(&theme));
                                 }
-                                for resp in [&name, &value] {
-                                    resp.context_menu(|ui| {
-                                        if ui.button(lbl_probe_this).clicked() {
-                                            open_probe = Some(Some(crate::probe::Probe {
-                                                subject: crate::probe::Subject::Header(k.clone()),
-                                                value: Some(serde_json::Value::String(v.clone())),
-                                            }));
-                                            ui.close();
-                                        }
-                                    });
-                                }
+                                row.context_menu(|ui| {
+                                    if ui.button(lbl_probe_this).clicked() {
+                                        open_probe = Some(Some(crate::probe::Probe {
+                                            subject: crate::probe::Subject::Header(k.clone()),
+                                            value: Some(serde_json::Value::String(v.clone())),
+                                        }));
+                                        ui.close();
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
@@ -651,6 +662,40 @@ mod probe_route_tests {
         assert!(
             washes.iter().all(|(r, _)| !r.contains(other)),
             "the highlight reached a row the pointer was nowhere near"
+        );
+    }
+
+    /// A row is the full width of the list, so the gap between the columns and
+    /// the space after a short value are part of it too: aiming there used to
+    /// hit nothing, giving neither a highlight nor a menu.
+    #[test]
+    fn hovering_past_the_end_of_a_header_still_lights_its_row() {
+        let mut app = app_with(
+            r#"{"a":1}"#,
+            vec![
+                ("X-Request-Id".into(), "r-42".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            200,
+        );
+        app.response_section = ResponseSection::Headers;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let short = rect_of(&painted, "r-42");
+        // Well past the value's last character, still on its line.
+        let empty = egui::pos2(short.max.x + 120.0, short.center().y);
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(empty)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let washes: Vec<_> = fills(&full)
+            .into_iter()
+            .filter(|(_, c)| c.a() > 0 && c.a() < 255)
+            .collect();
+        assert!(
+            washes
+                .iter()
+                .any(|(r, _)| r.contains(empty) && r.contains(short.center())),
+            "the empty space after a short value did not light its row"
         );
     }
 

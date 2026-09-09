@@ -99,6 +99,16 @@ pub(crate) fn centre_of(painted: &Painted, needle: &str) -> egui::Pos2 {
     *pos + egui::vec2(g.size().x / 2.0, g.size().y / 2.0)
 }
 
+/// The box painted text occupies, for a test that has to aim beside it rather
+/// than at it.
+pub(crate) fn rect_of(painted: &Painted, needle: &str) -> egui::Rect {
+    let (pos, g) = painted
+        .iter()
+        .find(|(_, g)| g.text().contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} was never painted: {:?}", texts(painted)));
+    egui::Rect::from_min_size(*pos, g.size())
+}
+
 /// Every filled rectangle one frame painted -- how a highlight shows up, since
 /// it is a wash under the text rather than any text of its own.
 pub(crate) fn fills(full: &egui::FullOutput) -> Vec<(egui::Rect, egui::Color32)> {

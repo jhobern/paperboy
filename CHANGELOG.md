@@ -249,6 +249,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A single assert sat in the middle of an empty tab.** The row was laid out
+  right to left so the remove ✕ could be pinned to the right edge, but such a
+  region claims the whole remaining height of the panel and centres its content
+  in it: one assert floated halfway down the section and pushed
+  "+ Add assert" and the expected status off the bottom. The row now reserves
+  the ✕'s width and fills the rest, like every other table -- which also puts
+  the field's left edge back in line with the sections above it, instead of
+  indented by the width the right-aligned field was not using.
+
+- **Aiming at a response header, not at its text.** A header row is the full
+  width of the list, so the gap between the columns and the space after a short
+  value belong to the row -- but the pointer had to be over one of the two
+  labels for the row to light up or to offer "Assert this...". The whole row is
+  now the target.
+
 - **A collection whose path ended in a `/` could not be saved.** `collection.hurl/`
   and `collection.hurl` name the same file to a human and two different things
   to the kernel: writing to the first fails with "Is a directory" however
