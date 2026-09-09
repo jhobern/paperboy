@@ -913,6 +913,7 @@ strings! {
     // The `# [Gen]` block. Each message names the row it belongs to, because a
     // request may declare several and "one of them is wrong" is not a report.
     gen_status => "⚠ Generated values not set:", "⚠ Valeurs générées non définies :", "⚠ Genererede værdier ikke angivet:";
+    gen_err_empty => "{row}: needs an expression", "{row} : nécessite une expression", "{row}: mangler et udtryk";
     gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
     gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
     gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
@@ -2521,6 +2522,7 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
     errors
         .iter()
         .map(|e| match e {
+            G::Empty { name } => s.gen_err_empty.replace("{row}", name),
             G::Syntax { name, detail } => s
                 .gen_err_syntax
                 .replace("{row}", name)

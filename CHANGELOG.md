@@ -249,6 +249,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A generated row you have named but not filled in says what is missing.** It
+  used to be reported as a parse failure -- "can't read the expression
+  (expression is empty)" -- which said the same thing twice and read as though
+  the editor had broken, on a row that was simply half-written. Both the editor
+  and the send now say "needs an expression".
+
 - **Completing a function builds it around what is already there.** Putting the
   caret in front of `uuid` and choosing `timestamp` wrote `timestamp` over the
   `uuid` -- both editors asked whether a function *had* to be given an argument

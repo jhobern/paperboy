@@ -81,6 +81,13 @@ pub trait GenSource {
 /// a request may declare several and "one of them is wrong" is not a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenError {
+    /// The row has a name but nothing to work out yet.
+    ///
+    /// Its own variant rather than a parse failure: an expression the user has
+    /// not written yet is not a mistyped one, and "can't read the expression
+    /// (expression is empty)" said the same thing twice while sounding like the
+    /// editor had failed at something.
+    Empty { name: String },
     /// The expression didn't parse. Carries the offending fragment.
     Syntax { name: String, detail: String },
     /// No such function.
@@ -114,7 +121,8 @@ impl GenError {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn row(&self) -> &str {
         match self {
-            GenError::Syntax { name, .. }
+            GenError::Empty { name }
+            | GenError::Syntax { name, .. }
             | GenError::UnknownFunction { name, .. }
             | GenError::Arity { name, .. }
             | GenError::BadArgument { name, .. }
@@ -381,6 +389,13 @@ pub fn expand(
         if name.trim().is_empty() && source.trim().is_empty() {
             continue;
         }
+        // A named row with nothing in it is reported the way the editor reports
+        // it, for the same reason: the two must say the same thing about the
+        // same block.
+        if source.trim().is_empty() {
+            errors.push(GenError::Empty { name: name.clone() });
+            continue;
+        }
         let expr = match Parser::new(source).parse_all() {
             Ok(e) => e,
             Err(detail) => {
@@ -458,6 +473,12 @@ pub fn check(rows: &[(String, String)]) -> Vec<GenError> {
     let mut out = Vec::new();
     for (name, source) in rows {
         if name.trim().is_empty() && source.trim().is_empty() {
+            continue;
+        }
+        // A row that has been named and not yet filled in is half-written, not
+        // wrong: say what is missing rather than reporting a parse failure.
+        if source.trim().is_empty() {
+            out.push(GenError::Empty { name: name.clone() });
             continue;
         }
         match Parser::new(source).parse_all() {
@@ -1966,6 +1987,29 @@ mod tests {
             "check(): {found:?}\nexpand(): {raised:?}"
         );
         assert!(found.is_empty() && raised.is_empty());
+    }
+
+    /// A row that has been named but not filled in is half-written, not
+    /// mistyped. It used to be reported as a parse failure -- "can't read the
+    /// expression (expression is empty)" -- which said the same thing twice and
+    /// sounded like the editor had broken.
+    #[test]
+    fn a_named_row_with_no_expression_says_what_is_missing() {
+        let rows = vec![("token".to_string(), "  ".to_string())];
+        let found = check(&rows);
+        assert!(
+            matches!(found.as_slice(), [GenError::Empty { name }] if name == "token"),
+            "{found:?}"
+        );
+        // The send says the same thing about the same block.
+        let mut vars = HashMap::new();
+        let raised = expand(&rows, &mut vars, &FakeSource::at(0));
+        assert_eq!(found, raised);
+        let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        assert_eq!(
+            crate::i18n::describe_gen_errors(&english, &found),
+            vec!["token: needs an expression".to_string()]
+        );
     }
 
     /// Parsing, checking and evaluating are mutually recursive over nesting
