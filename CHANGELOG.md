@@ -13,14 +13,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 ### Added
 
 - The terminal UI's `[Captures]`, `[Asserts]` and `[Generated]` summary above a
-  request now folds, with `z`. A request that checks its response thoroughly
-  can list more of those rows than the request itself has lines, at which point
-  the pane is nearly all description; folded, they leave a counted one-line
-  summary (`[Captures] 3 · [Asserts] 20`) so it is still obvious they are
-  there. Nobody has to ask: until `z` is pressed the summary folds itself as
-  soon as it would take more than a third of the pane. An unfolded list too
-  long for the pane also now ends in a count of the rows that didn't fit,
-  rather than simply stopping.
+  request now folds, with `z`, and starts folded. A request that checks its
+  response thoroughly can list more of those rows than the request itself has
+  lines, at which point the pane is nearly all description; folded, they leave
+  a counted one-line summary (`[Captures] 3 · [Asserts] 20`) so it is still
+  obvious they are there. `z show details` / `z hide details` appears in the
+  footer with the other shortcuts whenever the selected request has any of
+  them. An unfolded list too long for the pane also now ends in a count of the
+  rows that didn't fit, rather than simply stopping.
 
 - **A computed value outlives the request that computed it.** A `# [Gen]` block
   is PaperBoy's pre-request script, and the point of signing a request with a

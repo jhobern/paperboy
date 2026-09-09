@@ -3957,14 +3957,11 @@ pub(crate) fn draw_collection_main(
             ]));
         }
     }
-    // A third of the pane, but never less than three rows: on a short terminal
-    // the ratio alone would fold a single two-row section, which is exactly
-    // the case that costs nothing to show.
-    let fold_budget = ((inner.height as usize) / 3).max(3);
-    let folded = !meta_lines.is_empty()
-        && app
-            .request_meta_folded
-            .unwrap_or(meta_lines.len() > fold_budget);
+    // Folded until asked otherwise. A summary that opens itself only when it is
+    // small is a summary whose height nobody can predict, and the rows it holds
+    // are reference material -- worth a glance when you are working on the
+    // asserts, in the way of the request the rest of the time.
+    let folded = !meta_lines.is_empty() && app.request_meta_folded.unwrap_or(true);
     // Recorded so `z` can flip whatever is actually on screen, rather than
     // needing to work the automatic choice out a second time.
     app.request_meta_folded_now = folded;
@@ -3981,7 +3978,7 @@ pub(crate) fn draw_collection_main(
             spans.push(Span::styled(format!(" {n}"), Style::default().fg(th.dim)));
         }
         spans.push(Span::styled(
-            format!("   {}", s.meta_unfold_hint),
+            format!("   z {}", s.foot_meta_show),
             Style::default().fg(th.dim),
         ));
         top_lines.push(Line::from(spans));
@@ -4004,7 +4001,7 @@ pub(crate) fn draw_collection_main(
         // own: a line spent saying how to save lines would be self-defeating.
         if let Some(first) = meta_lines.first_mut() {
             first.spans.push(Span::styled(
-                format!("   {}", s.meta_fold_hint),
+                format!("   z {}", s.foot_meta_hide),
                 Style::default().fg(th.dim),
             ));
         }
@@ -4612,6 +4609,36 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
             .is_some_and(|e| e.last_response.is_some())
     {
         hint.push(format!("a {}", s.foot_probe));
+    }
+    // `z` shows or hides the captures/asserts/generated summary above the
+    // request. It is folded by default, so without a slot here the only trace
+    // of those rows is one line the eye reads as a heading — and a key nothing
+    // advertises is a key nobody finds. Only offered while the selected request
+    // actually has some of them.
+    let has_meta = app
+        .collections
+        .get(app.active_tab)
+        .and_then(|c| {
+            c.entries
+                .get(c.selected_entry.min(c.entries.len().saturating_sub(1)))
+        })
+        .is_some_and(|e| {
+            !e.captures.is_empty()
+                || !e.asserts.is_empty()
+                || e.expected_status.is_some()
+                || e.generators
+                    .iter()
+                    .any(|(n, v)| !n.trim().is_empty() || !v.trim().is_empty())
+        });
+    if has_meta {
+        hint.push(format!(
+            "z {}",
+            if app.request_meta_folded_now {
+                s.foot_meta_show
+            } else {
+                s.foot_meta_hide
+            }
+        ));
     }
     // The arrows step the Response section tabs — likewise only meaningful (and
     // only shown) while the Response pane holds focus. Advertised as the arrows

@@ -439,8 +439,6 @@ strings! {
     subst_hint_missing => "missing", "manquant", "mangler";
     subst_hint_undefined => "undefined", "non défini", "udefineret";
     subst_hint_generated => "generated", "généré", "genereret";
-    meta_fold_hint => "z fold", "z replier", "z fold ind";
-    meta_unfold_hint => "z show", "z déplier", "z fold ud";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
     env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
@@ -465,6 +463,8 @@ strings! {
     foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
+    foot_meta_show => "show details", "afficher les détails", "vis detaljer";
+    foot_meta_hide => "hide details", "masquer les détails", "skjul detaljer";
     help_title => "Help", "Aide", "Hjælp";
     help_heading => "PaperBoy — Terminal UI", "PaperBoy — Interface Terminal", "PaperBoy — Terminalgrænseflade";
     help_tab_shortcuts => "Shortcuts", "Raccourcis", "Genveje";
@@ -513,7 +513,7 @@ strings! {
     help_raw_json => "edit selected request in Raw Mode (JSON text)", "modifier la requête sélectionnée en mode brut (texte JSON)", "rediger den valgte anmodning i råtilstand (JSON-tekst)";
     help_new => "new request (or add variable, in the environment popup)", "nouvelle requête (ou ajouter une variable, dans la popup d'environnement)", "ny anmodning (eller tilføj variabel, i miljø-popup'en)";
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
-    help_fold_meta => "fold/unfold the captures, asserts and generated values above the request", "replier/déplier les captures, assertions et valeurs générées au-dessus de la requête", "fold anmodningens optagelser, kontroller og genererede værdier ind/ud";
+    help_fold_meta => "show/hide the captures, asserts and generated values above the request", "afficher/masquer les captures, assertions et valeurs générées au-dessus de la requête", "vis/skjul anmodningens optagelser, kontroller og genererede værdier";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_save_active => "save what's on screen (report, else collection)", "enregistrer ce qui est à l'écran (rapport, sinon collection)", "gem det viste (rapport, ellers samling)";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";

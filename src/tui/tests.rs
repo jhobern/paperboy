@@ -34239,10 +34239,10 @@ mod probe_menu_tests {
 
 /// A request with a lot of asserts describes itself more than it shows itself:
 /// the sections above the divider grow without limit while the request they
-/// describe is squeezed into whatever is left. Past a third of the pane they
-/// fold to a counted summary, which still says the asserts are there.
+/// describe is squeezed into whatever is left. They start folded to a counted
+/// summary, which still says the asserts are there.
 #[test]
-fn a_wall_of_asserts_folds_itself_away_above_the_request() {
+fn a_wall_of_asserts_is_folded_away_above_the_request() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = app_with(|a| {
@@ -34298,11 +34298,11 @@ fn a_wall_of_asserts_folds_itself_away_above_the_request() {
     );
 }
 
-/// The other half of the same rule: a couple of rows cost nothing to show, so
-/// they are shown -- but `z` still folds them for anyone who would rather see
-/// the request.
+/// Even a single row starts folded -- a summary that opened itself when small
+/// would have a height nobody could predict -- and the footer says which way
+/// `z` will go, since a fold nothing advertises is a fold nobody finds.
 #[test]
-fn a_short_summary_is_left_open_until_asked_to_fold() {
+fn even_one_capture_starts_folded_and_the_footer_offers_z() {
     use ratatui::{Terminal, backend::TestBackend};
 
     let mut app = app_with(|a| {
@@ -34319,27 +34319,32 @@ fn a_short_summary_is_left_open_until_asked_to_fold() {
     app.focus = Pane::Main;
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let open = buffer_text(term.backend().buffer());
+    let folded = buffer_text(term.backend().buffer());
+    let s = crate::i18n::Strings::for_language(&app.language);
     // The capture also exists in the Hurl text below the divider, so the
     // question is never "is it on screen" but "is it listed twice".
     let listed = |t: &str| t.matches("$.token").count();
-    assert_eq!(
-        listed(&open),
-        2,
-        "one capture is not worth hiding, so it is summarised as well as spelled out:\n{open}"
-    );
-
-    press(&mut app, KeyCode::Char('z'));
-    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
-    let folded = buffer_text(term.backend().buffer());
     assert!(
         folded.contains("[Captures] 1"),
-        "z folds it to the count:\n{folded}"
+        "the fold starts closed, counted:\n{folded}"
     );
     assert_eq!(
         listed(&folded),
         1,
-        "and the summary row itself is gone:\n{folded}"
+        "the row itself is not summarised above the request:\n{folded}"
+    );
+    assert!(
+        folded.contains(&format!("z {}", s.foot_meta_show)),
+        "the footer offers to show it:\n{folded}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let open = buffer_text(term.backend().buffer());
+    assert_eq!(listed(&open), 2, "z shows the row:\n{open}");
+    assert!(
+        open.contains(&format!("z {}", s.foot_meta_hide)),
+        "and the footer now offers to hide it again:\n{open}"
     );
 }
 
