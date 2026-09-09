@@ -259,6 +259,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **`counter()` counted each send twice.** A `# [Gen]` block is evaluated twice
+  on the way out -- once to find out whether anything in it is broken, so the
+  cause can be named instead of the 401 it would produce, and once for real --
+  and the check drew from the same counters the send does. A request numbering
+  its pages went 1, 3, 5. The check now reads the counter it is about to
+  report on rather than claiming a number from it.
+
 - **A single assert sat in the middle of an empty tab.** The row was laid out
   right to left so the remove ✕ could be pinned to the right edge, but such a
   region claims the whole remaining height of the panel and centres its content

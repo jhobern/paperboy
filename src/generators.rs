@@ -355,6 +355,35 @@ impl GenSource for SystemSource {
     }
 }
 
+/// The same world as [`SystemSource`], except that a counter is *read* rather
+/// than advanced.
+///
+/// A block is evaluated twice per send: once before the request goes out, to
+/// find out whether anything in it is broken (see
+/// `request::describe_generator_errors`), and once for real. Every fault that
+/// check reports is deterministic, so the dry run may use any values it likes
+/// — but `counter` is not a value, it is a position in a sequence, and running
+/// the block to ask a question moved it. `counter("page")` went 1, 3, 5.
+///
+/// Peeking keeps the answer honest (the dry run sees the number the real run
+/// is about to produce) without laying claim to it.
+pub struct DryRunSource;
+
+impl GenSource for DryRunSource {
+    fn now(&self) -> (i64, u32) {
+        SystemSource.now()
+    }
+
+    fn fill_random(&self, buf: &mut [u8]) {
+        SystemSource.fill_random(buf)
+    }
+
+    fn counter(&self, name: &str) -> u64 {
+        let counters = process_counters().lock().unwrap_or_else(|e| e.into_inner());
+        counters.get(name).copied().unwrap_or(0) + 1
+    }
+}
+
 // ── Evaluation ──────────────────────────────────────────────────────────
 
 /// Evaluate a request's `# [Gen]` rows and bind each result into `vars`, in

@@ -687,6 +687,18 @@ pub fn effective_vars_reporting<'a>(
     base: &HurlEntry,
     vars: &'a HashMap<String, String>,
 ) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
+    effective_vars_with(base, vars, &crate::generators::SystemSource::new())
+}
+
+/// [`effective_vars_reporting`] against a chosen world, so a caller that is
+/// only asking whether the block *would* work can use
+/// [`crate::generators::DryRunSource`] and leave the counters where it found
+/// them.
+pub fn effective_vars_with<'a>(
+    base: &HurlEntry,
+    vars: &'a HashMap<String, String>,
+    src: &dyn crate::generators::GenSource,
+) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
     let defaults = base.variable_defaults();
     if defaults.is_empty() && base.generators.is_empty() {
         return (Cow::Borrowed(vars), Vec::new());
@@ -702,11 +714,7 @@ pub fn effective_vars_reporting<'a>(
     // Evaluated last so a generator may read a declared parameter, and bound
     // over anything of the same name: a row that computes `nonce` is a
     // statement that *this* is where `nonce` comes from.
-    let errors = crate::generators::expand(
-        &base.generators,
-        &mut merged,
-        &crate::generators::SystemSource::new(),
-    );
+    let errors = crate::generators::expand(&base.generators, &mut merged, src);
     (Cow::Owned(merged), errors)
 }
 
@@ -1696,7 +1704,11 @@ fn describe_generator_errors(
     // Every failure this reports is deterministic — a syntax error, an unknown
     // function, a bad reference — so evaluating here and again at send time
     // cannot disagree, even though the random and time values will differ.
-    effective_vars_reporting(entry, &vars).1
+    //
+    // Deterministic is not the same as free, though: this runs on the way to
+    // every send, and a `counter` advanced by being asked about would count
+    // each send twice (1, 3, 5). `DryRunSource` reads the counter instead.
+    effective_vars_with(entry, &vars, &crate::generators::DryRunSource).1
 }
 
 /// Render placeholder problems for a status message. A truncation says what it
@@ -3121,6 +3133,31 @@ mod tests {
         assert_ne!(
             first, second,
             "two sends of the same request drew the same counter value ({first})"
+        );
+    }
+
+    /// ...and counts each send *once*. The block is evaluated twice per send —
+    /// once to find out whether it works, once for real — and the first of
+    /// those used to advance the counter too, so a request numbering its pages
+    /// went 1, 3, 5.
+    #[test]
+    fn asking_whether_a_block_works_leaves_its_counter_alone() {
+        let mut col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "http://h/a",
+                &[("page", r#"counter("request-test-precheck")"#)],
+            )],
+        );
+        col.selected_entry = 0;
+        let empty = HashMap::new();
+        // The pre-flight check every send makes, twice over.
+        assert!(generator_problems(&col, None).is_empty());
+        assert!(generator_problems(&col, None).is_empty());
+        let sent = effective_vars_reporting(&col.entries[0], &empty).0["page"].clone();
+        assert_eq!(
+            sent, "1",
+            "the checks took the send's numbers: it drew {sent} rather than 1"
         );
     }
 }
