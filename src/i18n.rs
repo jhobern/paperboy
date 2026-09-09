@@ -956,8 +956,49 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
-    gui_generated_functions => "All the functions. Typing in the field offers the ones that match.", "Toutes les fonctions. La saisie dans le champ propose celles qui correspondent.", "Alle funktionerne. Når du skriver i feltet, foreslås dem der passer.";
-    gui_generated_fn_button => "\u{192}", "\u{192}", "\u{192}";
+    // One line each for the generator functions, shown under the completion
+    // list for the highlighted row. A signature says how to *call* a function
+    // and nothing about what it does, which is the half a user reaching for
+    // `hmac_sha256_b64` already knows. Kept beside each other, and looked up by
+    // `Strings::gen_description`, whose match a test holds to the function
+    // table so a function added there cannot arrive undescribed.
+    gen_desc_timestamp => "Unix time in seconds, optionally offset.", "Temps Unix en secondes, avec décalage facultatif.", "Unix-tid i sekunder, eventuelt forskudt.";
+    gen_desc_timestamp_ms => "Unix time in milliseconds.", "Temps Unix en millisecondes.", "Unix-tid i millisekunder.";
+    gen_desc_iso8601 => "The current UTC time, ISO 8601.", "L'heure UTC courante, ISO 8601.", "Den aktuelle UTC-tid, ISO 8601.";
+    gen_desc_date => "The current UTC time, in a strftime format.", "L'heure UTC courante, au format strftime.", "Den aktuelle UTC-tid i et strftime-format.";
+    gen_desc_uuid => "A random UUID (version 4).", "Un UUID aléatoire (version 4).", "Et tilfældigt UUID (version 4).";
+    gen_desc_counter => "Counts up from 1, one count per name.", "Compte à partir de 1, un compteur par nom.", "Tæller op fra 1, én tæller pr. navn.";
+    gen_desc_random_int => "A random whole number between the two.", "Un entier aléatoire entre les deux bornes.", "Et tilfældigt heltal mellem de to.";
+    gen_desc_random_hex => "Random hex digits, that many characters.", "Des chiffres hexadécimaux aléatoires, autant de caractères.", "Tilfældige hex-cifre, så mange tegn.";
+    gen_desc_random_alnum => "Random letters and digits, that many characters.", "Des lettres et des chiffres aléatoires, autant de caractères.", "Tilfældige bogstaver og tal, så mange tegn.";
+    gen_desc_random_base64 => "That many random bytes, base64-encoded.", "Autant d'octets aléatoires, encodés en base64.", "Så mange tilfældige bytes, base64-kodet.";
+    gen_desc_base64 => "Base64-encodes the text.", "Encode le texte en base64.", "Base64-koder teksten.";
+    gen_desc_base64url => "Base64-encodes the text, URL-safe alphabet.", "Encode le texte en base64, alphabet compatible URL.", "Base64-koder teksten med URL-sikkert alfabet.";
+    gen_desc_base64_decode => "Decodes base64 back to text.", "Décode du base64 en texte.", "Afkoder base64 tilbage til tekst.";
+    gen_desc_hex => "The text's bytes as hex digits.", "Les octets du texte en hexadécimal.", "Tekstens bytes som hex-cifre.";
+    gen_desc_urlencode => "Percent-encodes the text for a URL.", "Encode le texte en pourcentage pour une URL.", "Procent-koder teksten til en URL.";
+    gen_desc_urldecode => "Decodes percent-encoding back to text.", "Décode l'encodage en pourcentage.", "Afkoder procent-kodning tilbage til tekst.";
+    gen_desc_json_string => "Quotes and escapes the text as JSON.", "Met le texte entre guillemets et l'échappe en JSON.", "Sætter teksten i anførselstegn og escaper den som JSON.";
+    gen_desc_md5 => "MD5 digest of the text, in hex.", "Empreinte MD5 du texte, en hexadécimal.", "MD5-hash af teksten, i hex.";
+    gen_desc_md5_b64 => "MD5 digest of the text, base64-encoded.", "Empreinte MD5 du texte, encodée en base64.", "MD5-hash af teksten, base64-kodet.";
+    gen_desc_sha1 => "SHA-1 digest of the text, in hex.", "Empreinte SHA-1 du texte, en hexadécimal.", "SHA-1-hash af teksten, i hex.";
+    gen_desc_sha1_b64 => "SHA-1 digest of the text, base64-encoded.", "Empreinte SHA-1 du texte, encodée en base64.", "SHA-1-hash af teksten, base64-kodet.";
+    gen_desc_sha256 => "SHA-256 digest of the text, in hex.", "Empreinte SHA-256 du texte, en hexadécimal.", "SHA-256-hash af teksten, i hex.";
+    gen_desc_sha256_b64 => "SHA-256 digest of the text, base64-encoded.", "Empreinte SHA-256 du texte, encodée en base64.", "SHA-256-hash af teksten, base64-kodet.";
+    gen_desc_sha512 => "SHA-512 digest of the text, in hex.", "Empreinte SHA-512 du texte, en hexadécimal.", "SHA-512-hash af teksten, i hex.";
+    gen_desc_sha512_b64 => "SHA-512 digest of the text, base64-encoded.", "Empreinte SHA-512 du texte, encodée en base64.", "SHA-512-hash af teksten, base64-kodet.";
+    gen_desc_hmac_sha1 => "HMAC-SHA1 of the message with the key, in hex.", "HMAC-SHA1 du message avec la clé, en hexadécimal.", "HMAC-SHA1 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha1_b64 => "HMAC-SHA1 of the message with the key, base64-encoded.", "HMAC-SHA1 du message avec la clé, encodé en base64.", "HMAC-SHA1 af beskeden med nøglen, base64-kodet.";
+    gen_desc_hmac_sha256 => "HMAC-SHA256 of the message with the key, in hex.", "HMAC-SHA256 du message avec la clé, en hexadécimal.", "HMAC-SHA256 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha256_b64 => "HMAC-SHA256 of the message with the key, base64-encoded.", "HMAC-SHA256 du message avec la clé, encodé en base64.", "HMAC-SHA256 af beskeden med nøglen, base64-kodet.";
+    gen_desc_hmac_sha512 => "HMAC-SHA512 of the message with the key, in hex.", "HMAC-SHA512 du message avec la clé, en hexadécimal.", "HMAC-SHA512 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha512_b64 => "HMAC-SHA512 of the message with the key, base64-encoded.", "HMAC-SHA512 du message avec la clé, encodé en base64.", "HMAC-SHA512 af beskeden med nøglen, base64-kodet.";
+    gen_desc_concat => "Joins its arguments into one string.", "Concatène ses arguments en une seule chaîne.", "Sammenføjer argumenterne til én streng.";
+    gen_desc_upper => "Upper-cases the text.", "Met le texte en majuscules.", "Gør teksten til store bogstaver.";
+    gen_desc_lower => "Lower-cases the text.", "Met le texte en minuscules.", "Gør teksten til små bogstaver.";
+    gen_desc_trim => "Removes whitespace from both ends.", "Supprime les espaces aux deux extrémités.", "Fjerner mellemrum i begge ender.";
+    gui_generated_var_note => "A variable this expression can read", "Une variable que cette expression peut lire", "En variabel som dette udtryk kan læse";
+    gui_generated_expr_hint => "uuid — type for functions, Ctrl+Space for all", "uuid — tapez pour les fonctions, Ctrl+Espace pour toutes", "uuid — skriv for funktioner, Ctrl+Mellemrum for alle";
     gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
     gui_generated_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_generated_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs générées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der genereres hver gang anmodningen sendes, brugt som {{ name }}";
@@ -1669,6 +1710,56 @@ impl Strings {
         static EN: std::sync::OnceLock<Strings> = std::sync::OnceLock::new();
         EN.get_or_init(|| Strings::for_language(&Language::English))
     }
+
+    /// The one-line description of a generator function, by name.
+    ///
+    /// A match rather than a map: the compiler then checks every arm names a
+    /// real string, and a test checks every function in
+    /// [`crate::generators::FUNCTIONS`] has an arm.
+    ///
+    /// Only the desktop completion list shows these today, so the terminal-only
+    /// build would otherwise warn about it.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn gen_description(&self, name: &str) -> &'static str {
+        match name {
+            "timestamp" => self.gen_desc_timestamp,
+            "timestamp_ms" => self.gen_desc_timestamp_ms,
+            "iso8601" => self.gen_desc_iso8601,
+            "date" => self.gen_desc_date,
+            "uuid" => self.gen_desc_uuid,
+            "counter" => self.gen_desc_counter,
+            "random_int" => self.gen_desc_random_int,
+            "random_hex" => self.gen_desc_random_hex,
+            "random_alnum" => self.gen_desc_random_alnum,
+            "random_base64" => self.gen_desc_random_base64,
+            "base64" => self.gen_desc_base64,
+            "base64url" => self.gen_desc_base64url,
+            "base64_decode" => self.gen_desc_base64_decode,
+            "hex" => self.gen_desc_hex,
+            "urlencode" => self.gen_desc_urlencode,
+            "urldecode" => self.gen_desc_urldecode,
+            "json_string" => self.gen_desc_json_string,
+            "md5" => self.gen_desc_md5,
+            "md5_b64" => self.gen_desc_md5_b64,
+            "sha1" => self.gen_desc_sha1,
+            "sha1_b64" => self.gen_desc_sha1_b64,
+            "sha256" => self.gen_desc_sha256,
+            "sha256_b64" => self.gen_desc_sha256_b64,
+            "sha512" => self.gen_desc_sha512,
+            "sha512_b64" => self.gen_desc_sha512_b64,
+            "hmac_sha1" => self.gen_desc_hmac_sha1,
+            "hmac_sha1_b64" => self.gen_desc_hmac_sha1_b64,
+            "hmac_sha256" => self.gen_desc_hmac_sha256,
+            "hmac_sha256_b64" => self.gen_desc_hmac_sha256_b64,
+            "hmac_sha512" => self.gen_desc_hmac_sha512,
+            "hmac_sha512_b64" => self.gen_desc_hmac_sha512_b64,
+            "concat" => self.gen_desc_concat,
+            "upper" => self.gen_desc_upper,
+            "lower" => self.gen_desc_lower,
+            "trim" => self.gen_desc_trim,
+            _ => "",
+        }
+    }
 }
 
 /// Fill the `{}` placeholders of a translated template, in order.
@@ -2340,6 +2431,26 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every function the completion list can offer needs a description in
+    /// every language: a missing arm falls through to the catch-all and shows
+    /// nothing, which reads as a function that does nothing rather than as a
+    /// gap in the translation table.
+    #[test]
+    fn every_generator_function_is_described_in_every_language() {
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            for f in crate::generators::FUNCTIONS {
+                let desc = s.gen_description(f.name);
+                assert!(
+                    !desc.is_empty(),
+                    "{:?} has no description for {}",
+                    lang,
+                    f.name
+                );
+            }
+        }
+    }
 
     /// A run can trip more than one pre-flight warning at once. Reporting only
     /// the first meant fixing what you were told about surfaced the next one,

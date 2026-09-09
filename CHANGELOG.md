@@ -214,30 +214,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the theme colour), in all three languages. The marker in the file is
   unchanged, so existing `.hurl` files are unaffected.
 
-- **The function menu says what it does, and sits where it acts.** The button
-  beside an expression was labelled `Function…` and floated in the middle of
-  the row, which reads as a command that *replaces* the field. It doesn't: it
-  inserts at the caret, which is what makes it useful while building a call
-  inside a call. It is now drawn against the field in the field's own colour so
-  the two read as one control, and its hover text says what it offers.
-
-- **Typing in a generated-value expression offers the functions that match.**
+- **The expression field completes what you type; the function button is gone.**
   Thirty-five functions is more than a menu is good for: you have to recognise
   the name you want in a list, when what you actually have in mind is the first
-  three letters of it. The desktop expression field now completes as you type,
-  exactly as the terminal wizard's already did — the same list, from the same
-  table, so the two front-ends cannot drift. ↑↓ move through it, Enter or Tab
-  accepts, Esc puts it away without leaving the field, and the list follows the
-  *word the caret is in*, so completing the inner call of `base64(up` does not
-  throw the outer one away. The button beside the field is now a bare `ƒ`, for
-  when you want to browse everything rather than filter.
+  three letters of it. And whatever the button beside the field was labelled
+  (`Function…`, `ƒ Insert…`, a bare `ƒ`) it read as a command that would
+  overwrite what was in the field. So the desktop field does the whole job
+  itself now, from the same table the terminal wizard completes against, so the
+  two front-ends cannot drift on what exists:
 
-- **The ƒ menu adds to the expression instead of eating it.** The caret defaults
-  to the end of the text, and the last word is right there, so picking from the
-  menu replaced whatever one-word expression was already in the cell. Only
-  completing something half-typed replaces it now; the menu inserts. The button
-  also sits hard against the field with a wide gap before the delete ✕, rather
-  than equidistant between the two, where it read as the ✕'s neighbour.
+  - Type, and the functions whose names match are offered. ↑↓ move through the
+    list, Enter or Tab accepts, Esc puts it away without leaving the field.
+  - The list follows the *word the caret is in*, so completing the inner call of
+    `base64(up` does not throw the outer one away.
+  - An empty cell offers the whole list to browse, and Ctrl+Space asks for it
+    back at any time — which is what the button was for.
+  - The highlighted entry is explained in a line under the list, so you can tell
+    `hmac_sha256` from `sha256` without leaving the field.
+  - Accepting a call writes its argument *names* and selects the first, so
+    `hmac_sha256(key, message)` says what it wants and the next keystroke fills
+    it in, rather than leaving you inside empty brackets.
+  - The variables the expression may read are offered alongside the functions,
+    since a `[Gen]` expression names them bare: the environment's variables, the
+    collection's captures and the rows *above* this one — but not the rows below
+    it or the row itself, which the block would reject.
+  - The empty field's hint says so: *uuid — type for functions, Ctrl+Space for
+    all*.
 
 ### Fixed
 

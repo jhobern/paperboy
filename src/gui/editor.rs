@@ -641,6 +641,32 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // key would have to walk the same entries and variables to notice a change,
     // so it would cost about what it saved. The highlighter downstream *is*
     // cached, which is where the frame time actually went.
+    // The names a `[Gen]` expression may read: everything substitution knows
+    // about, which is the environment's variables and the collection's
+    // captures. Worked out here, before the entry is borrowed mutably, for the
+    // same reason `subst_vars` is -- and only for the sections that show a
+    // block, since it walks every entry and every variable.
+    let gen_vars: Vec<String> = if matches!(section, EditorSection::Computed | EditorSection::All) {
+        let env = app.session.effective_env(ci);
+        let mut names: Vec<String> =
+            crate::request::subst_map(&app.session.collections[ci], env.as_ref())
+                .into_keys()
+                .collect();
+        // Substitution knows about this request's own `[Gen]` names too, but a
+        // row may only read the rows *above* it, and the table adds those as it
+        // is drawn. Leaving them in here would offer a row itself, and offer
+        // rows below it -- both of which `generators::check` calls an error.
+        let own: HashSet<String> = app.session.collections[ci].entries[sel]
+            .generators
+            .iter()
+            .map(|(n, _)| n.trim().to_string())
+            .collect();
+        names.retain(|n| !own.contains(n));
+        names.sort();
+        names
+    } else {
+        Vec::new()
+    };
     let (subst_vars, shadowed) = if section == EditorSection::Code {
         let env = app.session.effective_env(ci);
         (
@@ -711,14 +737,31 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry, &mut browse, &mut extract)
-                            {
+                            if draw_section(
+                                *sec,
+                                ui,
+                                &theme,
+                                st,
+                                entry,
+                                &gen_vars,
+                                &mut browse,
+                                &mut extract,
+                            ) {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry, &mut browse, &mut extract) {
+                        if draw_section(
+                            other,
+                            ui,
+                            &theme,
+                            st,
+                            entry,
+                            &gen_vars,
+                            &mut browse,
+                            &mut extract,
+                        ) {
                             changed = true;
                         }
                     }
@@ -997,6 +1040,10 @@ fn draw_section(
     theme: &super::theme::GuiTheme,
     st: &Strings,
     entry: &mut HurlEntry,
+    // The variable names a `[Gen]` expression may read, for its completion
+    // list. Resolved by the caller because the section body holds the
+    // collection mutably and so cannot ask the session anything.
+    vars: &[String],
     // Where a `[Form]` file picker opens when the field is still blank.
     browse: &mut Option<usize>,
     // Where a right-click "Extract to parameter…" lands, to be confirmed in a
@@ -1267,7 +1314,7 @@ fn draw_section(
         }
         EditorSection::Computed => {
             ui.label(RichText::new(st.gui_generated_help).color(theme.dim));
-            if widgets::computed_editor(ui, theme, st, req, &mut entry.generators) {
+            if widgets::computed_editor(ui, theme, st, req, &mut entry.generators, vars) {
                 changed = true;
             }
         }
@@ -1610,6 +1657,7 @@ mod tests {
                     &th,
                     &st,
                     entry,
+                    &[],
                     &mut browse,
                     &mut None,
                 );
@@ -2482,138 +2530,6 @@ mod computed_tests {
         );
     }
 
-    /// The function menu is the last thing in a row and the row has no
-    /// horizontal scrollbar, so a field that claims the whole width does not
-    /// merely look untidy — it puts the menu somewhere the user cannot reach.
-    #[test]
-    fn the_function_menu_stays_inside_the_panel() {
-        let mut session = crate::session::Session::default();
-        let mut entry = HurlEntry::default();
-        entry.method = "GET".into();
-        entry.url = "https://h/a".into();
-        entry.title = "Demo".into();
-        entry.generators = vec![
-            ("transaction_id".into(), "uuid".into()),
-            ("retries".into(), "0".into()),
-        ];
-        session.collections[0].entries = vec![entry];
-        session.collections[0].selected_entry = 0;
-        let mut app = GuiApp::for_test(session);
-        app.editor_section = EditorSection::Computed;
-        let th = GuiTheme::from_spec(&crate::theme::default_preset());
-        let ctx = egui::Context::default();
-        th.apply(&ctx);
-        let width = 900.0;
-        let mut placed = Vec::new();
-        for _ in 0..2 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(width, 700.0),
-                )),
-                ..Default::default()
-            };
-            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
-            placed = placed_text(&full.shapes);
-        }
-        let label = app.strings.gui_generated_fn_button;
-        let menus: Vec<&(String, egui::Rect)> =
-            placed.iter().filter(|(t, _)| t.contains(label)).collect();
-        assert_eq!(menus.len(), 2, "one per row: {placed:?}");
-        for (label, rect) in menus {
-            assert!(
-                rect.max.x <= width,
-                "{label} is off the right edge at {rect:?}"
-            );
-        }
-    }
-
-    /// The Insert button is drawn flush against the expression field so the
-    /// two read as one control. Floating free in the row it looked like a
-    /// separate command -- and a separate command beside a filled-in field
-    /// reads as one that replaces it, which this does not do.
-    #[test]
-    fn the_insert_button_touches_the_expression_field() {
-        let mut session = crate::session::Session::default();
-        let mut entry = HurlEntry::from_fields("t", "GET", "http://h/a", vec![], "");
-        entry.generators = vec![("nonce".to_string(), "uuid".to_string())];
-        session.collections[0].entries = vec![entry];
-        session.collections[0].selected_entry = 0;
-        let mut app = GuiApp::for_test(session);
-        app.editor_section = EditorSection::Computed;
-        let th = GuiTheme::from_spec(&crate::theme::default_preset());
-        let ctx = egui::Context::default();
-        th.apply(&ctx);
-        let mut full = None;
-        for _ in 0..2 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(900.0, 700.0),
-                )),
-                ..Default::default()
-            };
-            full = Some(ctx.run_ui(input, |u| super::ui(&mut app, u)));
-        }
-        let full = full.unwrap();
-        let button = placed_text(&full.shapes)
-            .into_iter()
-            .find(|(t, _)| t.contains(app.strings.gui_generated_fn_button))
-            .expect("no Insert button")
-            .1;
-        // The expression field is the widest text-input background on the row
-        // the button sits on: fields are drawn with egui's `extreme_bg_color`.
-        let field = crate::gui::probe_test_support::fills(&full)
-            .into_iter()
-            .filter(|(r, _)| {
-                r.min.y < button.center().y
-                    && r.max.y > button.center().y
-                    && r.max.x <= button.min.x + 1.0
-            })
-            .max_by(|a, b| a.0.width().total_cmp(&b.0.width()))
-            .expect("no field on the button's row");
-        let (field_rect, field_bg) = field;
-        // The button's own background, not the label inside it: what has to sit
-        // against the field is the edge the eye sees.
-        let (button_rect, button_bg) = crate::gui::probe_test_support::fills(&full)
-            .into_iter()
-            .filter(|(r, _)| r.contains(button.center()))
-            .min_by(|a, b| a.0.area().total_cmp(&b.0.area()))
-            .expect("the button has no background");
-        let gap = button_rect.min.x - field_rect.max.x;
-        // The ✕ to its right, which is a separate command and must not look
-        // like the button's partner: the ƒ has to be nearer the field than it
-        // is to the ✕, or proximity says the wrong thing.
-        let x_left = crate::gui::probe_test_support::fills(&full)
-            .into_iter()
-            .filter(|(r, _)| {
-                r.min.y < button.center().y
-                    && r.max.y > button.center().y
-                    && r.min.x > button_rect.max.x - 1.0
-            })
-            .map(|(r, _)| r.min.x)
-            .fold(f32::INFINITY, f32::min);
-        assert!(
-            (0.0..=8.0).contains(&gap),
-            "the button should sit against the field it belongs to, but the gap \
-             is {gap} (field {field_rect:?}, button {button_rect:?})"
-        );
-        if x_left.is_finite() {
-            assert!(
-                x_left - button_rect.max.x > gap,
-                "the ƒ is {gap} from the field but only {} from the delete \
-                 button, so it reads as the delete button's neighbour",
-                x_left - button_rect.max.x
-            );
-        }
-        // And it is painted in the field's colour rather than a button's, so
-        // the pair reads as one control.
-        assert_eq!(
-            button_bg, field_bg,
-            "the button should be painted in the field's colour"
-        );
-    }
-
     /// A row whose name isn't a variable Hurl can resolve is dropped when the
     /// block is saved. Rather than let the user's typing vanish silently, the
     /// name is painted in the error colour the moment it stops being valid.
@@ -3145,12 +3061,19 @@ mod computed_suggestion_tests {
     use super::*;
 
     fn app_with_row(name: &str, expr: &str) -> GuiApp {
+        app_with_rows(&[(name, expr)])
+    }
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
         let mut session = crate::session::Session::default();
         let mut entry = HurlEntry::default();
         entry.method = "GET".into();
         entry.url = "https://h/a".into();
         entry.title = "Demo".into();
-        entry.generators = vec![(name.to_string(), expr.to_string())];
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
         session.collections[0].entries = vec![entry];
         session.collections[0].selected_entry = 0;
         let mut app = GuiApp::for_test(session);
@@ -3275,31 +3198,137 @@ mod computed_suggestion_tests {
         );
     }
 
-    /// Picking from the ƒ menu adds to the expression; it does not eat it.
-    ///
-    /// The caret defaults to the end of the text, and the last word is right
-    /// there -- so a menu that replaced the word under the caret swallowed the
-    /// whole of a one-word expression, which is the opposite of what the button
-    /// says it does. Completing something half-typed still replaces it; that is
-    /// the difference between finishing a word and inserting one.
+    /// An empty cell is a question, not a blank: with nothing typed there is
+    /// nothing to filter by, and what the user wants is to be shown what there
+    /// is. This is the job the function menu used to do, done by the field.
     #[test]
-    fn the_function_menu_inserts_without_eating_what_is_there() {
-        let mut app = app_with_row("nonce", "uuid");
+    fn an_empty_expression_offers_everything() {
+        let mut app = app_with_row("nonce", "");
         let mut h = Harness::new();
-        let f_label = app.strings.gui_generated_fn_button;
-        h.click_text(&mut app, f_label);
-        h.click_text(&mut app, "timestamp_ms()");
+        // The empty cell paints its hint, which is where it is on screen.
+        let hint = app.strings.gui_generated_expr_hint;
+        h.click_text(&mut app, hint);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        // The popup scrolls, so only its first screenful is painted: what is
+        // being asserted is that it is the unfiltered list, not which entries
+        // happen to fit.
+        let calls = texts
+            .iter()
+            .filter(|t| t.contains('(') && t.ends_with(')'))
+            .count();
+        assert!(
+            calls >= 5,
+            "an empty cell should offer the list to browse: {texts:?}"
+        );
+    }
+
+    /// Ctrl+Space asks for the list back — after Esc, or over a word that has
+    /// already been completed, where nothing else would reopen it.
+    #[test]
+    fn ctrl_space_asks_for_the_list_again() {
+        let mut app = app_with_row("digest", "sha256");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha256");
+        h.frame(&mut app, key(egui::Key::Escape), 0.05);
+        let quiet = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            !quiet.iter().any(|(t, _)| t.contains("sha256(text)")),
+            "Escape should have put the list away"
+        );
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        let painted = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            painted.iter().any(|(t, _)| t.contains("sha256(text)")),
+            "Ctrl+Space should have opened the list: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Accepting a call leaves its argument names in place and the first of
+    /// them selected, so the next keystroke fills the argument in rather than
+    /// landing in an empty pair of brackets that says nothing about what is
+    /// wanted.
+    #[test]
+    fn accepting_a_call_selects_its_first_argument() {
+        let mut app = app_with_row("sig", "hmac_sha256");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "hmac_sha256");
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
         h.frame(&mut app, vec![], 0.05);
-        assert!(
-            expr(&app).contains("uuid"),
-            "the menu ate the expression that was there: {:?}",
-            expr(&app)
+        assert_eq!(expr(&app), "hmac_sha256(key, message)");
+        h.frame(&mut app, vec![egui::Event::Text("API_SECRET".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "hmac_sha256(API_SECRET, message)",
+            "typing should have replaced the selected argument name"
         );
-        assert!(
-            expr(&app).contains("timestamp_ms"),
-            "the menu never wrote the call in: {:?}",
-            expr(&app)
+    }
+
+    /// Expressions read variables by bare name, so the names in scope belong in
+    /// the same list as the functions -- and the rows *below* this one do not,
+    /// since a block is evaluated top to bottom.
+    #[test]
+    fn the_list_offers_the_variables_the_expression_can_read() {
+        let mut app = app_with_rows(&[
+            ("scope_above", "uuid"),
+            ("target", ""),
+            ("scope_below", "uuid"),
+        ]);
+        let mut h = Harness::new();
+        let hint = app.strings.gui_generated_expr_hint;
+        h.click_text(&mut app, hint);
+        h.frame(&mut app, vec![egui::Event::Text("scope".into())], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        // Both names are painted once by their own name cell, so what is being
+        // counted is the second painting: the one in the list.
+        let count = |name: &str| painted.iter().filter(|(t, _)| t.as_str() == name).count();
+        assert_eq!(
+            count("scope_above"),
+            2,
+            "the row above is a variable this one can read: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
         );
+        assert_eq!(
+            count("scope_below"),
+            1,
+            "a row below cannot be read, so offering it offers a mistake: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two rows may compute the same thing under different names, which used to
+    /// give their *name* cells the same widget id (each is keyed by its
+    /// neighbour's text, and the neighbours matched): egui painted a
+    /// duplicate-id warning over the table, and the two cells shared a caret.
+    #[test]
+    fn two_rows_with_the_same_expression_do_not_share_a_cell_id() {
+        let mut app = app_with_rows(&[("first", "uuid"), ("second", "uuid")]);
+        let mut h = Harness::new();
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let clash: Vec<&String> = painted
+            .iter()
+            .map(|(t, _)| t)
+            .filter(|t| t.contains("widget ID"))
+            .collect();
+        assert!(clash.is_empty(), "the two rows collided: {clash:?}");
     }
 
     /// An edit undone is not an edit: the pencil marker has to go away again.
