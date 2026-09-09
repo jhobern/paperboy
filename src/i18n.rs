@@ -928,6 +928,7 @@ strings! {
     gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
     gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
+    gen_err_failed_dep => "{row}: {reference} above it could not be worked out", "{row} : {reference} au-dessus n'a pas pu être calculé", "{row}: {reference} ovenover kunne ikke beregnes";
     gen_err_cycle => "{row}: refers to itself, or to a row below it", "{row} : se référence lui-même, ou une ligne en dessous", "{row}: refererer til sig selv eller til en række nedenunder";
     // A batch run has one shared variable set, so two requests that each
     // compute `nonce` get one value between them. Worth naming the row rather
@@ -2562,6 +2563,10 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
                 .replace("{detail}", detail),
             G::UndefinedReference { name, reference } => s
                 .gen_err_undefined
+                .replace("{row}", name)
+                .replace("{reference}", reference),
+            G::FailedDependency { name, reference } => s
+                .gen_err_failed_dep
                 .replace("{row}", name)
                 .replace("{reference}", reference),
             G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),

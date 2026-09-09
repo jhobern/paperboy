@@ -95,6 +95,23 @@ pub struct EntryOutcome {
     pub error: Option<String>,
 }
 
+/// What [`run_hurl_streaming_with`]'s `before_entry` hook decided about the
+/// entry it was called for.
+pub enum EntrySetup {
+    /// Bind these values over the run's variables and send the request.
+    Bind(Vec<(String, String)>),
+    /// Don't send it. `reason` is reported against the entry, which is marked
+    /// failed.
+    ///
+    /// This exists for the `# [Gen]` block: a row that fails to evaluate
+    /// leaves its name unbound, and *something else* of that name -- an
+    /// environment value, a capture from an earlier request -- is then used in
+    /// its place. The request goes out looking perfectly well-formed, signed
+    /// with the wrong key, and is answered. A request whose block failed must
+    /// not be sent at all, exactly as a single send refuses it.
+    Skip { reason: String },
+}
+
 /// The mapped result of a whole run (one or more entries).
 pub struct RunOutput {
     pub entries: Vec<EntryOutcome>,
@@ -221,7 +238,7 @@ pub fn run_hurl_streaming_with(
     content: &str,
     vars: &HashMap<String, String>,
     file_root: Option<&Path>,
-    mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> Vec<(String, String)>,
+    mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> EntrySetup,
     mut on_entry: impl FnMut(&EntryOutcome),
 ) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
@@ -264,8 +281,36 @@ pub fn run_hurl_streaming_with(
         for (name, value) in entry_variable_defaults(&hurl_file.entries[i - 1]) {
             known.entry(name).or_insert(value);
         }
-        for (k, v) in before_entry(i - 1, &known) {
-            variables.insert(k, Value::String(v));
+        match before_entry(i - 1, &known) {
+            EntrySetup::Bind(bindings) => {
+                for (k, v) in bindings {
+                    variables.insert(k, Value::String(v));
+                }
+            }
+            EntrySetup::Skip { reason } => {
+                // Reported as a finished, failed entry rather than as a gap:
+                // the caller's `on_entry` is what stamps the pass/fail marker
+                // and fills the per-entry response, so an entry that is simply
+                // not mentioned stays "still running" for the rest of the run.
+                // Method and URL as written (unsubstituted -- nothing was
+                // resolved for this entry) so the line printed for it still
+                // says which request it is.
+                let req = &hurl_file.entries[i - 1].request;
+                let outcome = EntryOutcome {
+                    entry_index: i - 1,
+                    method: req.method.to_string(),
+                    url: req.url.to_string(),
+                    ok: false,
+                    error: Some(reason.clone()),
+                    ..Default::default()
+                };
+                if error.is_none() {
+                    error = Some(reason);
+                }
+                on_entry(&outcome);
+                entries.push(outcome);
+                continue;
+            }
         }
         let runner_opts = RunnerOptionsBuilder::new()
             .continue_on_error(true)

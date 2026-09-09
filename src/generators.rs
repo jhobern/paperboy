@@ -110,6 +110,12 @@ pub enum GenError {
     UndefinedReference { name: String, reference: String },
     /// A row referring to itself, directly or through others.
     Cycle { name: String },
+    /// A row whose value depends on an earlier row that failed. Its own
+    /// variant because the alternative reads as a second, invented mistake:
+    /// the earlier row is not yet bound, which looks exactly like a row
+    /// referring to something below it, so a block with one typo used to
+    /// report a typo *and* a cycle -- and the cycle was the louder claim.
+    FailedDependency { name: String, reference: String },
 }
 
 impl GenError {
@@ -127,6 +133,7 @@ impl GenError {
             | GenError::Arity { name, .. }
             | GenError::BadArgument { name, .. }
             | GenError::UndefinedReference { name, .. }
+            | GenError::FailedDependency { name, .. }
             | GenError::Cycle { name } => name,
         }
     }
@@ -408,6 +415,10 @@ pub fn expand(
     let declared: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
     let mut errors = Vec::new();
     let mut done: Vec<&str> = Vec::new();
+    // Rows that were reached and failed, kept apart from rows not reached yet
+    // so a row reading one of them is told what actually happened rather than
+    // being accused of a cycle (see `GenError::FailedDependency`).
+    let mut failed: Vec<&str> = Vec::new();
 
     for (name, source) in rows {
         // A wholly blank row is a row the editor is still waiting on, not a
@@ -435,12 +446,15 @@ pub fn expand(
                 continue;
             }
         };
-        match eval(&expr, name, vars, &declared, &done, src) {
+        match eval(&expr, name, vars, &declared, &done, &failed, src) {
             Ok(value) => {
                 vars.insert(name.clone(), value);
                 done.push(name.as_str());
             }
-            Err(e) => errors.push(e),
+            Err(e) => {
+                errors.push(e);
+                failed.push(name.as_str());
+            }
         }
     }
     errors
@@ -540,6 +554,7 @@ fn eval(
     vars: &HashMap<String, String>,
     declared: &[&str],
     done: &[&str],
+    failed: &[&str],
     src: &dyn GenSource,
 ) -> Result<String, GenError> {
     match expr {
@@ -554,6 +569,15 @@ fn eval(
             // meaning of a row depend on the loaded environment.
             if is_function(name.as_str()) {
                 return call(name, &[], row, src);
+            }
+            // An earlier row that was tried and failed is a *consequence*,
+            // not a second mistake: say which row is missing so the reader
+            // fixes the one that is actually wrong.
+            if failed.contains(&name.as_str()) {
+                return Err(GenError::FailedDependency {
+                    name: row.to_string(),
+                    reference: name.clone(),
+                });
             }
             if declared.contains(&name.as_str()) && !done.contains(&name.as_str()) {
                 // Deliberately checked before `vars`: silently falling back to
@@ -583,7 +607,7 @@ fn eval(
             }
             let mut values = Vec::with_capacity(args.len());
             for a in args {
-                values.push(eval(a, row, vars, declared, done, src)?);
+                values.push(eval(a, row, vars, declared, done, failed, src)?);
             }
             call(function, &values, row, src)
         }
@@ -1906,6 +1930,48 @@ mod tests {
                 name: "first".into()
             }]
         );
+    }
+
+    /// A row reading one that failed says so. The earlier row is unbound,
+    /// which from the inside looks exactly like a row that has not run yet --
+    /// so a block with one typo used to report the typo *and* "b refers to
+    /// itself, or to a row below it", which is not true and is the louder of
+    /// the two claims.
+    #[test]
+    fn a_row_reading_a_failed_row_is_not_accused_of_a_cycle() {
+        let (_, e) = run(&[("a", "no_such_function()"), ("b", "concat(a)")]);
+        assert_eq!(
+            e,
+            vec![
+                GenError::UnknownFunction {
+                    name: "a".into(),
+                    function: "no_such_function".into()
+                },
+                GenError::FailedDependency {
+                    name: "b".into(),
+                    reference: "a".into()
+                }
+            ],
+            "one mistake, and its consequence named as one"
+        );
+    }
+
+    /// The environment is still not a fallback for a row that failed: reading
+    /// it would make a block with a typo in it send a *different* request
+    /// rather than none, which is the whole reason references are resolved
+    /// against the block first.
+    #[test]
+    fn a_failed_row_does_not_fall_back_to_the_environment() {
+        let (v, e) = run_with(
+            &[("a", "no_such_function()"), ("b", "concat(a)")],
+            HashMap::from([("a".to_string(), "from-the-environment".to_string())]),
+        );
+        assert!(
+            matches!(e[1], GenError::FailedDependency { .. }),
+            "{:?}",
+            e[1]
+        );
+        assert!(!v.contains_key("b"), "and nothing is bound for b");
     }
 
     /// A generator's value must never be re-read as a template. If a secret

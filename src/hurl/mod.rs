@@ -24,5 +24,7 @@ pub use entry::{
 pub(crate) use entry::{parse_gen_marker, parse_gen_row};
 pub(crate) use parser::parse_file_form_value;
 pub use parser::{parse_hurl, parse_hurl_error};
-pub use run::{AssertOutcome, EntryOutcome, RunOutput, run_hurl, run_hurl_streaming_with};
+pub use run::{
+    AssertOutcome, EntryOutcome, EntrySetup, RunOutput, run_hurl, run_hurl_streaming_with,
+};
 pub use stage::{expand_base64_form_fields, stage_out_of_scope_form_files};

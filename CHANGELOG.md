@@ -259,6 +259,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A request whose `# [Gen]` block failed is no longer sent by a whole-file
+  run.** A failed row leaves its name unbound, and something else of that name
+  is then used in its place -- an environment value, a capture from an earlier
+  request -- so the request went out looking perfectly well-formed, signed with
+  the wrong thing, and was answered `200`. The run *passed*. A single send has
+  always refused; "Run All" and the CLI reported the error and sent it anyway.
+  A streaming run now skips that one request and marks it failed; a batch run,
+  which is a single Hurl call over the whole file and so cannot skip less than
+  everything, refuses the run.
+
+- **A `# [Gen]` block written above its request is no longer deleted when its
+  row count is wrong.** A block whose count doesn't describe the lines below it
+  is deliberately not read as a block -- that is the safe way for a signing
+  block to fail -- and below a request those lines round-trip verbatim as
+  prose. Above one, nothing claimed them: the title walk skips past a block
+  marker on sight (a mangled `# [Gen]` written back as a title is worse), and
+  the prose scan began at the method line. So the first save silently deleted
+  the block the user was in the middle of fixing.
+
+- **A row that reads a row that failed says so.** It was reported as "refers to
+  itself, or to a row below it": the earlier row is unbound, which from the
+  inside looks exactly like a row that has not run yet. One typo produced two
+  errors, and the invented one was the louder.
+
 - **A refused send is reported the way the pre-flight check reports it, once.**
   A request stopped by a failed `# [Gen]` row was shown as "Request error:
   broken: nothing defines nothing_defines_this" -- an English sentence from the

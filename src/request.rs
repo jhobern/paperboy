@@ -1126,6 +1126,33 @@ pub fn run_all_entries(
                 &vars,
                 &crate::generators::SystemSource::new(),
             );
+            // A failed block stops the whole batch, because batch cannot stop
+            // less than that: it is one Hurl call over the whole file, so
+            // there is no way to run the other requests and skip this one (a
+            // streaming run skips just the one — see `EntrySetup::Skip`). And
+            // going on is the worst of the three options: the failed row's
+            // name is left to whatever else binds it — an environment value, a
+            // carried-over capture — so the request goes out well-formed,
+            // signed with the wrong thing, and is answered. Nothing is sent.
+            if !blocks.errors.is_empty() {
+                let flat: Vec<crate::generators::GenError> = blocks
+                    .errors
+                    .iter()
+                    .flat_map(|(_, errs)| errs.iter().cloned())
+                    .collect();
+                let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                let mut r = state.lock().unwrap();
+                r.loading = false;
+                r.error = crate::i18n::describe_gen_errors(&english, &flat).join("; ");
+                r.gen_errors = flat;
+                // No update is sent: dropping `tx` disconnects the receiver,
+                // and the drain takes that as "the run is over", clearing the
+                // in-flight marks the caller set on every entry.
+                if let Some(dir) = &staged_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return;
+            }
             // Bound *and* reported back as captures: a computed value is as
             // much a result of the run as a `[Captures]` row, and the request
             // after it — run on its own afterwards — needs to see it.
@@ -1165,10 +1192,10 @@ pub fn run_all_entries(
                 run_root,
                 |i, known| {
                     let Some(entry) = gen_entries.get(i) else {
-                        return Vec::new();
+                        return crate::hurl::EntrySetup::Bind(Vec::new());
                     };
                     if entry.generators.is_empty() {
-                        return Vec::new();
+                        return crate::hurl::EntrySetup::Bind(Vec::new());
                     }
                     let mut merged = known.clone();
                     let errs = crate::generators::expand(
@@ -1176,14 +1203,25 @@ pub fn run_all_entries(
                         &mut merged,
                         &crate::generators::SystemSource::new(),
                     );
-                    record_errs.borrow_mut().extend(errs);
+                    // A block that failed leaves its name unbound, and the
+                    // environment (or an earlier capture) may well bind the
+                    // same name -- so the request would go out signed with the
+                    // wrong thing and be answered. Not sent: see
+                    // `EntrySetup::Skip`.
+                    if !errs.is_empty() {
+                        let english =
+                            crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                        let reason = crate::i18n::describe_gen_errors(&english, &errs).join("; ");
+                        record_errs.borrow_mut().extend(errs);
+                        return crate::hurl::EntrySetup::Skip { reason };
+                    }
                     let bound: Vec<(String, String)> = entry
                         .generators
                         .iter()
                         .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
                         .collect();
                     record_gen.borrow_mut().extend(bound.iter().cloned());
-                    bound
+                    crate::hurl::EntrySetup::Bind(bound)
                 },
                 |eo| {
                     if let Some(&at) = run_positions.get(eo.entry_index) {
@@ -2982,6 +3020,96 @@ mod tests {
         (port, seen)
     }
 
+    /// A request whose `# [Gen]` block failed is not sent by a streaming run.
+    ///
+    /// The failed row leaves its name unbound -- and something else of that
+    /// name is then used in its place: an environment value, a capture from an
+    /// earlier request. The request goes out looking perfectly well-formed,
+    /// signed with the wrong thing, and is answered 200. That is the worst
+    /// shape a fault can take in an API client: the run *passes*. A single
+    /// send has always refused; the whole-collection run reported the error
+    /// and sent it anyway.
+    #[test]
+    fn a_streaming_run_does_not_send_a_request_whose_block_failed() {
+        let (port, seen) = recording_server(1);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            &format!("http://127.0.0.1:{port}/orders"),
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![("sig".to_string(), "no_such_function()".to_string())];
+        let entries = vec![e];
+        let content = collection_to_hurl(&entries);
+        // The environment binds the very name the block failed to compute,
+        // which is what used to go out.
+        let vars = HashMap::from([("sig".to_string(), "from-the-environment".to_string())]);
+        let out = crate::hurl::run::run_hurl_streaming_with(
+            &content,
+            &vars,
+            None,
+            move |i, known| {
+                let entry = &entries[i];
+                let mut merged = known.clone();
+                let errs = crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                );
+                if !errs.is_empty() {
+                    return crate::hurl::EntrySetup::Skip {
+                        reason: "block failed".to_string(),
+                    };
+                }
+                crate::hurl::EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect(),
+                )
+            },
+            |_| {},
+        );
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the wire: {:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(out.entries.len(), 1, "the entry is still accounted for");
+        assert!(!out.entries[0].ok, "and it is a failure, not a pass");
+        assert_eq!(out.entries[0].entry_index, 0, "credited to its own request");
+        assert!(
+            out.entries[0].url.contains("/orders"),
+            "and says which request it was: {:?}",
+            out.entries[0].url
+        );
+    }
+
+    /// The same, for a batch run. Batch is one Hurl call over the whole file,
+    /// so it cannot skip the one request -- it refuses the run instead, which
+    /// is still better than sending a signature computed from nothing.
+    #[test]
+    fn a_batch_run_is_refused_when_a_block_failed() {
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://127.0.0.1:1/orders",
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![("sig".to_string(), "no_such_function()".to_string())];
+        let vars = HashMap::from([("sig".to_string(), "from-the-environment".to_string())]);
+        let blocks = expand_batch_generators(&[e], &vars, &Fixed);
+        assert_eq!(blocks.errors.len(), 1, "the failure is reported");
+        assert!(
+            !blocks.bound.contains_key("sig"),
+            "and nothing is bound for the row that failed"
+        );
+    }
+
     /// A computed value must never reach the request preview: a generator name
     /// keeps its `{{braces}}` in the *computed* colour, even after the block's
     /// last result has been merged into `Collection::captures`. Otherwise an
@@ -3070,11 +3198,13 @@ mod tests {
                     &mut merged,
                     &crate::generators::SystemSource::new(),
                 ));
-                entry
-                    .generators
-                    .iter()
-                    .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
-                    .collect()
+                crate::hurl::EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect(),
+                )
             },
             |_| {},
         );

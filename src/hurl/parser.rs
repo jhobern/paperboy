@@ -747,6 +747,37 @@ fn scan_comments(
 
     let mut out = Vec::new();
 
+    // Comment lines in this entry's own leading block that neither its title
+    // nor a well-formed PaperBoy block claims — the lines of a `# [Gen]` block
+    // whose row count is wrong, most often. Kept as prose so they round-trip
+    // verbatim, which is what the same damaged block does when it sits *below*
+    // its request. Without this they belonged to nobody and were deleted by
+    // the first save.
+    {
+        let lead_top = leading_comment_top(lines, method_line);
+        let title_top = title_text_start(
+            lines,
+            lead_top.saturating_sub(1),
+            method_line.saturating_sub(1),
+        ) + 1;
+        let claimed = lead_block_lines(lines, lead_top, method_line);
+        for ln in lead_top..title_top {
+            if claimed.contains(&ln) {
+                continue;
+            }
+            if let Some(t) = lines
+                .get(ln - 1)
+                .map(|l| l.trim())
+                .filter(|t| t.starts_with('#'))
+            {
+                out.push(EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: t.to_string(),
+                });
+            }
+        }
+    }
+
     // File-leading comments above the very first entry (everything above this
     // entry's own title block), kept as `Lead`.
     if is_first {
@@ -1467,6 +1498,32 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
     // irreversible loss of a signing block (`title_block_top` guards the
     // request-splitter's walk for the same reason). Keep only the comment lines
     // *below* the last such block; everything at or above it is the block.
+    let title_start = title_text_start(lines, block_start, method);
+    lines[title_start..method]
+        .iter()
+        .map(|l| {
+            l.trim_start_matches('#')
+                .trim()
+                .trim_matches(|c| matches!(c, '-' | '='))
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Where an entry's title text begins, given `block_start` — the top of the
+/// contiguous comment block leading into its method line — and `method`, the
+/// method line itself (both 0-based).
+///
+/// Everything at or above the last PaperBoy block marker in that span belongs
+/// to the *request*, not to its title. Shared with the prose-comment scan,
+/// which keeps whatever this leaves out and is not a block (see
+/// `lead_block_lines`): the two must agree on the boundary, or a line is
+/// either claimed twice — duplicated on the next save — or by nobody, and
+/// deleted.
+fn title_text_start(lines: &[&str], block_start: usize, method: usize) -> usize {
     let mut title_start = block_start;
     let mut i = block_start;
     while i < method {
@@ -1487,18 +1544,52 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
         }
         i += 1;
     }
-    lines[title_start..method]
-        .iter()
-        .map(|l| {
-            l.trim_start_matches('#')
-                .trim()
-                .trim_matches(|c| matches!(c, '-' | '='))
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    title_start
+}
+
+/// The 1-based lines of `[top, method)` — an entry's leading comment block —
+/// that a *well-formed* PaperBoy block occupies, and which are therefore
+/// already carried by the model (`generators`, the body, `reports`).
+///
+/// Well-formed is the point. `title_text_start` skips past a marker on sight,
+/// because a mangled `# [Gen]` block written back as a title is the
+/// irreversible loss of a signing block. But a block whose row count doesn't
+/// describe the lines below it isn't read as a block either — so those lines
+/// were claimed by nobody and vanished on the next save, which is the same
+/// loss by a quieter route. Everything this doesn't list is kept as prose.
+fn lead_block_lines(lines: &[&str], top: usize, method: usize) -> Vec<usize> {
+    let mut claimed = Vec::new();
+    let mut i = top.saturating_sub(1);
+    let end = method.saturating_sub(1).min(lines.len());
+    while i < end {
+        if let Some(n) = parse_gen_marker(lines[i]) {
+            let last = i + 1 + n;
+            if last <= end && (i + 1..last).all(|j| parse_gen_row(lines[j]).is_some()) {
+                claimed.extend((i + 1..=last).map(|l| l));
+                i = last;
+                continue;
+            }
+        }
+        if let Some(n) = parse_body_marker(lines[i]) {
+            let last = i + 1 + n;
+            if last <= end && (i + 1..last).all(|j| lines[j].trim_start().starts_with('#')) {
+                claimed.extend((i + 1..=last).map(|l| l));
+                i = last;
+                continue;
+            }
+        }
+        if is_reports_marker(lines[i]) {
+            let mut j = i + 1;
+            while j < end && parse_report_row(lines[j]).is_some() {
+                j += 1;
+            }
+            claimed.extend((i + 1..=j).map(|l| l));
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    claimed
 }
 
 /// The 1-based line where the contiguous `#`-comment block that leads directly
@@ -1532,6 +1623,48 @@ fn leading_comment_top(lines: &[&str], method: usize) -> usize {
 mod tests {
     use super::super::entry::collection_to_hurl;
     use super::*;
+
+    /// A `# [Gen]` block whose row count doesn't describe the lines below it
+    /// is not read as a block -- and when it sat *above* its request, nothing
+    /// else claimed those lines either: the title walk skips past a marker on
+    /// sight (a mangled signing block written back as a title is worse), and
+    /// the prose scan began at the method line. So the first save deleted the
+    /// user's block. The same damage below a request round-trips verbatim.
+    #[test]
+    fn a_damaged_gen_block_above_a_request_survives_a_save() {
+        let src = "# [Gen] 3\n# n = uuid\n# s = timestamp\nGET http://h/a\n";
+        let col = parse_hurl(src);
+        assert!(
+            col[0].generators.is_empty(),
+            "a block whose count is wrong is not live -- that is the safe way \
+             for a signing block to fail"
+        );
+        let out = collection_to_hurl(&col);
+        for line in ["# [Gen] 3", "# n = uuid", "# s = timestamp"] {
+            assert!(out.contains(line), "{line} was deleted by the save:\n{out}");
+        }
+        // And a second pass is stable: the recovered prose must not be
+        // re-claimed, duplicated, or dropped again.
+        let again = collection_to_hurl(&parse_hurl(&out));
+        assert_eq!(again, out, "saving twice must not keep changing the file");
+    }
+
+    /// The block that *is* well-formed is still read as a block, not kept as
+    /// prose as well -- which would duplicate it on every save.
+    #[test]
+    fn a_good_gen_block_above_a_request_is_still_a_block() {
+        let src = "# [Gen] 2\n# n = uuid\n# s = timestamp\nGET http://h/a\n";
+        let col = parse_hurl(src);
+        assert_eq!(col[0].generators.len(), 2, "read as a block");
+        assert!(
+            !col[0]
+                .comments
+                .iter()
+                .any(|c| c.text.contains("[Gen]") || c.text.contains("uuid")),
+            "and not also kept as prose: {:?}",
+            col[0].comments
+        );
+    }
 
     #[test]
     fn parse_error_explains_captures_needing_a_response_line() {

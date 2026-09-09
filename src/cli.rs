@@ -14,8 +14,8 @@ use ratatui::crossterm::style::Stylize;
 use crate::environment::{looks_like_env, parse_vars};
 use crate::generators::SystemSource;
 use crate::hurl::{
-    EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, parse_hurl_error,
-    run_hurl, run_hurl_streaming_with,
+    EntryOutcome, EntrySetup, FormFieldKind, RunOutput, collection_to_hurl,
+    expand_base64_form_fields, parse_hurl_error, run_hurl, run_hurl_streaming_with,
 };
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::request;
@@ -229,48 +229,66 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
         for (title, errors) in &blocks.errors {
             report_gen(title, errors);
         }
-        // Said out loud rather than silently resolved: in batch the two
-        // requests share one value, so the second one's signature is computed
-        // over the first one's nonce. Streaming (the default) gives each its
-        // own, so the fix is usually to drop `--batch` — which is what the
-        // message suggests.
-        for name in &blocks.collisions {
-            eprintln!(
-                "{}",
-                paint(
+        // Nothing is sent when a block failed. Batch is one Hurl call over
+        // the whole file, so there is no way to skip the one request and run
+        // the rest (streaming does exactly that -- see `EntrySetup::Skip`),
+        // and going on would leave the failed row's name to whatever else
+        // binds it: the request goes out signed with the wrong thing and is
+        // answered. Dropping `--batch` runs the rest.
+        if !blocks.errors.is_empty() {
+            let flat: Vec<crate::generators::GenError> = blocks
+                .errors
+                .iter()
+                .flat_map(|(_, errs)| errs.iter().cloned())
+                .collect();
+            RunOutput {
+                entries: vec![],
+                error: Some(crate::i18n::describe_gen_errors(&strings, &flat).join("; ")),
+            }
+        } else {
+            // Said out loud rather than silently resolved: in batch the two
+            // requests share one value, so the second one's signature is computed
+            // over the first one's nonce. Streaming (the default) gives each its
+            // own, so the fix is usually to drop `--batch` — which is what the
+            // message suggests.
+            for name in &blocks.collisions {
+                eprintln!(
+                    "{}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
+                    )
+                );
+            }
+            // A generator whose name the environment already binds computes nothing
+            // in batch: one shared value set can't shadow the value from this
+            // request on without rewriting it for the requests above too, so the
+            // environment value stands. Say so — dropping `--batch` is the fix.
+            for name in &blocks.shadowed {
+                eprintln!(
+                    "{}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("  ! {}", strings.cli_gen_shadow.replace("{name}", name))
+                    )
+                );
+            }
+            vars.extend(blocks.bound);
+            let out = run_hurl(&run_content, &vars, file_root);
+            for eo in out.entries.iter() {
+                print_entry(
                     color,
-                    Hue::Yellow,
-                    &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
-                )
-            );
+                    eo.entry_index,
+                    total,
+                    titles.get(eo.entry_index).copied(),
+                    eo,
+                );
+                record(eo);
+            }
+            out
         }
-        // A generator whose name the environment already binds computes nothing
-        // in batch: one shared value set can't shadow the value from this
-        // request on without rewriting it for the requests above too, so the
-        // environment value stands. Say so — dropping `--batch` is the fix.
-        for name in &blocks.shadowed {
-            eprintln!(
-                "{}",
-                paint(
-                    color,
-                    Hue::Yellow,
-                    &format!("  ! {}", strings.cli_gen_shadow.replace("{name}", name))
-                )
-            );
-        }
-        vars.extend(blocks.bound);
-        let out = run_hurl(&run_content, &vars, file_root);
-        for eo in out.entries.iter() {
-            print_entry(
-                color,
-                eo.entry_index,
-                total,
-                titles.get(eo.entry_index).copied(),
-                eo,
-            );
-            record(eo);
-        }
-        out
     } else {
         run_hurl_streaming_with(
             &run_content,
@@ -278,10 +296,10 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
             file_root,
             |i, known| {
                 let Some(entry) = gen_entries.get(i) else {
-                    return Vec::new();
+                    return EntrySetup::Bind(Vec::new());
                 };
                 if entry.generators.is_empty() {
-                    return Vec::new();
+                    return EntrySetup::Bind(Vec::new());
                 }
                 let mut merged = known.clone();
                 let errors =
@@ -291,11 +309,21 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 if !std::mem::replace(&mut gen_reported[i], true) {
                     report_gen(&entry.title, &errors);
                 }
-                entry
-                    .generators
-                    .iter()
-                    .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
-                    .collect()
+                // Not sent when the block failed -- see `EntrySetup::Skip`.
+                if !errors.is_empty() {
+                    let english =
+                        crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                    return EntrySetup::Skip {
+                        reason: crate::i18n::describe_gen_errors(&english, &errors).join("; "),
+                    };
+                }
+                EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
+                        .collect(),
+                )
             },
             |eo| {
                 print_entry(
