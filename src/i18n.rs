@@ -35,6 +35,15 @@ macro_rules! strings {
                     Language::Danish => Self { $($field: $da,)* },
                 }
             }
+
+            /// Every row of the table, as (name, English, French, Danish), so a
+            /// test can hold the whole table to a rule. There is no other way
+            /// to look at every string: the table is a struct of fields, and a
+            /// rule checked "wherever someone remembered" is not checked.
+            #[cfg(test)]
+            pub fn table() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+                vec![$((stringify!($field), $en, $fr, $da),)*]
+            }
         }
     };
 }
@@ -774,7 +783,7 @@ strings! {
     probe_pick_subject_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
     probe_pick_header_title => "Which response header?", "Quel en-tête de réponse ?", "Hvilken svar-header?";
     probe_headers_group => "headers", "en-têtes", "headers";
-    probe_headers_group_count => "{0} headers — Enter to list them", "{0} en-têtes — Entrée pour les afficher", "{0} headers — Enter for at vise dem";
+    probe_headers_group_count => "{} headers — Enter to list them", "{} en-têtes — Entrée pour les afficher", "{} headers — Enter for at vise dem";
     probe_pick_verb_title => "What about it?", "Que vérifier ?", "Hvad med det?";
     probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
@@ -2558,4 +2567,53 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
             G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// `fill` substitutes `{}` and nothing else, so a row written with the
+    /// numbered form of the same idea renders the placeholder to the user:
+    /// "{0} headers" is what the assert palette said for a while.
+    #[test]
+    fn no_string_uses_a_numbered_placeholder() {
+        let mut bad = Vec::new();
+        for (name, en, fr, da) in Strings::table() {
+            for text in [en, fr, da] {
+                if (0..10).any(|i| text.contains(&format!("{{{i}}}"))) {
+                    bad.push(format!("{name}: {text}"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these rows use {{0}}-style placeholders, which `fill` leaves in the text:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// A translation that drops a `{}` drops the value it was carrying -- the
+    /// French reader is simply told "headers" -- and one that adds a `{}` gets
+    /// a stray brace. Neither shows up until someone runs in that language.
+    #[test]
+    fn every_language_of_a_row_takes_the_same_values() {
+        let count = |t: &str| t.matches("{}").count();
+        let mut bad = Vec::new();
+        for (name, en, fr, da) in Strings::table() {
+            if count(en) != count(fr) || count(en) != count(da) {
+                bad.push(format!(
+                    "{name}: en {}, fr {}, da {}",
+                    count(en),
+                    count(fr),
+                    count(da)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these rows disagree on how many values they take:\n{}",
+            bad.join("\n")
+        );
+    }
 }

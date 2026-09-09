@@ -337,12 +337,13 @@ impl crate::tui::app::TuiApp {
                 self.overlay = Some(Overlay::ProbeMenu(menu));
             }
             KeyCode::Backspace if menu.step == ProbeStep::PickSubject => {
-                // Backspace on an empty filter closes the menu, so the key that
-                // undoes typing keeps undoing right out of the overlay.
-                if menu.filter.pop().is_some() {
-                    menu.clamp_selection();
-                    self.overlay = Some(Overlay::ProbeMenu(menu));
-                }
+                // One backspace too many while clearing the filter is not a
+                // request to abandon the search: this used to close the
+                // palette, throwing away a subject the user had just narrowed
+                // down to. Only Esc closes it.
+                menu.filter.pop();
+                menu.clamp_selection();
+                self.overlay = Some(Overlay::ProbeMenu(menu));
             }
             KeyCode::Enter if menu.step == ProbeStep::PickSubject => {
                 // A filter matching nothing has no subject to advance on;
@@ -359,18 +360,18 @@ impl crate::tui::app::TuiApp {
             }
             // Esc closes from step one (step two retreats, above).
             KeyCode::Esc => {}
-            // On step two the list takes no filter, so a letter has nothing to
-            // do — but falling through to the cancel arm meant it silently
-            // threw away the subject the user had just hunted down, and the
-            // *next* keystroke landed in the main view: typing "contains" out
-            // of habit dismissed the palette, opened the New Request wizard on
-            // the `n`, and typed the rest into its name field. A key with
-            // nothing to do should do nothing.
-            _ if menu.step == ProbeStep::PickVerb => {
+            // A key with nothing to do does nothing, on either step. Falling
+            // through to a cancel arm threw away the subject the user had just
+            // hunted down and let the *next* keystroke land in the main view:
+            // typing "contains" out of habit dismissed the palette, opened the
+            // New Request wizard on the `n`, and typed the rest into its name
+            // field. The same held for ←/→, which switch response section in
+            // the main view and so closed the palette by passing through it.
+            // The palette is closed on purpose -- Esc, or backspacing out of
+            // an empty filter -- and not by accident.
+            _ => {
                 self.overlay = Some(Overlay::ProbeMenu(menu));
             }
-            // Step one: anything else cancels (the overlay was already taken).
-            _ => {}
         }
     }
 

@@ -259,6 +259,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **The assert palette closed on keys that were not meant for it.** ←/→ switch
+  response section in the pane behind the palette, and passed straight through
+  it: the subject you had just hunted down was thrown away, and the next
+  keystroke landed in the main view. One backspace too many while clearing the
+  filter did the same. The palette now closes on Esc and nothing else, and any
+  key with nothing to do does nothing.
+
+- **The collapsed headers row said "{0} headers".** `i18n::fill` substitutes
+  `{}`; the row was written with the numbered form and the placeholder went
+  out as text. The table is now held to that rule by a test, along with the
+  rule that a row's three translations take the same number of values.
+
 - **`counter()` counted each send twice.** A `# [Gen]` block is evaluated twice
   on the way out -- once to find out whether anything in it is broken, so the
   cause can be named instead of the 401 it would produce, and once for real --

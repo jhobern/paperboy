@@ -33747,6 +33747,63 @@ mod probe_menu_tests {
         }
     }
 
+    /// The palette is closed on purpose, not by a key that happens to mean
+    /// something in the pane behind it: ←/→ switch response section out there,
+    /// and used to fall straight through and dismiss the list.
+    #[test]
+    fn a_key_with_nothing_to_do_leaves_the_palette_open() {
+        let mut app = app_with_response(r#"{"token":"abc"}"#);
+        press(&mut app, KeyCode::Char('a'));
+        for key in [KeyCode::Left, KeyCode::Right, KeyCode::Tab, KeyCode::Insert] {
+            press(&mut app, key);
+            assert!(
+                matches!(app.overlay, Some(Overlay::ProbeMenu(_))),
+                "{key:?} closed the palette"
+            );
+        }
+        // Including one backspace too many while clearing the filter, which
+        // is a slip rather than a decision to abandon the search.
+        type_str(&mut app, "tok");
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert!(
+            matches!(app.overlay, Some(Overlay::ProbeMenu(_))),
+            "backspacing past an empty filter closed the palette"
+        );
+        assert_eq!(menu(&app).filter, "", "the filter should be cleared");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.overlay.is_none(),
+            "Esc is what closes it, and it did not"
+        );
+    }
+
+    /// The collapsed headers row says how many are behind it. It said
+    /// "{0} headers" for a while: `i18n::fill` substitutes `{}` and leaves any
+    /// other brace form in the text.
+    #[test]
+    fn the_headers_row_counts_the_headers_behind_it() {
+        let mut app = app_with_response(r#"{"token":"abc"}"#);
+        let ci = app.active_tab;
+        app.collections[ci].entries[0]
+            .last_response
+            .as_mut()
+            .unwrap()
+            .headers = vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("X-Request-Id".into(), "r-42".into()),
+        ];
+        press(&mut app, KeyCode::Char('a'));
+        let s = crate::i18n::Strings::for_language(&app.language);
+        let row = menu(&app)
+            .visible()
+            .into_iter()
+            .find(|r| r.label(&s) == s.probe_headers_group)
+            .expect("the headers group row should be listed");
+        assert_eq!(row.value(40, &s), "2 headers — Enter to list them");
+    }
+
     #[test]
     fn pointing_at_a_value_writes_the_assert_for_it() {
         let mut app = app_with_response(r#"{"token":"abc","user":{"id":7}}"#);
