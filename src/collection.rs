@@ -1270,6 +1270,46 @@ impl Collection {
         self.structure_modified = self.entries.iter().any(|e| e.user_added);
     }
 
+    /// Check each restored baseline against the file, and re-derive any the
+    /// file does not recognise.
+    ///
+    /// A baseline is a record of *what the file says*, so it must appear in the
+    /// file. One that does not was invented: builds before the restore path
+    /// kept baselines re-stamped every restored entry from its own edited text,
+    /// freezing whatever was unsaved at the time into the record of the file.
+    /// The pencil then never cleared -- undoing the edit made the request
+    /// differ from its "file" again -- and reverting would have put the unsaved
+    /// edit back as though it were saved work.
+    ///
+    /// Only attempted when the list and the file are the same length, which is
+    /// the same condition every other position-based answer here is given
+    /// under: with a request added or deleted, position means nothing and a
+    /// guess would be a silent, wrong answer about which file text belongs to
+    /// which request.
+    pub fn repair_restored_baselines(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let disk = crate::postman::parse_collection(&content);
+        if disk.len() != self.entries.len() {
+            return;
+        }
+        let texts: Vec<String> = disk.iter().map(|e| e.to_hurl()).collect();
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            let recognised = e
+                .baseline
+                .as_ref()
+                .is_some_and(|b| texts.iter().any(|t| t == b));
+            if !recognised {
+                e.baseline = Some(texts[i].clone());
+                e.mark_edited();
+            }
+        }
+    }
+
     pub fn reset_structure_baseline(&mut self) {
         for e in &mut self.entries {
             e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);

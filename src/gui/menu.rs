@@ -2393,7 +2393,13 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
         SaveKind::ReportResults | SaveKind::ReportBaseline | SaveKind::Report => None,
     };
     let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    std::fs::write(path, text).map_err(|e| {
+        format!(
+            "{} {}",
+            app.strings.gui_could_not_write,
+            crate::shared_utils::friendly_error(&e)
+        )
+    })?;
     // Remember the path for collections/environments.
     match kind {
         SaveKind::Collection => {
@@ -2447,7 +2453,13 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
         .map(|f| f.header.clone())
         .unwrap_or_default();
     let bytes = writer.write(result, &header)?;
-    std::fs::write(path, bytes).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    std::fs::write(path, bytes).map_err(|e| {
+        format!(
+            "{} {}",
+            app.strings.gui_could_not_write,
+            crate::shared_utils::friendly_error(&e)
+        )
+    })?;
     if let Some(ed) = app.report_editor.as_mut() {
         ed.results_exported = true;
         // Remembered so the toolbar can offer to open it: an HTML export is
@@ -2473,7 +2485,13 @@ fn save_report_baseline(app: &mut GuiApp, path: &Path) -> Result<(), String> {
         .ok_or_else(|| app.strings.report_baseline_no_result.to_string())?;
     crate::report::Baseline::from_result(result)
         .save(path)
-        .map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+        .map_err(|e| {
+            format!(
+                "{} {}",
+                app.strings.gui_could_not_write,
+                crate::shared_utils::friendly_error(&e)
+            )
+        })?;
     if let Some(ed) = app.report_editor.as_mut() {
         ed.results_exported = true;
     }

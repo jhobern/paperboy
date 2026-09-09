@@ -1382,6 +1382,73 @@ mod workspace_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A path that ends in a separator names no file the kernel will open:
+    /// writing to it fails with "Is a directory" however ordinary the file is.
+    /// One stored in a previous session is repaired on the way back in, rather
+    /// than leaving the tab unable to save for as long as the state survives.
+    #[test]
+    fn a_restored_path_with_a_trailing_slash_is_cleaned_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_slashy_path_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "GET https://h/a\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        let mut state = s.to_persisted();
+        state.tabs[0].path = Some(format!("{}/", path.display()));
+
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        assert_eq!(back.collections[0].path.as_deref(), Some(path.as_path()));
+        // And the file it names can actually be written.
+        let text = back.collections[0].to_hurl();
+        std::fs::write(back.collections[0].path.as_ref().unwrap(), text).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds before the restore path kept baselines re-stamped every restored
+    /// request from its own edited text, so an unsaved edit became the record
+    /// of what the file said. Undoing the edit then made the request differ
+    /// from its "file" and the pencil never cleared. Such a baseline is not in
+    /// the file, which is how it is recognised and thrown away.
+    #[test]
+    fn a_baseline_the_file_does_not_recognise_is_re_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_bad_baseline_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "# A\nGET https://h/a\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        // What the older build left behind: a baseline nobody wrote to disk.
+        s.collections[0].entries[0].baseline = Some("# A\nGET https://h/INVENTED\n".into());
+        s.collections[0].entries[0].mark_edited();
+        assert!(s.collections[0].entries[0].modified);
+
+        let state = s.to_persisted();
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        assert!(
+            !back.collections[0].entries[0].modified,
+            "the request matches the file, so nothing about it is unsaved"
+        );
+        assert!(back.collections[0].revert_request(0).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::collection::WsRow;
     use crate::remote_flow::WorkspaceGitFilter;

@@ -2484,6 +2484,11 @@ impl TuiApp {
         if path.is_empty() {
             return;
         }
+        // Typed by hand, so it can end in a separator -- which names no file
+        // the kernel will open. Cleaned once, here, rather than at each of the
+        // dozen actions below. See `shared_utils::file_path`.
+        let cleaned = crate::shared_utils::file_path(PathBuf::from(path));
+        let path: &str = &cleaned.to_string_lossy();
         match action {
             FileAction::SaveRequest => {
                 // `active_tab` counts collections then reports, so when a report

@@ -249,6 +249,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A collection whose path ended in a `/` could not be saved.** `collection.hurl/`
+  and `collection.hurl` name the same file to a human and two different things
+  to the kernel: writing to the first fails with "Is a directory" however
+  ordinary the file is, and it cannot be read back or reverted either -- the tab
+  was quietly cut off from its file. A trailing separator is now taken off
+  wherever a path enters the app, including one already saved in a previous
+  session, and a failed write says "Is a directory" rather than
+  "Is a directory (os error 21)".
+
+- **A pencil that would never clear is put right on restart.** Builds before the
+  last fix re-stamped every restored request's record of its file from its own
+  *edited* text, freezing whatever was unsaved into it: undoing the edit made
+  the request differ from its "file" again, so the pencil stayed for good, and
+  reverting would have restored the unsaved edit as though it were saved work.
+  A record the file does not recognise is now re-read from the file.
+
 - **A generated row you have named but not filled in says what is missing.** It
   used to be reported as a parse failure -- "can't read the expression
   (expression is empty)" -- which said the same thing twice and read as though

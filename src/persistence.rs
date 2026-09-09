@@ -94,7 +94,8 @@ impl PersistedEnv {
             .path
             .clone()
             .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from);
+            .map(std::path::PathBuf::from)
+            .map(crate::shared_utils::file_path);
         env.git_origin = self.git_origin.clone();
         (env, pending)
     }
@@ -250,7 +251,12 @@ impl PersistedTab {
         let path = self
             .path
             .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from);
+            .map(std::path::PathBuf::from)
+            // Repairs a path saved before it was cleaned on the way in: a
+            // trailing separator makes the file unwritable and unreadable, and
+            // the tab would go on failing to save for as long as the state
+            // survived.
+            .map(crate::shared_utils::file_path);
 
         // If the whole workspace root is gone (not just the last-selected
         // file) — e.g. it was a git-downloaded temp folder and the OS swept
@@ -329,6 +335,10 @@ impl PersistedTab {
         }
         c.selected_entry = self.selected_entry.min(c.entries.len().saturating_sub(1));
         c.path = path;
+        // After the path, which is what the baselines are checked against.
+        if restored_entries {
+            c.repair_restored_baselines();
+        }
         c.git_origin = self.git_origin;
         c.linked_env_id = linked_env_id;
         c.workspace_root = workspace_root;

@@ -78,7 +78,14 @@ impl<A> PendingPick<A> {
     /// callers have state to unwind when the user backs out.
     pub fn take(&mut self) -> Option<(A, Option<PathBuf>)> {
         match self.rx.try_recv() {
-            Ok(path) => Some((self.action.take()?, path)),
+            // Cleaned here because this is the one door every dialog result
+            // comes through: a chooser that hands back `collection.hurl/`
+            // otherwise leaves the caller holding a path nothing can be
+            // written to. See `shared_utils::file_path`.
+            Ok(path) => Some((
+                self.action.take()?,
+                path.map(crate::shared_utils::file_path),
+            )),
             // The worker thread vanished without answering. Treat it exactly as
             // a cancel: a lost dialog must not wedge the picker slot shut.
             Err(TryRecvError::Disconnected) => Some((self.action.take()?, None)),
