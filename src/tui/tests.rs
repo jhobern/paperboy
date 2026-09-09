@@ -31332,6 +31332,60 @@ fn ctrl_o_only_offers_to_open_an_export_that_still_describes_the_run() {
 /// The two lists index differently: a Workspace tab's `list_cursor` walks the
 /// file tree, an ordinary tab's walks the requests. Committing the wizard used
 /// to write a requests-list index into the workspace's cursor, so editing the
+fn set_form_url(app: &mut TuiApp, url: &str) {
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => f.url = super::editor::Editor::new(url, false),
+        _ => panic!("New Request overlay not open"),
+    }
+}
+
+/// An edit that ends where it started leaves nothing to save, and the pencil
+/// has to go with it. The wizard used to latch `modified = true` on any
+/// difference from the request it opened on, so changing a URL and changing it
+/// back left the request marked -- and a collection marked unsaved forever,
+/// which is also how "revert" appeared not to work.
+#[test]
+fn editing_a_request_back_to_what_it_was_clears_the_pencil() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    let mut e = crate::hurl::HurlEntry::from_fields(
+        "Login",
+        "GET",
+        "https://example.com/a",
+        Vec::new(),
+        "",
+    );
+    // What "saved" means: the text the file holds for this request.
+    e.baseline = Some(e.to_hurl());
+    app.collections[ci].entries = vec![e];
+    app.collections[ci].selected_entry = 0;
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+
+    // Open the wizard, change the URL, commit.
+    press(&mut app, KeyCode::Enter);
+    set_form_url(&mut app, "https://example.com/b");
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "a real change is marked"
+    );
+
+    // Open it again and put the URL back.
+    press(&mut app, KeyCode::Enter);
+    set_form_url(&mut app, "https://example.com/a");
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert_eq!(
+        app.collections[ci].entries[0].url, "https://example.com/a",
+        "the edit landed"
+    );
+    assert!(
+        !app.collections[ci].entries[0].modified,
+        "and the request matches the file again, so there is nothing to save"
+    );
+}
+
 /// first request of a file jumped the selection to the workspace's first row.
 #[test]
 fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {

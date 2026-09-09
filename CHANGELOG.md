@@ -259,6 +259,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **An edit that ends where it started no longer leaves a pencil on the
+  request.** The terminal UI's request wizard marked a request edited on any
+  difference from the one it opened on, rather than on a difference from the
+  file: change a URL and change it back, add a header and remove it, and the
+  pencil stayed -- and so did the collection's "unsaved changes", which is also
+  why reverting a request appeared not to take. The marker is now re-derived by
+  comparing against the saved text, as it already was everywhere else.
+- **The GUI's Code tab no longer loses a request's link to its file.** Re-
+  parsing the edited Hurl text produced a whole new request, and only the
+  "added by hand" marker was carried across; the saved text it compares itself
+  against, and its identity within the request list, were not. The request was
+  left permanently marked as edited -- typing the original text back would not
+  clear it -- and the collection reported that its list of requests had changed
+  shape when it had not.
 - **A request whose `# [Gen]` block failed is no longer sent by a whole-file
   run.** A failed row leaves its name unbound, and something else of that name
   is then used in its place -- an environment value, a capture from an earlier

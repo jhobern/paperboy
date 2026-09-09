@@ -252,9 +252,18 @@ fn apply_code_edit(
         if entries.len() == 1 {
             let mut parsed = entries.into_iter().next().unwrap();
             let entry = &mut session.collections[ci].entries[sel];
-            // `user_added` is UI-only and never written to Hurl text, so a
-            // reparse always drops it; carry it over from the live entry.
+            // None of these are written to Hurl text, so a reparse always
+            // drops them; carry them over from the live entry. `baseline` and
+            // `uid` matter beyond the marker: without the baseline the entry
+            // has nothing to compare against and the pencil latches on for
+            // good (even after typing the text back), and a `uid` of zero
+            // reads as "this request was not in the list that was saved", so
+            // the collection claims its *structure* changed too.
             parsed.user_added = entry.user_added;
+            parsed.baseline = entry.baseline.take();
+            parsed.uid = entry.uid;
+            parsed.last_run = std::mem::take(&mut entry.last_run);
+            parsed.last_response = entry.last_response.take();
             *entry = parsed;
             code_edit.error = None;
             true
@@ -1766,6 +1775,69 @@ mod tests {
             );
             assert_eq!(job.text, text, "layouter must not alter the buffer text");
         }
+    }
+
+    /// The Code tab replaces the entry with a freshly parsed one, and a parse
+    /// only ever recovers what Hurl text can say. `baseline` and `uid` cannot,
+    /// so dropping them left the request permanently pencilled (nothing to
+    /// compare against) and the collection claiming its request list had
+    /// changed shape.
+    #[test]
+    fn editing_the_hurl_buffer_keeps_what_the_text_cannot_say() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let mut code = super::super::app::CodeEdit::default();
+        {
+            let e = &mut session.collections[0].entries[0];
+            e.baseline = Some(e.to_hurl());
+            e.uid = 42;
+            e.user_added = true;
+        }
+        let saved = session.collections[0].entries[0].baseline.clone();
+
+        // Add a header, then take it away again: the entry ends up matching
+        // the file, so nothing should be left marked.
+        let mut edited = session.collections[0].entries[0].clone();
+        edited.headers.push(KvRow::toggled("X-Test", "hello", true));
+        let text = edited.to_hurl();
+        assert!(apply_code_edit(
+            &mut session,
+            &mut code,
+            &strings,
+            0,
+            0,
+            true,
+            &text
+        ));
+        session.collections[0].entries[0].mark_edited();
+        assert!(
+            session.collections[0].entries[0].modified,
+            "a real change is marked"
+        );
+
+        let back = saved.clone().unwrap();
+        assert!(apply_code_edit(
+            &mut session,
+            &mut code,
+            &strings,
+            0,
+            0,
+            true,
+            &back
+        ));
+        session.collections[0].entries[0].mark_edited();
+
+        let e = &session.collections[0].entries[0];
+        assert_eq!(
+            e.baseline, saved,
+            "the file's text has to survive a reparse"
+        );
+        assert_eq!(e.uid, 42, "and the entry's identity in the list");
+        assert!(e.user_added, "and the UI-only marker");
+        assert!(
+            !e.modified,
+            "back to what the file says, so there is nothing to save"
+        );
     }
 
     #[test]

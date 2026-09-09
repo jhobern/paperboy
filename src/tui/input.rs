@@ -3966,7 +3966,12 @@ impl TuiApp {
                 entry.captures = captures;
                 entry.reports = reports;
                 entry.generators = generators;
-                entry.modified = true;
+                // Re-derived against the file, not latched: an edit that ends
+                // where it started -- a URL changed and changed back, a header
+                // added and removed -- leaves the request identical to the one
+                // on disk, and a pencil on it says there is something to save
+                // when there is not. `mark_edited` compares the two.
+                entry.mark_edited();
             }
             col.invalidate_request_json();
             col.sync_folder_to_selected();
@@ -4285,7 +4290,10 @@ impl TuiApp {
                     _ => None,
                 };
                 if done.is_some() {
-                    entry.modified = true;
+                    // Re-derived, for the same reason as the wizard: adopting
+                    // notes that already match the file changes nothing, and a
+                    // pencil claiming otherwise sends the user to save.
+                    entry.mark_edited();
                     self.status = done;
                     self.save_state();
                 }
