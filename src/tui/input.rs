@@ -1945,6 +1945,14 @@ impl TuiApp {
                 self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // Fold the request's captures/asserts/generated summary away. A
+            // request with a dozen asserts can otherwise fill the pane with
+            // description and leave three rows for the request itself. The flip
+            // is against what was last drawn, so the first press always does
+            // the visible thing whichever way the automatic choice went.
+            KeyCode::Char('z') => {
+                self.request_meta_folded = Some(!self.request_meta_folded_now);
+            }
             // `/` starts filtering the Global Environments panel by name. It
             // also focuses the panel, so it works as "find me an environment"
             // from wherever you are rather than only once the panel is focused

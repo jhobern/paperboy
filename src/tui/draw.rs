@@ -3879,13 +3879,25 @@ pub(crate) fn draw_collection_main(
         }
         top_lines.push(Line::from(spans));
     }
+    // The three sections below describe the request rather than being part of
+    // its text, and a thoroughly covered request easily has more rows of them
+    // than the request itself has lines — at which point the pane is all
+    // description and barely any request. So they fold: `z` toggles them, and
+    // until the user says otherwise they fold themselves as soon as they would
+    // eat more than a third of the pane. Folded, they leave a one-line summary
+    // rather than vanishing — the counts are how you notice a request has
+    // captures at all.
+    let mut meta_lines: Vec<Line> = Vec::new();
+    // (section label, row count) for that folded summary line.
+    let mut meta_counts: Vec<(String, usize)> = Vec::new();
     if !captures.is_empty() {
-        top_lines.push(Line::styled(
+        meta_counts.push(("[Captures]".to_string(), captures.len()));
+        meta_lines.push(Line::styled(
             "[Captures]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
         for (name, expr) in &captures {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(name.clone(), Style::default().fg(th.text)),
                 Span::styled(" ← ", Style::default().fg(th.dim)),
@@ -3894,7 +3906,11 @@ pub(crate) fn draw_collection_main(
         }
     }
     if !asserts.is_empty() || expected_status.is_some() {
-        top_lines.push(Line::styled(
+        meta_counts.push((
+            "[Asserts]".to_string(),
+            asserts.len() + usize::from(expected_status.is_some()),
+        ));
+        meta_lines.push(Line::styled(
             "[Asserts]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
@@ -3903,13 +3919,13 @@ pub(crate) fn draw_collection_main(
         // the status check reads as one of the asserts, matching how Hurl
         // evaluates it.
         if let Some(code) = expected_status {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("status == {code}"), Style::default().fg(th.dim)),
             ]));
         }
         for a in &asserts {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(a.clone(), Style::default().fg(th.dim)),
             ]));
@@ -3925,12 +3941,13 @@ pub(crate) fn draw_collection_main(
         .filter(|(name, expr)| !name.trim().is_empty() || !expr.trim().is_empty())
         .collect();
     if !shown_gens.is_empty() {
-        top_lines.push(Line::styled(
+        meta_counts.push((format!("[{}]", s.field_generated), shown_gens.len()));
+        meta_lines.push(Line::styled(
             format!("[{}]", s.field_generated),
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
         for (name, expr) in shown_gens {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(name.clone(), Style::default().fg(th.text)),
                 // "=" rather than the captures' "←": a generated value is
@@ -3939,6 +3956,59 @@ pub(crate) fn draw_collection_main(
                 Span::styled(expr.clone(), Style::default().fg(th.dim)),
             ]));
         }
+    }
+    // A third of the pane, but never less than three rows: on a short terminal
+    // the ratio alone would fold a single two-row section, which is exactly
+    // the case that costs nothing to show.
+    let fold_budget = ((inner.height as usize) / 3).max(3);
+    let folded = !meta_lines.is_empty()
+        && app
+            .request_meta_folded
+            .unwrap_or(meta_lines.len() > fold_budget);
+    // Recorded so `z` can flip whatever is actually on screen, rather than
+    // needing to work the automatic choice out a second time.
+    app.request_meta_folded_now = folded;
+    if folded {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (label, n) in &meta_counts {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(th.dim)));
+            }
+            spans.push(Span::styled(
+                label.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {n}"), Style::default().fg(th.dim)));
+        }
+        spans.push(Span::styled(
+            format!("   {}", s.meta_unfold_hint),
+            Style::default().fg(th.dim),
+        ));
+        top_lines.push(Line::from(spans));
+    } else {
+        // The top region is capped so the request keeps a few rows, and a
+        // Paragraph simply stops drawing at the bottom — an unfolded list
+        // longer than the cap would otherwise end mid-way with nothing to say
+        // it had. Trade the last row for a count of what didn't fit.
+        let room =
+            (inner.height.saturating_sub(3).max(2) as usize).saturating_sub(top_lines.len() + 1);
+        if room >= 2 && meta_lines.len() > room {
+            let hidden = meta_lines.len() - (room - 1);
+            meta_lines.truncate(room - 1);
+            meta_lines.push(Line::styled(
+                format!("  … +{hidden}"),
+                Style::default().fg(th.dim),
+            ));
+        }
+        // The hint rides on the first section header rather than a line of its
+        // own: a line spent saying how to save lines would be self-defeating.
+        if let Some(first) = meta_lines.first_mut() {
+            first.spans.push(Span::styled(
+                format!("   {}", s.meta_fold_hint),
+                Style::default().fg(th.dim),
+            ));
+        }
+        top_lines.extend(meta_lines);
     }
 
     // Push a dim line to visually separate the Request meta-information from
@@ -5029,6 +5099,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+H", s.help_raw_mode),
                             ("Shift+J", s.help_raw_json),
                             ("b", s.help_base_url),
+                            ("z", s.help_fold_meta),
                             ("u (List pane)", s.help_restore_request),
                             ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),

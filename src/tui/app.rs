@@ -1216,6 +1216,14 @@ pub struct TuiApp {
     /// Same, for the Request JSON/Hurl body; cached by `draw_collection_main`.
     /// The offset itself lives in `main_panel`.
     pub(crate) main_max_scroll: u16,
+    /// Whether the `[Captures]`/`[Asserts]`/`[Generated]` summary above the
+    /// request is folded away. `None` means nobody has said, so
+    /// `draw_collection_main` decides by size; `z` writes a `Some` and that
+    /// choice then sticks for the session.
+    pub(crate) request_meta_folded: Option<bool>,
+    /// What that fold actually came out as on the last frame, so `z` can flip
+    /// what the user can see instead of re-deriving the automatic answer.
+    pub(crate) request_meta_folded_now: bool,
     /// Horizontal scroll offset (in characters) for the selected entry's name in
     /// the collections list, so long request URLs can be read end-to-end.
     pub(crate) list_hscroll: u16,
@@ -1552,6 +1560,8 @@ impl Default for TuiApp {
             list_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
+            request_meta_folded: None,
+            request_meta_folded_now: false,
             list_hscroll: 0,
             global_env_hscroll: 0,
             main_text_area: Rect::default(),

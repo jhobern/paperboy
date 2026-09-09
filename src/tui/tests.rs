@@ -34237,6 +34237,112 @@ mod probe_menu_tests {
     }
 }
 
+/// A request with a lot of asserts describes itself more than it shows itself:
+/// the sections above the divider grow without limit while the request they
+/// describe is squeezed into whatever is left. Past a third of the pane they
+/// fold to a counted summary, which still says the asserts are there.
+#[test]
+fn a_wall_of_asserts_folds_itself_away_above_the_request() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/wall".into(),
+        title: "Demo".into(),
+        asserts: (0..20)
+            .map(|i| format!("jsonpath \"$.field{i}\" exists"))
+            .collect(),
+        ..Default::default()
+    }];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let folded = buffer_text(term.backend().buffer());
+    // The rows also exist in the Hurl text below the divider, so the question
+    // is never "is this string on screen" but "is it listed twice".
+    let listed = |t: &str| t.matches("$.field0").count();
+    assert_eq!(
+        listed(&folded),
+        1,
+        "twenty asserts should not be summarised above the request as well:\n{folded}"
+    );
+    assert!(
+        folded.contains("[Asserts] 20"),
+        "the fold still says how many there are:\n{folded}"
+    );
+    assert!(
+        folded.contains("http://example.com/wall"),
+        "the request itself is still on screen:\n{folded}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let open = buffer_text(term.backend().buffer());
+    assert!(
+        !open.contains("[Asserts] 20"),
+        "z unfolds the summary again:\n{open}"
+    );
+    assert!(
+        open.contains("jsonpath \"$.field0\" exists"),
+        "and the rows are listed with it:\n{open}"
+    );
+    // More rows than the pane will give them: the ones that didn't fit are
+    // counted rather than just stopping.
+    assert!(
+        open.contains("… +"),
+        "an unfolded list too long for the pane says how much is missing:\n{open}"
+    );
+}
+
+/// The other half of the same rule: a couple of rows cost nothing to show, so
+/// they are shown -- but `z` still folds them for anyone who would rather see
+/// the request.
+#[test]
+fn a_short_summary_is_left_open_until_asked_to_fold() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/small".into(),
+        title: "Demo".into(),
+        captures: vec![("token".into(), "jsonpath \"$.token\"".into())],
+        ..Default::default()
+    }];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let open = buffer_text(term.backend().buffer());
+    // The capture also exists in the Hurl text below the divider, so the
+    // question is never "is it on screen" but "is it listed twice".
+    let listed = |t: &str| t.matches("$.token").count();
+    assert_eq!(
+        listed(&open),
+        2,
+        "one capture is not worth hiding, so it is summarised as well as spelled out:\n{open}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let folded = buffer_text(term.backend().buffer());
+    assert!(
+        folded.contains("[Captures] 1"),
+        "z folds it to the count:\n{folded}"
+    );
+    assert_eq!(
+        listed(&folded),
+        1,
+        "and the summary row itself is gone:\n{folded}"
+    );
+}
+
 /// A `# [Gen]` block is the request's pre-script wearing a comment's clothes:
 /// the file has to spell it that way to stay runnable by `hurl` itself, but the
 /// view shouldn't leave it reading as somebody's prose. It is summarised with
