@@ -453,22 +453,20 @@ pub(super) fn paint_span(
     compact: bool,
     colour: egui::Color32,
 ) -> usize {
-    // The field's name, washed more faintly than its value. A row lit only
-    // from the colon rightwards reads as a highlight that stopped short, and
-    // the pointer is usually on the name when a field is being aimed at -- but
-    // the name is not what the assert is about, and lighting it as strongly
-    // would say it was. (Copying still takes the value alone.)
+    // The field's name, washed as strongly as its value. A row lit only from
+    // the colon rightwards reads as a highlight that stopped short of what the
+    // pointer is on, and a fainter wash on the name was hard enough to see
+    // that it gave neither the whole field nor a clean value.
+    //
+    // Nor is the subject only ever the value: `exists`, `isEmpty` and `count`
+    // are statements about the *field*, and half of them are still true of a
+    // field whose value is missing. The pair is what is being pointed at, so
+    // the pair is what is lit -- the same promise the headers tab makes with
+    // its whole row. Copying still takes the value alone.
     if let Some((start, end)) = key_char_range(body, subject, compact)
         && end > start
     {
-        paint_char_range(
-            painter,
-            galley,
-            galley_pos,
-            start,
-            end,
-            colour.gamma_multiply(0.45),
-        );
+        paint_char_range(painter, galley, galley_pos, start, end, colour);
     }
     let Some((start, end)) = value_char_range(body, subject, compact) else {
         return 0;

@@ -919,6 +919,10 @@ impl Session {
             request::run_collection(&self.collections[ci], env.as_ref(), self.response.clone())
         {
             self.pending_captures.push(rx);
+        } else if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
+            // No thread was started, so no completion will ever arrive: undo
+            // the in-flight mark here or the entry spins forever.
+            entry.last_run = RunStatus::Failed;
         }
         Vec::new()
     }

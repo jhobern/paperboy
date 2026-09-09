@@ -628,11 +628,11 @@ mod probe_route_tests {
     }
 
     /// The pointer is usually on a field's *name* when that field is being
-    /// aimed at, so lighting only the value leaves the row looking half-lit --
-    /// but the name is not what the assert is about, so it is washed more
-    /// faintly than the value rather than as brightly.
+    /// aimed at, so lighting only the value leaves the row looking half-lit.
+    /// Name and value are washed alike -- the same promise the headers tab
+    /// makes with its whole row.
     #[test]
-    fn hovering_a_field_lights_its_name_faintly_and_its_value_fully() {
+    fn hovering_a_field_lights_its_name_and_its_value() {
         let body = "{\n  \"token\": \"abc123\"\n}";
         let mut app = app_with(body, vec![], 200);
         let ctx = themed_ctx();
@@ -661,9 +661,9 @@ mod probe_route_tests {
             super::wash(&app.theme),
             "the value should keep the full wash"
         );
-        assert!(
-            on_key.a() < on_value.a(),
-            "the name should be fainter than the value: name {on_key:?}, value {on_value:?}"
+        assert_eq!(
+            on_key, on_value,
+            "the name should be lit as strongly as the value"
         );
     }
 

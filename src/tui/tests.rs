@@ -33804,6 +33804,48 @@ mod probe_menu_tests {
         assert_eq!(row.value(40, &s), "2 headers — Enter to list them");
     }
 
+    /// The palette lists paths; the response shows text. The row under the
+    /// cursor is marked where the pane is showing it, so "this one" is
+    /// something the user can see rather than a path to find by eye.
+    #[test]
+    fn the_row_under_the_cursor_is_marked_in_the_response() {
+        use ratatui::style::Modifier;
+        let mut app = app_with_response("{\n  \"first\": \"aaa\",\n  \"token\": \"zzz\"\n}");
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "token");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let marked: String = {
+            let area = *buf.area();
+            let mut out = String::new();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    if cell.modifier.contains(Modifier::UNDERLINED) {
+                        out.push_str(cell.symbol());
+                    }
+                }
+            }
+            out
+        };
+        assert!(
+            marked.contains("\"zzz\""),
+            "the value the palette is pointing at was not marked; marked: {marked:?}"
+        );
+        assert!(
+            !marked.contains("aaa"),
+            "a value the palette is not pointing at was marked: {marked:?}"
+        );
+        // And nothing is marked once the palette is shut.
+        press(&mut app, KeyCode::Esc);
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        assert!(
+            app.resp_probe_anchor.is_none(),
+            "the mark outlived the palette"
+        );
+    }
+
     #[test]
     fn pointing_at_a_value_writes_the_assert_for_it() {
         let mut app = app_with_response(r#"{"token":"abc","user":{"id":7}}"#);

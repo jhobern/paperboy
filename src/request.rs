@@ -972,8 +972,24 @@ pub fn run_collection(
                 });
             }
             None => {
-                // Parse error, or nothing ran.
+                // Parse error, or nothing ran (a failed `# [Gen]` row, an
+                // unreadable body file, a staging failure).
                 r.error = out.error.unwrap_or_else(|| "no response".to_string());
+                // This is still the end of the send, so it has to be announced
+                // like one. Saying nothing left the entry stamped `Running`
+                // for the rest of the session — the spinner and "Sending…"
+                // never cleared, so a request refused *because* it could not
+                // be built looked exactly like one waiting on a dead server,
+                // which is the opposite of the message. `ok: false` with no
+                // values: nothing was captured or computed, and a request
+                // that never left is a failure.
+                let _ = tx.send(CaptureUpdate {
+                    col_id,
+                    entry_idx,
+                    ok: false,
+                    values: HashMap::new(),
+                    response: r.clone(),
+                });
             }
         }
     });
@@ -2338,6 +2354,53 @@ mod tests {
             ),
             "the report names the row and the misspelling: {:?}",
             problems[0]
+        );
+    }
+
+    /// A request that never leaves has still *finished*, and has to say so.
+    /// A failed `# [Gen]` row means nothing is built and no entry runs, and
+    /// the arm that handles "nothing ran" used to set the error and stop —
+    /// leaving the entry stamped `Running`, so the spinner and "Sending…" sat
+    /// there for the rest of the session. The one case where the client knows
+    /// immediately that the send is hopeless looked exactly like a request
+    /// waiting on a dead server.
+    #[test]
+    fn a_request_that_could_not_be_built_still_reports_that_it_is_over() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?s={{sig}}",
+                &[("sig", "hmac_sha526(k, m)")],
+            )],
+        );
+        let state = Arc::new(Mutex::new(ApiResponse::default()));
+        let rx = run_collection(&col, None, state).expect("the run starts");
+        let update = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a refusal is still an ending, and must be announced");
+        assert!(!update.ok, "a request that never left did not pass");
+        assert!(
+            update.response.error.contains("hmac_sha526"),
+            "and the response says which row stopped it: {:?}",
+            update.response.error
+        );
+        assert!(!update.response.loading, "nothing is in flight any more");
+
+        // A second run, drained the way a front-end drains it (the first
+        // update was consumed by `recv_timeout` above).
+        let state = Arc::new(Mutex::new(ApiResponse::default()));
+        let rx = run_collection(&col, None, state).expect("the run starts");
+        let mut cols = [col];
+        cols[0].entries[0].last_run = RunStatus::Running;
+        let mut pending = vec![rx];
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drain_capture_updates(&mut pending, &mut cols);
+        }
+        assert_eq!(
+            cols[0].entries[0].last_run,
+            RunStatus::Failed,
+            "so the front-end stops spinning"
         );
     }
 

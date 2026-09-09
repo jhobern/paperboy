@@ -1244,6 +1244,13 @@ pub struct TuiApp {
     /// The exact screen Rect the Response body was rendered into last frame,
     /// used to hit-test mouse clicks/drags against this panel.
     pub(crate) resp_text_area: Rect,
+    /// While the assert palette is open, where in the response the row under
+    /// its cursor is written — so the list can say "this one" about something
+    /// the user can see, rather than naming a path they have to find by eye.
+    /// Recomputed every frame by `draw_response` and painted afterwards, like
+    /// a selection; `None` whenever the palette is shut or the row is not
+    /// written in the section on view.
+    pub(crate) resp_probe_anchor: Option<(TextPos, TextPos)>,
     /// The Response body panel: like `main_panel`, but its wrap cache is
     /// *not* rebuilt unconditionally every frame — only when the body or
     /// panel width actually changes (`set_content` → `rebuild_if_needed`),
@@ -1551,6 +1558,7 @@ impl Default for TuiApp {
             main_panel: MultiSelectPanel::new(),
             main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
+            resp_probe_anchor: None,
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
             response_section: ResponseSection::Body,
@@ -1891,6 +1899,10 @@ impl TuiApp {
             self.response.clone(),
         ) {
             self.pending_captures.push(rx);
+        } else if let Some(entry) = self.collections[col_idx].entries.get_mut(selected) {
+            // No thread was started, so no completion will ever arrive: undo
+            // the in-flight mark here or the entry spins forever.
+            entry.last_run = RunStatus::Failed;
         }
     }
 

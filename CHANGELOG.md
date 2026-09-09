@@ -259,11 +259,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A request that cannot be built now stops sending.** A failed `# [Gen]` row
+  (or an unreadable body file, or a parse error) means no entry ever runs, and
+  the "nothing ran" path set the error and said nothing else — so the request
+  stayed marked in-flight, showing the pending marker and "Sending…" until the
+  app was restarted. The one case where the client knows *immediately* that
+  the send is hopeless was the one case that looked like a wait on a dead
+  server. Refusing to send is now announced like any other ending: the entry is
+  marked failed and the response carries the reason.
+
+### Added
+
+- **The assert palette marks the value it is talking about.** The palette lists
+  paths while the response shows text, so naming `$.data[0].token` to someone
+  looking at six plausible tokens left them to solve the puzzle by reading. The
+  row under the cursor is now marked where the response pane is showing it, and
+  the pane scrolls to it if it is off screen. It is a mark, not a selection:
+  `y` still copies whatever was selected by hand.
+
 - **A hovered field lights its name as well as its value.** The pointer is
   usually on the name when a field is being aimed at, so a wash that started at
-  the colon looked like a highlight that had stopped short. The name is washed
-  more faintly than the value: it is which field, not what the assert is about.
-  Copying still takes the value alone.
+  the colon looked like a highlight that had stopped short. Name and value are
+  washed alike: `exists`, `isEmpty` and `count` are assertions about the field
+  rather than about its value, so the field is what the highlight points at --
+  the same promise the headers tab makes with its whole row. Copying still
+  takes the value alone.
 
 - **The assert palette closed on keys that were not meant for it.** ←/→ switch
   response section in the pane behind the palette, and passed straight through

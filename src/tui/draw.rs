@@ -1903,6 +1903,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     // content (the Main/Response caches used to compute it are refreshed by
     // `draw_collection_main`/`draw_response` inside `draw_body` above).
     paint_selection_highlight(f, app, &th);
+    paint_probe_anchor(f, app, &th);
 
     // The report's questions are asked *over* the report, not instead of it:
     // the point of asking on the way to a run is that you can still see what
@@ -1930,6 +1931,42 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 /// region is confined to its own panel's cached text area/rows, so a
 /// highlight can never bleed into a neighbouring panel or the rest of the
 /// terminal row.
+/// Underline the value the assert palette's cursor is on, where the response
+/// pane is showing it (see `probe_anchor`).
+///
+/// Underlined rather than washed like a selection: the palette is a list of
+/// paths, and the response behind it is being *read* while the list is moved
+/// through, so the mark has to be findable at a glance without repainting a
+/// block of the body in another colour every time the cursor moves. It is also
+/// not a selection — `y` still copies whatever the user selected by hand.
+fn paint_probe_anchor(f: &mut Frame, app: &TuiApp, th: &Theme) {
+    let Some((start, end)) = app.resp_probe_anchor else {
+        return;
+    };
+    let Some(wrap) = app.resp_panel.wrap() else {
+        return;
+    };
+    let cells = tui_panel_select::selection::highlight_cells(
+        start,
+        end,
+        wrap,
+        app.resp_text_area,
+        app.resp_panel.scroll(),
+    );
+    let buf = f.buffer_mut();
+    for (row, from, to) in cells {
+        for col in from..to {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_style(
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
+                );
+            }
+        }
+    }
+}
+
 fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
     if !app.has_any_selection() {
         return;
@@ -3975,6 +4012,60 @@ pub(crate) fn draw_collection_main(
     );
 }
 
+/// Where the row under the assert palette's cursor is written in the section
+/// on view, as a `(start, end)` position pair.
+///
+/// The palette lists paths; the response shows text. Naming `$.data[0].token`
+/// to someone looking at a body with six plausible tokens in it leaves them to
+/// solve the puzzle by reading, which is exactly the work the palette exists to
+/// save. `None` when there is nothing to point at: a subject that isn't written
+/// in this section (a header while the body is on view, or the status, which is
+/// not in the response text at all), or the compact view, whose text is not the
+/// body -- an offset into it would land on the wrong field.
+fn probe_anchor(
+    app: &TuiApp,
+    body: &str,
+    headers: &[(String, String)],
+) -> Option<(TextPos, TextPos)> {
+    use crate::probe::Subject;
+    let Some(Overlay::ProbeMenu(menu)) = app.overlay.as_ref() else {
+        return None;
+    };
+    // Step two is about a subject already chosen; step one follows the cursor.
+    let probe = menu.chosen.clone().or_else(|| menu.choice())?;
+    match (&probe.subject, app.response_section) {
+        (Subject::Json(_) | Subject::JsonCount(_), ResponseSection::Body) => {
+            if app.response_compact {
+                return None;
+            }
+            let span = crate::probe::span_of(body, &probe.subject)?;
+            Some((text_pos_at(body, span.start), text_pos_at(body, span.end)))
+        }
+        (Subject::Header(name), ResponseSection::Headers) => {
+            // The headers section is one `key: value` line per header, built a
+            // few lines below; the value is what the assert is about.
+            let line = headers.iter().position(|(k, _)| k == name)?;
+            let start = name.chars().count() + 2;
+            let end = start + headers[line].1.chars().count();
+            Some((TextPos::new(line, start), TextPos::new(line, end)))
+        }
+        _ => None,
+    }
+}
+
+/// A byte offset into a text, as the panel's (line, char column) position.
+fn text_pos_at(text: &str, offset: usize) -> TextPos {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count();
+    let col = before
+        .rsplit_once('\n')
+        .map(|(_, last)| last)
+        .unwrap_or(before)
+        .chars()
+        .count();
+    TextPos::new(line, col)
+}
+
 pub(crate) fn draw_response(
     f: &mut Frame,
     area: Rect,
@@ -4034,6 +4125,8 @@ pub(crate) fn draw_response(
     // panel shows the compacted overview.
     app.resp_full_body = Arc::from("");
     app.resp_compact_line_maps = Vec::new();
+    // Same reason: every early return below leaves nothing to point at.
+    app.resp_probe_anchor = None;
 
     if loading {
         app.resp_max_scroll = 0;
@@ -4239,6 +4332,24 @@ pub(crate) fn draw_response(
         app.resp_panel.set_content(content.clone(), width);
     }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
+    // Scrolled to *before* the window is taken, so the row the palette is
+    // pointing at is on screen in the same frame the palette names it. Only
+    // when it isn't already visible: moving the pane under a user who can
+    // already see the value would be worse than not moving it at all.
+    let anchor = probe_anchor(app, &body, &headers);
+    if let Some((start, _)) = anchor
+        && let Some(row) = app.resp_panel.wrap().map(|w| w.textpos_to_row_col(start).0)
+    {
+        let scroll = u32::from(app.resp_panel.scroll());
+        let height = u32::from(body_area.height);
+        if row < scroll || row >= scroll + height {
+            // A third of the way down rather than at the very top: the value
+            // is nearly always read together with what surrounds it.
+            let want = row.saturating_sub(height / 3).min(u32::from(u16::MAX));
+            app.resp_panel.set_scroll(want as u16);
+        }
+    }
+    app.resp_probe_anchor = anchor;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
     let scroll = app.resp_panel.scroll();
