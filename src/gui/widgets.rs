@@ -1135,19 +1135,22 @@ fn suggest_state(ui: &egui::Ui, s: &Strings, id: egui::Id, text: &str, vars: &[S
     if !focused && st.had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.ctx().memory_mut(|m| m.request_focus(id));
         focused = true;
-        st.dismissed_for = Some(crate::generators::word_at(text, caret_of(ui.ctx(), id)).2);
+        st.dismissed_for =
+            Some(crate::generators::typed_word_at(text, caret_of(ui.ctx(), id)).prefix);
     }
     st.had_focus = focused;
     if !focused {
         st.forced = false;
     }
-    st.word = crate::generators::word_at(text, caret_of(ui.ctx(), id)).2;
+    let typed = crate::generators::typed_word_at(text, caret_of(ui.ctx(), id));
+    // The *typed* part of the word, not the whole of it: see `TypedWord`.
+    st.word = typed.prefix.clone();
     // Nothing typed yet is a question, not a blank: an empty cell (or a caret
     // just inside a bracket) is exactly where someone wants to be shown what
     // there is, which is the job the ƒ menu used to do badly.
     let browse = st.forced || st.word.is_empty();
     st.rows = if focused {
-        suggestions(s, &st.word, browse, vars)
+        suggestions(s, &typed, browse, vars)
     } else {
         Vec::new()
     };
@@ -1163,8 +1166,13 @@ fn suggest_state(ui: &egui::Ui, s: &Strings, id: egui::Id, text: &str, vars: &[S
 /// Variables come first because there are a handful of them and thirty-five
 /// functions: a name the user has defined is a specific answer, and burying it
 /// under a scrolling list of the built-ins would make it unfindable.
-fn suggestions(s: &Strings, word: &str, browse: bool, vars: &[String]) -> Vec<Suggestion> {
-    let lower = word.to_ascii_lowercase();
+fn suggestions(
+    s: &Strings,
+    w: &crate::generators::TypedWord,
+    browse: bool,
+    vars: &[String],
+) -> Vec<Suggestion> {
+    let lower = w.prefix.to_ascii_lowercase();
     let mut out: Vec<Suggestion> = vars
         .iter()
         .filter(|v| browse || v.to_ascii_lowercase().starts_with(&lower))
@@ -1175,7 +1183,9 @@ fn suggestions(s: &Strings, word: &str, browse: bool, vars: &[String]) -> Vec<Su
         })
         .collect();
     // The same list, from the same table, as the terminal wizard's dropdown.
-    for row in crate::generators::suggestions_for_word(word, browse).unwrap_or_default() {
+    for row in
+        crate::generators::suggestions_for_word(&w.prefix, &w.whole, browse).unwrap_or_default()
+    {
         let f = crate::generators::function_for_suggestion(row);
         let signature = f.is_some_and(|f| f.signature == row);
         out.push(Suggestion {
@@ -1430,21 +1440,17 @@ fn insert_at_caret(
 /// `sha256` rather than `shasha256`, and the rest of the expression around it
 /// is untouched.
 fn splice(text: &str, caret: Option<usize>, with: &str) -> (String, usize, usize) {
+    let w = crate::generators::typed_word_at(text, caret);
+    (splice_range(text, w.start, w.end, with), w.start, w.end)
+}
+
+/// Put `with` into `text` in place of the chars in `start..end`.
+fn splice_range(text: &str, start: usize, end: usize, with: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
-    let at = caret.unwrap_or(chars.len()).min(chars.len());
-    let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
-    let mut start = at;
-    while start > 0 && word(&chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = at;
-    while end < chars.len() && word(&chars[end]) {
-        end += 1;
-    }
-    let mut out: String = chars[..start].iter().collect();
+    let mut out: String = chars[..start.min(chars.len())].iter().collect();
     out.push_str(with);
-    out.extend(chars[end..].iter());
-    (out, start, end)
+    out.extend(chars[end.min(chars.len())..].iter());
+    out
 }
 
 /// Write `f`'s call into `text` at the caret, returning the new text and what
@@ -1462,20 +1468,46 @@ fn insert_call(
     caret: Option<usize>,
     f: &crate::generators::GenFunction,
 ) -> (String, usize, usize) {
-    let args = arg_names(f.signature);
+    let mut args: Vec<String> = arg_names(f.signature)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let w = crate::generators::typed_word_at(text, caret);
+    // Text the caret was put in front of is what the call is being built
+    // *around*: `t|uuid` completed with `timestamp` means `timestamp(uuid)`,
+    // not a `timestamp` where the `uuid` used to be. Only a function that takes
+    // an argument can wrap anything, so one that takes none replaces the word
+    // as before -- there is nowhere for the text to go.
+    let wrapping = f.min_args > 0 && !w.wrapped.is_empty();
+    if wrapping {
+        args[0] = w.wrapped.clone();
+    }
     let call = if f.min_args == 0 {
         f.name.to_string()
     } else {
         format!("{}({})", f.name, args.join(", "))
     };
-    let (out, start, _) = splice(text, caret, &call);
+    let end = if wrapping { w.wrap_end } else { w.end };
+    let out = splice_range(text, w.start, end, &call);
+    let start = w.start;
     if f.min_args == 0 {
         let at = start + call.chars().count();
         return (out, at, at);
     }
-    // The first argument, selected: `(` is one character past the name.
-    let from = start + f.name.chars().count() + 1;
-    let to = from + args.first().map(|a| a.chars().count()).unwrap_or(0);
+    // The argument left to fill in, selected: the first, or -- when the first
+    // is the text just wrapped -- the next one along. With nothing left to
+    // fill in, the caret goes after the closing bracket, where the expression
+    // carries on.
+    let filled = usize::from(wrapping);
+    let Some(arg) = args.get(filled) else {
+        let at = start + call.chars().count();
+        return (out, at, at);
+    };
+    // `(` is one character past the name; each earlier argument is followed by
+    // the `, ` that `join` put in.
+    let before: usize = args[..filled].iter().map(|a| a.chars().count() + 2).sum();
+    let from = start + f.name.chars().count() + 1 + before;
+    let to = from + arg.chars().count();
     (out, from, to)
 }
 

@@ -1161,7 +1161,14 @@ impl GuiApp {
         // key here would take it away from that editor while it is the surface
         // the keyboard is aimed at, so the global binding stands down whenever
         // the report editor is up and only claims Ctrl+Z otherwise.
+        //
+        // Gated on nothing being typed into for the same reason: every text
+        // field in the window has its own Ctrl+Z, and a global binding that
+        // consumed the key first took undo away from all of them -- typing in a
+        // URL, a header or a generated expression and pressing Ctrl+Z resurrected
+        // a deleted request instead of undoing what had just been typed.
         if self.report_editor.is_none()
+            && no_widget_focus
             && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z))
         {
             self.undo_delete_request();
@@ -2287,6 +2294,27 @@ mod tests {
             "an open dialog freezes the tree keys entirely"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every text field in the window has its own Ctrl+Z. The global binding
+    /// consumed the key before any of them saw it, so undo did not work in a
+    /// URL, a header cell or a generated expression -- it resurrected the last
+    /// deleted request instead, which is not what the keyboard was aimed at.
+    #[test]
+    fn ctrl_z_belongs_to_whatever_is_being_typed_into() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        app.delete_request_now(0, 1);
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("a-text-field")));
+        press(&mut app, &ctx, Key::Z, Modifiers::COMMAND);
+        assert_eq!(
+            app.session.collections[0].entries.len(),
+            1,
+            "the field being typed into owns Ctrl+Z"
+        );
     }
 
     #[test]

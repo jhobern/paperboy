@@ -3331,6 +3331,46 @@ mod computed_suggestion_tests {
         assert!(clash.is_empty(), "the two rows collided: {clash:?}");
     }
 
+    /// Typing in front of what is already there is how a call gets built
+    /// around it. The word straddling the caret is then `tuuid`, which matches
+    /// nothing, so the list went blank exactly when it was wanted: it filters
+    /// on what has been *typed*, and the rest is what the call wraps.
+    #[test]
+    fn typing_in_front_of_an_expression_offers_a_call_to_wrap_it() {
+        let mut app = app_with_row("stamp", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("base".into())], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            painted.iter().any(|(t, _)| t.contains("base64(")),
+            "the typed prefix should filter the list: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "base64(uuid)",
+            "the expression the caret was in front of is the call's argument"
+        );
+    }
+
+    /// The same, around a whole call rather than a bare name: the caret in
+    /// `b|sha256(x)` is in front of all of it.
+    #[test]
+    fn wrapping_takes_the_whole_call_the_caret_is_in_front_of() {
+        let mut app = app_with_row("stamp", "sha256(body)");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha256(body)");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("base64".into())], 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "base64(sha256(body))");
+    }
+
     /// An edit undone is not an edit: the pencil marker has to go away again.
     ///
     /// It used to latch -- change an expression, change it back, and the

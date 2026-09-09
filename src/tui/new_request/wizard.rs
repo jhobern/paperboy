@@ -442,8 +442,8 @@ impl WizardTab {
 /// find that `)` first and call the trailing word empty, and no further
 /// function could ever be completed inside `base64(sha│)`. The GUI's
 /// `insert_call` scans from the caret for the same reason.
-fn gen_word(text: &str, col: usize) -> (usize, usize, String) {
-    crate::generators::word_at(text, Some(col))
+fn gen_word(text: &str, col: usize) -> crate::generators::TypedWord {
+    crate::generators::typed_word_at(text, Some(col))
 }
 
 /// What accepting function `f` puts in the cell in place of the word at the
@@ -1174,10 +1174,11 @@ impl NewReq {
     fn gen_suggestions(&self, i: usize) -> Option<(usize, Vec<&'static str>)> {
         let row = self.generators.get(i)?;
         let text = row.expr.text();
-        let word = gen_word(&text, row.expr.col).2;
+        let w = gen_word(&text, row.expr.col);
         // The list itself is `generators::suggestions_for_word`, shared with
         // the GUI so the two front-ends offer the same thing at the same time.
-        crate::generators::suggestions_for_word(&word, self.gen_browse).map(|sugs| (i, sugs))
+        crate::generators::suggestions_for_word(&w.prefix, &w.whole, self.gen_browse)
+            .map(|sugs| (i, sugs))
     }
 
     /// The suggestion dropdown for the focused Key cell, if it should be shown:
@@ -1229,7 +1230,24 @@ impl NewReq {
                 if let Some(row) = self.generators.get_mut(i) {
                     let text = row.expr.text();
                     let chars: Vec<char> = text.chars().collect();
-                    let (start, end, _word) = gen_word(&text, row.expr.col);
+                    let w = gen_word(&text, row.expr.col);
+                    // Text the caret was put in front of is what the call is
+                    // being built *around*: `t|uuid` completed with `timestamp`
+                    // means `timestamp(uuid)`, not a `timestamp` where the
+                    // `uuid` used to be. Only a call with brackets can wrap
+                    // anything, so a bare name replaces the word as before --
+                    // there is nowhere for the text to go. The GUI wraps on the
+                    // same rule.
+                    let wrapping = !w.wrapped.is_empty() && call.ends_with("()");
+                    let (call, caret) = if wrapping {
+                        (
+                            format!("{}{})", call.trim_end_matches(')'), w.wrapped),
+                            caret + w.wrapped.chars().count(),
+                        )
+                    } else {
+                        (call, caret)
+                    };
+                    let (start, end) = (w.start, if wrapping { w.wrap_end } else { w.end });
                     let mut done = String::new();
                     done.extend(chars[..start].iter());
                     done.push_str(&call);
@@ -1267,7 +1285,7 @@ impl NewReq {
             return false;
         };
         let text = row.expr.text();
-        gen_word(&text, row.expr.col).2.is_empty()
+        gen_word(&text, row.expr.col).prefix.is_empty()
     }
 
     /// Whether the Form Kind (Text/File) dropdown should currently be shown:

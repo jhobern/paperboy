@@ -23233,6 +23233,30 @@ fn a_function_can_be_completed_inside_an_existing_call() {
     );
 }
 
+/// Typing in front of what is already in the cell is how a call gets built
+/// around it. The word straddling the caret is then `tuuid`, which matches no
+/// function, so the list went blank exactly when it was wanted: it filters on
+/// what has been *typed*, and what follows the caret is what the call wraps.
+#[test]
+fn typing_in_front_of_an_expression_wraps_it_in_the_accepted_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "base6");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "the typed prefix should filter the list, not the word around the caret"
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "base64(uuid)",
+        "the expression the caret was in front of is the call's argument"
+    );
+}
+
 #[test]
 fn editing_a_request_keeps_the_block_it_arrived_with() {
     let mut app = TuiApp::default();

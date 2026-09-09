@@ -240,8 +240,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
     it or the row itself, which the block would reject.
   - The empty field's hint says so: *uuid — type for functions, Ctrl+Space for
     all*.
+  - Typing in *front* of what is already there builds a call around it: the
+    list filters on what has been typed (the word straddling the caret in
+    `t|uuid` is `tuuid`, which matches nothing, so it used to go blank exactly
+    when it was wanted), and accepting `base64` over `b|sha256(body)` gives
+    `base64(sha256(body))` rather than losing the call that was there. The
+    terminal wizard wraps on the same rule.
 
 ### Fixed
+
+- **Ctrl+Z belongs to whatever is being typed into.** The desktop window's
+  global Ctrl+Z (undo the last request delete) consumed the key before any text
+  field saw it, so undo did nothing in a URL, a header cell or a generated
+  expression — it brought back a deleted request instead, which is not what the
+  keyboard was aimed at. The global binding now stands down whenever a widget
+  holds the keyboard, the way the `?` help key already did.
 
 - **An edit undone stops counting as an edit.** Changing a request — a generated
   expression, a header, a URL — and then changing it back left the pencil marker

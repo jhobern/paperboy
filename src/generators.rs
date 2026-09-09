@@ -1051,15 +1051,44 @@ pub fn functions_starting_with(prefix: &str) -> impl Iterator<Item = &'static Ge
         .iter()
         .filter(move |f| f.name.starts_with(prefix.as_str()))
 }
-/// The word straddling `caret` in a `[Gen]` expression: where it starts, where
-/// it ends, and the word itself.
+/// The identifier being typed at `caret` in a `[Gen]` expression.
 ///
 /// A word here is what a function name may be made of, so the caret in
 /// `concat(upper(na|me))` picks out `name` and not the whole expression. An
 /// expression is not one name the way a header is: completion has to work
 /// inside a call, because that is where the nesting this feature exists for
 /// puts it.
-pub fn word_at(text: &str, caret: Option<usize>) -> (usize, usize, String) {
+///
+/// The word is split at the caret rather than taken whole, because the two
+/// halves mean different things. What is *before* the caret is what the user
+/// has typed and so what filters the list: typing `t` in front of an existing
+/// `uuid` is someone reaching for `timestamp`, but the word straddling the
+/// caret is `tuuid`, which matches nothing and left the list blank exactly when
+/// it was wanted. What is *after* it is text the user put the caret in front of
+/// deliberately, and is offered to the accepted call as its first argument --
+/// which is how `t|uuid` becomes `timestamp(uuid)` rather than losing the
+/// `uuid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedWord {
+    /// Where the word starts.
+    pub start: usize,
+    /// Where the word ends.
+    pub end: usize,
+    /// Where the text to wrap ends: the end of the word, or of the call that
+    /// begins there — the caret in `t|base64(x)` is in front of the whole
+    /// `base64(x)`, not just the name.
+    pub wrap_end: usize,
+    /// The typed part, before the caret. What the list filters on.
+    pub prefix: String,
+    /// The text from the caret to `wrap_end`: what an accepted call wraps.
+    pub wrapped: String,
+    /// The whole word, both sides of the caret. Not what the list filters on,
+    /// but what decides there is nothing left to offer: a caret dropped in the
+    /// middle of a finished `uuid` should not open a list over the row below.
+    pub whole: String,
+}
+
+pub fn typed_word_at(text: &str, caret: Option<usize>) -> TypedWord {
     let chars: Vec<char> = text.chars().collect();
     let at = caret.unwrap_or(chars.len()).min(chars.len());
     let is_word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
@@ -1071,33 +1100,67 @@ pub fn word_at(text: &str, caret: Option<usize>) -> (usize, usize, String) {
     while end < chars.len() && is_word(&chars[end]) {
         end += 1;
     }
-    (start, end, chars[start..end].iter().collect())
+    // A name followed by its brackets is one thing to wrap, so scan the call
+    // out to its matching `)`. An unbalanced tail is left alone: wrapping half
+    // a call would move a bracket the user still has to close.
+    let mut wrap_end = end;
+    if chars.get(end) == Some(&'(') {
+        let mut depth = 0usize;
+        for (i, c) in chars.iter().enumerate().skip(end) {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wrap_end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    TypedWord {
+        prefix: chars[start..at].iter().collect(),
+        wrapped: chars[at..wrap_end].iter().collect(),
+        whole: chars[start..end].iter().collect(),
+        start,
+        end,
+        wrap_end,
+    }
 }
 
-/// The completion list to offer for `word`: each matching function's signature,
-/// followed by any ready-made calls it offers. `None` when there is nothing
-/// worth showing.
+/// The completion list to offer while `prefix` is being typed: each matching
+/// function's signature, followed by any ready-made calls it offers. `None`
+/// when there is nothing worth showing.
 ///
-/// `browse` is "the user asked for the list" (the ƒ button, or Enter in the
+/// `browse` is "the user asked for the list" (Ctrl+Space, or Enter in the
 /// terminal wizard) rather than "the user is typing": it is the only thing that
 /// makes an empty word offer the whole catalogue, because a list that appeared
 /// over an empty cell on its own would be in the way of every other way of
 /// filling it in.
 ///
-/// A name already typed in full and matching nothing else offers nothing: a
-/// dropdown that will not close reads as the editor refusing what was typed.
+/// `whole` is the word both sides of the caret. A name already typed in full
+/// and matching nothing else offers nothing: a dropdown that will not close
+/// reads as the editor refusing what was typed, and a caret dropped in the
+/// middle of a finished `uuid` to edit it would otherwise open a list over the
+/// row below.
 ///
 /// Shared by both front-ends deliberately. They had the same list built twice
 /// from the same table, which is how the two came to disagree about when it
 /// should appear.
-pub fn suggestions_for_word(word: &str, browse: bool) -> Option<Vec<&'static str>> {
-    if word.is_empty() && !browse {
+pub fn suggestions_for_word(prefix: &str, whole: &str, browse: bool) -> Option<Vec<&'static str>> {
+    if prefix.is_empty() && !browse {
         return None;
     }
-    let sugs: Vec<&'static str> = functions_starting_with(word)
+    let sugs: Vec<&'static str> = functions_starting_with(prefix)
         .flat_map(|f| std::iter::once(f.signature).chain(f.examples.iter().copied()))
         .collect();
-    let done = sugs.len() == 1 && is_function(word);
+    // A function that carries ready-made example calls still has something to
+    // offer once its name is complete -- `date` is the whole reason the
+    // examples exist -- so "nothing left to choose" is about the rows, not the
+    // name.
+    let done = sugs.len() == 1 && is_function(whole);
     (!sugs.is_empty() && !done).then_some(sugs)
 }
 
@@ -1276,6 +1339,35 @@ fn percent_decode(s: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The two halves of the word at the caret mean different things: what is
+    /// typed filters the list, what follows is what a call would wrap.
+    #[test]
+    fn a_word_is_split_at_the_caret() {
+        let w = typed_word_at("tuuid", Some(1));
+        assert_eq!(w.prefix, "t", "only the typed part filters the list");
+        assert_eq!(w.wrapped, "uuid");
+        assert_eq!((w.start, w.end, w.wrap_end), (0, 5, 5));
+    }
+
+    /// A name followed by its brackets is one thing to wrap: the caret in
+    /// `b|sha256(x)` is in front of the whole call, not just the name.
+    #[test]
+    fn the_call_after_the_caret_is_wrapped_whole() {
+        let w = typed_word_at("bsha256(md5(x))", Some(1));
+        assert_eq!(w.prefix, "b");
+        assert_eq!(w.wrapped, "sha256(md5(x))");
+        assert_eq!(w.wrap_end, 15);
+    }
+
+    /// An unbalanced tail is left alone -- wrapping half a call would move a
+    /// bracket the user still has to close.
+    #[test]
+    fn an_unclosed_call_is_not_wrapped() {
+        let w = typed_word_at("bsha256(md5(", Some(1));
+        assert_eq!(w.wrapped, "sha256", "only the name, not the open call");
+        assert_eq!(w.wrap_end, w.end);
+    }
+
     use super::*;
 
     fn parse(src: &str) -> Result<Expr, String> {
