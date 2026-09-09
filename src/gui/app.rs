@@ -345,6 +345,19 @@ fn logo_color_image() -> Option<egui::ColorImage> {
     ))
 }
 
+/// How a status message is marked: its icon and its colour.
+///
+/// The two say the same thing twice on purpose -- colour alone is no answer for
+/// someone who cannot tell these two apart, and this line is where a failed
+/// save is reported.
+fn status_badge(status: &crate::i18n::Status, theme: &GuiTheme) -> (&'static str, egui::Color32) {
+    if status.is_ok() {
+        (super::icons::PASS, theme.ok)
+    } else {
+        (super::icons::WARNING, theme.err)
+    }
+}
+
 impl GuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Register the Phosphor icon font so the tree/button icons render (see
@@ -1427,13 +1440,36 @@ impl GuiApp {
             let h = ui.text_style_height(&egui::TextStyle::Body);
             ui.add(egui::Image::new((logo.id(), egui::vec2(h, h))));
             ui.add_space(4.0);
-            let msg = self
-                .session
-                .status
-                .as_ref()
-                .map(|s| s.text(&self.strings))
-                .unwrap_or_default();
-            ui.colored_label(self.theme.dim, msg);
+            // Coloured and marked by outcome, as the terminal UI has always
+            // drawn it. Every message shared one dim grey here, so the line
+            // that says a save failed looked exactly like the line that says
+            // which theme is loaded -- and the rest of this bar is dim too, so
+            // there was nothing to catch the eye of someone looking at the
+            // request they had just sent. The icon carries the same answer as
+            // the colour, for anyone who cannot tell the two colours apart.
+            if let Some(status) = self.session.status.as_ref() {
+                let (icon, color) = status_badge(status, &self.theme);
+                let text = status.text(&self.strings);
+                // Clickable, because the terminal UI advertises a copy key for
+                // this line and a long parse error is exactly what someone
+                // wants to paste somewhere. The message is left on screen
+                // afterwards rather than replaced with "copied": what was
+                // copied is the thing worth still being able to read.
+                if ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{icon} {text}"))
+                                .color(color)
+                                .strong(),
+                        )
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(self.strings.gui_status_copy_hint)
+                    .clicked()
+                {
+                    ui.ctx().copy_text(text);
+                }
+            }
             // An import that was sent to the background reports from here, and
             // clicking it is the way back to the dialog. Computed before the
             // click so `self.postman` isn't borrowed twice.
@@ -1798,6 +1834,27 @@ fn report_id_clashes(_ctx: &egui::Context) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The terminal UI has always drawn this line in the outcome's colour;
+    /// the GUI drew every message in the one dim grey the rest of the bar uses,
+    /// so a failed save read like a note about which theme was loaded.
+    #[test]
+    fn a_status_message_is_marked_by_its_outcome() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let (ok_icon, ok_color) = status_badge(&crate::i18n::Status::Saved, &theme);
+        let (bad_icon, bad_color) = status_badge(&crate::i18n::Status::Error("no".into()), &theme);
+
+        assert_eq!(ok_color, theme.ok);
+        assert_eq!(bad_color, theme.err);
+        assert_ne!(
+            bad_color, theme.dim,
+            "a failure has to be told apart from the rest of the status bar"
+        );
+        assert_ne!(
+            ok_icon, bad_icon,
+            "colour alone is no answer for someone who cannot tell these two apart"
+        );
+    }
 
     fn edited_collection(name: &str) -> crate::collection::Collection {
         let mut e = crate::hurl::HurlEntry::default();

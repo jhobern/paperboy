@@ -257,6 +257,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   `[Asserts]`, and the block below is coloured as a section. The `#` stays, so
   copying the pane still gives valid Hurl.
 
+### Changed
+
+- **The GUI's status message is drawn in the outcome's colour, as the terminal
+  UI has always drawn it.** Every message shared the one dim grey the rest of
+  the status bar uses, so "could not write file" looked exactly like a note
+  about which theme was loaded. It now carries a tick or a warning sign and the
+  matching colour -- the icon saying the same thing as the colour, for anyone
+  who cannot tell the two apart -- and clicking it copies the text, which the
+  terminal UI has long offered with `^y`.
+
 ### Fixed
 
 - **Postman collections written against the older script API import their
