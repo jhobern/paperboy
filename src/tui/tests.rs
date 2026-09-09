@@ -6459,6 +6459,37 @@ fn saving_to_a_tag_that_already_exists_is_rejected_and_never_overwritten() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A refused send reports the same generator failure through two channels:
+/// the pre-flight check that saw it coming, and the response that carries the
+/// refusal. Both are on screen at once, a few rows apart, so printing the
+/// finding twice reads as two things having gone wrong.
+#[test]
+fn a_refused_send_is_only_reported_once() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let errors = vec![crate::generators::GenError::UndefinedReference {
+        name: "broken".into(),
+        reference: "nothing_defines_this".into(),
+    }];
+    let mut app = TuiApp::default();
+    app.status = Some(crate::i18n::Status::GeneratorErrors(errors.clone()));
+    {
+        let mut r = app.response.lock().unwrap();
+        r.error = "broken: nothing defines nothing_defines_this".into();
+        r.gen_errors = errors;
+    }
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert_eq!(
+        text.matches("nothing_defines_this").count(),
+        1,
+        "one failure, said once:\n{text}"
+    );
+}
+
 fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
     let area = buf.area();
     let mut out = String::new();

@@ -2068,10 +2068,19 @@ pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     ];
     // Surface the last runner error (transport failure / failed assert / parse
     // error) here on the status bar so it is never silently swallowed.
-    let error = { app.response.lock().unwrap().error.clone() };
-    if !error.is_empty() {
+    // `error_text`, not `error`: a request refused because a `# [Gen]` row
+    // failed reports that in the reader's language, under the heading the
+    // pre-flight check uses.
+    let error = { app.response.lock().unwrap().error_text(s) };
+    // Not when the status line is already saying it, word for word. A refused
+    // send reports the same generator failure through both channels -- the
+    // pre-flight check that saw it coming and the response that carries the
+    // refusal -- and printing one finding twice, a few rows apart, reads as
+    // two things having gone wrong.
+    let echoes_status = app.status.as_ref().is_some_and(|st| st.text(s) == error);
+    if !error.is_empty() && !echoes_status {
         spans.push(Span::styled(
-            format!("   {} {error}", s.req_error_prefix),
+            format!("   {error}"),
             Style::default().fg(th.err).add_modifier(Modifier::BOLD),
         ));
     }
@@ -4103,7 +4112,8 @@ pub(crate) fn draw_response(
                 r.status,
                 r.status_text.clone(),
                 r.body.clone(),
-                r.error.clone(),
+                // Already headed and localised -- see `ApiResponse::error_text`.
+                r.error_text(s),
                 r.assert_results.clone(),
                 r.duration_ms,
                 r.headers.clone(),
@@ -4159,7 +4169,7 @@ pub(crate) fn draw_response(
             // like any response body — the red fg is applied as the paragraph's
             // fallback style, and the panel still owns wrapping/scrolling for
             // long errors.
-            let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+            let content: Arc<str> = Arc::from(error.clone());
             app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
             app.resp_panel
                 .set_content(content, inner.width.max(1) as usize);
@@ -4278,10 +4288,7 @@ pub(crate) fn draw_response(
     f.render_widget(Paragraph::new(Line::from(status_spans)), rows[0]);
     if show_err_line {
         f.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{} {error}", s.req_error_prefix),
-                Style::default().fg(th.err),
-            )),
+            Paragraph::new(Line::styled(error.clone(), Style::default().fg(th.err))),
             rows[1],
         );
     }

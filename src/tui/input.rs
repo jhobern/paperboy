@@ -159,8 +159,14 @@ impl TuiApp {
                 parts.push(st.text(&Strings::for_language(&self.language)));
             }
             if self.overlay.is_none() {
-                let err = self.response.lock().unwrap().error.clone();
-                if !err.is_empty() {
+                let err = self
+                    .response
+                    .lock()
+                    .unwrap()
+                    .error_text(&Strings::for_language(&self.language));
+                // Both channels report a refused send, in the same words --
+                // copy the finding once (see the topbar in `draw`).
+                if !err.is_empty() && !parts.contains(&err) {
                     parts.push(err);
                 }
             }

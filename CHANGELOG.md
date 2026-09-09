@@ -259,6 +259,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A refused send is reported the way the pre-flight check reports it, once.**
+  A request stopped by a failed `# [Gen]` row was shown as "Request error:
+  broken: nothing defines nothing_defines_this" -- an English sentence from the
+  runner (which has no `Strings`) under a heading naming a request that was
+  never made. The failures now travel with the response, so both front-ends say
+  what the check says, in the reader's language: "Generated values not set:
+  ...". And they say it once: the check and the refusal are two channels
+  carrying one finding, and printing it twice a few rows apart read as two
+  things having gone wrong.
+
 - **A request that cannot be built now stops sending.** A failed `# [Gen]` row
   (or an unreadable body file, or a parse error) means no entry ever runs, and
   the "nothing ran" path set the error and said nothing else — so the request

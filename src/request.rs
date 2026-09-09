@@ -800,7 +800,7 @@ pub fn run_resolved_entry(
 }
 
 /// [`run_resolved_entry`], also handing back what the request's `# [Gen]` block
-/// computed for *this* send.
+/// computed for *this* send, and the rows that failed to compute.
 ///
 /// A generator is the pre-request script's job: a request that signs itself
 /// computes a `nonce` the request after it is expected to echo. Re-evaluating
@@ -815,7 +815,7 @@ pub fn run_resolved_entry_reporting(
     vars: &HashMap<String, String>,
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
-) -> (RunOutput, HashMap<String, String>) {
+) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
@@ -831,6 +831,7 @@ pub fn run_resolved_entry_reporting(
                 error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
             },
             HashMap::new(),
+            Vec::new(),
         );
     }
     let (vars, gen_errors) = effective_vars_reporting(base, vars);
@@ -850,6 +851,7 @@ pub fn run_resolved_entry_reporting(
                 error: Some(crate::i18n::describe_gen_errors(&english, &gen_errors).join("; ")),
             },
             HashMap::new(),
+            gen_errors,
         );
     }
     // Read off the block's results *before* the borrow of `vars` ends: these
@@ -873,6 +875,7 @@ pub fn run_resolved_entry_reporting(
                 error: Some(format!("Base64 file error: {e}")),
             },
             generated,
+            Vec::new(),
         );
     }
     let staged_dir = stage_out_of_scope_form_files(&mut entries, file_root).unwrap_or_default();
@@ -885,7 +888,7 @@ pub fn run_resolved_entry_reporting(
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
-    (out, generated)
+    (out, generated, Vec::new())
 }
 
 /// Why a request that could not be read cannot be sent. Front-end agnostic, so
@@ -943,10 +946,14 @@ pub fn run_collection(
         // and the report interpreter stay in exact lockstep. A base64/staging
         // failure comes back as `RunOutput { entries: [], error }` and surfaces
         // via the `None` arm below.
-        let (out, generated) =
+        let (out, generated, gen_errors) =
             run_resolved_entry_reporting(&base, &vars, file_root.as_deref(), &[]);
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // Kept structurally as well as in `error`: only the front-end knows
+        // the language, and "Request error:" is the wrong heading for a
+        // request that was never made (see `ApiResponse::error_text`).
+        r.gen_errors = gen_errors;
         match out.entries.into_iter().next() {
             Some(eo) => {
                 r.status = eo.status;
@@ -1008,6 +1015,10 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
         duration_ms: Some(eo.duration_ms),
+        // A "Run All" entry that ran has no generator failure to carry: the
+        // whole-file block is expanded once, up front, and its failures are
+        // reported for the run rather than against one response.
+        gen_errors: Vec::new(),
     }
 }
 
@@ -2301,7 +2312,8 @@ mod tests {
     #[test]
     fn a_send_hands_back_what_its_gen_block_computed() {
         let entry = entry_with_generators("https://127.0.0.1:1/", &[("nonce", "\"fixed\"")]);
-        let (_out, generated) = run_resolved_entry_reporting(&entry, &HashMap::new(), None, &[]);
+        let (_out, generated, _errs) =
+            run_resolved_entry_reporting(&entry, &HashMap::new(), None, &[]);
         assert_eq!(
             generated.get("nonce").map(String::as_str),
             Some("fixed"),

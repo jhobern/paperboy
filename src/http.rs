@@ -82,6 +82,14 @@ pub struct ApiResponse {
     /// response constructed before a run completed, or a transport error with
     /// no timing.
     pub duration_ms: Option<u64>,
+    /// Why the request never left, when a `# [Gen]` row was what stopped it.
+    /// `error` carries the same finding as one English sentence, because the
+    /// runner is front-end agnostic and has no `Strings`; this is the same
+    /// thing structurally, so a front-end that *does* know the language can
+    /// say it the way the pre-flight check says it ("Generated values not
+    /// set: ...") rather than prefixing the English text with "Request
+    /// error:", which names the wrong subject -- there was no request.
+    pub gen_errors: Vec<crate::generators::GenError>,
 }
 
 impl ApiResponse {
@@ -95,5 +103,84 @@ impl ApiResponse {
         self.headers.clear();
         self.assert_results.clear();
         self.duration_ms = None;
+        self.gen_errors.clear();
+    }
+
+    /// The error to show the reader, in their language: a generator failure is
+    /// the pre-flight report verbatim, anything else is the runner's own
+    /// message under the "Request error:" heading. Empty when the request did
+    /// not fail.
+    pub fn error_text(&self, s: &crate::i18n::Strings) -> String {
+        if !self.gen_errors.is_empty() {
+            return crate::i18n::Status::GeneratorErrors(self.gen_errors.clone()).text(s);
+        }
+        if self.error.is_empty() {
+            return String::new();
+        }
+        format!("{} {}", s.req_error_prefix, self.error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generators::GenError;
+    use crate::i18n::{Language, Strings};
+
+    /// A request refused before it left is not a "Request error": there was no
+    /// request. The runner has no `Strings` and says so in one English
+    /// sentence; the front-end has both, and must say what the pre-flight
+    /// check says -- in the reader's language, under the same heading.
+    #[test]
+    fn a_refused_send_is_reported_the_way_the_check_reports_it() {
+        let errors = vec![GenError::UndefinedReference {
+            name: "broken".into(),
+            reference: "nothing_defines_this".into(),
+        }];
+        let r = ApiResponse {
+            error: "broken: nothing defines nothing_defines_this".into(),
+            gen_errors: errors.clone(),
+            ..Default::default()
+        };
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            assert_eq!(
+                r.error_text(&s),
+                crate::i18n::Status::GeneratorErrors(errors.clone()).text(&s),
+                "the refusal reads exactly as the pre-flight check reads"
+            );
+            assert!(
+                !r.error_text(&s).contains(s.req_error_prefix),
+                "and not under a heading naming a request that was never made"
+            );
+        }
+    }
+
+    /// Everything else still is a runner error, and still says so.
+    #[test]
+    fn a_transport_failure_keeps_the_runner_heading() {
+        let r = ApiResponse {
+            error: "connection refused".into(),
+            ..Default::default()
+        };
+        let s = Strings::for_language(&Language::English);
+        assert_eq!(r.error_text(&s), "Request error: connection refused");
+        assert!(
+            ApiResponse::default().error_text(&s).is_empty(),
+            "a request that has not failed has nothing to say"
+        );
+    }
+
+    /// `begin` clears the last refusal along with the last response: without
+    /// it a send that succeeds would still be described by the generator
+    /// failure that stopped the previous one.
+    #[test]
+    fn starting_a_send_forgets_the_last_refusal() {
+        let mut r = ApiResponse {
+            gen_errors: vec![GenError::Cycle { name: "a".into() }],
+            ..Default::default()
+        };
+        r.begin();
+        assert!(r.gen_errors.is_empty());
     }
 }
