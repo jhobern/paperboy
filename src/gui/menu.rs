@@ -215,6 +215,11 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
         settings_menu(app, ui);
         view_menu(app, ui);
         help_menu(app, ui);
+        // The status message rides along here, to the right of the menus,
+        // exactly where the terminal UI draws it. See `GuiApp::status_message`
+        // for why it is not in the status bar at the foot of the window.
+        ui.add_space(16.0);
+        app.status_message(ui);
         // No Send button here. There used to be one pinned to the right of this
         // bar, doing exactly what the Send beside the URL does (`run_active`) —
         // but it was drawn unconditionally, so in the report editor or a

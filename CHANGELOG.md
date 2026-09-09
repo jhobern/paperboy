@@ -265,7 +265,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   about which theme was loaded. It now carries a tick or a warning sign and the
   matching colour -- the icon saying the same thing as the colour, for anyone
   who cannot tell the two apart -- and clicking it copies the text, which the
-  terminal UI has long offered with `^y`.
+  terminal UI has long offered with `^y`. It has also moved up to the menu row,
+  where the terminal UI puts it: at the foot of the window it sat among the
+  logo, the theme name and the environment, none of which ever change on their
+  own, and as far from the request just sent as the window allows. Those three
+  stay where they were.
 
 ### Fixed
 

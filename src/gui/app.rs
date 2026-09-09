@@ -1426,6 +1426,45 @@ impl GuiApp {
         }
     }
 
+    /// The transient status message ("Saved", "Could not write file: …"),
+    /// drawn on the menu row where the terminal UI puts it.
+    ///
+    /// Deliberately not down in the status bar with the logo, the theme name
+    /// and the active environment. Those never change unless the user changes
+    /// them, so nothing down there is ever worth a second look -- and a message
+    /// that appears for a moment, among things trained to be ignored, at the
+    /// far end of the window from the request just sent, was missed. Up here it
+    /// shares the row the user is already using.
+    ///
+    /// Coloured and marked by outcome, with the icon repeating what the colour
+    /// says for anyone who cannot tell the two apart.
+    pub(super) fn status_message(&mut self, ui: &mut egui::Ui) {
+        let Some(status) = self.session.status.as_ref() else {
+            return;
+        };
+        let (icon, color) = status_badge(status, &self.theme);
+        let text = status.text(&self.strings);
+        // Clickable, because the terminal UI advertises a copy key for this
+        // line and a long parse error is exactly what someone wants to paste
+        // somewhere. The message is left on screen afterwards rather than
+        // replaced with "copied": what was copied is the thing worth still
+        // being able to read.
+        if ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(format!("{icon} {text}"))
+                        .color(color)
+                        .strong(),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(self.strings.gui_status_copy_hint)
+            .clicked()
+        {
+            ui.ctx().copy_text(text);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // The PaperBoy logo badge, lazily uploaded on first use. Drawn at
@@ -1440,36 +1479,6 @@ impl GuiApp {
             let h = ui.text_style_height(&egui::TextStyle::Body);
             ui.add(egui::Image::new((logo.id(), egui::vec2(h, h))));
             ui.add_space(4.0);
-            // Coloured and marked by outcome, as the terminal UI has always
-            // drawn it. Every message shared one dim grey here, so the line
-            // that says a save failed looked exactly like the line that says
-            // which theme is loaded -- and the rest of this bar is dim too, so
-            // there was nothing to catch the eye of someone looking at the
-            // request they had just sent. The icon carries the same answer as
-            // the colour, for anyone who cannot tell the two colours apart.
-            if let Some(status) = self.session.status.as_ref() {
-                let (icon, color) = status_badge(status, &self.theme);
-                let text = status.text(&self.strings);
-                // Clickable, because the terminal UI advertises a copy key for
-                // this line and a long parse error is exactly what someone
-                // wants to paste somewhere. The message is left on screen
-                // afterwards rather than replaced with "copied": what was
-                // copied is the thing worth still being able to read.
-                if ui
-                    .add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("{icon} {text}"))
-                                .color(color)
-                                .strong(),
-                        )
-                        .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text(self.strings.gui_status_copy_hint)
-                    .clicked()
-                {
-                    ui.ctx().copy_text(text);
-                }
-            }
             // An import that was sent to the background reports from here, and
             // clicking it is the way back to the dialog. Computed before the
             // click so `self.postman` isn't borrowed twice.
@@ -1834,6 +1843,66 @@ fn report_id_clashes(_ctx: &egui::Context) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message that appears for a moment has to appear where the user is
+    /// looking. At the foot of the window it sat among the logo, the theme name
+    /// and the environment -- none of which ever change on their own, so
+    /// nothing down there is worth a second look -- and as far from the request
+    /// just sent as the window allows. The terminal UI puts it on the menu row,
+    /// and so does this.
+    #[test]
+    fn the_status_message_is_drawn_on_the_menu_row() {
+        super::super::requests::tests::redirect_saved_state();
+        let mut app = GuiApp::for_test(Session::default());
+        app.session.status = Some(crate::i18n::Status::Error("disc on fire".into()));
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let height = 800.0;
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, height),
+        ));
+        let out = ctx.run_ui(input, |ui| app.draw(ui));
+
+        let mut found = Vec::new();
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    out.push(t.visual_bounding_rect())
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, "disc on fire", &mut found);
+        }
+        let rect = found
+            .first()
+            .unwrap_or_else(|| panic!("the status message was not painted at all"));
+        assert!(
+            rect.top() < 80.0,
+            "the message should ride the menu row, but was painted at y={} of {height}",
+            rect.top()
+        );
+
+        // The frame really is laid out full-height, so that coordinate means
+        // something: the theme name -- which belongs at the foot of the window
+        // and stays there -- is painted right at the bottom of the same frame.
+        let mut bottom = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, app.strings.gui_theme_status_label, &mut bottom);
+        }
+        let theme_rect = bottom
+            .first()
+            .unwrap_or_else(|| panic!("the status bar was not painted"));
+        assert!(
+            theme_rect.top() > height - 80.0,
+            "the ambient status bar should still be at the foot: y={}",
+            theme_rect.top()
+        );
+    }
 
     /// The terminal UI has always drawn this line in the outcome's colour;
     /// the GUI drew every message in the one dim grey the rest of the bar uses,
