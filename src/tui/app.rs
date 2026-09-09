@@ -2259,7 +2259,13 @@ impl TuiApp {
                             // UI-only and never written to Hurl text); preserve
                             // it from the entry being replaced.
                             parsed.user_added = entry.user_added;
-                            parsed.modified = true;
+                            // The reparsed entry is a fresh struct, so it
+                            // carries no baseline of its own: take the one
+                            // belonging to the request it replaces, or an edit
+                            // typed and untyped again would still read as
+                            // unsaved.
+                            parsed.baseline = entry.baseline.clone();
+                            parsed.mark_edited();
                             *entry = parsed;
                         }
                     }
@@ -2314,7 +2320,8 @@ impl TuiApp {
                             || entry.cookies != parsed.cookies
                             || entry.body_src != parsed.body_src;
                         if changed {
-                            parsed.modified = true;
+                            parsed.baseline = entry.baseline.clone();
+                            parsed.mark_edited();
                             *entry = parsed;
                         }
                     }

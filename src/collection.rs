@@ -1241,6 +1241,10 @@ impl Collection {
     pub fn reset_structure_baseline(&mut self) {
         for e in &mut self.entries {
             e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);
+            // The same moment settles each request's *content* baseline: this
+            // is where the list and the file agree, so it is where "what the
+            // file says" is worth recording (see `HurlEntry::baseline`).
+            e.set_baseline();
         }
         self.structure_baseline = self.structure_fingerprint();
         self.structure_modified = false;

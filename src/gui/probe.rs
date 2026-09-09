@@ -544,7 +544,7 @@ pub(super) fn apply(app: &mut GuiApp, builder: &ProbeBuilder, verb: &Verb, name:
         }
     };
     if changed {
-        target.modified = true;
+        target.mark_edited();
         col.invalidate_request_json();
         app.session.save();
     }

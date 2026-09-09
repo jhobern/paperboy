@@ -451,7 +451,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             match &entries[..] {
                 [only] if !only.is_unreadable() => {
                     let mut healed = only.clone();
-                    healed.modified = true;
+                    // Reparsed text is a fresh struct with no baseline of its
+                    // own; the one that matters belongs to the request it is
+                    // replacing.
+                    healed.baseline = col.entries[sel].baseline.clone();
+                    healed.mark_edited();
                     col.entries[sel] = healed;
                 }
                 _ => col.entries[sel].unparsed = Some(raw),
@@ -764,7 +768,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     app.show_hurl = code_show_hurl;
     if changed {
         let col = &mut app.session.collections[ci];
-        col.entries[sel].modified = true;
+        col.entries[sel].mark_edited();
         col.invalidate_request_json();
     }
     if send {
@@ -2030,7 +2034,7 @@ pub(super) fn apply_extract_parameter(
             true,
         ));
     }
-    e.modified = true;
+    e.mark_edited();
     col.invalidate_request_json();
 }
 
@@ -2059,7 +2063,7 @@ pub(super) fn apply_picked_form_file(
         return;
     };
     f.value = path.to_string_lossy().into_owned();
-    e.modified = true;
+    e.mark_edited();
     col.invalidate_request_json();
 }
 
@@ -3295,6 +3299,37 @@ mod computed_suggestion_tests {
             expr(&app).contains("timestamp_ms"),
             "the menu never wrote the call in: {:?}",
             expr(&app)
+        );
+    }
+
+    /// An edit undone is not an edit: the pencil marker has to go away again.
+    ///
+    /// It used to latch -- change an expression, change it back, and the
+    /// request still offered to save a file it already matched.
+    #[test]
+    fn changing_an_expression_back_clears_the_edited_marker() {
+        let mut app = app_with_row("nonce", "uuid");
+        app.session.collections[0].reset_structure_baseline();
+        assert!(
+            !app.session.collections[0].entries[0].modified,
+            "a request straight off disk is not edited"
+        );
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("4".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "uuid4");
+        assert!(
+            app.session.collections[0].entries[0].modified,
+            "the edit was never noticed"
+        );
+        h.frame(&mut app, key(egui::Key::Backspace), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "uuid");
+        assert!(
+            !app.session.collections[0].entries[0].modified,
+            "the request matches the file again, so the pencil should be gone"
         );
     }
 

@@ -664,6 +664,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         comments: Vec::new(),
         user_added: base.user_added,
         modified: base.modified,
+        baseline: None,
         last_run: base.last_run,
         last_response: None,
     }

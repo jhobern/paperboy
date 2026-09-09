@@ -406,7 +406,7 @@ impl crate::tui::app::TuiApp {
                     return;
                 }
                 entry.expected_status = Some(code);
-                entry.modified = true;
+                entry.mark_edited();
                 self.status = Some(crate::i18n::Status::ProbeStatusSet(code));
             }
             Verb::Assert(predicate) => {
@@ -419,7 +419,7 @@ impl crate::tui::app::TuiApp {
                     return;
                 }
                 entry.asserts.push(line.clone());
-                entry.modified = true;
+                entry.mark_edited();
                 self.status = Some(crate::i18n::Status::ProbeAssertAdded(line));
             }
         }
@@ -491,7 +491,7 @@ impl crate::tui::app::TuiApp {
             Some(existing) => existing.1 = row.1.clone(),
             None => target.captures.push(row.clone()),
         }
-        target.modified = true;
+        target.mark_edited();
         self.status = Some(crate::i18n::Status::ProbeCaptureAdded(row.0));
         self.after_probe_edit(ci);
     }

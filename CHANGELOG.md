@@ -241,6 +241,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **An edit undone stops counting as an edit.** Changing a request — a generated
+  expression, a header, a URL — and then changing it back left the pencil marker
+  on it, so it went on offering to save a file it already matched. Each request
+  now remembers its text as of the last read or write and compares against it,
+  the way a reordered collection already decided whether it was still reordered.
+  A request restored from the saved session has no file to have agreed with, so
+  there the marker latches as before.
+
 - **A folder's requests are drawn under that folder.** A `.hurl` file is free to
   interleave folders — `Auth/Login`, `Users/List`, `Auth/Logout` is a perfectly
   ordinary import — and the tree drew each request where the file listed it, so

@@ -697,6 +697,24 @@ pub struct HurlEntry {
     #[serde(default)]
     pub modified: bool,
 
+    /// The request's text as it was last read from or written to disk, which
+    /// [`Self::mark_edited`] compares against to decide whether it is still
+    /// edited.
+    ///
+    /// Derived rather than latched, for the reason
+    /// `Collection::structure_modified` is: a flag that only ever went *true*
+    /// left a request marked unsaved after the edit had been undone -- change
+    /// an expression, change it back, and the pencil stayed, offering to save a
+    /// file that already matches.
+    ///
+    /// Runtime-only, and so not serialised: a session restored from
+    /// `state.json` has no file to have agreed with (a Workspace tab re-reads
+    /// its entries from disk, an ordinary tab's are the saved state itself), so
+    /// there is nothing honest to compare against. With no baseline
+    /// `mark_edited` latches, which is the old behaviour.
+    #[serde(default, skip_serializing)]
+    pub baseline: Option<String>,
+
     /// A runtime identity for this entry, used only to tell whether the
     /// collection's entry *list* still matches the one on disk — see
     /// `Collection::structure_baseline`.
@@ -950,6 +968,25 @@ fn encode_body_block(src: &str) -> String {
 }
 
 impl HurlEntry {
+    /// Record this request's current text as the one on disk, so later edits
+    /// are measured against it. See [`Self::baseline`].
+    pub fn set_baseline(&mut self) {
+        self.baseline = Some(self.to_hurl());
+    }
+
+    /// Say that this request has just been edited.
+    ///
+    /// Whether that leaves it *modified* is a question about the file, not
+    /// about the edit: typing a character and typing it back out again is two
+    /// edits and no change. With no baseline to compare against (see
+    /// [`Self::baseline`]) the flag latches, as it always did.
+    pub fn mark_edited(&mut self) {
+        self.modified = match &self.baseline {
+            Some(disk) => &self.to_hurl() != disk,
+            None => true,
+        };
+    }
+
     /// A request recovered from text that could not be parsed: kept verbatim,
     /// shown in the list, and written back out unchanged.
     ///

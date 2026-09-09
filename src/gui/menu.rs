@@ -2522,7 +2522,7 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
                     if let Some(col) = app.session.collections.get_mut(ci) {
                         if let Some(entry) = col.entries.get_mut(idx) {
                             entry.title = text.clone();
-                            entry.modified = true;
+                            entry.mark_edited();
                         }
                         col.invalidate_request_json();
                     }

@@ -538,6 +538,7 @@ fn map_entry(
         ),
         user_added: false,
         modified: false,
+        baseline: None,
         last_run: RunStatus::default(),
         last_response: None,
     }
