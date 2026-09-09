@@ -253,7 +253,7 @@ fn url_from_parts(m: &serde_json::Map<String, Value>) -> String {
 /// that `raw` already had it, which silently changed the request. Matching on
 /// the parameter *name* means a parameter that is in both is never duplicated.
 fn merge_enabled_queries(raw: &str, queries: &[Param]) -> String {
-    let existing: Vec<&str> = raw
+    let mut existing: Vec<&str> = raw
         .split_once('?')
         .map(|(_, q)| {
             q.split('&')
@@ -264,7 +264,20 @@ fn merge_enabled_queries(raw: &str, queries: &[Param]) -> String {
     let missing: Vec<String> = queries
         .iter()
         .filter(|q| !q.disabled && !q.key.trim().is_empty())
-        .filter(|q| !existing.contains(&q.key.as_str()))
+        .filter(|q| {
+            // Matched off one for one rather than by name alone. A key is
+            // allowed to appear more than once -- `?tag=a&tag=b` is how a list
+            // is sent -- and treating the name as seen once and for all
+            // dropped every repeat after the first, quietly narrowing the
+            // request to one value of a set.
+            match existing.iter().position(|k| *k == q.key.as_str()) {
+                Some(i) => {
+                    existing.remove(i);
+                    false
+                }
+                None => true,
+            }
+        })
         .map(|q| {
             if q.value.is_empty() {
                 q.key.clone()
@@ -609,6 +622,12 @@ struct EnvValue {
     /// variable has been ticked off, so defaulting it to `false` (as
     /// `#[serde(default)]` would) would silently drop every variable.
     enabled: Option<bool>,
+    /// `"secret"` for a value Postman masks in its own UI. Nothing here can
+    /// keep it masked -- a `.vars` file is plain text and so is the session
+    /// state -- but it is worth saying so on the way in (see
+    /// [`postman_env_secret_keys`]).
+    #[serde(rename = "type", default, deserialize_with = "de_str")]
+    kind: String,
 }
 
 /// The `KEY`/value pairs of a Postman environment export, or `None` if
@@ -621,6 +640,35 @@ struct EnvValue {
 /// flattened to a space — a `.vars` file is line-based, so keeping the break
 /// would split one variable into two on the next save/reload.
 pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
+    Some(
+        env_values(content)?
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect(),
+    )
+}
+
+/// The keys Postman had marked secret, in the order they appear.
+///
+/// PaperBoy has nowhere to *keep* a secret literal: a `.vars` file is plain
+/// text, and so is the session state it is remembered in. Importing one is
+/// therefore a decision about where a secret lives, and the import says so
+/// rather than quietly copying it into a second plaintext file -- with the
+/// provider references (`{{ op://… }}`, `{{ ssm:… }}`) that *are* the answer
+/// named in the note.
+pub fn postman_env_secret_keys(content: &str) -> Vec<String> {
+    env_values(content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, secret)| *secret)
+        .map(|(k, _, _)| k)
+        .collect()
+}
+
+/// The shared read behind [`postman_env_values`] and
+/// [`postman_env_secret_keys`]: key, value, and whether Postman called it a
+/// secret.
+fn env_values(content: &str) -> Option<Vec<(String, String, bool)>> {
     let v = serde_json::from_str::<Value>(content).ok()?;
     let v = unwrap_envelope(v, "environment", "values");
     // A collection also has no `values`, but check `item` too so a document
@@ -635,7 +683,8 @@ pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
             .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
             .map(|v| {
                 let value = v.value.replace(['\n', '\r'], " ");
-                (v.key.trim().to_string(), value.trim().to_string())
+                let secret = v.kind == "secret";
+                (v.key.trim().to_string(), value.trim().to_string(), secret)
             })
             .collect(),
     )
@@ -1950,8 +1999,15 @@ fn has_script(events: &[Event], listen: &str) -> bool {
 
 // `var/let/const X = pm.response.json()` — `X` is the parsed-body variable
 // whose accessor chains map to jsonpaths.
+// `var/let/const X = pm.response.json()`, and the older
+// `JSON.parse(responseBody)` that means exactly the same thing -- a legacy
+// collection names its body variable that way, and the common name it picks
+// (`jsonData`) is only a root here by coincidence.
 static JSON_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:var|let|const)\s+(\w+)\s*=\s*pm\.response\.json\s*\(\s*\)").unwrap()
+    Regex::new(
+        r"(?:var|let|const)\s+(\w+)\s*=\s*(?:pm\.response\.json\s*\(\s*\)|JSON\.parse\s*\(\s*responseBody\s*\))",
+    )
+    .unwrap()
 });
 
 /// Best-effort scrape of a request's `test` scripts into `[Captures]`: each
@@ -2006,15 +2062,78 @@ fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
 /// `jsonData` and the bare `pm.response.json()` (the body with no variable in
 /// between). [`captures_from_events`] and [`asserts_from_events`] must build
 /// this identically, or a `set` one covers is not a capture the other emits.
-fn capture_roots(code: &str) -> Vec<String> {
-    let mut roots: Vec<String> = JSON_VAR_RE
+fn capture_roots(code: &str) -> Vec<BodyRoot> {
+    let mut roots: Vec<BodyRoot> = JSON_VAR_RE
         .captures_iter(code)
-        .map(|c| c[1].to_string())
+        .map(|c| BodyRoot::whole(&c[1]))
         .collect();
-    roots.push("jsonData".to_string());
-    roots.push("pm.response.json()".to_string());
+    roots.push(BodyRoot::whole("jsonData"));
+    roots.push(BodyRoot::whole("pm.response.json()"));
+
+    // A name standing for *part* of the body -- `const data = jsonData.data;`
+    // and then `set("id", data.id)` -- is an ordinary way to write a script
+    // against a response that nests everything one level down, and every call
+    // through such a name used to be dropped as unreadable. Resolved in passes
+    // so an alias of an alias (`const first = data.items[0]`) resolves too;
+    // the list stops growing quickly, and the cap is only there so a
+    // pathological script cannot spin.
+    for _ in 0..4 {
+        let found: Vec<BodyRoot> = ALIAS_RE
+            .captures_iter(code)
+            .filter_map(|c| {
+                let name = c[1].to_string();
+                if roots.iter().any(|r| r.name == name) {
+                    return None;
+                }
+                // Declared twice with different meanings is a question the
+                // text cannot answer, so the name is not treated as a root at
+                // all rather than resolved to whichever came first.
+                if ALIAS_RE
+                    .captures_iter(code)
+                    .filter(|d| d[1] == name)
+                    .count()
+                    > 1
+                {
+                    return None;
+                }
+                let prefix = accessor_to_jsonpath(&compact_code(&c[2]), &roots)?;
+                Some(BodyRoot { name, prefix })
+            })
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        roots.extend(found);
+    }
     roots
 }
+
+/// A name a script's accessor chains can be rooted at, and where in the
+/// response body it stands for: `$` for the body itself, or the path of the
+/// part of it the name was assigned.
+#[derive(Debug, Clone)]
+struct BodyRoot {
+    name: String,
+    prefix: String,
+}
+
+impl BodyRoot {
+    fn whole(name: &str) -> Self {
+        BodyRoot {
+            name: name.to_string(),
+            prefix: "$".to_string(),
+        }
+    }
+}
+
+// `var/let/const X = <chain>` where the chain is an accessor chain off some
+// other name -- the declaration that makes `X` stand for part of the body.
+static ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:var|let|const)\s+(\w+)\s*=\s*((?:pm\.response\.json\s*\(\s*\)|[A-Za-z_$][\w$]*)(?:\s*\.\s*\w+|\s*\[[^\]\[]*\])+)",
+    )
+    .unwrap()
+});
 
 /// The `[Captures]` row a single `pm.<store>.set(...)` call becomes, or `None`
 /// when it cannot become one — the sole authority on which `set` calls turn
@@ -2030,7 +2149,7 @@ fn capture_from_call(
     call: &CallSite,
     code: &str,
     conditional: &[bool],
-    roots: &[String],
+    roots: &[BodyRoot],
 ) -> Option<(String, String)> {
     if call.args.len() != 2 {
         return None;
@@ -2198,19 +2317,36 @@ fn compact_code(code: &str) -> String {
     out
 }
 
-/// Whether any `pm.` call in the script was left untranslated — the signal that
-/// the note has to say the rest was dropped. `covered` holds the byte ranges
-/// already accounted for.
+/// Whether any script API call was left untranslated — the signal that the note
+/// has to say the rest was dropped. `covered` holds the byte ranges already
+/// accounted for.
+///
+/// Both spellings are looked for: `pm.` is today's sandbox, `postman.` the
+/// older one it replaced. A collection written against the old API and left
+/// alone since (which is most of what people have to import) is nothing but
+/// `postman.` calls, so looking only for `pm.` reported a script that had been
+/// entirely dropped as having nothing left in it.
 fn has_uncovered_pm_code(code: &str, in_string: &[bool], covered: &[(usize, usize)]) -> bool {
-    code.match_indices("pm.").any(|(i, _)| {
-        !in_string.get(i).copied().unwrap_or(false)
-            && !covered.iter().any(|(s, e)| i >= *s && i < *e)
+    ["pm.", "postman."].iter().any(|api| {
+        code.match_indices(api).any(|(i, _)| {
+            !in_string.get(i).copied().unwrap_or(false)
+                && !covered.iter().any(|(s, e)| i >= *s && i < *e)
+        })
     })
 }
 
-// `pm.<store>.set(` — the variable stores Postman exposes.
+/// A call that stores a variable, in either spelling: `pm.<store>.set(` for the
+/// stores today's sandbox exposes, and the older
+/// `postman.setEnvironmentVariable(` / `postman.setGlobalVariable(` that
+/// preceded them. The two take the same two arguments, a name and a value, so
+/// everything downstream reads them identically -- and a collection that has
+/// not been touched since the old API was current still imports its captures
+/// and its `# [Gen]` rows rather than losing every one of them.
 static SET_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"pm\.(?:environment|collectionVariables|globals|variables)\.set\s*\(").unwrap()
+    Regex::new(
+        r"(?:pm\.(?:environment|collectionVariables|globals|variables)\.set|postman\.set(?:Environment|Global)Variable)\s*\(",
+    )
+    .unwrap()
 });
 
 // `var/let/const X = require('uuid')`, so `X.v4()` can be read as a UUID.
@@ -2498,7 +2634,7 @@ fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
 
 /// What `pm.expect(<expr>)` is asserting about, for the expressions that name
 /// something Hurl can query.
-fn expect_subject(compacted: &str, roots: &[String]) -> Option<Subject> {
+fn expect_subject(compacted: &str, roots: &[BodyRoot]) -> Option<Subject> {
     match compacted {
         "pm.response.code" => return Some(Subject::Status),
         "pm.response.responseTime" => return Some(Subject::Duration),
@@ -3009,12 +3145,17 @@ fn regex_position(out: &str, in_string: &[bool]) -> bool {
 /// (`body['a'].b["c"][0]`) into a jsonpath (`$.a.b.c[0]`). Returns `None` for
 /// anything past a simple `.ident` / `['key']` / `[n]` chain (a method call,
 /// arithmetic, …), so an unparseable capture is dropped instead of guessed.
-fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
-    let mut s = roots.iter().find_map(|r| {
-        expr.strip_prefix(r.as_str())
+fn accessor_to_jsonpath(expr: &str, roots: &[BodyRoot]) -> Option<String> {
+    // Longest name first: `data` and `dataItems` both begin the same way, and
+    // matching the shorter one would leave `Items[0]` as the chain.
+    let mut by_len: Vec<&BodyRoot> = roots.iter().collect();
+    by_len.sort_by_key(|r| std::cmp::Reverse(r.name.len()));
+    let (root, mut s) = by_len.iter().find_map(|r| {
+        expr.strip_prefix(r.name.as_str())
             .filter(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+            .map(|rest| (*r, rest))
     })?;
-    let mut path = String::from("$");
+    let mut path = root.prefix.clone();
     while !s.is_empty() {
         if let Some(rest) = s.strip_prefix('.') {
             let end = rest
@@ -3559,7 +3700,7 @@ mod tests {
 
     #[test]
     fn accessor_chains_become_jsonpaths() {
-        let roots = vec!["jsonData".to_string()];
+        let roots = vec![BodyRoot::whole("jsonData")];
         let p = |e: &str| accessor_to_jsonpath(e, &roots);
         assert_eq!(p("jsonData['token']").as_deref(), Some("$.token"));
         assert_eq!(p("jsonData[\"token\"]").as_deref(), Some("$.token"));
@@ -4992,6 +5133,22 @@ mod field_tolerance_tests {
         );
     }
 
+    /// A key is allowed to appear more than once -- `?tag=a&tag=b` is how a
+    /// list is sent -- and the merge used to treat a name as accounted for the
+    /// first time it saw it, quietly narrowing the request to one value.
+    #[test]
+    fn a_query_parameter_repeated_in_the_list_keeps_every_value() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"d","request":{"method":"GET","url":{
+            "raw":"https://h/y?tag=a",
+            "query":[{"key":"tag","value":"a"},{"key":"tag","value":"b"}]}}}]}"#;
+        let e = import_postman(json);
+        assert_eq!(
+            e[0].url, "https://h/y?tag=a&tag=b",
+            "the second value of the pair is still sent"
+        );
+    }
+
     /// A `#` on a Hurl request line starts a comment, so a fragment left in
     /// the URL took the rest of the line with it on the next read. It is not
     /// sent to a server anyway — drop it, but say so.
@@ -5707,6 +5864,81 @@ mod defect_regressions {
             c.notes.iter().any(|n| n.detail.contains("[Captures]")),
             "{:?}",
             c.notes
+        );
+    }
+
+    /// The sandbox `pm.` replaced. A collection written against it and left
+    /// alone since -- which is most of what there is to import -- had every one
+    /// of its captures dropped, and the note said the script had nothing left
+    /// in it.
+    #[test]
+    fn the_older_postman_api_still_becomes_captures() {
+        let c = conv(
+            "",
+            "var jsonData = JSON.parse(responseBody);\npostman.setEnvironmentVariable('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    /// `JSON.parse(responseBody)` is the older spelling of
+    /// `pm.response.json()`, and a script is free to give it any name it likes.
+    #[test]
+    fn a_legacy_body_variable_under_any_name_is_a_root() {
+        let c = conv(
+            "",
+            "var body = JSON.parse(responseBody);\npostman.setEnvironmentVariable('id', body.user.id);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("id".to_string(), "jsonpath \"$.user.id\"".to_string())]
+        );
+    }
+
+    /// A name standing for part of the body is an ordinary way to write a
+    /// script against a response that nests everything one level down; every
+    /// call through one used to be dropped as unreadable.
+    #[test]
+    fn a_name_standing_for_part_of_the_body_is_a_root_too() {
+        let c = conv(
+            "",
+            "const body = pm.response.json();\nconst data = body.data;\nconst first = data.items[0];\npm.environment.set('id', first.id);\npm.environment.set('total', data.total);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![
+                (
+                    "id".to_string(),
+                    "jsonpath \"$.data.items[0].id\"".to_string()
+                ),
+                ("total".to_string(), "jsonpath \"$.data.total\"".to_string()),
+            ]
+        );
+    }
+
+    /// Two declarations of one name mean two different things at two points in
+    /// the script, and the text alone cannot say which applies where. Answering
+    /// anyway would capture from the wrong part of the body.
+    #[test]
+    fn a_name_declared_twice_is_not_treated_as_a_root() {
+        let c = conv(
+            "",
+            "const body = pm.response.json();\nconst d = body.a;\nconst d = body.b;\npm.environment.set('id', d.id);",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "an ambiguous name was resolved anyway: {:?}",
+            c.entries[0].captures
         );
     }
 

@@ -259,6 +259,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Postman collections written against the older script API import their
+  captures again.** `postman.setEnvironmentVariable(...)` and
+  `postman.setGlobalVariable(...)` -- the sandbox `pm.` replaced, and still
+  what most untouched collections contain -- were not recognised, so every
+  capture and every generated value in such a script was dropped *and* the
+  conversion note said the script had nothing left in it.
+  `JSON.parse(responseBody)` is now read as the response body it is, under
+  whatever name the script gives it.
+- **A script that reads part of the response through a name of its own is
+  translated.** `const data = body.data;` followed by
+  `pm.environment.set("id", data.id)` is an ordinary way to write against a
+  response that nests everything one level down, and every call through such a
+  name was dropped as unreadable. Names standing for part of the body -- and
+  names built on those in turn -- now resolve, except where one is declared
+  twice and the script alone cannot say which meaning applies.
+- **A query parameter that appears more than once keeps all its values.**
+  `?tag=a&tag=b` is how a list is sent, and the importer treated a name as
+  accounted for the first time it saw it -- quietly narrowing the request to a
+  single value.
+- **Importing a Postman environment now says when it has written a secret into
+  a plain file.** A variable Postman masks arrives here in the clear, and a
+  `.vars` file has nowhere to hide it, so the import names the variables
+  affected and the provider references (`{{ op://… }}`, `{{ ssm:… }}`) that
+  keep the value out of the file.
 - **A request deleted or reordered and left unsaved survives a restart.** The
   restored session adopted whatever was on screen when PaperBoy was closed as
   its record of the file, so a deletion or a drag came back looking as though
