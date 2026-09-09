@@ -2577,11 +2577,31 @@ mod computed_tests {
             .min_by(|a, b| a.0.area().total_cmp(&b.0.area()))
             .expect("the button has no background");
         let gap = button_rect.min.x - field_rect.max.x;
+        // The ✕ to its right, which is a separate command and must not look
+        // like the button's partner: the ƒ has to be nearer the field than it
+        // is to the ✕, or proximity says the wrong thing.
+        let x_left = crate::gui::probe_test_support::fills(&full)
+            .into_iter()
+            .filter(|(r, _)| {
+                r.min.y < button.center().y
+                    && r.max.y > button.center().y
+                    && r.min.x > button_rect.max.x - 1.0
+            })
+            .map(|(r, _)| r.min.x)
+            .fold(f32::INFINITY, f32::min);
         assert!(
             (0.0..=8.0).contains(&gap),
             "the button should sit against the field it belongs to, but the gap \
              is {gap} (field {field_rect:?}, button {button_rect:?})"
         );
+        if x_left.is_finite() {
+            assert!(
+                x_left - button_rect.max.x > gap,
+                "the ƒ is {gap} from the field but only {} from the delete \
+                 button, so it reads as the delete button's neighbour",
+                x_left - button_rect.max.x
+            );
+        }
         // And it is painted in the field's colour rather than a button's, so
         // the pair reads as one control.
         assert_eq!(
@@ -3248,6 +3268,33 @@ mod computed_suggestion_tests {
             back.iter().any(|(t, _)| t.contains("sha256(")),
             "typing another character should offer the list again: {:?}",
             back.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Picking from the ƒ menu adds to the expression; it does not eat it.
+    ///
+    /// The caret defaults to the end of the text, and the last word is right
+    /// there -- so a menu that replaced the word under the caret swallowed the
+    /// whole of a one-word expression, which is the opposite of what the button
+    /// says it does. Completing something half-typed still replaces it; that is
+    /// the difference between finishing a word and inserting one.
+    #[test]
+    fn the_function_menu_inserts_without_eating_what_is_there() {
+        let mut app = app_with_row("nonce", "uuid");
+        let mut h = Harness::new();
+        let f_label = app.strings.gui_generated_fn_button;
+        h.click_text(&mut app, f_label);
+        h.click_text(&mut app, "timestamp_ms()");
+        h.frame(&mut app, vec![], 0.05);
+        assert!(
+            expr(&app).contains("uuid"),
+            "the menu ate the expression that was there: {:?}",
+            expr(&app)
+        );
+        assert!(
+            expr(&app).contains("timestamp_ms"),
+            "the menu never wrote the call in: {:?}",
+            expr(&app)
         );
     }
 

@@ -232,6 +232,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   throw the outer one away. The button beside the field is now a bare `ƒ`, for
   when you want to browse everything rather than filter.
 
+- **The ƒ menu adds to the expression instead of eating it.** The caret defaults
+  to the end of the text, and the last word is right there, so picking from the
+  menu replaced whatever one-word expression was already in the cell. Only
+  completing something half-typed replaces it now; the menu inserts. The button
+  also sits hard against the field with a wide gap before the delete ✕, rather
+  than equidistant between the two, where it read as the ✕'s neighbour.
+
 ### Fixed
 
 - **A folder's requests are drawn under that folder.** A `.hurl` file is free to

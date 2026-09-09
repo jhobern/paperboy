@@ -924,7 +924,18 @@ pub fn computed_editor(
                     // claims the whole row and shoves them off the edge, and
                     // there is no horizontal scrollbar to get them back.
                     let f_w = button_width(ui, s.gui_generated_fn_button);
-                    let val_w = (ui.available_width() - x_w - f_w - 16.0).max(40.0);
+                    // The only gap on the row is the wide one before the delete
+                    // button -- three times the usual, because a `TextEdit`
+                    // paints its frame inset from the rect it allocated, so the
+                    // ƒ can never quite touch the field, and with an ordinary
+                    // gap on the other side it sat equidistant between the two
+                    // and read as the delete button's neighbour. Proximity is
+                    // the only grouping cue left, so it has to be unmistakable. Reserving
+                    // more than is spent leaves the slack at the right-hand
+                    // end, which floats the ƒ into the middle of the two and
+                    // makes it read as the delete button's neighbour.
+                    let x_gap = ui.spacing().item_spacing.x * 3.0;
+                    let val_w = (ui.available_width() - x_w - f_w - x_gap).max(40.0);
                     // Closed up against the field, and painted in the field's
                     // own colour rather than a button's, so the two read as one
                     // control. The gap is restored before the delete button,
@@ -941,7 +952,6 @@ pub fn computed_editor(
                     // Set *before* the field: egui applies the spacing that was
                     // in force when the widget before the gap was placed, so
                     // closing it after the field has been added does nothing.
-                    let gap = ui.spacing().item_spacing.x;
                     ui.spacing_mut().item_spacing.x = 0.0;
                     // The colour a `TextEdit` actually paints, which is not
                     // `extreme_bg_color`: the theme gives fields their own,
@@ -994,6 +1004,12 @@ pub fn computed_editor(
                     // to itself it top-aligns and hangs below the row it is
                     // part of. `flat_buttons` + an explicit height is how every
                     // other control that shares a row with a field is drawn.
+                    // Set *before* the ƒ, not after it: egui applies the
+                    // spacing that was in force when the widget before the gap
+                    // was placed, so widening the gap after the button has been
+                    // added leaves the ✕ hard against it -- which is exactly
+                    // the wrong pair to group.
+                    ui.spacing_mut().item_spacing.x = x_gap;
                     let menu = flat_buttons(ui, |ui| {
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = field_bg;
                         egui::containers::menu::MenuButton::from_button(
@@ -1018,7 +1034,13 @@ pub fn computed_editor(
                                             // menu that leaves the user to
                                             // click back into the cell has done
                                             // half the job.
-                                            write_call(ui.ctx(), field.id, &mut rows[i].1, f);
+                                            write_call(
+                                                ui.ctx(),
+                                                field.id,
+                                                &mut rows[i].1,
+                                                f,
+                                                false,
+                                            );
                                             ui.ctx().memory_mut(|m| m.request_focus(field.id));
                                             changed = true;
                                             ui.close();
@@ -1038,7 +1060,13 @@ pub fn computed_editor(
                                                 )
                                                 .clicked()
                                             {
-                                                write_text(ui.ctx(), field.id, &mut rows[i].1, ex);
+                                                write_text(
+                                                    ui.ctx(),
+                                                    field.id,
+                                                    &mut rows[i].1,
+                                                    ex,
+                                                    false,
+                                                );
                                                 ui.ctx().memory_mut(|m| m.request_focus(field.id));
                                                 changed = true;
                                                 ui.close();
@@ -1050,7 +1078,6 @@ pub fn computed_editor(
                         .0
                     });
                     menu.on_hover_text(s.gui_generated_functions);
-                    ui.spacing_mut().item_spacing.x = gap;
                     let hit = flat_buttons(ui, |ui| {
                         ui.add_sized(
                             [x_w, row_h],
@@ -1304,19 +1331,30 @@ fn accept_suggestion(ctx: &egui::Context, id: egui::Id, text: &mut String, row: 
         return;
     };
     if f.signature == row {
-        write_call(ctx, id, text, f);
+        write_call(ctx, id, text, f, true);
     } else {
-        write_text(ctx, id, text, row);
+        write_text(ctx, id, text, row, true);
     }
 }
 
+/// Write `f`'s call into the field.
+///
+/// `over_word` says what happens to the word the caret is in. Completing what
+/// is being typed replaces it, so `sha` + `sha256` is `sha256` and not
+/// `shasha256`. Picking from the ƒ menu does not: nothing was typed towards it,
+/// so there is no half-written name to finish — and a menu that quietly ate the
+/// expression already in the cell (the caret defaults to the end of the text,
+/// where the last word is) was the opposite of what it says it does.
 fn write_call(
     ctx: &egui::Context,
     id: egui::Id,
     text: &mut String,
     f: &crate::generators::GenFunction,
+    over_word: bool,
 ) {
-    insert_at_caret(ctx, id, text, |text, caret| insert_call(text, caret, f));
+    insert_at_caret(ctx, id, text, |text, caret| {
+        insert_call(text, caret, f, over_word)
+    });
 }
 
 /// Write a ready-made call (a [`GenFunction::examples`] entry) into the field.
@@ -1325,9 +1363,9 @@ fn write_call(
 /// the whole call rather than inside the brackets: an example arrives complete,
 /// so the next thing to do is carry on writing the expression around it, not
 /// fill in an argument that is already there.
-fn write_text(ctx: &egui::Context, id: egui::Id, text: &mut String, call: &str) {
+fn write_text(ctx: &egui::Context, id: egui::Id, text: &mut String, call: &str, over_word: bool) {
     insert_at_caret(ctx, id, text, |text, caret| {
-        let (out, start, _) = replace_word(text, caret, call);
+        let (out, start, _) = splice(text, caret, call, over_word);
         (out, start + call.chars().count())
     });
 }
@@ -1371,23 +1409,25 @@ fn insert_at_caret(
     egui::TextEdit::store_state(ctx, id, state);
 }
 
-/// Replace the word the caret sits in with `with`, returning the new text and
-/// where that word began.
+/// Put `with` into `text` at the caret, returning the new text and the range it
+/// went into.
 ///
-/// The word is *replaced* so choosing `sha256` after typing `sha` leaves one
-/// `sha256` rather than `shasha256`, and the rest of the expression around it
-/// is untouched.
-fn replace_word(text: &str, caret: Option<usize>, with: &str) -> (String, usize, usize) {
+/// With `over_word` the word the caret sits in is replaced, which is what
+/// completing a half-typed name means; without it nothing existing is removed
+/// and `with` is simply inserted where the caret is.
+fn splice(text: &str, caret: Option<usize>, with: &str, over_word: bool) -> (String, usize, usize) {
     let chars: Vec<char> = text.chars().collect();
     let at = caret.unwrap_or(chars.len()).min(chars.len());
     let word = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     let mut start = at;
-    while start > 0 && word(&chars[start - 1]) {
-        start -= 1;
-    }
     let mut end = at;
-    while end < chars.len() && word(&chars[end]) {
-        end += 1;
+    if over_word {
+        while start > 0 && word(&chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && word(&chars[end]) {
+            end += 1;
+        }
     }
     let mut out: String = chars[..start].iter().collect();
     out.push_str(with);
@@ -1398,9 +1438,10 @@ fn replace_word(text: &str, caret: Option<usize>, with: &str) -> (String, usize,
 /// Write `f`'s call into `text` at the caret, returning the new text and where
 /// the caret should land.
 ///
-/// The word the caret is in is *replaced*, so choosing `sha256` after typing
-/// `sha` leaves one `sha256` rather than `shasha256`, and the rest of the
-/// expression around it is untouched. A function that takes an argument is
+/// With `over_word` the word the caret is in is *replaced*, so choosing
+/// `sha256` after typing `sha` leaves one `sha256` rather than `shasha256`, and
+/// the rest of the expression around it is untouched. A function that takes an
+/// argument is
 /// written with both brackets and the caret between them: an unclosed one is
 /// an expression the user has to go back and finish, and the editor would call
 /// it a syntax error in the meantime. One that takes nothing is complete as its
@@ -1409,13 +1450,14 @@ fn insert_call(
     text: &str,
     caret: Option<usize>,
     f: &crate::generators::GenFunction,
+    over_word: bool,
 ) -> (String, usize) {
     let call = if f.min_args == 0 {
         f.name.to_string()
     } else {
         format!("{}()", f.name)
     };
-    let (out, start, _) = replace_word(text, caret, &call);
+    let (out, start, _) = splice(text, caret, &call, over_word);
     let inside = usize::from(f.min_args > 0);
     (out, start + f.name.chars().count() + inside)
 }
@@ -2764,7 +2806,7 @@ mod function_menu_tests {
         let f = function("sha256").expect("sha256 is a generator function");
         // Caret between the two brackets of the outer call: the inner call is
         // written there, not tacked onto the end.
-        let (text, caret) = insert_call("base64()", Some(7), f);
+        let (text, caret) = insert_call("base64()", Some(7), f, true);
         assert_eq!(text, "base64(sha256())");
         assert_eq!(caret, 14);
         assert_eq!(&text[..caret], "base64(sha256(");
@@ -2773,7 +2815,7 @@ mod function_menu_tests {
     #[test]
     fn a_half_typed_name_is_replaced_rather_than_doubled() {
         let f = function("uuid").expect("uuid is a generator function");
-        let (text, caret) = insert_call("id = uu", Some(7), f);
+        let (text, caret) = insert_call("id = uu", Some(7), f, true);
         assert_eq!(text, "id = uuid");
         // Nothing to type inside, so the caret sits after the name.
         assert_eq!(caret, 9);
@@ -2797,7 +2839,7 @@ mod function_menu_tests {
 
         let mut text = "base64()".to_string();
         let f = function("sha256").expect("sha256 is a generator function");
-        super::write_call(&ctx, id, &mut text, f);
+        super::write_call(&ctx, id, &mut text, f, true);
         assert_eq!(text, "base64(sha256())");
 
         let state = egui::TextEdit::load_state(&ctx, id).expect("state was stored");
@@ -2820,7 +2862,7 @@ mod function_menu_tests {
     #[test]
     fn a_field_never_clicked_into_appends() {
         let f = function("uuid").expect("uuid is a generator function");
-        let (text, caret) = insert_call("", None, f);
+        let (text, caret) = insert_call("", None, f, true);
         assert_eq!(text, "uuid");
         assert_eq!(caret, 4);
     }
