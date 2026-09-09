@@ -263,6 +263,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   function that can hold nothing (`uuid`, `timestamp_ms`) replaces the word
   now, because there is nowhere else for it to go.
 
+- **Pointing at a suggestion describes it.** The note and the preview under the
+  list describe the highlighted row, but only the arrow keys moved the
+  highlight — so scrolling the list with the mouse left them describing
+  whatever the keyboard had last landed on. Hovering a row now selects it, and
+  Enter takes the row being pointed at.
+
 - **The suggestion list shows what the highlighted row would produce.** Whether
   a row replaces the word at the caret or builds a call around it depends on
   where the caret is and what the function can hold: good rules, but not ones

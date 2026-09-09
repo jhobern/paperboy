@@ -1293,6 +1293,7 @@ impl Suggest {
     ) -> bool {
         let open = self.open();
         let mut picked: Option<Suggestion> = None;
+        let mut hovered: Option<usize> = None;
         if open {
             egui::Popup::from_response(field)
                 .id(id.with("suggest-popup"))
@@ -1320,10 +1321,17 @@ impl Suggest {
                                         RichText::new(&row.text).monospace().color(theme.computed)
                                     }
                                 };
-                                if ui
-                                    .add(egui::Button::selectable(k == self.sel, label))
-                                    .clicked()
-                                {
+                                let hit = ui.add(egui::Button::selectable(k == self.sel, label));
+                                // Pointing at a row selects it, as the arrow
+                                // keys do: the note and the preview under the
+                                // list describe *the* highlighted row, and a
+                                // mouse that moved the eye without moving the
+                                // highlight left them describing whatever the
+                                // keyboard last landed on.
+                                if hit.hovered() {
+                                    hovered = Some(k);
+                                }
+                                if hit.clicked() {
                                     picked = Some(row.clone());
                                 }
                             }
@@ -1339,6 +1347,16 @@ impl Suggest {
                     // hold. Those are good rules and impossible to guess, so
                     // rather than explain them, show the answer: `base64` over
                     // `uuid` reads `-> base64(uuid)` before it is accepted.
+                    // Applied before the note and preview are drawn, so a
+                    // hovered row describes itself in the same frame. The rows
+                    // above have already been painted with the old highlight;
+                    // the repaint puts that right without a visible flicker,
+                    // and without it a still mouse could sit on an unhighlighted
+                    // row indefinitely.
+                    if let Some(k) = hovered.filter(|k| *k != self.sel) {
+                        self.sel = k;
+                        ui.ctx().request_repaint();
+                    }
                     let row = self.rows.get(self.sel);
                     let preview = row
                         .map(|r| preview_of(text, caret_of(ui.ctx(), id), r))

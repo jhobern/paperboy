@@ -2600,24 +2600,6 @@ mod computed_tests {
         assert_ne!(good.1, err, "a valid name is not flagged");
         assert_eq!(bad.1, err, "an invalid name is painted in the error colour");
     }
-
-    /// Every string a frame painted, with where it was painted.
-    fn placed_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
-        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
-            match shape {
-                egui::epaint::Shape::Text(t) => {
-                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
-                }
-                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                _ => {}
-            }
-        }
-        let mut out = Vec::new();
-        for c in shapes {
-            walk(&c.shape, &mut out);
-        }
-        out
-    }
 }
 
 /// A `[Gen]` cell's caret and undo history live in egui's per-widget state, so
@@ -2845,6 +2827,18 @@ mod computed_cell_undo_tests {
             for _ in 0..6 {
                 self.frame(app, vec![], 0.4);
             }
+        }
+
+        /// Put the pointer over painted text and leave it there.
+        pub(super) fn hover_text(&mut self, app: &mut GuiApp, needle: &str) {
+            let at = self
+                .frame(app, vec![], 0.05)
+                .into_iter()
+                .find(|(t, _)| t == needle)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("{needle} was never painted"));
+            self.frame(app, vec![egui::Event::PointerMoved(at)], 0.05);
+            self.frame(app, vec![], 0.05);
         }
 
         pub(super) fn click_text(&mut self, app: &mut GuiApp, needle: &str) {
@@ -3143,6 +3137,33 @@ mod computed_suggestion_tests {
         h.frame(&mut app, key(egui::Key::Enter), 0.05);
         h.frame(&mut app, vec![], 0.05);
         assert_eq!(expr(&app), "timestamp_ms");
+    }
+
+    /// The note and the preview describe *the* highlighted row, so pointing at
+    /// a row has to highlight it -- a mouse that moved the eye without moving
+    /// the highlight left them describing whatever the arrow keys last landed
+    /// on.
+    #[test]
+    fn pointing_at_a_row_describes_that_row() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, vec![], 0.05);
+        h.hover_text(&mut app, "sha512(text)");
+        let texts: Vec<String> = h
+            .frame(&mut app, vec![], 0.05)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        assert!(
+            texts.iter().any(|t| t == s.gen_description("sha512")),
+            "the note still describes the row the keyboard was on: {texts:?}"
+        );
+        // And Enter takes the row being pointed at, not the one before it.
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert!(expr(&app).starts_with("sha512("), "{:?}", expr(&app));
     }
 
     /// Whether a row replaces the word or wraps it cannot be guessed, so the

@@ -34,6 +34,12 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// Which dialog to open, together with everything it needs. Owned (rather than
 /// borrowed) because it crosses to a worker thread.
+///
+/// Its contents are only ever read by [`spawn_dialog`], which does not exist
+/// under `cfg(test)` — the suite must not put a native window in front of
+/// whoever is running it — so under test the fields are carried and never
+/// looked at. They are still what the shipped binary opens the dialog with.
+#[cfg_attr(test, allow(dead_code))]
 pub enum PickKind {
     File {
         filters: Vec<(String, Vec<String>)>,
@@ -163,6 +169,8 @@ pub fn owned_filters(filters: &[Filter]) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+// Only reached from `spawn_dialog`, which `cfg(test)` leaves out.
+#[cfg_attr(test, allow(dead_code))]
 fn with_owned_filters(
     mut d: rfd::FileDialog,
     filters: &[(String, Vec<String>)],
@@ -181,6 +189,8 @@ fn with_owned_filters(
 /// "all files" and adds no restrictive filter.
 pub type Filter<'a> = (&'a str, &'a [&'a str]);
 
+// Only reached from `spawn_dialog`, which `cfg(test)` leaves out.
+#[cfg_attr(test, allow(dead_code))]
 fn base(title: &str, dir: Option<&Path>) -> rfd::FileDialog {
     let mut d = rfd::FileDialog::new().set_title(title);
     // Seed the starting directory from a sensible context (the last-used file's
