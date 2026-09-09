@@ -627,6 +627,46 @@ mod probe_route_tests {
         );
     }
 
+    /// The pointer is usually on a field's *name* when that field is being
+    /// aimed at, so lighting only the value leaves the row looking half-lit --
+    /// but the name is not what the assert is about, so it is washed more
+    /// faintly than the value rather than as brightly.
+    #[test]
+    fn hovering_a_field_lights_its_name_faintly_and_its_value_fully() {
+        let body = "{\n  \"token\": \"abc123\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let value = pos_in_text(&painted, "abc123");
+        let key = pos_in_text(&painted, "token");
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(value)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let washes: Vec<_> = fills(&full)
+            .into_iter()
+            .filter(|(_, c)| c.a() > 0 && c.a() < 255)
+            .collect();
+        let on_value = washes
+            .iter()
+            .find(|(r, _)| r.contains(value))
+            .expect("the value under the pointer was not lit")
+            .1;
+        let on_key = washes
+            .iter()
+            .find(|(r, _)| r.contains(key))
+            .expect("the name of the field under the pointer was not lit")
+            .1;
+        assert_eq!(
+            on_value,
+            super::wash(&app.theme),
+            "the value should keep the full wash"
+        );
+        assert!(
+            on_key.a() < on_value.a(),
+            "the name should be fainter than the value: name {on_key:?}, value {on_value:?}"
+        );
+    }
+
     /// The same promise on the headers tab: hovering either half of a row
     /// lights the whole row, because either half is the same subject and the
     /// menu that opens from it asserts on the pair.

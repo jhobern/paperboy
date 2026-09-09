@@ -781,6 +781,26 @@ impl Scan<'_> {
 /// pushed after everything inside it.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn span_of(body: &str, subject: &Subject) -> Option<Range<usize>> {
+    spans_of(body, subject).map(|(_, value)| value)
+}
+
+/// Where the *name* of the field at `path` is written, when it has one.
+///
+/// The companion to [`span_of`], for a front-end that wants to show which
+/// field it is talking about as well as which value: lighting the value alone
+/// leaves the pointer's own row looking half-lit, and lighting the name as
+/// brightly says the assert is about the name. `None` for the root and for an
+/// array element, which have no name of their own.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn key_span_of(body: &str, subject: &Subject) -> Option<Range<usize>> {
+    let (key, value) = spans_of(body, subject)?;
+    (key != value).then_some(key)
+}
+
+/// The first and last spans recorded for a path: its key (if it has one) and
+/// its value. A field records both under the same path — see [`span_of`] —
+/// and a value records only itself, in which case the two are equal.
+fn spans_of(body: &str, subject: &Subject) -> Option<(Range<usize>, Range<usize>)> {
     let wanted = match subject {
         Subject::Json(p) | Subject::JsonCount(p) => p,
         // A header or the status is not written in the body at all, and the
@@ -798,11 +818,13 @@ pub fn span_of(body: &str, subject: &Subject) -> Option<Range<usize>> {
     };
     scan.ws();
     scan.value(&mut String::from("$"), 0, &mut spans)?;
-    spans
+    let mut mine = spans
         .into_iter()
         .filter(|(_, p)| p == wanted)
-        .next_back()
-        .map(|(r, _)| r)
+        .map(|(r, _)| r);
+    let first = mine.next()?;
+    let last = mine.next_back().unwrap_or_else(|| first.clone());
+    Some((first, last))
 }
 
 /// The verbs worth offering for a subject.
@@ -931,6 +953,22 @@ mod tests {
         assert_eq!(span_of(body, &Subject::Header("X".into())), None);
         assert_eq!(span_of(body, &Subject::Status), None);
         assert_eq!(span_of("not json", &Subject::Json("$".into())), None);
+    }
+
+    /// ...and the name has a span of its own, for a front-end that wants to
+    /// show which field it means as well as which value. Only a *named* field
+    /// has one: the root and an array element are not called anything.
+    #[test]
+    fn a_field_can_also_point_back_at_its_name() {
+        let body = r#"{"status":"ok","token":"abc","n":[1,2]}"#;
+        let at = |path: &str| {
+            key_span_of(body, &Subject::Json(path.to_string())).map(|r| body[r].to_string())
+        };
+        assert_eq!(at("$.token"), Some(r#""token""#.to_string()));
+        assert_eq!(at("$.n"), Some(r#""n""#.to_string()));
+        assert_eq!(at("$.n[1]"), None, "an array element has no name");
+        assert_eq!(at("$"), None, "the whole body has no name");
+        assert_eq!(at("$.nope"), None);
     }
 
     /// Pointing at a value and asking where it is are two halves of one map,

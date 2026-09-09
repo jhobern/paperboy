@@ -294,7 +294,19 @@ pub(super) fn highlight(app: &GuiApp, ctx: &egui::Context, subject: &Subject) {
 /// which is the compacted text when Compact is on, so the range has to be
 /// mapped through the same compaction map the selection reader uses in reverse.
 fn value_char_range(body: &str, subject: &Subject, compact: bool) -> Option<(usize, usize)> {
-    let span = probe::span_of(body, subject)?;
+    char_range_of(body, probe::span_of(body, subject)?, compact)
+}
+
+/// The same for the field's *name*, where it has one.
+fn key_char_range(body: &str, subject: &Subject, compact: bool) -> Option<(usize, usize)> {
+    char_range_of(body, probe::key_span_of(body, subject)?, compact)
+}
+
+fn char_range_of(
+    body: &str,
+    span: std::ops::Range<usize>,
+    compact: bool,
+) -> Option<(usize, usize)> {
     let start = body[..span.start].chars().count();
     let end = start + body[span.clone()].chars().count();
     if !compact {
@@ -441,12 +453,41 @@ pub(super) fn paint_span(
     compact: bool,
     colour: egui::Color32,
 ) -> usize {
+    // The field's name, washed more faintly than its value. A row lit only
+    // from the colon rightwards reads as a highlight that stopped short, and
+    // the pointer is usually on the name when a field is being aimed at -- but
+    // the name is not what the assert is about, and lighting it as strongly
+    // would say it was. (Copying still takes the value alone.)
+    if let Some((start, end)) = key_char_range(body, subject, compact)
+        && end > start
+    {
+        paint_char_range(
+            painter,
+            galley,
+            galley_pos,
+            start,
+            end,
+            colour.gamma_multiply(0.45),
+        );
+    }
     let Some((start, end)) = value_char_range(body, subject, compact) else {
         return 0;
     };
     if end <= start {
         return 0;
     }
+    paint_char_range(painter, galley, galley_pos, start, end, colour)
+}
+
+/// Fill the rows a char range occupies in a laid-out galley.
+fn paint_char_range(
+    painter: &egui::Painter,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    start: usize,
+    end: usize,
+    colour: egui::Color32,
+) -> usize {
     let a = galley.layout_from_cursor(egui::text::CCursor::new(start));
     let b = galley.layout_from_cursor(egui::text::CCursor::new(end));
     let mut painted = 0;

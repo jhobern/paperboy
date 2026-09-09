@@ -259,6 +259,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A hovered field lights its name as well as its value.** The pointer is
+  usually on the name when a field is being aimed at, so a wash that started at
+  the colon looked like a highlight that had stopped short. The name is washed
+  more faintly than the value: it is which field, not what the assert is about.
+  Copying still takes the value alone.
+
 - **The assert palette closed on keys that were not meant for it.** ←/→ switch
   response section in the pane behind the palette, and passed straight through
   it: the subject you had just hunted down was thrown away, and the next
