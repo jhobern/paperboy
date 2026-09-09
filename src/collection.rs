@@ -1262,11 +1262,12 @@ impl Collection {
                 e.mark_edited();
             }
         }
-        // The list itself may differ from the file (a request added or deleted
-        // and left unsaved), but nothing here can tell: the stamps that would
-        // say so were runtime-only and went with the last session. The
-        // structural flag stays as restored, and `revert_request` falls back to
-        // matching a request's recorded text against the file.
+        // The list itself may differ from the file (a request added, deleted or
+        // dragged and left unsaved), and the stamps that would say so were
+        // runtime-only and went with the last session. All that can be answered
+        // here is the added case, which `user_added` records; the rest needs the
+        // file, so `rebuild_restored_structure_baseline` refines this once the
+        // path is known.
         self.structure_modified = self.entries.iter().any(|e| e.user_added);
     }
 
@@ -1308,6 +1309,59 @@ impl Collection {
                 e.mark_edited();
             }
         }
+    }
+
+    /// Rebuild the structural baseline from the *file* after a restore, so a
+    /// request deleted or dragged and left unsaved is still counted.
+    ///
+    /// Building a collection stamps its entries and adopts that list as the
+    /// baseline, which for a restored session means adopting whatever was on
+    /// screen when the user quit -- including a deletion or a reorder they had
+    /// not saved. The tab then came back looking clean, and quitting a second
+    /// time asked nothing: the change was simply lost, which is the one
+    /// outcome the unsaved-changes prompt exists to prevent. (An *added*
+    /// request survived only because `user_added` is persisted and was checked
+    /// separately.)
+    ///
+    /// The stamps themselves cannot answer -- they are runtime-only and went
+    /// with the last session -- but each entry's recorded baseline text can:
+    /// it is what the file said about that request, so matching those against
+    /// the file reconstructs which of the file's requests the list still holds,
+    /// and in what order. A request the file holds that the list does not gets
+    /// an identity no live entry carries, so the two lists differ and the
+    /// deletion shows. Matches are consumed as they are used, so two identical
+    /// requests in a file are accounted for one each rather than both being
+    /// credited to the same entry.
+    ///
+    /// Run after [`Self::repair_restored_baselines`], which is what makes the
+    /// recorded texts trustworthy enough to match on.
+    pub fn rebuild_restored_structure_baseline(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let disk = crate::postman::parse_collection(&content);
+        let mut used = vec![false; self.entries.len()];
+        let mut baseline = Vec::with_capacity(disk.len());
+        for text in disk.iter().map(|e| e.to_hurl()) {
+            // A request built by hand this session is not one of the file's,
+            // whatever text it carries: a copy starts life holding the copied
+            // request's baseline.
+            let live = self.entries.iter().enumerate().position(|(i, e)| {
+                !used[i] && !e.user_added && e.baseline.as_deref() == Some(text.as_str())
+            });
+            match live {
+                Some(i) => {
+                    used[i] = true;
+                    baseline.push(self.entries[i].uid);
+                }
+                None => baseline.push(NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed)),
+            }
+        }
+        self.structure_baseline = baseline;
+        self.refresh_structure_modified();
     }
 
     pub fn reset_structure_baseline(&mut self) {

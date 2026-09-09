@@ -1243,9 +1243,24 @@ impl NewReq {
                         // The caret lands after what was wrapped, still inside
                         // the brackets: whatever else the call wants (a second
                         // argument, an offset) is typed from there.
+                        //
+                        // A function that needs *another* argument beyond the
+                        // one just filled -- `hmac_sha256(key, text)` -- gets
+                        // the separator written for it, so what is left to type
+                        // is visible as a gap rather than looking like a
+                        // finished call that would then fail at send time with
+                        // "expects 2 arguments". The GUI writes the remaining
+                        // argument's name in and selects it; a terminal cell
+                        // has no selection to type over, so placeholder text
+                        // there would have to be deleted by hand.
+                        let more = f.min_args > 1;
+                        let tail = if more { ", " } else { "" };
                         (
-                            format!("{}({})", f.name, w.wrapped),
-                            f.name.chars().count() + 1 + w.wrapped.chars().count(),
+                            format!("{}({}{})", f.name, w.wrapped, tail),
+                            f.name.chars().count()
+                                + 1
+                                + w.wrapped.chars().count()
+                                + tail.chars().count(),
                         )
                     } else {
                         (call, caret)

@@ -23284,6 +23284,33 @@ fn a_function_with_an_optional_argument_wraps_what_is_there_too() {
     );
 }
 
+/// A function that takes *two* required arguments is not finished by the one
+/// the call was built around. `hmac_sha256(payload)` looked complete, read as
+/// complete, and then failed at send time with "expects 2 arguments"; the
+/// separator is written in so what is missing is visible while the expression
+/// is still on screen.
+#[test]
+fn wrapping_in_a_two_argument_function_leaves_room_for_the_second() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "payload");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "hmac_sha256");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "hmac_sha256(payload, )",
+        "the second argument the function needs has somewhere to be typed"
+    );
+    // And the caret is in that gap, so it is typed there and nowhere else.
+    type_str(&mut app, "key");
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "hmac_sha256(payload, key)"
+    );
+}
+
 /// A function that can hold nothing has nowhere to put the word, so it
 /// replaces it -- there is no other sensible answer.
 #[test]

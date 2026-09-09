@@ -338,6 +338,9 @@ impl PersistedTab {
         // After the path, which is what the baselines are checked against.
         if restored_entries {
             c.repair_restored_baselines();
+            // After the baselines, which is what the file's requests are
+            // matched against to work out what the list still holds.
+            c.rebuild_restored_structure_baseline();
         }
         c.git_origin = self.git_origin;
         c.linked_env_id = linked_env_id;
@@ -778,6 +781,83 @@ mod tests {
         assert_eq!(restored.text, r.text);
         assert_eq!(restored.path, r.path);
         assert!(!restored.dirty, "a restored report is not dirty");
+    }
+
+    /// Build a `.hurl` file of three named GET requests in a fresh temp
+    /// folder, and the saved-session tab that goes with it.
+    fn saved_tab_for_a_three_request_file(tag: &str) -> (PathBuf, PersistedTab) {
+        let dir = std::env::temp_dir().join(format!("paperboy_restore_{tag}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("c.hurl");
+        let entries: Vec<HurlEntry> = ["one", "two", "three"]
+            .iter()
+            .map(|n| {
+                HurlEntry::from_fields(
+                    n,
+                    "GET",
+                    &format!("https://example.com/{n}"),
+                    Vec::new(),
+                    "",
+                )
+            })
+            .collect();
+        let text: String = entries.iter().map(|e| e.to_hurl()).collect();
+        std::fs::write(&path, &text).unwrap();
+
+        // What a collection freshly read from that file looks like: every
+        // request agrees with it.
+        let mut c = Collection::new("c".to_string(), entries);
+        c.path = Some(path.clone());
+        c.reset_structure_baseline();
+        (path, PersistedTab::from_collection(&c, None))
+    }
+
+    /// A request deleted and left unsaved has to still be there to save after
+    /// a restart. The restored list was adopted as its own structural
+    /// baseline, so the tab came back looking as though it matched the file --
+    /// and quitting a second time asked nothing before throwing the deletion
+    /// away, which is precisely what the unsaved-changes prompt is for.
+    #[test]
+    fn a_deletion_left_unsaved_survives_a_restart() {
+        let (path, mut tab) = saved_tab_for_a_three_request_file("delete");
+        tab.entries.remove(1);
+
+        let (c, _) = tab.into_collection(None);
+        assert!(
+            c.has_unsaved_edits(),
+            "the file still holds the deleted request, so there is something to save"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The same for a drag: the requests are all still there, but not in the
+    /// order the file has them in.
+    #[test]
+    fn a_reorder_left_unsaved_survives_a_restart() {
+        let (path, mut tab) = saved_tab_for_a_three_request_file("reorder");
+        tab.entries.swap(0, 2);
+
+        let (c, _) = tab.into_collection(None);
+        assert!(
+            c.has_unsaved_edits(),
+            "the list is in a different order from the file"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// And the other way round: a session restored exactly as it was saved
+    /// must not claim to hold changes it does not have, or the prompt becomes
+    /// noise people learn to dismiss.
+    #[test]
+    fn an_untouched_session_comes_back_clean() {
+        let (path, tab) = saved_tab_for_a_three_request_file("clean");
+
+        let (c, _) = tab.into_collection(None);
+        assert!(
+            !c.has_unsaved_edits(),
+            "nothing was changed, so there is nothing to save"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// A Workspace tab reopens on whatever node was last selected in its tree,

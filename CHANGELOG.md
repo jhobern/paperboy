@@ -259,6 +259,19 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A request deleted or reordered and left unsaved survives a restart.** The
+  restored session adopted whatever was on screen when PaperBoy was closed as
+  its record of the file, so a deletion or a drag came back looking as though
+  it had been saved: the collection showed nothing to save, and closing a
+  second time threw the change away without asking. The file is now re-read on
+  restore and the list checked against it, so the change is still there to save
+  (and an untouched session still comes back clean).
+- **Completing an expression into a two-argument function no longer drops the
+  second argument.** In the terminal UI, accepting `hmac_sha256` in front of
+  `payload` wrote `hmac_sha256(payload)` -- which reads as a finished call and
+  only reveals itself at send time, as "expects 2 arguments". The separator is
+  now written in, so what is still missing is visible while the expression is
+  on screen.
 - **An edit that ends where it started no longer leaves a pencil on the
   request.** The terminal UI's request wizard marked a request edited on any
   difference from the one it opened on, rather than on a difference from the
