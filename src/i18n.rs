@@ -998,7 +998,7 @@ strings! {
     gen_desc_lower => "Lower-cases the text.", "Met le texte en minuscules.", "Gør teksten til små bogstaver.";
     gen_desc_trim => "Removes whitespace from both ends.", "Supprime les espaces aux deux extrémités.", "Fjerner mellemrum i begge ender.";
     gui_generated_var_note => "A variable this expression can read", "Une variable que cette expression peut lire", "En variabel som dette udtryk kan læse";
-    gui_generated_expr_hint => "uuid — type for functions, Ctrl+Space for all", "uuid — tapez pour les fonctions, Ctrl+Espace pour toutes", "uuid — skriv for funktioner, Ctrl+Mellemrum for alle";
+    gui_generated_expr_hint => "Type to search functions, or Ctrl+Space to list them all", "Tapez pour chercher une fonction, ou Ctrl+Espace pour les lister toutes", "Skriv for at søge efter funktioner, eller Ctrl+Mellemrum for at vise dem alle";
     gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
     gui_generated_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
     gui_generated_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs générées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der genereres hver gang anmodningen sendes, brugt som {{ name }}";

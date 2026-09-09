@@ -1409,6 +1409,12 @@ impl Collection {
         // suddenly read as structurally different from the file it just came
         // from and the collection would claim unsaved changes it doesn't have.
         self.entries[ei] = HurlEntry { uid, ..entry };
+        // It came straight out of the file, so the file is what later edits are
+        // measured against. Without a baseline `mark_edited` latches (see
+        // `HurlEntry::baseline`), so anything that so much as touched the
+        // reverted request afterwards put the pencil back on a request that
+        // matched what was on disk.
+        self.entries[ei].set_baseline();
         self.invalidate_request_json();
         self.sync_folder_to_selected();
         Some(method)
@@ -1456,6 +1462,9 @@ impl Collection {
             // across the reload like they are across a file switch.
             self.park_run_results();
             self.entries = entries;
+            // Straight off disk, so that is what later edits are measured
+            // against -- see the note in `revert_request`.
+            self.reset_structure_baseline();
             self.restore_run_results(path);
             self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
             self.invalidate_request_json();
@@ -2257,6 +2266,28 @@ mod revert_tests {
         col.entries.push(fresh);
         assert_eq!(col.revert_request(3), None);
         assert_eq!(col.entries.len(), 4, "the request must still be there");
+    }
+
+    /// A reverted request came straight out of the file, so the file is what
+    /// its later edits are measured against. Without that, the derived
+    /// `modified` flag had nothing to compare to and latched the moment
+    /// anything touched the request again — putting the pencil back on a
+    /// request that matched what was on disk.
+    #[test]
+    fn a_reverted_request_is_measured_against_the_file_again() {
+        let (_file, mut col) = three_on_disk("baseline");
+        col.entries[1].url = "https://h/b-EDITED".into();
+        col.entries[1].mark_edited();
+        assert!(col.entries[1].modified);
+        col.revert_request(1);
+        col.entries[1].mark_edited();
+        assert!(
+            !col.entries[1].modified,
+            "the request matches the file, so nothing about it is unsaved"
+        );
+        col.entries[1].url = "https://h/b-AGAIN".into();
+        col.entries[1].mark_edited();
+        assert!(col.entries[1].modified, "a real edit still counts");
     }
 
     #[test]

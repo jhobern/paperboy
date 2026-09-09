@@ -238,8 +238,8 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
     since a `[Gen]` expression names them bare: the environment's variables, the
     collection's captures and the rows *above* this one — but not the rows below
     it or the row itself, which the block would reject.
-  - The empty field's hint says so: *uuid — type for functions, Ctrl+Space for
-    all*.
+  - The empty field's hint says so: *Type to search functions, or Ctrl+Space to
+    list them all*.
   - Typing in *front* of what is already there builds a call around it: the
     list filters on what has been typed (the word straddling the caret in
     `t|uuid` is `tuuid`, which matches nothing, so it used to go blank exactly
@@ -248,6 +248,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
     terminal wizard wraps on the same rule.
 
 ### Fixed
+
+- **A reverted request stops claiming to be edited.** Reverting throws away a
+  request's edits by re-reading it out of the file, but the request was left
+  with nothing to measure later edits against — so the next thing to touch it
+  latched the pencil back on, over a request that matched the file exactly. It
+  now takes the file it just came from as its baseline, as a request read or
+  written at any other moment does. Reverting a whole workspace file does the
+  same for every request in it.
 
 - **Ctrl+Z belongs to whatever is being typed into.** The desktop window's
   global Ctrl+Z (undo the last request delete) consumed the key before any text
