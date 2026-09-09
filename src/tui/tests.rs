@@ -34025,3 +34025,60 @@ mod probe_menu_tests {
         assert!(text.contains("abcdef"), "{text}");
     }
 }
+
+/// A `# [Gen]` block is the request's pre-script wearing a comment's clothes:
+/// the file has to spell it that way to stay runnable by `hurl` itself, but the
+/// view shouldn't leave it reading as somebody's prose. It is summarised with
+/// the captures and asserts above the divider, and coloured as a section below
+/// it -- `#` and all, so a copy of the pane is still valid Hurl.
+#[test]
+fn hurl_view_shows_the_generated_block_as_a_section() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/path".into(),
+        title: "Demo".into(),
+        generators: vec![("page".into(), "counter(\"page\")".into())],
+        ..Default::default()
+    };
+    app.collections[ci].entries = vec![entry];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text = buffer_text(&buf);
+    let s = crate::i18n::Strings::for_language(&app.language);
+    assert!(
+        text.contains(&format!("[{}]", s.field_generated)),
+        "the generated rows are summarised like the captures:\n{text}"
+    );
+    assert!(
+        text.contains("page = counter(\"page\")"),
+        "the summary names the value and how it is worked out:\n{text}"
+    );
+    assert!(
+        text.contains("# [Gen] 1"),
+        "the raw text keeps the comment form the file uses:\n{text}"
+    );
+    let th = app.theme();
+    assert_eq!(
+        fg_at_substr(&buf, "# [Gen] 1"),
+        Some(th.computed),
+        "the block marker is coloured as a section, not left as plain text:\n{text}"
+    );
+    assert_eq!(
+        fg_at_substr(&buf, "# page = "),
+        Some(th.computed),
+        "the block's rows are coloured with it:\n{text}"
+    );
+    assert_ne!(
+        fg_at_substr(&buf, "# Demo"),
+        Some(th.computed),
+        "an ordinary comment is still an ordinary comment:\n{text}"
+    );
+}

@@ -19,6 +19,9 @@ pub use entry::{
     is_variable_name, key_problem, method_rgb, placeholder_problems, status_eq_code,
     suggest_parameter_name, value_problem,
 };
+// The `# [Gen]` block's own reader, so the views that *show* Hurl recognise
+// the block exactly as the parser does rather than by their own guess at it.
+pub(crate) use entry::{parse_gen_marker, parse_gen_row};
 pub(crate) use parser::parse_file_form_value;
 pub use parser::{parse_hurl, parse_hurl_error};
 pub use run::{AssertOutcome, EntryOutcome, RunOutput, run_hurl, run_hurl_streaming_with};

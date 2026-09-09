@@ -3314,6 +3314,29 @@ impl SubstSeen {
 /// is appended to it — used to strip the icon back out of copied/selected
 /// text later (see `TuiApp::main_shadow_icon_positions`), since it's a
 /// purely visual annotation that would otherwise corrupt a pasted request.
+/// Repaint a line's ordinary text without touching what `highlight_spans`
+/// deliberately coloured: a substituted `{{ var }}` keeps its status colour
+/// (that is the whole point of the legend), everything else takes `to`.
+fn recolor_base(
+    spans: Vec<Span<'static>>,
+    to: Color,
+    bold: bool,
+    base: Color,
+) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|mut sp| {
+            if sp.style.fg.is_none() || sp.style.fg == Some(base) {
+                sp.style = sp.style.fg(to);
+            }
+            if bold {
+                sp.style = sp.style.add_modifier(Modifier::BOLD);
+            }
+            sp
+        })
+        .collect()
+}
+
 fn highlight_spans(
     text: &str,
     vars: &std::collections::HashMap<String, crate::request::SubstInfo>,
@@ -3637,6 +3660,7 @@ pub(crate) fn draw_collection_main(
     let url = entry.url.clone();
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
+    let generators = entry.generators.clone();
     let expected_status = entry.expected_status;
     // A raw body plus form fields can't both be sent (see
     // `HurlEntry::body_form_conflict`), and the run refuses it. Said here too,
@@ -3699,6 +3723,13 @@ pub(crate) fn draw_collection_main(
     // `TuiApp::main_shadow_icon_positions`) rather than corrupting a pasted
     // request with a stray "!".
     let mut shadow_positions: std::collections::HashSet<TextPos> = std::collections::HashSet::new();
+    // A `# [Gen]` block is a section of the request that happens to be spelled
+    // as comments (that is the only way the file stays runnable by `hurl`
+    // itself). Colouring it like one keeps the `#` — copy this pane and you
+    // still get valid Hurl — while stopping the block from reading as inert
+    // prose. Counted the way the parser counts it, so a block that wouldn't
+    // load isn't dressed up as one that would.
+    let mut gen_rows_left = 0usize;
     let mut body_lines: Vec<Line> = buf
         .lines()
         .enumerate()
@@ -3707,6 +3738,19 @@ pub(crate) fn draw_collection_main(
             let spans = highlight_spans(l, &dvars, th, &mut seen, Some(&shadowed), Some(&mut cols));
             for c in cols {
                 shadow_positions.insert(TextPos::new(li, c));
+            }
+            let marker = crate::hurl::parse_gen_marker(l).filter(|n| *n > 0);
+            let row = gen_rows_left > 0 && crate::hurl::parse_gen_row(l).is_some();
+            if row {
+                gen_rows_left -= 1;
+            } else if let Some(n) = marker {
+                gen_rows_left = n;
+            } else {
+                gen_rows_left = 0;
+            }
+            if marker.is_some() || row {
+                let bold = marker.is_some() && !row;
+                return Line::from(recolor_base(spans, th.computed, bold, th.text));
             }
             Line::from(spans)
         })
@@ -3822,6 +3866,31 @@ pub(crate) fn draw_collection_main(
             top_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(a.clone(), Style::default().fg(th.dim)),
+            ]));
+        }
+    }
+    // Generated rows are summarised here beside the captures for the same
+    // reason the legend below has a "generated" dot: they are part of the
+    // request even though the file has to carry them as comments (a `[Gen]`
+    // section isn't Hurl syntax — see `HurlEntry::to_hurl`). Read from the
+    // block below, the `#` makes them look like somebody's note.
+    let shown_gens: Vec<&(String, String)> = generators
+        .iter()
+        .filter(|(name, expr)| !name.trim().is_empty() || !expr.trim().is_empty())
+        .collect();
+    if !shown_gens.is_empty() {
+        top_lines.push(Line::styled(
+            format!("[{}]", s.field_generated),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+        for (name, expr) in shown_gens {
+            top_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(name.clone(), Style::default().fg(th.text)),
+                // "=" rather than the captures' "←": a generated value is
+                // worked out here, not taken out of a response.
+                Span::styled(" = ", Style::default().fg(th.dim)),
+                Span::styled(expr.clone(), Style::default().fg(th.dim)),
             ]));
         }
     }

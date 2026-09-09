@@ -247,6 +247,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
     `base64(sha256(body))` rather than losing the call that was there. The
     terminal wizard wraps on the same rule.
 
+### Changed
+
+- **The generated block reads as part of the request in the terminal UI.** A
+  `# [Gen]` block has to be spelled as comments -- that is what keeps the file
+  runnable by `hurl` itself -- but the Request Hurl view showed it as exactly
+  that: unmarked text below the request, indistinguishable from a note somebody
+  left. Its rows are now summarised above the divider beside `[Captures]` and
+  `[Asserts]`, and the block below is coloured as a section. The `#` stays, so
+  copying the pane still gives valid Hurl.
+
 ### Fixed
 
 - **A single assert sat in the middle of an empty tab.** The row was laid out
