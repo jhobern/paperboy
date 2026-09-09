@@ -298,6 +298,10 @@ impl PersistedTab {
         // back to the empty "no collection chosen yet" state instead of
         // showing stale content — the picker auto-opens to let the user pick
         // a replacement.
+        // Whether the entries below came from the file or from the snapshot.
+        // Only the snapshot can hold edits the file has never seen, and only it
+        // therefore needs its recorded baselines kept rather than restamped.
+        let mut restored_entries = false;
         let (entries, path) = if workspace_root.is_some() {
             match path
                 .as_ref()
@@ -310,10 +314,19 @@ impl PersistedTab {
         } else if root_missing {
             (Vec::new(), None)
         } else {
+            restored_entries = true;
             (self.entries, path)
         };
 
+        // Captured before the collection is built, because building one treats
+        // its entries as freshly agreed with the file and restamps them.
+        let baselines: Vec<Option<String>> = restored_entries
+            .then(|| entries.iter().map(|e| e.baseline.clone()).collect())
+            .unwrap_or_default();
         let mut c = Collection::new(self.name, entries);
+        if restored_entries {
+            c.adopt_restored_entries(baselines);
+        }
         c.selected_entry = self.selected_entry.min(c.entries.len().saturating_sub(1));
         c.path = path;
         c.git_origin = self.git_origin;

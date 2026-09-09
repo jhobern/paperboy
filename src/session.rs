@@ -1331,6 +1331,57 @@ mod param_memory_tests {
 
 #[cfg(test)]
 mod workspace_tests {
+    /// A tab restored from the previous session can still put a request back
+    /// the way the file has it.
+    ///
+    /// The list a restart brings back is whatever was on screen, unsaved edits
+    /// included, so a request added and never saved made the restored list one
+    /// longer than its file. That difference used to disable revert for
+    /// *every* request in the tab -- "Nothing to revert", and the pencil
+    /// stayed on a request whose saved version was sitting right there.
+    #[test]
+    fn a_restored_tab_can_still_revert_a_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_restore_revert_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "# A\nGET https://h/a\n\n# B\nGET https://h/b\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        // A structural edit left unsaved before the restart: one more request
+        // in the list than the file holds.
+        let extra = s.collections[0].entries[0].clone();
+        s.collections[0].entries.push(extra);
+        s.collections[0].entries[2].user_added = true;
+        // And an ordinary edit on the request we are about to revert.
+        s.collections[0].entries[1]
+            .generators
+            .push(("nonce".into(), "uuid".into()));
+        s.collections[0].entries[1].mark_edited();
+
+        let state = s.to_persisted();
+        let mut back = Session::default();
+        back.apply_persisted(state);
+
+        // The edit survives the restart, pencil and all.
+        assert!(back.collections[0].entries[1].modified);
+        assert!(back.collections[0].has_saved_version(1));
+        assert!(back.collections[0].revert_request(1).is_some());
+        assert!(back.collections[0].entries[1].generators.is_empty());
+        assert!(!back.collections[0].entries[1].modified);
+        // The untouched request was never marked, and the unsaved addition
+        // still is.
+        assert!(!back.collections[0].entries[0].modified);
+        assert!(back.collections[0].structure_modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::collection::WsRow;
     use crate::remote_flow::WorkspaceGitFilter;

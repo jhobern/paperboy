@@ -360,6 +360,13 @@ pub trait SecretResolver {
 }
 
 /// Production resolver: shells out to the `op` and `aws` CLIs.
+///
+/// Unreferenced under `cfg(test)` by design: every entry point swaps in
+/// [`NoopResolver`] there so the suite never invokes a real provider CLI (see
+/// [`default_resolver`]). The `allow` keeps the test build warning-free without
+/// hiding a genuinely unused item — this is the only resolver the shipped
+/// binary ever uses.
+#[cfg_attr(test, allow(dead_code))]
 pub struct CliResolver;
 
 impl SecretResolver for CliResolver {
@@ -405,6 +412,8 @@ impl SecretResolver for CliResolver {
 /// lines so the (possibly multi-line) resolved value can be extracted
 /// unambiguously from the combined output, then fed to `op inject` over
 /// stdin. Returns `None` if the CLI itself couldn't be run at all.
+// Only reached through `CliResolver`, which `cfg(test)` swaps out.
+#[cfg_attr(test, allow(dead_code))]
 fn run_op_inject_batch(references: &[String]) -> Option<Vec<Option<String>>> {
     let markers: Vec<(String, String)> = references
         .iter()
@@ -447,6 +456,8 @@ fn run_op_inject_batch(references: &[String]) -> Option<Vec<Option<String>>> {
 /// Run `program args…`, writing `input` to its stdin, and return raw stdout
 /// (not trimmed, so multi-line output stays intact) or `None` if the program
 /// is missing or exits non-zero.
+// Only reached through `CliResolver`, which `cfg(test)` swaps out.
+#[cfg_attr(test, allow(dead_code))]
 fn run_cmd_with_stdin(program: &str, args: &[&str], input: &str) -> Option<String> {
     use std::io::Write;
     let mut child = Command::new(program)
@@ -467,6 +478,8 @@ fn run_cmd_with_stdin(program: &str, args: &[&str], input: &str) -> Option<Strin
 /// Run `program args…` and return trimmed stdout, or `None` if the program is
 /// missing, exits non-zero, or produces empty output. `stdin` is closed so a
 /// provider CLI never blocks waiting for interactive input.
+// Only reached through `CliResolver`, which `cfg(test)` swaps out.
+#[cfg_attr(test, allow(dead_code))]
 fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program)
         .args(args)

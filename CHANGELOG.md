@@ -249,6 +249,16 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **"Revert to saved" works again after a restart.** A tab restored from the
+  previous session brings back what was on screen, unsaved additions and all,
+  and PaperBoy took that list as a description of the file — so if a request had
+  been added and never saved, the list and the file disagreed about their
+  length and *every* request in that tab refused to revert ("Nothing to
+  revert"), leaving the pencil on requests whose saved version was sitting in
+  the file all along. Each request now remembers the text its file held across
+  the restart, and reverting falls back to finding itself in the file by that
+  text.
+
 - **A reverted request stops claiming to be edited.** Reverting throws away a
   request's edits by re-reading it out of the file, but the request was left
   with nothing to measure later edits against — so the next thing to touch it

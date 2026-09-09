@@ -4304,7 +4304,7 @@ impl TuiApp {
         // to (`Collection::revert_request` returns `None` for exactly these).
         // Say so up front rather than confirming a revert we know can't happen
         // and then reporting "nothing to revert" after the user commits.
-        if self.collections[ci].saved_position_of(ei).is_none() {
+        if !self.collections[ci].has_saved_version(ei) {
             self.status = Some(Status::RequestHasNoSavedVersion);
             return;
         }

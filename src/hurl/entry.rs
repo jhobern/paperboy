@@ -707,12 +707,19 @@ pub struct HurlEntry {
     /// an expression, change it back, and the pencil stayed, offering to save a
     /// file that already matches.
     ///
-    /// Runtime-only, and so not serialised: a session restored from
-    /// `state.json` has no file to have agreed with (a Workspace tab re-reads
-    /// its entries from disk, an ordinary tab's are the saved state itself), so
-    /// there is nothing honest to compare against. With no baseline
-    /// `mark_edited` latches, which is the old behaviour.
-    #[serde(default, skip_serializing)]
+    /// Persisted with the entry, because it is the only record of what the file
+    /// said that survives a restart. An ordinary tab's entries are restored
+    /// from `state.json` — edits and all — so without this the restored list
+    /// would be adopted as its own baseline and the tab would claim to match a
+    /// file it had unsaved changes against. It is also how a restored request
+    /// is found again in its file when the list around it has moved (see
+    /// `Collection::revert_request`).
+    ///
+    /// `None` means "no file to have agreed with": a request the user built
+    /// this session, or a Workspace tab's entries before they are re-read from
+    /// disk. With no baseline `mark_edited` latches, which is the old
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<String>,
 
     /// A runtime identity for this entry, used only to tell whether the

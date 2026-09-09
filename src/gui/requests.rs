@@ -816,7 +816,7 @@ fn ask_revert_request(app: &mut GuiApp, ci: usize, path: PathBuf, i: usize) {
     // duplicate still sharing its original's identity -- has no saved version
     // of its own to go back to. Say so instead of asking the user to confirm a
     // revert that would then quietly do nothing.
-    if app.session.collections[ci].saved_position_of(i).is_none() {
+    if !app.session.collections[ci].has_saved_version(i) {
         app.session.status = Some(crate::i18n::Status::RequestHasNoSavedVersion);
         return;
     }

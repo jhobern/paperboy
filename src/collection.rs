@@ -1238,6 +1238,38 @@ impl Collection {
     /// Called wherever the list and the file are brought into agreement:
     /// reading a file, writing one, and constructing a collection from entries
     /// that came straight off disk.
+    /// Adopt a list restored from `state.json`: stamp identities, but keep what
+    /// each entry already recorded the file as saying.
+    ///
+    /// A restored snapshot is *not* a moment of agreement — it is whatever the
+    /// user had on screen when they quit, unsaved edits and all. Treating it as
+    /// one (which building any collection from entries does) overwrote each
+    /// request's record of its file with its own edited text, so a restarted
+    /// session lost the pencil on requests that genuinely had unsaved changes,
+    /// and could no longer find any of them in their file to revert them.
+    ///
+    /// `modified` is re-derived here rather than trusted from the saved state,
+    /// for the same reason it is derived everywhere else: the text and the
+    /// baseline together are the answer, and a stored flag can only disagree
+    /// with them.
+    ///
+    /// The baselines have to be handed in because building the collection has
+    /// already restamped them: this puts back what the snapshot recorded.
+    pub fn adopt_restored_entries(&mut self, baselines: Vec<Option<String>>) {
+        for (e, baseline) in self.entries.iter_mut().zip(baselines) {
+            if let Some(baseline) = baseline {
+                e.baseline = Some(baseline);
+                e.mark_edited();
+            }
+        }
+        // The list itself may differ from the file (a request added or deleted
+        // and left unsaved), but nothing here can tell: the stamps that would
+        // say so were runtime-only and went with the last session. The
+        // structural flag stays as restored, and `revert_request` falls back to
+        // matching a request's recorded text against the file.
+        self.structure_modified = self.entries.iter().any(|e| e.user_added);
+    }
+
     pub fn reset_structure_baseline(&mut self) {
         for e in &mut self.entries {
             e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);
@@ -1392,16 +1424,10 @@ impl Collection {
     /// The other entries and their edits are untouched.
     pub fn revert_request(&mut self, ei: usize) -> Option<String> {
         let path = self.path.clone()?;
-        let di = self.saved_position_of(ei)?;
         let uid = self.entries[ei].uid;
         let content = std::fs::read_to_string(&path).ok()?;
         let mut disk = crate::postman::parse_collection(&content);
-        // The baseline describes the file as it was when we last agreed with
-        // it. If the file has grown or shrunk since, the position we just
-        // looked up means nothing any more.
-        if disk.len() != self.structure_baseline.len() || di >= disk.len() {
-            return None;
-        }
+        let di = self.disk_position_of(ei, &disk)?;
         let entry = disk.swap_remove(di);
         let method = entry.method.clone();
         // A freshly parsed entry is clean (not modified/added) but carries no
@@ -1430,6 +1456,50 @@ impl Collection {
     /// can be answered without reading the file is answered here, so the two
     /// cannot drift apart; the rest (the file changed, or can't be read since)
     /// necessarily stays with the read.
+    /// Which entry of the file just read is request `ei`, if it can be pointed
+    /// at with confidence.
+    ///
+    /// Two ways of asking, because the first only holds while the list and the
+    /// file are still the same shape:
+    ///
+    /// * by identity and position — the stamp the entry has carried since the
+    ///   list and the file last agreed, looked up in the baseline. Only
+    ///   meaningful while the file is still the length that baseline describes.
+    /// * by the text the entry recorded the file as holding
+    ///   ([`HurlEntry::baseline`]), matched against the file. This is what
+    ///   answers after a restart: a restored list adopts itself as its
+    ///   structural baseline, so a request added and left unsaved before the
+    ///   restart made the baseline describe a file one request longer than the
+    ///   real one -- and *every* request in the tab then failed the length
+    ///   check and could not be reverted at all. A unique text match is asked
+    ///   for: two identical requests in a file cannot be told apart, and
+    ///   restoring the wrong one would be a silent, unrecoverable loss of
+    ///   exactly the work the user was trying to keep.
+    fn disk_position_of(&self, ei: usize, disk: &[HurlEntry]) -> Option<usize> {
+        if let Some(di) = self.saved_position_of(ei)
+            && disk.len() == self.structure_baseline.len()
+            && di < disk.len()
+        {
+            return Some(di);
+        }
+        let entry = self.entries.get(ei)?;
+        // A request the user built by hand has no saved version, whatever text
+        // it carries: a copy of another request starts life with the copied
+        // request's baseline, and matching on that would "revert" the new
+        // request into the one it was copied from.
+        if entry.user_added {
+            return None;
+        }
+        let baseline = entry.baseline.as_ref()?;
+        let mut hits = disk
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| &e.to_hurl() == baseline)
+            .map(|(i, _)| i);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
     pub fn saved_position_of(&self, ei: usize) -> Option<usize> {
         self.path.as_ref()?;
         let uid = self.entries.get(ei)?.uid;
@@ -1452,6 +1522,21 @@ impl Collection {
     /// its requests are what the tree lists for it, so both places have to be
     /// dropped or the edits would come back the moment it was reopened. Errors
     /// if the file can't be re-read, and changes nothing in that case.
+    /// Whether request `ei` has a saved version to go back to at all, as far as
+    /// can be told without reading the file.
+    ///
+    /// The front-ends ask before offering to revert: confirming a revert and
+    /// only then reporting "nothing to revert" makes the user commit to
+    /// something that was never going to happen. Either route in
+    /// `disk_position_of` may find it, so either one being possible is enough.
+    pub fn has_saved_version(&self, ei: usize) -> bool {
+        let Some(e) = self.entries.get(ei) else {
+            return false;
+        };
+        self.path.is_some()
+            && (self.saved_position_of(ei).is_some() || (e.baseline.is_some() && !e.user_added))
+    }
+
     pub fn revert_workspace_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let entries = crate::postman::parse_collection(&std::fs::read_to_string(path)?);
         self.workspace_pending.remove(path);
