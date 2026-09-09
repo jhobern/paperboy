@@ -3110,6 +3110,58 @@ mod computed_suggestion_tests {
     /// click-on-painted-text.
     use super::computed_cell_undo_tests::Harness;
 
+    /// A caret put in front of what is already there means "build something
+    /// around this", whether or not the function *has* to be given an
+    /// argument. `timestamp([offset_seconds])` used to throw the word away
+    /// because its argument is optional.
+    #[test]
+    fn a_function_with_an_optional_argument_still_wraps_what_is_there() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "timestamp(uuid)",
+            "the word the caret was in front of should have been wrapped, not replaced"
+        );
+    }
+
+    /// A function that can hold nothing has nowhere to put the word, so it
+    /// replaces it.
+    #[test]
+    fn a_function_that_takes_nothing_replaces_the_word() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        // `timestamp_ms()` is the row under `timestamp([offset_seconds])`.
+        h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "timestamp_ms");
+    }
+
+    /// Whether a row replaces the word or wraps it cannot be guessed, so the
+    /// list says which before it is accepted.
+    #[test]
+    fn the_list_shows_what_the_highlighted_row_would_produce() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("timestamp(uuid)")),
+            "no preview of the highlighted row under the list: {texts:?}"
+        );
+    }
+
     #[test]
     fn typing_a_prefix_offers_the_functions_that_match() {
         let mut app = app_with_row("digest", "sha");

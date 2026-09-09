@@ -249,6 +249,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Completing a function builds it around what is already there.** Putting the
+  caret in front of `uuid` and choosing `timestamp` wrote `timestamp` over the
+  `uuid` -- both editors asked whether a function *had* to be given an argument
+  rather than whether it *could* be, so every function with an optional
+  argument threw away the expression it was being wrapped around. Only a
+  function that can hold nothing (`uuid`, `timestamp_ms`) replaces the word
+  now, because there is nowhere else for it to go.
+
+- **The suggestion list shows what the highlighted row would produce.** Whether
+  a row replaces the word at the caret or builds a call around it depends on
+  where the caret is and what the function can hold: good rules, but not ones
+  anyone should have to work out from the result. The GUI's list now reads
+  `-> timestamp(uuid)` under the highlighted row, before it is accepted.
+
 - **"Revert to saved" works again after a restart.** A tab restored from the
   previous session brings back what was on screen, unsaved additions and all,
   and PaperBoy took that list as a description of the file — so if a request had

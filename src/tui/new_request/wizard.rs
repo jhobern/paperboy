@@ -1217,32 +1217,35 @@ impl NewReq {
                 // caret after it: there is no argument left to type, so
                 // dropping the caret into the middle of a finished call would
                 // only be in the way.
-                let picked = crate::generators::function_for_suggestion(name).map(|f| {
-                    if f.signature == name {
-                        gen_completion(f)
-                    } else {
-                        (name.to_string(), name.chars().count())
-                    }
-                });
-                let Some((call, caret)) = picked else {
+                let picked = crate::generators::function_for_suggestion(name)
+                    .map(|f| (f, f.signature == name));
+                let Some((f, is_signature)) = picked else {
                     return;
+                };
+                let (call, caret) = if is_signature {
+                    gen_completion(f)
+                } else {
+                    (name.to_string(), name.chars().count())
                 };
                 if let Some(row) = self.generators.get_mut(i) {
                     let text = row.expr.text();
                     let chars: Vec<char> = text.chars().collect();
                     let w = gen_word(&text, row.expr.col);
                     // Text the caret was put in front of is what the call is
-                    // being built *around*: `t|uuid` completed with `timestamp`
-                    // means `timestamp(uuid)`, not a `timestamp` where the
-                    // `uuid` used to be. Only a call with brackets can wrap
-                    // anything, so a bare name replaces the word as before --
-                    // there is nowhere for the text to go. The GUI wraps on the
-                    // same rule.
-                    let wrapping = !w.wrapped.is_empty() && call.ends_with("()");
+                    // being built *around*: `|uuid` completed with `base64`
+                    // means `base64(uuid)`, not a `base64` where the `uuid`
+                    // used to be. A ready-made example is a finished call and
+                    // wraps nothing; otherwise `generators::can_wrap` decides,
+                    // so the GUI cannot answer this differently.
+                    let wrapping =
+                        !w.wrapped.is_empty() && is_signature && crate::generators::can_wrap(f);
                     let (call, caret) = if wrapping {
+                        // The caret lands after what was wrapped, still inside
+                        // the brackets: whatever else the call wants (a second
+                        // argument, an offset) is typed from there.
                         (
-                            format!("{}{})", call.trim_end_matches(')'), w.wrapped),
-                            caret + w.wrapped.chars().count(),
+                            format!("{}({})", f.name, w.wrapped),
+                            f.name.chars().count() + 1 + w.wrapped.chars().count(),
                         )
                     } else {
                         (call, caret)

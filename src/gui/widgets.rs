@@ -1328,14 +1328,34 @@ impl Suggest {
                                 }
                             }
                         });
-                    // What the highlighted row *does*, under the list rather
-                    // than beside each row: a note per row would triple the
+                    // What the highlighted row would *do to this expression*,
+                    // and what it does in general — under the list rather than
+                    // beside each row, since a note per row would triple the
                     // width of a list whose whole job is to be scanned.
-                    if let Some(note) = self.rows.get(self.sel).map(|r| r.note) {
-                        if !note.is_empty() {
-                            ui.separator();
-                            ui.label(RichText::new(note).color(theme.dim));
-                        }
+                    //
+                    // The preview is here because the same row can replace the
+                    // word at the caret or build a call around it, depending on
+                    // what the caret is in front of and what the function can
+                    // hold. Those are good rules and impossible to guess, so
+                    // rather than explain them, show the answer: `base64` over
+                    // `uuid` reads `-> base64(uuid)` before it is accepted.
+                    let row = self.rows.get(self.sel);
+                    let preview = row
+                        .map(|r| preview_of(text, caret_of(ui.ctx(), id), r))
+                        .filter(|p| p != text && Some(p.as_str()) != row.map(|r| r.text.as_str()));
+                    let note = row.map(|r| r.note).filter(|n| !n.is_empty());
+                    if preview.is_some() || note.is_some() {
+                        ui.separator();
+                    }
+                    if let Some(preview) = preview {
+                        ui.label(
+                            RichText::new(format!("\u{2192} {preview}"))
+                                .monospace()
+                                .color(theme.computed),
+                        );
+                    }
+                    if let Some(note) = note {
+                        ui.label(RichText::new(note).color(theme.dim));
                     }
                 });
         }
@@ -1346,6 +1366,21 @@ impl Suggest {
         ui.ctx()
             .data_mut(|d| d.insert_temp(id.with("suggest"), self.clone()));
         took
+    }
+}
+
+/// What the field would read if `row` were accepted now.
+///
+/// The same edit the accept path makes, made to a copy: the list draws this
+/// under the highlighted row, and the field itself is not to be touched until
+/// the user actually chooses something.
+fn preview_of(text: &str, caret: Option<usize>, row: &Suggestion) -> String {
+    match row.kind {
+        SuggestKind::Signature => match crate::generators::function_for_suggestion(&row.text) {
+            Some(f) => insert_call(text, caret, f).0,
+            None => text.to_string(),
+        },
+        _ => splice(text, caret, &row.text).0,
     }
 }
 
@@ -1474,23 +1509,31 @@ fn insert_call(
         .collect();
     let w = crate::generators::typed_word_at(text, caret);
     // Text the caret was put in front of is what the call is being built
-    // *around*: `t|uuid` completed with `timestamp` means `timestamp(uuid)`,
-    // not a `timestamp` where the `uuid` used to be. Only a function that takes
-    // an argument can wrap anything, so one that takes none replaces the word
-    // as before -- there is nowhere for the text to go.
-    let wrapping = f.min_args > 0 && !w.wrapped.is_empty();
+    // *around*: `|uuid` completed with `base64` means `base64(uuid)`, not a
+    // `base64` where the `uuid` used to be. See `generators::can_wrap` for what
+    // may hold it.
+    let wrapping = crate::generators::can_wrap(f) && !w.wrapped.is_empty();
     if wrapping {
-        args[0] = w.wrapped.clone();
+        // A signature with no named argument at all can still be wrapped
+        // around something if it is variadic, so there may be no placeholder
+        // to overwrite.
+        match args.first_mut() {
+            Some(first) => *first = w.wrapped.clone(),
+            None => args.push(w.wrapped.clone()),
+        }
     }
-    let call = if f.min_args == 0 {
-        f.name.to_string()
-    } else {
+    // Written with its brackets when it is holding something or needs
+    // something; a function that needs nothing is complete as its bare name,
+    // which is how a block already reads `stamp = timestamp`.
+    let call = if wrapping || f.min_args > 0 {
         format!("{}({})", f.name, args.join(", "))
+    } else {
+        f.name.to_string()
     };
     let end = if wrapping { w.wrap_end } else { w.end };
     let out = splice_range(text, w.start, end, &call);
     let start = w.start;
-    if f.min_args == 0 {
+    if !wrapping && f.min_args == 0 {
         let at = start + call.chars().count();
         return (out, at, at);
     }

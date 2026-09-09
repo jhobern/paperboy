@@ -1180,6 +1180,22 @@ pub fn completion(f: &GenFunction) -> (String, usize) {
     }
 }
 
+/// Whether `f` has anywhere to put text the caret was placed in front of.
+///
+/// Anything that takes an argument can be built *around* what is already
+/// there: the caret in `|uuid` completed with `base64` means `base64(uuid)`,
+/// not a `base64` where the `uuid` used to be. This asks about the arguments a
+/// function *may* take rather than the ones it *must*, because the two
+/// front-ends both used to ask about `min_args` -- and so threw the word away
+/// for `timestamp([offset_seconds])`, whose optional argument is exactly
+/// somewhere to put it. Only a function that can hold nothing (`uuid`,
+/// `timestamp_ms`) replaces the word, because there is nowhere for it to go.
+///
+/// Shared so the two front-ends cannot drift on the question again.
+pub fn can_wrap(f: &GenFunction) -> bool {
+    f.max_args != Some(0)
+}
+
 /// The function a suggestion row names, whether the row is a signature or one
 /// of the ready-made example calls listed under it.
 pub fn function_for_suggestion(row: &str) -> Option<&'static GenFunction> {

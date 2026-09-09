@@ -23233,6 +23233,44 @@ fn a_function_can_be_completed_inside_an_existing_call() {
     );
 }
 
+/// The same, for a function whose argument is *optional*. Both editors used to
+/// ask whether an argument was required rather than whether one was allowed,
+/// and so threw the expression away for `timestamp([offset_seconds])` --
+/// whose optional argument is exactly somewhere to put it.
+#[test]
+fn a_function_with_an_optional_argument_wraps_what_is_there_too() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "timestam");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "timestamp(uuid)",
+        "an optional argument is still somewhere to put the expression"
+    );
+}
+
+/// A function that can hold nothing has nowhere to put the word, so it
+/// replaces it -- there is no other sensible answer.
+#[test]
+fn a_function_that_takes_nothing_replaces_what_is_there() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "timestamp_m");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "timestamp_ms",
+        "nothing can be wrapped in a call that takes no arguments"
+    );
+}
+
 /// Typing in front of what is already in the cell is how a call gets built
 /// around it. The word straddling the caret is then `tuuid`, which matches no
 /// function, so the list went blank exactly when it was wanted: it filters on
