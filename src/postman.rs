@@ -665,6 +665,90 @@ pub fn postman_env_secret_keys(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every `{{name}}` in an environment value that PaperBoy could not work out:
+/// `(variable, the name it asked for)`.
+///
+/// After [`resolve_env_refs`] has done what it can, a leftover reference is one
+/// of two things -- a variable defined somewhere this file doesn't reach (a
+/// collection variable, a Postman global), or a loop -- and either way it is
+/// worth a word on the way in, because a `.vars` value is not a template and
+/// nothing downstream will ever expand it.
+pub fn postman_env_unresolved_refs(content: &str) -> Vec<(String, String)> {
+    env_values(content)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(k, v, _)| {
+            ENV_REF_RE
+                .captures_iter(&v)
+                .map(|c| c[1].trim().to_string())
+                .filter(|n| !is_provider_reference(n))
+                .map(|n| (k.clone(), n))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A `{{ … }}` anywhere in a value. Postman writes them without spaces, but a
+/// hand-edited environment may not, and the moustache is the same one Hurl uses.
+static ENV_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+
+/// Whether `inner` names one of PaperBoy's providers rather than another
+/// variable. These are resolved at load time by shelling out to a CLI (see
+/// [`crate::environment`]) and must survive the import untouched.
+fn is_provider_reference(inner: &str) -> bool {
+    inner.starts_with("op://") || inner.starts_with("ssm:") || inner.starts_with("env:")
+}
+
+/// Expand `{{name}}` references between an environment's own variables.
+///
+/// Postman treats a variable's value as a template and resolves it at the
+/// moment it is used, so `base_url = {{scheme}}://{{host}}` is ordinary and
+/// works. A `.vars` value is not a template -- it is the value -- and nothing
+/// downstream expands one, so an imported `{{host}}` would sit there as text
+/// (or, when it is the whole value, be classified as an unrecognised provider
+/// reference and shown as unresolved). Working them out here is the only place
+/// the answer is still known.
+///
+/// Repeated until nothing changes so a chain resolves, and bounded because a
+/// loop otherwise never settles: `a = {{b}}, b = {{a}}` reaches a state where
+/// each names itself, which no pass can improve on, and stops. What is left
+/// behind is reported by [`postman_env_unresolved_refs`] rather than guessed
+/// at.
+fn resolve_env_refs(values: &mut [(String, String, bool)]) {
+    for _ in 0..8 {
+        let known: Vec<(String, String)> = values
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone()))
+            .collect();
+        let mut changed = false;
+        for (key, value, _) in values.iter_mut() {
+            let next = ENV_REF_RE
+                .replace_all(value, |c: &regex::Captures| {
+                    let name = c[1].trim();
+                    // A value naming itself has nowhere to go; leaving the
+                    // reference visible is better than an empty string.
+                    if name == key || is_provider_reference(name) {
+                        return c[0].to_string();
+                    }
+                    known
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| c[0].to_string())
+                })
+                .into_owned();
+            if next != *value {
+                *value = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// The shared read behind [`postman_env_values`] and
 /// [`postman_env_secret_keys`]: key, value, and whether Postman called it a
 /// secret.
@@ -677,17 +761,18 @@ fn env_values(content: &str) -> Option<Vec<(String, String, bool)>> {
         return None;
     }
     let env = serde_json::from_value::<PostmanEnv>(v).ok()?;
-    Some(
-        env.values
-            .into_iter()
-            .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
-            .map(|v| {
-                let value = v.value.replace(['\n', '\r'], " ");
-                let secret = v.kind == "secret";
-                (v.key.trim().to_string(), value.trim().to_string(), secret)
-            })
-            .collect(),
-    )
+    let mut values: Vec<(String, String, bool)> = env
+        .values
+        .into_iter()
+        .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
+        .map(|v| {
+            let value = v.value.replace(['\n', '\r'], " ");
+            let secret = v.kind == "secret";
+            (v.key.trim().to_string(), value.trim().to_string(), secret)
+        })
+        .collect();
+    resolve_env_refs(&mut values);
+    Some(values)
 }
 
 /// Parse a collection file's `content`: a Postman JSON export is imported,
@@ -5617,6 +5702,82 @@ mod script_tests {
 #[cfg(test)]
 mod defect_regressions {
     use super::*;
+
+    /// Postman treats an environment value as a template and expands it when it
+    /// is used, so `base_url = {{scheme}}://{{host}}` is ordinary there. A
+    /// `.vars` value is not a template and nothing downstream expands one, so
+    /// the reference has to be worked out on the way in -- and a value that was
+    /// *only* a reference used to arrive classified as an unrecognised provider
+    /// reference and shown as unresolved.
+    #[test]
+    fn an_environment_value_referring_to_another_is_worked_out_on_import() {
+        let env = r#"{"values":[
+            {"key":"scheme","value":"https"},
+            {"key":"host","value":"api.example.com"},
+            {"key":"base_url","value":"{{scheme}}://{{host}}/v1"},
+            {"key":"same","value":"{{host}}"},
+            {"key":"secret","value":"{{ op://Vault/api/token }}"}
+        ]}"#;
+        let got = postman_env_values(env).unwrap();
+        let value = |k: &str| {
+            got.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("base_url"), "https://api.example.com/v1");
+        assert_eq!(
+            value("same"),
+            "api.example.com",
+            "a value that is nothing but a reference is the referenced value"
+        );
+        assert_eq!(
+            value("secret"),
+            "{{ op://Vault/api/token }}",
+            "a provider reference is not a variable reference and is left alone"
+        );
+        assert!(postman_env_unresolved_refs(env).is_empty());
+    }
+
+    /// Chains resolve; loops and names this file cannot reach are left visible
+    /// and reported, because an empty string here is a request that goes to the
+    /// wrong place rather than one that plainly fails.
+    #[test]
+    fn a_chain_resolves_and_what_cannot_be_resolved_is_reported() {
+        let env = r#"{"values":[
+            {"key":"a","value":"{{b}}"},
+            {"key":"b","value":"{{c}}"},
+            {"key":"c","value":"end"},
+            {"key":"loop1","value":"{{loop2}}"},
+            {"key":"loop2","value":"{{loop1}}"},
+            {"key":"elsewhere","value":"{{from_the_collection}}/path"}
+        ]}"#;
+        let got = postman_env_values(env).unwrap();
+        let value = |k: &str| {
+            got.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("a"), "end", "a chain is followed to the end");
+        assert!(
+            value("elsewhere").contains("{{from_the_collection}}"),
+            "an unreachable name is left as written: {}",
+            value("elsewhere")
+        );
+        let unresolved: Vec<String> = postman_env_unresolved_refs(env)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            unresolved.contains(&"elsewhere".to_string()),
+            "{unresolved:?}"
+        );
+        assert!(
+            unresolved.contains(&"loop1".to_string()) && unresolved.contains(&"loop2".to_string()),
+            "a loop settles rather than spinning, and says so: {unresolved:?}"
+        );
+    }
 
     fn j(s: &str) -> String {
         s.lines()

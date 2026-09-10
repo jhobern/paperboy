@@ -933,6 +933,9 @@ strings! {
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
     gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
     gen_err_failed_dep => "{row}: {reference} above it could not be worked out", "{row} : {reference} au-dessus n'a pas pu être calculé", "{row}: {reference} ovenover kunne ikke beregnes";
+    gen_err_name_missing => "A generated row has an expression but no name — nothing can ask for its value", "Une ligne générée a une expression mais pas de nom — rien ne peut demander sa valeur", "En genereret række har et udtryk, men intet navn — intet kan bede om dens værdi";
+    gen_err_name_invalid => "{row}: a name can only use letters, digits, _ and -", "{row} : un nom ne peut contenir que des lettres, des chiffres, _ et -", "{row}: et navn må kun bruge bogstaver, tal, _ og -";
+    gen_err_name_duplicate => "{row}: two rows are named this; only the first is used", "{row} : deux lignes portent ce nom ; seule la première est utilisée", "{row}: to rækker hedder dette; kun den første bruges";
     gen_err_cycle => "{row}: refers to itself, or to a row below it", "{row} : se référence lui-même, ou une ligne en dessous", "{row}: refererer til sig selv eller til en række nedenunder";
     // A batch run has one shared variable set, so two requests that each
     // compute `nonce` get one value between them. Worth naming the row rather
@@ -2574,6 +2577,9 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
                 .replace("{row}", name)
                 .replace("{reference}", reference),
             G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
+            G::NameMissing => s.gen_err_name_missing.to_string(),
+            G::NameInvalid { name } => s.gen_err_name_invalid.replace("{row}", name),
+            G::NameDuplicate { name } => s.gen_err_name_duplicate.replace("{row}", name),
         })
         .collect()
 }

@@ -1199,6 +1199,28 @@ fn render(
                             ),
                         });
                     }
+                    // Postman resolves a `{{name}}` in a value against its
+                    // other variables; PaperBoy expands those on the way in,
+                    // because a `.vars` value is not a template. What is left
+                    // is a name this file cannot reach -- a collection
+                    // variable, a Postman global, or a loop -- and it stays
+                    // visible rather than becoming an empty string, so the note
+                    // says which ones and why.
+                    let unresolved = crate::postman::postman_env_unresolved_refs(body);
+                    if !unresolved.is_empty() {
+                        let mut named: Vec<String> = unresolved
+                            .iter()
+                            .map(|(k, r)| format!("{k} wants {{{{{r}}}}}"))
+                            .collect();
+                        named.dedup();
+                        notes.push(ConversionNote {
+                            item: display.to_string(),
+                            detail: format!(
+                                "{}: nothing in this environment defines it, so the reference was                                  left as written. Postman would have looked in the collection's                                  own variables or its globals -- import those too, or fill the                                  value in by hand.",
+                                named.join("; ")
+                            ),
+                        });
+                    }
                     Rendered {
                         name: unique_file_name(&stem, "vars", taken),
                         contents: vars_text(&values),
@@ -2655,6 +2677,42 @@ mod tests {
         );
         assert_eq!(r.contents, body);
     }
+    /// Postman resolves `{{name}}` in an environment value against its other
+    /// variables. Those are expanded on the way in; one naming something this
+    /// file cannot reach is left as written and reported, because filling it
+    /// with an empty string would send the request somewhere plausible and
+    /// wrong.
+    #[test]
+    fn an_environment_reference_that_leads_nowhere_is_reported() {
+        let mut taken = HashSet::new();
+        let body = r#"{"name":"Prod","values":[
+            {"key":"host","value":"example.test"},
+            {"key":"base","value":"https://{{host}}/v1"},
+            {"key":"odd","value":"{{lives_in_the_collection}}"}]}"#;
+        let r = render(
+            "Prod",
+            body,
+            ItemKind::Environment,
+            ImportFormat::Hurl,
+            &mut taken,
+        );
+        assert!(
+            r.contents.contains("base=https://example.test/v1"),
+            "the reference it could work out is worked out: {}",
+            r.contents
+        );
+        let note = r
+            .notes
+            .iter()
+            .find(|n| n.detail.contains("lives_in_the_collection"))
+            .unwrap_or_else(|| panic!("no note about the dangling reference: {:?}", r.notes));
+        assert!(
+            note.detail.contains("odd") && note.detail.contains("collection"),
+            "the note names the variable and where Postman would have looked: {}",
+            note.detail
+        );
+    }
+
     /// A `.vars` file is plain text, and so is the session state it is
     /// remembered in, so a variable Postman was masking arrives in the clear.
     /// Writing it into a second plaintext file is a decision about where a

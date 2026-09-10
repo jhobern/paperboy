@@ -110,6 +110,21 @@ pub enum GenError {
     UndefinedReference { name: String, reference: String },
     /// A row referring to itself, directly or through others.
     Cycle { name: String },
+    /// An expression with nothing to call it. The name is the whole point of a
+    /// generated row -- it is how the value reaches the request -- so a row
+    /// without one computes something nothing can ever ask for. It carries no
+    /// name for the obvious reason, and is the one variant whose message
+    /// cannot name the row.
+    NameMissing,
+    /// A name Hurl could never carry in a `{{name}}`: anything outside letters,
+    /// digits, `_` and `-` (see [`crate::hurl::is_variable_name`]). Such a row
+    /// used to evaluate perfectly happily into a variable no placeholder could
+    /// name.
+    NameInvalid { name: String },
+    /// The same name given to two rows in one block. Both used to evaluate,
+    /// with the later silently overwriting the earlier -- so which value the
+    /// request sent depended on the order of two rows that looked independent.
+    NameDuplicate { name: String },
     /// A row whose value depends on an earlier row that failed. Its own
     /// variant because the alternative reads as a second, invented mistake:
     /// the earlier row is not yet bound, which looks exactly like a row
@@ -134,7 +149,11 @@ impl GenError {
             | GenError::BadArgument { name, .. }
             | GenError::UndefinedReference { name, .. }
             | GenError::FailedDependency { name, .. }
+            | GenError::NameInvalid { name }
+            | GenError::NameDuplicate { name }
             | GenError::Cycle { name } => name,
+            // The row has no name; that is what is wrong with it.
+            GenError::NameMissing => "",
         }
     }
 }
@@ -393,6 +412,58 @@ impl GenSource for DryRunSource {
 
 // ── Evaluation ──────────────────────────────────────────────────────────
 
+/// Everything wrong with the *names* in a block, and which rows must therefore
+/// not be evaluated.
+///
+/// Split out because [`expand`] and [`check`] have to agree to the letter: one
+/// runs on send and the other in the editor, and a row the editor calls fine
+/// but the send refuses is a request that mysteriously won't go with a message
+/// naming no row. The expression checks are already shared that way; the name
+/// checks are shared the same way.
+///
+/// A duplicate refuses the *later* row and keeps the earlier one, which is the
+/// reading order and the only one that doesn't depend on where the eye starts.
+/// Nothing is added to the failed set: a row named `my name` cannot be
+/// referenced by any expression in the first place (a reference is parsed with
+/// the same character rule), and for a duplicate the first row's value is
+/// perfectly good.
+fn name_faults(rows: &[(String, String)]) -> (Vec<GenError>, Vec<bool>) {
+    let mut errors = Vec::new();
+    let mut refused = vec![false; rows.len()];
+    let mut seen: Vec<&str> = Vec::new();
+    let mut reported: Vec<&str> = Vec::new();
+    for (i, (name, source)) in rows.iter().enumerate() {
+        let n = name.trim();
+        // A wholly blank row is the editor waiting for input, not a mistake --
+        // the same rule `expand` and `check` already apply to the expression.
+        if n.is_empty() && source.trim().is_empty() {
+            continue;
+        }
+        refused[i] = true;
+        if n.is_empty() {
+            errors.push(GenError::NameMissing);
+        } else if !crate::hurl::is_variable_name(n) {
+            errors.push(GenError::NameInvalid {
+                name: n.to_string(),
+            });
+        } else if seen.contains(&n) {
+            // Said once per name however many times it is repeated: the report
+            // is about a name, and three copies of one sentence read as three
+            // separate problems.
+            if !reported.contains(&n) {
+                reported.push(n);
+                errors.push(GenError::NameDuplicate {
+                    name: n.to_string(),
+                });
+            }
+        } else {
+            seen.push(n);
+            refused[i] = false;
+        }
+    }
+    (errors, refused)
+}
+
 /// Evaluate a request's `# [Gen]` rows and bind each result into `vars`, in
 /// declaration order so a row can build on the ones above it.
 ///
@@ -413,14 +484,19 @@ pub fn expand(
     src: &dyn GenSource,
 ) -> Vec<GenError> {
     let declared: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
-    let mut errors = Vec::new();
+    // Names first: a row nothing can name, or a name two rows are fighting
+    // over, is wrong whatever its expression works out to.
+    let (mut errors, refused) = name_faults(rows);
     let mut done: Vec<&str> = Vec::new();
     // Rows that were reached and failed, kept apart from rows not reached yet
     // so a row reading one of them is told what actually happened rather than
     // being accused of a cycle (see `GenError::FailedDependency`).
     let mut failed: Vec<&str> = Vec::new();
 
-    for (name, source) in rows {
+    for (i, (name, source)) in rows.iter().enumerate() {
+        if refused[i] {
+            continue;
+        }
         // A wholly blank row is a row the editor is still waiting on, not a
         // mistake — exactly as [`check`] treats it. The two must agree: `check`
         // runs in the editor while `expand` runs on send, and a row `check`
@@ -513,9 +589,9 @@ pub fn check(rows: &[(String, String)]) -> Vec<GenError> {
         }
     }
 
-    let mut out = Vec::new();
-    for (name, source) in rows {
-        if name.trim().is_empty() && source.trim().is_empty() {
+    let (mut out, refused) = name_faults(rows);
+    for (i, (name, source)) in rows.iter().enumerate() {
+        if refused[i] || (name.trim().is_empty() && source.trim().is_empty()) {
             continue;
         }
         // A row that has been named and not yet filled in is half-written, not
@@ -2082,6 +2158,82 @@ mod tests {
             "check(): {found:?}\nexpand(): {raised:?}"
         );
         assert!(found.is_empty() && raised.is_empty());
+    }
+
+    /// The name is how a generated value reaches the request. A row without one
+    /// used to evaluate happily into a variable no `{{placeholder}}` could ever
+    /// name -- work done for nobody, reported as nothing.
+    #[test]
+    fn a_row_with_no_name_is_refused_by_both() {
+        let rows = vec![(String::new(), "uuid".to_string())];
+        let found = check(&rows);
+        assert_eq!(found, vec![GenError::NameMissing], "{found:?}");
+        let mut vars = HashMap::new();
+        let raised = expand(&rows, &mut vars, &FakeSource::at(0));
+        assert_eq!(found, raised, "the editor and the send say the same thing");
+        assert!(
+            vars.is_empty(),
+            "and nothing is computed under an empty key: {vars:?}"
+        );
+        let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        // The one message that cannot name its row, because the missing name is
+        // the fault -- so it has to describe the row instead.
+        assert!(
+            crate::i18n::describe_gen_errors(&english, &found)[0].starts_with("A generated row"),
+            "{found:?}"
+        );
+    }
+
+    /// `{{my name}}` is not a placeholder Hurl will carry, so a row called
+    /// `my name` can never be read -- the same rule the extract-to-parameter
+    /// prompt already applies to the names it accepts.
+    #[test]
+    fn a_name_hurl_cannot_carry_is_refused() {
+        let rows = vec![("my name".to_string(), "uuid".to_string())];
+        let found = check(&rows);
+        assert!(
+            matches!(found.as_slice(), [GenError::NameInvalid { name }] if name == "my name"),
+            "{found:?}"
+        );
+        let mut vars = HashMap::new();
+        assert_eq!(expand(&rows, &mut vars, &FakeSource::at(0)), found);
+        assert!(vars.is_empty(), "{vars:?}");
+        // A name Hurl *will* carry is left alone, accents and all.
+        let fine = vec![("kunde-id_2".to_string(), "uuid".to_string())];
+        assert!(check(&fine).is_empty(), "{:?}", check(&fine));
+    }
+
+    /// Two rows with one name used to both evaluate, the later quietly
+    /// overwriting the earlier: which value the request sent depended on the
+    /// order of two rows that looked independent of each other.
+    #[test]
+    fn one_name_on_two_rows_is_reported_once() {
+        let rows: Vec<(String, String)> = [
+            ("token", "\"first\""),
+            ("other", "uuid"),
+            ("token", "\"second\""),
+            ("token", "\"third\""),
+        ]
+        .iter()
+        .map(|(n, x)| (n.to_string(), x.to_string()))
+        .collect();
+        let found = check(&rows);
+        assert!(
+            matches!(found.as_slice(), [GenError::NameDuplicate { name }] if name == "token"),
+            "one sentence about one name, however many copies there are: {found:?}"
+        );
+        let mut vars = HashMap::new();
+        let raised = expand(&rows, &mut vars, &FakeSource::at(0));
+        assert_eq!(raised, found);
+        assert_eq!(
+            vars.get("token").map(String::as_str),
+            Some("first"),
+            "the row that read first is the one that stands: {vars:?}"
+        );
+        assert!(
+            vars.contains_key("other"),
+            "and the rows around it still evaluate: {vars:?}"
+        );
     }
 
     /// A row that has been named but not filled in is half-written, not

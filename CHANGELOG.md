@@ -216,6 +216,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **Generated row names are checked.** A row's name is how its value reaches
+  the request, and nothing was checking it: a row with an expression and no
+  name computed a value under an empty key that no `{{placeholder}}` could ask
+  for; a name like `my name` is one Hurl will never carry in a `{{…}}`; and two
+  rows sharing a name both evaluated, the later silently overwriting the
+  earlier, so what the request sent depended on the order of two rows that
+  looked independent. All three are now refused, by the editor's live check and
+  by the send in the same words — the earlier of two rows with one name is the
+  one that stands.
+
+- **Postman environment values that reference other variables are worked out on
+  import.** Postman treats a value as a template and expands it when it is
+  used, so `base_url = {{scheme}}://{{host}}` is ordinary there; a `.vars` value
+  is not a template and nothing downstream expands one, so `{{host}}` used to
+  arrive as text — or, when it was the whole value, be taken for an
+  unrecognised provider reference and shown as unresolved. Chains are followed;
+  `{{ op://… }}` and `{{ ssm:… }}` are left alone as the provider references
+  they are. A reference this file cannot reach (a collection variable, a
+  Postman global, or a loop) is left as written and named in a conversion note,
+  rather than quietly becoming an empty string.
+
 - The Generated section's column header now reads `Expression   (Enter list
   functions)` rather than `(Enter lists the functions)`, matching the
   key-then-verb shape every other shortcut hint in the terminal UI uses.
