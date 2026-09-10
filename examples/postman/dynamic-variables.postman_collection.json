@@ -1,0 +1,123 @@
+{
+  "info": {
+    "_postman_id": "3f7c1a90-0e2b-4a11-9c3d-5b8e0a1d2c34",
+    "name": "PaperBoy — Dynamic variables",
+    "description": "Every Postman dynamic variable PaperBoy has an opinion about, one request per outcome. Import this and read CONVERSION-NOTES.md: the first two requests should generate no notes at all, the third should note two computed rows, and the last should list the values you must supply yourself.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Built in/A GUID and an ISO timestamp",
+      "description": "$guid, $randomUUID and $isoTimestamp all have exact Hurl equivalents, so these become {{newUuid}} and {{newDate}} and the request needs nothing supplied to run.",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Request-Id", "value": "{{$guid}}" },
+          { "key": "X-Correlation-Id", "value": "{{$randomUUID}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": \"{{$guid}}\",\n  \"occurred_at\": \"{{$isoTimestamp}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "https://postman-echo.com/post",
+          "protocol": "https",
+          "host": ["postman-echo", "com"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Built in/The same GUID twice",
+      "description": "One dynamic variable used in a header and in the body. Hurl's {{newUuid}} is evaluated per use, so these two are deliberately allowed to differ — the request is here to prove the import doesn't emit two rows for one name.",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "{{$guid}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"idempotency_key\": \"{{$guid}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "https://postman-echo.com/post",
+          "protocol": "https",
+          "host": ["postman-echo", "com"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Computed/A Unix timestamp and a random integer",
+      "description": "$timestamp is Unix seconds and $randomInt is 0-1000 inclusive. Neither is a Hurl built-in, so each arrives as a row in the [Gen] block. Used twice apiece to check exactly one row is written per name.",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "X-Timestamp", "value": "{{$timestamp}}" },
+          { "key": "X-Retry-Budget", "value": "{{$randomInt}}" }
+        ],
+        "url": {
+          "raw": "https://postman-echo.com/get?ts={{$timestamp}}&n={{$randomInt}}",
+          "protocol": "https",
+          "host": ["postman-echo", "com"],
+          "path": ["get"],
+          "query": [
+            { "key": "ts", "value": "{{$timestamp}}" },
+            { "key": "n", "value": "{{$randomInt}}" }
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Supplied/Faker data nothing can produce",
+      "description": "Postman's faker variables have no honest equivalent. These are renamed so the file still parses and listed in CONVERSION-NOTES.md as values to supply — inventing a name would send a plausible wrong value, which is harder to notice than a request that refuses to run.",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"first_name\": \"{{$randomFirstName}}\",\n  \"last_name\": \"{{$randomLastName}}\",\n  \"email\": \"{{$randomEmail}}\",\n  \"company\": \"{{$randomCompanyName}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "https://postman-echo.com/post",
+          "protocol": "https",
+          "host": ["postman-echo", "com"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Supplied/All three kinds in one request",
+      "description": "The mixed case: a built-in, a computed row and a supplied value side by side, so the preview shows all three placeholder colours at once.",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Request-Id", "value": "{{$guid}}" },
+          { "key": "X-Timestamp", "value": "{{$timestamp}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"colour\": \"{{$randomColor}}\",\n  \"seq\": {{$randomInt}}\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "https://postman-echo.com/post",
+          "protocol": "https",
+          "host": ["postman-echo", "com"],
+          "path": ["post"]
+        }
+      },
+      "response": []
+    }
+  ]
+}

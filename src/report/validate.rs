@@ -1219,11 +1219,17 @@ fn warn_if_vars_undefined(
     // parameter is that the request still works when nobody binds it. Warning
     // about those made a properly parameterised collection noisier than an
     // unparameterised one, which is exactly backwards.
-    let declared: HashSet<String> = entry
+    let mut declared: HashSet<String> = entry
         .variable_defaults()
         .into_iter()
         .map(|(n, _)| n)
         .collect();
+    // A `# [Gen]` row defines its name for the request it is on. The value
+    // genuinely does not exist until the request is sent, which is exactly why
+    // warning about it is wrong: the run computes it, and being told a
+    // signature "may be undefined" on every request that signs one teaches the
+    // user to stop reading the panel.
+    declared.extend(entry.generators.iter().map(|(n, _)| n.clone()));
     for var in refs {
         if !defined.contains(var.as_str()) && !declared.contains(var.as_str()) {
             diags.push(Diagnostic::warning(fill(
@@ -1234,8 +1240,11 @@ fn warn_if_vars_undefined(
     }
 }
 
-/// Thread the capture names of a successfully-resolved request into `defined`
-/// so that subsequent requests in the same block can use them.
+/// Thread the names a successfully-resolved request defines — its captures and
+/// its computed values — into `defined`, so that subsequent requests in the
+/// same block can use them. A `[Gen]` row is bound for its own request onwards,
+/// the same way a capture is, so a later request reading `{{transaction_id}}`
+/// is reading something that exists.
 fn add_entry_captures(name: &str, ctx: &Context, defined: &mut HashSet<String>) {
     if ctx.request_entries.is_none() {
         return;
@@ -1245,6 +1254,9 @@ fn add_entry_captures(name: &str, ctx: &Context, defined: &mut HashSet<String>) 
     };
     for (cap_name, _) in &entry.captures {
         defined.insert(cap_name.clone());
+    }
+    for (gen_name, _) in &entry.generators {
+        defined.insert(gen_name.clone());
     }
 }
 
@@ -2324,6 +2336,40 @@ mod tests {
             .filter(|d| d.severity == Severity::Warning && d.message.contains("may not be set"))
             .map(|d| d.message)
             .collect()
+    }
+
+    /// A `# [Gen]` row defines its name. Warning that a signature "may not be
+    /// set" on every request that computes one is a warning nobody can act on,
+    /// and a panel full of those is a panel nobody reads.
+    #[test]
+    fn a_computed_value_is_not_reported_as_possibly_unset() {
+        let mut entry = test_entry("sign", &["sig"], &[]);
+        entry
+            .generators
+            .push(("sig".to_string(), "hmac_sha256(k, m)".to_string()));
+        let warns = var_warns("REQUEST sign\n", &["k", "m"], &[], &[entry]);
+        assert!(
+            warns.is_empty(),
+            "the request computes sig itself: {warns:?}"
+        );
+    }
+
+    /// A computed value is bound for its own request onwards, exactly like a
+    /// capture, so a later request may read one an earlier request made.
+    #[test]
+    fn a_later_request_may_read_an_earlier_requests_computed_value() {
+        let mut first = test_entry("submit", &[], &[]);
+        first
+            .generators
+            .push(("transaction_id".to_string(), "uuid".to_string()));
+        let second = test_entry("result", &["transaction_id"], &[]);
+        let warns = var_warns(
+            "REQUEST submit\nREQUEST result\n",
+            &[],
+            &[],
+            &[first, second],
+        );
+        assert!(warns.is_empty(), "submit defines it first: {warns:?}");
     }
 
     /// A request that declares its own parameter supplies a value for it, so

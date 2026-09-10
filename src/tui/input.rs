@@ -159,8 +159,14 @@ impl TuiApp {
                 parts.push(st.text(&Strings::for_language(&self.language)));
             }
             if self.overlay.is_none() {
-                let err = self.response.lock().unwrap().error.clone();
-                if !err.is_empty() {
+                let err = self
+                    .response
+                    .lock()
+                    .unwrap()
+                    .error_text(&Strings::for_language(&self.language));
+                // Both channels report a refused send, in the same words --
+                // copy the finding once (see the topbar in `draw`).
+                if !err.is_empty() && !parts.contains(&err) {
                     parts.push(err);
                 }
             }
@@ -603,7 +609,8 @@ impl TuiApp {
             | MouseScrollTarget::WizardForm
             | MouseScrollTarget::WizardAsserts
             | MouseScrollTarget::WizardCaptures
-            | MouseScrollTarget::WizardReports => {
+            | MouseScrollTarget::WizardReports
+            | MouseScrollTarget::WizardComputed => {
                 self.on_key(Self::mouse_key(if dir < 0 {
                     KeyCode::Up
                 } else {
@@ -649,6 +656,7 @@ impl TuiApp {
             Some(Overlay::EnvCollision(collision)) => collision.sel = row,
             Some(Overlay::ReportColumns(picker)) => picker.selected = row,
             Some(Overlay::ReportBind(picker)) => picker.selected = row,
+            Some(Overlay::ProbeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportSettingMenu(menu)) => menu.selected = row,
             Some(Overlay::ReportNodeRequest(form)) => form.selected = row,
@@ -741,8 +749,11 @@ impl TuiApp {
             if form.focus != prev_focus {
                 form.suggest_hi = None;
                 let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
-                    if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                    if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()))
+                    || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
+                    if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
+                form.gen_browse = false;
                 let landed_on_kind = matches!(form.focus, NewField::FormField(i, FormCol::Kind)
                     if form.form_fields.get(i).is_some());
                 form.kind_dropdown_hidden = landed_on_kind;
@@ -1647,6 +1658,7 @@ impl TuiApp {
             } => self.result_cell_popup_key_handler(key, title, content, panel),
             Overlay::ReportColumns(picker) => self.report_columns_key_handler(key, picker),
             Overlay::ReportBind(picker) => self.report_bind_key_handler(key, picker),
+            Overlay::ProbeMenu(menu) => self.probe_menu_key_handler(key, menu),
             Overlay::ReportNodeMenu(menu) => self.report_node_menu_key_handler(key, menu),
             Overlay::ReportSettingMenu(menu) => self.report_setting_menu_key_handler(key, menu),
             Overlay::ReportNodeRequest(form) => self.report_node_request_key_handler(key, form),
@@ -1807,10 +1819,34 @@ impl TuiApp {
             // values, the redirect chain) and a third tab shouldn't need a
             // third key. Scoped to the Response pane so `i` stays free
             // elsewhere.
+            // `a` (Response pane) opens the assert/capture palette: pick a
+            // value the reply carried, then say what should be true of it next
+            // time — or keep it in a variable for the next request. This is the
+            // one action in the app that writes to the *request* from the
+            // response, which is why it lives on the response's own pane rather
+            // than in the wizard: the values it offers only exist here.
+            //
+            // Scoped to the Response pane so `a` stays free elsewhere (it adds
+            // a node in the report editor).
+            KeyCode::Char('a') if !ctrl && self.focus == Pane::Response => {
+                self.open_probe_menu();
+            }
             KeyCode::Char('i') if !ctrl && self.focus == Pane::Response => {
                 self.cycle_response_section(true);
             }
             KeyCode::Char('I') if !ctrl && self.focus == Pane::Response => {
+                self.cycle_response_section(false);
+            }
+            // The section tabs are a row of tabs, and Left/Right are what moves
+            // along a row of tabs everywhere else in the app (the collection tab
+            // bar, the environment panel). Nothing else claimed them in this
+            // pane -- the body scrolls with Up/Down -- so the obvious key does
+            // the obvious thing, and `i`/`I` stay as they were for anyone who
+            // has learned them.
+            KeyCode::Right if !ctrl && !shift && self.focus == Pane::Response => {
+                self.cycle_response_section(true);
+            }
+            KeyCode::Left if !ctrl && !shift && self.focus == Pane::Response => {
                 self.cycle_response_section(false);
             }
             // Shift+Arrow moves the *end* of an active selection, letting
@@ -1909,6 +1945,22 @@ impl TuiApp {
                 self.help_query.clear();
             }
             KeyCode::Char('b') => self.open_prompt_baseurl(),
+            // Fold the request's captures/asserts/generated summary away. A
+            // request with a dozen asserts can otherwise fill the pane with
+            // description and leave three rows for the request itself. The flip
+            // is against what was last drawn, so the first press always does
+            // the visible thing whichever way the automatic choice went.
+            // In the Response pane it folds that response's per-assert list
+            // instead -- the pane-scoped reading of "show me less of this",
+            // matching how `x`, `u` and `/` already mean "the thing in this
+            // pane". Both flips are against what was last drawn, so the first
+            // press always does the visible thing.
+            KeyCode::Char('z') if self.focus == Pane::Response => {
+                self.response_asserts_folded = Some(!self.response_asserts_folded_now);
+            }
+            KeyCode::Char('z') => {
+                self.request_meta_folded = Some(!self.request_meta_folded_now);
+            }
             // `/` starts filtering the Global Environments panel by name. It
             // also focuses the panel, so it works as "find me an environment"
             // from wherever you are rather than only once the panel is focused
@@ -2106,12 +2158,10 @@ impl TuiApp {
             // A no-op on a tab that isn't Workspace-bound (creating a new
             // Workspace tab is only done via File → Load → "(W)orkspace…").
             KeyCode::Char('w') => self.open_workspace_picker_for_active_tab(),
-            // Backspace is a shortcut for Enter on the Requests list's "up"
-            // row: go up a folder without needing it highlighted first.
-            KeyCode::Backspace
-                if self.focus == Pane::List
-                    && !self.collections[self.active_tab].folder.is_empty() =>
-            {
+            // Backspace closes the folder the cursor is in and moves onto its
+            // row -- the way out of a folder, now that there is no "up" row to
+            // press Enter on.
+            KeyCode::Backspace if self.focus == Pane::List && self.list_can_go_up() => {
                 self.list_folder_up(self.active_tab);
             }
             KeyCode::Char('n') => {
@@ -2141,7 +2191,7 @@ impl TuiApp {
                 // Prefill the Name field with the folder currently being
                 // browsed, so saving without editing it creates the request
                 // right where the user is looking, e.g. "Auth/" + typed name.
-                let folder = &self.collections[self.active_tab].folder;
+                let folder = &self.collections[self.active_tab].cursor_folder();
                 if !folder.is_empty() {
                     form.name = Editor::new(&format!("{}/", folder.join("/")), false);
                 }
@@ -2201,6 +2251,15 @@ impl TuiApp {
                 let ci = self.active_tab;
                 if self.collections[ci].is_workspace() {
                     self.on_left_workspace_list(ci);
+                } else if self.list_on_open_folder(ci) || self.list_hscroll == 0 {
+                    // A folder closes; a request scrolls its URL back to the
+                    // start and only then steps out of the folder it is in.
+                    // Both are what Left means where the cursor is: there is
+                    // nothing to scroll on a folder row, and a URL scrolled
+                    // half-way is exactly what the user is reading.
+                    if self.list_can_go_up() {
+                        self.list_folder_up(ci);
+                    }
                 } else {
                     self.scroll_list_h(-4);
                 }
@@ -2211,6 +2270,23 @@ impl TuiApp {
                 // collection), matching a file browser; otherwise it
                 // horizontally scrolls the selected request's URL.
                 let ci = self.active_tab;
+                // On an ordinary tab, Right opens the folder under the cursor
+                // -- the mirror of Left, and what a file tree does -- and
+                // scrolls the URL anywhere else.
+                if !self.collections[ci].is_workspace() {
+                    let col = &self.collections[ci];
+                    if let Some(crate::tree::Row::Folder {
+                        path,
+                        expanded: false,
+                    }) = col.rows().get(col.list_cursor)
+                    {
+                        let path = path.clone();
+                        self.list_folder_toggle(ci, path);
+                    } else {
+                        self.scroll_list_h(4);
+                    }
+                    return;
+                }
                 let col = &self.collections[ci];
                 let row = col
                     .is_workspace()
@@ -2956,18 +3032,62 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Ascend to the parent folder in the Requests list (Enter on the "up" row).
-    fn list_folder_up(&mut self, ci: usize) {
-        let col = &mut self.collections[ci];
-        col.folder.pop();
-        col.list_cursor = 0;
+    /// Whether the Requests-list cursor is sitting on an *open* folder row.
+    fn list_on_open_folder(&self, ci: usize) -> bool {
+        let col = &self.collections[ci];
+        matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Folder { expanded: true, .. })
+        )
     }
 
-    /// Descend into a subfolder in the Requests list (Enter on a folder row).
-    fn list_folder_down(&mut self, ci: usize, name: String) {
+    /// Whether the cursor is somewhere there is a folder to close: inside one,
+    /// or on an open one.
+    fn list_can_go_up(&self) -> bool {
+        let col = &self.collections[self.active_tab];
+        if col.is_workspace() || col.list_filter_active() {
+            return false;
+        }
+        !col.cursor_folder().is_empty()
+    }
+
+    /// Close the folder the cursor is in, and put the cursor on it.
+    ///
+    /// Left (and Backspace) on a row inside a folder closes the folder *around*
+    /// it rather than the row's own -- which is what "go up" meant in the old
+    /// breadcrumb list and what a file tree does everywhere else. On an open
+    /// folder row it closes that folder instead, since that is the folder the
+    /// cursor is pointing at.
+    fn list_folder_up(&mut self, ci: usize) {
         let col = &mut self.collections[ci];
-        col.folder.push(name);
-        col.list_cursor = 0;
+        let on_open_folder = matches!(
+            col.rows().get(col.list_cursor),
+            Some(crate::tree::Row::Folder { expanded: true, .. })
+        );
+        let folder = col.cursor_folder();
+        let target = if on_open_folder {
+            folder
+        } else {
+            let mut up = folder;
+            up.pop();
+            up
+        };
+        if target.is_empty() {
+            return;
+        }
+        col.toggle_folder(&target);
+        // The folder just closed is where the cursor belongs: its contents,
+        // wherever the cursor was among them, are no longer on the screen.
+        col.list_cursor = col
+            .rows()
+            .iter()
+            .position(|r| matches!(r, crate::tree::Row::Folder { path, .. } if *path == target))
+            .unwrap_or(0);
+    }
+
+    /// Open or close the folder under the cursor, leaving the cursor on it.
+    fn list_folder_toggle(&mut self, ci: usize, path: Vec<String>) {
+        self.collections[ci].toggle_folder(&path);
     }
 
     /// Handle Enter on a Workspace tab's file-tree list row.
@@ -3574,8 +3694,10 @@ impl TuiApp {
                     .rows()
                     .get(self.collections[ci].list_cursor)
                 {
-                    Some(crate::tree::Row::Up) => self.list_folder_up(ci),
-                    Some(crate::tree::Row::Folder(name)) => self.list_folder_down(ci, name.clone()),
+                    Some(crate::tree::Row::Folder { path, .. }) => {
+                        let path = path.clone();
+                        self.list_folder_toggle(ci, path);
+                    }
                     Some(crate::tree::Row::Entry(_)) => {
                         // Entering a request focuses the panel showing it and
                         // opens the edit wizard (same as pressing Enter again
@@ -3807,6 +3929,15 @@ impl TuiApp {
                 (!n.is_empty() && !e.is_empty()).then_some((n, e))
             })
             .collect();
+        let generators: Vec<(String, String)> = form
+            .generators
+            .iter()
+            .filter_map(|r| {
+                let n = r.name.text().trim().to_string();
+                let e = r.expr.text().trim().to_string();
+                (!n.is_empty() && !e.is_empty()).then_some((n, e))
+            })
+            .collect();
 
         if let Some((ci, ei)) = form.editing {
             let Some(col) = self.collections.get_mut(ci) else {
@@ -3834,7 +3965,8 @@ impl TuiApp {
                 || entry.expected_status != expected_status
                 || entry.asserts != asserts
                 || entry.captures != captures
-                || entry.reports != reports;
+                || entry.reports != reports
+                || entry.generators != generators;
             if changed {
                 entry.title = name;
                 entry.method = method;
@@ -3849,7 +3981,13 @@ impl TuiApp {
                 entry.asserts = asserts;
                 entry.captures = captures;
                 entry.reports = reports;
-                entry.modified = true;
+                entry.generators = generators;
+                // Re-derived against the file, not latched: an edit that ends
+                // where it started -- a URL changed and changed back, a header
+                // added and removed -- leaves the request identical to the one
+                // on disk, and a pencil on it says there is something to save
+                // when there is not. `mark_edited` compares the two.
+                entry.mark_edited();
             }
             col.invalidate_request_json();
             col.sync_folder_to_selected();
@@ -3870,6 +4008,7 @@ impl TuiApp {
         entry.asserts = asserts;
         entry.captures = captures;
         entry.reports = reports;
+        entry.generators = generators;
         let target = form.target_idx.min(self.collections.len() - 1);
         // Requests added to a real collection (not the Scratch Space, tab 0) are
         // marked so they're distinguishable from those loaded from the file.
@@ -4167,7 +4306,10 @@ impl TuiApp {
                     _ => None,
                 };
                 if done.is_some() {
-                    entry.modified = true;
+                    // Re-derived, for the same reason as the wizard: adopting
+                    // notes that already match the file changes nothing, and a
+                    // pencil claiming otherwise sends the user to save.
+                    entry.mark_edited();
                     self.status = done;
                     self.save_state();
                 }
@@ -4186,6 +4328,16 @@ impl TuiApp {
             return;
         }
         let ei = self.collections[ci].selected_entry;
+        // The collection has a file and this request is edited, but that is not
+        // enough: a request just added to it, or a duplicate that still shares
+        // its original's identity, has no saved version of its *own* to go back
+        // to (`Collection::revert_request` returns `None` for exactly these).
+        // Say so up front rather than confirming a revert we know can't happen
+        // and then reporting "nothing to revert" after the user commits.
+        if !self.collections[ci].has_saved_version(ei) {
+            self.status = Some(Status::RequestHasNoSavedVersion);
+            return;
+        }
         self.overlay = Some(Overlay::Confirm {
             action: ConfirmAction::RevertRequest(ci, ei),
             sel: 1,
@@ -6629,6 +6781,18 @@ impl TuiApp {
         if reveal_ctype_dropdown {
             form.ctype_dropdown_hidden = false;
         }
+        // Enter on an expression cell with nothing half-typed opens the function
+        // catalogue. Typing the first letters of a name you already know still
+        // works exactly as before; this is for the far commoner case of not
+        // knowing what there is to type. Enter rather than Down, because Down
+        // is how the rows are moved between and must stay that.
+        let open_gen_browse =
+            !submit && !ctrl && key.code == KeyCode::Enter && form.gen_browse_openable();
+        if open_gen_browse {
+            form.gen_browse = true;
+            form.suggest_hidden = false;
+            form.suggest_hi = Some(0);
+        }
         let dropdown = form.key_dropdown();
         let dropdown_open = dropdown.is_some();
         let sug_len = dropdown.as_ref().map(|(_, s)| s.len()).unwrap_or(0);
@@ -6650,6 +6814,7 @@ impl TuiApp {
                 // Dismiss the suggestion dropdown but keep the form open.
                 form.suggest_hidden = true;
                 form.suggest_hi = None;
+                form.gen_browse = false;
             } else if kind_open {
                 form.kind_dropdown_hidden = true;
             } else if ctype_open {
@@ -6682,7 +6847,11 @@ impl TuiApp {
                 do_submit = true;
                 keep = false;
             }
-        } else if reveal_key_dropdown || reveal_kind_dropdown || reveal_ctype_dropdown {
+        } else if open_gen_browse
+            || reveal_key_dropdown
+            || reveal_kind_dropdown
+            || reveal_ctype_dropdown
+        {
             // The dropdown was just revealed above; stay put so the
             // user can browse it with Down/Up instead of also
             // advancing focus like a normal Enter would.
@@ -6703,7 +6872,14 @@ impl TuiApp {
                 let name = sugs[k];
                 form.accept_suggestion(name);
             }
-            form.focus_next(true, true);
+            // Accepting a header name finishes the cell, so focus moves on.
+            // Accepting a function does not: what went in is `sha256()` with
+            // the caret between the brackets, and the argument still has to be
+            // typed — leaving the cell would abandon the call half-written, in
+            // a row the block then reports as a fault.
+            if !matches!(form.focus, NewField::Computed(_, CapCol::Expr)) {
+                form.focus_next(true, true);
+            }
         } else if !ctrl && kind_open && matches!(key.code, KeyCode::Up | KeyCode::Down) {
             // Step through Text → File → Base64 File (Down) or the
             // reverse (Up), clamped at the ends like a small list.
@@ -6817,6 +6993,25 @@ impl TuiApp {
             // text-entry cell, so the brackets can still be typed into
             // URLs, JSON bodies, header/cookie/form values, etc.
             form.cycle_view_tab(key.code == KeyCode::Char(']'));
+        } else if ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
+            // Ctrl+Z undoes within the focused text cell, Ctrl+Shift+Z redoes —
+            // the same binding the report editor and the main view's text panes
+            // use, and the one every text field anywhere has. The wizard's
+            // fields bound neither, which mattered most where an edit isn't
+            // something the user typed one character at a time: accepting a
+            // function suggestion rewrites the cell in one go, and without undo
+            // there was no way back to what was being typed.
+            //
+            // Per-cell, because that is where the history lives: each cell is
+            // its own [`Editor`] with its own stack, so this undoes the field
+            // you are in and never reaches into one you have left.
+            if let Some(ed) = form.active_editor() {
+                if shift {
+                    ed.redo();
+                } else {
+                    ed.undo();
+                }
+            }
         } else if ctrl && key.code == KeyCode::Char('d') {
             // Delete the focused Header/Cookie/Form/Assert/Capture row;
             // focus moves to the row sliding into its place, or the
@@ -6836,10 +7031,10 @@ impl TuiApp {
             } else {
                 form.jump_backward()
             };
-        } else if alt && let KeyCode::Char(c @ '1'..='9') = key.code {
-            // Alt+1..9 jumps directly to a section by number
+        } else if alt && let KeyCode::Char(c @ ('1'..='9' | '0')) = key.code {
+            // Alt+1..9 then Alt+0 jumps directly to a section by number
             // (Headers/Cookies/Queries/Options/Form/Body/Asserts/Captures/
-            // Reports), regardless of the current section-view tab — a
+            // Reports/Computed), regardless of the current section-view tab — a
             // direct-jump complement to Ctrl+Up/Down's sequential one. Alt
             // (not Ctrl) because Ctrl+<digit> has no standard control-code
             // encoding and most terminals only report it with a
@@ -6855,7 +7050,8 @@ impl TuiApp {
                 '6' => WizardTab::Body,
                 '7' => WizardTab::Asserts,
                 '8' => WizardTab::Captures,
-                _ => WizardTab::Reports, // '9'
+                '9' => WizardTab::Reports,
+                _ => WizardTab::Computed, // '0'
             };
             form.focus = form.first_field_of(tab);
         } else if ctrl && shift && matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -7205,6 +7401,64 @@ impl TuiApp {
                     KeyCode::End => form.reports[i].cell_mut(col).end(),
                     _ => {}
                 },
+                NewField::AddComputed => match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        form.generators.push(ReportRow::new());
+                        form.focus = NewField::Computed(form.generators.len() - 1, CapCol::Name);
+                    }
+                    KeyCode::Down => form.focus_next(true, true),
+                    KeyCode::Up => form.focus_next(false, true),
+                    _ => {}
+                },
+                NewField::Computed(i, col) => match key.code {
+                    KeyCode::Up => {
+                        form.focus = if i > 0 {
+                            NewField::Computed(i - 1, col)
+                        } else {
+                            form.up_into_reports()
+                        };
+                    }
+                    KeyCode::Down => {
+                        form.focus = if i + 1 < form.generators.len() {
+                            NewField::Computed(i + 1, col)
+                        } else {
+                            NewField::AddComputed
+                        };
+                    }
+                    KeyCode::Left => {
+                        let at_start = form.generators[i].cell_mut(col).col == 0;
+                        if !at_start {
+                            if ctrl {
+                                form.generators[i].cell_mut(col).home();
+                            } else {
+                                form.generators[i].cell_mut(col).left();
+                            }
+                        } else if let Some(prev) = form.prev_cap_col(col) {
+                            form.generators[i].cell_mut(prev).end();
+                            form.focus = NewField::Computed(i, prev);
+                        }
+                    }
+                    KeyCode::Right => {
+                        let ed = form.generators[i].cell_mut(col);
+                        let at_end = ed.col >= ed.line_len(ed.row);
+                        if !at_end {
+                            if ctrl {
+                                form.generators[i].cell_mut(col).end();
+                            } else {
+                                form.generators[i].cell_mut(col).right();
+                            }
+                        } else if let Some(next) = form.next_cap_col(col) {
+                            form.generators[i].cell_mut(next).home();
+                            form.focus = NewField::Computed(i, next);
+                        }
+                    }
+                    KeyCode::Enter => form.focus_next(true, true),
+                    KeyCode::Char(ch) => form.generators[i].cell_mut(col).insert(ch),
+                    KeyCode::Backspace => form.generators[i].cell_mut(col).backspace(),
+                    KeyCode::Home => form.generators[i].cell_mut(col).home(),
+                    KeyCode::End => form.generators[i].cell_mut(col).end(),
+                    _ => {}
+                },
                 _ => {
                     // Ghost Base URL: Right arrow on an empty URL field commits it.
                     if form.focus == NewField::Url
@@ -7282,7 +7536,17 @@ impl TuiApp {
                 }
             }
             // Typing in the Key cell (re)opens the dropdown for the new text.
-            if let NewField::Kvd(KvdKind::Header, _, HdrCol::Key) = form.focus
+            // The Computed expression cell shares the same suggestion machinery
+            // (its function menu), so typing there must re-offer the matches
+            // too — including after Esc has dismissed the list, which is what
+            // makes continuing to type bring it back rather than trapping the
+            // user until they leave the cell and return.
+            if matches!(form.focus, NewField::Kvd(KvdKind::Header, _, HdrCol::Key))
+                && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
+            {
+                typed_in_key = true;
+            }
+            if matches!(form.focus, NewField::Computed(_, CapCol::Expr))
                 && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace)
             {
                 typed_in_key = true;
@@ -7322,6 +7586,14 @@ impl TuiApp {
                     form.view_tab.last_field()
                 };
             }
+            // Leaving a cell ends its undo run: coming back to it and typing
+            // again is a second step, and one Ctrl+Z should take back only
+            // what was just typed rather than everything the cell ever held.
+            if form.focus != prev_focus
+                && let Some(ed) = form.editor_at(prev_focus)
+            {
+                ed.end_run();
+            }
             if typed_in_key {
                 form.suggest_hi = None;
                 form.suggest_hidden = false;
@@ -7329,13 +7601,18 @@ impl TuiApp {
                 // Moving to a different field resets the highlight, but
                 // only auto-*shows* the dropdown when landing on an
                 // empty Key cell (e.g. a freshly added header row).
-                // Arrowing onto a Key cell that already has text must
-                // not immediately trap Down/Up in the dropdown; Enter
-                // can still reveal it explicitly (`reveal_key_dropdown`).
+                // Arrowing onto a Key cell — or a Computed expression cell —
+                // that already has text must not immediately trap Down/Up in
+                // the dropdown; Enter can still reveal it explicitly
+                // (`reveal_key_dropdown`). This mirrors the mouse-focus path in
+                // `focus_new_request_field`.
                 form.suggest_hi = None;
                 let landed_on_populated_key = matches!(form.focus, NewField::Kvd(KvdKind::Header, i, HdrCol::Key)
-                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()));
+                            if form.headers.get(i).is_some_and(|r| !r.key.text().is_empty()))
+                    || matches!(form.focus, NewField::Computed(i, CapCol::Expr)
+                            if form.generators.get(i).is_some_and(|r| !r.expr.text().is_empty()));
                 form.suggest_hidden = landed_on_populated_key;
+                form.gen_browse = false;
             }
             if form.focus != prev_focus {
                 // Moving onto (or off of) the Kind cell resets its

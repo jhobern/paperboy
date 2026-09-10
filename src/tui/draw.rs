@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use crate::collection::{Collection, WsRow};
 use crate::environment::ValueSource;
 use crate::hurl::RunStatus;
-use crate::i18n::{Language, Strings};
+use crate::i18n::Strings;
 use crate::request;
 use crate::tree;
 
@@ -137,11 +137,8 @@ pub(crate) const ENV_ICON: &str = "\u{1F310}"; // 🌐
 /// `depth` on workspace rows drives `"  ".repeat(depth)` indentation in the
 /// rendered list.
 enum LeftRow {
-    Up,
-    /// Non-workspace virtual folder (title-encoded); always flat, no expand
-    /// state, rendered with FOLDER_ICON.
-    Folder(String),
-    /// Workspace filesystem folder; indented by `depth * 2` spaces and
+    /// An expandable folder: a workspace's directory on disk, or a
+    /// collection's title-encoded one. Indented by `depth * 2` spaces and
     /// rendered with an expand/collapse chevron.
     WsFolder {
         name: String,
@@ -292,12 +289,23 @@ impl LeftRow {
                 })
                 .collect()
         } else {
+            // A collection's title-encoded folders draw exactly like a
+            // workspace's real ones -- same chevron, same indentation. They
+            // behave the same way now, and a user has no reason to care that
+            // one kind is a directory and the other is a `/` in a name.
+            let entries = &col.entries;
             col.rows()
                 .into_iter()
-                .map(|r| match r {
-                    tree::Row::Up => LeftRow::Up,
-                    tree::Row::Folder(name) => LeftRow::Folder(name),
-                    tree::Row::Entry(idx) => LeftRow::Entry { idx, depth: 0 },
+                .map(|r| {
+                    let depth = r.depth(entries);
+                    match r {
+                        tree::Row::Folder { path, expanded } => LeftRow::WsFolder {
+                            name: path.last().cloned().unwrap_or_default(),
+                            depth,
+                            expanded,
+                        },
+                        tree::Row::Entry(idx) => LeftRow::Entry { idx, depth },
+                    }
                 })
                 .collect()
         }
@@ -1661,6 +1669,139 @@ fn draw_report_setting_menu_overlay(
     }
 }
 
+/// Draw the Response pane's assert/capture palette ([`Overlay::ProbeMenu`]).
+///
+/// Two columns on step one — what the value is called, and what it currently
+/// is — because a path on its own rarely settles "is this the field I mean?",
+/// and the value is what the offered equality assert will contain. Step two
+/// shows the assert lines themselves, verbatim, so the row is a preview of the
+/// text about to be written into the file.
+fn draw_probe_menu_overlay(
+    f: &mut Frame,
+    menu: &super::probe_menu::ProbeMenu,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    use super::probe_menu::ProbeStep;
+    use crate::probe::verb_label;
+    let step_one = menu.step == ProbeStep::PickSubject;
+    // The typed filter goes in the title, where it reads as part of the
+    // question rather than as another row of the list.
+    let typed = if menu.filter.is_empty() || !step_one {
+        String::new()
+    } else {
+        format!("  /{}", menu.filter)
+    };
+    let hint = if step_one {
+        s.probe_menu_hint
+    } else {
+        s.probe_verb_hint
+    };
+    let visible = menu.visible();
+    let n = menu.row_count().max(1);
+    let box_w = f.area().width.saturating_sub(6).clamp(40, 100);
+    let box_h = (n as u16 + 2).min(f.area().height.saturating_sub(2)).max(3);
+    let area = centered_rect(box_w, box_h, f.area());
+    f.render_widget(Clear, area);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let scroll = menu.selected.saturating_sub(inner_h.saturating_sub(1));
+    // A JSON body of any size gives more rows than fit, and a list that scrolls
+    // with no sign of it looks like the whole list: "7/214" is the difference
+    // between "that field is not offered" and "keep pressing Down". Only shown
+    // while something is actually off-screen, so short lists stay quiet.
+    let position = if menu.row_count() > inner_h {
+        format!("  {}/{}", menu.selected + 1, menu.row_count())
+    } else {
+        String::new()
+    };
+    let title = format!("{}{typed}{position}  ({hint})", menu.title(s));
+    let mut lines: Vec<Line> = Vec::new();
+    let row_style = |i: usize| {
+        if i == menu.selected {
+            Style::default()
+                .fg(th.bg)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.text)
+        }
+    };
+    if menu.row_count() == 0 {
+        // Say so rather than drawing an empty box, which reads as "broken"
+        // instead of "nothing matches".
+        lines.push(Line::from(Span::styled(
+            s.probe_menu_no_match.to_string(),
+            Style::default().fg(th.dim),
+        )));
+    }
+    if step_one {
+        // The name column is as wide as the longest visible name, capped so a
+        // deeply nested path can't push every value off the right edge.
+        let name_w = visible
+            .iter()
+            .map(|row| row.label(s).chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(inner_w.saturating_sub(12).max(8));
+        for (i, row) in visible.iter().enumerate().skip(scroll).take(inner_h) {
+            let name = row.label(s);
+            let name = if name.chars().count() > name_w {
+                // Truncate from the *left*: the tail of a jsonpath is the field
+                // being named, and the head is shared with its neighbours.
+                let tail: String = name
+                    .chars()
+                    .skip(name.chars().count() - name_w.saturating_sub(1))
+                    .collect();
+                format!("…{tail}")
+            } else {
+                format!("{name:name_w$}")
+            };
+            let value = row.value(inner_w.saturating_sub(name_w + 2).max(4), s);
+            let style = row_style(i);
+            lines.push(Line::from(vec![
+                Span::styled(name, style),
+                Span::styled("  ", style),
+                Span::styled(
+                    value,
+                    if i == menu.selected {
+                        style
+                    } else {
+                        Style::default().fg(th.dim)
+                    },
+                ),
+            ]));
+        }
+    } else {
+        let subject = menu.chosen.as_ref().map(|p| p.subject.clone());
+        for (i, verb) in menu.verbs.iter().enumerate().skip(scroll).take(inner_h) {
+            let label = match &subject {
+                Some(subject) => verb_label(subject, verb, s),
+                None => String::new(),
+            };
+            lines.push(Line::from(Span::styled(label, row_style(i))));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).block(panel(title, true, th)), area);
+    if let Some(app) = app {
+        app.set_mouse_layer(MouseLayer::Overlay);
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(1),
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        for row in scroll..menu.row_count().min(scroll + inner_h) {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                Rect::new(inner.x, inner.y + (row - scroll) as u16, inner.width, 1),
+                MouseHitTarget::OverlayRow(row),
+            );
+        }
+    }
+}
+
 /// Draw the node editor's insert / request-pick palette
 /// ([`Overlay::ReportNodeMenu`]): a simple selectable list — node kinds when
 /// adding, request titles when choosing a request name.
@@ -1743,9 +1884,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 
     f.render_widget(Block::default().style(Style::default().bg(th.bg)), f.area());
 
+    // No banner row. It used to spend three rows (a bordered block) on the
+    // app name, a `[English]` tag and the occasional runner error -- the name
+    // now rides the footer with the shortcuts, the language is evident from
+    // every other word on screen, and the error joins the status message on
+    // the menu row, which is where the eye already goes for "what just
+    // happened". Three rows back for the request and its response.
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -1753,15 +1899,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     .split(f.area());
 
     draw_menu(f, rows[0], app, &s, &th);
-    draw_topbar(f, rows[1], app, &s, &th);
-    draw_tabs(f, rows[2], app, &s, &th);
-    draw_body(f, rows[3], app, &s, &th);
-    draw_footer(f, rows[4], app, &s, &th);
+    draw_tabs(f, rows[1], app, &s, &th);
+    draw_body(f, rows[2], app, &s, &th);
+    draw_footer(f, rows[3], app, &s, &th);
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
     // `draw_collection_main`/`draw_response` inside `draw_body` above).
     paint_selection_highlight(f, app, &th);
+    paint_probe_anchor(f, app, &th);
 
     // The report's questions are asked *over* the report, not instead of it:
     // the point of asking on the way to a run is that you can still see what
@@ -1789,6 +1935,42 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 /// region is confined to its own panel's cached text area/rows, so a
 /// highlight can never bleed into a neighbouring panel or the rest of the
 /// terminal row.
+/// Underline the value the assert palette's cursor is on, where the response
+/// pane is showing it (see `probe_anchor`).
+///
+/// Underlined rather than washed like a selection: the palette is a list of
+/// paths, and the response behind it is being *read* while the list is moved
+/// through, so the mark has to be findable at a glance without repainting a
+/// block of the body in another colour every time the cursor moves. It is also
+/// not a selection — `y` still copies whatever the user selected by hand.
+fn paint_probe_anchor(f: &mut Frame, app: &TuiApp, th: &Theme) {
+    let Some((start, end)) = app.resp_probe_anchor else {
+        return;
+    };
+    let Some(wrap) = app.resp_panel.wrap() else {
+        return;
+    };
+    let cells = tui_panel_select::selection::highlight_cells(
+        start,
+        end,
+        wrap,
+        app.resp_text_area,
+        app.resp_panel.scroll(),
+    );
+    let buf = f.buffer_mut();
+    for (row, from, to) in cells {
+        for col in from..to {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.set_style(
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
+                );
+            }
+        }
+    }
+}
+
 fn paint_selection_highlight(f: &mut Frame, app: &TuiApp, th: &Theme) {
     if !app.has_any_selection() {
         return;
@@ -1847,6 +2029,24 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             Style::default().fg(th.dim),
         ));
     }
+    // The last runner error (transport failure / failed assert / parse error)
+    // rides here too, so it is never silently swallowed.
+    //
+    // `error_text`, not `error`: a request refused because a `# [Gen]` row
+    // failed reports that in the reader's language, under the heading the
+    // pre-flight check uses. And not at all when the status message beside it
+    // is already saying it, word for word -- a refused send reports the same
+    // finding through both channels (the check that saw it coming and the
+    // response that carries the refusal), and printing it twice on one row
+    // reads as two things having gone wrong.
+    let error = { app.response.lock().unwrap().error_text(s) };
+    let echoes_status = app.status.as_ref().is_some_and(|st| st.text(s) == error);
+    if !error.is_empty() && !echoes_status {
+        spans.push(Span::styled(
+            format!("     {error}"),
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+        ));
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
         area,
@@ -1872,35 +2072,6 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             MouseHitTarget::MenuSettings,
         );
     }
-}
-
-pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    let lang = match app.language {
-        Language::English => s.lang_english,
-        Language::French => s.lang_french,
-        Language::Danish => s.lang_danish,
-    };
-    let mut spans = vec![
-        Span::styled(
-            s.app_heading,
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(format!("[{lang}]"), Style::default().fg(th.dim)),
-    ];
-    // Surface the last runner error (transport failure / failed assert / parse
-    // error) here on the status bar so it is never silently swallowed.
-    let error = { app.response.lock().unwrap().error.clone() };
-    if !error.is_empty() {
-        spans.push(Span::styled(
-            format!("   {} {error}", s.req_error_prefix),
-            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(panel(String::new(), false, th)),
-        area,
-    );
 }
 
 /// Icon prefix shown before a tab's name (in both the tab bar and the
@@ -2151,12 +2322,22 @@ pub(crate) fn draw_collection_left(
     // substituted and colour-coded by whether their value is loaded.
     let env = app.effective_env(ci);
     let smap = crate::request::subst_map(col, env.as_ref());
+    // A request that computes values behaves differently from its neighbours --
+    // it can fail before it is even sent, and its URL holds a value that does
+    // not exist yet -- but the list said nothing about it, so the one request
+    // in a collection that had a `# [Gen]` block looked exactly like the rest.
+    // The column only appears when some request in this tab has one, so
+    // collections that compute nothing keep the width for their URLs.
+    let any_computed = col.entries.iter().any(|e| !e.generators.is_empty());
     // Columns available for the URL text (after the border, user-added marker
     // and the fixed method column). The selected row is shown highlighted
     // rather than with a leftmost caret, so no column is reserved for one.
     // Recorded so h-scrolling can be clamped to stop once the URL's end is
     // visible (no blank overscroll).
-    let url_w = list_area.width.saturating_sub(2 + 2 + 5);
+    // The computed column, when shown, takes two more of them.
+    let url_w = list_area
+        .width
+        .saturating_sub(2 + 2 + 5 + if any_computed { 2 } else { 0 });
     app.list_scroll_w.set(url_w);
     // Scroll is measured against the SUBSTITUTED display length (what's shown).
     // Folder/Up/collection rows have no scrollable URL text. A row that shows a
@@ -2184,15 +2365,6 @@ pub(crate) fn draw_collection_left(
         .iter()
         .enumerate()
         .map(|(i, row)| match row {
-            LeftRow::Up => ListItem::new(Line::from(Span::styled(
-                s.list_up_row.to_string(),
-                Style::default().fg(th.dim),
-            ))),
-            // Non-workspace virtual folder (title-encoded); no indentation.
-            LeftRow::Folder(name) => ListItem::new(Line::from(Span::styled(
-                format!("{FOLDER_ICON} {name}/"),
-                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-            ))),
             // Workspace filesystem folder with expand/collapse chevron and
             // depth-based indentation.
             LeftRow::WsFolder {
@@ -2350,6 +2522,15 @@ pub(crate) fn draw_collection_left(
                 // dotted marker while a run is still in progress; blank
                 // until a batch run has actually covered this entry.
                 spans.push(run_marker_span(e.last_run, th));
+                if any_computed {
+                    // ƒ, in the same violet the request preview paints computed
+                    // substitutions in, so the two read as one idea.
+                    spans.push(if e.generators.is_empty() {
+                        Span::raw("  ")
+                    } else {
+                        Span::styled("\u{0192} ", Style::default().fg(th.computed))
+                    });
+                }
                 // Show the request's name when it has one; otherwise fall back
                 // to the URL. A title encodes a folder path (`Auth/Login`), and
                 // those folders are already rows in the tree, so only the leaf
@@ -2425,7 +2606,7 @@ pub(crate) fn draw_collection_left(
         } else {
             items
         };
-    let mut title = if ci == 0 {
+    let title = if ci == 0 {
         s.tab_request.to_string()
     } else {
         // Unlike the tab bar (which always shows the tab's own, renameable
@@ -2443,13 +2624,9 @@ pub(crate) fn draw_collection_left(
         };
         format!("{}{}", tab_icons(col), display_name)
     };
-    // Non-workspace tabs show the current in-collection folder path as a
-    // breadcrumb (the title-encoded virtual folder from `col.folder`).
-    // Workspace tabs use a real expand/collapse tree — there is no single
-    // "current folder" to display, so the breadcrumb is omitted there.
-    if !col.is_workspace() && !col.folder.is_empty() {
-        title = format!("{title} › {}", col.folder.join(" › "));
-    }
+    // No breadcrumb on either kind of tab: both draw a real expand/collapse
+    // tree, so there is no single "current folder" to name — the open folders
+    // are on the screen, indented, saying it better than a title could.
     // A collection linked to a Global Environment shows that environment's
     // name (green, joined by a link icon) in this panel's title bar, so
     // it's visible at a glance which environment its requests will
@@ -3101,11 +3278,12 @@ pub(crate) fn draw_env_popup(
 fn subst_color(kind: crate::request::SubstKind, th: &Theme) -> Color {
     use crate::request::SubstKind;
     match kind {
-        SubstKind::Literal => th.subst,   // cyan
-        SubstKind::Loaded => th.ok,       // green
-        SubstKind::Pending => th.pending, // orange
-        SubstKind::Failed => th.err,      // red
-        SubstKind::Undefined => th.err,   // red
+        SubstKind::Literal => th.subst,     // cyan
+        SubstKind::Loaded => th.ok,         // green
+        SubstKind::Computed => th.computed, // violet: a value it will have, once sent
+        SubstKind::Pending => th.pending,   // orange
+        SubstKind::Failed => th.err,        // red
+        SubstKind::Undefined => th.err,     // red
     }
 }
 
@@ -3120,6 +3298,8 @@ struct SubstSeen {
     failed: bool,
     /// At least one referenced `{{ VAR }}` is defined nowhere at all.
     undefined: bool,
+    /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
+    computed: bool,
     /// At least one rendered substitution's Global Environment value is
     /// being shadowed by the collection's linked Environment.
     shadowed: bool,
@@ -3130,6 +3310,7 @@ impl SubstSeen {
         use crate::request::SubstKind;
         match kind {
             SubstKind::Loaded => self.loaded = true,
+            SubstKind::Computed => self.computed = true,
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
@@ -3138,7 +3319,12 @@ impl SubstSeen {
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed || self.undefined
+        self.loaded
+            || self.literal
+            || self.pending
+            || self.failed
+            || self.undefined
+            || self.computed
     }
 }
 
@@ -3158,6 +3344,29 @@ impl SubstSeen {
 /// is appended to it — used to strip the icon back out of copied/selected
 /// text later (see `TuiApp::main_shadow_icon_positions`), since it's a
 /// purely visual annotation that would otherwise corrupt a pasted request.
+/// Repaint a line's ordinary text without touching what `highlight_spans`
+/// deliberately coloured: a substituted `{{ var }}` keeps its status colour
+/// (that is the whole point of the legend), everything else takes `to`.
+fn recolor_base(
+    spans: Vec<Span<'static>>,
+    to: Color,
+    bold: bool,
+    base: Color,
+) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|mut sp| {
+            if sp.style.fg.is_none() || sp.style.fg == Some(base) {
+                sp.style = sp.style.fg(to);
+            }
+            if bold {
+                sp.style = sp.style.add_modifier(Modifier::BOLD);
+            }
+            sp
+        })
+        .collect()
+}
+
 fn highlight_spans(
     text: &str,
     vars: &std::collections::HashMap<String, crate::request::SubstInfo>,
@@ -3481,6 +3690,7 @@ pub(crate) fn draw_collection_main(
     let url = entry.url.clone();
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
+    let generators = entry.generators.clone();
     let expected_status = entry.expected_status;
     // A raw body plus form fields can't both be sent (see
     // `HurlEntry::body_form_conflict`), and the run refuses it. Said here too,
@@ -3543,6 +3753,13 @@ pub(crate) fn draw_collection_main(
     // `TuiApp::main_shadow_icon_positions`) rather than corrupting a pasted
     // request with a stray "!".
     let mut shadow_positions: std::collections::HashSet<TextPos> = std::collections::HashSet::new();
+    // A `# [Gen]` block is a section of the request that happens to be spelled
+    // as comments (that is the only way the file stays runnable by `hurl`
+    // itself). Colouring it like one keeps the `#` — copy this pane and you
+    // still get valid Hurl — while stopping the block from reading as inert
+    // prose. Counted the way the parser counts it, so a block that wouldn't
+    // load isn't dressed up as one that would.
+    let mut gen_rows_left = 0usize;
     let mut body_lines: Vec<Line> = buf
         .lines()
         .enumerate()
@@ -3551,6 +3768,19 @@ pub(crate) fn draw_collection_main(
             let spans = highlight_spans(l, &dvars, th, &mut seen, Some(&shadowed), Some(&mut cols));
             for c in cols {
                 shadow_positions.insert(TextPos::new(li, c));
+            }
+            let marker = crate::hurl::parse_gen_marker(l).filter(|n| *n > 0);
+            let row = gen_rows_left > 0 && crate::hurl::parse_gen_row(l).is_some();
+            if row {
+                gen_rows_left -= 1;
+            } else if let Some(n) = marker {
+                gen_rows_left = n;
+            } else {
+                gen_rows_left = 0;
+            }
+            if marker.is_some() || row {
+                let bold = marker.is_some() && !row;
+                return Line::from(recolor_base(spans, th.computed, bold, th.text));
             }
             Line::from(spans)
         })
@@ -3604,6 +3834,7 @@ pub(crate) fn draw_collection_main(
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
+            (seen.computed, s.subst_hint_generated, th.computed),
         ];
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (present, word, color) in segments {
@@ -3632,13 +3863,25 @@ pub(crate) fn draw_collection_main(
         }
         top_lines.push(Line::from(spans));
     }
+    // The three sections below describe the request rather than being part of
+    // its text, and a thoroughly covered request easily has more rows of them
+    // than the request itself has lines — at which point the pane is all
+    // description and barely any request. So they fold: `z` toggles them, and
+    // until the user says otherwise they fold themselves as soon as they would
+    // eat more than a third of the pane. Folded, they leave a one-line summary
+    // rather than vanishing — the counts are how you notice a request has
+    // captures at all.
+    let mut meta_lines: Vec<Line> = Vec::new();
+    // (section label, row count) for that folded summary line.
+    let mut meta_counts: Vec<(String, usize)> = Vec::new();
     if !captures.is_empty() {
-        top_lines.push(Line::styled(
+        meta_counts.push(("[Captures]".to_string(), captures.len()));
+        meta_lines.push(Line::styled(
             "[Captures]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
         for (name, expr) in &captures {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(name.clone(), Style::default().fg(th.text)),
                 Span::styled(" ← ", Style::default().fg(th.dim)),
@@ -3647,7 +3890,11 @@ pub(crate) fn draw_collection_main(
         }
     }
     if !asserts.is_empty() || expected_status.is_some() {
-        top_lines.push(Line::styled(
+        meta_counts.push((
+            "[Asserts]".to_string(),
+            asserts.len() + usize::from(expected_status.is_some()),
+        ));
+        meta_lines.push(Line::styled(
             "[Asserts]",
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
@@ -3656,17 +3903,93 @@ pub(crate) fn draw_collection_main(
         // the status check reads as one of the asserts, matching how Hurl
         // evaluates it.
         if let Some(code) = expected_status {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("status == {code}"), Style::default().fg(th.dim)),
             ]));
         }
         for a in &asserts {
-            top_lines.push(Line::from(vec![
+            meta_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(a.clone(), Style::default().fg(th.dim)),
             ]));
         }
+    }
+    // Generated rows are summarised here beside the captures for the same
+    // reason the legend below has a "generated" dot: they are part of the
+    // request even though the file has to carry them as comments (a `[Gen]`
+    // section isn't Hurl syntax — see `HurlEntry::to_hurl`). Read from the
+    // block below, the `#` makes them look like somebody's note.
+    let shown_gens: Vec<&(String, String)> = generators
+        .iter()
+        .filter(|(name, expr)| !name.trim().is_empty() || !expr.trim().is_empty())
+        .collect();
+    if !shown_gens.is_empty() {
+        meta_counts.push((format!("[{}]", s.field_generated), shown_gens.len()));
+        meta_lines.push(Line::styled(
+            format!("[{}]", s.field_generated),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+        for (name, expr) in shown_gens {
+            meta_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(name.clone(), Style::default().fg(th.text)),
+                // "=" rather than the captures' "←": a generated value is
+                // worked out here, not taken out of a response.
+                Span::styled(" = ", Style::default().fg(th.dim)),
+                Span::styled(expr.clone(), Style::default().fg(th.dim)),
+            ]));
+        }
+    }
+    // Folded until asked otherwise. A summary that opens itself only when it is
+    // small is a summary whose height nobody can predict, and the rows it holds
+    // are reference material -- worth a glance when you are working on the
+    // asserts, in the way of the request the rest of the time.
+    let folded = !meta_lines.is_empty() && app.request_meta_folded.unwrap_or(true);
+    // Recorded so `z` can flip whatever is actually on screen, rather than
+    // needing to work the automatic choice out a second time.
+    app.request_meta_folded_now = folded;
+    if folded {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (label, n) in &meta_counts {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(th.dim)));
+            }
+            spans.push(Span::styled(
+                label.clone(),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {n}"), Style::default().fg(th.dim)));
+        }
+        spans.push(Span::styled(
+            format!("   z {}", s.foot_meta_show),
+            Style::default().fg(th.dim),
+        ));
+        top_lines.push(Line::from(spans));
+    } else {
+        // The top region is capped so the request keeps a few rows, and a
+        // Paragraph simply stops drawing at the bottom — an unfolded list
+        // longer than the cap would otherwise end mid-way with nothing to say
+        // it had. Trade the last row for a count of what didn't fit.
+        let room =
+            (inner.height.saturating_sub(3).max(2) as usize).saturating_sub(top_lines.len() + 1);
+        if room >= 2 && meta_lines.len() > room {
+            let hidden = meta_lines.len() - (room - 1);
+            meta_lines.truncate(room - 1);
+            meta_lines.push(Line::styled(
+                format!("  … +{hidden}"),
+                Style::default().fg(th.dim),
+            ));
+        }
+        // The hint rides on the first section header rather than a line of its
+        // own: a line spent saying how to save lines would be self-defeating.
+        if let Some(first) = meta_lines.first_mut() {
+            first.spans.push(Span::styled(
+                format!("   z {}", s.foot_meta_hide),
+                Style::default().fg(th.dim),
+            ));
+        }
+        top_lines.extend(meta_lines);
     }
 
     // Push a dim line to visually separate the Request meta-information from
@@ -3749,6 +4072,60 @@ pub(crate) fn draw_collection_main(
     );
 }
 
+/// Where the row under the assert palette's cursor is written in the section
+/// on view, as a `(start, end)` position pair.
+///
+/// The palette lists paths; the response shows text. Naming `$.data[0].token`
+/// to someone looking at a body with six plausible tokens in it leaves them to
+/// solve the puzzle by reading, which is exactly the work the palette exists to
+/// save. `None` when there is nothing to point at: a subject that isn't written
+/// in this section (a header while the body is on view, or the status, which is
+/// not in the response text at all), or the compact view, whose text is not the
+/// body -- an offset into it would land on the wrong field.
+fn probe_anchor(
+    app: &TuiApp,
+    body: &str,
+    headers: &[(String, String)],
+) -> Option<(TextPos, TextPos)> {
+    use crate::probe::Subject;
+    let Some(Overlay::ProbeMenu(menu)) = app.overlay.as_ref() else {
+        return None;
+    };
+    // Step two is about a subject already chosen; step one follows the cursor.
+    let probe = menu.chosen.clone().or_else(|| menu.choice())?;
+    match (&probe.subject, app.response_section) {
+        (Subject::Json(_) | Subject::JsonCount(_), ResponseSection::Body) => {
+            if app.response_compact {
+                return None;
+            }
+            let span = crate::probe::span_of(body, &probe.subject)?;
+            Some((text_pos_at(body, span.start), text_pos_at(body, span.end)))
+        }
+        (Subject::Header(name), ResponseSection::Headers) => {
+            // The headers section is one `key: value` line per header, built a
+            // few lines below; the value is what the assert is about.
+            let line = headers.iter().position(|(k, _)| k == name)?;
+            let start = name.chars().count() + 2;
+            let end = start + headers[line].1.chars().count();
+            Some((TextPos::new(line, start), TextPos::new(line, end)))
+        }
+        _ => None,
+    }
+}
+
+/// A byte offset into a text, as the panel's (line, char column) position.
+fn text_pos_at(text: &str, offset: usize) -> TextPos {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count();
+    let col = before
+        .rsplit_once('\n')
+        .map(|(_, last)| last)
+        .unwrap_or(before)
+        .chars()
+        .count();
+    TextPos::new(line, col)
+}
+
 pub(crate) fn draw_response(
     f: &mut Frame,
     area: Rect,
@@ -3786,7 +4163,10 @@ pub(crate) fn draw_response(
                 r.status,
                 r.status_text.clone(),
                 r.body.clone(),
-                r.error.clone(),
+                // Already headed and localised -- see `ApiResponse::error_text`.
+                // The panel form: one fault per line, since unlike the status
+                // bar there is room for them (`ApiResponse::error_detail`).
+                r.error_detail(s),
                 r.assert_results.clone(),
                 r.duration_ms,
                 r.headers.clone(),
@@ -3808,6 +4188,8 @@ pub(crate) fn draw_response(
     // panel shows the compacted overview.
     app.resp_full_body = Arc::from("");
     app.resp_compact_line_maps = Vec::new();
+    // Same reason: every early return below leaves nothing to point at.
+    app.resp_probe_anchor = None;
 
     if loading {
         app.resp_max_scroll = 0;
@@ -3840,7 +4222,7 @@ pub(crate) fn draw_response(
             // like any response body — the red fg is applied as the paragraph's
             // fallback style, and the panel still owns wrapping/scrolling for
             // long errors.
-            let content: Arc<str> = Arc::from(format!("{} {error}", s.req_error_prefix));
+            let content: Arc<str> = Arc::from(error.clone());
             app.resp_panel.set_wrap_marker(Some(wrap_marker(th)));
             app.resp_panel
                 .set_content(content, inner.width.max(1) as usize);
@@ -3907,6 +4289,18 @@ pub(crate) fn draw_response(
         ));
     }
 
+    // A run with a dozen checks on it lists a dozen rows above the body, and
+    // when they all passed every one of them says what the `✓ 12/12` badge
+    // beside the status has already said -- so the reader pays most of the
+    // panel to be told twice. Folded when they all passed, open when one did
+    // not: a `✗` names the check and carries the reason, which is the thing
+    // that was worth coming for. `z` overrides either way, as it does for the
+    // request's own summary.
+    let folded = !asserts.is_empty()
+        && app
+            .response_asserts_folded
+            .unwrap_or(passed == total && error.is_empty());
+    app.response_asserts_folded_now = folded;
     // One line per assert (✓/✗ with the expression and, on failure, the actual).
     let assert_lines: Vec<Line> = asserts
         .iter()
@@ -3946,8 +4340,11 @@ pub(crate) fn draw_response(
     // headers as its body.
     let show_err_line = !error.is_empty() && passed == total;
     let err_h: u16 = u16::from(show_err_line);
-    let assert_h =
-        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h));
+    let assert_h = if folded {
+        0
+    } else {
+        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h))
+    };
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(err_h),
@@ -3959,10 +4356,7 @@ pub(crate) fn draw_response(
     f.render_widget(Paragraph::new(Line::from(status_spans)), rows[0]);
     if show_err_line {
         f.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{} {error}", s.req_error_prefix),
-                Style::default().fg(th.err),
-            )),
+            Paragraph::new(Line::styled(error.clone(), Style::default().fg(th.err))),
             rows[1],
         );
     }
@@ -4013,6 +4407,24 @@ pub(crate) fn draw_response(
         app.resp_panel.set_content(content.clone(), width);
     }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
+    // Scrolled to *before* the window is taken, so the row the palette is
+    // pointing at is on screen in the same frame the palette names it. Only
+    // when it isn't already visible: moving the pane under a user who can
+    // already see the value would be worse than not moving it at all.
+    let anchor = probe_anchor(app, &body, &headers);
+    if let Some((start, _)) = anchor
+        && let Some(row) = app.resp_panel.wrap().map(|w| w.textpos_to_row_col(start).0)
+    {
+        let scroll = u32::from(app.resp_panel.scroll());
+        let height = u32::from(body_area.height);
+        if row < scroll || row >= scroll + height {
+            // A third of the way down rather than at the very top: the value
+            // is nearly always read together with what surrounds it.
+            let want = row.saturating_sub(height / 3).min(u32::from(u16::MAX));
+            app.resp_panel.set_scroll(want as u16);
+        }
+    }
+    app.resp_probe_anchor = anchor;
     let max_scroll = app.resp_panel.clamp_scroll(body_area.height);
     app.resp_max_scroll = max_scroll;
     let scroll = app.resp_panel.scroll();
@@ -4186,10 +4598,77 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     if app.focus == Pane::Response && app.response_section == ResponseSection::Body {
         hint.push(format!("c {}", s.foot_compact));
     }
-    // `i` steps the Response section tabs — likewise only meaningful (and only
-    // shown) while the Response pane holds focus.
+    // `a` builds an assert or a capture out of the reply under the cursor. It
+    // is the only entry point to that palette, and a key nothing advertises is
+    // a key nobody finds -- but it is worth a footer slot only while there is
+    // a response for it to read.
+    if app.focus == Pane::Response
+        && app
+            .collections
+            .get(app.active_tab)
+            .and_then(|c| c.entries.get(c.selected_entry))
+            .is_some_and(|e| e.last_response.is_some())
+    {
+        hint.push(format!("a {}", s.foot_probe));
+    }
+    // In the Response pane the same key folds that response's assert list, so
+    // the slot describes whichever of the two `z` would act on.
+    let response_asserts = app.focus == Pane::Response
+        && app
+            .collections
+            .get(app.active_tab)
+            .and_then(|c| {
+                c.entries
+                    .get(c.selected_entry.min(c.entries.len().saturating_sub(1)))
+            })
+            .and_then(|e| e.last_response.as_ref())
+            .is_some_and(|r| !r.assert_results.is_empty());
+    if response_asserts {
+        hint.push(format!(
+            "z {}",
+            if app.response_asserts_folded_now {
+                s.foot_meta_show
+            } else {
+                s.foot_meta_hide
+            }
+        ));
+    }
+    // `z` shows or hides the captures/asserts/generated summary above the
+    // request. It is folded by default, so without a slot here the only trace
+    // of those rows is one line the eye reads as a heading — and a key nothing
+    // advertises is a key nobody finds. Only offered while the selected request
+    // actually has some of them.
+    let has_meta = app
+        .collections
+        .get(app.active_tab)
+        .and_then(|c| {
+            c.entries
+                .get(c.selected_entry.min(c.entries.len().saturating_sub(1)))
+        })
+        .is_some_and(|e| {
+            !e.captures.is_empty()
+                || !e.asserts.is_empty()
+                || e.expected_status.is_some()
+                || e.generators
+                    .iter()
+                    .any(|(n, v)| !n.trim().is_empty() || !v.trim().is_empty())
+        });
+    if has_meta && !response_asserts {
+        hint.push(format!(
+            "z {}",
+            if app.request_meta_folded_now {
+                s.foot_meta_show
+            } else {
+                s.foot_meta_hide
+            }
+        ));
+    }
+    // The arrows step the Response section tabs — likewise only meaningful (and
+    // only shown) while the Response pane holds focus. Advertised as the arrows
+    // rather than as `i`: a footer is where a key is learned, and "←/→" needs no
+    // learning at all.
     if app.focus == Pane::Response {
-        hint.push(format!("i {}", s.foot_response_section));
+        hint.push(format!("\u{2190}/\u{2192} {}", s.foot_response_section));
     }
     // `c` duplicates the highlighted request — but only where there is a
     // request under the cursor to duplicate; on a folder or "up" row it does
@@ -4670,6 +5149,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Shift+H", s.help_raw_mode),
                             ("Shift+J", s.help_raw_json),
                             ("b", s.help_base_url),
+                            ("z", s.help_fold_meta),
                             ("u (List pane)", s.help_restore_request),
                             ("^r (List pane)", s.help_revert_request),
                             ("m (workspace, List pane)", s.help_move_request),
@@ -4719,10 +5199,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.help_group_editing,
                         &[
                             ("", s.help_row_toggle_delete),
+                            ("Ctrl+Z", s.help_text_undo),
                             ("y", s.help_copy_selection),
                             ("Ctrl+C", s.help_ctrl_c),
+                            ("a (Response pane)", s.help_text_probe),
                             ("c (Response pane)", s.help_compact),
-                            ("i (Response pane)", s.help_response_section),
+                            ("\u{2192} / i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
                         ],
@@ -5074,8 +5556,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
+            // The app names itself here rather than in a row of its own: the
+            // overlay is already a titled panel, and "what is this, and which
+            // version" is the question its reader is closest to asking.
             let title = format!(
-                "{} — {}",
+                "{} {} — {} — {}",
+                s.app_heading,
+                env!("CARGO_PKG_VERSION"),
                 s.help_title,
                 match *tab {
                     0 => s.help_tab_shortcuts,
@@ -5138,6 +5625,9 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         }
         Overlay::ReportBind(picker) => {
             draw_report_bind_overlay(f, picker, s, th, Some(app));
+        }
+        Overlay::ProbeMenu(menu) => {
+            draw_probe_menu_overlay(f, menu, s, th, Some(app));
         }
         Overlay::ReportNodeMenu(menu) => {
             draw_report_node_menu_overlay(f, menu, s, th, Some(app));

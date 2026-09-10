@@ -274,6 +274,109 @@ pub fn value_problem(value: &str) -> Option<char> {
         .find(|c| matches!(c, '\n' | '\r' | '\t' | '\\'))
 }
 
+/// What Hurl will make of a `{{…}}` placeholder — which is not always what
+/// PaperBoy makes of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceholderProblem {
+    /// Hurl reads a name off the front and silently drops the rest. Carries the
+    /// placeholder as written and the name Hurl actually resolves.
+    Truncated { written: String, read: String },
+    /// Hurl can't read a name at all, so the whole file fails to parse and the
+    /// collection loads as nothing.
+    Unparsable { written: String },
+}
+
+/// The first character Hurl will carry in a `{{name}}`, per `hurl_core`'s
+/// `parser::expr::variable_name`: alphanumeric (Unicode — `{{Ké}}` is fine),
+/// `_` or `-`. Notably *not* `.`, and not `$`.
+fn hurl_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Characters that don't truncate a placeholder but end the template early, so
+/// the file fails to parse rather than sending the wrong thing.
+///
+/// `hurl_core`'s `parser::string::any_char` refuses these outright, and `#`
+/// additionally closes an unquoted template (it opens a comment). Unquoted is
+/// the only kind that matters here: [`for_each_wire_text`] covers URLs and row
+/// values, which PaperBoy always writes unquoted. Inside a *quoted* template —
+/// an assert, say — `#` is ordinary text, but asserts are stored as raw source
+/// and never scanned.
+///
+/// [`value_problem`] already refuses `\n`, `\r`, `\t` and `\` in a row value,
+/// so for values this is a second line of defence; a URL has no such check.
+fn hurl_template_stopper(c: char) -> bool {
+    matches!(c, '\\' | '\u{8}' | '\n' | '\u{c}' | '\r' | '\t' | '#')
+}
+
+/// How Hurl reads the placeholder whose contents (between the braces) are
+/// `inner`, when that differs from how PaperBoy reads it.
+///
+/// The two really do differ, and dangerously. PaperBoy's own
+/// [`PLACEHOLDER`](crate::environment) pattern takes any brace-free text
+/// between the braces, so `{{ api.key }}` resolves perfectly well in the
+/// request preview. Hurl's grammar is much narrower — a name is a run of
+/// alphanumerics, `_` and `-` — and `hurl_core`'s `templatize` parses the
+/// expression out of the placeholder *without checking that it consumed all of
+/// it*, discarding the remainder without a word. `{{ api.key }}` therefore goes
+/// on the wire as the value of `api`, and `{{ api.key }}` in the preview beside
+/// it says everything is fine.
+///
+/// So this is checked at the point of use rather than left to Hurl: a truncated
+/// placeholder makes a request *succeed* having sent the wrong thing, which is
+/// the same reason [`HurlEntry::body_form_conflict`] blocks a run instead of
+/// warning about it. A name Hurl can't read at all is caught here too, because
+/// the failure it causes is "the collection is empty" several steps away from
+/// the line responsible.
+///
+/// Hurl's own two placeholder functions, `{{ newUuid }}` and `{{ newDate }}`,
+/// are ordinary names to this test and pass it unchanged.
+pub fn placeholder_problem(inner: &str) -> Option<PlaceholderProblem> {
+    let written = format!("{{{{{inner}}}}}");
+    // Hurl skips spaces on both sides of the name. Not tabs: `zero_or_more_spaces`
+    // would take one, but a tab never survives long enough to reach it — it ends
+    // the template first (see `hurl_template_stopper`).
+    let body = inner.trim_matches(' ');
+    if body.chars().any(hurl_template_stopper) {
+        return Some(PlaceholderProblem::Unparsable { written });
+    }
+    let name: String = body.chars().take_while(|c| hurl_name_char(*c)).collect();
+    if name.is_empty() {
+        return Some(PlaceholderProblem::Unparsable { written });
+    }
+    if name.len() == body.len() {
+        return None;
+    }
+    Some(PlaceholderProblem::Truncated {
+        written,
+        read: name,
+    })
+}
+
+/// Every placeholder in `text` that Hurl would read differently from PaperBoy,
+/// in the order written.
+///
+/// The scan mirrors `hurl_core`'s `templatize`: a placeholder opens at `{{` and
+/// closes at the first following `}}`, and anything in between is its contents.
+pub fn placeholder_problems(text: &str) -> Vec<PlaceholderProblem> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            // An unterminated `{{` is a parse error in Hurl, but `key_problem`
+            // already reports that one against the row it appears in; saying it
+            // twice, in two vocabularies, would be worse than saying it once.
+            break;
+        };
+        if let Some(p) = placeholder_problem(&after[..close]) {
+            out.push(p);
+        }
+        rest = &after[close + 2..];
+    }
+    out
+}
+
 /// Escape a `[Multipart]` File field's path for Hurl source. `value` is stored
 /// as a real filesystem path (spaces and other characters unescaped, as the
 /// file picker produces), but Hurl's filename grammar requires a backslash
@@ -538,6 +641,23 @@ pub struct HurlEntry {
     /// `#[serde(default)]` keeps older saved requests loadable.
     #[serde(default)]
     pub reports: Vec<(String, String)>,
+    /// Generator definitions: `(name, expression)` pairs, each computing a value
+    /// for `{{name}}` just before the request is sent — a nonce, a timestamp, an
+    /// HMAC signature. Evaluated by [`crate::generators`].
+    ///
+    /// Stored inside valid Hurl as a `# [Gen] <n>` comment block (see
+    /// [`parse_gen_marker`] and [`parse_gen_row`]), which keeps the file
+    /// portable: every placeholder in the request itself is an ordinary Hurl
+    /// variable, so stock `hurl` parses the file identically and runs it given
+    /// `--variable name=…`. Putting the expression *in* the placeholder was the
+    /// obvious alternative and is not possible — Hurl reads a variable name only
+    /// as far as the first character outside its own set and silently drops the
+    /// rest, so `{{ hmac(k, m) }}` would be sent as the value of `hmac` (see
+    /// [`placeholder_problem`]).
+    ///
+    /// `#[serde(default)]` keeps older saved requests loadable.
+    #[serde(default)]
+    pub generators: Vec<(String, String)>,
     /// Prose comments recovered from a loaded `.hurl` file that aren't captured
     /// by any other field (banners, notes, comments between blocks). Each is
     /// anchored to the block it precedes (see [`CommentAnchor`]) so it
@@ -576,6 +696,31 @@ pub struct HurlEntry {
     /// UI-only; `#[serde(default)]` keeps older saved states loadable.
     #[serde(default)]
     pub modified: bool,
+
+    /// The request's text as it was last read from or written to disk, which
+    /// [`Self::mark_edited`] compares against to decide whether it is still
+    /// edited.
+    ///
+    /// Derived rather than latched, for the reason
+    /// `Collection::structure_modified` is: a flag that only ever went *true*
+    /// left a request marked unsaved after the edit had been undone -- change
+    /// an expression, change it back, and the pencil stayed, offering to save a
+    /// file that already matches.
+    ///
+    /// Persisted with the entry, because it is the only record of what the file
+    /// said that survives a restart. An ordinary tab's entries are restored
+    /// from `state.json` — edits and all — so without this the restored list
+    /// would be adopted as its own baseline and the tab would claim to match a
+    /// file it had unsaved changes against. It is also how a restored request
+    /// is found again in its file when the list around it has moved (see
+    /// `Collection::revert_request`).
+    ///
+    /// `None` means "no file to have agreed with": a request the user built
+    /// this session, or a Workspace tab's entries before they are re-read from
+    /// disk. With no baseline `mark_edited` latches, which is the old
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
 
     /// A runtime identity for this entry, used only to tell whether the
     /// collection's entry *list* still matches the one on disk — see
@@ -702,19 +847,21 @@ pub fn suggest_parameter_name(value: &str, declared: &[(String, String)]) -> Str
         .expect("an unused suffix always exists")
 }
 
-/// Whether `name` could be the name of a `{{name}}` variable.
+/// Whether `name` could be the name of a `{{name}}` variable Hurl will actually
+/// resolve: non-empty, and made only of the characters
+/// [`hurl_name_char`] accepts.
 ///
-/// Deliberately liberal — anything the `{{ … }}` placeholder pattern in
-/// [`crate::environment`] would match, i.e. non-empty with no whitespace and no
-/// braces. A stricter identifier rule would quietly refuse to default names
-/// that already work everywhere else in PaperBoy (`api-key`, `x.y`), and the
-/// two definitions of "a variable name" drifting apart is exactly the kind of
-/// bug nobody finds.
+/// This used to be deliberately liberal — anything PaperBoy's own `{{ … }}`
+/// pattern would match, on the reasoning that a name working everywhere else in
+/// PaperBoy should not be refused here. The reasoning was sound and the premise
+/// was wrong: `{{x.y}}` resolves in PaperBoy's preview but reaches the wire as
+/// the value of `x`, because Hurl reads a name only as far as the first
+/// character outside its own set and silently drops the rest (see
+/// [`placeholder_problem`]). Offering such a name here meant helping the user
+/// build a request that [`crate::request::truncated_placeholders`] then refuses
+/// to send — caught, but a step too late to be useful.
 pub fn is_variable_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name
-            .chars()
-            .any(|c| c.is_whitespace() || c == '{' || c == '}')
+    !name.is_empty() && name.chars().all(hurl_name_char)
 }
 
 /// Recognise a `# [Body] <n>` marker and return the line count it claims.
@@ -737,6 +884,68 @@ pub(crate) fn parse_body_marker(line: &str) -> Option<usize> {
 pub(crate) fn decode_body_line(line: &str) -> &str {
     let rest = line.trim_start().strip_prefix('#').unwrap_or("");
     rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// Recognise a `# [Gen] <n>` marker and return the row count it claims.
+///
+/// Counted for the same reason as [`parse_body_marker`], and more urgently: a
+/// generator row is what a request is *signed* with, so a block that has been
+/// hand-edited or badly merged must fail to validate rather than half-load. A
+/// block that doesn't validate falls through to the ordinary prose-comment
+/// scan and round-trips verbatim, so nothing is lost — the definitions simply
+/// stop being live, which is the safe direction to fail in.
+pub(crate) fn parse_gen_marker(line: &str) -> Option<usize> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    if !rest.get(..5)?.eq_ignore_ascii_case("[gen]") {
+        return None;
+    }
+    rest[5..].trim().parse::<usize>().ok()
+}
+
+/// Parse one `# name = expression` generator row into `(name, expression)`.
+///
+/// `=` rather than the `:` the `# [Reports]` block uses, and that is the whole
+/// point. A disabled request row is written `# key: value` and recovered by
+/// `split_kv`, which splits on the first `:` and requires the key to pass
+/// [`key_problem`]. Using `=` means a generator row can never be read as one:
+/// `sig = hmac_sha256(K, M)` has no colon at all, and `t = date("%H:%M")` — the
+/// awkward case, where the *expression* contains a colon — offers `t = date("%H`
+/// as the key, which contains spaces, `(` and `"` and so is refused. The two
+/// forms stay distinguishable even when a row is separated from its marker.
+///
+/// The name is *not* held to [`is_variable_name`]. Neither editor validates a
+/// generator name (the GUI adds a blank `("", "")` row on **+ Add**; the TUI
+/// wizard only trims), so a name the user is allowed to type — `api.key`, say —
+/// must still round-trip, or the whole block (every good row beside it) is lost
+/// on the next load. The reader therefore accepts exactly what the writer
+/// commits ([`gen_row_persistable`]): any non-blank name and expression. A name
+/// that Hurl would then truncate in a `{{…}}` placeholder is a real problem,
+/// but it is caught by [`crate::request::truncated_placeholders`] where it can
+/// be explained — not by silently deleting the block that carries it.
+pub(crate) fn parse_gen_row(line: &str) -> Option<(String, String)> {
+    let rest = line.trim_start().strip_prefix('#')?.trim_start();
+    let (name, expr) = rest.split_once('=')?;
+    let (name, expr) = (name.trim(), expr.trim());
+    if !gen_row_persistable(name, expr) {
+        return None;
+    }
+    Some((name.to_string(), expr.to_string()))
+}
+
+/// Whether a `(name, expression)` generator row can be written to a `.hurl`
+/// file and read back unchanged.
+///
+/// The one invariant that keeps a block alive across a save: the writer
+/// ([`to_hurl`](HurlEntry::to_hurl)) must never commit a row [`parse_gen_row`]
+/// would refuse, because the block is claimed all-or-nothing by its declared
+/// row count — one unreadable row and every good row beside it is discarded.
+/// A row is round-trippable when both halves carry text and the name holds no
+/// `=` (which the reader splits on) — so a half-typed `("", "")` is simply
+/// dropped, taking the block's row count down with it, rather than poisoning it.
+pub(crate) fn gen_row_persistable(name: &str, expr: &str) -> bool {
+    let name = name.trim();
+    let expr = expr.trim();
+    !name.is_empty() && !expr.is_empty() && !name.contains('=')
 }
 
 /// Write an authored body as the `# [Body]` block that carries it through a
@@ -766,6 +975,25 @@ fn encode_body_block(src: &str) -> String {
 }
 
 impl HurlEntry {
+    /// Record this request's current text as the one on disk, so later edits
+    /// are measured against it. See [`Self::baseline`].
+    pub fn set_baseline(&mut self) {
+        self.baseline = Some(self.to_hurl());
+    }
+
+    /// Say that this request has just been edited.
+    ///
+    /// Whether that leaves it *modified* is a question about the file, not
+    /// about the edit: typing a character and typing it back out again is two
+    /// edits and no change. With no baseline to compare against (see
+    /// [`Self::baseline`]) the flag latches, as it always did.
+    pub fn mark_edited(&mut self) {
+        self.modified = match &self.baseline {
+            Some(disk) => &self.to_hurl() != disk,
+            None => true,
+        };
+    }
+
     /// A request recovered from text that could not be parsed: kept verbatim,
     /// shown in the list, and written back out unchanged.
     ///
@@ -970,7 +1198,7 @@ impl HurlEntry {
     /// Hurl reads such a row as an assignment that wins over anything the
     /// caller passed in; PaperBoy reads it as a *default* — the value used only
     /// when nobody else binds the name (see
-    /// [`crate::request::effective_vars`]). That flip is what lets one request
+    /// [`crate::request::effective_vars_reporting`]). That flip is what lets one request
     /// serve both audiences: opened on its own it runs with the author's sample
     /// value, and driven from a PaperTrail loop (`FOR FILE IN FILES …`) it takes
     /// the loop's value, with neither side editing the other's file. The
@@ -1277,6 +1505,28 @@ impl HurlEntry {
             out.push_str("# [Reports]\n");
             for (name, query) in &self.reports {
                 out.push_str(&format!("# {name}: {query}\n"));
+            }
+        }
+        // Generator definitions: the same comment-encoding, but length-delimited
+        // like `# [Body]` rather than closed by adjacency, and written with `=`
+        // so a row parted from its marker can't be read as a disabled request
+        // row (see `parse_gen_row`). Written last so the block sits where
+        // `title_block_top` already refuses to walk, which is what stops it
+        // being absorbed as the *next* request's title.
+        //
+        // Only rows that read back are written, and the count is of those — a
+        // half-typed `("", "")` row the editor left behind is dropped here
+        // rather than committed as a line `parse_gen_row` refuses, which would
+        // fail the count check and silently discard the whole block on load.
+        let writable: Vec<&(String, String)> = self
+            .generators
+            .iter()
+            .filter(|(name, expr)| gen_row_persistable(name, expr))
+            .collect();
+        if !writable.is_empty() {
+            out.push_str(&format!("# [Gen] {}\n", writable.len()));
+            for (name, expr) in writable {
+                out.push_str(&format!("# {name} = {expr}\n"));
             }
         }
         push_comments(&mut out, Trailing);
@@ -1835,5 +2085,136 @@ mod tests {
         let back = crate::hurl::parse_hurl(&e.to_hurl());
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].method, "GET");
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    /// What `hurl_core` *actually* does with `{{inner}}`, discovered by asking
+    /// it, rather than by reading its grammar and hoping. Returns the variable
+    /// name Hurl resolves, or `None` if the file doesn't parse.
+    ///
+    /// This is the whole point of the test below: [`placeholder_problem`]
+    /// encodes a rule about someone else's parser, so it is checked against
+    /// that parser. If a future Hurl tightens the grammar (or fixes the silent
+    /// truncation — `templatize` parses the expression out of a placeholder
+    /// without checking it consumed all of it, which is arguably a bug
+    /// upstream), this test fails and says so, instead of PaperBoy quietly
+    /// refusing placeholders that had become perfectly valid.
+    fn hurl_reads(inner: &str) -> Option<String> {
+        let text = format!("GET http://h/{{{{{inner}}}}}\n");
+        let file = hurl_core::parser::parse_hurl_file(&text).ok()?;
+        let url = file.entries[0].request.url.to_string();
+        let start = url.find("{{")?;
+        let rest = &url[start + 2..];
+        let end = rest.find("}}")?;
+        Some(rest[..end].to_string())
+    }
+
+    #[test]
+    fn the_truncation_rule_matches_what_hurl_actually_does() {
+        // Fine: Hurl reads the whole name.
+        for inner in [
+            "TOKEN", " TOKEN ", "api_key", "api-key", "x1", "Ké",
+            // Hurl's own two placeholder functions are ordinary names to this
+            // test, and must not be flagged.
+            "newUuid", "newDate",
+        ] {
+            assert_eq!(
+                placeholder_problem(inner),
+                None,
+                "{inner:?} should be clean"
+            );
+            assert_eq!(
+                hurl_reads(inner).as_deref(),
+                Some(inner.trim_matches([' ', '\t'])),
+                "hurl disagrees about {inner:?}"
+            );
+        }
+
+        // Truncated: Hurl takes a prefix and discards the rest in silence.
+        // `api.key` is the one that matters — PaperBoy's own substitution
+        // resolves it, so preview and wire disagree with nothing to show for it.
+        for (inner, read) in [
+            ("api.key", "api"),
+            (" api.key ", "api"),
+            ("gen.uuid", "gen"),
+            ("a b", "a"),
+            ("hmac(k, m)", "hmac"),
+            ("TOKEN!", "TOKEN"),
+        ] {
+            assert_eq!(
+                placeholder_problem(inner),
+                Some(PlaceholderProblem::Truncated {
+                    written: format!("{{{{{inner}}}}}"),
+                    read: read.to_string(),
+                }),
+                "{inner:?} should be truncated"
+            );
+            assert_eq!(
+                hurl_reads(inner).as_deref(),
+                Some(read),
+                "hurl disagrees about {inner:?}"
+            );
+        }
+
+        // Unparsable: either no name at all, or a character that ends the
+        // template early (a tab, or the `#` that opens a comment) — so the
+        // whole *file* fails to load, which is why this is worth naming at the
+        // placeholder rather than leaving as "the collection is empty".
+        for inner in ["$guid", "", " ", ".x", "!", "\tTOKEN\t", "TOKEN\t", "a#b"] {
+            assert_eq!(
+                placeholder_problem(inner),
+                Some(PlaceholderProblem::Unparsable {
+                    written: format!("{{{{{inner}}}}}"),
+                }),
+                "{inner:?} should be unparsable"
+            );
+            assert_eq!(hurl_reads(inner), None, "hurl disagrees about {inner:?}");
+        }
+    }
+
+    /// The name offered to "extract to parameter" is held to Hurl's rule, not
+    /// PaperBoy's looser one. `api.key` reads as a perfectly good variable name
+    /// and resolves in the preview, but Hurl sends the value of `api` — so
+    /// accepting it here would build a request PaperBoy then refuses to send.
+    #[test]
+    fn a_parameter_name_hurl_would_truncate_is_not_offered() {
+        for good in ["TOKEN", "api_key", "api-key", "x1", "Ké"] {
+            assert_eq!(check_parameter_name(good, "v", &[]), None, "{good:?}");
+            assert!(is_variable_name(good), "{good:?}");
+        }
+        for bad in ["api.key", "$guid", "a b", "", "a{b"] {
+            assert_eq!(
+                check_parameter_name(bad, "v", &[]),
+                Some(ParamNameError::Invalid),
+                "{bad:?}"
+            );
+            assert!(!is_variable_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_placeholder_in_a_line_is_checked_in_order() {
+        let found = placeholder_problems("{{ok}}/{{a.b}}?t={{ok2}}&u={{c.d}}");
+        assert_eq!(
+            found,
+            vec![
+                PlaceholderProblem::Truncated {
+                    written: "{{a.b}}".into(),
+                    read: "a".into()
+                },
+                PlaceholderProblem::Truncated {
+                    written: "{{c.d}}".into(),
+                    read: "c".into()
+                },
+            ]
+        );
+        assert!(placeholder_problems("nothing templated here").is_empty());
+        // An unterminated `{{` is left to `key_problem`, which already reports
+        // it against the row it appears in.
+        assert!(placeholder_problems("{{ unterminated").is_empty());
     }
 }

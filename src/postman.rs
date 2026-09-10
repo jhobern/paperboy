@@ -15,6 +15,10 @@ use serde_json::Value;
 use crate::hurl::{
     CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow, parse_hurl,
 };
+// The assert vocabulary is shared with the response-side builder: an assert
+// imported from a Postman test and one built by pointing at a response are the
+// same thing said twice, and one emitter keeps them spelled identically.
+use crate::probe::{Predicate, Subject, assert_line, push_key};
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -28,6 +32,10 @@ struct Collection {
     /// The collection's default auth, inherited by every request that doesn't
     /// set its own.
     auth: Option<Auth>,
+    /// Scripts attached to the collection itself. Postman runs these before (or
+    /// after) *every* request in it, so they are read here and threaded down —
+    /// see [`walk_items`].
+    event: Vec<Event>,
     #[serde(rename = "protocolProfileBehavior")]
     protocol_profile_behavior: Option<Profile>,
 }
@@ -44,8 +52,12 @@ struct Item {
     /// beneath it. Only meaningful on folders; a leaf's auth lives on its
     /// `request`.
     auth: Option<Auth>,
-    /// Pre-request / test scripts. Only `test` scripts are mined for
-    /// `pm.<store>.set(...)` capture calls (see [`captures_from_events`]).
+    /// Pre-request / test scripts. On a folder these apply to everything
+    /// inside it, exactly as the collection's do (see [`walk_items`]);
+    /// `prerequest` scripts are mined for the assignments a `# [Gen]` block can
+    /// carry (see [`generators_from_events`]) and `test` scripts for
+    /// `pm.<store>.set(...)` captures and `pm.expect(...)` assertions (see
+    /// [`captures_from_events`], [`asserts_from_events`]).
     event: Vec<Event>,
     #[serde(rename = "protocolProfileBehavior")]
     protocol_profile_behavior: Option<Profile>,
@@ -78,15 +90,27 @@ impl Profile {
 }
 
 /// A Postman `event` — a `prerequest` or `test` script attached to an item.
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Event {
     #[serde(deserialize_with = "de_str")]
     listen: String,
     script: Script,
+    /// Set when this script was declared by an enclosing folder or by the
+    /// collection rather than by the request itself. Never deserialized — it is
+    /// stamped on by [`inherited_events`] as the script is carried down.
+    #[serde(skip)]
+    inherited: bool,
+    /// The folder breadcrumb of whoever declared it (empty for the collection
+    /// itself), so a note about an inherited script can be filed against the
+    /// thing that holds it. Ninety-five requests sharing one folder script
+    /// share one problem, and ninety-five copies of the note describing it read
+    /// as ninety-five problems.
+    #[serde(skip)]
+    owner: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 struct Script {
     exec: Vec<String>,
@@ -229,7 +253,7 @@ fn url_from_parts(m: &serde_json::Map<String, Value>) -> String {
 /// that `raw` already had it, which silently changed the request. Matching on
 /// the parameter *name* means a parameter that is in both is never duplicated.
 fn merge_enabled_queries(raw: &str, queries: &[Param]) -> String {
-    let existing: Vec<&str> = raw
+    let mut existing: Vec<&str> = raw
         .split_once('?')
         .map(|(_, q)| {
             q.split('&')
@@ -240,7 +264,20 @@ fn merge_enabled_queries(raw: &str, queries: &[Param]) -> String {
     let missing: Vec<String> = queries
         .iter()
         .filter(|q| !q.disabled && !q.key.trim().is_empty())
-        .filter(|q| !existing.contains(&q.key.as_str()))
+        .filter(|q| {
+            // Matched off one for one rather than by name alone. A key is
+            // allowed to appear more than once -- `?tag=a&tag=b` is how a list
+            // is sent -- and treating the name as seen once and for all
+            // dropped every repeat after the first, quietly narrowing the
+            // request to one value of a set.
+            match existing.iter().position(|k| *k == q.key.as_str()) {
+                Some(i) => {
+                    existing.remove(i);
+                    false
+                }
+                None => true,
+            }
+        })
         .map(|q| {
             if q.value.is_empty() {
                 q.key.clone()
@@ -585,6 +622,12 @@ struct EnvValue {
     /// variable has been ticked off, so defaulting it to `false` (as
     /// `#[serde(default)]` would) would silently drop every variable.
     enabled: Option<bool>,
+    /// `"secret"` for a value Postman masks in its own UI. Nothing here can
+    /// keep it masked -- a `.vars` file is plain text and so is the session
+    /// state -- but it is worth saying so on the way in (see
+    /// [`postman_env_secret_keys`]).
+    #[serde(rename = "type", default, deserialize_with = "de_str")]
+    kind: String,
 }
 
 /// The `KEY`/value pairs of a Postman environment export, or `None` if
@@ -597,6 +640,119 @@ struct EnvValue {
 /// flattened to a space — a `.vars` file is line-based, so keeping the break
 /// would split one variable into two on the next save/reload.
 pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
+    Some(
+        env_values(content)?
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect(),
+    )
+}
+
+/// The keys Postman had marked secret, in the order they appear.
+///
+/// PaperBoy has nowhere to *keep* a secret literal: a `.vars` file is plain
+/// text, and so is the session state it is remembered in. Importing one is
+/// therefore a decision about where a secret lives, and the import says so
+/// rather than quietly copying it into a second plaintext file -- with the
+/// provider references (`{{ op://… }}`, `{{ ssm:… }}`) that *are* the answer
+/// named in the note.
+pub fn postman_env_secret_keys(content: &str) -> Vec<String> {
+    env_values(content)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, _, secret)| *secret)
+        .map(|(k, _, _)| k)
+        .collect()
+}
+
+/// Every `{{name}}` in an environment value that PaperBoy could not work out:
+/// `(variable, the name it asked for)`.
+///
+/// After [`resolve_env_refs`] has done what it can, a leftover reference is one
+/// of two things -- a variable defined somewhere this file doesn't reach (a
+/// collection variable, a Postman global), or a loop -- and either way it is
+/// worth a word on the way in, because a `.vars` value is not a template and
+/// nothing downstream will ever expand it.
+pub fn postman_env_unresolved_refs(content: &str) -> Vec<(String, String)> {
+    env_values(content)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(k, v, _)| {
+            ENV_REF_RE
+                .captures_iter(&v)
+                .map(|c| c[1].trim().to_string())
+                .filter(|n| !is_provider_reference(n))
+                .map(|n| (k.clone(), n))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A `{{ … }}` anywhere in a value. Postman writes them without spaces, but a
+/// hand-edited environment may not, and the moustache is the same one Hurl uses.
+static ENV_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+
+/// Whether `inner` names one of PaperBoy's providers rather than another
+/// variable. These are resolved at load time by shelling out to a CLI (see
+/// [`crate::environment`]) and must survive the import untouched.
+fn is_provider_reference(inner: &str) -> bool {
+    inner.starts_with("op://") || inner.starts_with("ssm:") || inner.starts_with("env:")
+}
+
+/// Expand `{{name}}` references between an environment's own variables.
+///
+/// Postman treats a variable's value as a template and resolves it at the
+/// moment it is used, so `base_url = {{scheme}}://{{host}}` is ordinary and
+/// works. A `.vars` value is not a template -- it is the value -- and nothing
+/// downstream expands one, so an imported `{{host}}` would sit there as text
+/// (or, when it is the whole value, be classified as an unrecognised provider
+/// reference and shown as unresolved). Working them out here is the only place
+/// the answer is still known.
+///
+/// Repeated until nothing changes so a chain resolves, and bounded because a
+/// loop otherwise never settles: `a = {{b}}, b = {{a}}` reaches a state where
+/// each names itself, which no pass can improve on, and stops. What is left
+/// behind is reported by [`postman_env_unresolved_refs`] rather than guessed
+/// at.
+fn resolve_env_refs(values: &mut [(String, String, bool)]) {
+    for _ in 0..8 {
+        let known: Vec<(String, String)> = values
+            .iter()
+            .map(|(k, v, _)| (k.clone(), v.clone()))
+            .collect();
+        let mut changed = false;
+        for (key, value, _) in values.iter_mut() {
+            let next = ENV_REF_RE
+                .replace_all(value, |c: &regex::Captures| {
+                    let name = c[1].trim();
+                    // A value naming itself has nowhere to go; leaving the
+                    // reference visible is better than an empty string.
+                    if name == key || is_provider_reference(name) {
+                        return c[0].to_string();
+                    }
+                    known
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| c[0].to_string())
+                })
+                .into_owned();
+            if next != *value {
+                *value = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// The shared read behind [`postman_env_values`] and
+/// [`postman_env_secret_keys`]: key, value, and whether Postman called it a
+/// secret.
+fn env_values(content: &str) -> Option<Vec<(String, String, bool)>> {
     let v = serde_json::from_str::<Value>(content).ok()?;
     let v = unwrap_envelope(v, "environment", "values");
     // A collection also has no `values`, but check `item` too so a document
@@ -605,16 +761,18 @@ pub fn postman_env_values(content: &str) -> Option<Vec<(String, String)>> {
         return None;
     }
     let env = serde_json::from_value::<PostmanEnv>(v).ok()?;
-    Some(
-        env.values
-            .into_iter()
-            .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
-            .map(|v| {
-                let value = v.value.replace(['\n', '\r'], " ");
-                (v.key.trim().to_string(), value.trim().to_string())
-            })
-            .collect(),
-    )
+    let mut values: Vec<(String, String, bool)> = env
+        .values
+        .into_iter()
+        .filter(|v| v.enabled.unwrap_or(true) && !v.key.trim().is_empty())
+        .map(|v| {
+            let value = v.value.replace(['\n', '\r'], " ");
+            let secret = v.kind == "secret";
+            (v.key.trim().to_string(), value.trim().to_string(), secret)
+        })
+        .collect();
+    resolve_env_refs(&mut values);
+    Some(values)
 }
 
 /// Parse a collection file's `content`: a Postman JSON export is imported,
@@ -704,11 +862,31 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
         &mut Vec::new(),
         inherited,
         &[],
+        &inherited_events(&[], &root.event, &[]),
         root.protocol_profile_behavior.unwrap_or_default(),
         &mut tokens,
         &mut out,
     );
     out
+}
+
+/// The scripts in force inside a folder (or the collection): everything handed
+/// down from above, then this level's own, stamped as inherited because from
+/// here on they belong to somebody else.
+///
+/// Order matters and is Postman's: collection first, then each folder outside
+/// in, then the request. A `prerequest` that sets a variable an inner one reads
+/// has to have run first, and the same holds for the `[Gen]` rows they become.
+fn inherited_events(from_above: &[Event], own: &[Event], owner: &[String]) -> Vec<Event> {
+    from_above
+        .iter()
+        .cloned()
+        .chain(own.iter().cloned().map(|mut e| {
+            e.inherited = true;
+            e.owner = owner.join("/");
+            e
+        }))
+        .collect()
 }
 
 /// Recursively collect requests, descending into folders (nodes carrying a
@@ -721,11 +899,19 @@ pub fn convert_postman(content: &str) -> ConvertedCollection {
 /// level that *declared* it, which is where a generated OAuth 2 token request
 /// belongs: naming it after the first request that happens to use it would
 /// bury a collection-wide token three folders deep.
+///
+/// `events` are the scripts every request at this level inherits — the
+/// collection's, plus those of each folder passed through. Postman runs a
+/// folder's `prerequest` before *every* request inside it, so a folder script
+/// computing an id belongs to each of those requests just as surely as one
+/// written on the request itself; reading only the leaf's own `event` list lost
+/// the whole thing silently.
 fn walk_items(
     items: &[Item],
     path: &mut Vec<String>,
     inherited: Option<&Auth>,
     auth_path: &[String],
+    events: &[Event],
     profile: Profile,
     tokens: &mut OAuthTokens,
     out: &mut ConvertedCollection,
@@ -744,7 +930,17 @@ fn walk_items(
                 .protocol_profile_behavior
                 .unwrap_or_default()
                 .over(profile);
-            walk_items(sub, path, here, &here_path, here_profile, tokens, out);
+            let here_events = inherited_events(events, &it.event, path);
+            walk_items(
+                sub,
+                path,
+                here,
+                &here_path,
+                &here_events,
+                here_profile,
+                tokens,
+                out,
+            );
             path.pop();
         } else if let Some(req) = &it.request {
             let title = if path.is_empty() {
@@ -761,17 +957,31 @@ fn walk_items(
                 .protocol_profile_behavior
                 .unwrap_or_default()
                 .over(profile);
-            let mut entry = map_request(&title, req, &it.event, auth, profile);
+            let events: Vec<Event> = events.iter().cloned().chain(it.event.clone()).collect();
+            let mut entry = map_request(&title, req, &events, auth, profile);
             apply_path_variables(&title, &req.url, &mut entry, out);
             apply_oauth2(&title, token_path, auth, &mut entry, tokens, out);
-            note_losses(&title, req, &it.event, auth, profile, &entry, out);
-            for name in rename_dynamic_variables(&mut entry) {
+            note_losses(&title, req, &events, auth, profile, &entry, out);
+            for (name, fate) in rename_dynamic_variables(&mut entry) {
+                let detail = match fate {
+                    DynamicFate::Builtin(f) => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; Hurl generates the same \
+                         thing, so it became `{{{{{f}}}}}` and still needs nothing supplied"
+                    ),
+                    DynamicFate::Computed(expr) => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; it is now computed by this \
+                         request's `[Gen]` block as `{expr}`, once per send rather than once per \
+                         use"
+                    ),
+                    DynamicFate::Supplied => format!(
+                        "Postman generated `{{{{${name}}}}}` for you; nothing here can produce it, \
+                         so it became the variable `{{{{{plain}}}}}`, which has to be supplied",
+                        plain = name.replace('.', "_")
+                    ),
+                };
                 out.notes.push(ConversionNote {
                     item: title.clone(),
-                    detail: format!(
-                        "Postman generated `{{{{${name}}}}}` for you; Hurl has no equivalent, so it \
-                         became the variable `{{{{{name}}}}}`, which has to be supplied"
-                    ),
+                    detail,
                 });
             }
             out.entries.push(entry);
@@ -1150,31 +1360,120 @@ fn apply_path_variables(
     }
 }
 
-/// Postman's *dynamic variables* — `{{$guid}}`, `{{$randomInt}}`,
-/// `{{$timestamp}}` — are values it generates at send time. Hurl has no such
-/// thing, and worse, a `$` is not legal in a Hurl template name: one
-/// `{{$guid}}` anywhere in a collection made the whole converted file fail to
-/// parse ("parsing template variable"), so every request in it was lost, not
-/// just the one that used it.
+/// What became of one of Postman's *dynamic variables* — `{{$guid}}`,
+/// `{{$timestamp}}`, `{{$randomInt}}` — the values it makes up at send time.
+enum DynamicFate {
+    /// Hurl generates the same thing itself, so the placeholder becomes its
+    /// built-in and needs nothing else. The most portable outcome there is:
+    /// stock `hurl` runs it with no variables supplied at all.
+    Builtin(&'static str),
+    /// A `# [Gen]` row now computes it. Carries the expression written into the
+    /// block.
+    Computed(&'static str),
+    /// Nothing here produces it, so it becomes an ordinary variable the user
+    /// has to supply.
+    Supplied,
+}
+
+/// What PaperBoy can do about `$name`.
 ///
-/// Each is rewritten to an ordinary variable of the same name without the `$`
-/// (`{{$guid}}` → `{{guid}}`), which parses, runs as soon as the value is
-/// supplied, and stays readable as the thing it was. Dotted forms
-/// (`{{$processEnv.HOME}}`) fold their dots into underscores for the same
-/// reason. Returns the names rewritten, so each can be noted.
-fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
+/// Only the handful whose meaning is exact and unambiguous are claimed. Guessing
+/// at `$randomFirstName` would be worse than saying it has to be supplied: a
+/// request that sends a plausible wrong value is harder to notice than one that
+/// refuses to run.
+fn dynamic_fate(name: &str) -> DynamicFate {
+    match name {
+        // Hurl's own generators, so no `# [Gen]` block is needed at all.
+        "guid" | "randomUUID" => DynamicFate::Builtin("newUuid"),
+        "isoTimestamp" => DynamicFate::Builtin("newDate"),
+        // `$timestamp` is Unix *seconds*, which `newDate` is not — it renders
+        // ISO 8601. Close enough to reach for by mistake, so it is spelled out.
+        "timestamp" => DynamicFate::Computed("timestamp"),
+        // Postman documents `$randomInt` as 0 to 1000 inclusive.
+        "randomInt" => DynamicFate::Computed("random_int(0, 1000)"),
+        // …and `$randomAlphaNumeric` as exactly one character, which is easy
+        // to misread as "some" and is why the length is written out.
+        "randomAlphaNumeric" => DynamicFate::Computed("random_alnum(1)"),
+        _ => DynamicFate::Supplied,
+    }
+}
+
+/// Rewrite Postman's dynamic variables into something Hurl can read, and where
+/// possible into something that actually produces a value.
+///
+/// A `$` is not legal in a Hurl template name, and the failure was not local:
+/// one `{{$guid}}` anywhere in a collection made the whole converted file fail
+/// to parse ("parsing template variable"), so every request in it was lost, not
+/// just the one that used it. Renaming is therefore not optional.
+///
+/// Where the value has an exact equivalent it is *supplied* rather than merely
+/// renamed — `{{$guid}}` becomes Hurl's own `{{newUuid}}`, `{{$timestamp}}`
+/// becomes a `# [Gen]` row — so the request runs on import instead of stopping
+/// on a variable nobody can fill in. Everything else keeps its name without the
+/// `$` (`{{$randomFirstName}}` → `{{randomFirstName}}`), which parses and stays
+/// readable as the thing it was; dotted forms (`{{$processEnv.HOME}}`) fold
+/// their dots into underscores for the same reason.
+///
+/// Returns each original `$name` and its fate, so every one can be noted.
+fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<(String, DynamicFate)> {
     static DYNAMIC_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\{\{\s*\$([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}").unwrap());
 
-    let mut found: Vec<String> = Vec::new();
+    let mut found: Vec<(String, DynamicFate)> = Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    // The `[Gen]` rows this entry already carries — from its own pre-request
+    // script — so a dynamic variable does not silently reuse one of them.
+    let existing: Vec<(String, String)> = entry.generators.clone();
     let mut fix = |text: &mut String| {
         if !text.contains("{{") {
             return;
         }
         let replaced = DYNAMIC_RE.replace_all(text, |caps: &regex::Captures| {
-            let name = caps[1].replace('.', "_");
-            if !found.contains(&name) {
-                found.push(name.clone());
+            let raw = &caps[1];
+            let fate = dynamic_fate(raw);
+            // The name a `$`-less Hurl template can carry.
+            let plain = raw.replace('.', "_");
+            let name = match fate {
+                DynamicFate::Builtin(f) => f.to_string(),
+                DynamicFate::Computed(expr) => {
+                    // The row that computes this value. If a row of the wanted
+                    // name already exists — here or in a `[Gen]` block this
+                    // entry carries — with a *different* expression, pointing
+                    // the placeholder at it would resolve to that other value.
+                    // `{{$timestamp}}` (Unix seconds) folding onto a script's
+                    // millisecond `timestamp` row is exactly the silent
+                    // wrong-value the note then mis-describes. So a fresh name
+                    // (`timestamp_1`) is taken and the placeholder points at it.
+                    let taken = |n: &str| {
+                        existing
+                            .iter()
+                            .chain(rows.iter())
+                            .find(|(name, _)| name == n)
+                            .map(|(_, e)| e.clone())
+                    };
+                    let mut candidate = plain.clone();
+                    let mut suffix = 0;
+                    loop {
+                        match taken(&candidate) {
+                            None => {
+                                rows.push((candidate.clone(), expr.to_string()));
+                                break;
+                            }
+                            // Same expression already: reuse the row rather than
+                            // add a duplicate.
+                            Some(e) if e == expr => break,
+                            Some(_) => {
+                                suffix += 1;
+                                candidate = format!("{plain}_{suffix}");
+                            }
+                        }
+                    }
+                    candidate
+                }
+                DynamicFate::Supplied => plain.clone(),
+            };
+            if !found.iter().any(|(n, _)| n == raw) {
+                found.push((raw.to_string(), fate));
             }
             format!("{{{{{name}}}}}")
         });
@@ -1201,6 +1500,14 @@ fn rename_dynamic_variables(entry: &mut HurlEntry) -> Vec<String> {
     if let Some((user, pass)) = entry.basic_auth.as_mut() {
         fix(user);
         fix(pass);
+    }
+    // Appended rather than assigned: a converted entry could already carry a
+    // block from elsewhere, and a name defined twice is a block that reads
+    // differently depending on which row won.
+    for (name, expr) in rows {
+        if !entry.generators.iter().any(|(n, _)| *n == name) {
+            entry.generators.push((name, expr));
+        }
     }
     found
 }
@@ -1330,19 +1637,233 @@ fn note_losses(
             ));
         }
     }
-    if events
-        .iter()
-        .any(|e| e.listen == "prerequest" && !e.script.exec.is_empty())
-    {
-        note("a pre-request script was dropped — Hurl has no equivalent".into());
+    // Scripts. The notes are worded around what *did* carry over, because a
+    // partly-translated script is the common case and "dropped" would be a lie
+    // about the half that wasn't. A script the request inherited is filed
+    // against the folder holding it instead, once — the alternative is the same
+    // sentence repeated under every request in the folder, which reads as many
+    // problems rather than the one it is.
+    //
+    // Crucially the kept/residue is computed *per owner*, not over the merged
+    // script. The converters run over folder+request together, so when the
+    // *folder's* part is what failed to convert, blaming the leftover on the
+    // request put "; the rest of it was dropped" under sixteen of FMS's
+    // ninety-eight requests whose own scripts convert completely. Each owning
+    // event is reduced on its own and filed against whoever wrote it — the same
+    // thing the `setNextRequest` loop below already does deliberately.
+    let scope = |owner: &Option<String>| match owner {
+        None => "this request's",
+        Some(_) => "this folder's",
+    };
+    let reach = |owner: &Option<String>| match owner {
+        None => "",
+        Some(_) => ", and it runs for every request inside",
+    };
+    for (owner, group) in owner_groups(events, "prerequest") {
+        let (rows, residue) = generators_from_events(&group);
+        let detail = if rows.is_empty() {
+            // Worth naming the `[Gen]` block even when nothing translated: this
+            // note is the moment the user learns the script is gone, and most
+            // pre-request scripts are computing a nonce, a stamp or a
+            // signature, which the block does.
+            format!(
+                "{} pre-request script was dropped — Hurl cannot run one{}. If it was computing \
+                 a nonce, a timestamp or a signature, a request's `[Gen]` block can do that \
+                 instead",
+                scope(&owner),
+                reach(&owner)
+            )
+        } else {
+            let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+            let rest = if residue {
+                "; the rest of it was dropped, since Hurl cannot run a script"
+            } else {
+                ""
+            };
+            format!(
+                "{} pre-request script now computes {} in the `[Gen]` block of each request it \
+                 covers, once per send{rest}",
+                scope(&owner),
+                and_list(&names)
+            )
+        };
+        push_note(out, title, owner, detail);
     }
-    let has_tests = events
+    for (owner, group) in owner_groups(events, "test") {
+        let captures = captures_from_events(&group);
+        let (status, asserts, residue) = asserts_from_events(&group);
+        let mut kept: Vec<String> = Vec::new();
+        if !captures.is_empty() {
+            kept.push(format!("{} [Captures]", captures.len()));
+        }
+        if status.is_some() {
+            kept.push("the status it expects".to_string());
+        }
+        if !asserts.is_empty() {
+            kept.push(format!("{} [Asserts]", asserts.len()));
+        }
+        let detail = if kept.is_empty() {
+            format!(
+                "{} test script was dropped — nothing in it reduced to a Hurl capture or \
+                 assertion",
+                scope(&owner)
+            )
+        } else {
+            let rest = if residue {
+                "; the rest of it was dropped"
+            } else {
+                ""
+            };
+            format!(
+                "{} test script became {}{rest}",
+                scope(&owner),
+                and_list(&kept.iter().map(String::as_str).collect::<Vec<_>>())
+            )
+        };
+        push_note(out, title, owner, detail);
+    }
+    // Said separately, and for both script kinds, because it is not a lost
+    // assertion but a lost *order*: a collection whose scripts choose what runs
+    // next does not do the same thing when it is run top to bottom, and the
+    // requests themselves look perfectly correct while it happens.
+    // Read one event at a time rather than the concatenated script, so the note
+    // is filed against whoever actually wrote the call — the same per-owner
+    // reduction the script notes above now do. Filing an inherited jump against
+    // the request that carries its own assertions alongside it would claim the
+    // folder's problem as the request's, which is how one folder script once
+    // produced eighteen identical notes on a real collection.
+    for e in events {
+        if e.listen != "prerequest" && e.listen != "test" {
+            continue;
+        }
+        let script = e
+            .script
+            .exec
+            .iter()
+            .map(|l| l.trim_end_matches('\r'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !script.contains("setNextRequest") {
+            continue;
+        }
+        let owner = e.inherited.then(|| e.owner.clone());
+        for detail in next_request_fates(&script, title) {
+            push_note(out, title, owner.clone(), detail);
+        }
+    }
+}
+
+// `pm.execution.setNextRequest(` and the older `postman.setNextRequest(`.
+static NEXT_CALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:pm\.execution|postman|pm)\.setNextRequest\s*\(").unwrap());
+
+/// What each `setNextRequest` in a script was doing, said in terms the reader
+/// can act on.
+///
+/// This is a lost *order*, not a lost assertion: the requests themselves look
+/// perfectly correct while the collection quietly does something else. PaperBoy
+/// runs a collection in file order, and PaperTrail — which does drive requests
+/// in a written order — has no branching either, so none of these can be
+/// converted. What they can be is named: the four shapes below are four
+/// different problems with four different fixes, and the one note they used to
+/// share sent every reader looking for the wrong one.
+fn next_request_fates(script: &str, title: &str) -> Vec<String> {
+    let (code, in_string) = strip_js_noise(script);
+    let conditional = conditional_mask(&code);
+    // The request's own name as the script would have written it: Postman
+    // addresses a request by its bare name, while `title` is the breadcrumb
+    // the import builds from the folders around it.
+    let own = title.rsplit('/').next().unwrap_or(title).trim();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |d: String| {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    };
+    for call in find_calls(&code, &in_string, &NEXT_CALL_RE) {
+        let Some(arg) = call.args.first().map(|a| a.trim()) else {
+            continue;
+        };
+        let guarded = conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start);
+        match unquote(arg) {
+            Some(name) if name.trim() == own => push(format!(
+                "this request ran itself again (`setNextRequest(\"{own}\")`) — that is a polling \
+                 loop, which Hurl writes as `[Options] retry: <n>` plus the assert that has to \
+                 pass in the end, rather than as a repeated request"
+            )),
+            Some(name) if guarded => push(format!(
+                "a script sometimes jumped to `{name}` instead of carrying on; PaperBoy runs a \
+                 collection in file order and has no way to say \"only sometimes\", so check \
+                 whether `{name}` is where it needs to be"
+            )),
+            Some(name) => push(format!(
+                "a script always ran `{name}` next, whatever follows this request in the file; \
+                 move `{name}` after this request, or write the order out in a PaperTrail flow \
+                 (`REQUEST` lines run in the order you write them)"
+            )),
+            None if arg == "null" => push(
+                "a script stopped the run here (`setNextRequest(null)`); nothing after this \
+                 request ran, and in PaperBoy it will"
+                    .into(),
+            ),
+            None => push(
+                "a script chose the next request by a name it worked out as it ran, so what runs \
+                 next isn't in the file at all; PaperBoy runs a collection in file order"
+                    .into(),
+            ),
+        }
+    }
+    out
+}
+
+/// File a note against the request, or — when the script that caused it came
+/// from an enclosing folder — against that folder, and only once. `owner` is
+/// `None` for a script the request declares itself, otherwise the breadcrumb of
+/// the folder (or collection) that does; an empty breadcrumb is the collection.
+fn push_note(out: &mut ConvertedCollection, title: &str, owner: Option<String>, detail: String) {
+    let item = owner.unwrap_or_else(|| title.to_string());
+    if out
+        .notes
         .iter()
-        .any(|e| e.listen == "test" && !e.script.exec.is_empty());
-    if has_tests && entry.captures.is_empty() {
-        note("a test script was dropped — nothing in it reduced to a [Captures] entry".into());
-    } else if has_tests {
-        note("a test script was read for [Captures] only; its assertions were dropped".into());
+        .any(|n| n.item == item && n.detail == detail)
+    {
+        return;
+    }
+    out.notes.push(ConversionNote { item, detail });
+}
+
+/// The `listen` scripts in force here, grouped by who wrote them, so each part
+/// can be reduced on its own and its note filed against its owner.
+///
+/// Each group is `(owner, events)`: `None` for the request's own scripts (the
+/// note reads "this request's" and is filed against the request), or
+/// `Some(breadcrumb)` for a folder's or the collection's (the note reads "this
+/// folder's" and is filed against that folder, once for every request that
+/// inherits it). Groups with no actual code are dropped — Postman writes an
+/// empty script tab on nearly every request, and a note for each is noise that
+/// buries the two that matter.
+fn owner_groups(events: &[Event], listen: &str) -> Vec<(Option<String>, Vec<Event>)> {
+    let mut groups: Vec<(Option<String>, Vec<Event>)> = Vec::new();
+    for e in events.iter().filter(|e| e.listen == listen) {
+        let key = e.inherited.then(|| e.owner.clone());
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(e.clone()),
+            None => groups.push((key, vec![e.clone()])),
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, group)| has_script(group, listen))
+        .collect()
+}
+/// `a`, `a and b`, `a, b and c` — the readable spelling of a short list.
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
     }
 }
 
@@ -1523,19 +2044,53 @@ fn map_request(
     // stays bare (a hand-added `[Captures]` later gives a clear "add HTTP *"
     // parse error, so we don't emit an unsolicited wildcard line).
     entry.captures = captures_from_events(events);
+    // The rest of the `test` script: the status it checked and the assertions
+    // that reduce to Hurl queries. Only the unconditional ones — see
+    // [`asserts_from_events`].
+    let (status, asserts, _) = asserts_from_events(events);
+    entry.expected_status = status;
+    entry.asserts = asserts;
+    // And the `prerequest` script's assignments, as the `[Gen]` block that
+    // computes them per send.
+    let (generators, _) = generators_from_events(events);
+    entry.generators = generators;
     entry
+}
+
+/// The text of every `listen` script in `events`, in the order Postman runs
+/// them: the collection's, then each enclosing folder's outside in, then the
+/// request's own.
+fn script_text(events: &[Event], listen: &str) -> String {
+    events
+        .iter()
+        .filter(|e| e.listen == listen)
+        .flat_map(|e| e.script.exec.iter())
+        .map(|l| l.trim_end_matches('\r'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether any `listen` script actually holds code.
+///
+/// Postman writes `"exec": [""]` for a script tab that was opened and never
+/// typed into, and a collection somebody has clicked through carries one on
+/// nearly every request. Testing the *vector* for emptiness therefore announced
+/// a dropped pre-request script for every one of them — which is worse than
+/// saying nothing, because the two notes that mattered were then buried in
+/// thirty about scripts that do not exist.
+fn has_script(events: &[Event], listen: &str) -> bool {
+    !script_text(events, listen).trim().is_empty()
 }
 
 // `var/let/const X = pm.response.json()` — `X` is the parsed-body variable
 // whose accessor chains map to jsonpaths.
+// `var/let/const X = pm.response.json()`, and the older
+// `JSON.parse(responseBody)` that means exactly the same thing -- a legacy
+// collection names its body variable that way, and the common name it picks
+// (`jsonData`) is only a root here by coincidence.
 static JSON_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:var|let|const)\s+(\w+)\s*=\s*pm\.response\.json\s*\(\s*\)").unwrap()
-});
-
-// `pm.<store>.set("NAME", <value>)` for the variable stores Postman exposes.
-static SET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"pm\.(?:environment|collectionVariables|globals|variables)\.set\(\s*['"]([^'"]+)['"]\s*,\s*([^)]+)\)"#,
+        r"(?:var|let|const)\s+(\w+)\s*=\s*(?:pm\.response\.json\s*\(\s*\)|JSON\.parse\s*\(\s*responseBody\s*\))",
     )
     .unwrap()
 });
@@ -1545,15 +2100,18 @@ static SET_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// is the `pm.response.json()` variable becomes `NAME = jsonpath "$.a.b"`.
 /// Calls that don't reduce to a plain accessor chain are skipped rather than
 /// failing the import.
+///
+/// This uses [`find_calls`] and [`capture_from_call`] — the *same* balanced-
+/// paren parser, root list and conditional gate [`asserts_from_events`] uses to
+/// decide which `set` calls it has "covered". The two once disagreed: the
+/// coverage side added `pm.response.json()` as a root and read the whole call,
+/// while this side used a `[^)]+` regex that stopped at the first `)`, so
+/// `pm.response.json().token` was marked covered and then captured *nothing* —
+/// no capture, and no note either, on a report that claimed a clean import. A
+/// single shared decision keeps coverage and conversion from ever diverging.
 fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
-    let script = events
-        .iter()
-        .filter(|e| e.listen == "test")
-        .flat_map(|e| e.script.exec.iter())
-        .map(|l| l.trim_end_matches('\r'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if script.is_empty() {
+    let script = script_text(events, "test");
+    if script.trim().is_empty() {
         return Vec::new();
     }
     // Read the script as code, not as text: a `pm.environment.set(...)` line
@@ -1563,46 +2121,955 @@ fn captures_from_events(events: &[Event]) -> Vec<(String, String)> {
     // requests interpolate, a spurious `token` capture changes the bytes those
     // requests send. A wrong capture is far worse than a missing one.
     let (code, in_string) = strip_js_noise(&script);
+    let conditional = conditional_mask(&code);
+    let roots = capture_roots(&code);
 
-    // Response-body variable name(s); default to the near-universal `jsonData`
-    // when the script assigns the body to nothing we recognise.
-    let mut roots: Vec<String> = JSON_VAR_RE
+    let mut caps: Vec<(String, String)> = Vec::new();
+    for call in find_calls(&code, &in_string, &SET_CALL_RE) {
+        let Some((name, query)) = capture_from_call(&call, &code, &conditional, &roots) else {
+            continue;
+        };
+        // The script ran top to bottom and the last write won. A name captured
+        // twice does not read as two rows: `[Captures]` would store the second
+        // over the first anyway, and a note saying "2 [Captures]" for one
+        // stored value is a lie. The row is replaced, exactly as the `[Gen]`
+        // path does for the same reason.
+        match caps.iter_mut().find(|(n, _)| *n == name) {
+            Some(row) => row.1 = query,
+            None => caps.push((name, query)),
+        }
+    }
+    caps
+}
+
+/// The response-body roots a `test` script's accessor chains resolve against:
+/// every `var body = pm.response.json()` name, plus the near-universal
+/// `jsonData` and the bare `pm.response.json()` (the body with no variable in
+/// between). [`captures_from_events`] and [`asserts_from_events`] must build
+/// this identically, or a `set` one covers is not a capture the other emits.
+fn capture_roots(code: &str) -> Vec<BodyRoot> {
+    let mut roots: Vec<BodyRoot> = JSON_VAR_RE
+        .captures_iter(code)
+        .map(|c| BodyRoot::whole(&c[1]))
+        .collect();
+    roots.push(BodyRoot::whole("jsonData"));
+    roots.push(BodyRoot::whole("pm.response.json()"));
+
+    // A name standing for *part* of the body -- `const data = jsonData.data;`
+    // and then `set("id", data.id)` -- is an ordinary way to write a script
+    // against a response that nests everything one level down, and every call
+    // through such a name used to be dropped as unreadable. Resolved in passes
+    // so an alias of an alias (`const first = data.items[0]`) resolves too;
+    // the list stops growing quickly, and the cap is only there so a
+    // pathological script cannot spin.
+    for _ in 0..4 {
+        let found: Vec<BodyRoot> = ALIAS_RE
+            .captures_iter(code)
+            .filter_map(|c| {
+                let name = c[1].to_string();
+                if roots.iter().any(|r| r.name == name) {
+                    return None;
+                }
+                // Declared twice with different meanings is a question the
+                // text cannot answer, so the name is not treated as a root at
+                // all rather than resolved to whichever came first.
+                if ALIAS_RE
+                    .captures_iter(code)
+                    .filter(|d| d[1] == name)
+                    .count()
+                    > 1
+                {
+                    return None;
+                }
+                let prefix = accessor_to_jsonpath(&compact_code(&c[2]), &roots)?;
+                Some(BodyRoot { name, prefix })
+            })
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        roots.extend(found);
+    }
+    roots
+}
+
+/// A name a script's accessor chains can be rooted at, and where in the
+/// response body it stands for: `$` for the body itself, or the path of the
+/// part of it the name was assigned.
+#[derive(Debug, Clone)]
+struct BodyRoot {
+    name: String,
+    prefix: String,
+}
+
+impl BodyRoot {
+    fn whole(name: &str) -> Self {
+        BodyRoot {
+            name: name.to_string(),
+            prefix: "$".to_string(),
+        }
+    }
+}
+
+// `var/let/const X = <chain>` where the chain is an accessor chain off some
+// other name -- the declaration that makes `X` stand for part of the body.
+static ALIAS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:var|let|const)\s+(\w+)\s*=\s*((?:pm\.response\.json\s*\(\s*\)|[A-Za-z_$][\w$]*)(?:\s*\.\s*\w+|\s*\[[^\]\[]*\])+)",
+    )
+    .unwrap()
+});
+
+/// The `[Captures]` row a single `pm.<store>.set(...)` call becomes, or `None`
+/// when it cannot become one — the sole authority on which `set` calls turn
+/// into captures.
+///
+/// A call is refused (and so left as residue, to be noted) when it is guarded
+/// by a conditional (Hurl captures unconditionally, so a guarded one would run
+/// where the guard said it should not — and, worse, error whenever the guarded
+/// path was not taken), when its name is not one Hurl can carry (an invalid
+/// name is written into the file and then silently deleted the first time it is
+/// reopened), or when its value is not a plain accessor chain.
+fn capture_from_call(
+    call: &CallSite,
+    code: &str,
+    conditional: &[bool],
+    roots: &[BodyRoot],
+) -> Option<(String, String)> {
+    if call.args.len() != 2 {
+        return None;
+    }
+    if conditional.get(call.start).copied().unwrap_or(false) || !starts_statement(code, call.start)
+    {
+        return None;
+    }
+    let name = unquote(call.args[0].trim())?;
+    // A name Hurl's grammar rejects is written into `[Captures]` and then
+    // dropped the first time the file is reopened, while the note claims it
+    // became a capture. The `[Gen]` path already filters the same way.
+    if !crate::hurl::is_variable_name(name) {
+        return None;
+    }
+    let path = accessor_to_jsonpath(&compact_code(call.args[1]), roots)?;
+    Some((name.to_string(), format!("jsonpath \"{path}\"")))
+}
+
+/// One real (unquoted, uncommented) call found in a script: the byte range it
+/// occupies and its already-split top-level arguments.
+struct CallSite<'a> {
+    /// Start of the call's name, e.g. the `p` of `pm.expect(`.
+    start: usize,
+    /// One past its closing `)`.
+    end: usize,
+    args: Vec<&'a str>,
+}
+
+/// Every call in `code` whose `<name>(` matches `head` — which must end at the
+/// `(` — paired with its balanced argument list.
+///
+/// A regex cannot do this part on its own: `pm.expect(pm.response.json().a)`
+/// closes three parens before the one that ends the call, and an argument
+/// pattern of `[^)]+` stops at the first of them. That was harmless for the
+/// accessor chains [`captures_from_events`] was written for and wrong for
+/// anything holding a call, which is most of what a script assigns.
+fn find_calls<'a>(code: &'a str, in_string: &[bool], head: &Regex) -> Vec<CallSite<'a>> {
+    let mut out = Vec::new();
+    for m in head.find_iter(code) {
+        if in_string.get(m.start()).copied().unwrap_or(false) {
+            continue;
+        }
+        let open = m.end() - 1;
+        let Some(close) = matching_paren(code, open) else {
+            continue;
+        };
+        out.push(CallSite {
+            start: m.start(),
+            end: close + 1,
+            args: split_args(&code[open + 1..close]),
+        });
+    }
+    out
+}
+
+/// Index of the `)` closing the `(` at `open`, skipping anything quoted.
+fn matching_paren(code: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in code[open..].char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split an argument list on its top-level commas — those outside any nested
+/// brackets and outside any string.
+fn split_args(inner: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (i, c) in inner.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !inner[start..].trim().is_empty() || !out.is_empty() {
+        out.push(&inner[start..]);
+    }
+    out
+}
+
+/// `code` with every whitespace character removed, so a value can be recognised
+/// by shape without a table of every way to space it.
+fn compact(code: &str) -> String {
+    code.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Like [`compact`], but leaves the inside of string literals alone.
+///
+/// Whitespace only ever muddies the *shape* of an expression, so it is safe to
+/// drop between tokens — but a space inside a quoted key or value is data.
+/// `pm.expect(jsonData['full name'])` names a field that really is called
+/// `full name`, and `pm.response.headers.get('X Weird')` a header that really
+/// has a space; compacting straight through the quotes turned both into a query
+/// for a field that does not exist, and the assert then failed against a
+/// perfectly correct response. This keeps everything inside `'…'`, `"…"` or
+/// `` `…` `` verbatim while stripping the whitespace around it.
+fn compact_code(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in code.chars() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            _ if c.is_whitespace() => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether any script API call was left untranslated — the signal that the note
+/// has to say the rest was dropped. `covered` holds the byte ranges already
+/// accounted for.
+///
+/// Both spellings are looked for: `pm.` is today's sandbox, `postman.` the
+/// older one it replaced. A collection written against the old API and left
+/// alone since (which is most of what people have to import) is nothing but
+/// `postman.` calls, so looking only for `pm.` reported a script that had been
+/// entirely dropped as having nothing left in it.
+fn has_uncovered_pm_code(code: &str, in_string: &[bool], covered: &[(usize, usize)]) -> bool {
+    ["pm.", "postman."].iter().any(|api| {
+        code.match_indices(api).any(|(i, _)| {
+            !in_string.get(i).copied().unwrap_or(false)
+                && !covered.iter().any(|(s, e)| i >= *s && i < *e)
+        })
+    })
+}
+
+/// A call that stores a variable, in either spelling: `pm.<store>.set(` for the
+/// stores today's sandbox exposes, and the older
+/// `postman.setEnvironmentVariable(` / `postman.setGlobalVariable(` that
+/// preceded them. The two take the same two arguments, a name and a value, so
+/// everything downstream reads them identically -- and a collection that has
+/// not been touched since the old API was current still imports its captures
+/// and its `# [Gen]` rows rather than losing every one of them.
+static SET_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:pm\.(?:environment|collectionVariables|globals|variables)\.set|postman\.set(?:Environment|Global)Variable)\s*\(",
+    )
+    .unwrap()
+});
+
+// `var/let/const X = require('uuid')`, so `X.v4()` can be read as a UUID.
+static UUID_REQUIRE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:var|let|const)\s+(\w+)\s*=\s*require\s*\(\s*['"]uuid['"]\s*\)"#).unwrap()
+});
+
+/// The `# [Gen]` block a `prerequest` script reduces to, and whether anything
+/// in it did not reduce.
+///
+/// Each `pm.<store>.set("NAME", <value>)` whose value has an exact `[Gen]`
+/// equivalent becomes a row. That is the whole of the translation, and
+/// deliberately so: a pre-request script can do anything, a wrong guess at what
+/// one produces sends a plausible-looking request that fails for no visible
+/// reason, and the note names what was left behind so the user can write the
+/// rest themselves.
+///
+/// Folder and collection scripts arrive here too (see [`walk_items`]), which is
+/// the case that matters most — a folder that stamps every request inside it
+/// with a fresh id is the commonest pre-request script there is, and it used to
+/// vanish without a word.
+fn generators_from_events(events: &[Event]) -> (Vec<(String, String)>, bool) {
+    let script = script_text(events, "prerequest");
+    if script.trim().is_empty() {
+        return (Vec::new(), false);
+    }
+    let (code, in_string) = strip_js_noise(&script);
+    let conditional = conditional_mask(&code);
+    let mut aliases: Vec<String> = UUID_REQUIRE_RE
         .captures_iter(&code)
         .map(|c| c[1].to_string())
         .collect();
-    if roots.is_empty() {
-        roots.push("jsonData".to_string());
+    aliases.push("uuid".to_string());
+    // The `require` line is bookkeeping for a call we do translate, so it is
+    // not something left behind.
+    let mut covered: Vec<(usize, usize)> = UUID_REQUIRE_RE
+        .find_iter(&code)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for call in find_calls(&code, &in_string, &SET_CALL_RE) {
+        if call.args.len() != 2 {
+            continue;
+        }
+        // Only unconditional sets become rows, exactly as `[Asserts]` takes only
+        // unconditional assertions and for the same reason. Postman's ubiquitous
+        // `if (!pm.environment.get('id')) { pm.environment.set('id', uuid()); }`
+        // means "set it *once*"; taken unconditionally it becomes a fresh id on
+        // every send. A guarded set is left uncovered, so it is noted rather than
+        // silently made unconditional.
+        if conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start)
+        {
+            continue;
+        }
+        let Some(name) = unquote(call.args[0].trim()) else {
+            continue;
+        };
+        // A name Hurl reads only part of would be set here and truncated in the
+        // placeholder that reads it, which is the failure `[Gen]` names exist to
+        // avoid.
+        if !crate::hurl::is_variable_name(name) {
+            continue;
+        }
+        let Some(expr) = gen_expression(call.args[1].trim(), &aliases) else {
+            continue;
+        };
+        match rows.iter_mut().find(|(n, _)| n == name) {
+            // The script ran top to bottom and the last write won. A block with
+            // the same name twice does not: its meaning would depend on which
+            // row won, so the row is replaced rather than repeated.
+            Some(row) => row.1 = expr,
+            None => rows.push((name.to_string(), expr)),
+        }
+        covered.push((call.start, call.end));
     }
-    SET_RE
-        .captures_iter(&code)
-        .filter(|c| {
-            // The call itself must be code. Its *arguments* are quoted, so
-            // only the position the match starts at can be judged.
-            c.get(0)
-                .is_some_and(|m| !in_string.get(m.start()).copied().unwrap_or(false))
-        })
-        .filter_map(|c| {
-            let path = accessor_to_jsonpath(c[2].trim(), &roots)?;
-            Some((c[1].to_string(), format!("jsonpath \"{path}\"")))
-        })
-        .collect()
+    let residue = has_uncovered_pm_code(&code, &in_string, &covered);
+    (rows, residue)
 }
 
-/// Blank out JavaScript comments and report which bytes sit inside a string
-/// literal.
+/// The `# [Gen]` expression a script's assigned value means *exactly*, or
+/// `None` when nothing here means exactly the same thing.
 ///
-/// The returned text is the same length as the input — comments become spaces,
-/// keeping newlines — so a match offset in it means the same thing in the
-/// original. The scanner is deliberately small: it understands `//`, `/* */`,
-/// `'`/`"`/backtick strings and backslash escapes, which is everything needed
-/// to tell "this call is real code" from "this call is text". It does not try
-/// to be a JavaScript parser — a regex over a scripting language is a
-/// heuristic either way, and the point here is only to stop the obvious
-/// false positives.
+/// Short on purpose. Every entry is a value with one obvious equivalent, and
+/// the cost of being wrong is asymmetric: a request that refuses to run is
+/// found in a second, a request that sends a plausible wrong id is found by
+/// whoever reads the server's logs next week.
+fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
+    // A literal is exactly itself: `pm.environment.set("retries", 0)` becomes a
+    // row that evaluates to 0 on every send, which is what the script did.
+    if let Some(text) = unquote(value) {
+        // `[Gen]` has no escape syntax, so a literal carrying a quote or a
+        // backslash cannot be written down as one and is left to the note.
+        return (!text.contains(['"', '\\'])).then(|| format!("\"{text}\""));
+    }
+    if is_hurl_number(value) {
+        return Some(value.to_string());
+    }
+    // Whitespace-free, so `new Date().getTime()` and `new Date( ).getTime( )`
+    // are one case rather than two. (Which is why the patterns below read
+    // `newDate()`.)
+    let c = compact(value);
+    if uuid_aliases.iter().any(|a| c == format!("{a}.v4()"))
+        || c == "require('uuid').v4()"
+        || c == "require(\"uuid\").v4()"
+        || c == "uuidv4()"
+    {
+        return Some("uuid".to_string());
+    }
+    match c.as_str() {
+        "Date.now()" | "newDate().getTime()" | "newDate().valueOf()" => {
+            Some("timestamp_ms".to_string())
+        }
+        "Math.floor(Date.now()/1000)"
+        | "Math.round(Date.now()/1000)"
+        | "Math.floor(newDate().getTime()/1000)"
+        | "Math.round(newDate().getTime()/1000)" => Some("timestamp".to_string()),
+        "newDate().toISOString()" => Some("iso8601".to_string()),
+        _ => replaced_dynamic(&c),
+    }
+}
+
+/// `pm.variables.replaceIn('{{$guid}}')` — the supported way for a script to
+/// ask for one of Postman's dynamic variables. The same handful
+/// [`dynamic_fate`] claims are claimed here, for the same reasons.
+fn replaced_dynamic(compacted: &str) -> Option<String> {
+    let inner = compacted
+        .strip_prefix("pm.variables.replaceIn(")?
+        .strip_suffix(')')?;
+    let name = unquote(inner)?.strip_prefix("{{$")?.strip_suffix("}}")?;
+    // Read off `dynamic_fate` rather than repeated, so the two cannot come to
+    // disagree about which names PaperBoy claims. The difference is only that
+    // this is a *generator expression*, where Hurl's own `{{newUuid}}` is not
+    // available — so a `Builtin` is spelled as the equivalent function.
+    match dynamic_fate(name) {
+        DynamicFate::Builtin("newUuid") => Some("uuid".to_string()),
+        DynamicFate::Builtin("newDate") => Some("iso8601".to_string()),
+        DynamicFate::Builtin(_) => None,
+        DynamicFate::Computed(expr) => Some(expr.to_string()),
+        DynamicFate::Supplied => None,
+    }
+}
+
+// `pm.expect(` — the Chai entry point nearly every Postman assertion goes
+// through.
+static EXPECT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"pm\.expect\s*\(").unwrap());
+
+// `pm.response.to.have.status(` — the other spelling of a status check.
+static STATUS_CALL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"pm\.response\.to\.have\.status\s*\(").unwrap());
+
+// `pm.test("name", () => {` — the wrapper the assertions sit in. Only the head
+// is ever matched: covering the whole call would swallow everything inside it,
+// including whatever we failed to translate.
+static TEST_CALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"pm\.test\s*\(").unwrap());
+
+/// The `HTTP <status>` line and `[Asserts]` a `test` script reduces to, plus
+/// whether anything in it did not reduce.
 ///
-/// A regex literal (`/foo/`) is not recognised, so its contents are read as
-/// code; that can only ever cause a `pm...set(...)` *inside a regex* to be
-/// picked up, which is not a thing anybody writes.
+/// Only *unconditional* assertions are taken. A `pm.expect` inside an `if` is
+/// an assertion that sometimes does not apply, and Hurl has no way to say
+/// "check this only when…" — importing it as an unconditional assert would turn
+/// a passing collection into a failing one, which is the fastest way to teach
+/// somebody to ignore assertion failures. Those are reported as dropped
+/// instead, along with everything else that does not reduce.
+fn asserts_from_events(events: &[Event]) -> (Option<u16>, Vec<String>, bool) {
+    let script = script_text(events, "test");
+    if script.trim().is_empty() {
+        return (None, Vec::new(), false);
+    }
+    let (code, in_string) = strip_js_noise(&script);
+    let conditional = conditional_mask(&code);
+
+    // Built identically to [`captures_from_events`], so that whether a `set`
+    // call is "covered" here and whether it becomes a capture there are one
+    // decision, not two that can drift apart.
+    let roots = capture_roots(&code);
+
+    // Scaffolding that is not "something we failed to translate": the wrapper,
+    // the body variable, and the `pm.<store>.set` calls `captures_from_events`
+    // has already turned into `[Captures]`.
+    let mut covered: Vec<(usize, usize)> = TEST_CALL_RE
+        .find_iter(&code)
+        .chain(JSON_VAR_RE.find_iter(&code))
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    // A `set` call counts as covered only when it actually becomes a capture —
+    // the very same test `captures_from_events` applies. Marking a call covered
+    // that then captured nothing (a guarded set, an invalid name, or a value
+    // `[^)]+` cut off at the first `)`) left no residue and so no note, on a
+    // report that claimed a clean conversion.
+    for call in find_calls(&code, &in_string, &SET_CALL_RE) {
+        if capture_from_call(&call, &code, &conditional, &roots).is_some() {
+            covered.push((call.start, call.end));
+        }
+    }
+
+    let mut status = None;
+    let mut asserts: Vec<String> = Vec::new();
+
+    for call in find_calls(&code, &in_string, &STATUS_CALL_RE) {
+        if conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start)
+        {
+            continue;
+        }
+        let Some(code_num) = call.args.first().and_then(|a| a.trim().parse::<u16>().ok()) else {
+            continue;
+        };
+        // Only the status actually adopted is covered. A second, *different*
+        // status is a check the collection made that the import would silently
+        // drop — so it is left as residue, and the note says the rest was
+        // dropped, rather than quietly asserting the weaker of the two.
+        if status.get_or_insert(code_num) == &code_num {
+            covered.push((call.start, call.end));
+        }
+    }
+
+    for call in find_calls(&code, &in_string, &EXPECT_RE) {
+        if conditional.get(call.start).copied().unwrap_or(false)
+            || !starts_statement(&code, call.start)
+            || call.args.len() != 1
+        {
+            continue;
+        }
+        let tail_end = statement_end(&code, call.end);
+        let Some(subject) = expect_subject(&compact_code(call.args[0]), &roots) else {
+            continue;
+        };
+        // A deep equality against an object or array literal. Hurl has no
+        // predicate that takes a document, so it is spelled out one leaf at a
+        // time — which the reader gets the better of, since a failure then
+        // names the field that differed.
+        if let Subject::Json(path) = &subject
+            && let Some(value) = deep_expectation(&code[call.end..tail_end])
+        {
+            let lines = crate::probe::deep_equality(path, &value);
+            // An empty expansion is `{}` or a document of nothing but
+            // expressions: saying nothing about the body is not the assertion
+            // that was written, so it is left as residue to be noted.
+            if !lines.is_empty() {
+                for (s, p) in lines {
+                    if let Some(line) = assert_line(s, p)
+                        && !asserts.contains(&line)
+                    {
+                        asserts.push(line);
+                    }
+                }
+                covered.push((call.start, tail_end));
+                continue;
+            }
+        }
+        let Some(predicate) = parse_tail(&code[call.end..tail_end]) else {
+            continue;
+        };
+        match (subject, predicate) {
+            (Subject::Status, Predicate::Eq(v)) => match v.parse::<u16>() {
+                // As above: a second, differing status is left uncovered so it
+                // is noted, rather than silently discarded in favour of the
+                // first.
+                Ok(n) => {
+                    if status.get_or_insert(n) == &n {
+                        covered.push((call.start, tail_end));
+                    }
+                    continue;
+                }
+                Err(_) => continue,
+            },
+            (subject, predicate) => match assert_line(subject, predicate) {
+                Some(line) => {
+                    if !asserts.contains(&line) {
+                        asserts.push(line);
+                    }
+                }
+                None => continue,
+            },
+        }
+        covered.push((call.start, tail_end));
+    }
+
+    let residue = has_uncovered_pm_code(&code, &in_string, &covered);
+    (status, asserts, residue)
+}
+
+/// What `pm.expect(<expr>)` is asserting about, for the expressions that name
+/// something Hurl can query.
+fn expect_subject(compacted: &str, roots: &[BodyRoot]) -> Option<Subject> {
+    match compacted {
+        "pm.response.code" => return Some(Subject::Status),
+        "pm.response.responseTime" => return Some(Subject::Duration),
+        _ => {}
+    }
+    if let Some(rest) = compacted.strip_prefix("pm.response.headers.get(")
+        && let Some(inner) = rest.strip_suffix(')')
+        && let Some(name) = unquote(inner)
+    {
+        return Some(Subject::Header(name.to_string()));
+    }
+    // `.length` is a property of the value, not a key in it: read as a key it
+    // would produce `$.errors.length`, a path that matches nothing and an
+    // assert that fails for a reason having nothing to do with the response.
+    if let Some(head) = compacted.strip_suffix(".length") {
+        return accessor_to_jsonpath(head, roots).map(Subject::JsonCount);
+    }
+    accessor_to_jsonpath(compacted, roots).map(Subject::Json)
+}
+
+/// The document a Chai deep-equality tail compares against, when the tail is
+/// one and the document is written out in full.
+///
+/// Only the *deep* spellings count. `.to.equal({…})` in Chai is reference
+/// equality, which no two separately-parsed documents ever satisfy, so a
+/// collection using it is asserting something that was already failing — and
+/// importing it as a deep equality would quietly change what the test means.
+fn deep_expectation(tail: &str) -> Option<Value> {
+    // `.to.deep.include` is deliberately absent: on an array it means "contains
+    // this element", which is not what a per-index expansion says.
+    let (head, inner) = split_chai_call(tail)?;
+    matches!(
+        head.as_str(),
+        ".to.eql(" | ".to.deep.equal(" | ".to.deep.eql("
+    )
+    .then(|| js_literal(inner))
+    .flatten()
+}
+
+/// Split a Chai tail into its whitespace-free call chain (up to and including
+/// the opening bracket) and the argument text *as written*.
+///
+/// The argument is deliberately not compacted: `compact` removes whitespace
+/// everywhere, including inside string literals, so reading
+/// `.to.equal("Not Found")` off compacted text asserts `"NotFound"` — an
+/// assert that fails on a response that was correct.
+fn split_chai_call(tail: &str) -> Option<(String, &str)> {
+    let t = tail.trim().trim_end_matches(';').trim_end();
+    let inner = t.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    Some((compact(&inner[..=open]), &inner[open + 1..]))
+}
+
+/// Read a Chai tail (`.to.equal("x")`, `.is.not.empty`) as a predicate.
+fn parse_tail(tail: &str) -> Option<Predicate> {
+    // Longest first: `.to.not.equal(` also starts with `.to.`.
+    let calls: [(&str, fn(String) -> Predicate); 12] = [
+        (".to.not.be.equal(", Predicate::Ne),
+        (".to.not.equal(", Predicate::Ne),
+        (".to.not.eql(", Predicate::Ne),
+        (".to.deep.equal(", Predicate::Eq),
+        (".to.deep.eql(", Predicate::Eq),
+        (".to.be.equal(", Predicate::Eq),
+        (".to.equal(", Predicate::Eq),
+        (".to.eql(", Predicate::Eq),
+        (".to.include(", Predicate::Contains),
+        (".to.contain(", Predicate::Contains),
+        (".to.be.above(", Predicate::Gt),
+        (".to.be.below(", Predicate::Lt),
+    ];
+    if let Some((call, inner)) = split_chai_call(tail) {
+        for (head, make) in calls {
+            if call == head {
+                return hurl_literal(inner).map(make);
+            }
+        }
+    }
+    match compact(tail).trim_end_matches(';') {
+        ".to.be.empty" | ".is.empty" => Some(Predicate::Empty(true)),
+        ".to.not.be.empty" | ".is.not.empty" => Some(Predicate::Empty(false)),
+        _ => None,
+    }
+}
+
+/// A JavaScript literal as the Hurl value it is identical to, or `None` for an
+/// expression whose value is not knowable from the text.
+fn hurl_literal(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let Some(text) = unquote(value) {
+        // Hurl quoted strings take `\"` and `\\`, but a literal needing them is
+        // rare enough that dropping the assert (and saying so) beats getting the
+        // escaping subtly wrong. `{{` is refused for the same reason: Hurl would
+        // read it as a template and compare against a substituted value, so a
+        // literal carrying one is left to the note rather than mis-asserted.
+        return (!text.contains(['"', '\\']) && !text.contains("{{"))
+            .then(|| format!("\"{text}\""));
+    }
+    if matches!(value, "true" | "false" | "null") {
+        return Some(value.to_string());
+    }
+    // Only a number Hurl's predicate grammar can actually read. `f64::parse`
+    // also accepts `1e3`, `.5`, `Infinity` and `NaN`, none of which Hurl will
+    // parse — the assert was written, the note claimed it, and it vanished (or
+    // broke the whole file) the first time the collection was reopened.
+    is_hurl_number(value).then(|| value.to_string())
+}
+
+/// Whether `value` is a number Hurl's predicate grammar accepts: an optional
+/// leading `-`, one or more digits, and — if there is a `.` — one or more
+/// digits after it. No exponent, no bare `.5`, no `Infinity`/`NaN`.
+fn is_hurl_number(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let mut parts = digits.splitn(2, '.');
+    let int = parts.next().unwrap_or("");
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(frac) => !frac.is_empty() && frac.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
+/// Whether the call at `start` begins its own statement: nothing but whitespace
+/// between it and the last `;`, `{`, `}` or newline.
+///
+/// This is what keeps a conditional assertion out even when it has no block of
+/// its own — `if (x) pm.expect(...)` and `x ? pm.expect(...) : y` both put
+/// something in front of the call, and both mean "sometimes".
+fn starts_statement(code: &str, start: usize) -> bool {
+    // "Or the start of the script": a boundary that is *missing* used to read
+    // as "nothing in front of it", so the very first line of a script was
+    // exempt from the whole rule — `if (ok) pm.expect(…)` written on line one
+    // imported as an unconditional assert.
+    let boundary = code[..start].rfind([';', '{', '}', '\n']);
+    let from = boundary.map_or(0, |i| i + 1);
+    if !code[from..start].trim().is_empty() {
+        return false;
+    }
+    // A brace-less guard split over two lines is still a guard:
+    //
+    // ```js
+    // if (jsonData.ok)
+    //     pm.expect(...)
+    // ```
+    //
+    // The newline in front of the call looks like the end of a statement, but
+    // it is the middle of one. When the boundary is a newline, look back past
+    // the whitespace to the real code before it, and if that is the head of a
+    // brace-less `if`/`for`/`while`/`else`/`do`, the call is its guarded body.
+    if boundary.is_some_and(|i| code.as_bytes()[i] == b'\n') {
+        let head = code[..boundary.unwrap()].trim_end();
+        if ends_with_guard_head(head) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `head` — the code on the line(s) before a brace-less body — ends in
+/// a guard whose body is what follows: `else`, `do`, or `if`/`for`/`while (…)`.
+fn ends_with_guard_head(head: &str) -> bool {
+    let word_before = |s: &str| -> String {
+        s.chars()
+            .rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    };
+    // A bare `else` or `do` with only its body to come.
+    let last_word = word_before(head);
+    if matches!(last_word.as_str(), "else" | "do") {
+        return true;
+    }
+    // `if (...)`, `for (...)`, `while (...)`: the keyword is what sits before
+    // the parenthesised condition this `)` closes.
+    if head.ends_with(')')
+        && let Some(open) = matching_open_paren(head)
+    {
+        let keyword = word_before(head[..open].trim_end());
+        return matches!(keyword.as_str(), "if" | "for" | "while");
+    }
+    false
+}
+
+/// The index of the `(` matched by the final `)` of `s`, scanning back and
+/// counting depth. Strings have already been left in place by
+/// [`strip_js_noise`], so a `)` quoted in one is a rare source of a wrong
+/// match — acceptable for a heuristic whose only job is to spot a guard head.
+fn matching_open_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.last() != Some(&b')') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One past the end of the statement beginning at `from`: the next `;` or
+/// newline outside any brackets or strings.
+fn statement_end(code: &str, from: usize) -> usize {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in code[from..].char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ';' | '\n' if depth == 0 => return from + i,
+            ')' | '}' if depth == 0 => return from + i,
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+/// For each byte of `code`, whether reaching it is conditional on something
+/// only the run knows.
+///
+/// Everything inside a `{ … }` counts as conditional except the body of a
+/// `pm.test("…", () => { … })` callback, which runs whenever the script does.
+/// The exception is deliberately that narrow. A block guarded by `if` obviously
+/// only sometimes runs, but so does the body of a helper —
+///
+/// ```js
+/// const assertMatched = (body) => { pm.expect(body.Result).to.equal("Matched"); };
+/// ```
+///
+/// — which runs only where it is called, and in the collection this was written
+/// for it is called in one arm of an if/else whose other arm asserts the
+/// opposite. Taking both produced a request asserting that one field equalled
+/// two different strings: an assertion that can never pass, on a request that
+/// was working perfectly.
+fn conditional_mask(code: &str) -> Vec<bool> {
+    let mut mask = vec![false; code.len()];
+    let mut blocks: Vec<bool> = Vec::new();
+    let mut parens: Vec<usize> = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in code.char_indices() {
+        let inside = blocks.iter().any(|c| *c);
+        for m in mask.iter_mut().skip(i).take(c.len_utf8()) {
+            *m = inside;
+        }
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' => parens.push(i),
+            ')' => {
+                parens.pop();
+            }
+            '{' => blocks.push(!opens_test_callback(code, &parens, i)),
+            '}' => {
+                blocks.pop();
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
+/// Whether the `{` at `at` opens the callback body of a `pm.test(...)`.
+///
+/// `parens` holds the still-open `(`s, so the innermost is the call this block
+/// is an argument of — which is what tells a test callback from an arrow
+/// function assigned to a variable, whose own parameter list closed before the
+/// `{`.
+fn opens_test_callback(code: &str, parens: &[usize], at: usize) -> bool {
+    let Some(&open) = parens.last() else {
+        return false;
+    };
+    let name: String = code[..open]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !matches!(name.as_str(), "pm.test" | "pm.it") {
+        return false;
+    }
+    // The text between `pm.test(` and this `{` must be *only* a callback
+    // header — the name argument, a comma, and the callback's own signature —
+    // and nothing more. Testing merely that it `contains("function(")` and
+    // `ends_with(')')` matched the *inner* `{` of an `if` inside a
+    // `function () {}` callback too (`("t",function(){if(jsonData.ok)` both
+    // contains `function(` and ends with `)`), so the guard block was taken as
+    // unconditional and everything in it imported unconditionally. An arrow
+    // header ends with `=>`; a `function` header ends right after its own
+    // parameter list.
+    static TEST_CALLBACK_HEADER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\(.*,(?:async)?function\*?\([^)]*\)$").unwrap());
+    let between = compact(&code[open..at]);
+    between.ends_with("=>") || TEST_CALLBACK_HEADER.is_match(&between)
+}
+
+/// Blank out JavaScript comments and regex literals, and report which bytes sit
+/// inside a string literal.
+///
+/// The returned text is the same length as the input — comments and regex
+/// literals become spaces, keeping newlines — so a match offset in it means the
+/// same thing in the original. The scanner is deliberately small: it
+/// understands `//`, `/* */`, `'`/`"`/backtick strings, backslash escapes and
+/// `/regex/` literals, which is everything needed to tell "this call is real
+/// code" from "this is text or a pattern". It does not try to be a JavaScript
+/// parser — a regex over a scripting language is a heuristic either way, and
+/// the point here is only to stop the obvious false positives.
+///
+/// Blanking regex literals is not cosmetic. A pattern like `/\{([^}]*)\}/` holds
+/// one `{` and two `}`; read as code, the extra `}` pops the enclosing `if`
+/// block in [`conditional_mask`], and every statement after it reads as
+/// unconditional. The mirror — an unmatched `{` in `const re = /\{/;` — hides
+/// every assertion after it instead. A `/` is taken to open a regex only in
+/// expression position (at the start, or after `(`, `,`, `=`, `:`, `[`, `!`,
+/// `&`, `|`, `{`, `;`, `?`, or `return`); after a value or `)` it is division.
 fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
     #[derive(PartialEq)]
     enum St {
@@ -1610,11 +3077,13 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
         Line,
         Block,
         Str(char),
+        Regex,
     }
     let mut out = String::with_capacity(script.len());
     let mut in_string = Vec::with_capacity(script.len());
     let mut st = St::Code;
     let mut escaped = false;
+    let mut regex_class = false;
     let mut chars = script.chars().peekable();
     while let Some(c) = chars.next() {
         let (keep, quoted) = match st {
@@ -1625,6 +3094,12 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
                 }
                 '/' if chars.peek() == Some(&'*') => {
                     st = St::Block;
+                    (false, false)
+                }
+                '/' if regex_position(&out, &in_string) => {
+                    st = St::Regex;
+                    escaped = false;
+                    regex_class = false;
                     (false, false)
                 }
                 '\'' | '"' | '`' => {
@@ -1664,6 +3139,31 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
                 }
                 (true, true)
             }
+            St::Regex => {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '[' {
+                    regex_class = true;
+                } else if c == ']' {
+                    regex_class = false;
+                } else if c == '\n' {
+                    // An unterminated regex at end of line is a typo (or a `/`
+                    // we misjudged); don't swallow the rest of the script.
+                    st = St::Code;
+                } else if c == '/' && !regex_class {
+                    // End of the pattern. Its flags (`gimsuy`) are letters that
+                    // would read back as an identifier, so blank them too.
+                    while chars.peek().is_some_and(|p| p.is_ascii_alphabetic()) {
+                        chars.next();
+                        out.push(' ');
+                        in_string.push(false);
+                    }
+                    st = St::Code;
+                }
+                (false, false)
+            }
         };
         // A blanked character becomes a single space, which can shorten
         // `out` — that is fine, because the flags are pushed to match `out`,
@@ -1678,16 +3178,69 @@ fn strip_js_noise(script: &str) -> (String, Vec<bool>) {
     (out, in_string)
 }
 
+/// Whether a `/` reached with this code emitted so far opens a regex literal
+/// rather than being a division. True in expression position: at the very
+/// start, after an operator or opener, or after a keyword like `return` that a
+/// value follows — false after a value, an identifier, or a closing bracket.
+fn regex_position(out: &str, in_string: &[bool]) -> bool {
+    // The last emitted character that is real code (not inside a string, not a
+    // blanked comment/regex, not whitespace).
+    let last = out
+        .char_indices()
+        .rev()
+        .find(|&(i, ch)| !ch.is_whitespace() && !in_string.get(i).copied().unwrap_or(false))
+        .map(|(_, ch)| ch);
+    match last {
+        None => true,
+        Some(c) if "(,=:[!&|{;?".contains(c) => true,
+        Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => {
+            // A keyword that a value follows means expression position; a plain
+            // identifier or number means the `/` divides it.
+            let word: String = out
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            matches!(
+                word.as_str(),
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "do"
+                    | "else"
+                    | "case"
+                    | "void"
+                    | "delete"
+                    | "new"
+                    | "throw"
+                    | "yield"
+                    | "await"
+            )
+        }
+        Some(_) => false,
+    }
+}
+
 /// Convert a JS accessor chain rooted at one of `roots`
 /// (`body['a'].b["c"][0]`) into a jsonpath (`$.a.b.c[0]`). Returns `None` for
 /// anything past a simple `.ident` / `['key']` / `[n]` chain (a method call,
 /// arithmetic, …), so an unparseable capture is dropped instead of guessed.
-fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
-    let mut s = roots.iter().find_map(|r| {
-        expr.strip_prefix(r.as_str())
+fn accessor_to_jsonpath(expr: &str, roots: &[BodyRoot]) -> Option<String> {
+    // Longest name first: `data` and `dataItems` both begin the same way, and
+    // matching the shorter one would leave `Items[0]` as the chain.
+    let mut by_len: Vec<&BodyRoot> = roots.iter().collect();
+    by_len.sort_by_key(|r| std::cmp::Reverse(r.name.len()));
+    let (root, mut s) = by_len.iter().find_map(|r| {
+        expr.strip_prefix(r.name.as_str())
             .filter(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+            .map(|rest| (*r, rest))
     })?;
-    let mut path = String::from("$");
+    let mut path = root.prefix.clone();
     while !s.is_empty() {
         if let Some(rest) = s.strip_prefix('.') {
             let end = rest
@@ -1715,33 +3268,326 @@ fn accessor_to_jsonpath(expr: &str, roots: &[String]) -> Option<String> {
     Some(path)
 }
 
-/// Append a jsonpath key: a plain identifier as `.name`, anything else bracket-
-/// quoted (`['a-b']`) so the path stays valid.
-fn push_key(path: &mut String, key: &str) {
-    let simple = !key.is_empty()
-        && !key.starts_with(|c: char| c.is_ascii_digit())
-        && key.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if simple {
-        path.push('.');
-        path.push_str(key);
-    } else {
-        path.push_str(&format!("['{key}']"));
+/// Strip matching single or double quotes, returning the inner text.
+/// A JavaScript object or array literal as the JSON value it stands for, or
+/// `None` for anything whose value the text alone doesn't fix.
+///
+/// `pm.expect(x).to.eql({ id: 1, name: 'a' })` is a perfectly ordinary Postman
+/// assertion, and its argument is *nearly* JSON: what stops `serde_json`
+/// reading it is unquoted keys, single quotes and a trailing comma. Those three
+/// are normalised here. Anything else — a nested expression, a template
+/// literal, a function call — makes the whole literal unreadable rather than
+/// half-read, because half a deep equality is an assertion nobody wrote.
+fn js_literal(src: &str) -> Option<Value> {
+    let src = src.trim();
+    if !(src.starts_with('{') || src.starts_with('[')) {
+        return None;
     }
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' | '\'' => {
+                // Re-emit as a double-quoted JSON string, escaping what JSON
+                // requires and un-escaping the `\'` that only mattered inside
+                // single quotes.
+                let str_start = out.len();
+                out.push('"');
+                let mut closed = false;
+                while let Some((_, d)) = chars.next() {
+                    match d {
+                        '\\' => {
+                            let (_, e) = chars.next()?;
+                            match e {
+                                '\'' => out.push('\''),
+                                '"' => out.push_str("\\\""),
+                                other => {
+                                    out.push('\\');
+                                    out.push(other);
+                                }
+                            }
+                        }
+                        d if d == c => {
+                            closed = true;
+                            break;
+                        }
+                        '"' => out.push_str("\\\""),
+                        '\n' => return None,
+                        other => out.push(other),
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                out.push('"');
+                // A `{{…}}` inside the string would be read back as a Hurl
+                // template when the leaf became an assert, comparing the
+                // response against a *substituted* value (or erroring on an
+                // undefined variable) for a body that was correct. `[Gen]`/
+                // `[Asserts]` have no way to escape it, so the whole literal is
+                // declined and left to the note.
+                if out[str_start..].contains("{{") {
+                    return None;
+                }
+            }
+            // An unquoted key: a bare identifier immediately followed by `:`.
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let start = i;
+                let mut end = i + c.len_utf8();
+                while let Some(&(j, d)) = chars.peek() {
+                    if d.is_ascii_alphanumeric() || d == '_' || d == '$' {
+                        end = j + d.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let word = &src[start..end];
+                let followed_by_colon = src[end..].trim_start().starts_with(':');
+                match word {
+                    // Bare words that are values, not keys.
+                    "true" | "false" | "null" if !followed_by_colon => out.push_str(word),
+                    _ if followed_by_colon => {
+                        out.push('"');
+                        out.push_str(word);
+                        out.push('"');
+                    }
+                    // A bare identifier used as a *value* is a variable, whose
+                    // contents the export doesn't say.
+                    _ => return None,
+                }
+            }
+            // A trailing comma before the closing bracket is legal JS and not
+            // legal JSON.
+            ',' => {
+                if src[i + 1..].trim_start().starts_with(['}', ']']) {
+                    continue;
+                }
+                out.push(',');
+            }
+            other => out.push(other),
+        }
+    }
+    serde_json::from_str(&out).ok()
 }
 
-/// Strip matching single or double quotes, returning the inner text.
+/// A single string literal's inner text, or `None` when `s` is not exactly one
+/// string.
+///
+/// It is not enough that the first and last characters are the same quote: `'a'
+/// + x + 'b'` starts and ends with `'` yet is a *concatenation*, and reading it
+/// as the one string `a' + x + 'b` fed a wrong value straight into a `[Gen]`
+/// row or an assert. So the opening quote is scanned to its real terminator
+/// (respecting `\` escapes); only when that terminator is the final character
+/// is this one string.
 fn unquote(s: &str) -> Option<&str> {
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
-        Some(&s[1..s.len() - 1])
-    } else {
-        None
+    let bytes = s.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
     }
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == quote {
+            // The closing quote must be the last byte, or what follows it
+            // (`+ x + '…'`, `.trim()`, …) makes this more than one string.
+            return (i == bytes.len() - 1).then(|| &s[1..i]);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collections under `examples/postman/` are what a user is told to
+    /// import to see this working. A mapping change that stopped producing the
+    /// outcome the example's own description promises would be found by them,
+    /// not by us, so they are converted here.
+    mod shipped_examples {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn convert_example(file: &str) -> ConvertedCollection {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/postman/");
+            let json = std::fs::read_to_string(format!("{path}{file}"))
+                .unwrap_or_else(|e| panic!("{file} is shipped and must be readable: {e}"));
+            convert_postman(&json)
+        }
+
+        fn entry<'a>(c: &'a ConvertedCollection, title: &str) -> &'a HurlEntry {
+            c.entries
+                .iter()
+                .find(|e| e.title == title)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no request titled {title:?}; found {:?}",
+                        c.entries.iter().map(|e| &e.title).collect::<Vec<_>>()
+                    )
+                })
+        }
+
+        #[test]
+        fn the_dynamic_variable_example_demonstrates_all_three_outcomes() {
+            let c = convert_example("dynamic-variables.postman_collection.json");
+
+            let builtin = entry(&c, "Built in/A GUID and an ISO timestamp");
+            let text = builtin.to_hurl();
+            assert!(
+                text.contains("{{newUuid}}") && text.contains("{{newDate}}"),
+                "$guid and $isoTimestamp become Hurl's own placeholders: {text}"
+            );
+            assert!(
+                builtin.generators.is_empty(),
+                "a built-in needs no computed row"
+            );
+
+            let twice = entry(&c, "Built in/The same GUID twice");
+            assert!(
+                twice.generators.is_empty(),
+                "and still none when used in two places"
+            );
+
+            let computed = entry(&c, "Computed/A Unix timestamp and a random integer");
+            let names: Vec<&str> = computed
+                .generators
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            assert_eq!(
+                computed.generators.len(),
+                2,
+                "one row per name however often it is used, not one per use: {names:?}"
+            );
+            let exprs: Vec<&str> = computed
+                .generators
+                .iter()
+                .map(|(_, e)| e.as_str())
+                .collect();
+            assert!(
+                exprs.contains(&"timestamp"),
+                "$timestamp is Unix seconds: {exprs:?}"
+            );
+            assert!(
+                exprs.iter().any(|e| e.starts_with("random_int(")),
+                "$randomInt is a bounded integer: {exprs:?}"
+            );
+
+            let supplied = entry(&c, "Supplied/Faker data nothing can produce");
+            assert!(
+                supplied.generators.is_empty(),
+                "nothing here can be honestly computed"
+            );
+            assert!(
+                c.notes.iter().any(|n| n.item == supplied.title),
+                "so the user is told to supply it instead"
+            );
+        }
+
+        #[test]
+        fn every_shipped_example_still_parses_as_hurl() {
+            for file in [
+                "dynamic-variables.postman_collection.json",
+                "signed-requests.postman_collection.json",
+            ] {
+                let c = convert_example(file);
+                assert!(!c.entries.is_empty(), "{file} converted to nothing");
+                for e in &c.entries {
+                    let text = e.to_hurl();
+                    let back = crate::hurl::parse_hurl(&text);
+                    assert_eq!(
+                        back.len(),
+                        1,
+                        "{file}: {:?} did not survive a round trip:\n{text}",
+                        e.title
+                    );
+                    assert_eq!(back[0].generators, e.generators, "{file}: {:?}", e.title);
+                }
+            }
+        }
+
+        /// `signed-requests.hurl` is the worked answer the README tells the
+        /// user to compare their own block against, so its rows must actually
+        /// evaluate. A `.hurl` file that no longer parses, or a function that
+        /// has been renamed out from under it, would otherwise be found by
+        /// whoever followed the instructions.
+        #[test]
+        fn the_worked_signing_example_parses_and_evaluates() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/postman/signed-requests.hurl"
+            );
+            let text = std::fs::read_to_string(path).expect("shipped example must be readable");
+            let entries = crate::hurl::parse_hurl(&text);
+            assert_eq!(entries.len(), 6, "six requests, one deliberately broken");
+
+            let vars: HashMap<String, String> = [
+                ("baseUrl", "https://postman-echo.com"),
+                ("API_KEY", "EXAMPLE-KEY-id"),
+                ("API_SECRET", "EXAMPLE-SECRET-not-a-real-key"),
+                ("SINCE", "2026-01-01T00:00:00Z"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+            for e in &entries {
+                assert!(
+                    !e.generators.is_empty(),
+                    "{:?} is in this file to demonstrate a block",
+                    e.title
+                );
+                let mut merged = vars.clone();
+                let errors = crate::generators::expand(
+                    &e.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                );
+                if e.title.starts_with("Deliberately broken") {
+                    assert_eq!(errors.len(), 1, "the typo is the point of that request");
+                    continue;
+                }
+                assert!(errors.is_empty(), "{:?}: {errors:?}", e.title);
+            }
+
+            // The known-answer request is the file's own proof, so check the
+            // vector here too rather than only against a live server.
+            let vector = &entries[4];
+            let mut merged = vars.clone();
+            crate::generators::expand(
+                &vector.generators,
+                &mut merged,
+                &crate::generators::SystemSource::new(),
+            );
+            assert_eq!(
+                merged.get("sig").map(String::as_str),
+                Some("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+                "RFC 4231 case 2"
+            );
+        }
+
+        #[test]
+        fn the_signing_example_keeps_the_scripts_it_cannot_run() {
+            let c = convert_example("signed-requests.postman_collection.json");
+            let signed = entry(&c, "HMAC-SHA256 over a nonce and a timestamp");
+            assert!(
+                signed.to_hurl().contains("{{sig}}"),
+                "the signature placeholder is preserved for the [Gen] row to fill"
+            );
+            assert!(
+                c.notes
+                    .iter()
+                    .any(|n| n.item == signed.title && n.detail.to_lowercase().contains("script")),
+                "and the dropped pre-request script is reported, not silently lost: {:?}",
+                c.notes
+            );
+        }
+    }
 
     #[test]
     fn imports_requests_headers_and_body() {
@@ -1939,7 +3785,7 @@ mod tests {
 
     #[test]
     fn accessor_chains_become_jsonpaths() {
-        let roots = vec!["jsonData".to_string()];
+        let roots = vec![BodyRoot::whole("jsonData")];
         let p = |e: &str| accessor_to_jsonpath(e, &roots);
         assert_eq!(p("jsonData['token']").as_deref(), Some("$.token"));
         assert_eq!(p("jsonData[\"token\"]").as_deref(), Some("$.token"));
@@ -2963,8 +4809,15 @@ mod inheritance_tests {
         let converted = convert_postman(json);
         let hurl = crate::hurl::collection_to_hurl(&converted.entries);
         assert!(!hurl.contains("{{$"), "a `$` is not a legal name: {hurl}");
-        assert!(hurl.contains("{{guid}}"), "{hurl}");
+        assert!(
+            hurl.contains("{{newUuid}}"),
+            "a GUID is something Hurl generates itself: {hurl}"
+        );
         assert!(hurl.contains("{{timestamp}}"), "{hurl}");
+        assert!(
+            hurl.contains("# [Gen] 1") && hurl.contains("# timestamp = timestamp"),
+            "a Unix timestamp is computed rather than left to be supplied: {hurl}"
+        );
         assert!(hurl.contains("{{processEnv_HOME}}"), "{hurl}");
         assert_eq!(
             crate::hurl::parse_hurl(&hurl).len(),
@@ -2979,7 +4832,70 @@ mod inheritance_tests {
             converted
                 .notes
                 .iter()
-                .any(|n| n.detail.contains("{{guid}}"))
+                .any(|n| n.detail.contains("{{newUuid}}") && n.detail.contains("nothing supplied")),
+            "the GUID note says it needs nothing: {:?}",
+            converted.notes
+        );
+        assert!(
+            converted
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("{{processEnv_HOME}}")
+                    && n.detail.contains("has to be supplied")),
+            "the one nothing can produce still says so: {:?}",
+            converted.notes
+        );
+    }
+
+    /// The values PaperBoy can now actually produce. Before the `# [Gen]`
+    /// block existed every one of these imported as a variable nobody could
+    /// fill in, so the request arrived unrunnable.
+    #[test]
+    fn the_generated_values_paperboy_can_produce_are_produced() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/?n={{$randomInt}}&u={{$randomUUID}}",
+            "header": [ { "key": "X-At", "value": "{{$isoTimestamp}}" } ] } } ]
+        }"#;
+        let converted = convert_postman(json);
+        let entry = &converted.entries[0];
+        assert_eq!(
+            entry.generators,
+            vec![("randomInt".to_string(), "random_int(0, 1000)".to_string())],
+            "only the one Hurl can't generate itself needs a row"
+        );
+        assert!(entry.url.contains("{{newUuid}}"), "{}", entry.url);
+        assert_eq!(entry.headers[0].value, "{{newDate}}");
+
+        // Portability is the whole point of preferring the built-ins: the file
+        // must still read back as Hurl, block and all.
+        let hurl = crate::hurl::collection_to_hurl(&converted.entries);
+        let back = crate::hurl::parse_hurl(&hurl);
+        assert_eq!(back.len(), 1, "{:?}", crate::hurl::parse_hurl_error(&hurl));
+        assert_eq!(back[0].generators, entry.generators, "the block survives");
+    }
+
+    /// One `$name` used twice is one row, not two — a name defined twice is a
+    /// block whose meaning depends on which row won.
+    #[test]
+    fn a_generated_value_used_twice_declares_one_row() {
+        let json = r#"{
+          "info": { "name": "d", "schema": "x" },
+          "item": [ { "name": "start", "request": { "method": "POST",
+            "url": "https://x/?a={{$timestamp}}&b={{$timestamp}}",
+            "header": [ { "key": "X-At", "value": "{{$timestamp}}" } ] } } ]
+        }"#;
+        let converted = convert_postman(json);
+        assert_eq!(
+            converted.entries[0].generators,
+            vec![("timestamp".to_string(), "timestamp".to_string())]
+        );
+        assert_eq!(
+            converted.notes.len(),
+            1,
+            "and it is reported once: {:?}",
+            converted.notes
         );
     }
 
@@ -3302,6 +5218,22 @@ mod field_tolerance_tests {
         );
     }
 
+    /// A key is allowed to appear more than once -- `?tag=a&tag=b` is how a
+    /// list is sent -- and the merge used to treat a name as accounted for the
+    /// first time it saw it, quietly narrowing the request to one value.
+    #[test]
+    fn a_query_parameter_repeated_in_the_list_keeps_every_value() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"d","request":{"method":"GET","url":{
+            "raw":"https://h/y?tag=a",
+            "query":[{"key":"tag","value":"a"},{"key":"tag","value":"b"}]}}}]}"#;
+        let e = import_postman(json);
+        assert_eq!(
+            e[0].url, "https://h/y?tag=a&tag=b",
+            "the second value of the pair is still sent"
+        );
+    }
+
     /// A `#` on a Hurl request line starts a comment, so a fragment left in
     /// the URL took the rest of the line with it on the next read. It is not
     /// sent to a server anyway — drop it, but say so.
@@ -3353,6 +5285,1230 @@ mod field_tolerance_tests {
             !c.notes.iter().any(|n| n.detail.contains("query")),
             "no query-string claim for a key that went to a header: {:?}",
             c.notes
+        );
+    }
+}
+
+/// Postman's pre-request and test scripts, and how much of each one a Hurl
+/// request can be made to state on its own.
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    /// Postman writes `"exec": [""]` for a script tab that was opened and left
+    /// empty. Treating that as a script produced a note about losing something
+    /// that was never there — on a third of a real collection's requests.
+    #[test]
+    fn an_empty_script_tab_is_not_reported_as_a_lost_script() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[""]}},
+                               {"listen":"test","script":{"exec":["",""]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            !c.notes.iter().any(|n| n.detail.contains("script")),
+            "nothing was lost, so nothing is claimed: {:?}",
+            c.notes
+        );
+    }
+
+    /// A folder's scripts run for every request inside it, so they have to be
+    /// carried down; only the request's own `event` used to be read, which lost
+    /// them entirely and without a word.
+    #[test]
+    fn a_folder_pre_request_script_reaches_every_request_inside_it() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"F","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('transaction_id', require('uuid').v4());",
+             "pm.environment.set('retries', 0);"]}}],
+           "item":[{"name":"a","request":{"method":"POST","url":"https://h/a"}},
+                   {"name":"b","request":{"method":"POST","url":"https://h/b"}}]}]}"#;
+        let c = convert_postman(json);
+        for e in &c.entries {
+            assert_eq!(
+                e.generators,
+                vec![
+                    ("transaction_id".to_string(), "uuid".to_string()),
+                    ("retries".to_string(), "0".to_string())
+                ],
+                "{} computes the folder's values",
+                e.title
+            );
+        }
+        let script_notes: Vec<&ConversionNote> = c
+            .notes
+            .iter()
+            .filter(|n| n.detail.contains("pre-request script"))
+            .collect();
+        assert_eq!(
+            script_notes.len(),
+            1,
+            "one folder script is one note, not one per request: {:?}",
+            c.notes
+        );
+        assert_eq!(
+            script_notes[0].item, "F",
+            "filed against the folder that holds it"
+        );
+    }
+
+    /// The whole point of the translation: the shapes a pre-request script
+    /// reaches for most often are exactly the ones `[Gen]` covers.
+    #[test]
+    fn the_usual_pre_request_computations_become_generators() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('id', uuidv4());",
+             "pm.collectionVariables.set('ms', Date.now());",
+             "pm.variables.set('secs', Math.floor(Date.now() / 1000));",
+             "pm.environment.set('when', new Date().toISOString());",
+             "pm.environment.set('guid', pm.variables.replaceIn('{{$guid}}'));",
+             "pm.environment.set('tries', 0);",
+             "pm.environment.set('who', 'alice');"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(
+            c.entries[0].generators,
+            vec![
+                ("id".to_string(), "uuid".to_string()),
+                ("ms".to_string(), "timestamp_ms".to_string()),
+                ("secs".to_string(), "timestamp".to_string()),
+                ("when".to_string(), "iso8601".to_string()),
+                ("guid".to_string(), "uuid".to_string()),
+                ("tries".to_string(), "0".to_string()),
+                ("who".to_string(), "\"alice\"".to_string()),
+            ]
+        );
+        let back = crate::hurl::parse_hurl(&c.entries[0].to_hurl());
+        assert_eq!(
+            back[0].generators, c.entries[0].generators,
+            "and the block reads back"
+        );
+    }
+
+    /// A test script's status check is the one assertion nearly every Postman
+    /// collection has, and Hurl states it on the request line.
+    #[test]
+    fn a_status_assertion_becomes_the_expected_status() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"test","script":{"exec":[
+             "pm.test('bad request', function () {",
+             "    pm.response.to.have.status(400);",
+             "});"]}}],
+           "request":{"method":"POST","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(c.entries[0].expected_status, Some(400));
+    }
+
+    /// Body checks inside a `pm.test` callback are unconditional, so they can
+    /// be stated as `[Asserts]`. `.length` is a count in Hurl, not a path.
+    #[test]
+    fn body_checks_inside_a_test_callback_become_asserts() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"test","script":{"exec":[
+             "pm.test('shape', () => {",
+             "    const b = pm.response.json();",
+             "    pm.expect(b.status).to.eql('Matched');",
+             "    pm.expect(b.ModelState['body.Image']).to.not.be.empty;",
+             "    pm.expect(b.errors.length).to.equal(1);",
+             "});"]}}],
+           "request":{"method":"POST","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(
+            c.entries[0].asserts,
+            vec![
+                "jsonpath \"$.status\" == \"Matched\"".to_string(),
+                "jsonpath \"$.ModelState['body.Image']\" not isEmpty".to_string(),
+                "jsonpath \"$.errors\" count == 1".to_string(),
+            ]
+        );
+        let back = crate::hurl::parse_hurl(&c.entries[0].to_hurl());
+        assert_eq!(back[0].asserts, c.entries[0].asserts, "and they read back");
+    }
+
+    /// The trap that a first pass fell into: a helper that asserts one thing
+    /// and a helper that asserts its opposite are both *called* from branches,
+    /// so hoisting either into `[Asserts]` makes the request fail whichever way
+    /// the response goes. Only a `pm.test` callback body is unconditional.
+    #[test]
+    fn assertions_the_script_only_sometimes_runs_are_not_hoisted() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"test","script":{"exec":[
+             "const matched = (b) => { pm.expect(b.result).to.eql('Matched'); };",
+             "const notMatched = (b) => { pm.expect(b.result).to.eql('NotMatched'); };",
+             "const b = pm.response.json();",
+             "if (pm.environment.get('expect') === 'yes') { matched(b); } else { notMatched(b); }",
+             "if (b.code) pm.expect(b.code).to.eql(2);"]}}],
+           "request":{"method":"POST","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "nothing here always holds: {:?}",
+            c.entries[0].asserts
+        );
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("test script was dropped")),
+            "and the user is told, so they can assert it by hand: {:?}",
+            c.notes
+        );
+    }
+
+    /// A collection whose scripts pick the next request does not do the same
+    /// thing run top to bottom, and every request in it still looks right.
+    ///
+    /// A *guarded* jump is the "only sometimes" case, which neither file order
+    /// nor a PaperTrail flow can express.
+    #[test]
+    fn a_script_choosing_the_next_request_is_reported_as_lost_order() {
+        let notes = next_request_notes(
+            "x",
+            "if (pm.response.code === 202) pm.execution.setNextRequest('poll');",
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("sometimes jumped to `poll`") && d.contains("file order")),
+            "{notes:?}"
+        );
+    }
+
+    /// The four shapes are four different problems. Lumping them into one note
+    /// sent the reader looking for the wrong fix — most of all for a polling
+    /// loop, which Hurl expresses directly and which the old note never
+    /// mentioned.
+    #[test]
+    fn a_request_that_reran_itself_is_named_as_a_polling_loop() {
+        let notes = next_request_notes(
+            "get_result",
+            "if (!done) { pm.execution.setNextRequest('get_result'); }",
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("polling loop") && d.contains("retry")),
+            "{notes:?}"
+        );
+    }
+
+    /// An unconditional jump *is* an order, and an order is the one thing here
+    /// that can be written down — so the note says where.
+    #[test]
+    fn an_unconditional_jump_is_reported_as_an_order_to_write_down() {
+        let notes = next_request_notes("submit", "pm.execution.setNextRequest('get_result');");
+        assert!(
+            notes
+                .iter()
+                .any(|d| d.contains("always ran `get_result` next") && d.contains("PaperTrail")),
+            "{notes:?}"
+        );
+    }
+
+    /// `setNextRequest(null)` ends the run. On import the requests after it
+    /// start running, which is a behaviour change in the direction of doing
+    /// *more*, so it is worth its own sentence.
+    #[test]
+    fn stopping_the_run_is_reported_as_the_requests_after_it_now_running() {
+        let notes = next_request_notes("x", "pm.execution.setNextRequest(null);");
+        assert!(
+            notes.iter().any(|d| d.contains("stopped the run here")),
+            "{notes:?}"
+        );
+    }
+
+    /// A name built at run time isn't in the file at all, so there is nothing
+    /// to reorder — a different problem from a jump to a name we can see.
+    #[test]
+    fn a_computed_next_request_name_is_reported_as_not_being_in_the_file() {
+        let notes = next_request_notes("x", "pm.execution.setNextRequest('Test Case ' + (n + 1));");
+        assert!(
+            notes.iter().any(|d| d.contains("worked out as it ran")),
+            "{notes:?}"
+        );
+    }
+
+    /// The old note fired once per script; these fire once per distinct shape,
+    /// so a loop written twice doesn't read as two findings.
+    #[test]
+    fn the_same_jump_twice_is_one_note() {
+        let notes = next_request_notes(
+            "x",
+            "pm.execution.setNextRequest('a');\npm.execution.setNextRequest('a');",
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+    }
+
+    /// Postman documents `$randomAlphaNumeric` as *one* character. Left
+    /// unclaimed it became a variable the user had to supply, on a request that
+    /// otherwise ran on import.
+    #[test]
+    fn random_alpha_numeric_is_computed_rather_than_left_to_be_supplied() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","request":{"method":"GET","url":"https://h/x?c={{$randomAlphaNumeric}}"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0].generators.contains(&(
+                "randomAlphaNumeric".to_string(),
+                "random_alnum(1)".to_string()
+            )),
+            "{:?}",
+            c.entries[0].generators
+        );
+    }
+
+    /// The `pm.variables.replaceIn` table used to be a second, hand-kept copy
+    /// of the same list, so a name added to one was silently absent from the
+    /// other.
+    #[test]
+    fn replace_in_claims_the_same_names_as_a_plain_placeholder() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('c', pm.variables.replaceIn('{{$randomAlphaNumeric}}'));"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0]
+                .generators
+                .contains(&("c".to_string(), "random_alnum(1)".to_string())),
+            "{:?}",
+            c.entries[0].generators
+        );
+    }
+
+    // ── Deep equality ──────────────────────────────────────────────────
+
+    /// `.to.eql({…})` is an ordinary Postman assertion and its argument is not
+    /// a scalar, so the whole test used to be dropped. Hurl has no predicate
+    /// that takes a document, so it is spelled out one leaf at a time — which
+    /// also makes the failure name the field that differed.
+    #[test]
+    fn a_deep_equality_against_an_object_becomes_one_assert_per_leaf() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' }); });",
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.user.id\" == 7".to_string()),
+            "{asserts:?}"
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.user.name\" == \"Ada\"".to_string()),
+            "{asserts:?}"
+        );
+    }
+
+    /// An array's length is pinned as well as its elements: per-index asserts
+    /// alone pass on a longer list that happens to start the same way, which is
+    /// not what a deep equality says.
+    #[test]
+    fn a_deep_equality_against_an_array_pins_its_length_too() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().ids).to.eql([1, 2]); });",
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.ids\" count == 2".to_string()),
+            "{asserts:?}"
+        );
+        assert!(
+            asserts.contains(&"jsonpath \"$.ids[0]\" == 1".to_string()),
+            "{asserts:?}"
+        );
+    }
+
+    /// A literal holding a variable says nothing the file can be checked
+    /// against, and half a deep equality is an assertion nobody wrote — so it
+    /// is dropped whole and noted, not partly imported.
+    #[test]
+    fn a_deep_equality_holding_an_expression_is_not_half_imported() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.eql({ id: expectedId }); });",
+        );
+        assert!(asserts.is_empty(), "{asserts:?}");
+    }
+
+    /// Chai's `.to.equal` on an object is *reference* equality, which two
+    /// separately-parsed documents never satisfy. Importing it as a deep
+    /// equality would quietly change what the test means.
+    #[test]
+    fn a_shallow_equal_against_an_object_is_not_read_as_a_deep_one() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().user).to.equal({ id: 7 }); });",
+        );
+        assert!(asserts.is_empty(), "{asserts:?}");
+    }
+
+    /// `compact` drops whitespace everywhere, including inside string
+    /// literals, so reading a tail off compacted text turned
+    /// `.to.equal("Not Found")` into an assert for `"NotFound"` — one that
+    /// fails on a perfectly correct response.
+    #[test]
+    fn a_space_inside_an_expected_string_survives() {
+        let asserts = asserts_of(
+            "pm.test('t', () => { pm.expect(pm.response.json().msg).to.equal('Not Found'); });",
+        );
+        assert_eq!(
+            asserts,
+            vec!["jsonpath \"$.msg\" == \"Not Found\"".to_string()]
+        );
+    }
+
+    fn asserts_of(script: &str) -> Vec<String> {
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"x","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+               "request":{{"method":"GET","url":"https://h/x"}}}}]}}"#,
+            serde_json::to_string(script).unwrap()
+        );
+        convert_postman(&json).entries[0].asserts.clone()
+    }
+
+    /// The jump lives in the folder's script, but each request also carries a
+    /// test script of its own — so the "does this request have a script?"
+    /// question said the folder's problem belonged to every request under it.
+    /// On the collection this was found in, one folder script produced
+    /// eighteen identical notes.
+    #[test]
+    fn an_inherited_jump_is_reported_once_against_the_folder() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"F","event":[{"listen":"test","script":{"exec":[
+             "pm.execution.setNextRequest('poll');"]}}],
+           "item":[
+             {"name":"a","event":[{"listen":"test","script":{"exec":[
+                "pm.test('t', () => { pm.response.to.have.status(200); });"]}}],
+              "request":{"method":"GET","url":"https://h/a"}},
+             {"name":"b","event":[{"listen":"test","script":{"exec":[
+                "pm.test('t', () => { pm.response.to.have.status(200); });"]}}],
+              "request":{"method":"GET","url":"https://h/b"}}]}]}"#;
+        let c = convert_postman(json);
+        let jumps: Vec<&ConversionNote> = c
+            .notes
+            .iter()
+            .filter(|n| n.detail.contains("`poll`"))
+            .collect();
+        assert_eq!(jumps.len(), 1, "{:?}", c.notes);
+        assert_eq!(jumps[0].item, "F", "filed against the folder that wrote it");
+    }
+
+    fn next_request_notes(title: &str, script: &str) -> Vec<String> {
+        super::next_request_fates(script, title)
+    }
+}
+
+/// Regressions for fourteen defects the Postman importer once had, each of
+/// which either sent or asserted a value the collection never meant, or filed
+/// a loss against the wrong item. Every test asserts the *correct* behaviour
+/// and keeps a negative control alongside it, so a fix that over-corrects fails
+/// here just as surely as one that under-corrects.
+#[cfg(test)]
+mod defect_regressions {
+    use super::*;
+
+    /// Postman treats an environment value as a template and expands it when it
+    /// is used, so `base_url = {{scheme}}://{{host}}` is ordinary there. A
+    /// `.vars` value is not a template and nothing downstream expands one, so
+    /// the reference has to be worked out on the way in -- and a value that was
+    /// *only* a reference used to arrive classified as an unrecognised provider
+    /// reference and shown as unresolved.
+    #[test]
+    fn an_environment_value_referring_to_another_is_worked_out_on_import() {
+        let env = r#"{"values":[
+            {"key":"scheme","value":"https"},
+            {"key":"host","value":"api.example.com"},
+            {"key":"base_url","value":"{{scheme}}://{{host}}/v1"},
+            {"key":"same","value":"{{host}}"},
+            {"key":"secret","value":"{{ op://Vault/api/token }}"}
+        ]}"#;
+        let got = postman_env_values(env).unwrap();
+        let value = |k: &str| {
+            got.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("base_url"), "https://api.example.com/v1");
+        assert_eq!(
+            value("same"),
+            "api.example.com",
+            "a value that is nothing but a reference is the referenced value"
+        );
+        assert_eq!(
+            value("secret"),
+            "{{ op://Vault/api/token }}",
+            "a provider reference is not a variable reference and is left alone"
+        );
+        assert!(postman_env_unresolved_refs(env).is_empty());
+    }
+
+    /// Chains resolve; loops and names this file cannot reach are left visible
+    /// and reported, because an empty string here is a request that goes to the
+    /// wrong place rather than one that plainly fails.
+    #[test]
+    fn a_chain_resolves_and_what_cannot_be_resolved_is_reported() {
+        let env = r#"{"values":[
+            {"key":"a","value":"{{b}}"},
+            {"key":"b","value":"{{c}}"},
+            {"key":"c","value":"end"},
+            {"key":"loop1","value":"{{loop2}}"},
+            {"key":"loop2","value":"{{loop1}}"},
+            {"key":"elsewhere","value":"{{from_the_collection}}/path"}
+        ]}"#;
+        let got = postman_env_values(env).unwrap();
+        let value = |k: &str| {
+            got.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("a"), "end", "a chain is followed to the end");
+        assert!(
+            value("elsewhere").contains("{{from_the_collection}}"),
+            "an unreachable name is left as written: {}",
+            value("elsewhere")
+        );
+        let unresolved: Vec<String> = postman_env_unresolved_refs(env)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            unresolved.contains(&"elsewhere".to_string()),
+            "{unresolved:?}"
+        );
+        assert!(
+            unresolved.contains(&"loop1".to_string()) && unresolved.contains(&"loop2".to_string()),
+            "a loop settles rather than spinning, and says so: {unresolved:?}"
+        );
+    }
+
+    fn j(s: &str) -> String {
+        s.lines()
+            .map(|l| serde_json::to_string(l).unwrap())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// One request with an optional `prerequest` and/or `test` script, a URL
+    /// and a title (the breadcrumb Postman would address it by).
+    fn conv(pre: &str, test: &str, url: &str, title: &str) -> ConvertedCollection {
+        let mut ev = Vec::new();
+        if !pre.is_empty() {
+            ev.push(format!(
+                r#"{{"listen":"prerequest","script":{{"exec":[{}]}}}}"#,
+                j(pre)
+            ));
+        }
+        if !test.is_empty() {
+            ev.push(format!(
+                r#"{{"listen":"test","script":{{"exec":[{}]}}}}"#,
+                j(test)
+            ));
+        }
+        convert_postman(&format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"{title}","event":[{}],"request":{{"method":"GET","url":"{url}"}}}}]}}"#,
+            ev.join(",")
+        ))
+    }
+
+    // P1 — an `if` inside a `function () {}` test callback is conditional.
+    #[test]
+    fn a_guard_inside_a_function_test_callback_is_not_hoisted() {
+        let c = conv(
+            "",
+            "pm.test('t', function () {\n  if (jsonData.ok) {\n    pm.expect(jsonData.name).to.equal('Ada');\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "guarded assert hoisted: {:?}",
+            c.entries[0].asserts
+        );
+        // A guarded status line is likewise not adopted.
+        let st = conv(
+            "",
+            "pm.test('t', function () {\n  if (ok) {\n    pm.response.to.have.status(500);\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(st.entries[0].expected_status, None);
+        // And a guarded jump reads as a sometimes-jump, not an always-jump.
+        let nx = conv(
+            "",
+            "pm.test('t', function () {\n  if (bad) {\n    postman.setNextRequest('Retry');\n  }\n});",
+            "https://h/x",
+            "Login",
+        );
+        assert!(
+            nx.notes
+                .iter()
+                .any(|n| n.detail.contains("sometimes jumped to `Retry`")),
+            "{:?}",
+            nx.notes
+        );
+        // Control: a plain `function () {}` callback body is still taken — the
+        // fix must narrow, not disable, callback detection.
+        let plain = conv(
+            "",
+            "pm.test('t', function () {\n  pm.expect(jsonData.name).to.equal('Ada');\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            plain.entries[0].asserts,
+            vec!["jsonpath \"$.name\" == \"Ada\"".to_string()]
+        );
+        // Control: the arrow spelling of the same guard was always refused.
+        let arrow = conv(
+            "",
+            "pm.test('t', () => {\n  if (jsonData.ok) {\n    pm.expect(jsonData.name).to.equal('Ada');\n  }\n});",
+            "https://h/x",
+            "x",
+        );
+        assert!(arrow.entries[0].asserts.is_empty());
+    }
+
+    // P2 — a brace-less guard split over two lines is still a guard.
+    #[test]
+    fn a_brace_less_guard_split_across_lines_is_still_conditional() {
+        let c = conv(
+            "",
+            "if (jsonData.ok)\n    pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "{:?}",
+            c.entries[0].asserts
+        );
+        let e = conv(
+            "",
+            "if (jsonData.ok) {\n} else\n  pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            e.entries[0].asserts.is_empty(),
+            "{:?}",
+            e.entries[0].asserts
+        );
+        let f = conv(
+            "",
+            "for (const x of jsonData.items)\n  pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            f.entries[0].asserts.is_empty(),
+            "{:?}",
+            f.entries[0].asserts
+        );
+        // Control: an ordinary statement after a newline is still taken.
+        let ok = conv(
+            "",
+            "const a = 1;\npm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].asserts,
+            vec!["jsonpath \"$.name\" == \"Ada\"".to_string()]
+        );
+        // Control: the same guard on one line was always refused.
+        let one = conv(
+            "",
+            "if (jsonData.ok) pm.expect(jsonData.name).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert!(one.entries[0].asserts.is_empty());
+    }
+
+    // P3 — `unquote` accepts one string, never a concatenation.
+    #[test]
+    fn a_string_concatenation_is_not_read_as_one_string() {
+        assert_eq!(unquote("'Not' + ' ' + 'Found'"), None);
+        assert_eq!(unquote("'Found'"), Some("Found"));
+        assert_eq!(unquote("'it\\'s'"), Some("it\\'s"));
+        // The concatenated predicate is declined, not asserted as a wrong value.
+        let a = conv(
+            "",
+            "pm.expect(jsonData.name).to.equal('Not' + ' ' + 'Found');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            a.entries[0].asserts.is_empty(),
+            "{:?}",
+            a.entries[0].asserts
+        );
+        assert!(a.notes.iter().any(|n| n.detail.contains("dropped")));
+        // A concatenated `[Gen]` value — actually *sent* — is declined too.
+        let g = conv(
+            "pm.environment.set('key', 'abc' + '-' + 'def');",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "{:?}",
+            g.entries[0].generators
+        );
+        // Control: a plain quoted value still converts.
+        let ok = conv(
+            "pm.environment.set('key', 'abcdef');",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("key".to_string(), "\"abcdef\"".to_string())]
+        );
+    }
+
+    // P4 — a space inside a quoted subject key or header name survives.
+    #[test]
+    fn a_space_in_a_subject_key_or_header_name_survives() {
+        let k = conv(
+            "",
+            "pm.expect(jsonData['full name']).to.equal('Ada');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            k.entries[0].asserts,
+            vec!["jsonpath \"$['full name']\" == \"Ada\"".to_string()]
+        );
+        let h = conv(
+            "",
+            "pm.expect(pm.response.headers.get('X Weird')).to.equal('a');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            h.entries[0].asserts,
+            vec!["header \"X Weird\" == \"a\"".to_string()]
+        );
+        // Control: the predicate side already kept its spaces.
+        let p = conv(
+            "",
+            "pm.expect(jsonData.msg).to.equal('Not Found');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            p.entries[0].asserts,
+            vec!["jsonpath \"$.msg\" == \"Not Found\"".to_string()]
+        );
+    }
+
+    // P5 — a capture over `pm.response.json()` is actually captured, not marked
+    // covered and silently lost.
+    #[test]
+    fn a_capture_over_response_json_is_captured_not_lost() {
+        let c = conv(
+            "",
+            "pm.test('ok', function () { pm.response.to.have.status(200); });\npm.environment.set('token', pm.response.json().token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+        assert_eq!(c.entries[0].expected_status, Some(200));
+        // Coverage and conversion cannot diverge: what is covered here really is
+        // a capture, so the note counts it.
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("[Captures]")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    /// The sandbox `pm.` replaced. A collection written against it and left
+    /// alone since -- which is most of what there is to import -- had every one
+    /// of its captures dropped, and the note said the script had nothing left
+    /// in it.
+    #[test]
+    fn the_older_postman_api_still_becomes_captures() {
+        let c = conv(
+            "",
+            "var jsonData = JSON.parse(responseBody);\npostman.setEnvironmentVariable('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    /// `JSON.parse(responseBody)` is the older spelling of
+    /// `pm.response.json()`, and a script is free to give it any name it likes.
+    #[test]
+    fn a_legacy_body_variable_under_any_name_is_a_root() {
+        let c = conv(
+            "",
+            "var body = JSON.parse(responseBody);\npostman.setEnvironmentVariable('id', body.user.id);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("id".to_string(), "jsonpath \"$.user.id\"".to_string())]
+        );
+    }
+
+    /// A name standing for part of the body is an ordinary way to write a
+    /// script against a response that nests everything one level down; every
+    /// call through one used to be dropped as unreadable.
+    #[test]
+    fn a_name_standing_for_part_of_the_body_is_a_root_too() {
+        let c = conv(
+            "",
+            "const body = pm.response.json();\nconst data = body.data;\nconst first = data.items[0];\npm.environment.set('id', first.id);\npm.environment.set('total', data.total);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![
+                (
+                    "id".to_string(),
+                    "jsonpath \"$.data.items[0].id\"".to_string()
+                ),
+                ("total".to_string(), "jsonpath \"$.data.total\"".to_string()),
+            ]
+        );
+    }
+
+    /// Two declarations of one name mean two different things at two points in
+    /// the script, and the text alone cannot say which applies where. Answering
+    /// anyway would capture from the wrong part of the body.
+    #[test]
+    fn a_name_declared_twice_is_not_treated_as_a_root() {
+        let c = conv(
+            "",
+            "const body = pm.response.json();\nconst d = body.a;\nconst d = body.b;\npm.environment.set('id', d.id);",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "an ambiguous name was resolved anyway: {:?}",
+            c.entries[0].captures
+        );
+    }
+
+    // P6 — `[Gen]` rows and `[Captures]` are only taken from unconditional code.
+    #[test]
+    fn a_conditional_generator_or_capture_is_left_as_residue() {
+        let g = conv(
+            "if (!pm.environment.get('id')) { pm.environment.set('id', require('uuid').v4()); }",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "guarded set-once became an unconditional row: {:?}",
+            g.entries[0].generators
+        );
+        assert!(g.notes.iter().any(|n| n.detail.contains("dropped")));
+        let e = conv(
+            "if (a) {\n  pm.environment.set('id', 1);\n} else {\n  pm.environment.set('id', 2);\n}",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            e.entries[0].generators.is_empty(),
+            "an if/else silently picked a branch: {:?}",
+            e.entries[0].generators
+        );
+        let c = conv(
+            "",
+            "if (pm.response.code === 200) {\n  pm.environment.set('token', jsonData.token);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "a guarded capture would error whenever the guard was not taken: {:?}",
+            c.entries[0].captures
+        );
+        assert!(c.notes.iter().any(|n| n.detail.contains("dropped")));
+        // Controls: the unconditional forms still convert.
+        let okg = conv(
+            "pm.environment.set('id', require('uuid').v4());",
+            "",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            okg.entries[0].generators,
+            vec![("id".to_string(), "uuid".to_string())]
+        );
+        let okc = conv(
+            "",
+            "pm.environment.set('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            okc.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    // P7 — a capture name Hurl cannot carry is refused, not written and later
+    // silently deleted.
+    #[test]
+    fn an_invalid_capture_name_is_refused() {
+        let c = conv(
+            "",
+            "pm.environment.set('my token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].captures.is_empty(),
+            "{:?}",
+            c.entries[0].captures
+        );
+        assert!(c.notes.iter().any(|n| n.detail.contains("dropped")));
+        let hurl = crate::hurl::collection_to_hurl(&c.entries);
+        assert!(
+            !hurl.contains("my token: jsonpath"),
+            "an invalid name was written into the file: {hurl}"
+        );
+        assert_eq!(crate::hurl::parse_hurl(&hurl).len(), 1);
+        // Control: a valid name is captured.
+        let ok = conv(
+            "",
+            "pm.environment.set('token', jsonData.token);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].captures,
+            vec![("token".to_string(), "jsonpath \"$.token\"".to_string())]
+        );
+    }
+
+    // P8 — a dynamic variable does not fold onto an existing, differing `[Gen]`
+    // row and take its value.
+    #[test]
+    fn a_dynamic_variable_does_not_reuse_a_differing_gen_row() {
+        let c = conv(
+            "pm.environment.set('timestamp', Date.now());",
+            "",
+            "https://h/x?t={{$timestamp}}",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].generators,
+            vec![
+                ("timestamp".to_string(), "timestamp_ms".to_string()),
+                ("timestamp_1".to_string(), "timestamp".to_string()),
+            ]
+        );
+        assert_eq!(c.entries[0].url, "https://h/x?t={{timestamp_1}}");
+        assert!(
+            c.notes.iter().any(|n| n
+                .detail
+                .contains("computed by this request's `[Gen]` block as `timestamp`")),
+            "{:?}",
+            c.notes
+        );
+        // Control: with no clash, the natural name is used.
+        let ok = conv("", "", "https://h/x?t={{$timestamp}}", "x");
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("timestamp".to_string(), "timestamp".to_string())]
+        );
+        assert_eq!(ok.entries[0].url, "https://h/x?t={{timestamp}}");
+    }
+
+    // P9 — a brace inside a regex literal does not shift the block stack.
+    #[test]
+    fn a_brace_in_a_regex_literal_does_not_shift_the_block_stack() {
+        let c = conv(
+            "",
+            "if (bad) {\n    const m = pm.response.text().match(/\\{([^}]*)\\}/);\n    pm.expect(jsonData.a).to.equal(1);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "the extra `}}` popped the if and hoisted a guarded assert: {:?}",
+            c.entries[0].asserts
+        );
+        // The mirror: an unmatched `{` in a folder script must not hide the
+        // request's own assertions.
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"F","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                "item":[{{"name":"r","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                  "request":{{"method":"GET","url":"https://h/x"}}}}]}}]}}"#,
+            j("const re = /\\{/;"),
+            j("pm.expect(jsonData.a).to.equal(1);")
+        );
+        let f = convert_postman(&json);
+        assert_eq!(
+            f.entries[0].asserts,
+            vec!["jsonpath \"$.a\" == 1".to_string()]
+        );
+        // Control: a `/` that is really division is not read as a regex.
+        let d = conv(
+            "",
+            "const half = total / 2;\nif (bad) {\n  pm.expect(jsonData.a).to.equal(1);\n}",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            d.entries[0].asserts.is_empty(),
+            "{:?}",
+            d.entries[0].asserts
+        );
+    }
+
+    // P10 — a number Hurl's grammar cannot read is not asserted or emitted.
+    #[test]
+    fn a_number_hurl_cannot_read_is_declined() {
+        for src in ["1e3", ".5", "Infinity", "NaN"] {
+            let c = conv(
+                "",
+                &format!("pm.expect(jsonData.a).to.equal({src});"),
+                "https://h/x",
+                "x",
+            );
+            assert!(
+                c.entries[0].asserts.is_empty(),
+                "{src} was asserted: {:?}",
+                c.entries[0].asserts
+            );
+        }
+        // Controls: ordinary numbers still convert and read back.
+        for (src, line) in [
+            ("200", "jsonpath \"$.a\" == 200"),
+            ("1.5", "jsonpath \"$.a\" == 1.5"),
+            ("-3", "jsonpath \"$.a\" == -3"),
+        ] {
+            let c = conv(
+                "",
+                &format!("pm.expect(jsonData.a).to.equal({src});"),
+                "https://h/x",
+                "x",
+            );
+            assert_eq!(c.entries[0].asserts, vec![line.to_string()], "{src}");
+            let back = crate::hurl::parse_hurl(&crate::hurl::collection_to_hurl(&c.entries));
+            assert_eq!(back[0].asserts, c.entries[0].asserts, "{src} round-trips");
+        }
+        // The generator side: an unreadable number is declined, and every row
+        // the importer does emit passes `generators::check`.
+        let g = conv("pm.environment.set('n', 1e3);", "", "https://h/x", "x");
+        assert!(
+            g.entries[0].generators.is_empty(),
+            "{:?}",
+            g.entries[0].generators
+        );
+        let ok = conv("pm.environment.set('n', 5);", "", "https://h/x", "x");
+        assert_eq!(
+            ok.entries[0].generators,
+            vec![("n".to_string(), "5".to_string())]
+        );
+        assert!(crate::generators::check(&ok.entries[0].generators).is_empty());
+    }
+
+    // P11 — a second, differing expected status is kept as residue, not
+    // silently discarded.
+    #[test]
+    fn a_second_differing_status_is_noted_not_dropped_silently() {
+        let c = conv(
+            "",
+            "pm.test('a', () => { pm.response.to.have.status(200); });\npm.test('b', () => { pm.expect(pm.response.code).to.equal(201); });",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(c.entries[0].expected_status, Some(200));
+        assert!(
+            c.notes
+                .iter()
+                .any(|n| n.detail.contains("the rest of it was dropped")),
+            "the losing status left no note: {:?}",
+            c.notes
+        );
+        // Control: a second *matching* status is not residue.
+        let ok = conv(
+            "",
+            "pm.test('a', () => { pm.response.to.have.status(200); });\npm.test('b', () => { pm.expect(pm.response.code).to.equal(200); });",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(ok.entries[0].expected_status, Some(200));
+        assert!(
+            !ok.notes
+                .iter()
+                .any(|n| n.detail.contains("the rest of it was dropped")),
+            "{:?}",
+            ok.notes
+        );
+    }
+
+    // P12 — an inherited script's losses are filed against the folder that
+    // wrote them, not the request that only inherits them.
+    #[test]
+    fn a_folder_scripts_residue_is_filed_against_the_folder() {
+        let json = format!(
+            r#"{{"info":{{"name":"d","schema":"x"}},"item":[
+              {{"name":"F","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                "item":[{{"name":"r","event":[{{"listen":"test","script":{{"exec":[{}]}}}}],
+                  "request":{{"method":"GET","url":"https://h/x"}}}}]}}]}}"#,
+            j("const t = pm.environment.get('x');\npm.cookies.clear();"),
+            j("pm.test('t', () => { pm.expect(jsonData.a).to.equal(1); });")
+        );
+        let c = convert_postman(&json);
+        assert_eq!(c.notes.len(), 2, "{:?}", c.notes);
+        // The request's own note is clean — its script converted completely.
+        let req = c
+            .notes
+            .iter()
+            .find(|n| n.item == "F/r")
+            .expect("request note missing");
+        assert!(
+            req.detail
+                .contains("this request's test script became 1 [Asserts]"),
+            "{:?}",
+            req
+        );
+        assert!(
+            !req.detail.contains("the rest of it was dropped"),
+            "the folder's loss was blamed on the request: {:?}",
+            req
+        );
+        // The folder's own loss is filed against the folder.
+        let folder = c
+            .notes
+            .iter()
+            .find(|n| n.item == "F")
+            .expect("folder note missing");
+        assert!(
+            folder
+                .detail
+                .contains("this folder's test script was dropped"),
+            "{:?}",
+            folder
+        );
+    }
+
+    // P13 — a `{{` in an assert literal is refused, not read back as a Hurl
+    // template.
+    #[test]
+    fn a_template_looking_literal_is_not_asserted() {
+        let c = conv(
+            "",
+            "pm.expect(jsonData.a).to.equal('id {{x}} here');",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            c.entries[0].asserts.is_empty(),
+            "{:?}",
+            c.entries[0].asserts
+        );
+        let d = conv(
+            "",
+            "pm.expect(jsonData).to.eql({ a: 'x {{y}} z' });",
+            "https://h/x",
+            "x",
+        );
+        assert!(
+            d.entries[0].asserts.is_empty(),
+            "{:?}",
+            d.entries[0].asserts
+        );
+        // Control: an ordinary string is asserted.
+        let ok = conv(
+            "",
+            "pm.expect(jsonData.a).to.equal('plain');",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            ok.entries[0].asserts,
+            vec!["jsonpath \"$.a\" == \"plain\"".to_string()]
+        );
+    }
+
+    // P14 — a capture name defined twice keeps only the last write, as the
+    // generator path does — not two rows the file cannot hold.
+    #[test]
+    fn a_capture_name_defined_twice_keeps_only_the_last() {
+        let c = conv(
+            "",
+            "pm.environment.set('id', jsonData.a);\npm.environment.set('id', jsonData.b);",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(
+            c.entries[0].captures,
+            vec![("id".to_string(), "jsonpath \"$.b\"".to_string())]
+        );
+        assert!(
+            c.notes.iter().any(|n| n.detail.contains("1 [Captures]")),
+            "{:?}",
+            c.notes
+        );
+    }
+
+    /// Controls that must keep converting correctly — if any of these changes,
+    /// a fix has over-reached.
+    #[test]
+    fn controls_still_convert_correctly() {
+        let a = conv(
+            "",
+            "pm.test('t', () => {\n  pm.expect(pm.response.code).to.equal(400);\n  pm.expect(pm.response.json()).to.eql({ Message: 'The request is invalid.', ModelState: { 'body.Image': ['too big',] } });\n});",
+            "https://h/x",
+            "x",
+        );
+        assert_eq!(a.entries[0].expected_status, Some(400));
+        assert_eq!(
+            a.entries[0].asserts,
+            vec![
+                "jsonpath \"$.Message\" == \"The request is invalid.\"".to_string(),
+                "jsonpath \"$.ModelState['body.Image']\" count == 1".to_string(),
+                "jsonpath \"$.ModelState['body.Image'][0]\" == \"too big\"".to_string(),
+            ]
+        );
+        // A helper called from top level is still conditional (only a `pm.test`
+        // callback body is unconditional).
+        let helper = conv(
+            "",
+            "const check = (b) => { pm.expect(b.a).to.equal('one'); };\ncheck(jsonData);",
+            "https://h/x",
+            "x",
+        );
+        assert!(helper.entries[0].asserts.is_empty());
+        // Chai `.to.equal` on an object is reference equality, never a deep one.
+        let equal_obj = conv(
+            "",
+            "pm.expect(jsonData).to.equal({ a: 1 });",
+            "https://h/x",
+            "x",
+        );
+        assert!(equal_obj.entries[0].asserts.is_empty());
+        // `.to.eql({})` asserts nothing about the body, so it is left as residue.
+        let empty_obj = conv("", "pm.expect(jsonData).to.eql({});", "https://h/x", "x");
+        assert!(empty_obj.entries[0].asserts.is_empty());
+        assert!(
+            empty_obj
+                .notes
+                .iter()
+                .any(|n| n.detail.contains("nothing in it reduced"))
         );
     }
 }

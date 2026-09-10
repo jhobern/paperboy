@@ -35,12 +35,26 @@ macro_rules! strings {
                     Language::Danish => Self { $($field: $da,)* },
                 }
             }
+
+            /// Every row of the table, as (name, English, French, Danish), so a
+            /// test can hold the whole table to a rule. There is no other way
+            /// to look at every string: the table is a struct of fields, and a
+            /// rule checked "wherever someone remembered" is not checked.
+            #[cfg(test)]
+            pub fn table() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+                vec![$((stringify!($field), $en, $fr, $da),)*]
+            }
         }
     };
 }
 
+/// The application's own name. Not a `Strings` row: it is the same word in
+/// every language, and the terminal window title is set before a language is
+/// known.
+pub const APP_NAME: &str = "PaperBoy";
+
 strings! {
-    app_heading => "🦀 PaperBoy", "🦀 PaperBoy", "🦀 PaperBoy";
+    app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
     response_heading => "Response", "Réponse", "Svar";
@@ -84,6 +98,7 @@ strings! {
     theme_c_err => "Error", "Erreur", "Fejl";
     theme_c_subst => "Substitution", "Substitution", "Substitution";
     theme_c_pending => "Pending", "En attente", "Afventer";
+    theme_c_generated => "Generated", "Généré", "Genereret";
     theme_c_select_bg => "Selection bg", "Sélection fond", "Markering bg";
     theme_c_select_fg => "Selection text", "Sélection texte", "Markering tekst";
     theme_c_field => "Field background", "Fond des champs", "Feltbaggrund";
@@ -231,9 +246,9 @@ strings! {
     invalid_hurl_prefix => "Not valid Hurl —", "Hurl invalide —", "Ikke gyldig Hurl —";
     status_copy_key => "^y", "^y", "^y";
     status_copy_hint => "copy", "copier", "kopiér";
+    gui_status_copy_hint => "Click to copy this message", "Cliquez pour copier ce message", "Klik for at kopiere denne besked";
     invalid_request_json => "Not valid Request JSON (expected an object with at least \"method\" and \"url\"); edit and try again.", "JSON de requête invalide (un objet avec au moins « method » et « url » est attendu) ; modifiez et réessayez.", "Ikke gyldig anmodnings-JSON (forventede et objekt med mindst \"method\" og \"url\"); ret og prøv igen.";
     no_requests_hint => "No requests yet \u{2014} press n to create one.", "Aucune requête \u{2014} appuyez sur n pour en créer une.", "Ingen anmodninger endnu \u{2014} tryk på n for at oprette en.";
-    list_up_row => "‹ .. (up a folder)", "‹ .. (dossier parent)", "‹ .. (mappe op)";
     new_request => "\u{FF0B} New Request", "\u{FF0B} Nouvelle requête", "\u{FF0B} Ny anmodning";
     edit_request => "\u{270E} Edit Request", "\u{270E} Modifier la requête", "\u{270E} Rediger anmodning";
     field_name => "Name", "Nom", "Navn";
@@ -249,6 +264,7 @@ strings! {
     field_asserts => "Asserts", "Assertions", "Assertions";
     field_captures => "Captures", "Captures", "Captures";
     field_reports => "Reports", "Rapports", "Rapporter";
+    field_generated => "Generated", "Généré", "Genereret";
     tab_all => "All", "Tout", "Alle";
     hdr_key => "Key", "Clé", "Nøgle";
     hdr_value => "Value", "Valeur", "Værdi";
@@ -285,10 +301,14 @@ strings! {
     add_assert => "\u{FF0B} Add assert", "\u{FF0B} Ajouter une assertion", "\u{FF0B} Tilføj assertion";
     add_capture => "\u{FF0B} Add capture", "\u{FF0B} Ajouter une capture", "\u{FF0B} Tilføj capture";
     add_report => "\u{FF0B} Add report field", "\u{FF0B} Ajouter un champ de rapport", "\u{FF0B} Tilføj rapportfelt";
+    add_generated => "\u{FF0B} Add generated value", "\u{FF0B} Ajouter une valeur générée", "\u{FF0B} Tilføj genereret værdi";
     cap_name => "Name", "Nom", "Navn";
     cap_expr => "Expression", "Expression", "Udtryk";
     report_name => "Name", "Nom", "Navn";
     report_expr => "Expression", "Expression", "Udtryk";
+    generated_name => "Name", "Nom", "Navn";
+    generated_expr => "Expression", "Expression", "Udtryk";
+    generated_fn_hint => "Expression   (Enter list functions)", "Expression   (Entrée lister les fonctions)", "Udtryk   (Enter vis funktioner)";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";
@@ -423,6 +443,7 @@ strings! {
     subst_hint_loading => "loading", "en cours", "indlæser";
     subst_hint_missing => "missing", "manquant", "mangler";
     subst_hint_undefined => "undefined", "non défini", "udefineret";
+    subst_hint_generated => "generated", "généré", "genereret";
     env_undefined_vars => "⚠ Sent with undefined variables:", "⚠ Envoyé avec des variables non définies :", "⚠ Sendt med udefinerede variabler:";
     env_undefined_in_loaded_env => "— defined in {envs}, which is loaded but neither active nor linked. Activate or link it in the Environments panel.", "— définies dans {envs}, qui est chargé mais ni actif ni lié. Activez-le ou liez-le dans le panneau Environnements.", "— defineret i {envs}, som er indlæst, men hverken aktivt eller tilknyttet. Aktivér eller tilknyt det i Miljøer-panelet.";
     gui_undefined_banner_one => "1 variable in this request is undefined", "1 variable de cette requête n'est pas définie", "1 variabel i denne anmodning er udefineret";
@@ -443,9 +464,12 @@ strings! {
     foot_close => "delete", "supprimer", "fjern";
     foot_copy_selection => "copy", "copier", "kopiér";
     foot_compact => "compact", "compact", "kompakt";
+    foot_probe => "assert/capture", "vérifier/capturer", "kontrollér/opsaml";
     foot_response_section => "section", "section", "sektion";
     foot_help => "help", "aide", "hjælp";
     foot_quit => "quit", "quitter", "afslut";
+    foot_meta_show => "show details", "afficher les détails", "vis detaljer";
+    foot_meta_hide => "hide details", "masquer les détails", "skjul detaljer";
     help_title => "Help", "Aide", "Hjælp";
     help_heading => "PaperBoy — Terminal UI", "PaperBoy — Interface Terminal", "PaperBoy — Terminalgrænseflade";
     help_tab_shortcuts => "Shortcuts", "Raccourcis", "Genveje";
@@ -494,6 +518,7 @@ strings! {
     help_raw_json => "edit selected request in Raw Mode (JSON text)", "modifier la requête sélectionnée en mode brut (texte JSON)", "rediger den valgte anmodning i råtilstand (JSON-tekst)";
     help_new => "new request (or add variable, in the environment popup)", "nouvelle requête (ou ajouter une variable, dans la popup d'environnement)", "ny anmodning (eller tilføj variabel, i miljø-popup'en)";
     help_base_url => "edit default new-request URL", "modifier l'URL par défaut des nouvelles requêtes", "rediger standard-URL for nye anmodninger";
+    help_fold_meta => "show/hide the captures, asserts and generated values above the request", "afficher/masquer les captures, assertions et valeurs générées au-dessus de la requête", "vis/skjul anmodningens optagelser, kontroller og genererede værdier";
     help_menus => "File / Settings menu", "menu Fichier / Paramètres", "Fil- / Indstillinger-menu";
     help_save_active => "save what's on screen (report, else collection)", "enregistrer ce qui est à l'écran (rapport, sinon collection)", "gem det viste (rapport, ellers samling)";
     help_workspace_browse => "Browse Workspace (choose a collection file)", "Parcourir le Workspace (choisir un fichier de collection)", "Gennemse Workspace (vælg en samlingsfil)";
@@ -532,10 +557,11 @@ strings! {
     foot_find_request => "find request", "chercher requête", "find forespørgsel";
     help_find_request => "find a request anywhere in the collection — or any row of a workspace tree (Esc clears it)", "chercher une requête dans toute la collection — ou n'importe quelle ligne d'un arbre d'espace de travail (Échap l'efface)", "find en forespørgsel hvor som helst i samlingen — eller en vilkårlig række i et arbejdsområdetræ (Esc rydder det)";
     help_row_toggle_delete => "in wizard tables: ^E toggle row enabled, ^D delete row", "dans les tableaux : ^E activer/désactiver la ligne, ^D supprimer la ligne", "i guidens tabeller: ^E slå række til/fra, ^D slet række";
+    help_text_undo => "undo / redo in the focused text field (^Z / ^Shift+Z)", "annuler / rétablir dans le champ de texte actif (^Z / ^Maj+Z)", "fortryd / gendan i det aktive tekstfelt (^Z / ^Skift+Z)";
     help_copy_selection => "copy the selection, or the whole panel if nothing is selected (Request JSON / Request Hurl / Response panel)", "copier la sélection, ou tout le panneau si rien n'est sélectionné (panneau JSON de requête / Hurl de requête / réponse)", "kopiér markeringen, eller hele ruden hvis intet er markeret (Request JSON / Request Hurl / Response-rude)";
     help_ctrl_c => "copy the selection; with nothing selected, ask whether to quit", "copier la sélection\u{a0}; si rien n'est sélectionné, demander s'il faut quitter", "kopiér markeringen; hvis intet er markeret, spørg om der skal afsluttes";
     help_compact => "toggle Response compact view (copy still yields the full body)", "basculer l'aperçu compact de la réponse (la copie donne le corps complet)", "slå Response-kompaktvisning til/fra (kopiering giver hele brødteksten)";
-    help_response_section => "step the Response section tabs (Body / Headers); Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); Skift+I går tilbage";
+    help_response_section => "step the Response section tabs (Body / Headers); \u{2190} or Shift+I steps back", "parcourir les onglets de section de la réponse (corps / en-têtes)\u{a0}; \u{2190} ou Maj+I revient en arrière", "gennemgå Response-sektionsfanerne (Body / Headere); \u{2190} eller Skift+I går tilbage";
     help_multi_select => "Alt+Click+Drag adds another selection region (plain click clears all)", "Alt+Clic+Glisser ajoute une autre zone de sélection (un clic simple efface tout)", "Alt+Klik+Træk tilføjer endnu et markeringsområde (almindeligt klik rydder alt)";
     help_save_editor => "save a multi-line editor", "enregistrer un éditeur multi-lignes", "gem en flerlinjet editor";
     help_cancel => "close menu / cancel edit", "fermer le menu / annuler la modification", "luk menu / annuller redigering";
@@ -598,8 +624,8 @@ strings! {
     help_grammar_envs => "loop over environments (BASELINE/COMPARISON to diff)", "boucler sur des environnements (BASELINE/COMPARISON pour comparer)", "gennemløb miljøer (BASELINE/COMPARISON for at sammenligne)";
     help_grammar_baseline_file => "use a saved .baseline snapshot as a role instead of a live env", "utiliser un instantané .baseline enregistré comme rôle au lieu d'un environnement", "brug et gemt .baseline-øjebliksbillede som rolle i stedet for et live-miljø";
     help_grammar_result => "diff column: candidate vs baseline env, per reported field", "colonne de différence : candidat vs référence, par champ rapporté", "forskelskolonne: kandidat vs. reference, pr. rapporteret felt";
-    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 opret · Esc annuller";
-    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-9 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-9 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-9 hop til · ^Enter/F2 gem · Esc annuller";
+    new_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-0 jump · ^Enter/F2 create · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-0 aller à · ^Entrée/F2 créer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-0 hop til · ^Enter/F2 opret · Esc annuller";
+    edit_request_hint => "Tab/arrows move · PgUp/PgDn tab · Alt+1-0 jump · ^Enter/F2 save · Esc cancel", "Tab/flèches se déplacer · PgUp/PgDn onglet · Alt+1-0 aller à · ^Entrée/F2 enregistrer · Échap annuler", "Tab/pile flyt · PgUp/PgDn faneblad · Alt+1-0 hop til · ^Enter/F2 gem · Esc annuller";
     raw_mode_hint => "Edit the raw Hurl text · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le texte Hurl brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå Hurl-tekst · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     raw_json_hint => "Edit the raw JSON · F2/^Enter reparse & save · Esc cancel · Shift+Arrow select · ^Y copy", "Modifiez le JSON brut · F2/^Entrée réanalyser et enregistrer · Échap annuler · Maj+Flèche sélection · ^Y copier", "Rediger den rå JSON · F2/^Enter genfortolk & gem · Esc annuller · Shift+Pil markér · ^Y kopiér";
     ctrl_enter_key => "^Enter", "^Entrée", "^Enter";
@@ -699,6 +725,7 @@ strings! {
     status_file_reverted => "file reverted to last saved:", "fichier rétabli à la dernière sauvegarde :", "fil gendannet til sidst gemte:";
     status_env_reverted => "reverted to last saved:", "rétabli à la dernière sauvegarde :", "gendannet til sidst gemte:";
     status_nothing_to_revert => "Nothing to revert (no saved version or no changes)", "Rien à rétablir (aucune version sauvegardée ou aucune modification)", "Intet at gendanne (ingen gemt version eller ingen ændringer)";
+    status_request_no_saved_version => "This request has no saved version to revert to yet", "Cette requête n'a pas encore de version enregistrée à rétablir", "Denne anmodning har endnu ingen gemt version at gendanne til";
     report_running_indicator => "⏳ Running…", "⏳ En cours…", "⏳ Kører…";
     report_nodes_heading => "Structure", "Structure", "Struktur";
     report_nodes_hint => "a add · Enter configure · e edit line · f File · Del remove · Shift+↑/↓ move · Ctrl+Z undo · Esc source", "a ajouter · Entrée configurer · e modifier la ligne · f Fichier · Suppr retirer · Maj+↑/↓ déplacer · Ctrl+Z annuler · Échap source", "a tilføj · Enter konfigurer · e rediger linje · f Fil · Del fjern · Skift+↑/↓ flyt · Ctrl+Z fortryd · Esc kilde";
@@ -759,6 +786,47 @@ strings! {
     report_setting_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
     report_setting_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
     report_node_config_title => "Configure node", "Configurer le nœud", "Konfigurer node";
+    // The Response pane's "assert this / capture this" palette (`a`). Built
+    // from what the server actually replied, so the wording talks about the
+    // response rather than about Hurl.
+    probe_pick_subject_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
+    probe_pick_header_title => "Which response header?", "Quel en-tête de réponse ?", "Hvilken svar-header?";
+    probe_headers_group => "headers", "en-têtes", "headers";
+    probe_headers_group_count => "{} headers — Enter to list them", "{} en-têtes — Entrée pour les afficher", "{} headers — Enter for at vise dem";
+    probe_pick_verb_title => "What about it?", "Que vérifier ?", "Hvad med det?";
+    probe_menu_hint => "type to filter · Enter choose · Esc cancel", "taper pour filtrer · Entrée choisir · Échap annuler", "skriv for at filtrere · Enter vælg · Esc annuller";
+    probe_verb_hint => "Enter add · Esc back", "Entrée ajouter · Échap retour", "Enter tilføj · Esc tilbage";
+    probe_menu_no_match => "nothing matches what you typed", "rien ne correspond à ce que vous avez tapé", "intet passer til det, du har skrevet";
+    probe_verb_capture => "capture it into a variable for later requests…", "le capturer dans une variable pour les requêtes suivantes…", "opsaml det i en variabel til senere forespørgsler…";
+    probe_verb_unavailable => "(not expressible in Hurl)", "(inexprimable en Hurl)", "(kan ikke udtrykkes i Hurl)";
+    probe_capture_name_title => "Variable name", "Nom de la variable", "Variabelnavn";
+    probe_assert_added => "Assert added:", "Vérification ajoutée :", "Kontrol tilføjet:";
+    probe_status_set => "Expected status set to", "Statut attendu défini à", "Forventet status sat til";
+    probe_capture_added => "Capture added:", "Capture ajoutée :", "Opsamling tilføjet:";
+    probe_no_response => "Send the request first — asserts are built from a response", "Envoyez d’abord la requête — les vérifications se construisent à partir d’une réponse", "Send forespørgslen først — kontroller bygges ud fra et svar";
+    probe_nothing_to_probe => "Nothing in this response can be asserted on", "Rien dans cette réponse ne peut être vérifié", "Intet i dette svar kan kontrolleres";
+    probe_already_there => "That one is already on the request", "Celle-ci est déjà sur la requête", "Den er der allerede på forespørgslen";
+    help_text_probe => "Assert/capture from the response", "Vérifier/capturer depuis la réponse", "Kontrollér/opsaml fra svaret";
+    gui_probe_button => "Assert…", "Vérifier…", "Kontrollér…";
+    gui_probe_button_hint => "Build an assert or a capture from this response", "Construire une vérification ou une capture depuis cette réponse", "Byg en kontrol eller opsamling ud fra dette svar";
+    gui_probe_assert_this => "Assert this…", "Vérifier ceci…", "Kontrollér dette…";
+    gui_probe_title => "Assert or capture from the response", "Vérifier ou capturer depuis la réponse", "Kontrollér eller opsaml fra svaret";
+    gui_probe_back => "‹ Back", "‹ Retour", "‹ Tilbage";
+    gui_probe_add_assert => "Add this check", "Ajouter cette vérification", "Tilføj denne kontrol";
+    gui_probe_add_capture => "Add capture", "Ajouter la capture", "Tilføj opsamling";
+    gui_probe_step_subject => "1. Pick a value from the response", "1. Choisissez une valeur de la réponse", "1. Vælg en værdi fra svaret";
+    gui_probe_step_subject_hint => "The value you pick is highlighted in the response below.", "La valeur choisie est mise en évidence dans la réponse ci-dessous.", "Den valgte værdi fremhæves i svaret nedenfor.";
+    gui_probe_step_verb => "2. Say what should be true about it", "2. Indiquez ce qui doit être vrai à son sujet", "2. Angiv hvad der skal gælde for den";
+    gui_probe_step_verb_hint => "The line you pick is written to this request, and checked every time it runs.", "La ligne choisie est écrite dans cette requête et vérifiée à chaque exécution.", "Den valgte linje skrives til denne forespørgsel og kontrolleres ved hver kørsel.";
+    gui_probe_step_name => "3. Name the variable", "3. Nommez la variable", "3. Navngiv variablen";
+    gui_probe_step_name_hint => "A [Captures] row stores this value when the request runs. Later requests use it as a placeholder.", "Une ligne [Captures] enregistre cette valeur lors de l’exécution. Les requêtes suivantes l’utilisent comme espace réservé.", "En [Captures]-række gemmer værdien, når forespørgslen kører. Senere forespørgsler bruger den som pladsholder.";
+    gui_probe_selected => "Selected", "Sélection", "Valgt";
+    gui_probe_copy_value => "Copy value", "Copier la valeur", "Kopiér værdi";
+    gui_probe_copy_value_hint => "Copy exactly this value from the response", "Copier exactement cette valeur de la réponse", "Kopiér præcis denne værdi fra svaret";
+    gui_probe_next => "Next ›", "Suivant ›", "Næste ›";
+    gui_probe_copy_this => "Copy this value", "Copier cette valeur", "Kopiér denne værdi";
+    gui_probe_filter_hint => "filter by name or value", "filtrer par nom ou valeur", "filtrér efter navn eller værdi";
+    gui_probe_name_required => "Name the variable before adding it.", "Nommez la variable avant de l'ajouter.", "Navngiv variablen, før du tilføjer den.";
     report_node_request_hint => "Space/←→ toggle/cycle · type alias · Enter apply · Esc cancel", "Espace/←→ bascule/défile · saisir l'alias · Entrée appliquer · Échap annuler", "Mellemrum/←→ skift · skriv alias · Enter anvend · Esc annuller";
     report_node_name_label => "Name", "Nom", "Navn";
     report_node_name_none => "pick a request", "choisir une requête", "vælg en forespørgsel";
@@ -843,6 +911,7 @@ strings! {
     gui_sec_cookies => "Cookies", "Cookies", "Cookies";
     gui_sec_options => "Options", "Options", "Indstillinger";
     gui_sec_asserts => "Asserts", "Assertions", "Assertioner";
+    gui_sec_generated => "Generated", "Généré", "Genereret";
     gui_sec_captures => "Captures", "Captures", "Optagelser";
     gui_sec_code => "Raw Request", "Requête brute", "Rå anmodning";
     // The two representations the Raw Request view can show. Both are format
@@ -853,6 +922,36 @@ strings! {
     gui_query_parameters => "Query parameters", "Paramètres de requête", "Forespørgselsparametre";
     body_form_conflict_status => "✖ Not sent — a raw body and form fields can't both be sent:", "✖ Non envoyé — un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble :", "✖ Ikke sendt — en rå brødtekst og formularfelter kan ikke sendes sammen:";
     body_form_conflict_hint => "✖ A raw body and form fields can't both be sent — remove one", "✖ Un corps brut et des champs de formulaire ne peuvent pas être envoyés ensemble — supprimez-en un", "✖ En rå brødtekst og formularfelter kan ikke sendes sammen — fjern det ene";
+    // Hurl reads a variable name as far as the first character outside
+    // `A-Z a-z 0-9 _ -` and silently ignores the rest, so `{{ api.key }}` is
+    // sent as the value of `api`. Named as "sent as" because the point the user
+    // has to grasp is that the text is not what goes on the wire.
+    truncated_placeholder_status => "✖ Not sent — Hurl reads only part of these variable names:", "✖ Non envoyé — Hurl ne lit qu'une partie de ces noms de variables :", "✖ Ikke sendt — Hurl læser kun en del af disse variabelnavne:";
+    truncated_placeholder_hint => "Hurl variable names allow only letters, digits, _ and -", "Les noms de variables Hurl n'acceptent que lettres, chiffres, _ et -", "Hurl-variabelnavne tillader kun bogstaver, cifre, _ og -";
+    // The `# [Gen]` block. Each message names the row it belongs to, because a
+    // request may declare several and "one of them is wrong" is not a report.
+    gen_status => "⚠ Generated values not set:", "⚠ Valeurs générées non définies :", "⚠ Genererede værdier ikke angivet:";
+    gen_err_empty => "{row}: needs an expression", "{row} : nécessite une expression", "{row}: mangler et udtryk";
+    gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
+    gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
+    gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
+    gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
+    gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
+    gen_err_failed_dep => "{row}: {reference} above it could not be worked out", "{row} : {reference} au-dessus n'a pas pu être calculé", "{row}: {reference} ovenover kunne ikke beregnes";
+    gen_err_cascade_one => "1 further row below it could not be worked out either", "1 ligne supplémentaire en dessous n'a pas pu être calculée non plus", "1 yderligere række nedenunder kunne heller ikke beregnes";
+    gen_err_cascade => "{n} further rows below it could not be worked out either", "{n} lignes supplémentaires en dessous n'ont pas pu être calculées non plus", "{n} yderligere rækker nedenunder kunne heller ikke beregnes";
+    gen_err_name_missing => "A generated row has an expression but no name — nothing can ask for its value", "Une ligne générée a une expression mais pas de nom — rien ne peut demander sa valeur", "En genereret række har et udtryk, men intet navn — intet kan bede om dens værdi";
+    gen_err_name_invalid => "{row}: a name can only use letters, digits, _ and -", "{row} : un nom ne peut contenir que des lettres, des chiffres, _ et -", "{row}: et navn må kun bruge bogstaver, tal, _ og -";
+    gen_err_name_duplicate => "{row}: two rows are named this; only the first is used", "{row} : deux lignes portent ce nom ; seule la première est utilisée", "{row}: to rækker hedder dette; kun den første bruges";
+    gen_err_cycle => "{row}: refers to itself, or to a row below it", "{row} : se référence lui-même, ou une ligne en dessous", "{row}: refererer til sig selv eller til en række nedenunder";
+    // A batch run has one shared variable set, so two requests that each
+    // compute `nonce` get one value between them. Worth naming the row rather
+    // than the requests: the user knows where their own `nonce` rows are, and
+    // the two titles would make the line twice as long.
+    gen_collision => "⚠ Both requests compute {name} — in one batch they share the first value", "⚠ Les deux requêtes calculent {name} — dans un même lot elles partagent la première valeur", "⚠ Begge anmodninger beregner {name} — i én batch deler de den første værdi";
+    cli_gen_collision => "more than one request computes {name}: in --batch they share the first value (drop --batch to give each its own)", "plusieurs requêtes calculent {name} : avec --batch elles partagent la première valeur (retirez --batch pour que chacune ait la sienne)", "flere anmodninger beregner {name}: med --batch deler de den første værdi (fjern --batch for at give hver sin egen)";
+    gen_shadow => "⚠ {name} is set by the environment — in one batch the generated value is not used", "⚠ {name} est défini par l'environnement — dans un même lot la valeur générée n'est pas utilisée", "⚠ {name} er sat af miljøet — i én batch bruges den genererede værdi ikke";
+    cli_gen_shadow => "{name} is set by the environment: in --batch the generated value is not used (drop --batch to let it override from its request on)", "{name} est défini par l'environnement : avec --batch la valeur générée n'est pas utilisée (retirez --batch pour qu'elle prenne effet à partir de sa requête)", "{name} er sat af miljøet: med --batch bruges den genererede værdi ikke (fjern --batch for at lade den tage over fra sin anmodning)";
     gui_body_conflict_headline => "This request has both a raw body and form fields", "Cette requête a à la fois un corps brut et des champs de formulaire", "Denne anmodning har både en rå brødtekst og formularfelter";
     gui_body_conflict_detail => "Only the body would be sent, labelled as a form — every form field would be dropped. Remove one of them.", "Seul le corps serait envoyé, étiqueté comme un formulaire — tous les champs de formulaire seraient perdus. Supprimez l'un des deux.", "Kun brødteksten ville blive sendt, mærket som en formular — alle formularfelter ville gå tabt. Fjern det ene af dem.";
     gui_body_conflict_clear => "Remove the raw body", "Supprimer le corps brut", "Fjern den rå brødtekst";
@@ -882,6 +981,52 @@ strings! {
     gui_options_declare_parameter => "Add 'variable: NAME=value' to declare a parameter: the request keeps working on its own with that value, and a report can steer it by name.", "Ajoutez «\u{a0}variable\u{a0}: NOM=valeur\u{a0}» pour déclarer un paramètre\u{a0}: la requête continue de fonctionner seule avec cette valeur, et un rapport peut la piloter par son nom.", "Tilføj 'variable: NAVN=værdi' for at erklære en parameter: forespørgslen virker fortsat alene med den værdi, og en rapport kan styre den ved navn.";
     gui_response_assertions => "Response assertions (Hurl expressions)", "Assertions de réponse (expressions Hurl)", "Svar-assertioner (Hurl-udtryk)";
     gui_expected_status => "Expected status", "Statut attendu", "Forventet status";
+    // One line each for the generator functions, shown under the completion
+    // list for the highlighted row. A signature says how to *call* a function
+    // and nothing about what it does, which is the half a user reaching for
+    // `hmac_sha256_b64` already knows. Kept beside each other, and looked up by
+    // `Strings::gen_description`, whose match a test holds to the function
+    // table so a function added there cannot arrive undescribed.
+    gen_desc_timestamp => "Unix time in seconds, optionally offset.", "Temps Unix en secondes, avec décalage facultatif.", "Unix-tid i sekunder, eventuelt forskudt.";
+    gen_desc_timestamp_ms => "Unix time in milliseconds.", "Temps Unix en millisecondes.", "Unix-tid i millisekunder.";
+    gen_desc_iso8601 => "The current UTC time, ISO 8601.", "L'heure UTC courante, ISO 8601.", "Den aktuelle UTC-tid, ISO 8601.";
+    gen_desc_date => "The current UTC time, in a strftime format.", "L'heure UTC courante, au format strftime.", "Den aktuelle UTC-tid i et strftime-format.";
+    gen_desc_uuid => "A random UUID (version 4).", "Un UUID aléatoire (version 4).", "Et tilfældigt UUID (version 4).";
+    gen_desc_counter => "Counts up from 1, one count per name.", "Compte à partir de 1, un compteur par nom.", "Tæller op fra 1, én tæller pr. navn.";
+    gen_desc_random_int => "A random whole number between the two.", "Un entier aléatoire entre les deux bornes.", "Et tilfældigt heltal mellem de to.";
+    gen_desc_random_hex => "Random hex digits, that many characters.", "Des chiffres hexadécimaux aléatoires, autant de caractères.", "Tilfældige hex-cifre, så mange tegn.";
+    gen_desc_random_alnum => "Random letters and digits, that many characters.", "Des lettres et des chiffres aléatoires, autant de caractères.", "Tilfældige bogstaver og tal, så mange tegn.";
+    gen_desc_random_base64 => "That many random bytes, base64-encoded.", "Autant d'octets aléatoires, encodés en base64.", "Så mange tilfældige bytes, base64-kodet.";
+    gen_desc_base64 => "Base64-encodes the text.", "Encode le texte en base64.", "Base64-koder teksten.";
+    gen_desc_base64url => "Base64-encodes the text, URL-safe alphabet.", "Encode le texte en base64, alphabet compatible URL.", "Base64-koder teksten med URL-sikkert alfabet.";
+    gen_desc_base64_decode => "Decodes base64 back to text.", "Décode du base64 en texte.", "Afkoder base64 tilbage til tekst.";
+    gen_desc_hex => "The text's bytes as hex digits.", "Les octets du texte en hexadécimal.", "Tekstens bytes som hex-cifre.";
+    gen_desc_urlencode => "Percent-encodes the text for a URL.", "Encode le texte en pourcentage pour une URL.", "Procent-koder teksten til en URL.";
+    gen_desc_urldecode => "Decodes percent-encoding back to text.", "Décode l'encodage en pourcentage.", "Afkoder procent-kodning tilbage til tekst.";
+    gen_desc_json_string => "Quotes and escapes the text as JSON.", "Met le texte entre guillemets et l'échappe en JSON.", "Sætter teksten i anførselstegn og escaper den som JSON.";
+    gen_desc_md5 => "MD5 digest of the text, in hex.", "Empreinte MD5 du texte, en hexadécimal.", "MD5-hash af teksten, i hex.";
+    gen_desc_md5_b64 => "MD5 digest of the text, base64-encoded.", "Empreinte MD5 du texte, encodée en base64.", "MD5-hash af teksten, base64-kodet.";
+    gen_desc_sha1 => "SHA-1 digest of the text, in hex.", "Empreinte SHA-1 du texte, en hexadécimal.", "SHA-1-hash af teksten, i hex.";
+    gen_desc_sha1_b64 => "SHA-1 digest of the text, base64-encoded.", "Empreinte SHA-1 du texte, encodée en base64.", "SHA-1-hash af teksten, base64-kodet.";
+    gen_desc_sha256 => "SHA-256 digest of the text, in hex.", "Empreinte SHA-256 du texte, en hexadécimal.", "SHA-256-hash af teksten, i hex.";
+    gen_desc_sha256_b64 => "SHA-256 digest of the text, base64-encoded.", "Empreinte SHA-256 du texte, encodée en base64.", "SHA-256-hash af teksten, base64-kodet.";
+    gen_desc_sha512 => "SHA-512 digest of the text, in hex.", "Empreinte SHA-512 du texte, en hexadécimal.", "SHA-512-hash af teksten, i hex.";
+    gen_desc_sha512_b64 => "SHA-512 digest of the text, base64-encoded.", "Empreinte SHA-512 du texte, encodée en base64.", "SHA-512-hash af teksten, base64-kodet.";
+    gen_desc_hmac_sha1 => "HMAC-SHA1 of the message with the key, in hex.", "HMAC-SHA1 du message avec la clé, en hexadécimal.", "HMAC-SHA1 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha1_b64 => "HMAC-SHA1 of the message with the key, base64-encoded.", "HMAC-SHA1 du message avec la clé, encodé en base64.", "HMAC-SHA1 af beskeden med nøglen, base64-kodet.";
+    gen_desc_hmac_sha256 => "HMAC-SHA256 of the message with the key, in hex.", "HMAC-SHA256 du message avec la clé, en hexadécimal.", "HMAC-SHA256 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha256_b64 => "HMAC-SHA256 of the message with the key, base64-encoded.", "HMAC-SHA256 du message avec la clé, encodé en base64.", "HMAC-SHA256 af beskeden med nøglen, base64-kodet.";
+    gen_desc_hmac_sha512 => "HMAC-SHA512 of the message with the key, in hex.", "HMAC-SHA512 du message avec la clé, en hexadécimal.", "HMAC-SHA512 af beskeden med nøglen, i hex.";
+    gen_desc_hmac_sha512_b64 => "HMAC-SHA512 of the message with the key, base64-encoded.", "HMAC-SHA512 du message avec la clé, encodé en base64.", "HMAC-SHA512 af beskeden med nøglen, base64-kodet.";
+    gen_desc_concat => "Joins its arguments into one string.", "Concatène ses arguments en une seule chaîne.", "Sammenføjer argumenterne til én streng.";
+    gen_desc_upper => "Upper-cases the text.", "Met le texte en majuscules.", "Gør teksten til store bogstaver.";
+    gen_desc_lower => "Lower-cases the text.", "Met le texte en minuscules.", "Gør teksten til små bogstaver.";
+    gen_desc_trim => "Removes whitespace from both ends.", "Supprime les espaces aux deux extrémités.", "Fjerner mellemrum i begge ender.";
+    gui_generated_var_note => "A variable this expression can read", "Une variable que cette expression peut lire", "En variabel som dette udtryk kan læse";
+    gui_generated_expr_hint => "Type to search functions, or Ctrl+Space to list them all", "Tapez pour chercher une fonction, ou Ctrl+Espace pour les lister toutes", "Skriv for at søge efter funktioner, eller Ctrl+Mellemrum for at vise dem alle";
+    gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
+    gui_generated_faults => "This block won't run as written:", "Ce bloc ne s'exécutera pas tel quel :", "Denne blok kører ikke som skrevet:";
+    gui_generated_help => "Values worked out fresh each time the request is sent, used as {{ name }}", "Valeurs générées à chaque envoi de la requête, utilisées comme {{ name }}", "Værdier der genereres hver gang anmodningen sendes, brugt som {{ name }}";
     gui_captures_help => "Capture values from the response for later requests", "Capturer des valeurs de la réponse pour des requêtes ultérieures", "Fang værdier fra svaret til senere anmodninger";
     gui_add_assert => "+ Add assert", "+ Ajouter une assertion", "+ Tilføj assertion";
     gui_add_field => "+ Add field", "+ Ajouter un champ", "+ Tilføj felt";
@@ -1590,6 +1735,56 @@ impl Strings {
         static EN: std::sync::OnceLock<Strings> = std::sync::OnceLock::new();
         EN.get_or_init(|| Strings::for_language(&Language::English))
     }
+
+    /// The one-line description of a generator function, by name.
+    ///
+    /// A match rather than a map: the compiler then checks every arm names a
+    /// real string, and a test checks every function in
+    /// [`crate::generators::FUNCTIONS`] has an arm.
+    ///
+    /// Only the desktop completion list shows these today, so the terminal-only
+    /// build would otherwise warn about it.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn gen_description(&self, name: &str) -> &'static str {
+        match name {
+            "timestamp" => self.gen_desc_timestamp,
+            "timestamp_ms" => self.gen_desc_timestamp_ms,
+            "iso8601" => self.gen_desc_iso8601,
+            "date" => self.gen_desc_date,
+            "uuid" => self.gen_desc_uuid,
+            "counter" => self.gen_desc_counter,
+            "random_int" => self.gen_desc_random_int,
+            "random_hex" => self.gen_desc_random_hex,
+            "random_alnum" => self.gen_desc_random_alnum,
+            "random_base64" => self.gen_desc_random_base64,
+            "base64" => self.gen_desc_base64,
+            "base64url" => self.gen_desc_base64url,
+            "base64_decode" => self.gen_desc_base64_decode,
+            "hex" => self.gen_desc_hex,
+            "urlencode" => self.gen_desc_urlencode,
+            "urldecode" => self.gen_desc_urldecode,
+            "json_string" => self.gen_desc_json_string,
+            "md5" => self.gen_desc_md5,
+            "md5_b64" => self.gen_desc_md5_b64,
+            "sha1" => self.gen_desc_sha1,
+            "sha1_b64" => self.gen_desc_sha1_b64,
+            "sha256" => self.gen_desc_sha256,
+            "sha256_b64" => self.gen_desc_sha256_b64,
+            "sha512" => self.gen_desc_sha512,
+            "sha512_b64" => self.gen_desc_sha512_b64,
+            "hmac_sha1" => self.gen_desc_hmac_sha1,
+            "hmac_sha1_b64" => self.gen_desc_hmac_sha1_b64,
+            "hmac_sha256" => self.gen_desc_hmac_sha256,
+            "hmac_sha256_b64" => self.gen_desc_hmac_sha256_b64,
+            "hmac_sha512" => self.gen_desc_hmac_sha512,
+            "hmac_sha512_b64" => self.gen_desc_hmac_sha512_b64,
+            "concat" => self.gen_desc_concat,
+            "upper" => self.gen_desc_upper,
+            "lower" => self.gen_desc_lower,
+            "trim" => self.gen_desc_trim,
+            _ => "",
+        }
+    }
 }
 
 /// Fill the `{}` placeholders of a translated template, in order.
@@ -1647,6 +1842,25 @@ pub enum Status {
     ReportBindNoCollections,
     /// Text was copied to the clipboard (a selection or a whole-panel copy).
     Copied,
+    /// An `[Asserts]` line was built from the response and added to the
+    /// request; holds the line, so the confirmation shows what was written
+    /// rather than just that something was.
+    ProbeAssertAdded(String),
+    /// The expected status was taken from the response; holds the code.
+    ProbeStatusSet(u16),
+    /// A `[Captures]` row was built from the response; holds the variable name.
+    ProbeCaptureAdded(String),
+    /// The assert or capture chosen is already on the request, so nothing was
+    /// added. Said out loud: silently doing nothing reads as a broken key.
+    ProbeAlreadyThere,
+    /// `a` was pressed before the request had been sent. Distinct from
+    /// `NoResponse` (a *save* with nothing to write): the palette's problem is
+    /// not that a file is missing but that there is nothing to build from yet,
+    /// and saying so is the difference between a dead key and an instruction.
+    ProbeNoResponse,
+    /// A response arrived but offered no subjects -- an empty body with no
+    /// headers worth asserting on.
+    ProbeNothingToProbe,
     /// The active collection has no remembered git origin, so "Save to Git"
     /// can't be opened.
     NoGitOrigin,
@@ -1679,6 +1893,39 @@ pub enum Status {
     /// form). Blocking rather than advisory: the request would otherwise appear
     /// to succeed.
     BodyFormConflict(Vec<String>),
+    /// The run was refused because these placeholders don't mean on the wire
+    /// what they say on the screen: Hurl reads a variable name only as far as
+    /// the first character outside `A-Z a-z 0-9 _ -`, and drops the remainder
+    /// without complaint. Each string is `{{written}} → name` (or just the
+    /// placeholder, when Hurl can't read a name from it at all).
+    ///
+    /// Blocking, like [`Status::BodyFormConflict`] and unlike
+    /// [`Status::UndefinedVars`]: the request would otherwise be sent, be
+    /// answered, and be wrong.
+    TruncatedPlaceholders(Vec<String>),
+    /// The request's `# [Gen]` block didn't fully evaluate, so the names it was
+    /// meant to compute are unbound and their `{{…}}` will be sent literally.
+    ///
+    /// Reported, not blocking: an unbound value fails loudly at the server, so
+    /// this is the [`Status::UndefinedVars`] situation rather than the
+    /// [`Status::BodyFormConflict`] one. Said all the same, because "401" is a
+    /// poor way to learn that a function name was misspelled.
+    GeneratorErrors(Vec<crate::generators::GenError>),
+    /// A batch "Run All" is about to give two requests one value for a name
+    /// they each compute. Carries the colliding names.
+    GeneratorCollisions(Vec<String>),
+    /// A batch "Run All" is about to leave an environment value in place where a
+    /// request's `# [Gen]` block meant to override it — batch shares one value
+    /// set, so the computed value would rewrite requests above the generator too
+    /// and is dropped instead. Carries the shadowed names.
+    GeneratorShadows(Vec<String>),
+    /// Several pre-flight warnings at once. A run-all can trip more than one --
+    /// a broken generator *and* a batch collision, say -- and the old chain of
+    /// `else if`s showed the first and hid the rest, so fixing the one you were
+    /// told about surfaced another and the run failed twice for what was
+    /// always one problem set. Kept as a list of the real statuses so each
+    /// still renders its own wording.
+    PreflightWarnings(Vec<Status>),
     /// The user asked to retry a single previously-failed Environment panel
     /// variable (env var / 1Password / SSM); names the variable being retried.
     EnvVarReloading(String),
@@ -1895,6 +2142,12 @@ pub enum Status {
     /// to revert to (a scratch collection / never-saved env), or no unsaved
     /// changes.
     NothingToRevert,
+    /// `Ctrl+R` on a request that has no saved version to go back to: one just
+    /// added to a saved collection but never written, or a duplicate that still
+    /// shares its original's identity. Distinct from [`Self::NothingToRevert`]
+    /// so the message can say *why* rather than offering — then failing — a
+    /// confirmation the request can't honour.
+    RequestHasNoSavedVersion,
     /// Leftover `# [Body]` notes were taken back as the request's body.
     NotesAdopted,
     /// Leftover `# [Body]` notes were deleted, leaving the body as it was.
@@ -1916,6 +2169,20 @@ pub enum Status {
     /// shows only the workspace's own file types (`.hurl/.json/.vars/.trail`);
     /// `false` shows every file.
     WorkspaceTreeFilter(bool),
+}
+
+/// Fold the pre-flight warnings a run tripped into one status.
+///
+/// A run can trip several at once, and reporting only the first meant fixing
+/// what you were told about surfaced the next one — the same run failing twice
+/// over one problem set. One warning still reports as itself so the wording
+/// (and the tests that read it) is unchanged.
+pub fn preflight_status(warnings: Vec<Status>) -> Option<Status> {
+    match warnings.len() {
+        0 => None,
+        1 => warnings.into_iter().next(),
+        _ => Some(Status::PreflightWarnings(warnings)),
+    }
 }
 
 impl Status {
@@ -1968,6 +2235,12 @@ impl Status {
             Status::Loaded => s.file_loaded.to_string(),
             Status::Cleared => s.clear_all_done.to_string(),
             Status::Copied => s.copied_to_clipboard.to_string(),
+            Status::ProbeAssertAdded(line) => format!("{} {line}", s.probe_assert_added),
+            Status::ProbeStatusSet(code) => format!("{} {code}", s.probe_status_set),
+            Status::ProbeCaptureAdded(name) => format!("{} {name}", s.probe_capture_added),
+            Status::ProbeAlreadyThere => s.probe_already_there.to_string(),
+            Status::ProbeNoResponse => s.probe_no_response.to_string(),
+            Status::ProbeNothingToProbe => s.probe_nothing_to_probe.to_string(),
             Status::NoResponse => s.file_no_response.to_string(),
             Status::NotCollection => s.file_not_collection.to_string(),
             Status::NotEnvironment => s.file_not_environment.to_string(),
@@ -1996,6 +2269,41 @@ impl Status {
             }
             Status::BodyFormConflict(names) => {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))
+            }
+            // Summarised, not listed: this is one line on a status bar, and a
+            // block whose rows all read one broken row would otherwise fill it
+            // with seven ways of saying "something else went wrong".
+            Status::GeneratorErrors(errors) => {
+                format!(
+                    "{} {}",
+                    s.gen_status,
+                    summarise_gen_errors(s, errors).join("; ")
+                )
+            }
+            Status::GeneratorCollisions(names) => names
+                .iter()
+                .map(|n| s.gen_collision.replace("{name}", n))
+                .collect::<Vec<_>>()
+                .join("; "),
+            // Joined with a separator rather than newlines: the status line is
+            // one line, and the wrapping it already does is per-line.
+            Status::PreflightWarnings(list) => list
+                .iter()
+                .map(|st| st.text(s))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            Status::GeneratorShadows(names) => names
+                .iter()
+                .map(|n| s.gen_shadow.replace("{name}", n))
+                .collect::<Vec<_>>()
+                .join("; "),
+            Status::TruncatedPlaceholders(items) => {
+                format!(
+                    "{} {} — {}",
+                    s.truncated_placeholder_status,
+                    items.join(", "),
+                    s.truncated_placeholder_hint
+                )
             }
             Status::EnvVarReloading(key) => format!("{} {key}…", s.env_reloading_var),
             Status::EnvActivated(name) => format!("{} {name}", s.env_activated),
@@ -2127,6 +2435,7 @@ impl Status {
             Status::FileReverted(name) => format!("{} {name}", s.status_file_reverted),
             Status::EnvReverted(name) => format!("{} {name}", s.status_env_reverted),
             Status::NothingToRevert => s.status_nothing_to_revert.to_string(),
+            Status::RequestHasNoSavedVersion => s.status_request_no_saved_version.to_string(),
             Status::NotesAdopted => s.notes_adopted.to_string(),
             Status::NotesDiscarded => s.notes_discarded.to_string(),
             Status::NotesAppliedFromRaw => s.notes_applied_from_raw.to_string(),
@@ -2150,6 +2459,48 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every function the completion list can offer needs a description in
+    /// every language: a missing arm falls through to the catch-all and shows
+    /// nothing, which reads as a function that does nothing rather than as a
+    /// gap in the translation table.
+    #[test]
+    fn every_generator_function_is_described_in_every_language() {
+        for lang in [Language::English, Language::French, Language::Danish] {
+            let s = Strings::for_language(&lang);
+            for f in crate::generators::FUNCTIONS {
+                let desc = s.gen_description(f.name);
+                assert!(
+                    !desc.is_empty(),
+                    "{:?} has no description for {}",
+                    lang,
+                    f.name
+                );
+            }
+        }
+    }
+
+    /// A run can trip more than one pre-flight warning at once. Reporting only
+    /// the first meant fixing what you were told about surfaced the next one,
+    /// so the same run failed twice over one problem set.
+    #[test]
+    fn several_preflight_warnings_are_reported_together() {
+        let en = Strings::for_language(&Language::English);
+        let collisions = Status::GeneratorCollisions(vec!["nonce".into()]);
+        let shadows = Status::GeneratorShadows(vec!["token".into()]);
+        let both = preflight_status(vec![collisions.clone(), shadows.clone()]).unwrap();
+        let text = both.text(&en);
+        assert!(text.contains("nonce"), "{text}");
+        assert!(text.contains("token"), "{text}");
+        // A single warning still reports as itself, unchanged.
+        assert_eq!(
+            preflight_status(vec![shadows.clone()]).unwrap().text(&en),
+            shadows.text(&en)
+        );
+        assert!(preflight_status(Vec::new()).is_none());
+        // Warnings are problems, so the line stays red.
+        assert!(!both.is_ok());
+    }
 
     #[test]
     fn status_text_follows_the_current_language() {
@@ -2185,5 +2536,207 @@ mod tests {
         assert_eq!(da.file_menu, "Fil");
         assert_eq!(da.response_heading, "Svar");
         assert_eq!(da.new_request, "\u{FF0B} Ny anmodning");
+    }
+}
+
+/// The same failures with the knock-on rows collapsed into a single sentence.
+///
+/// One undefined name at the top of a block fails every row that reads it, and
+/// every row that reads *those*: eight rows, one mistake, and seven sentences
+/// saying only that something else went wrong first. That is a wall of text
+/// whose one useful line is buried in the middle of it. Only the rows that
+/// actually broke are described; the rest are counted.
+///
+/// When *everything* failed that way there is nothing else to say, so they are
+/// all described rather than reporting a count of nothing.
+pub fn summarise_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) -> Vec<String> {
+    use crate::generators::GenError as G;
+    let (knock_on, causes): (Vec<_>, Vec<_>) = errors
+        .iter()
+        .cloned()
+        .partition(|e| matches!(e, G::FailedDependency { .. }));
+    if causes.is_empty() {
+        return describe_gen_errors(s, errors);
+    }
+    let mut out = describe_gen_errors(s, &causes);
+    // One row is not "1 row(s)": a count written as a form is a count the
+    // reader has to translate back into a sentence.
+    match knock_on.len() {
+        0 => {}
+        1 => out.push(s.gen_err_cascade_one.to_string()),
+        n => out.push(s.gen_err_cascade.replace("{n}", &n.to_string())),
+    }
+    out
+}
+
+/// Render `# [Gen]` failures in the active language, one string per failing row.
+///
+/// Shared by the status line and the headless runner: the block is evaluated by
+/// both, and a user who has learned "there is no function called `hmac_sha526`"
+/// from the UI should meet the same sentence from the CLI.
+pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) -> Vec<String> {
+    use crate::generators::GenError as G;
+    errors
+        .iter()
+        .map(|e| match e {
+            G::Empty { name } => s.gen_err_empty.replace("{row}", name),
+            G::Syntax { name, detail } => s
+                .gen_err_syntax
+                .replace("{row}", name)
+                .replace("{detail}", detail),
+            G::UnknownFunction { name, function } => s
+                .gen_err_unknown
+                .replace("{row}", name)
+                .replace("{function}", function),
+            G::Arity {
+                name,
+                function,
+                expected,
+                got,
+            } => s
+                .gen_err_arity
+                .replace("{row}", name)
+                .replace("{function}", function)
+                .replace("{expected}", expected)
+                .replace("{got}", &got.to_string()),
+            G::BadArgument {
+                name,
+                function,
+                detail,
+            } => s
+                .gen_err_argument
+                .replace("{row}", name)
+                .replace("{function}", function)
+                .replace("{detail}", detail),
+            G::UndefinedReference { name, reference } => s
+                .gen_err_undefined
+                .replace("{row}", name)
+                .replace("{reference}", reference),
+            G::FailedDependency { name, reference } => s
+                .gen_err_failed_dep
+                .replace("{row}", name)
+                .replace("{reference}", reference),
+            G::Cycle { name } => s.gen_err_cycle.replace("{row}", name),
+            G::NameMissing => s.gen_err_name_missing.to_string(),
+            G::NameInvalid { name } => s.gen_err_name_invalid.replace("{row}", name),
+            G::NameDuplicate { name } => s.gen_err_name_duplicate.replace("{row}", name),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::generators::GenError as G;
+
+    /// One undefined name at the top of a block fails every row that reads it,
+    /// and every row that reads those. Eight rows, one mistake -- and the
+    /// report used to be eight sentences, seven of which said only that
+    /// something else had gone wrong first, with the one that named the fault
+    /// buried among them.
+    #[test]
+    fn a_cascade_is_reported_as_its_cause_and_a_count() {
+        let english = Strings::for_language(&Language::English);
+        let mut errors = vec![G::UndefinedReference {
+            name: "message".into(),
+            reference: "session_nonce".into(),
+        }];
+        for row in [
+            "as_hex",
+            "as_b64",
+            "as_b64url",
+            "digest_hex",
+            "digest_b64",
+            "sig_hex",
+            "sig_b64",
+        ] {
+            errors.push(G::FailedDependency {
+                name: row.into(),
+                reference: "message".into(),
+            });
+        }
+        let said = summarise_gen_errors(&english, &errors);
+        assert_eq!(said.len(), 2, "the cause, and how far it spread: {said:?}");
+        assert!(
+            said[0].contains("session_nonce"),
+            "the cause is named first: {said:?}"
+        );
+        assert!(
+            said[1].contains('7'),
+            "and the rows it took with it are counted: {said:?}"
+        );
+        // The status line is built from the same summary, so it fits.
+        let line = Status::GeneratorErrors(errors).text(&english);
+        assert!(line.len() < 140, "a status line has to be one line: {line}");
+    }
+
+    /// When every row failed that way there is no cause among them to report --
+    /// the block reads something defined elsewhere -- so counting them would
+    /// leave nothing at all. They are described instead.
+    #[test]
+    fn knock_on_rows_with_no_cause_beside_them_are_still_described() {
+        let english = Strings::for_language(&Language::English);
+        let errors = vec![
+            G::FailedDependency {
+                name: "a".into(),
+                reference: "gone".into(),
+            },
+            G::FailedDependency {
+                name: "b".into(),
+                reference: "gone".into(),
+            },
+        ];
+        let said = summarise_gen_errors(&english, &errors);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said.iter().all(|l| l.contains("gone")), "{said:?}");
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// `fill` substitutes `{}` and nothing else, so a row written with the
+    /// numbered form of the same idea renders the placeholder to the user:
+    /// "{0} headers" is what the assert palette said for a while.
+    #[test]
+    fn no_string_uses_a_numbered_placeholder() {
+        let mut bad = Vec::new();
+        for (name, en, fr, da) in Strings::table() {
+            for text in [en, fr, da] {
+                if (0..10).any(|i| text.contains(&format!("{{{i}}}"))) {
+                    bad.push(format!("{name}: {text}"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these rows use {{0}}-style placeholders, which `fill` leaves in the text:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// A translation that drops a `{}` drops the value it was carrying -- the
+    /// French reader is simply told "headers" -- and one that adds a `{}` gets
+    /// a stray brace. Neither shows up until someone runs in that language.
+    #[test]
+    fn every_language_of_a_row_takes_the_same_values() {
+        let count = |t: &str| t.matches("{}").count();
+        let mut bad = Vec::new();
+        for (name, en, fr, da) in Strings::table() {
+            if count(en) != count(fr) || count(en) != count(da) {
+                bad.push(format!(
+                    "{name}: en {}, fr {}, da {}",
+                    count(en),
+                    count(fr),
+                    count(da)
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these rows disagree on how many values they take:\n{}",
+            bad.join("\n")
+        );
     }
 }

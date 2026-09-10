@@ -196,7 +196,14 @@ impl Editor {
     }
 
     /// Insert `ch` at the cursor and advance one column.
+    ///
+    /// Records its own undo run, so history is kept for every caller — the
+    /// key wrappers below, and the hosts that reach past them and drive an
+    /// editor a primitive at a time (the request wizard's table cells do).
+    /// Recording is idempotent within a run: a wrapper that has already opened
+    /// an Insert run adds nothing here.
     pub fn insert(&mut self, ch: char) {
+        self.record_edit(EditKind::Insert);
         let idx = Self::byte_idx(&self.lines[self.row], self.col);
         self.lines[self.row].insert(idx, ch);
         self.col += 1;
@@ -245,11 +252,30 @@ impl Editor {
         }
     }
 
+    /// Replace the whole buffer with `text` and leave the caret at
+    /// `(row, col)`, as a single undo step.
+    ///
+    /// The alternative — building a fresh [`Editor`] over the new text — is
+    /// what accepting a completion used to do, and it threw the undo history
+    /// away with the old editor: a programmatic edit the user cannot take back
+    /// is worse than one they never asked for.
+    pub fn replace_text(&mut self, text: &str, row: usize, col: usize) {
+        self.checkpoint();
+        self.lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(|l| l.to_string()).collect()
+        };
+        self.set_cursor(row, col);
+        self.coalesce = None;
+    }
+
     /// Split the current line at the cursor (no-op in single-line mode).
     pub fn newline(&mut self) {
         if !self.multiline {
             return;
         }
+        self.record_edit(EditKind::Insert);
         let idx = Self::byte_idx(&self.lines[self.row], self.col);
         let tail = self.lines[self.row].split_off(idx);
         self.lines.insert(self.row + 1, tail);
@@ -260,6 +286,7 @@ impl Editor {
     /// Delete the character before the cursor, joining with the previous line
     /// when at column 0.
     pub fn backspace(&mut self) {
+        self.record_edit(EditKind::Delete);
         if self.col > 0 {
             let start = Self::byte_idx(&self.lines[self.row], self.col - 1);
             let end = Self::byte_idx(&self.lines[self.row], self.col);
@@ -354,11 +381,39 @@ impl Editor {
     /// checkpoint only when it *starts* a new run (a different kind from the
     /// one currently coalescing), so a run of same-kind edits collapses into a
     /// single undo step.
+    ///
+    /// The push is skipped when the newest checkpoint already holds exactly the
+    /// current buffer and caret. That happens whenever a key handler calls
+    /// [`checkpoint`](Self::checkpoint) and then a primitive that now records
+    /// its own run (`newline`, `backspace` via `delete_word_left`): both would
+    /// otherwise snapshot the same state, so one Ctrl+Z would be a dead
+    /// keypress. Deduping here rather than dropping the explicit `checkpoint()`
+    /// keeps the fix safe against the *next* primitive someone moves inside a
+    /// checkpointed handler — the boundary the checkpoint draws is still there,
+    /// it just isn't recorded twice.
     fn record_edit(&mut self, kind: EditKind) {
-        if self.coalesce != Some(kind) {
+        if self.coalesce != Some(kind) && !self.top_undo_is_current() {
             self.push_undo();
         }
         self.coalesce = Some(kind);
+    }
+
+    /// Whether the newest undo checkpoint is identical to the live buffer and
+    /// caret — the tell-tale of a checkpoint just taken that a following
+    /// primitive is about to duplicate.
+    fn top_undo_is_current(&self) -> bool {
+        self.undo_stack
+            .last()
+            .is_some_and(|s| s.row == self.row && s.col == self.col && s.lines == self.lines)
+    }
+
+    /// End any coalesced edit run without recording a checkpoint, so the next
+    /// edit starts a fresh undo step. Called on cursor movement, and by a host
+    /// when focus leaves the field: coming back to a cell and typing again is
+    /// a second run, not a continuation of the first, and one undo should take
+    /// back only what was just typed.
+    pub fn end_run(&mut self) {
+        self.break_run();
     }
 
     /// End any coalesced edit run without recording a checkpoint, so the next
@@ -400,6 +455,7 @@ impl Editor {
 
     /// Move the cursor one character left (wrapping to the previous line end).
     pub fn left(&mut self) {
+        self.break_run();
         if self.col > 0 {
             self.col -= 1;
         } else if self.row > 0 {
@@ -410,6 +466,7 @@ impl Editor {
 
     /// Move the cursor one character right (wrapping to the next line start).
     pub fn right(&mut self) {
+        self.break_run();
         if self.col < self.line_len(self.row) {
             self.col += 1;
         } else if self.row + 1 < self.lines.len() {
@@ -420,6 +477,7 @@ impl Editor {
 
     /// Move the cursor up one line, clamping the column to the new line length.
     pub fn up(&mut self) {
+        self.break_run();
         if self.row > 0 {
             self.row -= 1;
             self.col = self.col.min(self.line_len(self.row));
@@ -428,6 +486,7 @@ impl Editor {
 
     /// Move the cursor down one line, clamping the column to the new line length.
     pub fn down(&mut self) {
+        self.break_run();
         if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = self.col.min(self.line_len(self.row));
@@ -436,11 +495,13 @@ impl Editor {
 
     /// Move the cursor to column 0 of the current line.
     pub fn home(&mut self) {
+        self.break_run();
         self.col = 0;
     }
 
     /// Move the cursor to the end of the current line.
     pub fn end(&mut self) {
+        self.break_run();
         self.col = self.line_len(self.row);
     }
 
@@ -1606,5 +1667,151 @@ mod tests {
             shown.ends_with('\u{2026}'),
             "six columns in a four-column cell is truncated, showed {shown:?}"
         );
+    }
+
+    /// A programmatic edit made through `checkpoint()` and then a primitive
+    /// that now records its own run used to snapshot the same state twice, so
+    /// the second Ctrl+Z was a dead keypress: Enter and the typing before it
+    /// have to be two distinct, non-duplicated undo steps.
+    #[test]
+    fn enter_is_one_undo_step_not_two() {
+        let mut ed = Editor::new("ab", true);
+        ed.insert('c');
+        apply_edit_key_full(&mut ed, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ed.text(), "abc\n");
+        ed.undo();
+        assert_eq!(ed.text(), "abc", "one undo takes back the newline");
+        ed.undo();
+        assert_eq!(
+            ed.text(),
+            "ab",
+            "the next undo must take back the typing, not repeat the same state"
+        );
+    }
+
+    /// The same double-push through the Ctrl+Backspace path when the caret is
+    /// at column 0 and the word-delete falls through to `backspace()`.
+    #[test]
+    fn ctrl_backspace_joining_two_lines_is_one_undo_step() {
+        let mut ed = Editor::new("ab\ncd", true);
+        ed.set_cursor(1, 0);
+        apply_edit_key_full(
+            &mut ed,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        );
+        assert_eq!(ed.text(), "abcd");
+        ed.undo();
+        assert_eq!(ed.text(), "ab\ncd", "one undo puts the line break back");
+        assert!(
+            !ed.undo(),
+            "there was nothing else to undo, but the history holds a duplicate: {:?}",
+            ed.text()
+        );
+    }
+
+    /// Multi-byte control: every primitive over accented text, CJK and an
+    /// emoji leaves the caret on a character boundary and never panics.
+    #[test]
+    fn primitives_survive_multi_byte_text() {
+        let s = "héllo 世界 🎉 café";
+        let mut ed = Editor::new(s, false);
+        assert_eq!(ed.col, s.chars().count());
+        for _ in 0..s.chars().count() + 2 {
+            ed.left();
+        }
+        for _ in 0..s.chars().count() + 2 {
+            ed.right();
+        }
+        for _ in 0..s.chars().count() {
+            ed.backspace();
+        }
+        assert_eq!(ed.text(), "");
+        let mut ed = Editor::new(s, false);
+        while !ed.text().is_empty() {
+            ed.delete_word_left();
+        }
+        let mut ed = Editor::new("tail", false);
+        ed.home();
+        for ch in "héllo 世界 🎉 ".chars() {
+            ed.insert(ch);
+        }
+        assert_eq!(ed.text(), "héllo 世界 🎉 tail");
+    }
+
+    /// Multi-byte control: the selection helpers and the "extract to
+    /// parameter" primitive count in characters, not bytes.
+    #[test]
+    fn selection_over_multi_byte_text_is_measured_in_characters() {
+        let mut ed = Editor::new("héllo 世界\n🎉 café", true);
+        ed.set_cursor(0, 6);
+        ed.begin_selection_if_needed();
+        ed.set_cursor(1, 2);
+        ed.sel_anchor = Some((0, 6));
+        assert_eq!(ed.selected_text().as_deref(), Some("世界\n🎉 "));
+        let taken = ed.replace_selection_or_all("{{X}}");
+        assert_eq!(taken, "世界\n🎉 ");
+        assert_eq!(ed.text(), "héllo {{X}}café");
+    }
+
+    /// Multi-byte control: `replace_text` (the "accept a completion in place"
+    /// primitive) places the caret in characters over wide glyphs.
+    #[test]
+    fn replace_text_places_the_caret_in_characters() {
+        let mut ed = Editor::new("héllo", false);
+        ed.replace_text("世界 sha256()", 0, 10);
+        assert_eq!(ed.text(), "世界 sha256()");
+        assert_eq!(ed.col, 10);
+        ed.backspace();
+        assert_eq!(ed.text(), "世界 sha256)");
+    }
+
+    /// Multi-byte control: rendering into a narrow area with the caret in
+    /// every position must not panic or slice a character in half.
+    #[test]
+    fn rendering_multi_byte_text_at_every_caret_position_is_safe() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        for text in ["héllo 世界 🎉 café", "🎉🎉🎉🎉", "e\u{0301}xte\u{0301}nded"] {
+            let n = text.chars().count();
+            for col in 0..=n {
+                for w in [1u16, 2, 3, 7, 40] {
+                    let mut term = Terminal::new(TestBackend::new(w, 3)).unwrap();
+                    let mut ed = Editor::new(text, false);
+                    ed.set_cursor(0, col);
+                    term.draw(|f| {
+                        let area = Rect::new(0, 0, w, 1);
+                        render_editor(f, area, &ed, &wide_theme(), false);
+                        render_line_field(
+                            f,
+                            Rect::new(0, 1, w, 1),
+                            &ed,
+                            &wide_theme(),
+                            true,
+                            false,
+                        );
+                        render_clipped_line(
+                            f,
+                            Rect::new(0, 2, w, 1),
+                            text,
+                            Color::White,
+                            Some(TruncationMarker::default()),
+                        );
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
+    /// Multi-byte control: mapping a mouse click back to a character position
+    /// always lands on a valid character.
+    #[test]
+    fn clicking_into_multi_byte_text_lands_on_a_character() {
+        let ed = Editor::new("héllo 世界 🎉", false);
+        let area = Rect::new(0, 0, 20, 1);
+        for x in 0..25u16 {
+            let (row, col) = ed.point_to_row_col((x, 0), area);
+            assert!(col <= ed.line_len(row));
+        }
     }
 }

@@ -15,10 +15,16 @@ mod stage;
 
 pub use entry::{
     CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KeyProblem, KvRow, METHODS,
-    ParamNameError, RunStatus, check_parameter_name, collection_to_hurl, key_problem, method_rgb,
-    status_eq_code, suggest_parameter_name, value_problem,
+    ParamNameError, PlaceholderProblem, RunStatus, check_parameter_name, collection_to_hurl,
+    is_variable_name, key_problem, method_rgb, placeholder_problems, status_eq_code,
+    suggest_parameter_name, value_problem,
 };
+// The `# [Gen]` block's own reader, so the views that *show* Hurl recognise
+// the block exactly as the parser does rather than by their own guess at it.
+pub(crate) use entry::{parse_gen_marker, parse_gen_row};
 pub(crate) use parser::parse_file_form_value;
 pub use parser::{parse_hurl, parse_hurl_error};
-pub use run::{AssertOutcome, EntryOutcome, RunOutput, run_hurl, run_hurl_streaming};
+pub use run::{
+    AssertOutcome, EntryOutcome, EntrySetup, RunOutput, run_hurl, run_hurl_streaming_with,
+};
 pub use stage::{expand_base64_form_fields, stage_out_of_scope_form_files};

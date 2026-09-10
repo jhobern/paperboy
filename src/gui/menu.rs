@@ -215,6 +215,11 @@ pub fn menu_bar(app: &mut GuiApp, ui: &mut egui::Ui) {
         settings_menu(app, ui);
         view_menu(app, ui);
         help_menu(app, ui);
+        // The status message rides along here, to the right of the menus,
+        // exactly where the terminal UI draws it. See `GuiApp::status_message`
+        // for why it is not in the status bar at the foot of the window.
+        ui.add_space(16.0);
+        app.status_message(ui);
         // No Send button here. There used to be one pinned to the right of this
         // bar, doing exactly what the Send beside the URL does (`run_active`) —
         // but it was drawn unconditionally, so in the report editor or a
@@ -701,6 +706,7 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
             name,
         } => extract_parameter_dialog(app, ctx, ci, entry, target, value, range, name),
         Dialog::Prompt { kind, text } => prompt_dialog(app, ctx, kind, text),
+        Dialog::ProbeBuilder(builder) => probe_builder_dialog(app, ctx, builder),
         Dialog::Theme(state) => theme_dialog(app, ctx, *state),
         Dialog::CloseGitWorkspace { ci, root } => close_git_workspace_dialog(app, ctx, ci, root),
         Dialog::UnsavedQuit { count, tabs } => unsaved_quit_dialog(app, ctx, count, tabs),
@@ -733,6 +739,486 @@ pub fn show_dialog(app: &mut GuiApp, ctx: &egui::Context) {
         }
         Dialog::Shortcuts => shortcuts_dialog(app, ctx),
     }
+}
+
+/// The response viewer's assert/capture builder.
+///
+/// Three steps in one window: pick a value the server actually sent, say what
+/// should be true about it, and — for a capture — name the variable. Each step
+/// leads with what it is asking for, because a bare list of `jsonpath "$" …`
+/// lines says what the answers look like but never what the question was.
+///
+/// Picking and committing are separate. Rows are *selected* by a click and
+/// acted on by the button (or a double-click, or Enter): a list where the first
+/// click commits gives no chance to look at a row before choosing it, and the
+/// whole point of this dialog is looking. Whatever is selected is highlighted
+/// in the response body behind the dialog, so "which of these six tokens is
+/// `$.data[0].token`?" is answered by looking rather than by reading paths.
+///
+/// Opened by right-clicking the response body (which pre-selects the value
+/// under the caret) or from the Assert… button (which starts on the list).
+fn probe_builder_dialog(
+    app: &mut GuiApp,
+    ctx: &egui::Context,
+    mut builder: Box<super::probe::ProbeBuilder>,
+) {
+    let title = app.strings.gui_probe_title;
+    let l = ProbeLabels::new(app);
+    let strings = crate::i18n::Strings::for_language(&app.session.language);
+    let (dim, err, accent, text) = (
+        app.theme.dim,
+        app.theme.err,
+        app.theme.accent,
+        app.theme.text,
+    );
+    // What the frame decided, applied after it closes: the dialog body borrows
+    // `builder`, and applying writes through `app` to the same session the
+    // rows were built from.
+    let mut back = false;
+    let mut advance = false;
+    let mut chosen_verb: Option<crate::probe::Verb> = None;
+    let mut start_capture = false;
+    let mut copy: Option<crate::probe::Probe> = None;
+    let mut hovered: Option<crate::probe::Subject> = None;
+    let selection = builder.selection.clone();
+    // Wide enough that the title fits its own bar: an egui window shrinks to
+    // its content, and this one's content is a list of short rows, so the
+    // heading was being elided to "Assert or capture from the res…" — on the
+    // one dialog whose whole job is to say what it is for.
+    let frame = super::widgets::dialog(ctx, title, Some(520.0), |ui| {
+        let mut keep = true;
+        let (up, down, enter) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        match (builder.chosen.clone(), builder.capture_name.clone()) {
+            // Step one: which value?
+            (None, _) => {
+                step_heading(ui, accent, dim, l.step_subject, l.step_subject_hint);
+                ui.add(
+                    egui::TextEdit::singleline(&mut builder.filter)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(l.filter),
+                );
+                ui.add_space(6.0);
+                let rows: Vec<crate::probe::Probe> =
+                    builder.visible().into_iter().cloned().collect();
+                builder.selected = move_selection(builder.selected, rows.len(), up, down);
+                let mut clicked: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Rows are one line each, clipped with an ellipsis
+                        // rather than wrapped. A row ends in a value the server
+                        // chose, and a 60-character bearer token holds no break
+                        // opportunity, so wrapping tore the literal off after
+                        // its opening quote and left a `"` sitting alone on a
+                        // line. What the row is for is being scannable; the
+                        // whole value is a highlight and a Copy value away.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        // egui grows a hovered widget by a pixel, which in a
+                        // list of rows means the row under the pointer -- and
+                        // everything below it -- shifts as the pointer crosses
+                        // it. Aiming at a moving row is exactly what this list
+                        // must not ask for.
+                        steady_rows(ui);
+                        for (i, probe) in rows.iter().enumerate() {
+                            let row = super::probe::subject_row(probe);
+                            let widget = ui.selectable_label(
+                                i == builder.selected,
+                                egui::RichText::new(row).monospace(),
+                            );
+                            if widget.clicked() {
+                                clicked = Some(i);
+                            }
+                            // Merely pointing at a row highlights its value in
+                            // the response: the fastest way to answer "which of
+                            // these is $.data[0].token?" is to run the pointer
+                            // down the list and watch the body.
+                            if widget.hovered() {
+                                hovered = Some(probe.subject.clone());
+                            }
+                            // A double-click is the shortcut for people who
+                            // already know which row they want.
+                            if widget.double_clicked() {
+                                clicked = Some(i);
+                                advance = true;
+                            }
+                            if i == builder.selected && (up || down) {
+                                widget.scroll_to_me(None);
+                            }
+                        }
+                    });
+                if let Some(i) = clicked {
+                    builder.selected = i;
+                }
+                let picked = rows.get(builder.selected).cloned();
+                ui.add_space(8.0);
+                centred_row(ui, &[l.next, l.copy, l.cancel], |ui| {
+                    if ui
+                        .add_enabled(picked.is_some(), egui::Button::new(l.next))
+                        .clicked()
+                        || (enter && picked.is_some())
+                    {
+                        advance = true;
+                    }
+                    if ui
+                        .add_enabled(picked.is_some(), egui::Button::new(l.copy))
+                        .on_hover_text(l.copy_hint)
+                        .clicked()
+                    {
+                        copy = picked.clone();
+                    }
+                    if ui.button(l.cancel).clicked() {
+                        keep = false;
+                    }
+                });
+                if advance {
+                    builder.chosen = picked;
+                }
+            }
+            // Step three: what should the captured value be called?
+            (Some(probe), Some(mut name)) => {
+                step_heading(ui, accent, dim, l.step_name, l.step_name_hint);
+                chosen_value(ui, &probe, l.selected, dim, text);
+                ui.add_space(6.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(320.0)
+                        .hint_text(l.name),
+                );
+                let submit = resp.lost_focus() && enter;
+                // The row exactly as it will be written, so the name being
+                // typed is visibly the left-hand side of a real `[Captures]`
+                // line rather than an answer to an unexplained prompt.
+                let row = crate::probe::capture_row(&probe.subject, &name);
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{}: {}", row.0, row.1))
+                        .monospace()
+                        .color(dim),
+                );
+                builder.capture_name = Some(name);
+                // Set when Add was pressed on an empty name: say why nothing was
+                // written rather than let the whole dialog vanish silently.
+                if builder.name_required {
+                    ui.colored_label(err, l.name_required);
+                }
+                ui.add_space(8.0);
+                centred_row(ui, &[l.back, l.add_capture, l.copy, l.cancel], |ui| {
+                    if ui.button(l.back).clicked() {
+                        back = true;
+                    }
+                    if ui.button(l.add_capture).clicked() || submit {
+                        chosen_verb = Some(crate::probe::Verb::Capture);
+                    }
+                    if ui.button(l.copy).on_hover_text(l.copy_hint).clicked() {
+                        copy = Some(probe.clone());
+                    }
+                    if ui.button(l.cancel).clicked() {
+                        keep = false;
+                    }
+                });
+            }
+            // Step two: what about it?
+            (Some(probe), None) => {
+                step_heading(ui, accent, dim, l.step_verb, l.step_verb_hint);
+                chosen_value(ui, &probe, l.selected, dim, text);
+                ui.add_space(6.0);
+                builder.selected_verb =
+                    move_selection(builder.selected_verb, builder.verbs.len(), up, down);
+                let mut clicked: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // Rows are one line each, clipped with an ellipsis
+                        // rather than wrapped. A row ends in a value the server
+                        // chose, and a 60-character bearer token holds no break
+                        // opportunity, so wrapping tore the literal off after
+                        // its opening quote and left a `"` sitting alone on a
+                        // line. What the row is for is being scannable; the
+                        // whole value is a highlight and a Copy value away.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        // egui grows a hovered widget by a pixel, which in a
+                        // list of rows means the row under the pointer -- and
+                        // everything below it -- shifts as the pointer crosses
+                        // it. Aiming at a moving row is exactly what this list
+                        // must not ask for.
+                        steady_rows(ui);
+                        for (i, verb) in builder.verbs.iter().enumerate() {
+                            let row = super::probe::verb_row(&probe.subject, verb, &strings);
+                            let widget = ui.selectable_label(
+                                i == builder.selected_verb,
+                                egui::RichText::new(row).monospace(),
+                            );
+                            if widget.clicked() {
+                                clicked = Some(i);
+                            }
+                            if widget.double_clicked() {
+                                clicked = Some(i);
+                                advance = true;
+                            }
+                        }
+                    });
+                if let Some(i) = clicked {
+                    builder.selected_verb = i;
+                }
+                if enter {
+                    advance = true;
+                }
+                // Choosing a capture is not the end of the dialog -- it still
+                // needs a name -- so the button says so rather than promising
+                // to add something and then asking another question.
+                let commit = match builder.verbs.get(builder.selected_verb) {
+                    Some(crate::probe::Verb::Capture) => l.next,
+                    _ => l.add_assert,
+                };
+                ui.add_space(8.0);
+                centred_row(ui, &[l.back, commit, l.copy, l.cancel], |ui| {
+                    if ui.button(l.back).clicked() {
+                        back = true;
+                    }
+                    if ui.button(commit).clicked() {
+                        advance = true;
+                    }
+                    if ui.button(l.copy).on_hover_text(l.copy_hint).clicked() {
+                        copy = Some(probe.clone());
+                    }
+                    if ui.button(l.cancel).clicked() {
+                        keep = false;
+                    }
+                });
+                if advance {
+                    match builder.verbs.get(builder.selected_verb) {
+                        Some(crate::probe::Verb::Capture) => start_capture = true,
+                        Some(other) => chosen_verb = Some(other.clone()),
+                        None => {}
+                    }
+                }
+            }
+        }
+        keep
+    });
+    // A frame egui never drew is not an answer: keep the dialog open.
+    if frame.dismissed || !frame.inner_or(true) {
+        return;
+    }
+    if let Some(probe) = copy {
+        if let Some(text) = super::probe::value_text(app, &probe) {
+            ctx.copy_text(text);
+            app.session.status = Some(crate::i18n::Status::Copied);
+        }
+    }
+    if advance
+        && builder.capture_name.is_none()
+        && builder.chosen.is_some()
+        && builder.verbs.is_empty()
+    {
+        // Just arrived on step two: work out what can be said about the value.
+        let probe = builder.chosen.clone().expect("checked above");
+        builder.verbs = crate::probe::verbs_for(&probe, selection.as_deref());
+        builder.selected_verb = 0;
+    } else if back {
+        // Back from the name field returns to the verbs, not all the way out:
+        // one step per press, like the terminal UI's Esc.
+        if builder.capture_name.take().is_none() {
+            builder.chosen = None;
+            builder.verbs.clear();
+        }
+    } else if start_capture {
+        let subject = builder.chosen.as_ref().map(|p| p.subject.clone());
+        if let Some(subject) = subject {
+            builder.name_required = false;
+            builder.capture_name = Some(super::probe::suggested_name(app, &builder, &subject));
+        }
+    } else if let Some(verb) = chosen_verb {
+        let name = builder.capture_name.clone().unwrap_or_default();
+        // An empty capture name is refused by `apply`; closing the dialog on
+        // that refusal threw away three steps of work with nothing to show for
+        // it. Keep the dialog up and flag why. Any other outcome — written, or
+        // a duplicate that is already there — is done, so close.
+        if matches!(verb, crate::probe::Verb::Capture) && name.trim().is_empty() {
+            builder.name_required = true;
+        } else {
+            super::probe::apply(app, &builder, &verb, &name);
+            return;
+        }
+    }
+    // Show which value the dialog is talking about, in the response itself.
+    // Only on a change: rewriting the field's selection every frame would take
+    // it away from anything else that touches it.
+    let showing = hovered
+        .or_else(|| builder.chosen.as_ref().map(|p| p.subject.clone()))
+        .or_else(|| {
+            builder
+                .visible()
+                .get(builder.selected)
+                .map(|p| p.subject.clone())
+        });
+    if showing != builder.highlighted
+        && let Some(subject) = showing.clone()
+    {
+        super::probe::highlight(app, ctx, &subject);
+    }
+    builder.highlighted = showing;
+    app.dialog = Some(Dialog::ProbeBuilder(builder));
+}
+
+/// The builder's labels, read out of `app` once so the dialog body can borrow
+/// the builder mutably without holding a second borrow of the app.
+struct ProbeLabels {
+    back: &'static str,
+    add_assert: &'static str,
+    add_capture: &'static str,
+    cancel: &'static str,
+    filter: &'static str,
+    name: &'static str,
+    name_required: &'static str,
+    step_subject: &'static str,
+    step_subject_hint: &'static str,
+    step_verb: &'static str,
+    step_verb_hint: &'static str,
+    step_name: &'static str,
+    step_name_hint: &'static str,
+    selected: &'static str,
+    copy: &'static str,
+    copy_hint: &'static str,
+    next: &'static str,
+}
+
+impl ProbeLabels {
+    fn new(app: &GuiApp) -> Self {
+        Self {
+            back: app.strings.gui_probe_back,
+            add_assert: app.strings.gui_probe_add_assert,
+            add_capture: app.strings.gui_probe_add_capture,
+            cancel: app.strings.gui_cancel,
+            filter: app.strings.gui_probe_filter_hint,
+            name: app.strings.probe_capture_name_title,
+            name_required: app.strings.gui_probe_name_required,
+            step_subject: app.strings.gui_probe_step_subject,
+            step_subject_hint: app.strings.gui_probe_step_subject_hint,
+            step_verb: app.strings.gui_probe_step_verb,
+            step_verb_hint: app.strings.gui_probe_step_verb_hint,
+            step_name: app.strings.gui_probe_step_name,
+            step_name_hint: app.strings.gui_probe_step_name_hint,
+            selected: app.strings.gui_probe_selected,
+            copy: app.strings.gui_probe_copy_value,
+            copy_hint: app.strings.gui_probe_copy_value_hint,
+            next: app.strings.gui_probe_next,
+        }
+    }
+}
+
+/// A step's "what am I being asked?" header: the question, then one line of
+/// what the answer will do.
+fn step_heading(ui: &mut egui::Ui, accent: egui::Color32, dim: egui::Color32, q: &str, hint: &str) {
+    ui.label(egui::RichText::new(q).strong().color(accent));
+    ui.colored_label(dim, hint);
+    ui.add_space(6.0);
+}
+
+/// The value the later steps are about, restated: by step two the list is gone,
+/// and "what did I click?" should not need the dialog to be reopened.
+fn chosen_value(
+    ui: &mut egui::Ui,
+    probe: &crate::probe::Probe,
+    lbl: &str,
+    dim: egui::Color32,
+    text: egui::Color32,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(dim, format!("{lbl}:"));
+        ui.label(
+            egui::RichText::new(crate::probe::subject_label(&probe.subject))
+                .monospace()
+                .strong()
+                .color(text),
+        );
+        let value = crate::probe::value_preview(probe.value.as_ref(), 60);
+        if !value.is_empty() {
+            ui.label(egui::RichText::new(value).monospace().color(dim));
+        }
+    });
+}
+
+/// Rows that do not move when the pointer crosses them.
+///
+/// egui expands a hovered (and a pressed) widget by a pixel, which is a nice
+/// touch on a button and unusable in a list: the row under the pointer grows,
+/// pushing every row below it down, so the thing being aimed at moves out from
+/// under the aim.
+fn steady_rows(ui: &mut egui::Ui) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.hovered.expansion = 0.0;
+    widgets.active.expansion = 0.0;
+    // A `selectable_label` is a `Button`, and a button's outline is part of
+    // what it measures. An *unselected, unhovered* row is the one state egui
+    // draws with no frame at all, so any stroke width on the others made the
+    // row grow the moment it was hovered or selected -- pushing every row
+    // below it down, under a pointer that was aiming at one of them. Both
+    // states still read clearly through their fill.
+    for state in [
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.bg_stroke.width = 0.0;
+    }
+}
+
+/// A row of buttons centred in the dialog rather than left-aligned against it.
+///
+/// egui lays a `horizontal` out from the left edge, and the width has to be
+/// known before the buttons are added to place them anywhere else -- so the
+/// labels are measured first, in the same text style the buttons will use.
+fn centred_row(ui: &mut egui::Ui, labels: &[&str], add: impl FnOnce(&mut egui::Ui)) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let padding = ui.spacing().button_padding.x * 2.0;
+    let gap = ui.spacing().item_spacing.x;
+    let width: f32 = labels
+        .iter()
+        .map(|t| {
+            let galley = ui.painter().layout_no_wrap(
+                t.to_string(),
+                font.clone(),
+                egui::Color32::PLACEHOLDER,
+            );
+            galley.size().x + padding
+        })
+        .sum::<f32>()
+        + gap * labels.len().saturating_sub(1) as f32;
+    ui.horizontal(|ui| {
+        let slack = ui.available_width() - width;
+        if slack > 0.0 {
+            ui.add_space(slack / 2.0);
+        }
+        add(ui);
+    });
+}
+
+/// Arrow-key movement over a list of `len` rows, clamped at both ends.
+///
+/// Clamped rather than wrapping: a list this short is read top to bottom, and
+/// arriving back at the top after the last row reads as a lost keypress.
+fn move_selection(selected: usize, len: usize, up: bool, down: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let mut i = selected.min(len - 1);
+    if up {
+        i = i.saturating_sub(1);
+    }
+    if down {
+        i = (i + 1).min(len - 1);
+    }
+    i
 }
 
 /// Confirm deleting a request. Gated on `confirm_on_delete_request`; the delete
@@ -981,7 +1467,13 @@ fn revert_to_saved_dialog(
             if ui.button(go).clicked() {
                 match entry {
                     Some(ei) => {
-                        app.session.collections[ci].revert_request(ei);
+                        // Declining here means the file changed under us since
+                        // the pre-check; the dialog has already been confirmed,
+                        // so the status line is the only place left to say so.
+                        app.session.status = match app.session.collections[ci].revert_request(ei) {
+                            Some(_) => Some(crate::i18n::Status::RequestReverted(name.clone())),
+                            None => Some(crate::i18n::Status::NothingToRevert),
+                        };
                     }
                     None => {
                         let _ = app.session.collections[ci].revert_workspace_file(&path);
@@ -1906,7 +2398,13 @@ fn apply_save(app: &mut GuiApp, kind: SaveKind, path: &Path) -> Result<(), Strin
         SaveKind::ReportResults | SaveKind::ReportBaseline | SaveKind::Report => None,
     };
     let text = content.ok_or_else(|| app.strings.gui_nothing_to_save.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    std::fs::write(path, text).map_err(|e| {
+        format!(
+            "{} {}",
+            app.strings.gui_could_not_write,
+            crate::shared_utils::friendly_error(&e)
+        )
+    })?;
     // Remember the path for collections/environments.
     match kind {
         SaveKind::Collection => {
@@ -1960,7 +2458,13 @@ fn export_report_results(app: &mut GuiApp, path: &str) -> Result<(), String> {
         .map(|f| f.header.clone())
         .unwrap_or_default();
     let bytes = writer.write(result, &header)?;
-    std::fs::write(path, bytes).map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+    std::fs::write(path, bytes).map_err(|e| {
+        format!(
+            "{} {}",
+            app.strings.gui_could_not_write,
+            crate::shared_utils::friendly_error(&e)
+        )
+    })?;
     if let Some(ed) = app.report_editor.as_mut() {
         ed.results_exported = true;
         // Remembered so the toolbar can offer to open it: an HTML export is
@@ -1986,7 +2490,13 @@ fn save_report_baseline(app: &mut GuiApp, path: &Path) -> Result<(), String> {
         .ok_or_else(|| app.strings.report_baseline_no_result.to_string())?;
     crate::report::Baseline::from_result(result)
         .save(path)
-        .map_err(|e| format!("{} {e}", app.strings.gui_could_not_write))?;
+        .map_err(|e| {
+            format!(
+                "{} {}",
+                app.strings.gui_could_not_write,
+                crate::shared_utils::friendly_error(&e)
+            )
+        })?;
     if let Some(ed) = app.report_editor.as_mut() {
         ed.results_exported = true;
     }
@@ -2035,7 +2545,7 @@ fn rename_dialog(app: &mut GuiApp, ctx: &egui::Context, target: RenameTarget, mu
                     if let Some(col) = app.session.collections.get_mut(ci) {
                         if let Some(entry) = col.entries.get_mut(idx) {
                             entry.title = text.clone();
-                            entry.modified = true;
+                            entry.mark_edited();
                         }
                         col.invalidate_request_json();
                     }
@@ -2303,6 +2813,303 @@ fn file_stem(path: &str) -> String {
 /// The i18n label for the `i`th editable theme colour (mirrors the terminal
 /// UI's `theme_editor::color_label`, reading the same `Strings` fields).
 use crate::theme::color_label;
+
+/// The probe builder's modal, driven through the real dialog layer with
+/// simulated clicks. Harness in [`crate::gui::probe_test_support`].
+#[cfg(test)]
+mod probe_dialog_tests {
+    use crate::gui::app::Dialog;
+    use crate::gui::probe_test_support::*;
+    use eframe::egui;
+
+    /// Clearing the suggested name and pressing Add must not throw the dialog
+    /// away: `apply` refuses an empty name, and the caller used to `return`
+    /// either way, losing three steps of work with nothing written. Now the
+    /// dialog stays up and says why.
+    #[test]
+    fn add_with_an_empty_capture_name_loses_the_dialog() {
+        let body = r#"{"token":"abc"}"#;
+        let mut app = app_with(body, vec![], 200);
+        let probe = crate::probe::probes(200, None, &[], body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, Some(probe));
+        if let Some(Dialog::ProbeBuilder(b)) = &mut app.dialog {
+            b.capture_name = Some(String::new());
+        }
+
+        dialog_frame(&mut app, &ctx, vec![]);
+        let painted = dialog_frame(&mut app, &ctx, vec![]);
+        let add = centre_of(&painted, app.strings.gui_probe_add_capture);
+        let (press, release) = click_events(add, egui::PointerButton::Primary);
+        dialog_frame(&mut app, &ctx, press);
+        dialog_frame(&mut app, &ctx, release);
+
+        let captures = app.session.collections[0].entries[0].captures.clone();
+        assert!(
+            captures.is_empty(),
+            "an empty name should not write a capture"
+        );
+        assert!(
+            app.dialog.is_some(),
+            "Add with an empty name threw the dialog away and wrote nothing"
+        );
+    }
+
+    /// One click on a row must not commit it. The list is there to be read —
+    /// picking a row and acting on it are separate, so a row can be looked at
+    /// (and highlighted in the body) before it is chosen.
+    #[test]
+    fn a_click_selects_a_row_without_choosing_it() {
+        let body = r#"{"first":"one","token":"abc"}"#;
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+
+        dialog_frame(&mut app, &ctx, vec![]);
+        let painted = dialog_frame(&mut app, &ctx, vec![]);
+        let row = centre_of(&painted, "$.token");
+        let (press, release) = click_events(row, egui::PointerButton::Primary);
+        dialog_frame(&mut app, &ctx, press);
+        dialog_frame(&mut app, &ctx, release);
+
+        let Some(Dialog::ProbeBuilder(b)) = &app.dialog else {
+            panic!("the click closed the builder");
+        };
+        assert!(
+            b.chosen.is_none(),
+            "the first click jumped straight to step two"
+        );
+        assert_eq!(
+            b.visible()
+                .get(b.selected)
+                .map(|p| crate::probe::subject_label(&p.subject)),
+            Some("$.token".to_string()),
+            "the click did not select the row it landed on"
+        );
+
+        let painted = dialog_frame(&mut app, &ctx, vec![]);
+        let next = centre_of(&painted, app.strings.gui_probe_next);
+        let (press, release) = click_events(next, egui::PointerButton::Primary);
+        dialog_frame(&mut app, &ctx, press);
+        dialog_frame(&mut app, &ctx, release);
+
+        let Some(Dialog::ProbeBuilder(b)) = &app.dialog else {
+            panic!("Next closed the builder");
+        };
+        assert_eq!(
+            b.chosen
+                .as_ref()
+                .map(|p| crate::probe::subject_label(&p.subject)),
+            Some("$.token".to_string()),
+            "Next did not take the selected row to step two"
+        );
+        assert!(!b.verbs.is_empty(), "step two has nothing to say about it");
+    }
+
+    /// Whichever value the builder is talking about is shown *in the response*,
+    /// as a real selection of the body field — so it can be seen, and copied,
+    /// rather than matched to a path by eye.
+    #[test]
+    fn the_value_under_discussion_is_highlighted_in_the_body() {
+        let body = "{\n  \"first\": \"one\",\n  \"token\": \"abc\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let probe = crate::probe::probes(200, None, &[], body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        super::super::probe::open(&mut app, &ctx, Some(probe));
+        dialog_frame(&mut app, &ctx, vec![]);
+
+        let range = egui::TextEdit::load_state(&ctx, super::super::probe::body_field_id(&app))
+            .and_then(|s| s.cursor.char_range())
+            .expect("the builder highlighted nothing")
+            .as_sorted_char_range();
+        let selected: String = body
+            .chars()
+            .skip(range.start.0)
+            .take(range.end.0 - range.start.0)
+            .collect();
+        assert_eq!(
+            selected, "\"abc\"",
+            "the highlight covers the wrong part of the body"
+        );
+    }
+
+    /// Copy value puts the bytes the server actually sent on the clipboard —
+    /// the same logic that isolates a section for an assert, reused for the
+    /// far more common "I just want this value" case.
+    #[test]
+    fn copy_value_puts_the_chosen_value_on_the_clipboard() {
+        let body = r#"{"token":"abc"}"#;
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        let probe = crate::probe::probes(200, None, &[], body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        super::super::probe::open(&mut app, &ctx, Some(probe));
+
+        dialog_frame(&mut app, &ctx, vec![]);
+        let painted = dialog_frame(&mut app, &ctx, vec![]);
+        let copy = centre_of(&painted, app.strings.gui_probe_copy_value);
+        let (press, release) = click_events(copy, egui::PointerButton::Primary);
+        dialog_frame(&mut app, &ctx, press);
+        let full = ctx.run_ui(input(release), |ui| super::show_dialog(&mut app, ui.ctx()));
+        let copied: Vec<String> = full
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::output::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            copied,
+            vec!["\"abc\"".to_string()],
+            "Copy value did not copy the value it is pointing at"
+        );
+        assert!(
+            app.dialog.is_some(),
+            "copying threw the builder away instead of leaving it up"
+        );
+    }
+
+    /// A verb row ends in a literal the server chose. A long one — a bearer
+    /// token, say — holds no space to break at, so wrapping split it right
+    /// after its opening quote and left a lone `"` on a line of its own, in a
+    /// list whose rows are supposed to read as single assert lines.
+    #[test]
+    fn a_long_value_does_not_wrap_the_verb_rows() {
+        let token = "PVmx3If8pKT2OFZttbomJuZqTdQpL3dXeNEDB5Opl0vBwXUYtjG3Mo6WkGmp";
+        let body = format!(r#"{{"token":"{token}"}}"#);
+        let mut app = app_with(&body, vec![], 200);
+        let ctx = themed_ctx();
+        let probe = crate::probe::probes(200, None, &[], &body)
+            .into_iter()
+            .find(|p| crate::probe::subject_label(&p.subject) == "$.token")
+            .unwrap();
+        super::super::probe::open(&mut app, &ctx, Some(probe));
+
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            painted = dialog_frame(&mut app, &ctx, vec![]);
+        }
+        let wrapped: Vec<String> = painted
+            .iter()
+            .filter(|(_, g)| g.text().contains("jsonpath") && g.rows.len() > 1)
+            .map(|(_, g)| g.text().to_string())
+            .collect();
+        assert!(
+            wrapped.is_empty(),
+            "an assert row wrapped onto a second line: {wrapped:?}"
+        );
+    }
+
+    /// Hovering a row must not move the rows. A list that shifts under the
+    /// pointer is unusable for aiming at anything.
+    #[test]
+    fn hovering_a_row_does_not_move_the_list() {
+        let token = "PVmx3If8pKT2OFZttbomJuZqTdQpL3dXeNEDB5Opl0vBwXUYtjG3Mo6WkGmp";
+        let body = format!(r#"{{"token":"{token}","other":"{token}"}}"#);
+        let mut app = app_with(&body, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            painted = dialog_frame(&mut app, &ctx, vec![]);
+        }
+        let before: Vec<(String, egui::Pos2)> = painted
+            .iter()
+            .map(|(p, g)| (g.text().to_string(), *p))
+            .collect();
+        let row = centre_of(&painted, "$.token");
+        let mut after = Vec::new();
+        for _ in 0..3 {
+            let p = dialog_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(row)]);
+            after = p.iter().map(|(p, g)| (g.text().to_string(), *p)).collect();
+        }
+        assert_eq!(before, after, "hovering a row moved the list");
+    }
+
+    /// Pointing at a row is enough to show its value in the response: running
+    /// the pointer down the list and watching the body is the quickest way to
+    /// tell six similar-looking tokens apart.
+    #[test]
+    fn hovering_a_row_highlights_that_value_in_the_body() {
+        let body = "{\n  \"first\": \"one\",\n  \"token\": \"abc\"\n}";
+        let mut app = app_with(body, vec![], 200);
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        super::super::probe::open(&mut app, &ctx, None);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            painted = dialog_frame(&mut app, &ctx, vec![]);
+        }
+        let row = centre_of(&painted, "$.token");
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(row)]);
+        }
+
+        let range = egui::TextEdit::load_state(&ctx, super::super::probe::body_field_id(&app))
+            .and_then(|s| s.cursor.char_range())
+            .expect("hovering highlighted nothing")
+            .as_sorted_char_range();
+        let selected: String = body
+            .chars()
+            .skip(range.start.0)
+            .take(range.end.0 - range.start.0)
+            .collect();
+        assert_eq!(
+            selected, "\"abc\"",
+            "the hovered row highlighted the wrong part of the body"
+        );
+    }
+
+    /// The subject list is a filter field over rows of monospace text with no
+    /// width cap on the path column. On a small window the dialog must still
+    /// paint inside the screen.
+    #[test]
+    fn the_builder_fits_a_small_window() {
+        let deep = format!(
+            r#"{{"{}":{{"{}":"{}"}}}}"#,
+            "a_very_long_field_name_indeed".repeat(2),
+            "another_long_nested_field_name".repeat(2),
+            "v".repeat(200)
+        );
+        let mut app = app_with(&deep, vec![], 200);
+        let ctx = themed_ctx();
+        super::super::probe::open(&mut app, &ctx, None);
+        let screen = egui::vec2(520.0, 380.0);
+        let mut painted = Vec::new();
+        for _ in 0..3 {
+            let full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), screen)),
+                    ..Default::default()
+                },
+                |ui| super::show_dialog(&mut app, ui.ctx()),
+            );
+            painted = collect(&full);
+        }
+        let overflow: Vec<(String, f32)> = painted
+            .iter()
+            .map(|(p, g)| (g.text().to_string(), p.x + g.size().x))
+            .filter(|(_, right)| *right > screen.x)
+            .collect();
+        assert!(
+            overflow.is_empty(),
+            "the builder paints past the right edge of a {}x{} window: {overflow:?}",
+            screen.x,
+            screen.y
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

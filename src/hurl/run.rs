@@ -95,6 +95,23 @@ pub struct EntryOutcome {
     pub error: Option<String>,
 }
 
+/// What [`run_hurl_streaming_with`]'s `before_entry` hook decided about the
+/// entry it was called for.
+pub enum EntrySetup {
+    /// Bind these values over the run's variables and send the request.
+    Bind(Vec<(String, String)>),
+    /// Don't send it. `reason` is reported against the entry, which is marked
+    /// failed.
+    ///
+    /// This exists for the `# [Gen]` block: a row that fails to evaluate
+    /// leaves its name unbound, and *something else* of that name -- an
+    /// environment value, a capture from an earlier request -- is then used in
+    /// its place. The request goes out looking perfectly well-formed, signed
+    /// with the wrong key, and is answered. A request whose block failed must
+    /// not be sent at all, exactly as a single send refuses it.
+    Skip { reason: String },
+}
+
 /// The mapped result of a whole run (one or more entries).
 pub struct RunOutput {
     pub entries: Vec<EntryOutcome>,
@@ -179,9 +196,27 @@ pub fn run_hurl(
     RunOutput { entries, error }
 }
 
+/// The `variable:` `[Options]` a parsed Hurl entry declares, as `(name, value)`
+/// pairs — the defaults a `# [Gen]` block is allowed to read (see the streaming
+/// runner above). Placeholder-valued definitions are rendered as written; a
+/// literal like `SAMPLE_KEY=s3cret` comes back verbatim.
+fn entry_variable_defaults(entry: &hurl_core::ast::Entry) -> Vec<(String, String)> {
+    use hurl_core::ast::OptionKind;
+    entry
+        .request
+        .options()
+        .iter()
+        .filter_map(|opt| match &opt.kind {
+            OptionKind::Variable(def) => Some((def.name.clone(), def.value.to_string())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Like [`run_hurl`], but invokes `on_entry` immediately after each request
-/// finishes, instead of only returning once the whole collection has run —
-/// so a caller (the CLI) can stream results out as they happen.
+/// finishes, instead of only returning once the whole collection has run — so a
+/// caller can stream results out as they happen — and gives `before_entry` a
+/// chance to bind extra variables just before each entry runs.
 ///
 /// Each entry runs via its own [`runner::run_entries`] call, windowed to just
 /// that one entry (`from_entry`/`to_entry`); `[Captures]` still flow from one
@@ -191,10 +226,19 @@ pub fn run_hurl(
 /// remembered from `Set-Cookie` response headers) does *not* carry across
 /// entries in this mode, since each call starts a fresh HTTP client — an
 /// explicit `[Cookies]` section on a request is unaffected either way.
-pub fn run_hurl_streaming(
+///
+/// `before_entry` is called with the entry's zero-based index and everything
+/// currently bound — the environment, plus whatever earlier entries captured —
+/// and whatever it returns is bound over the top for that entry onwards. This
+/// is how a `# [Gen]` block reaches a whole-collection run: the block belongs to
+/// one request and is evaluated per send, so it cannot be folded into the run's
+/// variables up front, and evaluating it here is also what lets a generator
+/// read a value an earlier request captured.
+pub fn run_hurl_streaming_with(
     content: &str,
     vars: &HashMap<String, String>,
     file_root: Option<&Path>,
+    mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> EntrySetup,
     mut on_entry: impl FnMut(&EntryOutcome),
 ) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
@@ -220,6 +264,54 @@ pub fn run_hurl_streaming(
     let total = hurl_file.entries.len();
 
     for i in 1..=total {
+        let mut known: HashMap<String, String> = variables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value().to_string()))
+            .collect();
+        // Layer this entry's own `[Options] variable:` rows in as defaults
+        // before the block is evaluated, so a generator can read a parameter
+        // the request declares — `sig = hmac_sha256(SAMPLE_KEY, "m")` with
+        // `[Options] variable: SAMPLE_KEY=…`. A single send does exactly this
+        // (`effective_vars_reporting` folds the defaults in first); without it
+        // the block was evaluated before Hurl applies the option, failed on the
+        // undefined name, and the request went out with a literal `{{sig}}`.
+        // Layered into a *copy* only, not into `variables`: the surviving option
+        // rows are still applied by Hurl during the run, and binding them here
+        // would leak a per-entry default into later entries.
+        for (name, value) in entry_variable_defaults(&hurl_file.entries[i - 1]) {
+            known.entry(name).or_insert(value);
+        }
+        match before_entry(i - 1, &known) {
+            EntrySetup::Bind(bindings) => {
+                for (k, v) in bindings {
+                    variables.insert(k, Value::String(v));
+                }
+            }
+            EntrySetup::Skip { reason } => {
+                // Reported as a finished, failed entry rather than as a gap:
+                // the caller's `on_entry` is what stamps the pass/fail marker
+                // and fills the per-entry response, so an entry that is simply
+                // not mentioned stays "still running" for the rest of the run.
+                // Method and URL as written (unsubstituted -- nothing was
+                // resolved for this entry) so the line printed for it still
+                // says which request it is.
+                let req = &hurl_file.entries[i - 1].request;
+                let outcome = EntryOutcome {
+                    entry_index: i - 1,
+                    method: req.method.to_string(),
+                    url: req.url.to_string(),
+                    ok: false,
+                    error: Some(reason.clone()),
+                    ..Default::default()
+                };
+                if error.is_none() {
+                    error = Some(reason);
+                }
+                on_entry(&outcome);
+                entries.push(outcome);
+                continue;
+            }
+        }
         let runner_opts = RunnerOptionsBuilder::new()
             .continue_on_error(true)
             .from_entry(Some(i))
@@ -258,7 +350,7 @@ pub fn run_hurl_streaming(
 
 /// Map one runner [`EntryResult`] to the app's [`EntryOutcome`], returning it
 /// alongside its own concise error (if any) for the caller to fold into the
-/// whole run's status. Shared by [`run_hurl`] and [`run_hurl_streaming`] so
+/// whole run's status. Shared by [`run_hurl`] and [`run_hurl_streaming_with`] so
 /// both stay in lockstep on exactly what gets surfaced from a Hurl result.
 fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<String>) {
     let (method, url) = e

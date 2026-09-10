@@ -1,6 +1,6 @@
 //! Small cross-cutting helpers that have no single obvious home module.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// An error's message with the C errno stripped, ready to show a person.
 ///
@@ -26,6 +26,30 @@ pub(crate) fn friendly_error(e: &impl std::fmt::Display) -> String {
         })
         .map(|(head, i)| head[..i].to_string());
     stripped.unwrap_or(text)
+}
+
+/// A path the app means to *write a file to*, with any trailing separator
+/// taken off.
+///
+/// `collection.hurl/` and `collection.hurl` name the same file to a human and
+/// two different things to the kernel: opening the first for writing fails with
+/// `EISDIR` however ordinary the file is, and `Path::exists` says no, so a
+/// collection that picked one up could neither be saved nor re-read nor
+/// reverted -- it simply stopped being connected to its file, with an error
+/// about a directory that is not one. A trailing separator can never be part of
+/// a file's name, so it is dropped wherever a path enters the app rather than
+/// left to fail later.
+///
+/// A path that is *only* separators (`/`) is left alone: it is the root, and
+/// there is nothing left of it to keep.
+pub(crate) fn file_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if trimmed.is_empty() || trimmed.len() == text.len() {
+        drop(text);
+        return path;
+    }
+    PathBuf::from(trimmed)
 }
 
 /// The file stem of `path` (its name without an extension), or `fallback` when

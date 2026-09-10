@@ -34,6 +34,12 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 /// Which dialog to open, together with everything it needs. Owned (rather than
 /// borrowed) because it crosses to a worker thread.
+///
+/// Its contents are only ever read by [`spawn_dialog`], which does not exist
+/// under `cfg(test)` — the suite must not put a native window in front of
+/// whoever is running it — so under test the fields are carried and never
+/// looked at. They are still what the shipped binary opens the dialog with.
+#[cfg_attr(test, allow(dead_code))]
 pub enum PickKind {
     File {
         filters: Vec<(String, Vec<String>)>,
@@ -72,7 +78,14 @@ impl<A> PendingPick<A> {
     /// callers have state to unwind when the user backs out.
     pub fn take(&mut self) -> Option<(A, Option<PathBuf>)> {
         match self.rx.try_recv() {
-            Ok(path) => Some((self.action.take()?, path)),
+            // Cleaned here because this is the one door every dialog result
+            // comes through: a chooser that hands back `collection.hurl/`
+            // otherwise leaves the caller holding a path nothing can be
+            // written to. See `shared_utils::file_path`.
+            Ok(path) => Some((
+                self.action.take()?,
+                path.map(crate::shared_utils::file_path),
+            )),
             // The worker thread vanished without answering. Treat it exactly as
             // a cancel: a lost dialog must not wedge the picker slot shut.
             Err(TryRecvError::Disconnected) => Some((self.action.take()?, None)),
@@ -163,6 +176,8 @@ pub fn owned_filters(filters: &[Filter]) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+// Only reached from `spawn_dialog`, which `cfg(test)` leaves out.
+#[cfg_attr(test, allow(dead_code))]
 fn with_owned_filters(
     mut d: rfd::FileDialog,
     filters: &[(String, Vec<String>)],
@@ -181,6 +196,8 @@ fn with_owned_filters(
 /// "all files" and adds no restrictive filter.
 pub type Filter<'a> = (&'a str, &'a [&'a str]);
 
+// Only reached from `spawn_dialog`, which `cfg(test)` leaves out.
+#[cfg_attr(test, allow(dead_code))]
 fn base(title: &str, dir: Option<&Path>) -> rfd::FileDialog {
     let mut d = rfd::FileDialog::new().set_title(title);
     // Seed the starting directory from a sensible context (the last-used file's

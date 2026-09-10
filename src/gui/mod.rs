@@ -17,6 +17,9 @@ mod filepick;
 mod icons;
 mod menu;
 mod postman;
+mod probe;
+#[cfg(test)]
+mod probe_test_support;
 mod remote;
 mod report_editor;
 mod report_run;

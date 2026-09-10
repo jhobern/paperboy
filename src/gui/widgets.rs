@@ -238,6 +238,27 @@ pub fn wrapping_field_font(
     color: Color32,
     font: egui::TextStyle,
 ) -> egui::Response {
+    wrapping_field_font_id(ui, width, text, hint, color, font, None)
+}
+
+/// [`wrapping_field_font`] with an explicit widget id.
+///
+/// A `TextEdit` with no id of its own is identified by where it lands in the
+/// layout — which is fine until a *table* of them shuffles: delete a row and
+/// the one below slides into its id, inheriting its caret and its undo history
+/// (egui keys both by widget id). Rows the user can add, delete and reorder —
+/// the `[Gen]` block — pass a stable per-row, per-request id here so a cell's
+/// history follows the row, not the slot. Everything else passes `None` and
+/// keeps the positional id it always had.
+pub fn wrapping_field_font_id(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &mut String,
+    hint: &str,
+    color: Color32,
+    font: egui::TextStyle,
+    id: Option<egui::Id>,
+) -> egui::Response {
     // A `TextEdit`'s `desired_width` is the width of the *text*: its margin is
     // added on top. Asking for the caller's width therefore claimed a few
     // pixels more than the column reserved, so a filled table laid its columns
@@ -257,15 +278,17 @@ pub fn wrapping_field_font(
         .fonts_mut(|f| f.layout(text.clone(), font_id, color, text_w).size().y)
         + TEXT_EDIT_MARGIN;
     let field = |ui: &mut egui::Ui, text: &mut String| {
-        ui.add(
-            egui::TextEdit::multiline(text)
-                .hint_text(hint)
-                .text_color(color)
-                .desired_width(text_w)
-                .desired_rows(1)
-                .return_key(None)
-                .font(font.clone()),
-        )
+        let mut edit = egui::TextEdit::multiline(text)
+            .hint_text(hint)
+            .text_color(color)
+            .desired_width(text_w)
+            .desired_rows(1)
+            .return_key(None)
+            .font(font.clone());
+        if let Some(id) = id {
+            edit = edit.id(id);
+        }
+        ui.add(edit)
     };
     flat_fields(ui, |ui| {
         // A value that fits is drawn exactly as it always was: no viewport, no
@@ -812,6 +835,761 @@ pub fn kv_editor(
 
 /// An editable table of `(name, value)` pairs without an enabled flag
 /// (captures, reports). Returns true if anything changed.
+/// A per-row anchor for a `[Gen]` cell's widget id, taken from its *neighbour*
+/// cell's text (the name cell anchors on the expression and vice versa) so that
+/// typing in a cell never changes that cell's own id. Whitespace-only text
+/// doesn't count as content — an empty neighbour falls back to the row index so
+/// two blank rows don't hash to the same id and clash.
+///
+/// `dup` is how many rows above this one have the same neighbour text, and
+/// disambiguates the case the text alone can't: two rows computing `uuid` under
+/// different names have the same expression, so their *name* cells would
+/// otherwise share an id — egui would paint a duplicate-id warning over the
+/// table and the two cells would share one caret and one undo history.
+fn neighbour_key(neighbour: &str, i: usize, dup: usize) -> egui::Id {
+    if neighbour.trim().is_empty() {
+        egui::Id::new(("row", i))
+    } else {
+        egui::Id::new(("neighbour", neighbour, dup))
+    }
+}
+
+/// The `# [Gen]` table: `Name | Expression`, with a function menu on each row
+/// and, under it, everything wrong with the block that can be known without
+/// sending anything.
+///
+/// A near-copy of [`pair_editor`] rather than a flag on it: the extra column
+/// and the fault list are most of what this draws, and the expression column is
+/// monospaced because it is code.
+pub fn computed_editor(
+    ui: &mut egui::Ui,
+    theme: &GuiTheme,
+    s: &Strings,
+    // A stable identity for the request whose block this is. The per-cell ids
+    // below hang off it so a `[Gen]` cell's caret and undo history (which egui
+    // keys by widget id) belong to *this request's* row rather than to the
+    // slot: without it, switching to another request in the list handed its
+    // first row the previous request's undo stack, and Ctrl+Z wrote one
+    // request's expression into the other.
+    req: egui::Id,
+    rows: &mut Vec<(String, String)>,
+    // The names an expression here may read: the environment's variables and
+    // the collection's captures. The rows above each one are added to these as
+    // the table is drawn -- a row can build on the ones before it, and which
+    // those are depends on where you are in the table.
+    vars: &[String],
+) -> bool {
+    let mut changed = false;
+    let mut remove: Option<usize> = None;
+    let key_w = split_key_width(ui, 42.0);
+    let x_w = remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    ui.push_id(req.with("computed"), |ui| {
+        table_rows(ui, |ui| {
+            table_row(ui, |ui| {
+                sized_header(ui, theme, s.generated_name, key_w);
+                column_header(ui, theme, s.generated_expr);
+            });
+            for i in 0..rows.len() {
+                table_row(ui, |ui| {
+                    // Per-row, per-request cell ids that follow the *row*, not
+                    // its position, so a row keeps its caret and undo history
+                    // when one above it is deleted and it slides up a slot.
+                    // Each cell is keyed by the *other* cell's text — the name
+                    // cell by the expression, the expression cell by the name —
+                    // so typing in one never moves the id of the cell being
+                    // typed in (which would drop focus every keystroke), while
+                    // still giving the row a content identity that survives a
+                    // deletion. An empty neighbour falls back to the row index
+                    // so two blank rows don't collide.
+                    let name_dup = rows[..i]
+                        .iter()
+                        .filter(|(_, e)| e.trim() == rows[i].1.trim())
+                        .count();
+                    let expr_dup = rows[..i]
+                        .iter()
+                        .filter(|(n, _)| n.trim() == rows[i].0.trim())
+                        .count();
+                    let name_anchor = neighbour_key(&rows[i].1, i, name_dup);
+                    let expr_anchor = neighbour_key(&rows[i].0, i, expr_dup);
+                    let name_id = req.with(("computed-name", name_anchor));
+                    let expr_id = req.with(("computed-expr", expr_anchor));
+                    // A name that isn't a variable Hurl will resolve, or a name
+                    // left blank beside a filled-in expression, is a row that
+                    // vanishes on save (the block only keeps readable rows), so
+                    // flag it in the error colour where it is typed rather than
+                    // letting it disappear silently.
+                    let name = rows[i].0.trim();
+                    let bad_name = (!name.is_empty() && !crate::hurl::is_variable_name(name))
+                        || (name.is_empty() && !rows[i].1.trim().is_empty());
+                    let name_color = if bad_name { theme.err } else { theme.text };
+                    let k = wrapping_field_font_id(
+                        ui,
+                        key_w,
+                        &mut rows[i].0,
+                        s.generated_name,
+                        name_color,
+                        egui::TextStyle::Body,
+                        Some(name_id),
+                    );
+                    if k.changed() {
+                        changed = true;
+                    }
+                    if bad_name {
+                        k.on_hover_text(s.gui_generated_bad_name);
+                    }
+                    // The delete ✕ is reserved before the field is sized: an
+                    // infinite-width field laid out left to right claims the
+                    // whole row and shoves it off the edge, and there is no
+                    // horizontal scrollbar to get it back.
+                    let val_w =
+                        (ui.available_width() - x_w - ui.spacing().item_spacing.x).max(40.0);
+                    // The completion list for what is being typed, worked out
+                    // *before* the field is drawn: its keys (↑↓, Enter, Esc,
+                    // Ctrl+Space) have to be taken out of the queue before the
+                    // `TextEdit` gets them, or Up and Down move the caret
+                    // instead of the selection.
+                    //
+                    // There is no button beside the field any more. A menu of
+                    // thirty-five functions was the wrong shape for the job --
+                    // you rarely want to read the whole list, you want the one
+                    // whose first three letters you can remember -- and
+                    // whatever it was labelled (`Function…`, `ƒ Insert…`, a
+                    // bare `ƒ`) it read as a command that would overwrite the
+                    // field. The field itself now offers everything the button
+                    // did: type to filter it, or ask for the lot with
+                    // Ctrl+Space or an empty cell.
+                    // The rows above this one are variables it may read; the
+                    // rows below are not (a block is evaluated top to bottom,
+                    // and `check` calls a backward reference an error), so
+                    // offering them would be offering a mistake.
+                    let mut in_scope: Vec<String> = vars.to_vec();
+                    in_scope.extend(
+                        rows[..i]
+                            .iter()
+                            .map(|(n, _)| n.trim())
+                            .filter(|n| !n.is_empty())
+                            .map(str::to_string),
+                    );
+                    let mut sugg = suggest_state(ui, s, expr_id, &rows[i].1, &in_scope);
+                    if sugg.take_keys(ui) {
+                        changed = true;
+                    }
+                    sugg.apply(ui.ctx(), expr_id, &mut rows[i].1);
+                    let field = wrapping_field_font_id(
+                        ui,
+                        val_w,
+                        &mut rows[i].1,
+                        s.gui_generated_expr_hint,
+                        theme.text,
+                        egui::TextStyle::Monospace,
+                        Some(expr_id),
+                    );
+                    if field.changed() {
+                        changed = true;
+                    }
+                    if sugg.show(ui, theme, &field, expr_id, &mut rows[i].1) {
+                        changed = true;
+                    }
+                    let hit = flat_buttons(ui, |ui| {
+                        ui.add_sized(
+                            [x_w, row_h],
+                            egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                        )
+                    });
+                    if hit.clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+        });
+    });
+    if let Some(i) = remove {
+        rows.remove(i);
+        changed = true;
+    }
+    if ui.button(s.gui_add).clicked() {
+        rows.push((String::new(), String::new()));
+        changed = true;
+    }
+    // Said here rather than at send time: a mistyped function name is a 401
+    // twenty minutes later, and this is the screen where it can still be a
+    // typo the user simply fixes.
+    let faults = crate::generators::check(rows);
+    if !faults.is_empty() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(s.gui_generated_faults)
+                .color(theme.err)
+                .strong(),
+        );
+        for line in crate::i18n::summarise_gen_errors(s, &faults) {
+            ui.label(RichText::new(line).color(theme.err));
+        }
+    }
+    changed
+}
+
+/// One row of an expression field's completion list.
+#[derive(Clone, PartialEq)]
+struct Suggestion {
+    /// What is written into the field when the row is accepted.
+    text: String,
+    kind: SuggestKind,
+    /// One line saying what it is, shown under the list for the highlighted
+    /// row. A signature says how to *call* a function and nothing about what it
+    /// does, which is the half a user reaching for `hmac_sha256_b64` already
+    /// knows.
+    note: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SuggestKind {
+    /// A function signature: accepted as a call, with its first argument
+    /// selected.
+    Signature,
+    /// A ready-made call from [`crate::generators::GenFunction::examples`],
+    /// written in as it stands.
+    Example,
+    /// A variable this row may read: an environment variable, an earlier
+    /// request's capture, or a `[Gen]` row above this one. Expressions refer to
+    /// variables by bare name, so they belong in the same list as the
+    /// functions rather than in one of their own.
+    Variable,
+}
+
+/// The state of one expression field's completion list, for the frame being
+/// drawn.
+///
+/// A struct rather than a handful of locals because the work is split either
+/// side of the field: the keys have to be taken before the `TextEdit` is added
+/// (or ↑↓ move the caret instead of the selection) while the popup can only be
+/// placed once there is a field rect to hang it under.
+#[derive(Clone)]
+struct Suggest {
+    /// The field the list belongs to.
+    id: egui::Id,
+    /// Whether the field had focus on the previous frame, which is how an
+    /// Escape that egui has already acted on is recognised (see below).
+    had_focus: bool,
+    /// The word the caret is in, which is what the list is filtered by.
+    word: String,
+    /// The rows on offer.
+    rows: Vec<Suggestion>,
+    /// Which row is highlighted.
+    sel: usize,
+    /// The word the user dismissed the list for. Kept as the *word* rather than
+    /// a flag so typing another character brings the list back: Esc means "not
+    /// for this", not "never again".
+    dismissed_for: Option<String>,
+    /// Whether the user asked for the list with Ctrl+Space, which overrides a
+    /// dismissal and shows everything regardless of what has been typed.
+    forced: bool,
+    /// A row accepted by the keyboard this frame, to write into the field
+    /// before it is drawn so the change is on screen immediately.
+    accepted: Option<Suggestion>,
+}
+
+impl Default for Suggest {
+    fn default() -> Self {
+        Self {
+            id: egui::Id::NULL,
+            had_focus: false,
+            word: String::new(),
+            rows: Vec::new(),
+            sel: 0,
+            dismissed_for: None,
+            forced: false,
+            accepted: None,
+        }
+    }
+}
+
+/// Where the caret is in the field with `id`, if egui knows.
+fn caret_of(ctx: &egui::Context, id: egui::Id) -> Option<usize> {
+    let state = egui::TextEdit::load_state(ctx, id)?;
+    state.cursor.char_range().map(|r| r.primary.index.0)
+}
+
+/// Read (and re-derive) the completion state for the expression field `id`.
+///
+/// Only ever offered while the field has focus: a list hanging under a field
+/// nobody is typing in is in the way of the row below it.
+///
+/// `vars` are the names this expression may read — the environment, the
+/// collection's captures, and the rows above this one.
+fn suggest_state(ui: &egui::Ui, s: &Strings, id: egui::Id, text: &str, vars: &[String]) -> Suggest {
+    let mut st: Suggest = ui
+        .data(|d| d.get_temp::<Suggest>(id.with("suggest")))
+        .unwrap_or_default();
+    st.accepted = None;
+    st.id = id;
+    let mut focused = ui.memory(|m| m.has_focus(id));
+    // egui takes a text field's focus away on Escape at the start of the pass,
+    // before any widget runs -- so a key consumed here is consumed too late,
+    // and the list would close only as a side effect of the field going quiet.
+    // Recognise that case from the outside (focus was here last frame, is gone
+    // this frame, and Escape was pressed) and put it back: Escape while the
+    // list is up means "not this suggestion", not "stop typing". A second
+    // Escape, with the list closed, leaves the field the usual way.
+    if !focused && st.had_focus && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.ctx().memory_mut(|m| m.request_focus(id));
+        focused = true;
+        st.dismissed_for =
+            Some(crate::generators::typed_word_at(text, caret_of(ui.ctx(), id)).prefix);
+    }
+    st.had_focus = focused;
+    if !focused {
+        st.forced = false;
+    }
+    let typed = crate::generators::typed_word_at(text, caret_of(ui.ctx(), id));
+    // The *typed* part of the word, not the whole of it: see `TypedWord`.
+    st.word = typed.prefix.clone();
+    // Nothing typed yet is a question, not a blank: an empty cell (or a caret
+    // just inside a bracket) is exactly where someone wants to be shown what
+    // there is, which is the job the ƒ menu used to do badly.
+    let browse = st.forced || st.word.is_empty();
+    st.rows = if focused {
+        suggestions(s, &typed, browse, vars)
+    } else {
+        Vec::new()
+    };
+    if st.dismissed_for.as_deref() != Some(st.word.as_str()) {
+        st.dismissed_for = None;
+    }
+    st.sel = st.sel.min(st.rows.len().saturating_sub(1));
+    st
+}
+
+/// The rows to offer for `word`: the variables it could be, then the functions.
+///
+/// Variables come first because there are a handful of them and thirty-five
+/// functions: a name the user has defined is a specific answer, and burying it
+/// under a scrolling list of the built-ins would make it unfindable.
+fn suggestions(
+    s: &Strings,
+    w: &crate::generators::TypedWord,
+    browse: bool,
+    vars: &[String],
+) -> Vec<Suggestion> {
+    let lower = w.prefix.to_ascii_lowercase();
+    let mut out: Vec<Suggestion> = vars
+        .iter()
+        .filter(|v| browse || v.to_ascii_lowercase().starts_with(&lower))
+        .map(|v| Suggestion {
+            text: v.clone(),
+            kind: SuggestKind::Variable,
+            note: s.gui_generated_var_note,
+        })
+        .collect();
+    // The same list, from the same table, as the terminal wizard's dropdown.
+    for row in
+        crate::generators::suggestions_for_word(&w.prefix, &w.whole, browse).unwrap_or_default()
+    {
+        let f = crate::generators::function_for_suggestion(row);
+        let signature = f.is_some_and(|f| f.signature == row);
+        out.push(Suggestion {
+            text: row.to_string(),
+            kind: if signature {
+                SuggestKind::Signature
+            } else {
+                SuggestKind::Example
+            },
+            note: f.map(|f| s.gen_description(f.name)).unwrap_or(""),
+        });
+    }
+    out
+}
+
+impl Suggest {
+    /// Whether the list is on screen, and so owns its keys.
+    fn open(&self) -> bool {
+        !self.rows.is_empty() && (self.forced || self.dismissed_for.is_none())
+    }
+
+    /// Take the keys the list answers to out of the queue before the field can
+    /// read them. Returns whether a row was accepted.
+    ///
+    /// Enter and Tab both accept: Enter is what the terminal wizard uses, and
+    /// Tab is what every other completion in every other editor uses. The field
+    /// is a multiline `TextEdit` with `return_key(None)`, so neither is being
+    /// stolen from anything.
+    fn take_keys(&mut self, ui: &egui::Ui) -> bool {
+        // Ctrl+Space is read whether the list is up or not -- asking for it is
+        // the one thing that has to work when it is down.
+        if self.had_focus
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Space))
+        {
+            self.forced = true;
+            self.sel = 0;
+        }
+        if !self.open() {
+            return false;
+        }
+        let n = self.rows.len();
+        let (mut down, mut up, mut accept, mut dismiss) = (false, false, false, false);
+        ui.input_mut(|i| {
+            use egui::{Key, Modifiers};
+            down = i.consume_key(Modifiers::NONE, Key::ArrowDown);
+            up = i.consume_key(Modifiers::NONE, Key::ArrowUp);
+            accept = i.consume_key(Modifiers::NONE, Key::Enter)
+                || i.consume_key(Modifiers::NONE, Key::Tab);
+            dismiss = i.consume_key(Modifiers::NONE, Key::Escape);
+        });
+        if down {
+            self.sel = (self.sel + 1) % n;
+        }
+        if up {
+            self.sel = (self.sel + n - 1) % n;
+        }
+        if dismiss {
+            self.dismissed_for = Some(self.word.clone());
+            self.forced = false;
+            // egui surrenders a text field's focus on Escape before any widget
+            // runs, so consuming the key here is not enough -- the focus has
+            // already gone by the time we see it. Ask for it back: Escape while
+            // the list is up means "not this suggestion", not "stop typing".
+            // A second Escape, with the list closed, leaves the field as usual.
+            ui.ctx().memory_mut(|m| m.request_focus(self.id));
+        }
+        if accept {
+            self.accepted = self.rows.get(self.sel).cloned();
+        }
+        self.accepted.is_some()
+    }
+
+    /// Write an accepted row into the field, before it is drawn.
+    fn apply(&mut self, ctx: &egui::Context, id: egui::Id, text: &mut String) {
+        let Some(row) = self.accepted.take() else {
+            return;
+        };
+        self.accept(ctx, id, text, &row);
+    }
+
+    /// Write `row` in, and put the list away until the user asks again.
+    fn accept(&mut self, ctx: &egui::Context, id: egui::Id, text: &mut String, row: &Suggestion) {
+        accept_suggestion(ctx, id, text, row);
+        // Focus stays in the field: the next thing to do is fill the argument
+        // in, and a completion that leaves the user to click back into the cell
+        // has done half the job.
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.rows.clear();
+        self.forced = false;
+        // The caret now sits inside the brackets, where the word is empty and
+        // the list would otherwise spring straight back up over the argument
+        // being typed. Ctrl+Space asks for it again.
+        self.dismissed_for = Some(String::new());
+    }
+
+    /// Draw the list under `field`, and act on a click. Returns whether the
+    /// text changed.
+    fn show(
+        &mut self,
+        ui: &egui::Ui,
+        theme: &GuiTheme,
+        field: &egui::Response,
+        id: egui::Id,
+        text: &mut String,
+    ) -> bool {
+        let open = self.open();
+        let mut picked: Option<Suggestion> = None;
+        let mut hovered: Option<usize> = None;
+        if open {
+            egui::Popup::from_response(field)
+                .id(id.with("suggest-popup"))
+                .open(true)
+                .align(egui::RectAlign::BOTTOM_START)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (k, row) in self.rows.iter().enumerate() {
+                                // An example is drawn dimmed and indented under
+                                // the signature it belongs to, as the terminal
+                                // wizard draws it; a variable is dimmed too,
+                                // since it is a name the user already knows
+                                // rather than one being offered to them.
+                                let label = match row.kind {
+                                    SuggestKind::Signature => RichText::new(&row.text).monospace(),
+                                    SuggestKind::Example => {
+                                        RichText::new(format!("    {}", row.text))
+                                            .monospace()
+                                            .color(theme.dim)
+                                    }
+                                    SuggestKind::Variable => {
+                                        RichText::new(&row.text).monospace().color(theme.computed)
+                                    }
+                                };
+                                let hit = ui.add(egui::Button::selectable(k == self.sel, label));
+                                // Pointing at a row selects it, as the arrow
+                                // keys do: the note and the preview under the
+                                // list describe *the* highlighted row, and a
+                                // mouse that moved the eye without moving the
+                                // highlight left them describing whatever the
+                                // keyboard last landed on.
+                                if hit.hovered() {
+                                    hovered = Some(k);
+                                }
+                                if hit.clicked() {
+                                    picked = Some(row.clone());
+                                }
+                            }
+                        });
+                    // What the highlighted row would *do to this expression*,
+                    // and what it does in general — under the list rather than
+                    // beside each row, since a note per row would triple the
+                    // width of a list whose whole job is to be scanned.
+                    //
+                    // The preview is here because the same row can replace the
+                    // word at the caret or build a call around it, depending on
+                    // what the caret is in front of and what the function can
+                    // hold. Those are good rules and impossible to guess, so
+                    // rather than explain them, show the answer: `base64` over
+                    // `uuid` reads `-> base64(uuid)` before it is accepted.
+                    // Applied before the note and preview are drawn, so a
+                    // hovered row describes itself in the same frame. The rows
+                    // above have already been painted with the old highlight;
+                    // the repaint puts that right without a visible flicker,
+                    // and without it a still mouse could sit on an unhighlighted
+                    // row indefinitely.
+                    if let Some(k) = hovered.filter(|k| *k != self.sel) {
+                        self.sel = k;
+                        ui.ctx().request_repaint();
+                    }
+                    let row = self.rows.get(self.sel);
+                    let preview = row
+                        .map(|r| preview_of(text, caret_of(ui.ctx(), id), r))
+                        .filter(|p| p != text && Some(p.as_str()) != row.map(|r| r.text.as_str()));
+                    let note = row.map(|r| r.note).filter(|n| !n.is_empty());
+                    if preview.is_some() || note.is_some() {
+                        ui.separator();
+                    }
+                    if let Some(preview) = preview {
+                        ui.label(
+                            RichText::new(format!("\u{2192} {preview}"))
+                                .monospace()
+                                .color(theme.computed),
+                        );
+                    }
+                    if let Some(note) = note {
+                        ui.label(RichText::new(note).color(theme.dim));
+                    }
+                });
+        }
+        let took = picked.is_some();
+        if let Some(row) = picked {
+            self.accept(ui.ctx(), id, text, &row);
+        }
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(id.with("suggest"), self.clone()));
+        took
+    }
+}
+
+/// What the field would read if `row` were accepted now.
+///
+/// The same edit the accept path makes, made to a copy: the list draws this
+/// under the highlighted row, and the field itself is not to be touched until
+/// the user actually chooses something.
+fn preview_of(text: &str, caret: Option<usize>, row: &Suggestion) -> String {
+    match row.kind {
+        SuggestKind::Signature => match crate::generators::function_for_suggestion(&row.text) {
+            Some(f) => insert_call(text, caret, f).0,
+            None => text.to_string(),
+        },
+        _ => splice(text, caret, &row.text).0,
+    }
+}
+
+/// Write the suggestion `row` into `text`: a signature becomes the call it
+/// describes, anything else goes in as it stands.
+fn accept_suggestion(ctx: &egui::Context, id: egui::Id, text: &mut String, row: &Suggestion) {
+    match row.kind {
+        SuggestKind::Signature => {
+            let Some(f) = crate::generators::function_for_suggestion(&row.text) else {
+                return;
+            };
+            write_call(ctx, id, text, f);
+        }
+        _ => write_text(ctx, id, text, &row.text),
+    }
+}
+
+/// Write `f`'s call into the field, replacing the word the caret is in.
+///
+/// The word is replaced rather than inserted beside: completing `sha` with
+/// `sha256` has to leave one `sha256`, not `shasha256`. With an empty word --
+/// a blank cell, or a caret just inside a bracket -- there is nothing to
+/// replace and the call is simply written where the caret is.
+fn write_call(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    f: &crate::generators::GenFunction,
+) {
+    insert_at_caret(ctx, id, text, |text, caret| insert_call(text, caret, f));
+}
+
+/// Write a ready-made call, or a variable name, into the field.
+///
+/// The same caret and undo care as [`write_call`], but the caret lands after
+/// what was written rather than inside it: these arrive complete, so the next
+/// thing to do is carry on writing the expression around them.
+fn write_text(ctx: &egui::Context, id: egui::Id, text: &mut String, call: &str) {
+    insert_at_caret(ctx, id, text, |text, caret| {
+        let (out, start, _) = splice(text, caret, call);
+        let at = start + call.chars().count();
+        (out, at, at)
+    });
+}
+
+/// The shared half of [`write_call`] and [`write_text`]: apply an edit made
+/// behind the field's back, and tell the field's own state about it.
+///
+/// Everything a field has to be told happens here:
+///
+/// * the caret — or the *selection*, since a call written in with its argument
+///   names in it leaves the first of them selected, so typing over it fills the
+///   argument in. egui keeps this per field and would otherwise leave it where
+///   it was, pointing into text that has since moved;
+/// * an undo point holding the text *before* the insert. egui only records one
+///   once the text has sat still for a moment, so a completion lands inside
+///   that window: Ctrl+Z would jump back past it to whatever was last stable —
+///   usually the empty cell — with no redo to come back by. Recording the
+///   pre-insert state makes the insert one reversible step like a typed one.
+///
+/// With no state stored — a cell never clicked into — there is no caret to
+/// insert at and no history to preserve, so the edit goes on the end.
+fn insert_at_caret(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    edit: impl Fn(&str, Option<usize>) -> (String, usize, usize),
+) {
+    use egui::text::{CCursor, CCursorRange};
+    let Some(mut state) = egui::TextEdit::load_state(ctx, id) else {
+        (*text, _, _) = edit(text, None);
+        return;
+    };
+    let range = state.cursor.char_range();
+    let at_end = CCursorRange::one(CCursor::new(text.chars().count()));
+    let mut undoer = state.undoer();
+    undoer.add_undo(&(range.unwrap_or(at_end), text.clone()));
+    state.set_undoer(undoer);
+    let (out, from, to) = edit(text, range.map(|r| r.primary.index.0));
+    *text = out;
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(from),
+        CCursor::new(to),
+    )));
+    egui::TextEdit::store_state(ctx, id, state);
+}
+
+/// Put `with` into `text` in place of the word the caret sits in, returning the
+/// new text and the range that word occupied.
+///
+/// The word is *replaced* so choosing `sha256` after typing `sha` leaves one
+/// `sha256` rather than `shasha256`, and the rest of the expression around it
+/// is untouched.
+fn splice(text: &str, caret: Option<usize>, with: &str) -> (String, usize, usize) {
+    let w = crate::generators::typed_word_at(text, caret);
+    (splice_range(text, w.start, w.end, with), w.start, w.end)
+}
+
+/// Put `with` into `text` in place of the chars in `start..end`.
+fn splice_range(text: &str, start: usize, end: usize, with: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: String = chars[..start.min(chars.len())].iter().collect();
+    out.push_str(with);
+    out.extend(chars[end.min(chars.len())..].iter());
+    out
+}
+
+/// Write `f`'s call into `text` at the caret, returning the new text and what
+/// should be selected afterwards.
+///
+/// A function that takes an argument is written with its brackets *and* the
+/// argument names from its signature — `hmac_sha256(key, text)` — with the
+/// first name selected, so typing fills it in while the rest of the call stays
+/// as a reminder of what else is wanted. An unclosed bracket would be an
+/// expression the user has to go back and finish, and the editor would call it
+/// a syntax error in the meantime. A function that takes nothing is complete as
+/// its bare name, which is how the block already reads `stamp = timestamp`.
+fn insert_call(
+    text: &str,
+    caret: Option<usize>,
+    f: &crate::generators::GenFunction,
+) -> (String, usize, usize) {
+    let mut args: Vec<String> = arg_names(f.signature)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let w = crate::generators::typed_word_at(text, caret);
+    // Text the caret was put in front of is what the call is being built
+    // *around*: `|uuid` completed with `base64` means `base64(uuid)`, not a
+    // `base64` where the `uuid` used to be. See `generators::can_wrap` for what
+    // may hold it.
+    let wrapping = crate::generators::can_wrap(f) && !w.wrapped.is_empty();
+    if wrapping {
+        // A signature with no named argument at all can still be wrapped
+        // around something if it is variadic, so there may be no placeholder
+        // to overwrite.
+        match args.first_mut() {
+            Some(first) => *first = w.wrapped.clone(),
+            None => args.push(w.wrapped.clone()),
+        }
+    }
+    // Written with its brackets when it is holding something or needs
+    // something; a function that needs nothing is complete as its bare name,
+    // which is how a block already reads `stamp = timestamp`.
+    let call = if wrapping || f.min_args > 0 {
+        format!("{}({})", f.name, args.join(", "))
+    } else {
+        f.name.to_string()
+    };
+    let end = if wrapping { w.wrap_end } else { w.end };
+    let out = splice_range(text, w.start, end, &call);
+    let start = w.start;
+    if !wrapping && f.min_args == 0 {
+        let at = start + call.chars().count();
+        return (out, at, at);
+    }
+    // The argument left to fill in, selected: the first, or -- when the first
+    // is the text just wrapped -- the next one along. With nothing left to
+    // fill in, the caret goes after the closing bracket, where the expression
+    // carries on.
+    let filled = usize::from(wrapping);
+    let Some(arg) = args.get(filled) else {
+        let at = start + call.chars().count();
+        return (out, at, at);
+    };
+    // `(` is one character past the name; each earlier argument is followed by
+    // the `, ` that `join` put in.
+    let before: usize = args[..filled].iter().map(|a| a.chars().count() + 2).sum();
+    let from = start + f.name.chars().count() + 1 + before;
+    let to = from + arg.chars().count();
+    (out, from, to)
+}
+
+/// The argument names in a signature, without the brackets that mark the
+/// optional ones: `timestamp([offset_seconds])` gives `offset_seconds`.
+///
+/// Written into the call as placeholder text, so they have to be the names the
+/// signature shows — a user who fills the first one in and stops still has a
+/// call that says what is missing.
+fn arg_names(signature: &str) -> Vec<&str> {
+    let Some(open) = signature.find('(') else {
+        return Vec::new();
+    };
+    let inner = signature[open + 1..].trim_end_matches(')');
+    inner
+        .split(',')
+        .map(|a| a.trim().trim_matches(|c| c == '[' || c == ']'))
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
 pub fn pair_editor(
     ui: &mut egui::Ui,
     theme: &GuiTheme,
@@ -2144,4 +2922,93 @@ fn shade(ctx: &egui::Context, title: &str) {
                 .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(96));
             ui.allocate_response(screen.size(), egui::Sense::click_and_drag());
         });
+}
+
+#[cfg(test)]
+mod function_menu_tests {
+    use super::{egui, insert_call};
+    use crate::generators::function;
+
+    #[test]
+    fn a_chosen_function_lands_at_the_caret_with_its_argument_selected() {
+        let f = function("sha256").expect("sha256 is a generator function");
+        // Caret between the two brackets of the outer call: the inner call is
+        // written there, not tacked onto the end.
+        let (text, from, to) = insert_call("base64()", Some(7), f);
+        assert_eq!(text, "base64(sha256(text))");
+        assert_eq!(
+            &text[from..to],
+            "text",
+            "the argument name is selected, so typing fills it in"
+        );
+    }
+
+    /// A call with more than one argument keeps the rest as a reminder of what
+    /// is wanted, with only the first selected.
+    #[test]
+    fn every_argument_is_written_in_and_the_first_is_selected() {
+        let f = function("hmac_sha256").expect("hmac_sha256 is a generator function");
+        let (text, from, to) = insert_call("", None, f);
+        assert_eq!(text, "hmac_sha256(key, message)");
+        assert_eq!(&text[from..to], "key");
+    }
+
+    #[test]
+    fn a_half_typed_name_is_replaced_rather_than_doubled() {
+        let f = function("uuid").expect("uuid is a generator function");
+        let (text, from, to) = insert_call("id = uu", Some(7), f);
+        assert_eq!(text, "id = uuid");
+        // Nothing to fill in, so the caret sits after the name and nothing is
+        // selected.
+        assert_eq!((from, to), (9, 9));
+    }
+
+    /// An edit made behind a text field's back is outside egui's own undo
+    /// bookkeeping, which only records a point once the text has been still for
+    /// a moment: without an explicit one, Ctrl+Z after choosing a function
+    /// jumped back past the insert to whatever was last stable — usually an
+    /// empty cell — and there was no redo to come back by.
+    #[test]
+    fn choosing_a_function_leaves_something_for_ctrl_z_to_undo() {
+        use egui::text::{CCursor, CCursorRange};
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("expr");
+        let mut state = egui::widgets::text_edit::TextEditState::default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(7))));
+        egui::TextEdit::store_state(&ctx, id, state);
+
+        let mut text = "base64()".to_string();
+        let f = function("sha256").expect("sha256 is a generator function");
+        super::write_call(&ctx, id, &mut text, f);
+        assert_eq!(text, "base64(sha256(text))");
+
+        let state = egui::TextEdit::load_state(&ctx, id).expect("state was stored");
+        assert_eq!(
+            state
+                .cursor
+                .char_range()
+                .map(|r| (r.secondary.index.0, r.primary.index.0)),
+            Some((14, 18)),
+            "the argument written in is selected, ready to be typed over"
+        );
+        let now = (
+            CCursorRange::one(CCursor::new(18)),
+            "base64(sha256(text))".to_string(),
+        );
+        assert_eq!(
+            state.undoer().undo(&now).map(|(_, t)| t.as_str()),
+            Some("base64()"),
+            "one undo goes back to the expression as it was"
+        );
+    }
+
+    #[test]
+    fn a_field_never_clicked_into_appends() {
+        let f = function("uuid").expect("uuid is a generator function");
+        let (text, from, to) = insert_call("", None, f);
+        assert_eq!(text, "uuid");
+        assert_eq!((from, to), (4, 4));
+    }
 }

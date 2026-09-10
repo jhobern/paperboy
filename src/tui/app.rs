@@ -161,6 +161,15 @@ pub(crate) enum PromptKind {
     /// live in the global list, not per-collection.
     EnvValue(u64, usize),
     RenameTab(usize),
+    /// Naming the variable a response-built `[Captures]` row will use (see
+    /// [`crate::tui::probe_menu`]). The collection is addressed by id rather
+    /// than tab index because the prompt outlives the menu that opened it, and
+    /// a tab reorder in between must not redirect the row.
+    ProbeCapture {
+        collection_id: u64,
+        entry: usize,
+        subject: Box<crate::probe::Subject>,
+    },
     /// Renaming a Global Environment (F2 while the Global Environments list
     /// or its entries popup is focused), addressed by env id.
     RenameEnv(u64),
@@ -550,6 +559,10 @@ pub(crate) enum Overlay {
         secret_checkbox: Option<bool>,
     },
     Browser(FileAction, Box<FileExplorer>),
+    /// The Response pane's assert/capture palette (`a`): a two-step list over
+    /// [`crate::probe`] — pick a value the reply carries, then pick what to say
+    /// about it. See [`crate::tui::probe_menu::ProbeMenu`].
+    ProbeMenu(Box<crate::tui::probe_menu::ProbeMenu>),
     NewRequest(Box<NewReq>),
     EnvVarForm(Box<EnvVarForm>),
     RemoteGit(Box<RemoteWizard>),
@@ -837,6 +850,7 @@ pub(crate) enum MouseScrollTarget {
     WizardAsserts,
     WizardCaptures,
     WizardReports,
+    WizardComputed,
     OverlayList,
     BrowserList,
     WorkspacePicker,
@@ -928,6 +942,10 @@ impl MouseHitTarget {
             MouseHitTarget::NewRequestField(NewField::Capture(..))
             | MouseHitTarget::NewRequestActivate(NewField::AddCapture) => {
                 Some(MouseScrollTarget::WizardCaptures)
+            }
+            MouseHitTarget::NewRequestField(NewField::Computed(..))
+            | MouseHitTarget::NewRequestActivate(NewField::AddComputed) => {
+                Some(MouseScrollTarget::WizardComputed)
             }
             MouseHitTarget::NewRequestField(NewField::Report(..))
             | MouseHitTarget::NewRequestActivate(NewField::AddReport) => {
@@ -1198,6 +1216,23 @@ pub struct TuiApp {
     /// Same, for the Request JSON/Hurl body; cached by `draw_collection_main`.
     /// The offset itself lives in `main_panel`.
     pub(crate) main_max_scroll: u16,
+    /// Whether the `[Captures]`/`[Asserts]`/`[Generated]` summary above the
+    /// request is folded away. `None` means nobody has said, so
+    /// `draw_collection_main` decides by size; `z` writes a `Some` and that
+    /// choice then sticks for the session.
+    pub(crate) request_meta_folded: Option<bool>,
+    /// Whether the Response panel's per-assert list is folded away. `None`
+    /// means nobody has said, so `draw_response` decides: a run where every
+    /// assert passed has nothing to read there that the `✓ 4/4` badge beside
+    /// the status does not already say, while a `✗` is the thing the reader
+    /// came for.
+    pub(crate) response_asserts_folded: Option<bool>,
+    /// What that fold came out as on the last frame, so `z` flips what is on
+    /// screen rather than re-deriving the automatic answer.
+    pub(crate) response_asserts_folded_now: bool,
+    /// What that fold actually came out as on the last frame, so `z` can flip
+    /// what the user can see instead of re-deriving the automatic answer.
+    pub(crate) request_meta_folded_now: bool,
     /// Horizontal scroll offset (in characters) for the selected entry's name in
     /// the collections list, so long request URLs can be read end-to-end.
     pub(crate) list_hscroll: u16,
@@ -1226,6 +1261,13 @@ pub struct TuiApp {
     /// The exact screen Rect the Response body was rendered into last frame,
     /// used to hit-test mouse clicks/drags against this panel.
     pub(crate) resp_text_area: Rect,
+    /// While the assert palette is open, where in the response the row under
+    /// its cursor is written — so the list can say "this one" about something
+    /// the user can see, rather than naming a path they have to find by eye.
+    /// Recomputed every frame by `draw_response` and painted afterwards, like
+    /// a selection; `None` whenever the palette is shut or the row is not
+    /// written in the section on view.
+    pub(crate) resp_probe_anchor: Option<(TextPos, TextPos)>,
     /// The Response body panel: like `main_panel`, but its wrap cache is
     /// *not* rebuilt unconditionally every frame — only when the body or
     /// panel width actually changes (`set_content` → `rebuild_if_needed`),
@@ -1527,12 +1569,17 @@ impl Default for TuiApp {
             list_filter_typing: false,
             resp_max_scroll: 0,
             main_max_scroll: 0,
+            request_meta_folded: None,
+            response_asserts_folded: None,
+            response_asserts_folded_now: false,
+            request_meta_folded_now: false,
             list_hscroll: 0,
             global_env_hscroll: 0,
             main_text_area: Rect::default(),
             main_panel: MultiSelectPanel::new(),
             main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
+            resp_probe_anchor: None,
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
             response_section: ResponseSection::Body,
@@ -1832,12 +1879,28 @@ impl TuiApp {
             self.status = Some(Status::BodyFormConflict(conflicts));
             return;
         }
+        // Refused for the same reason: a truncated `{{ api.key }}` is sent as
+        // `api` and answered, so nothing about the response says it was wrong.
+        let truncated = request::truncated_placeholders(&self.collections[col_idx]);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
+            return;
+        }
+        // A `# [Gen]` failure is said in preference to the undefined-variable
+        // report it would otherwise produce: "there is no function called
+        // hmac_sha526" is the same finding as "nothing defines sig", but
+        // actionable.
+        let gen_errors = request::generator_problems(&self.collections[col_idx], env.as_ref());
         let undefined = request::undefined_request_keys(&self.collections[col_idx], env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -1857,6 +1920,10 @@ impl TuiApp {
             self.response.clone(),
         ) {
             self.pending_captures.push(rx);
+        } else if let Some(entry) = self.collections[col_idx].entries.get_mut(selected) {
+            // No thread was started, so no completion will ever arrive: undo
+            // the in-flight mark here or the entry spins forever.
+            entry.last_run = RunStatus::Failed;
         }
     }
 
@@ -1889,12 +1956,46 @@ impl TuiApp {
             self.status = Some(Status::BodyFormConflict(conflicts));
             return;
         }
+        let truncated = request::truncated_placeholders_all(col);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
+            return;
+        }
+        let gen_errors = request::generator_problems_all(col, env.as_ref());
+        // Batch alone shares one variable set across the file, so batch alone
+        // makes two requests computing the same name settle on one value.
+        // Reported rather than refused: it is occasionally what was meant.
+        let collisions = if self.run_all_batch_mode {
+            request::generator_collisions(col)
+        } else {
+            Vec::new()
+        };
+        // Same reasoning as collisions: only batch shares one value set, so
+        // only batch drops a generator that an environment value already binds.
+        let shadows = if self.run_all_batch_mode {
+            request::generator_env_shadows(col, env.as_ref())
+        } else {
+            Vec::new()
+        };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(col_idx, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        let mut warnings = Vec::new();
+        if !gen_errors.is_empty() {
+            warnings.push(Status::GeneratorErrors(gen_errors));
+        }
+        if !collisions.is_empty() {
+            warnings.push(Status::GeneratorCollisions(collisions));
+        }
+        if !shadows.is_empty() {
+            warnings.push(Status::GeneratorShadows(shadows));
+        }
+        if !undefined.is_empty() {
+            warnings.push(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            });
+        }
+        self.status = crate::i18n::preflight_status(warnings);
         self.resp_panel.set_scroll(0);
         // A fresh response is coming; any selection painted over the old
         // one would be stale.
@@ -2100,6 +2201,11 @@ impl TuiApp {
                         .push(spawn_resolution(env_id, vec![secret]));
                 }
             }
+            PromptKind::ProbeCapture {
+                collection_id,
+                entry,
+                subject,
+            } => self.finish_probe_capture(collection_id, entry, &subject, &text),
             PromptKind::RenameEnv(env_id) => {
                 if !text.trim().is_empty()
                     && let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
@@ -2186,7 +2292,13 @@ impl TuiApp {
                             // UI-only and never written to Hurl text); preserve
                             // it from the entry being replaced.
                             parsed.user_added = entry.user_added;
-                            parsed.modified = true;
+                            // The reparsed entry is a fresh struct, so it
+                            // carries no baseline of its own: take the one
+                            // belonging to the request it replaces, or an edit
+                            // typed and untyped again would still read as
+                            // unsaved.
+                            parsed.baseline = entry.baseline.clone();
+                            parsed.mark_edited();
                             *entry = parsed;
                         }
                     }
@@ -2241,7 +2353,8 @@ impl TuiApp {
                             || entry.cookies != parsed.cookies
                             || entry.body_src != parsed.body_src;
                         if changed {
-                            parsed.modified = true;
+                            parsed.baseline = entry.baseline.clone();
+                            parsed.mark_edited();
                             *entry = parsed;
                         }
                     }
@@ -2404,6 +2517,11 @@ impl TuiApp {
         if path.is_empty() {
             return;
         }
+        // Typed by hand, so it can end in a separator -- which names no file
+        // the kernel will open. Cleaned once, here, rather than at each of the
+        // dozen actions below. See `shared_utils::file_path`.
+        let cleaned = crate::shared_utils::file_path(PathBuf::from(path));
+        let path: &str = &cleaned.to_string_lossy();
         match action {
             FileAction::SaveRequest => {
                 // `active_tab` counts collections then reports, so when a report

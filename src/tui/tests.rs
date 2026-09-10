@@ -6459,6 +6459,37 @@ fn saving_to_a_tag_that_already_exists_is_rejected_and_never_overwritten() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A refused send reports the same generator failure through two channels:
+/// the pre-flight check that saw it coming, and the response that carries the
+/// refusal. Both are on screen at once, a few rows apart, so printing the
+/// finding twice reads as two things having gone wrong.
+#[test]
+fn a_refused_send_is_only_reported_once() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let errors = vec![crate::generators::GenError::UndefinedReference {
+        name: "broken".into(),
+        reference: "nothing_defines_this".into(),
+    }];
+    let mut app = TuiApp::default();
+    app.status = Some(crate::i18n::Status::GeneratorErrors(errors.clone()));
+    {
+        let mut r = app.response.lock().unwrap();
+        r.error = "broken: nothing defines nothing_defines_this".into();
+        r.gen_errors = errors;
+    }
+
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+    let text = buffer_text(term.backend().buffer());
+
+    assert_eq!(
+        text.matches("nothing_defines_this").count(),
+        1,
+        "one failure, said once:\n{text}"
+    );
+}
+
 fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
     let area = buf.area();
     let mut out = String::new();
@@ -7749,6 +7780,109 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     assert!(
         out.contains("got"),
         "the failing assert's actual value is shown:\n{out}"
+    );
+}
+
+/// A run whose checks all passed says so in the `[Asserts] 8/8` badge; listing
+/// all eight of them underneath spends the panel repeating it, and pushes the
+/// body -- the thing that badge cannot show -- off the bottom. So the list
+/// starts folded when nothing failed, and `z` opens it.
+#[test]
+fn a_wall_of_passing_asserts_is_folded_away_from_the_response() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "the body nobody could see".into(),
+            assert_results: (0..8)
+                .map(|i| AssertOutcome {
+                    expr: format!("jsonpath \"$.field{i}\" exists"),
+                    passed: true,
+                    detail: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+    }
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+    let ci = app.active_tab;
+
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("8/8"),
+        "the badge still reports every check:\n{out}"
+    );
+    assert_eq!(
+        out.matches("jsonpath").count(),
+        0,
+        "no row per check while folded:\n{out}"
+    );
+    assert!(
+        out.contains("the body nobody could see"),
+        "the room goes to the body:\n{out}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.matches("jsonpath").count() > 1,
+        "z lists the checks:\n{out}"
+    );
+}
+
+/// The banner row is gone: the name moves to the terminal's window title and
+/// the help overlay's heading, the language tag is dropped (every other word
+/// on screen is already in that language), and the runner error joins the
+/// status message on the menu row. Three rows the request and its response get
+/// to keep.
+#[test]
+fn the_banner_row_gives_its_three_rows_to_the_body() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+    }
+    app.response.lock().unwrap().error = "the wire went nowhere".into();
+
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let t = buffer_text(term.backend().buffer());
+    let rows: Vec<&str> = t.lines().collect();
+
+    assert!(
+        !t.contains(&format!("[{}]", s.lang_english)),
+        "no language tag anywhere:\n{t}"
+    );
+    assert!(
+        rows[0].contains("the wire went nowhere"),
+        "the runner error rides the menu row:\n{t}"
+    );
+    assert!(
+        rows.iter().all(|r| !r.contains("PaperBoy")),
+        "the name is in the window title, not in a row of the layout:\n{t}"
     );
 }
 
@@ -10741,6 +10875,49 @@ fn ctrl_r_on_an_unmodified_or_scratch_request_is_a_noop() {
     ));
 }
 
+/// Ctrl+R on a request that was just added to a saved collection but never
+/// written must not offer a confirmation it can't honour: the request has no
+/// saved version of its own (its identity isn't in the file yet), so it says so
+/// plainly instead of confirming and then reporting "nothing to revert".
+#[test]
+fn ctrl_r_on_a_never_saved_new_request_says_there_is_no_saved_version() {
+    let dir = temp_dir("revnew");
+    let path = dir.join("api.hurl");
+
+    let mut app = TuiApp::default();
+    let e0 = HurlEntry::from_fields("first", "GET", "http://h/orig", vec![], "");
+    app.collections
+        .push(Collection::new("api".into(), vec![e0]));
+    app.active_tab = 1;
+    app.do_file_action(FileAction::SaveCollection, path.to_str().unwrap());
+
+    // Add a brand-new request (unstamped, so uid == 0) and edit into it. It has
+    // never been written, so there is nothing on disk to revert it to.
+    {
+        let col = &mut app.collections[1];
+        let mut fresh = HurlEntry::from_fields("brand new", "GET", "http://h/new", vec![], "");
+        fresh.modified = true;
+        col.entries.push(fresh);
+        col.selected_entry = col.entries.len() - 1;
+    }
+    app.focus = Pane::List;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(
+        app.overlay.is_none(),
+        "no confirmation is offered for a request with no saved version"
+    );
+    assert!(
+        matches!(
+            app.status,
+            Some(crate::i18n::Status::RequestHasNoSavedVersion)
+        ),
+        "it says plainly there is no saved version, status was {:?}",
+        app.status
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Ctrl+R in the entries popup reverts the whole environment to its last saved
 /// values (after confirmation): edited vars go back to the saved value and
 /// user-added vars are dropped.
@@ -12925,6 +13102,77 @@ fn cancelling_the_file_picker_restores_the_wizard_unchanged() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ── Placeholders Hurl reads differently ───────────────────────────
+
+/// `{{ api.key }}` is refused rather than sent. PaperBoy's own substitution
+/// resolves the dotted name perfectly well, so the request preview shows the
+/// right value while Hurl puts the value of `api` on the wire — a request that
+/// is answered, and wrong, with nothing anywhere to say so.
+#[test]
+fn sending_a_request_whose_placeholder_hurl_would_truncate_is_refused() {
+    let entry = HurlEntry {
+        title: "Fetch".to_string(),
+        method: "GET".to_string(),
+        url: "http://127.0.0.1:1/x?k={{ api.key }}".to_string(),
+        ..Default::default()
+    };
+
+    let mut app = TuiApp::default();
+    app.collections
+        .push(Collection::new("t".to_string(), vec![entry]));
+    app.active_tab = 1;
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+
+    match &app.status {
+        Some(crate::i18n::Status::TruncatedPlaceholders(items)) => {
+            // The message has to show what it *becomes*: the whole difficulty
+            // is that the text as written looks correct.
+            assert_eq!(items, &vec!["{{ api.key }} \u{2192} api".to_string()]);
+        }
+        other => panic!("expected the run to be refused, got {other:?}"),
+    }
+    let r = app.response.lock().unwrap();
+    assert!(
+        !r.loading,
+        "must not be left stuck loading on a request that can never be sent correctly"
+    );
+}
+
+/// The names Hurl really does carry must keep working — including its own two
+/// placeholder functions, which are not PaperBoy variables at all.
+#[test]
+fn ordinary_and_built_in_placeholder_names_are_not_refused() {
+    for url in [
+        "http://127.0.0.1:1/x?k={{api_key}}",
+        "http://127.0.0.1:1/x?k={{api-key}}",
+        "http://127.0.0.1:1/x?id={{ newUuid }}",
+    ] {
+        let entry = HurlEntry {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            ..Default::default()
+        };
+        let mut app = TuiApp::default();
+        app.collections
+            .push(Collection::new("t".to_string(), vec![entry]));
+        app.active_tab = 1;
+        app.focus = Pane::Main;
+
+        app.on_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+
+        assert!(
+            !matches!(
+                app.status,
+                Some(crate::i18n::Status::TruncatedPlaceholders(_))
+            ),
+            "{url} should be allowed through, got {:?}",
+            app.status
+        );
+    }
+}
+
 // ── Body / Form-Multipart conflict ──────────────────────────────────────
 
 /// A body plus form fields is refused before anything is sent. It used to be
@@ -13680,9 +13928,21 @@ fn ctrl_up_down_jumps_directly_between_sections() {
         "reports start empty, so the entry point is the Add row"
     );
     app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "the `# [Gen]` block starts empty too"
+    );
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
     assert_eq!(new_focus(&app), NewField::Name, "wraps back to the top");
 
     // And Ctrl+Up walks the same chain backward.
+    app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "the `# [Gen]` block starts empty too"
+    );
     app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
     assert_eq!(
         new_focus(&app),
@@ -15060,23 +15320,17 @@ fn collection_with_folders() -> Collection {
     )
 }
 
-/// The row index of the "Up" row in `col`'s current folder view.
-fn row_of_up(col: &Collection) -> usize {
+/// The row index of the folder row at `path` (a slash path) in `col`'s tree.
+fn row_of_folder(col: &Collection, path: &str) -> usize {
+    let want: Vec<String> = path.split('/').map(str::to_string).collect();
     col.rows()
         .iter()
-        .position(|r| matches!(r, crate::tree::Row::Up))
-        .expect("no Up row")
+        .position(|r| matches!(r, crate::tree::Row::Folder { path, .. } if *path == want))
+        .unwrap_or_else(|| panic!("no folder row {path:?}"))
 }
 
-/// The row index of the `Folder(name)` row in `col`'s current folder view.
-fn row_of_folder(col: &Collection, name: &str) -> usize {
-    col.rows()
-        .iter()
-        .position(|r| matches!(r, crate::tree::Row::Folder(n) if n == name))
-        .unwrap_or_else(|| panic!("no Folder({name}) row"))
-}
-
-/// The row index of the entry titled `title` in `col`'s current folder view.
+/// The row index of the entry titled `title`, which must be visible: a
+/// request inside a closed folder has no row at all.
 fn row_of_entry(col: &Collection, title: &str) -> usize {
     let idx = col
         .entries
@@ -15086,7 +15340,7 @@ fn row_of_entry(col: &Collection, title: &str) -> usize {
     col.rows()
         .iter()
         .position(|r| matches!(r, crate::tree::Row::Entry(i) if *i == idx))
-        .unwrap_or_else(|| panic!("entry {title:?} is not visible in the current folder"))
+        .unwrap_or_else(|| panic!("entry {title:?} is not visible: is its folder closed?"))
 }
 
 /// Arrow keys step through folder and entry rows alike, but `selected_entry`
@@ -15121,47 +15375,78 @@ fn arrows_step_through_folder_and_entry_rows_at_the_root() {
 }
 
 #[test]
-fn enter_descends_into_a_folder_and_backspace_ascends() {
+fn enter_expands_a_folder_in_place_and_backspace_collapses_it() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
-    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
+    let folder_row = row_of_folder(&app.collections[0], "A");
+    app.collections[0].list_cursor = folder_row;
 
     press(&mut app, KeyCode::Enter);
-    assert_eq!(
-        app.collections[0].folder,
-        vec!["A".to_string()],
-        "Enter descends into the folder"
+    assert!(
+        app.collections[0].expanded.contains(&vec!["A".to_string()]),
+        "Enter opens the folder"
     );
     assert_eq!(
-        app.collections[0].list_cursor, 0,
-        "cursor resets on entering a folder"
+        app.collections[0].list_cursor, folder_row,
+        "the folder stays where it was, so the cursor does too"
     );
     assert!(
         app.overlay.is_none(),
-        "descending into a folder must not open the wizard"
+        "opening a folder must not open the wizard"
     );
+    // Its contents are now rows of their own, drawn under it.
+    assert!(row_of_entry(&app.collections[0], "A/one") > folder_row);
 
-    // Ascend back out with Backspace (a shortcut for the Up row).
     press(&mut app, KeyCode::Backspace);
     assert!(
-        app.collections[0].folder.is_empty(),
-        "Backspace ascends back to the root"
+        app.collections[0].expanded.is_empty(),
+        "Backspace closes it again"
     );
 }
 
+/// The whole point of the tree over the old breadcrumb list: opening one
+/// folder does not close another.
 #[test]
-fn enter_on_the_up_row_ascends_to_the_parent_folder() {
+fn two_folders_can_be_open_at_the_same_time() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].entries.push(HurlEntry::from_fields(
+        "C/far",
+        "GET",
+        "http://h/far",
+        vec![],
+        "",
+    ));
     app.focus = Pane::List;
-    app.collections[0].list_cursor = row_of_up(&app.collections[0]);
 
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
+    press(&mut app, KeyCode::Enter);
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "C");
+    press(&mut app, KeyCode::Enter);
+
+    // Both sets of children are on screen at once.
+    row_of_entry(&app.collections[0], "A/one");
+    row_of_entry(&app.collections[0], "C/far");
+}
+
+/// Closing a folder shuts what was open inside it, so reopening it doesn't
+/// unfold three levels the user never asked for again.
+#[test]
+fn closing_a_folder_closes_the_folders_inside_it() {
+    let mut app = TuiApp::default();
+    app.collections[0] = collection_with_folders();
+    app.focus = Pane::List;
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0]
+        .expanded
+        .insert(vec!["A".to_string(), "B".to_string()]);
+
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A");
     press(&mut app, KeyCode::Enter);
     assert!(
-        app.collections[0].folder.is_empty(),
-        "Enter on the Up row goes back to the root"
+        app.collections[0].expanded.is_empty(),
+        "A/B closed along with A"
     );
 }
 
@@ -15169,7 +15454,7 @@ fn enter_on_the_up_row_ascends_to_the_parent_folder() {
 fn enter_on_a_request_row_inside_a_folder_still_opens_the_edit_wizard() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
     app.collections[0].list_cursor = row_of_entry(&app.collections[0], "A/one");
     app.collections[0].selected_entry = app.collections[0]
@@ -15187,7 +15472,7 @@ fn enter_on_a_request_row_inside_a_folder_still_opens_the_edit_wizard() {
 }
 
 #[test]
-fn delete_is_a_no_op_on_a_folder_or_up_row() {
+fn delete_is_a_no_op_on_a_folder_row() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
     app.focus = Pane::List;
@@ -15202,21 +15487,18 @@ fn delete_is_a_no_op_on_a_folder_or_up_row() {
         "deleting a folder row is a no-op"
     );
 
-    app.collections[0].folder = vec!["A".to_string()];
-    app.collections[0].list_cursor = row_of_up(&app.collections[0]);
+    // And on a nested folder row, reached by opening its parent.
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A/B");
     press(&mut app, KeyCode::Char('x'));
-    assert_eq!(
-        app.collections[0].entries.len(),
-        before,
-        "deleting the Up row is a no-op"
-    );
+    assert_eq!(app.collections[0].entries.len(), before);
 }
 
 #[test]
-fn delete_removes_a_request_row_while_browsing_a_folder() {
+fn delete_removes_a_request_row_inside_an_open_folder() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
     app.collections[0].list_cursor = row_of_entry(&app.collections[0], "A/one");
     app.collections[0].selected_entry = app.collections[0]
@@ -15247,7 +15529,7 @@ fn delete_removes_a_request_row_while_browsing_a_folder() {
 }
 
 #[test]
-fn requests_list_breadcrumb_shows_the_current_folder() {
+fn the_requests_list_draws_open_folders_indented_in_place() {
     use crate::i18n::{Language, Strings};
     use ratatui::{Terminal, backend::TestBackend};
     let th = super::theme::theme(&Language::English);
@@ -15255,25 +15537,38 @@ fn requests_list_breadcrumb_shows_the_current_folder() {
 
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
+    app.collections[0]
+        .expanded
+        .insert(vec!["A".to_string(), "B".to_string()]);
     app.focus = Pane::List;
 
     let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
     term.draw(|f| super::draw::draw_collection_left(f, f.area(), &app, 0, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
+    let line = |needle: &str| {
+        out.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not on screen:\n{out}"))
+            .to_string()
+    };
+    let indent = |l: &str| l.trim_start_matches(['│', ' ']).len();
+    let (a, b, deep) = (line(" A"), line(" B"), line("deep"));
     assert!(
-        out.contains("A") && out.contains("B"),
-        "the breadcrumb shows the nested folder path:\n{out}"
+        indent(&a) > indent(&b) && indent(&b) > indent(&deep),
+        "each level is drawn one step further in:\n{out}"
     );
 }
 
 #[test]
-fn new_request_prefills_the_current_folder_in_the_name_field() {
+fn new_request_prefills_the_folder_under_the_cursor_in_the_name_field() {
     let mut app = TuiApp::default();
     app.collections[0] = collection_with_folders();
-    app.collections[0].folder = vec!["A".to_string(), "B".to_string()];
+    app.collections[0].expanded.insert(vec!["A".to_string()]);
     app.focus = Pane::List;
+    // Pointing at the A/B folder row: a new request belongs in it.
+    app.collections[0].list_cursor = row_of_folder(&app.collections[0], "A/B");
 
     press(&mut app, KeyCode::Char('n'));
     match &app.overlay {
@@ -15281,7 +15576,7 @@ fn new_request_prefills_the_current_folder_in_the_name_field() {
             assert_eq!(
                 form.name.text(),
                 "A/B/",
-                "the Name field is prefilled with the current folder"
+                "the Name field is prefilled with the folder under the cursor"
             );
         }
         _ => panic!("expected the New Request form to open"),
@@ -15289,11 +15584,12 @@ fn new_request_prefills_the_current_folder_in_the_name_field() {
 }
 
 #[test]
-fn persisted_state_resyncs_the_folder_view_after_reload() {
+fn persisted_state_reopens_the_folders_around_the_selected_request() {
     // A persisted collection whose `selected_entry` points at a deeply
-    // nested request must resync `folder`/`list_cursor` on load, so the
-    // Requests list opens already browsing the right folder instead of
-    // showing the root view with a stale cursor.
+    // nested request must reopen the folders around it on load, so the
+    // Requests list shows the selected row instead of a closed tree with a
+    // stale cursor. The open set itself is never persisted -- it is derived
+    // from the selection, which is.
     let mut col = collection_with_folders();
     col.selected_entry = col
         .entries
@@ -15302,13 +15598,23 @@ fn persisted_state_resyncs_the_folder_view_after_reload() {
         .unwrap();
     // Simulate a fresh load where the view-layer fields haven't been
     // computed yet (as if freshly deserialized).
-    col.folder = vec![];
+    col.expanded.clear();
     col.list_cursor = 0;
 
     let persisted = crate::persistence::PersistedTab::from_collection(&col, None);
     let (restored, _pending) = persisted.into_collection(None);
 
-    assert_eq!(restored.folder, vec!["A".to_string(), "B".to_string()]);
+    assert!(restored.expanded.contains(&vec!["A".to_string()]));
+    assert!(
+        restored
+            .expanded
+            .contains(&vec!["A".to_string(), "B".to_string()])
+    );
+    assert_eq!(
+        restored.rows().get(restored.list_cursor),
+        Some(&crate::tree::Row::Entry(restored.selected_entry)),
+        "and the cursor is on the selected request"
+    );
 }
 
 #[test]
@@ -16720,7 +17026,6 @@ fn workspace_bound_tabs_show_the_folder_icon_in_the_tab_bar_and_list_title() {
 #[test]
 fn a_workspace_tab_advertises_the_w_shortcut_in_the_footer() {
     use crate::i18n::{Language, Strings};
-    use ratatui::{Terminal, backend::TestBackend};
     let s = Strings::for_language(&Language::English);
     let dir = workspace_temp_dir("title_hint");
     let mut col = Collection::new("my-ws".to_string(), Vec::new());
@@ -18167,8 +18472,14 @@ fn run_entry_reports_undefined_variables_without_blocking() {
         app.status
     );
     // Reported, not blocked: a literal `{{ MISSING }}` is valid Hurl to send.
+    //
+    // Asked of the receiver rather than of the `loading` flag: the send runs on
+    // a background thread that clears the flag the moment it finishes, and
+    // `192.0.2.1` fails instantly on a host with no route to it — so reading
+    // the flag is a race that loses under load. The receiver is registered by
+    // `run_entry` itself and stays put.
     assert!(
-        app.response.lock().unwrap().loading,
+        !app.pending_captures.is_empty(),
         "the request must still have been sent"
     );
 }
@@ -22665,6 +22976,514 @@ fn report_bind_without_collections_is_blocked() {
     assert!(app.overlay.is_none());
 }
 
+// ---- Computed values: the `# [Gen]` block in the request wizard ----
+
+/// Authoring a computed value end to end: reach the section, add a row, type a
+/// name and an expression, save, and find it on the entry — and in the `.hurl`
+/// the entry serialises to, since a block that only exists in memory is a
+/// block that vanishes on the next load.
+#[test]
+fn a_computed_value_authored_in_the_wizard_reaches_the_hurl_file() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    type_str(&mut app, "signed");
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "https://example.test/?n={{nonce}}");
+
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "Alt+0 opens the block"
+    );
+    press(&mut app, KeyCode::Enter); // add a row
+    assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Name));
+    type_str(&mut app, "nonce");
+    press(&mut app, KeyCode::Right); // Name -> Expression
+    type_str(&mut app, "random_hex(16)");
+    press(&mut app, KeyCode::F(2));
+
+    let entry = &app.collections[0].entries[0];
+    assert_eq!(
+        entry.generators,
+        vec![("nonce".to_string(), "random_hex(16)".to_string())]
+    );
+    let hurl = entry.to_hurl();
+    assert!(
+        hurl.contains("# [Gen] 1") && hurl.contains("# nonce = random_hex(16)"),
+        "the block is written to the file: {hurl}"
+    );
+}
+
+/// Thirty-five functions is more than anyone will remember the spelling of,
+/// and a misspelt one is only found when the request comes back 401. The
+/// expression cell offers them as you type, with their arguments named.
+#[test]
+fn the_expression_cell_suggests_generator_functions() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "hmac_sha2");
+    let dd = form_ref(&app).key_dropdown().expect("suggestions");
+    assert_eq!(
+        dd.1,
+        vec!["hmac_sha256(key, message)", "hmac_sha256_b64(key, message)"]
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let form = form_ref(&app);
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "hmac_sha256()",
+        "the signature is what is read; the call is what is typed"
+    );
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 12),
+        "the caret waits between the brackets, on the first argument"
+    );
+}
+
+/// Accepting a suggestion used to rebuild the cell's editor over the new text,
+/// which threw the undo history away with the old one: whatever had been typed
+/// before it was gone for good, with nothing left to step back to. (The
+/// wizard's table cells don't bind Ctrl+Z themselves yet — this checks the
+/// history the cell keeps, which is what such a binding would undo through.)
+#[test]
+fn accepting_a_function_leaves_the_cell_something_to_undo() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "concat(sha25");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let Some(Overlay::NewRequest(form)) = app.overlay.as_mut() else {
+        panic!("the wizard is open");
+    };
+    assert_eq!(form.generators[0].expr.text(), "concat(sha256()");
+    assert!(
+        form.generators[0].expr.undo(),
+        "there is a step to take back"
+    );
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "concat(sha25",
+        "one undo puts back what was being typed"
+    );
+}
+
+/// A function that needs no argument is complete as its bare name — a
+/// trailing `(` would be an expression the user has to go back and finish.
+#[test]
+fn accepting_a_function_that_takes_nothing_leaves_no_open_bracket() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uui");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "uuid");
+}
+
+/// An expression is not one name the way a header is, so only the word being
+/// typed may be replaced: completing inside `concat(` must leave the `concat(`
+/// alone.
+#[test]
+fn a_suggestion_replaces_only_the_word_being_typed() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "concat(sha25");
+    let dd = form_ref(&app).key_dropdown().expect("suggestions");
+    assert_eq!(dd.1, vec!["sha256(text)", "sha256_b64(text)"]);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let form = form_ref(&app);
+    assert_eq!(form.generators[0].expr.text(), "concat(sha256()");
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 14)
+    );
+}
+
+/// The dropdown has to be able to close, or it reads as the editor refusing
+/// what was typed: a name typed out in full with nothing else beginning that
+/// way has nothing left to offer.
+#[test]
+fn a_finished_function_name_closes_the_suggestions() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "iso8601");
+    assert!(form_ref(&app).key_dropdown().is_none());
+}
+
+/// A mistyped function name is a 401 twenty minutes later if nothing says so
+/// while it is still a typo. The section says it as the row is written.
+#[test]
+fn a_computed_row_that_cannot_run_says_so_while_it_is_being_typed() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "hmac_sha526(k, m)");
+    let mut term = Terminal::new(TestBackend::new(110, 34)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let painted: String = term
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        painted.contains("no function called"),
+        "expected the fault beside the section label, painted:\n{painted}"
+    );
+}
+
+/// Reach a `[Gen]` row's Expression cell in a new request.
+fn open_form_on_computed_expression(app: &mut TuiApp) {
+    press(app, KeyCode::Char('n'));
+    type_str(app, "gen");
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    press(app, KeyCode::Enter); // add a row
+    type_str(app, "value");
+    press(app, KeyCode::Right); // Name -> Expression
+    assert_eq!(new_focus(app), NewField::Computed(0, CapCol::Expr));
+}
+
+/// Completion helps someone who already knows a function is called
+/// `hmac_sha256`. Nothing in the terminal UI would *show* you the thirty-odd
+/// functions the way the GUI's function menu does, so an expression cell with
+/// nothing typed in it yet lists them all on Enter.
+#[test]
+fn an_empty_expression_cell_lists_every_function_on_enter() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    assert!(
+        form_ref(&app).key_dropdown().is_none(),
+        "the catalogue opened over the form before it was asked for"
+    );
+    press(&mut app, KeyCode::Enter);
+    let (_, sugs) = form_ref(&app)
+        .key_dropdown()
+        .expect("Enter on an empty expression cell offered nothing");
+    let listed: usize = crate::generators::FUNCTIONS
+        .iter()
+        .map(|f| 1 + f.examples.len())
+        .sum();
+    assert_eq!(
+        sugs.len(),
+        listed,
+        "the list is meant to be the whole catalogue, examples included"
+    );
+    assert_eq!(
+        new_focus(&app),
+        NewField::Computed(0, CapCol::Expr),
+        "Enter moved on instead of opening the list"
+    );
+    // And choosing one writes the call, exactly as completing a typed name does.
+    press(&mut app, KeyCode::Enter);
+    let expr = form_ref(&app).generators[0].expr.text();
+    assert!(
+        expr.starts_with(crate::generators::FUNCTIONS[0].name),
+        "picking from the catalogue wrote {expr:?}"
+    );
+}
+
+/// `date(format)` names its argument and says nothing whatever about what a
+/// format is, and the failure it produces -- "date takes 1 arguments, not 0" --
+/// says less. The catalogue therefore carries whole working calls beside the
+/// signature, and picking one writes it as it stands with the caret after it:
+/// there is no argument left to fill in.
+#[test]
+fn the_catalogue_offers_ready_made_date_formats() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    press(&mut app, KeyCode::Enter);
+    type_str(&mut app, "date");
+    let sugs = form_ref(&app).key_dropdown().expect("no matches").1;
+    let example = crate::generators::FUNCTIONS
+        .iter()
+        .find(|f| f.name == "date")
+        .expect("no date function")
+        .examples[0];
+    assert!(
+        sugs.contains(&example),
+        "the date row offered no formats at all: {sugs:?}"
+    );
+    // Down onto the signature, again onto the first example, then take it.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let row = &form_ref(&app).generators[0];
+    assert_eq!(
+        row.expr.text(),
+        example,
+        "picking a format wrote something else"
+    );
+    assert_eq!(
+        row.expr.col,
+        example.chars().count(),
+        "the caret was left inside a call that is already finished"
+    );
+}
+
+/// Typing narrows the catalogue like any other filter, and Esc means "not
+/// now" -- pressing Enter again would reopen it, but arrowing away must not.
+#[test]
+fn the_function_catalogue_narrows_as_it_is_typed_and_closes_on_escape() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    press(&mut app, KeyCode::Enter);
+    let all = form_ref(&app).key_dropdown().expect("no catalogue").1.len();
+    type_str(&mut app, "sha");
+    let narrowed = form_ref(&app).key_dropdown().expect("no matches").1;
+    assert!(
+        narrowed.len() < all && narrowed.iter().all(|sig| sig.starts_with("sha")),
+        "typing did not narrow the catalogue: {narrowed:?}"
+    );
+    press(&mut app, KeyCode::Esc);
+    assert!(form_ref(&app).key_dropdown().is_none());
+    assert!(
+        matches!(app.overlay, Some(Overlay::NewRequest(_))),
+        "Esc closed the whole form"
+    );
+}
+
+/// A half-filled row is dropped rather than saved: a name with no expression
+/// computes nothing, and an expression with no name binds nothing, so either
+/// would be a row that exists only to fail.
+#[test]
+fn a_computed_row_missing_a_half_is_not_saved() {
+    let mut app = TuiApp::default();
+    press(&mut app, KeyCode::Char('n'));
+    type_str(&mut app, "half");
+    press(&mut app, KeyCode::Tab); // -> Target
+    press(&mut app, KeyCode::Tab); // -> Method
+    press(&mut app, KeyCode::Tab); // -> Url
+    type_str(&mut app, "https://example.test/");
+    app.on_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+    press(&mut app, KeyCode::Enter);
+    type_str(&mut app, "nonce"); // name only, no expression
+    press(&mut app, KeyCode::F(2));
+    assert!(
+        app.collections[0].entries[0].generators.is_empty(),
+        "a nameless or expressionless row is not a generator"
+    );
+}
+
+/// `counter` takes a name (`min_args: 1`), so choosing it from the menu must
+/// write `counter()` with the caret between the brackets — ready for the
+/// argument — not the bare `counter` it used to write when the signature
+/// advertised zero arguments while `call` demanded one, which landed a row that
+/// could never run. The completion reads `min_args`, as the GUI does, so the
+/// two front-ends cannot disagree if a signature is reworded.
+#[test]
+fn choosing_counter_from_the_suggestions_writes_a_runnable_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "coun");
+    let sugs: Vec<&str> = crate::generators::functions_starting_with("coun")
+        .map(|f| f.signature)
+        .collect();
+    assert_eq!(sugs, vec!["counter(name)"], "the menu offers this");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    let form = form_ref(&app);
+    assert_eq!(
+        form.generators[0].expr.text(),
+        "counter()",
+        "a function that needs an argument is written with both brackets"
+    );
+    assert_eq!(
+        (form.generators[0].expr.row, form.generators[0].expr.col),
+        (0, 8),
+        "the caret waits between the brackets, on the argument"
+    );
+}
+
+/// Arrowing onto a Computed expression cell that already holds a part-typed
+/// name must not auto-open the function dropdown: if it did, the Down pressed
+/// to reach the next row would be swallowed by the list instead. Mirrors the
+/// header Key cell's behaviour, which the mouse path already had.
+#[test]
+fn arrowing_onto_a_populated_expression_cell_does_not_trap_the_arrow_keys() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "sha"); // a name still being typed, dropdown open
+    press(&mut app, KeyCode::Esc); // dismiss the list, leaving the text
+    press(&mut app, KeyCode::Down); // the list is closed, so Down leaves the cell
+    assert_eq!(new_focus(&app), NewField::AddComputed);
+    press(&mut app, KeyCode::Up); // arrow back ONTO the populated cell
+    assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Expr));
+    press(&mut app, KeyCode::Down); // meant to move on again
+    assert_eq!(
+        new_focus(&app),
+        NewField::AddComputed,
+        "Down moved into the auto-opened suggestion list instead of the next row"
+    );
+}
+
+/// After Esc dismisses the function list, typing more of the name must bring
+/// it back — the same `typed_in_key` bookkeeping the header Key cell has.
+#[test]
+fn typing_after_escaping_the_function_list_offers_suggestions_again() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "sha");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "the list is showing while the name is being typed"
+    );
+    press(&mut app, KeyCode::Esc); // dismiss it
+    assert!(form_ref(&app).key_dropdown().is_none());
+    type_str(&mut app, "2"); // keep typing: "sha2"
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "typing more of a function name must re-offer the matches"
+    );
+}
+
+/// Accepting a call leaves the caret between the brackets, with a `)` to its
+/// right. A function must still be completable there — as `gen_suggestions`'
+/// own doc promises ("completed inside `concat(upper(`") — which needs the
+/// word to be found by scanning from the caret, not back from the end of the
+/// cell (where the `)` would make the trailing word empty).
+#[test]
+fn a_function_can_be_completed_inside_an_existing_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    // Accept `base64()` from the menu: the caret lands inside it.
+    type_str(&mut app, "base6");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "base64()");
+    // Now start typing the inner function.
+    type_str(&mut app, "sha");
+    assert_eq!(form_ref(&app).generators[0].expr.text(), "base64(sha)");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "typing a function name inside an accepted call offers nothing: cell is {:?}",
+        form_ref(&app).generators[0].expr.text()
+    );
+}
+
+/// The same, for a function whose argument is *optional*. Both editors used to
+/// ask whether an argument was required rather than whether one was allowed,
+/// and so threw the expression away for `timestamp([offset_seconds])` --
+/// whose optional argument is exactly somewhere to put it.
+#[test]
+fn a_function_with_an_optional_argument_wraps_what_is_there_too() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "timestam");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "timestamp(uuid)",
+        "an optional argument is still somewhere to put the expression"
+    );
+}
+
+/// A function that takes *two* required arguments is not finished by the one
+/// the call was built around. `hmac_sha256(payload)` looked complete, read as
+/// complete, and then failed at send time with "expects 2 arguments"; the
+/// separator is written in so what is missing is visible while the expression
+/// is still on screen.
+#[test]
+fn wrapping_in_a_two_argument_function_leaves_room_for_the_second() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "payload");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "hmac_sha256");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "hmac_sha256(payload, )",
+        "the second argument the function needs has somewhere to be typed"
+    );
+    // And the caret is in that gap, so it is typed there and nowhere else.
+    type_str(&mut app, "key");
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "hmac_sha256(payload, key)"
+    );
+}
+
+/// A function that can hold nothing has nowhere to put the word, so it
+/// replaces it -- there is no other sensible answer.
+#[test]
+fn a_function_that_takes_nothing_replaces_what_is_there() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "timestamp_m");
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "timestamp_ms",
+        "nothing can be wrapped in a call that takes no arguments"
+    );
+}
+
+/// Typing in front of what is already in the cell is how a call gets built
+/// around it. The word straddling the caret is then `tuuid`, which matches no
+/// function, so the list went blank exactly when it was wanted: it filters on
+/// what has been *typed*, and what follows the caret is what the call wraps.
+#[test]
+fn typing_in_front_of_an_expression_wraps_it_in_the_accepted_call() {
+    let mut app = TuiApp::default();
+    open_form_on_computed_expression(&mut app);
+    type_str(&mut app, "uuid");
+    press(&mut app, KeyCode::Home);
+    type_str(&mut app, "base6");
+    assert!(
+        form_ref(&app).key_dropdown().is_some(),
+        "the typed prefix should filter the list, not the word around the caret"
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(
+        form_ref(&app).generators[0].expr.text(),
+        "base64(uuid)",
+        "the expression the caret was in front of is the call's argument"
+    );
+}
+
+#[test]
+fn editing_a_request_keeps_the_block_it_arrived_with() {
+    let mut app = TuiApp::default();
+    let mut entry = crate::hurl::HurlEntry {
+        method: "GET".into(),
+        url: "https://example.test/".into(),
+        title: "signed".into(),
+        ..Default::default()
+    };
+    entry.generators = vec![("stamp".to_string(), "timestamp".to_string())];
+    app.collections[0].entries.push(entry);
+    app.collections[0].selected_entry = 0;
+    app.focus = Pane::List;
+    press(&mut app, KeyCode::Enter); // opens the edit wizard on the selection
+    assert_eq!(
+        form_ref(&app).generators.len(),
+        1,
+        "the wizard loaded the existing block"
+    );
+    assert_eq!(form_ref(&app).generators[0].name.text(), "stamp");
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(
+        app.collections[0].entries[0].generators,
+        vec![("stamp".to_string(), "timestamp".to_string())],
+        "and saving without touching it changes nothing"
+    );
+}
+
 // ---- P1b: [Reports] section authoring in the request wizard ----
 
 #[test]
@@ -22694,10 +23513,12 @@ fn tab_reaches_the_reports_section_after_captures() {
     press(&mut app, KeyCode::Tab); // -> AddCapture
     press(&mut app, KeyCode::Tab); // -> AddReport
     assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::Tab); // -> AddComputed (the `# [Gen]` block)
+    assert_eq!(new_focus(&app), NewField::AddComputed);
     press(&mut app, KeyCode::Tab); // wraps back to Name
     assert_eq!(new_focus(&app), NewField::Name);
-    press(&mut app, KeyCode::BackTab); // Shift+Tab returns to AddReport
-    assert_eq!(new_focus(&app), NewField::AddReport);
+    press(&mut app, KeyCode::BackTab); // Shift+Tab returns to AddComputed
+    assert_eq!(new_focus(&app), NewField::AddComputed);
 }
 
 #[test]
@@ -30641,6 +31462,60 @@ fn ctrl_o_only_offers_to_open_an_export_that_still_describes_the_run() {
 /// The two lists index differently: a Workspace tab's `list_cursor` walks the
 /// file tree, an ordinary tab's walks the requests. Committing the wizard used
 /// to write a requests-list index into the workspace's cursor, so editing the
+fn set_form_url(app: &mut TuiApp, url: &str) {
+    match app.overlay.as_mut().unwrap() {
+        Overlay::NewRequest(f) => f.url = super::editor::Editor::new(url, false),
+        _ => panic!("New Request overlay not open"),
+    }
+}
+
+/// An edit that ends where it started leaves nothing to save, and the pencil
+/// has to go with it. The wizard used to latch `modified = true` on any
+/// difference from the request it opened on, so changing a URL and changing it
+/// back left the request marked -- and a collection marked unsaved forever,
+/// which is also how "revert" appeared not to work.
+#[test]
+fn editing_a_request_back_to_what_it_was_clears_the_pencil() {
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    let mut e = crate::hurl::HurlEntry::from_fields(
+        "Login",
+        "GET",
+        "https://example.com/a",
+        Vec::new(),
+        "",
+    );
+    // What "saved" means: the text the file holds for this request.
+    e.baseline = Some(e.to_hurl());
+    app.collections[ci].entries = vec![e];
+    app.collections[ci].selected_entry = 0;
+    app.collections[ci].list_cursor = 0;
+    app.focus = Pane::List;
+
+    // Open the wizard, change the URL, commit.
+    press(&mut app, KeyCode::Enter);
+    set_form_url(&mut app, "https://example.com/b");
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    assert!(
+        app.collections[ci].entries[0].modified,
+        "a real change is marked"
+    );
+
+    // Open it again and put the URL back.
+    press(&mut app, KeyCode::Enter);
+    set_form_url(&mut app, "https://example.com/a");
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert_eq!(
+        app.collections[ci].entries[0].url, "https://example.com/a",
+        "the edit landed"
+    );
+    assert!(
+        !app.collections[ci].entries[0].modified,
+        "and the request matches the file again, so there is nothing to save"
+    );
+}
+
 /// first request of a file jumped the selection to the workspace's first row.
 #[test]
 fn saving_an_edited_request_keeps_the_workspace_selection_on_it() {
@@ -31130,6 +32005,31 @@ fn i_steps_the_response_section_tabs_and_shift_i_steps_back() {
     );
 }
 
+/// The section tabs are a row of tabs, and Left/Right are what moves along a
+/// row of tabs everywhere else in the app. Nothing else claimed the arrows in
+/// this pane, so the obvious key does the obvious thing -- `i` was a shortcut
+/// nobody would guess.
+#[test]
+fn the_arrows_step_the_response_section_tabs() {
+    let mut app = app_with_response_headers("{}", &[("content-type", "application/json")]);
+    assert_eq!(app.response_section, ResponseSection::Body);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.response_section, ResponseSection::Headers);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(
+        app.response_section,
+        ResponseSection::Body,
+        "the left arrow steps the ring backwards"
+    );
+    // The footer teaches the arrows rather than the letter.
+    let s = Strings::for_language(&app.language);
+    let foot = render_footer(&mut app);
+    assert!(
+        foot.contains('\u{2190}') && foot.contains(s.foot_response_section),
+        "the footer does not advertise the arrows: {foot:?}"
+    );
+}
+
 /// The section keys are scoped to the Response pane, so `i` stays free for
 /// every other panel — the same rule `c` (compact) already follows.
 #[test]
@@ -31344,6 +32244,48 @@ fn ctrl_w_still_closes_the_tab_from_any_pane() {
             "Ctrl+W must still close the tab from {pane:?}"
         );
     }
+}
+
+/// The palette on `a` is the only way to reach the assert/capture builder, and
+/// a key nothing advertises is a key nobody finds — but it is only worth a
+/// footer slot while there is a response for it to read.
+#[test]
+fn the_response_footer_advertises_the_assert_palette_once_there_is_a_response() {
+    let mut app = app_with_response_body("{}");
+    app.focus = Pane::Response;
+    let s = Strings::for_language(&Language::English);
+    assert!(
+        render_footer(&mut app).contains(&format!("a {}", s.foot_probe)),
+        "the palette is advertised where it works"
+    );
+    let ci = app.active_tab;
+    app.collections[ci].entries[0].last_response = None;
+    assert!(
+        !render_footer(&mut app).contains(&format!("a {}", s.foot_probe)),
+        "and not before the request has been sent"
+    );
+}
+
+/// A request that computes values can fail before it is even sent, and its URL
+/// holds a value that does not exist yet — but the list used to show it exactly
+/// like its neighbours. The column only appears where something in the tab
+/// computes, so collections that don't keep the room for their URLs.
+#[test]
+fn the_request_list_marks_the_requests_that_compute_values() {
+    fn list_text(app: &mut TuiApp) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| super::draw::draw(f, app)).unwrap();
+        buffer_text(term.backend().buffer())
+    }
+    let mut app = app_with_response_body("{}");
+    assert!(!list_text(&mut app).contains('\u{0192}'));
+    let ci = app.active_tab;
+    app.collections[ci].entries[0].generators = vec![("nonce".into(), "uuid()".into())];
+    assert!(
+        list_text(&mut app).contains('\u{0192}'),
+        "the computing request is marked"
+    );
 }
 
 /// The footer is one line, and at 80 columns it was being truncated before it
@@ -31686,9 +32628,9 @@ fn reordering_inside_a_folder_steps_over_requests_from_other_folders() {
         entry_named("Users/List"),
         entry_named("Auth/Logout"),
     ];
-    // Browse into Auth, where the rows are Up, Login, Logout.
-    app.collections[ci].folder = vec!["Auth".into()];
-    app.collections[ci].list_cursor = 2; // Logout
+    // Open Auth, where the rows are Auth, Login, Logout, Users.
+    app.collections[ci].expanded.insert(vec!["Auth".into()]);
+    app.collections[ci].list_cursor = row_of_entry(&app.collections[ci], "Auth/Logout");
     app.collections[ci].selected_entry = 2;
     app.focus = Pane::List;
 
@@ -31824,10 +32766,11 @@ fn clearing_the_filter_follows_the_request_that_was_found() {
 
     press(&mut app, KeyCode::Esc);
 
-    assert_eq!(
-        app.collections[ci].folder,
-        vec!["Auth".to_string()],
-        "the list is now browsing the folder the match lives in"
+    assert!(
+        app.collections[ci]
+            .expanded
+            .contains(&vec!["Auth".to_string()]),
+        "the folder the match lives in has been opened around it"
     );
     assert_eq!(app.collections[ci].selected_entry, 1);
     let cursor = app.collections[ci].list_cursor;
@@ -32910,4 +33853,657 @@ fn a_reorder_undone_after_switching_workspace_files_away_and_back_clears_the_mar
     assert_eq!(app.collections[ci].unsaved_edit_count(), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(test)]
+mod wizard_undo_tests {
+    use super::*;
+
+    fn ctrl(app: &mut TuiApp, code: KeyCode, shift: bool) {
+        let mut m = KeyModifiers::CONTROL;
+        if shift {
+            m |= KeyModifiers::SHIFT;
+        }
+        app.on_key(KeyEvent::new(code, m));
+    }
+
+    /// Every other text surface in the app undoes with Ctrl+Z; the wizard's
+    /// fields bound nothing at all, which was worst where an edit isn't
+    /// something typed a character at a time — accepting a function suggestion
+    /// rewrites the cell in one go.
+    #[test]
+    fn ctrl_z_undoes_within_the_focused_wizard_cell() {
+        let mut app = TuiApp::default();
+        open_form_on_computed_expression(&mut app);
+        type_str(&mut app, "concat(sha25");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(form_ref(&app).generators[0].expr.text(), "concat(sha256()");
+
+        ctrl(&mut app, KeyCode::Char('z'), false);
+        assert_eq!(
+            form_ref(&app).generators[0].expr.text(),
+            "concat(sha25",
+            "one undo takes back the accepted suggestion"
+        );
+        ctrl(&mut app, KeyCode::Char('Z'), true);
+        assert_eq!(
+            form_ref(&app).generators[0].expr.text(),
+            "concat(sha256()",
+            "and Ctrl+Shift+Z puts it back"
+        );
+    }
+
+    /// The history is per cell, because that is where it is kept: undoing in
+    /// the cell you are in must not reach into one you have left.
+    #[test]
+    fn undo_belongs_to_the_cell_the_focus_is_in() {
+        let mut app = TuiApp::default();
+        open_form_on_computed_expression(&mut app);
+        type_str(&mut app, "uuid");
+        // Back to the Name cell of the same row and type there. (Left would
+        // only move the caret within the expression — a cell's own ←/→ step
+        // between cells at its edges, and the caret is at the end of "uuid".)
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(new_focus(&app), NewField::Computed(0, CapCol::Name));
+        type_str(&mut app, "_id");
+        ctrl(&mut app, KeyCode::Char('z'), false);
+        let form = form_ref(&app);
+        assert_eq!(
+            form.generators[0].name.text(),
+            "value",
+            "the Name cell undid the run typed into it"
+        );
+        assert_eq!(
+            form.generators[0].expr.text(),
+            "uuid",
+            "the expression beside it is untouched"
+        );
+    }
+}
+
+/// The Response pane's assert/capture palette (`a`) — the "I can see the value,
+/// make it a test" path that used to mean typing a jsonpath in by hand.
+mod probe_menu_tests {
+    use super::*;
+    use crate::tui::app::{Overlay, PromptKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A request with a JSON reply already in hand, focused on the Response
+    /// pane — the state the palette is opened from.
+    fn app_with_response(body: &str) -> TuiApp {
+        let mut app = TuiApp::default();
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry {
+            title: "Login".into(),
+            method: "POST".into(),
+            url: "https://api.test/login".into(),
+            ..Default::default()
+        });
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 201,
+            status_text: "Created".into(),
+            body: body.into(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            duration_ms: Some(120),
+            ..Default::default()
+        });
+        app.focus = Pane::Response;
+        app
+    }
+
+    fn menu(app: &TuiApp) -> &crate::tui::probe_menu::ProbeMenu {
+        match app.overlay.as_ref() {
+            Some(Overlay::ProbeMenu(m)) => m,
+            _ => panic!("expected the probe menu overlay to be open"),
+        }
+    }
+
+    /// The palette is closed on purpose, not by a key that happens to mean
+    /// something in the pane behind it: ←/→ switch response section out there,
+    /// and used to fall straight through and dismiss the list.
+    #[test]
+    fn a_key_with_nothing_to_do_leaves_the_palette_open() {
+        let mut app = app_with_response(r#"{"token":"abc"}"#);
+        press(&mut app, KeyCode::Char('a'));
+        for key in [KeyCode::Left, KeyCode::Right, KeyCode::Tab, KeyCode::Insert] {
+            press(&mut app, key);
+            assert!(
+                matches!(app.overlay, Some(Overlay::ProbeMenu(_))),
+                "{key:?} closed the palette"
+            );
+        }
+        // Including one backspace too many while clearing the filter, which
+        // is a slip rather than a decision to abandon the search.
+        type_str(&mut app, "tok");
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        assert!(
+            matches!(app.overlay, Some(Overlay::ProbeMenu(_))),
+            "backspacing past an empty filter closed the palette"
+        );
+        assert_eq!(menu(&app).filter, "", "the filter should be cleared");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.overlay.is_none(),
+            "Esc is what closes it, and it did not"
+        );
+    }
+
+    /// The collapsed headers row says how many are behind it. It said
+    /// "{0} headers" for a while: `i18n::fill` substitutes `{}` and leaves any
+    /// other brace form in the text.
+    #[test]
+    fn the_headers_row_counts_the_headers_behind_it() {
+        let mut app = app_with_response(r#"{"token":"abc"}"#);
+        let ci = app.active_tab;
+        app.collections[ci].entries[0]
+            .last_response
+            .as_mut()
+            .unwrap()
+            .headers = vec![
+            ("Content-Type".into(), "application/json".into()),
+            ("X-Request-Id".into(), "r-42".into()),
+        ];
+        press(&mut app, KeyCode::Char('a'));
+        let s = crate::i18n::Strings::for_language(&app.language);
+        let row = menu(&app)
+            .visible()
+            .into_iter()
+            .find(|r| r.label(&s) == s.probe_headers_group)
+            .expect("the headers group row should be listed");
+        assert_eq!(row.value(40, &s), "2 headers — Enter to list them");
+    }
+
+    /// The palette lists paths; the response shows text. The row under the
+    /// cursor is marked where the pane is showing it, so "this one" is
+    /// something the user can see rather than a path to find by eye.
+    #[test]
+    fn the_row_under_the_cursor_is_marked_in_the_response() {
+        use ratatui::style::Modifier;
+        let mut app = app_with_response("{\n  \"first\": \"aaa\",\n  \"token\": \"zzz\"\n}");
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "token");
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let marked: String = {
+            let area = *buf.area();
+            let mut out = String::new();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    if cell.modifier.contains(Modifier::UNDERLINED) {
+                        out.push_str(cell.symbol());
+                    }
+                }
+            }
+            out
+        };
+        assert!(
+            marked.contains("\"zzz\""),
+            "the value the palette is pointing at was not marked; marked: {marked:?}"
+        );
+        assert!(
+            !marked.contains("aaa"),
+            "a value the palette is not pointing at was marked: {marked:?}"
+        );
+        // And nothing is marked once the palette is shut.
+        press(&mut app, KeyCode::Esc);
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        assert!(
+            app.resp_probe_anchor.is_none(),
+            "the mark outlived the palette"
+        );
+    }
+
+    #[test]
+    fn pointing_at_a_value_writes_the_assert_for_it() {
+        let mut app = app_with_response(r#"{"token":"abc","user":{"id":7}}"#);
+        press(&mut app, KeyCode::Char('a'));
+        // Type the field name to bring it to the top, exactly as the hint says.
+        type_str(&mut app, "token");
+        assert_eq!(
+            crate::probe::subject_label(&menu(&app).choice().unwrap().subject),
+            "$.token"
+        );
+        press(&mut app, KeyCode::Enter);
+        // Step two offers the value that actually came back, first.
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.asserts, [r#"jsonpath "$.token" == "abc""#]);
+        assert!(entry.modified);
+        assert!(app.overlay.is_none());
+    }
+
+    /// The status has a line of its own in Hurl, so choosing it must not add a
+    /// second, competing claim in `[Asserts]`.
+    #[test]
+    fn the_status_goes_on_the_http_line_not_into_asserts() {
+        let mut app = app_with_response("{}");
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "status");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.expected_status, Some(201));
+        assert!(entry.asserts.is_empty());
+    }
+
+    #[test]
+    fn capturing_asks_for_a_name_and_suggests_one_from_the_field() {
+        let mut app = app_with_response(r#"{"data":{"access_token":"ey.."}}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "access_token");
+        press(&mut app, KeyCode::Enter);
+        // Walk to the capture row, which is always last.
+        let rows = menu(&app).verbs.len();
+        for _ in 0..rows {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        match app.overlay.as_ref() {
+            Some(Overlay::Prompt { kind, editor, .. }) => {
+                assert!(matches!(kind, PromptKind::ProbeCapture { .. }));
+                assert_eq!(editor.text(), "access_token");
+            }
+            _ => panic!("expected the capture-name prompt to be open"),
+        }
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(
+            entry.captures,
+            [(
+                "access_token".to_string(),
+                "jsonpath \"$.data.access_token\"".to_string()
+            )]
+        );
+        assert!(entry.modified);
+    }
+
+    /// Esc backs out one decision at a time: "not that assert, but still an
+    /// assert" is the common correction, and closing the whole palette would
+    /// mean re-finding the field.
+    #[test]
+    fn escape_steps_back_to_the_value_list_before_closing() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "$.a");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(menu(&app).step, crate::tui::probe_menu::ProbeStep::PickVerb);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            menu(&app).step,
+            crate::tui::probe_menu::ProbeStep::PickSubject
+        );
+        // The filter survives the step back, so the list is where it was.
+        assert_eq!(menu(&app).filter, "$.a");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.overlay.is_none());
+    }
+
+    /// Every row is derived from a reply; without one the palette would be an
+    /// empty box with no explanation.
+    #[test]
+    fn there_is_nothing_to_build_from_before_the_request_is_sent() {
+        let mut app = app_with_response("{}");
+        let ci = app.active_tab;
+        app.collections[ci].entries[0].last_response = None;
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.overlay.is_none());
+        // Not the generic "no response to save": the palette says what the
+        // user has to do next, which is send the request.
+        assert!(matches!(app.status, Some(Status::ProbeNoResponse)));
+    }
+
+    /// A letter on step two has nothing to do, and doing nothing is the whole
+    /// point: it used to fall into the cancel arm, throwing away the field the
+    /// user had just hunted down *and* leaking the next keystroke into the main
+    /// view, where typing "contains" out of habit opened the New Request
+    /// wizard on the `n`.
+    #[test]
+    fn a_letter_on_the_verb_list_is_ignored_rather_than_closing_the_palette() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "$.a");
+        press(&mut app, KeyCode::Enter);
+        let before = menu(&app).selected;
+        for c in "contains".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(menu(&app).step, crate::tui::probe_menu::ProbeStep::PickVerb);
+        assert_eq!(menu(&app).selected, before, "the pick is where it was");
+        // Nothing leaked past the overlay: no wizard, no new request.
+        assert_eq!(app.collections[app.active_tab].entries.len(), 1);
+        // Esc still backs out one step, then closes.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            menu(&app).step,
+            crate::tui::probe_menu::ProbeStep::PickSubject
+        );
+    }
+
+    /// Capturing a field that is already captured offers the name it already
+    /// has. The old suggestion dodged the taken name (`token_2`) and wrote the
+    /// same jsonpath twice under two names, which nobody means to do.
+    #[test]
+    fn capturing_the_same_field_twice_offers_the_name_it_already_has() {
+        let mut app = app_with_response(r#"{"data":{"access_token":"ey.."}}"#);
+        let capture = |app: &mut TuiApp| {
+            press(app, KeyCode::Char('a'));
+            type_str(app, "access_token");
+            press(app, KeyCode::Enter);
+            let rows = menu(app).verbs.len();
+            for _ in 0..rows {
+                press(app, KeyCode::Down);
+            }
+            press(app, KeyCode::Enter);
+        };
+        capture(&mut app);
+        press(&mut app, KeyCode::Enter);
+        capture(&mut app);
+        match app.overlay.as_ref() {
+            Some(Overlay::Prompt { editor, .. }) => assert_eq!(editor.text(), "access_token"),
+            _ => panic!("expected the capture-name prompt to be open"),
+        }
+        press(&mut app, KeyCode::Enter);
+        let entry = &app.collections[app.active_tab].entries[0];
+        assert_eq!(entry.captures.len(), 1, "one row, not two aliases");
+        assert!(matches!(app.status, Some(Status::ProbeAlreadyThere)));
+    }
+
+    /// Choosing the same assert twice is a no-op that says so — silently doing
+    /// nothing reads as a broken key.
+    #[test]
+    fn the_same_assert_is_not_added_twice() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Char('a'));
+            type_str(&mut app, "$.a");
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(app.collections[app.active_tab].entries[0].asserts.len(), 1);
+        assert!(matches!(app.status, Some(Status::ProbeAlreadyThere)));
+    }
+
+    /// A reply that isn't JSON still has a status, headers and its own text.
+    #[test]
+    fn a_non_json_reply_falls_back_to_the_headers_and_the_text() {
+        let mut app = app_with_response("<html>nope</html>");
+        let s = Strings::for_language(&app.language);
+        press(&mut app, KeyCode::Char('a'));
+        let labels: Vec<String> = menu(&app).visible().iter().map(|r| r.label(&s)).collect();
+        assert!(labels.contains(&s.probe_headers_group.to_string()));
+        assert!(labels.contains(&"body".to_string()));
+        assert!(!labels.iter().any(|l| l.starts_with('$')));
+    }
+
+    /// A reply carries a dozen headers nobody opened the palette for, and
+    /// listed flat they push the body off the bottom of the box. They collapse
+    /// to one row that opens them, and Esc closes that list again rather than
+    /// the whole palette.
+    #[test]
+    fn the_headers_collapse_to_one_row_that_opens_them() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        let s = Strings::for_language(&app.language);
+        press(&mut app, KeyCode::Char('a'));
+        let labels = |app: &TuiApp| -> Vec<String> {
+            menu(app).visible().iter().map(|r| r.label(&s)).collect()
+        };
+        assert!(
+            !labels(&app).iter().any(|l| l.starts_with("header ")),
+            "the headers were listed flat: {:?}",
+            labels(&app)
+        );
+        let group = labels(&app)
+            .iter()
+            .position(|l| l == s.probe_headers_group)
+            .expect("no row to open the headers with");
+        for _ in 0..group {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            labels(&app).iter().all(|l| l.starts_with("header ")),
+            "opening the group showed something other than headers: {:?}",
+            labels(&app)
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.overlay.is_some(),
+            "Esc closed the palette instead of the header list"
+        );
+        assert!(labels(&app).iter().any(|l| l.starts_with('$')));
+    }
+
+    /// Someone who types a header's name knows what they want: the filter
+    /// reaches headers without the group having to be opened first.
+    #[test]
+    fn typing_a_header_name_finds_it_without_opening_the_group() {
+        let mut app = app_with_response(r#"{"a":1}"#);
+        let s = Strings::for_language(&app.language);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "content-type");
+        let labels: Vec<String> = menu(&app).visible().iter().map(|r| r.label(&s)).collect();
+        assert_eq!(labels, vec!["header Content-Type".to_string()]);
+    }
+
+    /// A list taller than the box scrolls, and a list that scrolls with no sign
+    /// of it reads as the whole list — "that field isn't offered" instead of
+    /// "keep pressing Down".
+    #[test]
+    fn a_scrolling_subject_list_says_where_in_it_the_cursor_is() {
+        let body = format!(
+            "{{{}}}",
+            (0..40)
+                .map(|i| format!("\"f{i}\":{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut app = app_with_response(&body);
+        press(&mut app, KeyCode::Char('a'));
+        let total = menu(&app).row_count();
+        let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains(&format!("1/{total}")), "{text}");
+        press(&mut app, KeyCode::Down);
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains(&format!("2/{total}")), "{text}");
+        // A list that fits says nothing, so the short cases stay quiet.
+        let mut small = app_with_response(r#"{"a":1}"#);
+        press(&mut small, KeyCode::Char('a'));
+        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut small))
+            .unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(!text.contains("1/"), "{text}");
+    }
+
+    /// The palette draws both columns, so a row settles "is this the field I
+    /// mean?" without opening it.
+    #[test]
+    fn the_list_shows_each_value_beside_its_path() {
+        let mut app = app_with_response(r#"{"token":"abcdef"}"#);
+        press(&mut app, KeyCode::Char('a'));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| crate::tui::draw::draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("$.token"), "{text}");
+        assert!(text.contains("abcdef"), "{text}");
+    }
+}
+
+/// A request with a lot of asserts describes itself more than it shows itself:
+/// the sections above the divider grow without limit while the request they
+/// describe is squeezed into whatever is left. They start folded to a counted
+/// summary, which still says the asserts are there.
+#[test]
+fn a_wall_of_asserts_is_folded_away_above_the_request() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/wall".into(),
+        title: "Demo".into(),
+        asserts: (0..20)
+            .map(|i| format!("jsonpath \"$.field{i}\" exists"))
+            .collect(),
+        ..Default::default()
+    }];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let folded = buffer_text(term.backend().buffer());
+    // The rows also exist in the Hurl text below the divider, so the question
+    // is never "is this string on screen" but "is it listed twice".
+    let listed = |t: &str| t.matches("$.field0").count();
+    assert_eq!(
+        listed(&folded),
+        1,
+        "twenty asserts should not be summarised above the request as well:\n{folded}"
+    );
+    assert!(
+        folded.contains("[Asserts] 20"),
+        "the fold still says how many there are:\n{folded}"
+    );
+    assert!(
+        folded.contains("http://example.com/wall"),
+        "the request itself is still on screen:\n{folded}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let open = buffer_text(term.backend().buffer());
+    assert!(
+        !open.contains("[Asserts] 20"),
+        "z unfolds the summary again:\n{open}"
+    );
+    assert!(
+        open.contains("jsonpath \"$.field0\" exists"),
+        "and the rows are listed with it:\n{open}"
+    );
+    // More rows than the pane will give them: the ones that didn't fit are
+    // counted rather than just stopping.
+    assert!(
+        open.contains("… +"),
+        "an unfolded list too long for the pane says how much is missing:\n{open}"
+    );
+}
+
+/// Even a single row starts folded -- a summary that opened itself when small
+/// would have a height nobody could predict -- and the footer says which way
+/// `z` will go, since a fold nothing advertises is a fold nobody finds.
+#[test]
+fn even_one_capture_starts_folded_and_the_footer_offers_z() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    app.collections[ci].entries = vec![HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/small".into(),
+        title: "Demo".into(),
+        captures: vec![("token".into(), "jsonpath \"$.token\"".into())],
+        ..Default::default()
+    }];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let folded = buffer_text(term.backend().buffer());
+    let s = crate::i18n::Strings::for_language(&app.language);
+    // The capture also exists in the Hurl text below the divider, so the
+    // question is never "is it on screen" but "is it listed twice".
+    let listed = |t: &str| t.matches("$.token").count();
+    assert!(
+        folded.contains("[Captures] 1"),
+        "the fold starts closed, counted:\n{folded}"
+    );
+    assert_eq!(
+        listed(&folded),
+        1,
+        "the row itself is not summarised above the request:\n{folded}"
+    );
+    assert!(
+        folded.contains(&format!("z {}", s.foot_meta_show)),
+        "the footer offers to show it:\n{folded}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let open = buffer_text(term.backend().buffer());
+    assert_eq!(listed(&open), 2, "z shows the row:\n{open}");
+    assert!(
+        open.contains(&format!("z {}", s.foot_meta_hide)),
+        "and the footer now offers to hide it again:\n{open}"
+    );
+}
+
+/// A `# [Gen]` block is the request's pre-script wearing a comment's clothes:
+/// the file has to spell it that way to stay runnable by `hurl` itself, but the
+/// view shouldn't leave it reading as somebody's prose. It is summarised with
+/// the captures and asserts above the divider, and coloured as a section below
+/// it -- `#` and all, so a copy of the pane is still valid Hurl.
+#[test]
+fn hurl_view_shows_the_generated_block_as_a_section() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with(|a| {
+        a.default_request_view = RequestView::Hurl;
+    });
+    let ci = app.active_tab;
+    let entry = HurlEntry {
+        method: "GET".into(),
+        url: "http://example.com/path".into(),
+        title: "Demo".into(),
+        generators: vec![("page".into(), "counter(\"page\")".into())],
+        ..Default::default()
+    };
+    app.collections[ci].entries = vec![entry];
+    app.focus = Pane::Main;
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text = buffer_text(&buf);
+    let s = crate::i18n::Strings::for_language(&app.language);
+    assert!(
+        text.contains(&format!("[{}]", s.field_generated)),
+        "the generated rows are summarised like the captures:\n{text}"
+    );
+    assert!(
+        text.contains("page = counter(\"page\")"),
+        "the summary names the value and how it is worked out:\n{text}"
+    );
+    assert!(
+        text.contains("# [Gen] 1"),
+        "the raw text keeps the comment form the file uses:\n{text}"
+    );
+    let th = app.theme();
+    assert_eq!(
+        fg_at_substr(&buf, "# [Gen] 1"),
+        Some(th.computed),
+        "the block marker is coloured as a section, not left as plain text:\n{text}"
+    );
+    assert_eq!(
+        fg_at_substr(&buf, "# page = "),
+        Some(th.computed),
+        "the block's rows are coloured with it:\n{text}"
+    );
+    assert_ne!(
+        fg_at_substr(&buf, "# Demo"),
+        Some(th.computed),
+        "an ordinary comment is still an ordinary comment:\n{text}"
+    );
 }

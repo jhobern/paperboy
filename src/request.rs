@@ -3,7 +3,9 @@
 //! building / running, so both front-ends behave identically.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,10 +16,11 @@ use serde_json::Value;
 
 use crate::collection::Collection;
 use crate::environment::{EnvUpdate, Environment, ValueSource, substitute};
+use crate::generators::GenError;
 use crate::http::ApiResponse;
 use crate::hurl::{
     EntryOutcome, FormField, HurlEntry, KvRow, RunOutput, RunStatus, collection_to_hurl,
-    expand_base64_form_fields, run_hurl, run_hurl_streaming, stage_out_of_scope_form_files,
+    expand_base64_form_fields, run_hurl, stage_out_of_scope_form_files,
 };
 
 /// The top-bar Base URL. It seeds the URL field when composing a new request,
@@ -74,6 +77,15 @@ pub enum SubstKind {
     /// Failed to resolve, or a capture not yet initialised from a response
     /// (kept as `{{ VAR }}`, red).
     Failed,
+    /// Produced by the request's `# [Gen]` block at send time.
+    ///
+    /// Kept as `{{ VAR }}` rather than substituted, because the value doesn't
+    /// exist yet and inventing one for the preview would mean a new random
+    /// number or timestamp on every frame — a flickering preview that also
+    /// wouldn't be what gets sent. Coloured as loaded, since it *will* have a
+    /// value; a row that can't evaluate is reported separately (see
+    /// [`generator_problems`]).
+    Computed,
     /// Referenced by the request but defined nowhere at all — no environment
     /// variable, no `[Captures]` name, no captured value (kept as `{{ VAR }}`,
     /// red).
@@ -155,6 +167,27 @@ pub fn subst_map(col: &Collection, env: Option<&Environment>) -> HashMap<String,
                 kind: SubstKind::Loaded,
             },
         );
+    }
+
+    // Names an entry's own `# [Gen]` block computes, applied *last* so they win
+    // over `col.captures`. This branch merges a completed send's generated
+    // values into `CaptureUpdate::values`, so from the first send onwards a
+    // generator name is also present in `col.captures` with its value — and a
+    // computed value must never be shown: it may be an HMAC of a secret (unlike
+    // an environment secret, a capture is rendered in the clear), and the
+    // preview would in any case be a lie, showing the *previous* send's nonce
+    // while the next send computes a fresh one. Rendered as `{{name}}` in the
+    // computed colour instead, whatever `col.captures` holds.
+    for e in &col.entries {
+        for (name, _) in &e.generators {
+            out.insert(
+                name.clone(),
+                SubstInfo {
+                    shown: None,
+                    kind: SubstKind::Computed,
+                },
+            );
+        }
     }
 
     out
@@ -620,47 +653,55 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         captures: base.captures.clone(),
         asserts: base.asserts.clone(),
         reports: base.reports.clone(),
+        // Generators have already been evaluated into the variable set by
+        // `effective_vars_reporting`, and their placeholders are ordinary `{{name}}`
+        // references that Hurl resolves from it. Carrying the definitions onto
+        // the run entry would re-emit the block as a comment in text nobody
+        // reads back, and risk them being evaluated twice.
+        generators: Vec::new(),
         // A transient copy that's only executed, never serialized — comments
         // don't affect the run.
         comments: Vec::new(),
         user_added: base.user_added,
         modified: base.modified,
+        baseline: None,
         last_run: base.last_run,
         last_response: None,
     }
 }
 
-/// Layer a request's own declared parameters (`[Options] variable: NAME=value`,
-/// see [`HurlEntry::variable_defaults`]) *under* the caller's `vars`, producing
-/// the variable set the request actually runs with.
+/// The variables a request actually runs with: those it is given, plus its own
+/// declared parameter defaults, plus its `# [Gen]` rows evaluated over both.
+/// Also returns whatever went wrong in the block, so the caller can say so
+/// (see [`generator_problems`]) rather than sending a request whose signature
+/// is still `{{sig}}`.
 ///
-/// Precedence is the whole point: a declared parameter is a **default**, so it
-/// fills in only the names nobody else bound. Opened on its own, a request runs
-/// with the author's sample value; driven from a PaperTrail loop that binds
-/// `FILE`, it runs with the loop's value and the default stands aside. Hurl's
-/// native reading of the same line is the opposite (the entry option overwrites
-/// the run's variables), which is why the row is also stripped from the entry
-/// text before it is handed to the runner — see [`strip_variable_options`].
-///
-/// A default's own value is substituted against the caller's variables first,
-/// so one parameter can be expressed in terms of another (`variable:
-/// FILE={{SAMPLES}}/invoice.pdf`). Defaults are applied in written order and an
-/// earlier one is visible to a later one, which makes that composition
-/// predictable rather than order-of-iteration luck. Nothing is applied
-/// recursively: a default referencing a name that is itself only defaulted
-/// later is left as written, exactly as [`substitute`] leaves any unresolved
-/// placeholder.
-///
-/// Returns the caller's map untouched (borrowed) when the request declares no
-/// parameters — the overwhelmingly common case, and a send is hot enough that
-/// cloning every variable for nothing is worth avoiding.
-pub fn effective_vars<'a>(
+/// A computed value needs no separate secret handling even when it is derived
+/// from one: it is only ever put into this map, which goes to `run_hurl` as
+/// variables and is dropped afterwards. It reaches no preview (a generator name
+/// renders as [`SubstKind::Computed`], keeping its braces rather than showing a
+/// value) and no `state.json`. That is the same transient path a resolved
+/// `op://` secret already takes, so an HMAC of a secret is no more exposed than
+/// the secret was.
+pub fn effective_vars_reporting<'a>(
     base: &HurlEntry,
     vars: &'a HashMap<String, String>,
-) -> Cow<'a, HashMap<String, String>> {
+) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
+    effective_vars_with(base, vars, &crate::generators::SystemSource::new())
+}
+
+/// [`effective_vars_reporting`] against a chosen world, so a caller that is
+/// only asking whether the block *would* work can use
+/// [`crate::generators::DryRunSource`] and leave the counters where it found
+/// them.
+pub fn effective_vars_with<'a>(
+    base: &HurlEntry,
+    vars: &'a HashMap<String, String>,
+    src: &dyn crate::generators::GenSource,
+) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
     let defaults = base.variable_defaults();
-    if defaults.is_empty() {
-        return Cow::Borrowed(vars);
+    if defaults.is_empty() && base.generators.is_empty() {
+        return (Cow::Borrowed(vars), Vec::new());
     }
     let mut merged = vars.clone();
     for (name, value) in defaults {
@@ -670,11 +711,15 @@ pub fn effective_vars<'a>(
         let value = substitute(&value, &merged);
         merged.insert(name, value);
     }
-    Cow::Owned(merged)
+    // Evaluated last so a generator may read a declared parameter, and bound
+    // over anything of the same name: a row that computes `nonce` is a
+    // statement that *this* is where `nonce` comes from.
+    let errors = crate::generators::expand(&base.generators, &mut merged, src);
+    (Cow::Owned(merged), errors)
 }
 
 /// Remove the `variable:` rows from a run entry's `[Options]`, having already
-/// folded them into the variable set via [`effective_vars`].
+/// folded them into the variable set via [`effective_vars_reporting`].
 ///
 /// Left in, they would undo the default semantics for everything
 /// [`resolve_entry`] does not substitute in Rust — `[Captures]` and `[Asserts]`
@@ -751,6 +796,26 @@ pub fn run_resolved_entry(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> RunOutput {
+    run_resolved_entry_reporting(base, vars, file_root, extra_captures).0
+}
+
+/// [`run_resolved_entry`], also handing back what the request's `# [Gen]` block
+/// computed for *this* send, and the rows that failed to compute.
+///
+/// A generator is the pre-request script's job: a request that signs itself
+/// computes a `nonce` the request after it is expected to echo. Re-evaluating
+/// the block to find that value would produce a different `uuid` and a later
+/// `timestamp` than the one actually sent, so the values have to travel out of
+/// the send that made them. The caller merges them where captures go
+/// ([`CaptureUpdate::values`]), which is memory only — a computed value still
+/// reaches no `state.json`, since it may be an HMAC of a secret and is in any
+/// case usually good for one request.
+pub fn run_resolved_entry_reporting(
+    base: &HurlEntry,
+    vars: &HashMap<String, String>,
+    file_root: Option<&std::path::Path>,
+    extra_captures: &[(String, String)],
+) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
@@ -760,12 +825,43 @@ pub fn run_resolved_entry(
     // Handing it to the runner would produce a parse error naming a line
     // number in a document the user never sees, so say what is actually wrong.
     if base.is_unreadable() {
-        return RunOutput {
-            entries: vec![],
-            error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
-        };
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+            },
+            HashMap::new(),
+            Vec::new(),
+        );
     }
-    let vars = effective_vars(base, vars);
+    let (vars, gen_errors) = effective_vars_reporting(base, vars);
+    // A failed `[Gen]` row is left unbound, so going on would send the request
+    // with `{{sig}}` where the signature should be — a 401 whose cause is three
+    // screens away. The interactive send refuses for this reason; a report run
+    // has to refuse too, or the one path nobody is watching becomes the one
+    // that lies. Reported in English like `UNREADABLE_REQUEST_ERROR`: this is
+    // the front-end-agnostic layer and has no `Strings`, and the alternative —
+    // a `RunOutput` that carries the errors structurally — is a wider change
+    // than the message is worth.
+    if !gen_errors.is_empty() {
+        let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(crate::i18n::summarise_gen_errors(&english, &gen_errors).join("; ")),
+            },
+            HashMap::new(),
+            gen_errors,
+        );
+    }
+    // Read off the block's results *before* the borrow of `vars` ends: these
+    // are the values this send actually used, not what a second evaluation
+    // would produce.
+    let generated: HashMap<String, String> = base
+        .generators
+        .iter()
+        .filter_map(|(name, _)| vars.get(name).map(|v| (name.clone(), v.clone())))
+        .collect();
     let resolved = resolve_entry(base, &vars);
     let mut run_entry = to_run_entry(base, resolved);
     run_entry.captures.extend(extra_captures.iter().cloned());
@@ -773,10 +869,14 @@ pub fn run_resolved_entry(
 
     let mut entries = [run_entry];
     if let Err(e) = expand_base64_form_fields(&mut entries, file_root) {
-        return RunOutput {
-            entries: vec![],
-            error: Some(format!("Base64 file error: {e}")),
-        };
+        return (
+            RunOutput {
+                entries: vec![],
+                error: Some(format!("Base64 file error: {e}")),
+            },
+            generated,
+            Vec::new(),
+        );
     }
     let staged_dir = stage_out_of_scope_form_files(&mut entries, file_root).unwrap_or_default();
     let mut run_entry = entries.into_iter().next().unwrap();
@@ -788,7 +888,7 @@ pub fn run_resolved_entry(
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
-    out
+    (out, generated, Vec::new())
 }
 
 /// Why a request that could not be read cannot be sent. Front-end agnostic, so
@@ -846,9 +946,14 @@ pub fn run_collection(
         // and the report interpreter stay in exact lockstep. A base64/staging
         // failure comes back as `RunOutput { entries: [], error }` and surfaces
         // via the `None` arm below.
-        let out = run_resolved_entry(&base, &vars, file_root.as_deref(), &[]);
+        let (out, generated, gen_errors) =
+            run_resolved_entry_reporting(&base, &vars, file_root.as_deref(), &[]);
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // Kept structurally as well as in `error`: only the front-end knows
+        // the language, and "Request error:" is the wrong heading for a
+        // request that was never made (see `ApiResponse::error_text`).
+        r.gen_errors = gen_errors;
         match out.entries.into_iter().next() {
             Some(eo) => {
                 r.status = eo.status;
@@ -859,7 +964,12 @@ pub fn run_collection(
                 r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
-                let values: HashMap<String, String> = eo.captures.into_iter().collect();
+                // The block's values go back with the captures, so the next
+                // request sees a `nonce` this one computed exactly the way it
+                // sees a token this one captured. A `[Captures]` row of the
+                // same name is the later, more specific statement and wins.
+                let mut values: HashMap<String, String> = generated;
+                values.extend(eo.captures);
                 let _ = tx.send(CaptureUpdate {
                     col_id,
                     entry_idx,
@@ -869,8 +979,24 @@ pub fn run_collection(
                 });
             }
             None => {
-                // Parse error, or nothing ran.
+                // Parse error, or nothing ran (a failed `# [Gen]` row, an
+                // unreadable body file, a staging failure).
                 r.error = out.error.unwrap_or_else(|| "no response".to_string());
+                // This is still the end of the send, so it has to be announced
+                // like one. Saying nothing left the entry stamped `Running`
+                // for the rest of the session — the spinner and "Sending…"
+                // never cleared, so a request refused *because* it could not
+                // be built looked exactly like one waiting on a dead server,
+                // which is the opposite of the message. `ok: false` with no
+                // values: nothing was captured or computed, and a request
+                // that never left is a failure.
+                let _ = tx.send(CaptureUpdate {
+                    col_id,
+                    entry_idx,
+                    ok: false,
+                    values: HashMap::new(),
+                    response: r.clone(),
+                });
             }
         }
     });
@@ -889,6 +1015,10 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
         duration_ms: Some(eo.duration_ms),
+        // A "Run All" entry that ran has no generator failure to carry: the
+        // whole-file block is expanded once, up front, and its failures are
+        // reported for the run rather than against one response.
+        gen_errors: Vec::new(),
     }
 }
 
@@ -983,6 +1113,52 @@ pub fn run_all_entries(
         let mut captures: HashMap<String, String> = HashMap::new();
         let mut responses: Vec<Option<ApiResponse>> = vec![None; total];
 
+        // `# [Gen]` blocks. Same split as the headless runner: batch has no
+        // per-request moment to evaluate anything in, so everything is bound
+        // once up front (and a name two requests compute collapses to one
+        // value — the caller warns before starting such a run); streaming
+        // evaluates each block in its own window, which is also what lets a
+        // generator read a value an earlier request captured.
+        let mut vars = vars;
+        if batch {
+            let blocks = expand_batch_generators(
+                &run_entries,
+                &vars,
+                &crate::generators::SystemSource::new(),
+            );
+            // A failed block stops the whole batch, because batch cannot stop
+            // less than that: it is one Hurl call over the whole file, so
+            // there is no way to run the other requests and skip this one (a
+            // streaming run skips just the one — see `EntrySetup::Skip`). And
+            // going on is the worst of the three options: the failed row's
+            // name is left to whatever else binds it — an environment value, a
+            // carried-over capture — so the request goes out well-formed,
+            // signed with the wrong thing, and is answered. Nothing is sent.
+            if !blocks.errors.is_empty() {
+                let flat: Vec<crate::generators::GenError> = blocks
+                    .errors
+                    .iter()
+                    .flat_map(|(_, errs)| errs.iter().cloned())
+                    .collect();
+                let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                let mut r = state.lock().unwrap();
+                r.loading = false;
+                r.error = crate::i18n::summarise_gen_errors(&english, &flat).join("; ");
+                r.gen_errors = flat;
+                // No update is sent: dropping `tx` disconnects the receiver,
+                // and the drain takes that as "the run is over", clearing the
+                // in-flight marks the caller set on every entry.
+                if let Some(dir) = &staged_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return;
+            }
+            // Bound *and* reported back as captures: a computed value is as
+            // much a result of the run as a `[Captures]` row, and the request
+            // after it — run on its own afterwards — needs to see it.
+            captures.extend(blocks.bound.iter().map(|(k, v)| (k.clone(), v.clone())));
+            vars.extend(blocks.bound);
+        }
         let out = if batch {
             run_hurl(&content, &vars, run_root)
         } else {
@@ -997,19 +1173,91 @@ pub fn run_all_entries(
             // not the outcome's ordinal: `[Options] repeat`/`retry` make one
             // request produce several. Trusting the ordinal slid every later
             // result up and dropped the last one off the end.
-            run_hurl_streaming(&content, &vars, run_root, |eo| {
-                if let Some(&at) = run_positions.get(eo.entry_index) {
-                    results[at] = Some(eo.ok);
-                    captures.extend(eo.captures.iter().cloned());
-                    responses[at] = Some(entry_response(eo));
+            let gen_entries = run_entries.clone();
+            // Written by the before-each-entry hook and read by the
+            // after-each-entry one; both run on this thread, one at a time, so
+            // a `RefCell` is enough to let the two closures share it.
+            let generated: Rc<RefCell<HashMap<String, String>>> = Rc::default();
+            let record_gen = Rc::clone(&generated);
+            // A block that fails to evaluate leaves its `{{name}}` unbound, so
+            // the request goes out with a literal placeholder and Hurl aborts it
+            // on `Undefined variable` — three screens from the real cause. The
+            // actual generator error was previously discarded here; collect it
+            // so it can be surfaced as the run's error below.
+            let gen_errors: Rc<RefCell<Vec<crate::generators::GenError>>> = Rc::default();
+            let record_errs = Rc::clone(&gen_errors);
+            let mut streamed = crate::hurl::run::run_hurl_streaming_with(
+                &content,
+                &vars,
+                run_root,
+                |i, known| {
+                    let Some(entry) = gen_entries.get(i) else {
+                        return crate::hurl::EntrySetup::Bind(Vec::new());
+                    };
+                    if entry.generators.is_empty() {
+                        return crate::hurl::EntrySetup::Bind(Vec::new());
+                    }
+                    let mut merged = known.clone();
+                    let errs = crate::generators::expand(
+                        &entry.generators,
+                        &mut merged,
+                        &crate::generators::SystemSource::new(),
+                    );
+                    // A block that failed leaves its name unbound, and the
+                    // environment (or an earlier capture) may well bind the
+                    // same name -- so the request would go out signed with the
+                    // wrong thing and be answered. Not sent: see
+                    // `EntrySetup::Skip`.
+                    if !errs.is_empty() {
+                        let english =
+                            crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                        let reason = crate::i18n::summarise_gen_errors(&english, &errs).join("; ");
+                        record_errs.borrow_mut().extend(errs);
+                        return crate::hurl::EntrySetup::Skip { reason };
+                    }
+                    let bound: Vec<(String, String)> = entry
+                        .generators
+                        .iter()
+                        .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
+                        .collect();
+                    record_gen.borrow_mut().extend(bound.iter().cloned());
+                    crate::hurl::EntrySetup::Bind(bound)
+                },
+                |eo| {
+                    if let Some(&at) = run_positions.get(eo.entry_index) {
+                        results[at] = Some(eo.ok);
+                        // Computed values first so a `[Captures]` row of the same
+                        // name — the later, more specific statement — still wins.
+                        captures.extend(
+                            generated
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone())),
+                        );
+                        captures.extend(eo.captures.iter().cloned());
+                        responses[at] = Some(entry_response(eo));
+                    }
+                    let _ = tx.send(BatchRunUpdate {
+                        col_id,
+                        results: results.clone(),
+                        captures: captures.clone(),
+                        responses: responses.clone(),
+                    });
+                },
+            );
+            // Prefer the generator error over Hurl's downstream `Undefined
+            // variable`: the unbound placeholder is a symptom, the failed block
+            // is the cause. Only when the run itself reported nothing else.
+            if streamed.error.is_none() {
+                let errs = gen_errors.borrow();
+                if !errs.is_empty() {
+                    let english =
+                        crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                    streamed.error =
+                        Some(crate::i18n::summarise_gen_errors(&english, &errs).join("; "));
                 }
-                let _ = tx.send(BatchRunUpdate {
-                    col_id,
-                    results: results.clone(),
-                    captures: captures.clone(),
-                    responses: responses.clone(),
-                });
-            })
+            }
+            streamed
         };
         if let Some(dir) = &staged_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -1117,34 +1365,62 @@ pub fn drain_capture_updates(
     !pending.is_empty()
 }
 
-/// Environment variable names referenced (via `{{ KEY }}`) anywhere in `entry`.
-pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<String> {
-    let mut keys = std::collections::HashSet::new();
-    let mut add = |text: &str| keys.extend(crate::environment::referenced_keys(text));
-
-    add(&entry.url);
+/// Every piece of an entry's text that reaches the wire *as a Hurl template* —
+/// so anything scanning for `{{…}}` sees exactly the places a placeholder is
+/// substituted, and no more.
+///
+/// Shared by [`entry_referenced_keys`] and [`entry_placeholder_problems`]
+/// deliberately: the set of fields "a variable can appear in" and the set it is
+/// "checked in" drifting apart would mean a placeholder that resolves but is
+/// never validated, which is the exact bug the validation exists to catch.
+fn for_each_wire_text(entry: &HurlEntry, mut visit: impl FnMut(&str)) {
+    visit(&entry.url);
     for r in entry.headers.iter().chain(&entry.queries) {
-        add(&r.key);
-        add(&r.value);
+        visit(&r.key);
+        visit(&r.value);
     }
     for f in &entry.form_fields {
-        add(&f.key);
-        add(&f.value);
+        visit(&f.key);
+        visit(&f.value);
     }
     for r in &entry.cookies {
-        add(&r.key);
-        add(&r.value);
+        visit(&r.key);
+        visit(&r.value);
     }
     if let Some((u, p)) = &entry.basic_auth {
-        add(u);
-        add(p);
+        visit(u);
+        visit(p);
     }
     // A `{{ var }}` written inside a comment is never sent, so it doesn't
     // count as a use of that variable.
     if let Some(body) = entry.body_wire() {
-        add(&body);
+        visit(&body);
     }
+}
+
+/// Environment variable names referenced (via `{{ KEY }}`) anywhere in `entry`.
+pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    for_each_wire_text(entry, |text| {
+        keys.extend(crate::environment::referenced_keys(text))
+    });
     keys
+}
+
+/// Placeholders in `entry` that Hurl would read differently from PaperBoy — see
+/// [`placeholder_problems`](crate::hurl::placeholder_problems). Deduplicated,
+/// keeping the order written, since the same `{{ api.key }}` typed into three
+/// headers is one mistake and should be said once.
+pub fn entry_placeholder_problems(entry: &HurlEntry) -> Vec<crate::hurl::PlaceholderProblem> {
+    let mut out: Vec<crate::hurl::PlaceholderProblem> = Vec::new();
+    for_each_wire_text(entry, |text| {
+        for p in crate::hurl::placeholder_problems(text) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    });
+    out
 }
 
 /// Secret variables the selected entry needs but that haven't resolved yet.
@@ -1203,6 +1479,9 @@ fn defined_keys(col: &Collection, env: Option<&Environment>) -> std::collections
     }
     for entry in &col.entries {
         defined.extend(entry.captures.iter().map(|(name, _)| name.clone()));
+        // A `# [Gen]` row defines its name just as surely as a capture does —
+        // it is computed rather than fetched, but `{{sig}}` is not a typo.
+        defined.extend(entry.generators.iter().map(|(name, _)| name.clone()));
     }
     defined.extend(col.captures.keys().cloned());
     defined
@@ -1266,6 +1545,248 @@ pub fn body_form_conflicts_all(col: &Collection) -> Vec<String> {
         .iter()
         .filter(|e| e.body_form_conflict())
         .map(request_label)
+        .collect()
+}
+
+/// Placeholders in the selected request that Hurl reads differently from
+/// PaperBoy, rendered for display as `written → read`.
+///
+/// Blocking, for the same reason as [`body_form_conflicts`] and not the same
+/// reason as [`undefined_request_keys`]: an undefined variable goes on the wire
+/// literally and fails loudly, but `{{ api.key }}` goes on the wire as the
+/// value of `api` and the server answers as though it were asked a sensible
+/// question. There is no version of that a user finds by reading the response.
+pub fn truncated_placeholders(col: &Collection) -> Vec<String> {
+    col.entries
+        .get(col.selected_entry)
+        .map(|e| describe_placeholder_problems(&entry_placeholder_problems(e)))
+        .unwrap_or_default()
+}
+
+/// [`truncated_placeholders`] across every entry — used by "Run All".
+pub fn truncated_placeholders_all(col: &Collection) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        for d in describe_placeholder_problems(&entry_placeholder_problems(e)) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Anything wrong with the selected request's `# [Gen]` block, described for a
+/// status message.
+///
+/// Reported rather than blocking, unlike [`truncated_placeholders`]. A row that
+/// fails binds nothing, so its `{{sig}}` goes on the wire literally and comes
+/// back a loud 401 — the [`undefined_request_keys`] situation, not the
+/// [`body_form_conflicts`] one. The reason is still worth saying at the moment
+/// it happens, because "401" is a poor way to learn you misspelled `hmac_sha256`.
+pub fn generator_problems(col: &Collection, env: Option<&Environment>) -> Vec<GenError> {
+    let Some(entry) = col.entries.get(col.selected_entry) else {
+        return Vec::new();
+    };
+    describe_generator_errors(entry, env, &col.captures)
+}
+
+/// [`generator_problems`] across every entry — used by "Run All".
+pub fn generator_problems_all(col: &Collection, env: Option<&Environment>) -> Vec<GenError> {
+    let mut out: Vec<GenError> = Vec::new();
+    for entry in &col.entries {
+        for d in describe_generator_errors(entry, env, &col.captures) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// Everything a whole-file run needs to know about the `# [Gen]` blocks it is
+/// about to carry.
+///
+/// A block belongs to one request and is evaluated per send, which a streaming
+/// run can honour (each entry gets its own window) but a batch run cannot: batch
+/// is a single Hurl call over the whole file, so there is no "before this
+/// request" moment to evaluate anything in. Everything is therefore evaluated
+/// once, up front, against the environment alone — and a name two requests each
+/// compute collapses to one value for both, which is the [`collisions`] list.
+///
+/// [`collisions`]: BatchGenerators::collisions
+pub struct BatchGenerators {
+    /// The names bound for the run. Where two requests compute the same name
+    /// the first request's value is kept, matching the order Hurl would have
+    /// run them in.
+    pub bound: HashMap<String, String>,
+    /// What failed, per request, paired with that request's title so the
+    /// caller can say which one it was.
+    pub errors: Vec<(String, Vec<GenError>)>,
+    /// Names computed by more than one request. In a streaming run each of
+    /// those requests gets its own value; in a batch run they share the first,
+    /// so the caller warns rather than silently sending one request's nonce
+    /// with another's signature.
+    pub collisions: Vec<String>,
+    /// Names a `# [Gen]` block computes that an environment variable (or a
+    /// carried-over capture) *already* binds. A streaming run shadows the
+    /// environment value only from the computing request onwards; a batch run
+    /// shares one value set across the whole file, so binding the computed value
+    /// up front would rewrite it for the requests *above* the generator too —
+    /// requests that may have no block at all. Batch therefore leaves the
+    /// environment value in place (see [`expand_batch_generators`]) and lists
+    /// the name here so the user is told their generator did nothing in batch.
+    pub shadowed: Vec<String>,
+}
+
+/// Evaluate every entry's `# [Gen]` block once, for a batch (whole-file) run.
+///
+/// Shared by the headless runner and "Run All" in batch mode so the two cannot
+/// drift on which value a name ends up with.
+pub fn expand_batch_generators(
+    entries: &[crate::hurl::HurlEntry],
+    vars: &HashMap<String, String>,
+    src: &dyn crate::generators::GenSource,
+) -> BatchGenerators {
+    let mut bound = HashMap::new();
+    let mut errors = Vec::new();
+    let mut collisions: Vec<String> = Vec::new();
+    let mut shadowed: Vec<String> = Vec::new();
+    // Which request first claimed each name, so a second claim is recognised
+    // as a collision rather than as the same request being listed twice (a
+    // repeated name *within* one block is that block's own business).
+    let mut claimed: HashMap<String, usize> = HashMap::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        if e.generators.is_empty() {
+            continue;
+        }
+        // Each block is evaluated against the environment plus what earlier
+        // blocks bound — not against the run's own captures, which do not
+        // exist yet in a batch run.
+        let mut merged = vars.clone();
+        merged.extend(
+            bound
+                .iter()
+                .map(|(k, v): (&String, &String)| (k.clone(), v.clone())),
+        );
+        let errs = crate::generators::expand(&e.generators, &mut merged, src);
+        if !errs.is_empty() {
+            errors.push((e.title.clone(), errs));
+        }
+        for (name, _) in &e.generators {
+            match claimed.get(name) {
+                Some(&first) if first != i => {
+                    if !collisions.contains(name) {
+                        collisions.push(name.clone());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            claimed.entry(name.clone()).or_insert(i);
+            // A name the *environment* already binds is left alone: overriding
+            // it here would rewrite it for every request in the file, including
+            // the ones above this generator that never asked. Streaming would
+            // shadow it only from here on, which one shared value set can't
+            // reproduce — so keep the environment value and warn instead.
+            if vars.contains_key(name) {
+                if !shadowed.contains(name) {
+                    shadowed.push(name.clone());
+                }
+                continue;
+            }
+            if let Some(v) = merged.get(name) {
+                bound.entry(name.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+
+    BatchGenerators {
+        bound,
+        errors,
+        collisions,
+        shadowed,
+    }
+}
+
+/// The `# [Gen]` names more than one request in the collection computes.
+///
+/// Only a batch run has to care (see [`BatchGenerators::collisions`]); the
+/// front-ends call this to warn before starting one.
+pub fn generator_collisions(col: &Collection) -> Vec<String> {
+    let mut claimed: Vec<&str> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        let mut seen_here: Vec<&str> = Vec::new();
+        for (name, _) in &e.generators {
+            if seen_here.contains(&name.as_str()) {
+                continue;
+            }
+            seen_here.push(name);
+            if claimed.contains(&name.as_str()) {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            } else {
+                claimed.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// The `# [Gen]` names a batch run would compute over a value the environment
+/// (or a carried-over capture) already binds.
+///
+/// Only a batch run has to care (see [`BatchGenerators::shadowed`]): it shares
+/// one value set, so it leaves the environment value in place for the whole
+/// file rather than rewriting it for the requests above the generator. The
+/// front-ends call this to warn before starting such a run — the computed value
+/// won't be used, and dropping `--batch` is usually the fix.
+pub fn generator_env_shadows(col: &Collection, env: Option<&Environment>) -> Vec<String> {
+    let vars = collection_vars(env, &col.captures);
+    let mut out: Vec<String> = Vec::new();
+    for e in &col.entries {
+        for (name, _) in &e.generators {
+            if vars.contains_key(name) && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn describe_generator_errors(
+    entry: &crate::hurl::HurlEntry,
+    env: Option<&Environment>,
+    captures: &HashMap<String, String>,
+) -> Vec<GenError> {
+    if entry.generators.is_empty() {
+        return Vec::new();
+    }
+    let vars = collection_vars(env, captures);
+    // Every failure this reports is deterministic — a syntax error, an unknown
+    // function, a bad reference — so evaluating here and again at send time
+    // cannot disagree, even though the random and time values will differ.
+    //
+    // Deterministic is not the same as free, though: this runs on the way to
+    // every send, and a `counter` advanced by being asked about would count
+    // each send twice (1, 3, 5). `DryRunSource` reads the counter instead.
+    effective_vars_with(entry, &vars, &crate::generators::DryRunSource).1
+}
+
+/// Render placeholder problems for a status message. A truncation says what it
+/// becomes (`{{api.key}} → api`), because the whole difficulty of the bug is
+/// that the text looks right; an unparsable one has no "becomes" to show.
+fn describe_placeholder_problems(problems: &[crate::hurl::PlaceholderProblem]) -> Vec<String> {
+    use crate::hurl::PlaceholderProblem as P;
+    problems
+        .iter()
+        .map(|p| match p {
+            P::Truncated { written, read } => format!("{written} → {read}"),
+            P::Unparsable { written } => written.clone(),
+        })
         .collect()
 }
 
@@ -1718,6 +2239,275 @@ mod tests {
 
     // ── Captures ──────────────────────────────────────────────────────────
 
+    fn entry_with_generators(url: &str, rows: &[(&str, &str)]) -> HurlEntry {
+        let mut e = HurlEntry {
+            method: "GET".into(),
+            url: url.into(),
+            ..Default::default()
+        };
+        e.generators = rows
+            .iter()
+            .map(|(n, x)| (n.to_string(), x.to_string()))
+            .collect();
+        e
+    }
+
+    // ── Whole-file `# [Gen]` handling ──────────────────────────────────
+
+    /// A batch run has one variable set for the whole file, so two requests
+    /// that each compute `nonce` cannot each have their own. Silently picking
+    /// one is how a signature ends up computed over the other request's nonce,
+    /// so the collision is named and the caller warns.
+    #[test]
+    fn two_requests_computing_one_name_collide_in_a_batch_run() {
+        let entries = vec![
+            entry_with_generators("https://x/", &[("nonce", "\"first\"")]),
+            entry_with_generators("https://y/", &[("nonce", "\"second\"")]),
+        ];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.collisions, vec!["nonce".to_string()]);
+        assert_eq!(
+            blocks.bound.get("nonce").map(String::as_str),
+            Some("first"),
+            "the first request in the file keeps its value"
+        );
+        assert!(blocks.errors.is_empty(), "{:?}", blocks.errors);
+    }
+
+    /// Only a *second request* claiming the name is a collision. One request
+    /// listing a name twice is that block's own business, and reporting it as
+    /// a batch-only hazard would send the user looking for a request that
+    /// isn't there.
+    #[test]
+    fn one_request_is_never_in_collision_with_itself() {
+        let entries = vec![entry_with_generators(
+            "https://x/",
+            &[("n", "\"a\""), ("n", "\"b\"")],
+        )];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert!(blocks.collisions.is_empty(), "{:?}", blocks.collisions);
+    }
+
+    /// A later block may read what an earlier one computed — the same reading
+    /// streaming gives, so moving between the two modes doesn't change which
+    /// names resolve.
+    #[test]
+    fn a_later_gen_block_can_read_an_earlier_one_in_batch() {
+        let entries = vec![
+            entry_with_generators("https://x/", &[("base", "\"abc\"")]),
+            entry_with_generators("https://y/", &[("derived", "base")]),
+        ];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.bound.get("derived").map(String::as_str), Some("abc"));
+    }
+
+    /// Failures are reported per request: "one of them is wrong" is not a
+    /// report when the file has thirty requests in it.
+    #[test]
+    fn a_failing_block_is_reported_against_its_own_request() {
+        let mut bad = entry_with_generators("https://y/", &[("sig", "nope()")]);
+        bad.title = "Sign".into();
+        let entries = vec![entry_with_generators("https://x/", &[("n", "uuid")]), bad];
+        let blocks = expand_batch_generators(
+            &entries,
+            &HashMap::new(),
+            &crate::generators::SystemSource::new(),
+        );
+        assert_eq!(blocks.errors.len(), 1);
+        assert_eq!(blocks.errors[0].0, "Sign");
+    }
+
+    /// The pre-flight warning the front-ends show, which reads the collection
+    /// rather than evaluating anything.
+    #[test]
+    fn generator_collisions_names_only_what_two_requests_share() {
+        let col = Collection::new(
+            "c".into(),
+            vec![
+                entry_with_generators("https://x/", &[("nonce", "uuid"), ("ts", "timestamp")]),
+                entry_with_generators("https://y/", &[("nonce", "uuid")]),
+            ],
+        );
+        assert_eq!(generator_collisions(&col), vec!["nonce".to_string()]);
+    }
+
+    /// A computed value is a result of the send, not a detail of it: the
+    /// request after the one that signed itself has to be able to echo the
+    /// nonce, so the value has to travel out of the send that made it rather
+    /// than be recomputed (which would produce a different `uuid`).
+    #[test]
+    fn a_send_hands_back_what_its_gen_block_computed() {
+        let entry = entry_with_generators("https://127.0.0.1:1/", &[("nonce", "\"fixed\"")]);
+        let (_out, generated, _errs) =
+            run_resolved_entry_reporting(&entry, &HashMap::new(), None, &[]);
+        assert_eq!(
+            generated.get("nonce").map(String::as_str),
+            Some("fixed"),
+            "the connection failing doesn't unmake the value it was sent with"
+        );
+    }
+
+    /// A name the `# [Gen]` block computes is defined by that block. Before
+    /// `defined_keys` knew about generators, a request that signed itself
+    /// correctly was still reported as referring to an undefined variable.
+    #[test]
+    fn a_generated_name_is_not_reported_as_undefined() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?n={{nonce}}",
+                &[("nonce", "uuid")],
+            )],
+        );
+        assert!(
+            undefined_request_keys(&col, None).is_empty(),
+            "the block defines nonce"
+        );
+        assert!(
+            generator_problems(&col, None).is_empty(),
+            "and the row evaluates"
+        );
+    }
+
+    /// A row that cannot evaluate is *reported*, not blocked: nothing binds
+    /// `sig`, so `{{sig}}` goes out literally and the server rejects it loudly.
+    /// The report exists to name the actual mistake instead of leaving the user
+    /// to infer it from a 401.
+    #[test]
+    fn a_generator_row_that_cannot_evaluate_is_reported() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?s={{sig}}",
+                &[("sig", "hmac_sha526(k, m)")],
+            )],
+        );
+        let problems = generator_problems(&col, None);
+        assert_eq!(problems.len(), 1, "one bad row, one report");
+        assert!(
+            matches!(
+                &problems[0],
+                crate::generators::GenError::UnknownFunction { name, function }
+                    if name == "sig" && function == "hmac_sha526"
+            ),
+            "the report names the row and the misspelling: {:?}",
+            problems[0]
+        );
+    }
+
+    /// A request that never leaves has still *finished*, and has to say so.
+    /// A failed `# [Gen]` row means nothing is built and no entry runs, and
+    /// the arm that handles "nothing ran" used to set the error and stop —
+    /// leaving the entry stamped `Running`, so the spinner and "Sending…" sat
+    /// there for the rest of the session. The one case where the client knows
+    /// immediately that the send is hopeless looked exactly like a request
+    /// waiting on a dead server.
+    #[test]
+    fn a_request_that_could_not_be_built_still_reports_that_it_is_over() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/?s={{sig}}",
+                &[("sig", "hmac_sha526(k, m)")],
+            )],
+        );
+        let state = Arc::new(Mutex::new(ApiResponse::default()));
+        let rx = run_collection(&col, None, state).expect("the run starts");
+        let update = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a refusal is still an ending, and must be announced");
+        assert!(!update.ok, "a request that never left did not pass");
+        assert!(
+            update.response.error.contains("hmac_sha526"),
+            "and the response says which row stopped it: {:?}",
+            update.response.error
+        );
+        assert!(!update.response.loading, "nothing is in flight any more");
+
+        // A second run, drained the way a front-end drains it (the first
+        // update was consumed by `recv_timeout` above).
+        let state = Arc::new(Mutex::new(ApiResponse::default()));
+        let rx = run_collection(&col, None, state).expect("the run starts");
+        let mut cols = [col];
+        cols[0].entries[0].last_run = RunStatus::Running;
+        let mut pending = vec![rx];
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drain_capture_updates(&mut pending, &mut cols);
+        }
+        assert_eq!(
+            cols[0].entries[0].last_run,
+            RunStatus::Failed,
+            "so the front-end stops spinning"
+        );
+    }
+
+    /// Every failing row is reported, not just the first, so a block with two
+    /// mistakes takes one round of fixing rather than two.
+    #[test]
+    fn every_failing_generator_row_is_reported() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "https://x/",
+                &[("a", "nope()"), ("b", "uuid"), ("c", "{{")],
+            )],
+        );
+        let problems = generator_problems(&col, None);
+        let rows: Vec<&str> = problems.iter().map(|e| e.row()).collect();
+        assert_eq!(rows, vec!["a", "c"], "b is fine and says nothing");
+    }
+
+    /// `generator_problems` only looks at the selected request; `_all` looks at
+    /// every one, matching the two run commands they back.
+    #[test]
+    fn generator_problems_follow_the_selection() {
+        let mut col = Collection::new(
+            "c".into(),
+            vec![
+                entry_with_generators("https://x/", &[("a", "uuid")]),
+                entry_with_generators("https://y/", &[("b", "nope()")]),
+            ],
+        );
+        col.selected_entry = 0;
+        assert!(
+            generator_problems(&col, None).is_empty(),
+            "entry 0 is sound"
+        );
+        assert_eq!(
+            generator_problems_all(&col, None).len(),
+            1,
+            "Run All still sees entry 1's mistake"
+        );
+    }
+
+    /// A generated name keeps its braces in the preview rather than showing a
+    /// value: the value doesn't exist until the request is sent, and inventing
+    /// one per frame would flicker and still not be what goes on the wire.
+    #[test]
+    fn a_generated_name_previews_as_computed() {
+        let col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators("https://x/", &[("nonce", "uuid")])],
+        );
+        let map = subst_map(&col, None);
+        let info = map.get("nonce").expect("the generator name is known");
+        assert_eq!(info.kind, SubstKind::Computed);
+        assert!(info.shown.is_none(), "no value is invented for the preview");
+    }
+
     #[test]
     fn collection_vars_includes_captures_overriding_env() {
         let env = env_with(vec![EnvVar {
@@ -2002,7 +2792,7 @@ mod tests {
         let entry = param_entry("FILE", "./samples/invoice.pdf");
         let vars = HashMap::new();
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(
             effective.get("FILE"),
@@ -2024,7 +2814,7 @@ mod tests {
         let entry = param_entry("FILE", "./samples/invoice.pdf");
         let vars = HashMap::from([("FILE".to_string(), "./inbox/real.pdf".to_string())]);
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(effective.get("FILE"), Some(&"./inbox/real.pdf".to_string()));
     }
@@ -2097,7 +2887,7 @@ mod tests {
             .push(KvRow::new("variable", "DOC={{SAMPLES}}/invoice.pdf"));
         let vars = HashMap::from([("ROOT".to_string(), "/srv".to_string())]);
 
-        let effective = effective_vars(&entry, &vars);
+        let effective = effective_vars_reporting(&entry, &vars).0;
 
         assert_eq!(effective.get("SAMPLES"), Some(&"/srv/samples".to_string()));
         assert_eq!(
@@ -2136,7 +2926,7 @@ mod tests {
         let vars = HashMap::from([("TOKEN".to_string(), "abc".to_string())]);
 
         assert!(matches!(
-            effective_vars(&entry, &vars),
+            effective_vars_reporting(&entry, &vars).0,
             std::borrow::Cow::Borrowed(_)
         ));
     }
@@ -2162,5 +2952,417 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A failed `[Gen]` row leaves its name unbound, so running on would send
+    /// `{{sig}}` where a signature belongs. The interactive send refuses; the
+    /// report runner used to throw the errors away and send it anyway, which
+    /// is the one path with nobody watching.
+    #[test]
+    fn a_request_whose_computed_value_failed_is_not_sent() {
+        let entry = HurlEntry {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:9/{{sig}}".to_string(),
+            generators: vec![("sig".to_string(), "hmac_sha526(k, m)".to_string())],
+            ..Default::default()
+        };
+        let out = run_resolved_entry(&entry, &HashMap::new(), None, &[]);
+        assert!(out.entries.is_empty(), "nothing was sent");
+        let error = out.error.unwrap_or_default();
+        assert!(
+            error.contains("hmac_sha526"),
+            "and the reason names the row's fault: {error}"
+        );
+    }
+
+    /// A pinned clock and "random" source, so a computed value can be asserted.
+    struct Fixed;
+    impl crate::generators::GenSource for Fixed {
+        fn now(&self) -> (i64, u32) {
+            (1_700_000_000, 0)
+        }
+        fn fill_random(&self, buf: &mut [u8]) {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+        }
+        fn counter(&self, _name: &str) -> u64 {
+            1
+        }
+    }
+
+    /// A tiny loopback HTTP server that records the request bytes it was sent,
+    /// so a test can assert on what actually reached the wire. Returns the bound
+    /// port and a handle to the recorded requests.
+    fn recording_server(responses: usize) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for _ in 0..responses {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                record
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = sock.flush();
+            }
+        });
+        (port, seen)
+    }
+
+    /// A request whose `# [Gen]` block failed is not sent by a streaming run.
+    ///
+    /// The failed row leaves its name unbound -- and something else of that
+    /// name is then used in its place: an environment value, a capture from an
+    /// earlier request. The request goes out looking perfectly well-formed,
+    /// signed with the wrong thing, and is answered 200. That is the worst
+    /// shape a fault can take in an API client: the run *passes*. A single
+    /// send has always refused; the whole-collection run reported the error
+    /// and sent it anyway.
+    #[test]
+    fn a_streaming_run_does_not_send_a_request_whose_block_failed() {
+        let (port, seen) = recording_server(1);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            &format!("http://127.0.0.1:{port}/orders"),
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![("sig".to_string(), "no_such_function()".to_string())];
+        let entries = vec![e];
+        let content = collection_to_hurl(&entries);
+        // The environment binds the very name the block failed to compute,
+        // which is what used to go out.
+        let vars = HashMap::from([("sig".to_string(), "from-the-environment".to_string())]);
+        let out = crate::hurl::run::run_hurl_streaming_with(
+            &content,
+            &vars,
+            None,
+            move |i, known| {
+                let entry = &entries[i];
+                let mut merged = known.clone();
+                let errs = crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                );
+                if !errs.is_empty() {
+                    return crate::hurl::EntrySetup::Skip {
+                        reason: "block failed".to_string(),
+                    };
+                }
+                crate::hurl::EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect(),
+                )
+            },
+            |_| {},
+        );
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the wire: {:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(out.entries.len(), 1, "the entry is still accounted for");
+        assert!(!out.entries[0].ok, "and it is a failure, not a pass");
+        assert_eq!(out.entries[0].entry_index, 0, "credited to its own request");
+        assert!(
+            out.entries[0].url.contains("/orders"),
+            "and says which request it was: {:?}",
+            out.entries[0].url
+        );
+    }
+
+    /// The same, for a batch run. Batch is one Hurl call over the whole file,
+    /// so it cannot skip the one request -- it refuses the run instead, which
+    /// is still better than sending a signature computed from nothing.
+    #[test]
+    fn a_batch_run_is_refused_when_a_block_failed() {
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://127.0.0.1:1/orders",
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![("sig".to_string(), "no_such_function()".to_string())];
+        let vars = HashMap::from([("sig".to_string(), "from-the-environment".to_string())]);
+        let blocks = expand_batch_generators(&[e], &vars, &Fixed);
+        assert_eq!(blocks.errors.len(), 1, "the failure is reported");
+        assert!(
+            !blocks.bound.contains_key("sig"),
+            "and nothing is bound for the row that failed"
+        );
+    }
+
+    /// A computed value must never reach the request preview: a generator name
+    /// keeps its `{{braces}}` in the *computed* colour, even after the block's
+    /// last result has been merged into `Collection::captures`. Otherwise an
+    /// HMAC-of-a-secret would be shown in plaintext, and the preview would show
+    /// the previous send's value while the next send computes a fresh one.
+    #[test]
+    fn a_computed_value_never_reaches_the_preview() {
+        let mut col = Collection::new("c".to_string(), vec![]);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://h/a",
+            vec![KvRow::new("Authorization", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(API_SECRET, "canonical")"#.to_string(),
+        )];
+        col.entries.push(e);
+
+        // What a completed send leaves behind: the block's result folded into
+        // the captures.
+        col.captures.insert(
+            "sig".to_string(),
+            "9f8e7d6c5b4a-hmac-of-a-secret".to_string(),
+        );
+
+        let map = subst_map(&col, None);
+        assert_eq!(
+            map["sig"].kind,
+            SubstKind::Computed,
+            "a name the block defines stays Computed even when captured"
+        );
+        let shown = subst_display("Authorization: {{sig}}", &map);
+        assert_eq!(
+            shown, "Authorization: {{sig}}",
+            "the preview keeps the braces rather than showing the value"
+        );
+    }
+
+    /// A whole-collection run must let a generator read its own request's
+    /// `[Options] variable:` rows, exactly as a single send does — otherwise a
+    /// signature over a declared key binds nothing and `{{sig}}` goes out
+    /// literally. The streaming path now layers the entry's own defaults before
+    /// evaluating the block.
+    #[test]
+    fn a_generator_sees_its_own_requests_parameters_in_a_run_all() {
+        let (port, seen) = recording_server(1);
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            &format!("http://127.0.0.1:{port}/orders"),
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.options = vec![KvRow::new("variable", "SAMPLE_KEY=s3cret")];
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(SAMPLE_KEY, "m")"#.to_string(),
+        )];
+
+        // What a single send computes, for reference — this one always worked.
+        let empty = HashMap::new();
+        let (vars, errs) = effective_vars_reporting(&e, &empty);
+        assert!(errs.is_empty(), "a single send resolves it: {errs:?}");
+        let expected = vars["sig"].clone();
+
+        // What "Run All" / `paperboy -c` do: the block is evaluated in
+        // `before_entry`, over what the run has bound at that moment — which now
+        // includes the entry's own `[Options] variable:` rows.
+        let entries = vec![e];
+        let content = collection_to_hurl(&entries);
+        let gen_errors: std::rc::Rc<std::cell::RefCell<Vec<crate::generators::GenError>>> =
+            std::rc::Rc::default();
+        let record_errs = std::rc::Rc::clone(&gen_errors);
+        let out = crate::hurl::run::run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            move |i, known| {
+                let entry = &entries[i];
+                let mut merged = known.clone();
+                record_errs.borrow_mut().extend(crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &crate::generators::SystemSource::new(),
+                ));
+                crate::hurl::EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(n, _)| merged.get(n).map(|v| (n.clone(), v.clone())))
+                        .collect(),
+                )
+            },
+            |_| {},
+        );
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            sent.contains(&format!("X-Sig: {expected}")),
+            "the run must send the signature a single send would (`{expected}`).\n\
+             errors: {:?}\nrun error: {:?}\nwire:\n{sent}",
+            gen_errors.borrow(),
+            out.error
+        );
+    }
+
+    /// The pre-flight panel and the run it precedes must agree about a block:
+    /// both now apply the request's own `[Options] variable:` rows before
+    /// evaluating, so a signature over a declared key is clean in both.
+    #[test]
+    fn the_run_all_preflight_agrees_with_the_run() {
+        let mut e = HurlEntry::from_fields("Signed", "GET", "http://127.0.0.1:1/x", vec![], "");
+        e.options = vec![KvRow::new("variable", "SAMPLE_KEY=s3cret")];
+        e.generators = vec![(
+            "sig".to_string(),
+            r#"hmac_sha256(SAMPLE_KEY, "m")"#.to_string(),
+        )];
+        let col = Collection::new("c".to_string(), vec![e.clone()]);
+
+        // What the panel says before the run.
+        let preflight = generator_problems_all(&col, None);
+        // What the run's `before_entry` hook now sees: the entry's own defaults
+        // layered in first (mirroring the fixed streaming path), then the block.
+        let mut merged: HashMap<String, String> = HashMap::new();
+        for (name, value) in e.variable_defaults() {
+            merged.entry(name).or_insert(value);
+        }
+        let at_run_time = crate::generators::expand(&e.generators, &mut merged, &Fixed);
+
+        assert_eq!(
+            preflight.len(),
+            at_run_time.len(),
+            "pre-flight: {preflight:?}\nat run time: {at_run_time:?}"
+        );
+        assert!(preflight.is_empty() && at_run_time.is_empty());
+    }
+
+    /// A batch run must not rewrite an environment variable behind the back of a
+    /// request that has no `# [Gen]` block. Batch shares one value set, so a
+    /// name a *later* request computes would otherwise replace the environment
+    /// value for the requests above it too. Batch leaves the environment value
+    /// in place and records the name in `shadowed` so the user is told.
+    #[test]
+    fn batch_does_not_rewrite_an_earlier_requests_variable() {
+        let (port, seen) = recording_server(2);
+        let first = HurlEntry::from_fields(
+            "Reads TOKEN",
+            "GET",
+            &format!("http://127.0.0.1:{port}/first"),
+            vec![KvRow::new("X-Token", "{{TOKEN}}")],
+            "",
+        );
+        let mut second = HurlEntry::from_fields(
+            "Computes TOKEN",
+            "GET",
+            &format!("http://127.0.0.1:{port}/second"),
+            vec![KvRow::new("X-Token", "{{TOKEN}}")],
+            "",
+        );
+        second.generators = vec![(
+            "TOKEN".to_string(),
+            r#""computed-by-request-two""#.to_string(),
+        )];
+
+        let entries = vec![first, second];
+        let mut vars = HashMap::new();
+        vars.insert("TOKEN".to_string(), "from-the-environment".to_string());
+
+        let blocks = expand_batch_generators(&entries, &vars, &Fixed);
+        assert_eq!(
+            blocks.shadowed,
+            vec!["TOKEN".to_string()],
+            "the environment binding of TOKEN is reported as shadowed, not rewritten"
+        );
+        assert!(
+            !blocks.bound.contains_key("TOKEN"),
+            "the computed value is not bound over the environment for the whole file"
+        );
+        vars.extend(blocks.bound.clone());
+        let content = collection_to_hurl(&entries);
+        let _ = crate::hurl::run_hurl(&content, &vars, None);
+
+        let sent = seen.lock().unwrap().join("\n");
+        let first_req = sent.split("GET /second").next().unwrap_or("").to_string();
+        assert!(
+            first_req.contains("X-Token: from-the-environment"),
+            "the first request keeps the environment's TOKEN.\nwire:\n{sent}"
+        );
+    }
+
+    /// A wholly blank generator row is a row still being typed, not a mistake:
+    /// [`effective_vars_reporting`] (the send) must ignore it just as the
+    /// editor's `check` does, so a half-typed row never blocks the send with a
+    /// message that names no row.
+    #[test]
+    fn a_blank_row_does_not_block_the_send() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![
+            ("nonce".to_string(), "uuid".to_string()),
+            (String::new(), String::new()),
+        ];
+        let vars = HashMap::new();
+        let (_, errors) = effective_vars_reporting(&e, &vars);
+        assert!(
+            errors.is_empty(),
+            "a row the editor is still waiting on must not refuse the send: {errors:?}"
+        );
+    }
+
+    /// `counter(name)` must count *across* sends, per the README: the counter
+    /// state lives in a process-global table, not on the per-send
+    /// `SystemSource`, so two sends of the same request draw different values.
+    #[test]
+    fn a_counter_counts_across_sends() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![(
+            "page".to_string(),
+            r#"counter("request-test-counter")"#.to_string(),
+        )];
+        let empty = HashMap::new();
+        let first = effective_vars_reporting(&e, &empty).0["page"].clone();
+        let second = effective_vars_reporting(&e, &empty).0["page"].clone();
+        assert_ne!(
+            first, second,
+            "two sends of the same request drew the same counter value ({first})"
+        );
+    }
+
+    /// ...and counts each send *once*. The block is evaluated twice per send —
+    /// once to find out whether it works, once for real — and the first of
+    /// those used to advance the counter too, so a request numbering its pages
+    /// went 1, 3, 5.
+    #[test]
+    fn asking_whether_a_block_works_leaves_its_counter_alone() {
+        let mut col = Collection::new(
+            "c".into(),
+            vec![entry_with_generators(
+                "http://h/a",
+                &[("page", r#"counter("request-test-precheck")"#)],
+            )],
+        );
+        col.selected_entry = 0;
+        let empty = HashMap::new();
+        // The pre-flight check every send makes, twice over.
+        assert!(generator_problems(&col, None).is_empty());
+        assert!(generator_problems(&col, None).is_empty());
+        let sent = effective_vars_reporting(&col.entries[0], &empty).0["page"].clone();
+        assert_eq!(
+            sent, "1",
+            "the checks took the send's numbers: it drew {sent} rather than 1"
+        );
     }
 }

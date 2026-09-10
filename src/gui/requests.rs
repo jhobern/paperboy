@@ -200,6 +200,10 @@ struct Actions {
     rename: Option<usize>,
     duplicate: Option<usize>,
     delete: Option<usize>,
+    /// A request whose in-memory edits are to be thrown away, restoring it from
+    /// the collection on disk. Raises the same confirmation the workspace
+    /// tree's own Revert does — a revert has no undo.
+    revert: Option<usize>,
     /// A request dragged to a new position: `(from, before)`, where `before` is
     /// the index of the request it was dropped above (`entries.len()` for the
     /// gap past the last one). Applied with
@@ -224,6 +228,10 @@ struct RowLabels<'a> {
     duplicate: &'a str,
     delete: &'a str,
     edited: &'a str,
+    /// The Revert item's label, or `None` for a collection with no file on
+    /// disk yet — there is no saved version to go back to, so the item would
+    /// be an offer nothing can honour.
+    revert: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -401,6 +409,18 @@ fn render_entry_row(
                 actions.delete = Some(i);
                 ui.close();
             }
+            // Last, below Delete: it is the other destructive entry, and it is
+            // only offered where it can do something — an unedited request has
+            // nothing to throw away, and one the user added has no saved
+            // version to come back to, so `modified` is the test rather than
+            // the pencil marker beside it.
+            if let Some(revert) = labels.revert
+                && entries[i].modified
+                && ui.button(revert).clicked()
+            {
+                actions.revert = Some(i);
+                ui.close();
+            }
         });
         if reorderable {
             if row.drag_started() {
@@ -520,6 +540,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         s.gui_delete,
         s.gui_edited_request,
     );
+    let lbl_revert = s.gui_ws_revert_request;
     let (lbl_import, lbl_import_file, lbl_import_account, tip_import_file, tip_import_account) = (
         s.gui_import_postman_button,
         s.gui_menu_import_file,
@@ -607,6 +628,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let filtering = app.session.collections[ci].list_filter_active();
     let sort = app.session.collections[ci].list_sort;
     let query = app.session.collections[ci].list_query.clone();
+    // Whether this tab has a file behind it at all: a collection that has never
+    // been saved has no last-saved version, so Revert has nothing to offer.
+    let on_disk = app.session.collections[ci].path.is_some();
     let mut actions = Actions::default();
 
     egui::ScrollArea::vertical()
@@ -657,6 +681,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 duplicate: lbl_duplicate,
                 delete: lbl_delete,
                 edited: lbl_edited,
+                revert: on_disk.then_some(lbl_revert),
             };
             // A filtered list is flat and folder-blind (see
             // `crate::tree::rows_matching`): the tree shows one collapsible
@@ -753,6 +778,11 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
             col.invalidate_request_json();
         }
     }
+    if let Some(i) = actions.revert
+        && let Some(path) = app.session.collections[ci].path.clone()
+    {
+        ask_revert_request(app, ci, path, i);
+    }
     if let Some(i) = actions.delete {
         // Route through the preference-honouring path so the context menu and
         // the Requests-panel Delete key can't disagree about whether to ask
@@ -772,6 +802,38 @@ fn apply_actions(app: &mut GuiApp, ci: usize, actions: Actions) {
         app.session.collections[ci].selected_entry = i;
         app.run_active();
     }
+}
+
+/// Raise the confirmation for throwing away request `i`'s in-memory edits and
+/// putting the version in `path` back in its place.
+///
+/// Shared by the plain request list and the workspace tree, which offer the
+/// same action from two different menus and must ask about it the same way.
+/// The request is named by the leaf of its title, so one buried three folders
+/// deep is asked about by the name on its row rather than its whole path.
+fn ask_revert_request(app: &mut GuiApp, ci: usize, path: PathBuf, i: usize) {
+    // A request the file has never held -- one added in this session, or a
+    // duplicate still sharing its original's identity -- has no saved version
+    // of its own to go back to. Say so instead of asking the user to confirm a
+    // revert that would then quietly do nothing.
+    if !app.session.collections[ci].has_saved_version(i) {
+        app.session.status = Some(crate::i18n::Status::RequestHasNoSavedVersion);
+        return;
+    }
+    let name = app.session.collections[ci]
+        .entries
+        .get(i)
+        .map(|e| {
+            let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
+            if leaf.is_empty() { e.url.clone() } else { leaf }
+        })
+        .unwrap_or_default();
+    app.dialog = Some(Dialog::RevertToSaved {
+        ci,
+        path,
+        entry: Some(i),
+        name,
+    });
 }
 
 /// Row indentation per tree depth, in pixels.
@@ -2491,20 +2553,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
     }
     match action {
         WsAction::RevertRequest { collection, idx } => {
-            let name = app.session.collections[ci]
-                .entries
-                .get(idx)
-                .map(|e| {
-                    let leaf = crate::tree::entry_path(&e.title).pop().unwrap_or_default();
-                    if leaf.is_empty() { e.url.clone() } else { leaf }
-                })
-                .unwrap_or_default();
-            app.dialog = Some(super::app::Dialog::RevertToSaved {
-                ci,
-                path: collection,
-                entry: Some(idx),
-                name,
-            });
+            ask_revert_request(app, ci, collection, idx);
         }
         WsAction::RevertFile(path) => {
             let name = path
@@ -4387,6 +4436,74 @@ pub(crate) mod tests {
             app.session.collections[ci].list_cursor, api_row,
             "clicking a row hands the keyboard cursor to it, so the two don't fight"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod revert_menu_tests {
+    use super::*;
+    use crate::gui::app::Dialog;
+
+    /// A plain collection tab's request rows offer the same "Revert to saved"
+    /// the workspace tree's do — the menu is egui-driven, so what's checked
+    /// here is that both routes raise one dialog, aimed at the same request and
+    /// naming it the same way.
+    #[test]
+    fn reverting_a_request_asks_before_throwing_the_edits_away() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_revert_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "# Folder/Login\nGET https://example.com/a\n").unwrap();
+
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(session.load_collection_text("c".into(), &text, Some(path.clone())));
+        let ci = session.active_tab;
+        let mut app = GuiApp::for_test(session);
+
+        super::ask_revert_request(&mut app, ci, path.clone(), 0);
+        match &app.dialog {
+            Some(Dialog::RevertToSaved {
+                ci: dci,
+                path: dp,
+                entry,
+                name,
+            }) => {
+                assert_eq!((*dci, entry.unwrap()), (ci, 0));
+                assert_eq!(dp, &path);
+                // The leaf of the title, not "Folder/Login": the row says
+                // "Login", so the question has to as well.
+                assert_eq!(name, "Login");
+            }
+            _ => panic!("a revert must be confirmed, since it has no undo"),
+        }
+
+        // A request the file has never held has nothing to revert *to*. Asking
+        // the user to confirm a revert that then quietly does nothing is the
+        // worst of both: they commit to losing edits, and keep them.
+        app.dialog = None;
+        app.session.collections[ci]
+            .entries
+            .push(crate::hurl::HurlEntry {
+                method: "GET".into(),
+                url: "https://example.com/new".into(),
+                user_added: true,
+                ..Default::default()
+            });
+        let added = app.session.collections[ci].entries.len() - 1;
+        super::ask_revert_request(&mut app, ci, path.clone(), added);
+        assert!(app.dialog.is_none(), "nothing to confirm");
+        assert!(matches!(
+            app.session.status,
+            Some(crate::i18n::Status::RequestHasNoSavedVersion)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

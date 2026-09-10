@@ -301,6 +301,12 @@ pub(crate) enum NewField {
     Report(usize, CapCol),
     /// The "+ Add report field" row of the `[Reports]` section.
     AddReport,
+    /// A focused cell of a `[Gen]` row — the name being computed, or the
+    /// expression computing it. Shares [`CapCol`] with Captures and Reports:
+    /// all three are a name beside an expression.
+    Computed(usize, CapCol),
+    /// The "+ Add computed value" row of the `[Gen]` section.
+    AddComputed,
 }
 
 impl NewField {
@@ -322,6 +328,7 @@ impl NewField {
             NewField::Assert(..) | NewField::AddAssert => Some(WizardTab::Asserts),
             NewField::Capture(..) | NewField::AddCapture => Some(WizardTab::Captures),
             NewField::Report(..) | NewField::AddReport => Some(WizardTab::Reports),
+            NewField::Computed(..) | NewField::AddComputed => Some(WizardTab::Computed),
         }
     }
 }
@@ -343,12 +350,15 @@ pub(crate) enum WizardTab {
     Asserts,
     Captures,
     Reports,
+    /// The `# [Gen]` block: values the request computes for itself at send
+    /// time.
+    Computed,
 }
 
 impl WizardTab {
     /// All tabs, in their default display order — used to initialize a
     /// fresh `NewReq::tab_order` (which the user may subsequently reorder).
-    pub(crate) const ALL: [WizardTab; 10] = [
+    pub(crate) const ALL: [WizardTab; 11] = [
         WizardTab::All,
         WizardTab::Headers,
         WizardTab::Cookies,
@@ -359,6 +369,7 @@ impl WizardTab {
         WizardTab::Asserts,
         WizardTab::Captures,
         WizardTab::Reports,
+        WizardTab::Computed,
     ];
 
     pub(crate) fn label(self, s: &Strings) -> &'static str {
@@ -373,6 +384,7 @@ impl WizardTab {
             WizardTab::Asserts => s.field_asserts,
             WizardTab::Captures => s.field_captures,
             WizardTab::Reports => s.field_reports,
+            WizardTab::Computed => s.field_generated,
         }
     }
 
@@ -394,6 +406,7 @@ impl WizardTab {
             WizardTab::Asserts => NewField::Assert(0),
             WizardTab::Captures => NewField::Capture(0, CapCol::Name),
             WizardTab::Reports => NewField::Report(0, CapCol::Name),
+            WizardTab::Computed => NewField::Computed(0, CapCol::Name),
         }
     }
 
@@ -411,12 +424,42 @@ impl WizardTab {
             WizardTab::Asserts => NewField::AddAssert,
             WizardTab::Captures => NewField::AddCapture,
             WizardTab::Reports => NewField::AddReport,
+            WizardTab::Computed => NewField::AddComputed,
         }
     }
 }
 
 /// `ctx` values for [`NewReq::dropdown_scroll`], so the two dropdowns that
 /// share it don't inherit each other's viewport.
+
+/// The identifier being typed at the caret in a `[Gen]` expression: the char
+/// range `[start, end)` of the word straddling `col`, and the word itself.
+///
+/// Scanning outward from the caret in *both* directions — not back from the end
+/// of the whole cell — is what lets a suggestion be accepted inside an existing
+/// call. Accepting one writes `name()` with the caret between the brackets, so
+/// there is always a `)` to the right of the caret; a scan from the end would
+/// find that `)` first and call the trailing word empty, and no further
+/// function could ever be completed inside `base64(sha│)`. The GUI's
+/// `insert_call` scans from the caret for the same reason.
+fn gen_word(text: &str, col: usize) -> crate::generators::TypedWord {
+    crate::generators::typed_word_at(text, Some(col))
+}
+
+/// What accepting function `f` puts in the cell in place of the word at the
+/// caret, and how far into it the caret should then sit.
+///
+/// Keyed off `f.min_args`, exactly as the GUI's `insert_call` is, rather than
+/// off the wording of the signature: a function that needs an argument is
+/// written with *both* brackets and the caret between them, so the next
+/// keystroke is the argument and the block doesn't report an unclosed `(` as a
+/// fault; one that needs none is complete as its bare name, caret after it.
+/// Reading `min_args` instead of parsing `signature` keeps this in step with
+/// the GUI even if a signature is ever reworded.
+fn gen_completion(f: &crate::generators::GenFunction) -> (String, usize) {
+    crate::generators::completion(f)
+}
+
 const KEY_DROPDOWN: u64 = 1;
 const CTYPE_DROPDOWN: u64 = 2;
 
@@ -442,6 +485,10 @@ pub(crate) struct NewReq {
     pub(crate) asserts: Vec<AssertRow>,
     pub(crate) captures: Vec<CaptureRow>,
     pub(crate) reports: Vec<ReportRow>,
+    /// The `# [Gen]` rows. A [`ReportRow`] is reused rather than copied: both
+    /// are a name beside an expression, and a second identical struct is a
+    /// second place to forget to update.
+    pub(crate) generators: Vec<ReportRow>,
     pub(crate) method_idx: usize,
     pub(crate) focus: NewField,
     /// The last Headers/Cookies/Queries/Options or Form table cell the user
@@ -461,6 +508,17 @@ pub(crate) struct NewReq {
     /// True once the user has dismissed the dropdown with Esc; reset when they
     /// type or move to a different field.
     pub(crate) suggest_hidden: bool,
+    /// Whether the `[Gen]` expression cell is showing the whole function
+    /// catalogue rather than the matches for a half-typed name.
+    ///
+    /// Completion-as-you-type only helps someone who already knows a function
+    /// is called `hmac_sha256`; there was nothing in the terminal UI that would
+    /// *show* you the thirty-odd functions, the way the GUI's function menu
+    /// does. Enter (or Down) on an expression cell opens the list; typing then
+    /// narrows it in the usual way. Not on by default, because a list that
+    /// covers the form the moment a cell is focused is in the way of everyone
+    /// who came to type an expression they already know.
+    pub(crate) gen_browse: bool,
     /// Where the key-suggestion and content-type dropdowns are scrolled to,
     /// carried between frames (see [`ListScroll`]); both cap at eight rows and
     /// scroll beyond that, and only one is ever open at a time.
@@ -481,6 +539,11 @@ pub(crate) struct NewReq {
     /// Set during draw: screen rect of the focused Key cell, so the suggestion
     /// dropdown can be anchored beneath it.
     pub(crate) key_cell_rect: std::cell::Cell<Option<Rect>>,
+    /// Where the focused `[Gen]` Expression cell was last drawn, so the
+    /// function dropdown can anchor beneath it. Kept apart from
+    /// [`Self::key_cell_rect`] because the All tab stacks both tables in one
+    /// frame and each clears its own anchor as it draws.
+    pub(crate) gen_cell_rect: std::cell::Cell<Option<Rect>>,
     /// Set during draw: screen rect of the focused Form Kind cell, so its
     /// Text/File dropdown can be anchored beneath it.
     pub(crate) kind_cell_rect: std::cell::Cell<Option<Rect>>,
@@ -505,6 +568,7 @@ pub(crate) struct NewReq {
     pub(crate) assert_scroll: std::cell::Cell<usize>,
     pub(crate) capture_scroll: std::cell::Cell<usize>,
     pub(crate) report_scroll: std::cell::Cell<usize>,
+    pub(crate) computed_scroll: std::cell::Cell<usize>,
     /// Index of the first visible section in the combined "All" view when the
     /// nine stacked sections are collectively taller than the dialog body.
     /// Persisted between renders so the scroll position stays put, moving only
@@ -703,6 +767,7 @@ impl NewReq {
             WizardTab::Asserts => self.asserts.iter().any(|r| !r.is_blank()),
             WizardTab::Captures => self.captures.iter().any(|r| !r.is_blank()),
             WizardTab::Reports => self.reports.iter().any(|r| !r.is_blank()),
+            WizardTab::Computed => self.generators.iter().any(|r| !r.is_blank()),
         }
     }
 
@@ -788,6 +853,10 @@ impl NewReq {
         for row in &self.reports {
             let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
         }
+        sig.push(R);
+        for row in &self.generators {
+            let _ = write!(sig, "{F}{}{F}{}", row.name.text(), row.expr.text());
+        }
         sig
     }
 
@@ -848,6 +917,7 @@ impl NewReq {
             asserts: Vec::new(),
             captures: Vec::new(),
             reports: Vec::new(),
+            generators: Vec::new(),
             method_idx: 0,
             focus: NewField::Name,
             last_table_cell: None,
@@ -857,11 +927,13 @@ impl NewReq {
             extract: None,
             suggest_hi: None,
             suggest_hidden: false,
+            gen_browse: false,
             dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
             ctype_hi: None,
             key_cell_rect: std::cell::Cell::new(None),
+            gen_cell_rect: std::cell::Cell::new(None),
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             form_desc_visible: std::cell::Cell::new(true),
@@ -871,6 +943,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            computed_scroll: std::cell::Cell::new(0),
             all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: None,
@@ -899,6 +972,7 @@ impl NewReq {
             NewField::Assert(i) => i < self.asserts.len(),
             NewField::Capture(i, _) => i < self.captures.len(),
             NewField::Report(i, _) => i < self.reports.len(),
+            NewField::Computed(i, _) => i < self.generators.len(),
             _ => true,
         }
     }
@@ -1001,6 +1075,16 @@ impl NewReq {
                 row
             })
             .collect();
+        let generators = entry
+            .generators
+            .iter()
+            .map(|(n, e)| {
+                let mut row = ReportRow::new();
+                row.name = Editor::new(n, false);
+                row.expr = Editor::new(e, false);
+                row
+            })
+            .collect();
         Self {
             name: Editor::new(&entry.title, false),
             url: Editor::new(&entry.url, false),
@@ -1013,6 +1097,7 @@ impl NewReq {
             asserts,
             captures,
             reports,
+            generators,
             method_idx,
             focus: NewField::Name,
             last_table_cell: None,
@@ -1022,11 +1107,13 @@ impl NewReq {
             extract: None,
             suggest_hi: None,
             suggest_hidden: false,
+            gen_browse: false,
             dropdown_scroll: ListScroll::default(),
             kind_dropdown_hidden: false,
             ctype_dropdown_hidden: false,
             ctype_hi: None,
             key_cell_rect: std::cell::Cell::new(None),
+            gen_cell_rect: std::cell::Cell::new(None),
             kind_cell_rect: std::cell::Cell::new(None),
             ctype_cell_rect: std::cell::Cell::new(None),
             form_desc_visible: std::cell::Cell::new(true),
@@ -1036,6 +1123,7 @@ impl NewReq {
             assert_scroll: std::cell::Cell::new(0),
             capture_scroll: std::cell::Cell::new(0),
             report_scroll: std::cell::Cell::new(0),
+            computed_scroll: std::cell::Cell::new(0),
             all_scroll: std::cell::Cell::new(0),
             file_root,
             editing: Some((ci, ei)),
@@ -1065,6 +1153,9 @@ impl NewReq {
     /// [`Self::key_dropdown`] and to decide whether Enter should be able to
     /// reveal a dropdown that arrow-key navigation auto-hid.
     fn key_suggestions(&self) -> Option<(usize, Vec<&'static str>)> {
+        if let NewField::Computed(i, CapCol::Expr) = self.focus {
+            return self.gen_suggestions(i);
+        }
         let NewField::Kvd(KvdKind::Header, i, HdrCol::Key) = self.focus else {
             return None;
         };
@@ -1072,6 +1163,22 @@ impl NewReq {
         let sugs = filter_headers(&text);
         let single_exact = sugs.len() == 1 && sugs[0].eq_ignore_ascii_case(text.trim());
         (!sugs.is_empty() && !single_exact).then_some((i, sugs))
+    }
+
+    /// The generator functions matching what is being typed in `[Gen]` row
+    /// `i`'s expression, offered as their signatures: the argument names are
+    /// the whole reason to look, and `hmac_sha256` alone does not say what it
+    /// wants first. Only the word *at the caret* filters, so a function can
+    /// still be completed inside `concat(upper(` — an expression is not one
+    /// name the way a header is.
+    fn gen_suggestions(&self, i: usize) -> Option<(usize, Vec<&'static str>)> {
+        let row = self.generators.get(i)?;
+        let text = row.expr.text();
+        let w = gen_word(&text, row.expr.col);
+        // The list itself is `generators::suggestions_for_word`, shared with
+        // the GUI so the two front-ends offer the same thing at the same time.
+        crate::generators::suggestions_for_word(&w.prefix, &w.whole, self.gen_browse)
+            .map(|sugs| (i, sugs))
     }
 
     /// The suggestion dropdown for the focused Key cell, if it should be shown:
@@ -1093,13 +1200,110 @@ impl NewReq {
 
     /// Fill the focused Key cell with header `name` and close the dropdown.
     pub(crate) fn accept_suggestion(&mut self, name: &str) {
-        if let NewField::Kvd(KvdKind::Header, i, HdrCol::Key) = self.focus
-            && let Some(row) = self.headers.get_mut(i)
-        {
-            row.key = Editor::new(name, false);
+        match self.focus {
+            NewField::Kvd(KvdKind::Header, i, HdrCol::Key) => {
+                if let Some(row) = self.headers.get_mut(i) {
+                    row.key = Editor::new(name, false);
+                }
+            }
+            // The suggestion is a signature; what goes in the cell is the call.
+            // Only the word straddling the caret is replaced — the rest of the
+            // expression around it is the user's.
+            NewField::Computed(i, CapCol::Expr) => {
+                // `name` is the signature the dropdown showed; the call to
+                // write, and whether it needs brackets, come from the function
+                // it names — read from `min_args`, as the GUI does.
+                // A ready-made example is written as it stands, with the
+                // caret after it: there is no argument left to type, so
+                // dropping the caret into the middle of a finished call would
+                // only be in the way.
+                let picked = crate::generators::function_for_suggestion(name)
+                    .map(|f| (f, f.signature == name));
+                let Some((f, is_signature)) = picked else {
+                    return;
+                };
+                let (call, caret) = if is_signature {
+                    gen_completion(f)
+                } else {
+                    (name.to_string(), name.chars().count())
+                };
+                if let Some(row) = self.generators.get_mut(i) {
+                    let text = row.expr.text();
+                    let chars: Vec<char> = text.chars().collect();
+                    let w = gen_word(&text, row.expr.col);
+                    // Text the caret was put in front of is what the call is
+                    // being built *around*: `|uuid` completed with `base64`
+                    // means `base64(uuid)`, not a `base64` where the `uuid`
+                    // used to be. A ready-made example is a finished call and
+                    // wraps nothing; otherwise `generators::can_wrap` decides,
+                    // so the GUI cannot answer this differently.
+                    let wrapping =
+                        !w.wrapped.is_empty() && is_signature && crate::generators::can_wrap(f);
+                    let (call, caret) = if wrapping {
+                        // The caret lands after what was wrapped, still inside
+                        // the brackets: whatever else the call wants (a second
+                        // argument, an offset) is typed from there.
+                        //
+                        // A function that needs *another* argument beyond the
+                        // one just filled -- `hmac_sha256(key, text)` -- gets
+                        // the separator written for it, so what is left to type
+                        // is visible as a gap rather than looking like a
+                        // finished call that would then fail at send time with
+                        // "expects 2 arguments". The GUI writes the remaining
+                        // argument's name in and selects it; a terminal cell
+                        // has no selection to type over, so placeholder text
+                        // there would have to be deleted by hand.
+                        let more = f.min_args > 1;
+                        let tail = if more { ", " } else { "" };
+                        (
+                            format!("{}({}{})", f.name, w.wrapped, tail),
+                            f.name.chars().count()
+                                + 1
+                                + w.wrapped.chars().count()
+                                + tail.chars().count(),
+                        )
+                    } else {
+                        (call, caret)
+                    };
+                    let (start, end) = (w.start, if wrapping { w.wrap_end } else { w.end });
+                    let mut done = String::new();
+                    done.extend(chars[..start].iter());
+                    done.push_str(&call);
+                    done.extend(chars[end..].iter());
+                    // Replaced in place rather than rebuilt: a fresh Editor
+                    // starts with an empty undo stack, so Ctrl+Z after
+                    // accepting a suggestion would have nothing to go back to.
+                    // The caret lands inside the call rather than at the end of
+                    // the text — the completion went into the middle of an
+                    // expression.
+                    row.expr.replace_text(&done, 0, start + caret);
+                }
+            }
+            _ => {}
         }
         self.suggest_hi = None;
         self.suggest_hidden = true;
+        self.gen_browse = false;
+    }
+
+    /// Whether Enter on the focused cell should open the function catalogue
+    /// rather than move on: an expression cell with nothing to complete yet.
+    pub(crate) fn gen_browse_openable(&self) -> bool {
+        let NewField::Computed(i, CapCol::Expr) = self.focus else {
+            return false;
+        };
+        // Not once it has been dismissed (Esc means "not now", and reopening
+        // on the next keypress makes Esc look broken), and not with a name
+        // half-typed -- that is what completion is for, and the catalogue
+        // would replace the matches with everything.
+        if self.gen_browse || self.suggest_hidden {
+            return false;
+        }
+        let Some(row) = self.generators.get(i) else {
+            return false;
+        };
+        let text = row.expr.text();
+        gen_word(&text, row.expr.col).prefix.is_empty()
     }
 
     /// Whether the Form Kind (Text/File) dropdown should currently be shown:
@@ -1251,7 +1455,16 @@ impl NewReq {
 
     /// The text editor for the focused field, if it is a text field.
     pub(crate) fn active_editor(&mut self) -> Option<&mut Editor> {
-        match self.focus {
+        self.editor_at(self.focus)
+    }
+
+    /// The [`Editor`] behind `field`, if that field is a text-entry one.
+    ///
+    /// Separate from [`active_editor`](Self::active_editor) so a host can also
+    /// reach the field focus has just *left* — which is where an undo run has
+    /// to be ended, so typing after coming back to a cell is its own step.
+    pub(crate) fn editor_at(&mut self, field: NewField) -> Option<&mut Editor> {
+        match field {
             NewField::Name => Some(&mut self.name),
             NewField::Url => Some(&mut self.url),
             NewField::Body => Some(&mut self.body),
@@ -1273,6 +1486,7 @@ impl NewReq {
             NewField::Assert(i) => self.asserts.get_mut(i).map(|r| &mut r.expr),
             NewField::Capture(i, col) => self.captures.get_mut(i).map(|r| r.cell_mut(col)),
             NewField::Report(i, col) => self.reports.get_mut(i).map(|r| r.cell_mut(col)),
+            NewField::Computed(i, col) => self.generators.get_mut(i).map(|r| r.cell_mut(col)),
             NewField::Method
             | NewField::Target
             | NewField::TabBar
@@ -1283,7 +1497,8 @@ impl NewReq {
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
-            | NewField::AddReport => None,
+            | NewField::AddReport
+            | NewField::AddComputed => None,
         }
     }
 
@@ -1305,6 +1520,22 @@ impl NewReq {
     /// when tabbing between `[Captures]` and Name.
     pub(crate) fn reports_blank(&self) -> bool {
         self.reports.iter().all(ReportRow::is_blank)
+    }
+
+    /// True when every `# [Gen]` row is blank — the section is then skipped
+    /// when tabbing past it.
+    /// The `[Gen]` rows as the evaluator takes them, blank ones left out —
+    /// a row still being typed is not yet a mistake.
+    pub(crate) fn generator_rows(&self) -> Vec<(String, String)> {
+        self.generators
+            .iter()
+            .filter(|r| !r.is_blank())
+            .map(|r| (r.name.text(), r.expr.text()))
+            .collect()
+    }
+
+    pub(crate) fn generators_blank(&self) -> bool {
+        self.generators.iter().all(ReportRow::is_blank)
     }
 
     /// The field that represents "arriving at the `[Asserts]` section for the
@@ -1334,6 +1565,15 @@ impl NewReq {
             NewField::AddReport
         } else {
             NewField::Report(0, CapCol::Name)
+        }
+    }
+
+    /// Like [`Self::assert_entry`], but for the `# [Gen]` block.
+    pub(crate) fn computed_entry(&self) -> NewField {
+        if self.generators.is_empty() {
+            NewField::AddComputed
+        } else {
+            NewField::Computed(0, CapCol::Name)
         }
     }
 
@@ -1399,6 +1639,14 @@ impl NewReq {
                     NewField::Report(i.min(self.reports.len() - 1), CapCol::Name)
                 }
             }
+            NewField::Computed(i, _) if i < self.generators.len() => {
+                self.generators.remove(i);
+                if self.generators.is_empty() {
+                    NewField::AddComputed
+                } else {
+                    NewField::Computed(i.min(self.generators.len() - 1), CapCol::Name)
+                }
+            }
             other => other,
         };
     }
@@ -1452,6 +1700,16 @@ impl NewReq {
             NewField::AddCapture
         } else {
             NewField::Capture(self.captures.len() - 1, CapCol::Name)
+        }
+    }
+
+    /// Like [`Self::up_into_captures`], but the section above the `# [Gen]`
+    /// block: its last `[Reports]` row, or that section's "+ Add" row.
+    pub(crate) fn up_into_reports(&self) -> NewField {
+        if self.reports.is_empty() {
+            NewField::AddReport
+        } else {
+            NewField::Report(self.reports.len() - 1, CapCol::Name)
         }
     }
 
@@ -1624,6 +1882,8 @@ impl NewReq {
             NewField::AddCapture => (11, usize::MAX, 0),
             NewField::Report(i, c) => (12, i, if c == CapCol::Name { 0 } else { 1 }),
             NewField::AddReport => (12, usize::MAX, 0),
+            NewField::Computed(i, c) => (13, i, if c == CapCol::Name { 0 } else { 1 }),
+            NewField::AddComputed => (13, usize::MAX, 0),
         }
     }
 
@@ -1752,6 +2012,15 @@ impl NewReq {
             }
             v.push(NewField::AddReport);
         }
+        if self.generators_blank() {
+            v.push(self.computed_entry());
+        } else {
+            for i in 0..self.generators.len() {
+                v.push(NewField::Computed(i, CapCol::Name));
+                v.push(NewField::Computed(i, CapCol::Expr));
+            }
+            v.push(NewField::AddComputed);
+        }
         v
     }
 
@@ -1823,7 +2092,8 @@ impl NewReq {
             NewField::Body => self.assert_entry(),
             NewField::Assert(..) | NewField::AddAssert => self.capture_entry(),
             NewField::Capture(..) | NewField::AddCapture => self.report_entry(),
-            NewField::Report(..) | NewField::AddReport => NewField::Name,
+            NewField::Report(..) | NewField::AddReport => self.computed_entry(),
+            NewField::Computed(..) | NewField::AddComputed => NewField::Name,
         }
     }
 
@@ -1833,8 +2103,8 @@ impl NewReq {
     pub(crate) fn jump_backward(&self) -> NewField {
         match self.focus {
             // Wrapping backward past the first field lands on the last section,
-            // matching jump_forward's `Report -> Name` wrap.
-            NewField::Name => self.report_entry(),
+            // matching jump_forward's `Computed -> Name` wrap.
+            NewField::Name => self.computed_entry(),
             NewField::Target | NewField::Method | NewField::Url | NewField::TabBar => {
                 self.next_backward(true)
             }
@@ -1853,6 +2123,7 @@ impl NewReq {
             NewField::Assert(..) | NewField::AddAssert => NewField::Body,
             NewField::Capture(..) | NewField::AddCapture => self.assert_entry(),
             NewField::Report(..) | NewField::AddReport => self.capture_entry(),
+            NewField::Computed(..) | NewField::AddComputed => self.report_entry(),
         }
     }
 
@@ -1870,6 +2141,7 @@ impl NewReq {
             WizardTab::Asserts => self.assert_entry(),
             WizardTab::Captures => self.capture_entry(),
             WizardTab::Reports => self.report_entry(),
+            WizardTab::Computed => self.computed_entry(),
             other => other.first_field(),
         }
     }
@@ -1884,7 +2156,10 @@ impl NewReq {
             // point of it, so `[`/`]` keep cycling from there.
             NewField::TabBar => false,
             NewField::Name | NewField::Url | NewField::Body => true,
-            NewField::Assert(_) | NewField::Capture(..) | NewField::Report(..) => true,
+            NewField::Assert(_)
+            | NewField::Capture(..)
+            | NewField::Report(..)
+            | NewField::Computed(..) => true,
             NewField::Kvd(KvdKind::Header, _, col)
             | NewField::Kvd(KvdKind::Cookie, _, col)
             | NewField::Kvd(KvdKind::Query, _, col)
@@ -1904,7 +2179,8 @@ impl NewReq {
             | NewField::AddFormField
             | NewField::AddAssert
             | NewField::AddCapture
-            | NewField::AddReport => false,
+            | NewField::AddReport
+            | NewField::AddComputed => false,
         }
     }
 
@@ -1976,7 +2252,7 @@ pub(crate) fn section_height(header_h: u16, row_count: usize) -> u16 {
 
 /// Number of stacked sections in the combined "All" view (Headers, Cookies,
 /// Queries, Options, Form, Body, Asserts, Captures, Reports — in that order).
-pub(crate) const SECTION_COUNT: usize = 9;
+pub(crate) const SECTION_COUNT: usize = 10;
 
 /// Map a [`WizardTab`] to its index in the stacked "All" view (the order the
 /// sections are drawn). `All` has no position of its own.
@@ -1992,6 +2268,7 @@ pub(crate) fn wizard_tab_section_index(tab: WizardTab) -> Option<usize> {
         WizardTab::Asserts => 6,
         WizardTab::Captures => 7,
         WizardTab::Reports => 8,
+        WizardTab::Computed => 9,
     })
 }
 
@@ -2008,6 +2285,7 @@ fn all_section_is_empty(form: &NewReq, i: usize) -> bool {
         6 => form.asserts.is_empty(),
         7 => form.captures.is_empty(),
         8 => form.reports.is_empty(),
+        9 => form.generators.is_empty(),
         _ => true,
     }
 }
@@ -2029,6 +2307,7 @@ fn all_section_block_h(form: &NewReq, i: usize) -> u16 {
         6 => (form.asserts.len(), 0),
         7 => (form.captures.len(), 1),
         8 => (form.reports.len(), 1),
+        9 => (form.generators.len(), 1),
         _ => (0, 1),
     };
     if count == 0 {
@@ -2071,6 +2350,7 @@ fn all_section_empty_meta(
         6 => (s.field_asserts, s.add_assert, NewField::AddAssert),
         7 => (s.field_captures, s.add_capture, NewField::AddCapture),
         8 => (s.field_reports, s.add_report, NewField::AddReport),
+        9 => (s.field_generated, s.add_generated, NewField::AddComputed),
         _ => (
             s.field_headers,
             s.add_header,
@@ -2094,6 +2374,7 @@ fn empty_section_add_col(s: &Strings) -> usize {
         s.field_asserts,
         s.field_captures,
         s.field_reports,
+        s.field_generated,
     ]
     .iter()
     .map(|l| Span::raw(*l).width())
@@ -2150,6 +2431,7 @@ fn draw_all_section(
         6 => draw_asserts_section(f, label, table, form, s, th, app),
         7 => draw_captures_section(f, label, table, form, s, th, app),
         8 => draw_reports_section(f, label, table, form, s, th, app),
+        9 => draw_computed_section(f, label, table, form, s, th, app),
         _ => {}
     }
 }
@@ -2573,6 +2855,7 @@ pub(crate) fn draw_new_request_with_hits(
             WizardTab::Asserts => draw_asserts_section(f, sub[0], sub[1], form, s, th, app),
             WizardTab::Captures => draw_captures_section(f, sub[0], sub[1], form, s, th, app),
             WizardTab::Reports => draw_reports_section(f, sub[0], sub[1], form, s, th, app),
+            WizardTab::Computed => draw_computed_section(f, sub[0], sub[1], form, s, th, app),
         }
     }
 
@@ -2839,6 +3122,53 @@ fn draw_reports_section(
         matches!(form.focus, NewField::Report(..)) || form.focus == NewField::AddReport;
     draw_section_label(f, label, s.field_reports, rep_focused, th);
     draw_report_table_with_hits(f, table, form, s, th, app);
+}
+
+/// Draw the `# [Gen]` label + table into the given (label, table) rects.
+fn draw_computed_section(
+    f: &mut Frame,
+    label: Rect,
+    table: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    let focused =
+        matches!(form.focus, NewField::Computed(..)) || form.focus == NewField::AddComputed;
+    // A block that cannot run is said so here rather than at send time: a
+    // mistyped function name is otherwise a 401 twenty minutes later, and this
+    // is the screen on which it is still just a typo. Only the first fault is
+    // shown — the label is one line, and the rest follow as each is fixed.
+    let faults = crate::generators::check(&form.generator_rows());
+    match faults.first() {
+        None => draw_section_label(f, label, s.field_generated, focused, th),
+        Some(fault) => {
+            let (fg, bg) = section_label_colors(focused, th);
+            let detail = crate::i18n::describe_gen_errors(s, std::slice::from_ref(fault))
+                .pop()
+                .unwrap_or_default();
+            // Clipped to what the label rect can hold, with an ellipsis. A
+            // Paragraph simply drops the overflow, so on a narrow terminal the
+            // sentence ended mid-word and read as a *different*, shorter
+            // complaint -- "unknown function" with the name it objects to cut
+            // off. The ellipsis at least says there is more.
+            let room = (label.width as usize).saturating_sub(s.field_generated.chars().count() + 1);
+            let detail = crate::shared_utils::truncate_to_width(&detail, room);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", s.field_generated),
+                        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(detail, Style::default().fg(th.err).bg(bg)),
+                ]))
+                .style(Style::default().bg(bg)),
+                label,
+            );
+        }
+    }
+    draw_computed_table_with_hits(f, table, form, s, th, app);
 }
 
 /// Draw the Text/File dropdown beneath the focused Form Kind cell, with the
@@ -3108,7 +3438,11 @@ pub(crate) fn draw_key_suggestions(
     let Some((_, sugs)) = form.key_dropdown() else {
         return;
     };
-    let Some(anchor) = form.key_cell_rect.get() else {
+    let anchor = match form.focus {
+        NewField::Computed(_, CapCol::Expr) => form.gen_cell_rect.get(),
+        _ => form.key_cell_rect.get(),
+    };
+    let Some(anchor) = anchor else {
         return;
     };
     let fr = f.area();
@@ -4380,6 +4714,143 @@ pub(crate) fn draw_report_table_with_hits(
             f,
             bar_area,
             form.reports.len(),
+            data_rects.len().max(1),
+            start,
+            th,
+        );
+    }
+}
+
+/// Draw the `# [Gen]` table: `Name | Expression` columns, plus an "Add
+/// computed value" hint line. Structurally identical to
+/// [`draw_computed_table_with_hits`] — Captures, Reports and computed values are
+/// all a name beside an expression, and only the expression's language differs.
+pub(crate) fn draw_computed_table_with_hits(
+    f: &mut Frame,
+    area: Rect,
+    form: &NewReq,
+    s: &Strings,
+    th: &Theme,
+    app: Option<&TuiApp>,
+) {
+    let focused_idx = match form.focus {
+        NewField::Computed(i, _) => Some(i),
+        _ => None,
+    };
+    form.gen_cell_rect.set(None);
+    let Some((table_area, header_rect, data_rects, add_rect, scrolling, start)) =
+        windowed_table_rows(
+            area,
+            true,
+            form.generators.len(),
+            &form.computed_scroll,
+            focused_idx,
+        )
+    else {
+        return;
+    };
+
+    let name_w = 18u16.min(table_area.width.saturating_sub(4)).max(4);
+    let cell_rects = |row_area: Rect| {
+        Layout::horizontal([Constraint::Length(name_w), Constraint::Min(1)])
+            .spacing(1)
+            .split(row_area)
+    };
+    if scrolling {
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                area,
+                MouseHitTarget::Scroll(MouseScrollTarget::WizardComputed),
+            );
+        }
+    }
+    let lbl = |t: &str| {
+        Paragraph::new(Span::styled(
+            t.to_string(),
+            Style::default().fg(th.dim).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    if let Some(hrect) = header_rect {
+        let hcells = cell_rects(hrect);
+        f.render_widget(lbl(s.generated_name), hcells[0]);
+        // The column header carries the way in to the function list: a cell
+        // that completes what you type is no use to someone who does not know
+        // there is anything to type, and this is the only place they are
+        // already looking.
+        let expr_label = if matches!(form.focus, NewField::Computed(_, CapCol::Expr)) {
+            s.generated_fn_hint
+        } else {
+            s.generated_expr
+        };
+        f.render_widget(lbl(expr_label), hcells[1]);
+    }
+
+    for (slot, row_area) in data_rects.iter().enumerate() {
+        let i = start + slot;
+        let row = &form.generators[i];
+        let cells = cell_rects(*row_area);
+        draw_header_cell(
+            f,
+            cells[0],
+            &row.name,
+            form.focus == NewField::Computed(i, CapCol::Name),
+            true,
+            th,
+        );
+        if let Some(app) = app {
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[0],
+                MouseHitTarget::NewRequestField(NewField::Computed(i, CapCol::Name)),
+            );
+            app.push_mouse_hit(
+                MouseLayer::Overlay,
+                cells[1],
+                MouseHitTarget::NewRequestField(NewField::Computed(i, CapCol::Expr)),
+            );
+        }
+        let expr_focused = form.focus == NewField::Computed(i, CapCol::Expr);
+        draw_header_cell(f, cells[1], &row.expr, expr_focused, true, th);
+        // Remembered so the function dropdown can anchor beneath the cell,
+        // which is drawn later, on top of the form.
+        if expr_focused {
+            form.gen_cell_rect.set(Some(cells[1]));
+        }
+    }
+
+    let add_focused = form.focus == NewField::AddComputed;
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            s.add_generated.to_string(),
+            Style::default()
+                .fg(if add_focused { th.accent } else { th.dim })
+                .add_modifier(Modifier::BOLD),
+        )),
+        add_rect,
+    );
+    if let Some(app) = app {
+        app.push_mouse_hit(
+            MouseLayer::Overlay,
+            add_rect,
+            MouseHitTarget::NewRequestActivate(NewField::AddComputed),
+        );
+    }
+
+    if scrolling {
+        let header_h = 1u16;
+        let bar_area = Rect {
+            x: area.x,
+            y: table_area.y + header_h,
+            width: 1,
+            // Only the scrollable data rows, not the pinned "+ Add …" line.
+            height: data_rects.len() as u16,
+        };
+        draw_scrollbar(
+            f,
+            bar_area,
+            form.generators.len(),
             data_rects.len().max(1),
             start,
             th,

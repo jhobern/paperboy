@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -54,6 +54,19 @@ ratatui = "0.30.2"
 clap = { version = "4.6.1", features = ["derive"] }
 ratatui-explorer = "0.3.0"
 uuid = { version = "1", features = ["v4"] }
+# Randomness for the `# [Gen]` block's nonces and keys. Already compiled as a
+# transitive dependency of `uuid`, so naming it directly costs no extra build;
+# pure Rust, so it doesn't disturb the no-C-toolchain story `build.rs` guards.
+getrandom = "0.3"
+# Hashes and HMAC for the `# [Gen]` block's signature functions. RustCrypto, so
+# pure Rust with no OpenSSL and no C toolchain — signing must not become the
+# reason `cargo install paperboy` needs a build environment. `sha2` is already
+# compiled as a transitive dependency; the `0.10`/`0.12` line is the one it and
+# `digest 0.10` are on, so these share it rather than duplicating the tree.
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
 regex = "1"
 # Local-time formatting for the report name `{time}` token. `Local` reads the
 # system timezone via libc (robust in our multithreaded runner, unlike the

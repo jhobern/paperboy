@@ -8,6 +8,887 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.5] - 2026-09-08
+
+### Added
+
+- The Response panel's per-assert list now folds too, with the same `z`. A run
+  whose checks all passed already says so in the `[Asserts] ✓ 8/8` badge beside
+  the status, and listing all eight underneath spends the panel repeating it
+  while pushing the body — the thing the badge cannot show — off the bottom. So
+  the list starts folded when nothing failed and open when anything did, which
+  is the case the reader came for; `z` overrides either way, and with the
+  Response pane focused it acts on that list rather than on the request's
+  summary.
+
+- The terminal UI's `[Captures]`, `[Asserts]` and `[Generated]` summary above a
+  request now folds, with `z`, and starts folded. A request that checks its
+  response thoroughly can list more of those rows than the request itself has
+  lines, at which point the pane is nearly all description; folded, they leave
+  a counted one-line summary (`[Captures] 3 · [Asserts] 20`) so it is still
+  obvious they are there. `z show details` / `z hide details` appears in the
+  footer with the other shortcuts whenever the selected request has any of
+  them. An unfolded list too long for the pane also now ends in a count of the
+  rows that didn't fit, rather than simply stopping.
+
+- **A computed value outlives the request that computed it.** A `# [Gen]` block
+  is PaperBoy's pre-request script, and the point of signing a request with a
+  `nonce` is usually that the *next* request quotes it back. Until now the
+  block's results were used for the one send and thrown away, so the second
+  request had nothing to substitute. They now go back into the collection
+  alongside `[Captures]` values, which is what makes "run the next one on its
+  own" work. Still memory only — a computed value can be an HMAC of a secret,
+  and is in any case good for about one request — so nothing new reaches
+  `state.json`.
+
+- **Asserts and captures built from the response you just got.** Every API
+  client but this one lets you look at a reply and say "check that next time";
+  PaperBoy made you read the jsonpath off the screen and type it back into the
+  wizard, which is slow and is the easiest place in the app to introduce a typo
+  that later looks like a server fault. With a response on screen, `a` in the
+  Response pane now opens a two-step palette: choose a value the server
+  actually sent — the status, the duration, any header, any value in a JSON
+  body, each listed beside what it currently is — then choose what to say about
+  it. The rows in the second step are the Hurl lines themselves, so the choice
+  is a preview of the text about to be written. Typing narrows the list, and
+  whatever is selected in the body seeds the filter, so highlighting a token
+  opens the list on the field holding it.
+
+  The last row on every value is *keep it in a variable*: it adds a
+  `[Captures]` row under a name derived from the field (`$.data.access_token` →
+  `access_token`), which is the whole of the "log in, then use the token"
+  workflow in three keystrokes. Choosing the status sets the `HTTP <status>`
+  line rather than adding a second, competing claim in `[Asserts]`, and an
+  assert already on the request is reported rather than silently duplicated.
+
+  The vocabulary and the emitter are shared with the Postman importer, so an
+  assert converted from a `pm.expect(...)` and one built here are spelled
+  identically.
+
+  In the GUI the same builder is a right-click away: *Assert this…* on a value
+  in the response body resolves the field under the caret from the raw JSON —
+  so it works on a minified body as well as a pretty-printed one — and an
+  **Assert…** button beside Copy opens it on the full list. Right-clicking a
+  header row offers the same for that header.
+
+- **Computed values: a `# [Gen]` block for the things a request has to work
+  out for itself.** Postman collections lean on pre-request scripts for values
+  that cannot be written down in advance — a nonce, a timestamp, a
+  Base64-encoded credential — and until now PaperBoy had no answer for them at
+  all. A request can now carry a short block of assignments, evaluated once
+  each time it is sent:
+
+  ```
+  # [Gen] 2
+  # nonce = random_hex(16)
+  # stamp = timestamp
+  ```
+
+  and use them as ordinary `{{ nonce }}` / `{{ stamp }}` placeholders. Because
+  they *are* ordinary placeholders, the `.hurl` file stays portable: stock
+  `hurl` parses it identically and runs it with `--variable nonce=…`, and a
+  missing one is a loud `Undefined variable` rather than a request that
+  silently goes out wrong. The block lives in comments for the same reason, so
+  nothing outside PaperBoy has to understand it. Rows use `=` rather than `:`
+  so they can never be mistaken for the disabled `# key: value` headers the
+  same comment space already carries, and the block is length-prefixed like
+  `# [Body]`, so a bad merge degrades into prose instead of half-loading.
+
+  Thirty-five functions are available — UUIDs, timestamps and dates, random
+  numbers, hex and alphabets, Base64, URL encoding, text work, and MD5, SHA-1,
+  SHA-256, SHA-512 and their HMACs — and each row may read variables, captures
+  and earlier rows, so a request can sign the nonce and timestamp it just
+  computed. Hashes and signatures come in hex and `_b64` pairs rather than
+  taking an encoding argument, because a signature in the wrong encoding is the
+  right length, looks entirely plausible, and is rejected with the same 401 as
+  a wrong secret. (For the same reason: `base64(sha256(m))` is not
+  `sha256_b64(m)` — the first encodes the hex text, the second the digest.)
+  All of it is pure Rust, so signing doesn't drag OpenSSL or a C toolchain into
+  a `cargo install`.
+  A row is evaluated once per send, so a nonce that appears in both a header
+  and a signed body is the *same* nonce, which Postman's scripts cannot
+  promise. Values are computed straight into the run, so one derived from a
+  secret is no more exposed than the secret already was: it reaches no preview
+  and no saved state.
+
+  In the request preview a computed name keeps its braces and is coloured as
+  loaded, rather than being flagged as an undefined variable, since the value
+  genuinely doesn't exist until the request is sent — inventing one per frame
+  would flicker and still not be what goes on the wire. A row that cannot be
+  evaluated is reported before sending, naming the row and what is wrong with
+  it, because "there is no function called `hmac_sha526`" is a far better way
+  to learn of a typo than the 401 it would otherwise become.
+
+  The block is editable as a **Computed** section in the request wizard
+  (`Alt+0`, after Reports), with the same name/expression table the Reports
+  section uses, so a signature can be authored without dropping into the raw
+  file. Computed placeholders now draw in a theme colour of their own rather
+  than borrowing the "loaded" one — the two mean different things, and a
+  request that is waiting on a value it will compute reads differently from one
+  whose variables are already resolved. Themes saved before the colour existed
+  keep their old appearance rather than being repainted by the upgrade.
+
+  Importing from Postman now uses the block where it can. `{{$guid}}`,
+  `{{$randomUUID}}` and `{{$isoTimestamp}}` map to Hurl's own `{{newUuid}}` and
+  `{{newDate}}` and need nothing supplied at all; `{{$timestamp}}` and
+  `{{$randomInt}}` arrive as generated rows and simply work. The remainder are
+  still renamed and reported, because guessing at `$randomFirstName` would send
+  a plausible wrong value, and a request that quietly sends the wrong thing is
+  worse than one that refuses to run. A dynamic variable used twice in a request
+  yields a single row, since a name defined twice is a block whose meaning
+  depends on which row won.
+
+  The headless runner evaluates the block too, which it did not at first: a
+  collection that ran from the UI came back "Undefined variable" from `-c`,
+  which is the worst possible way to find out, since the whole point of the CLI
+  is running in something that is not watching. Each request's rows are
+  evaluated in its own window as it comes up, so a generator can read a value an
+  earlier request captured and two requests each get their own nonce. `--batch`
+  is one Hurl call over the whole file and has no such window, so there the
+  blocks are evaluated once before the run and a name computed by two requests
+  takes the first one's value for both. Failing rows are named on stderr in the
+  same words the status line uses.
+
+  `examples/postman/` holds collections to import and the `.hurl` file they
+  should become once the blocks are written, including a request signed against
+  the RFC 4231 test vector — a signing implementation that is self-consistently
+  wrong passes every test written from its own output.
+
+- **Computed values are something you write, not just something an import
+  leaves behind.** The GUI could open a request carrying a `# [Gen]` block and
+  never show it — the block survived only because the editor writes back what
+  it parsed — so the GUI editor now has a **Computed** section beside Asserts
+  and Captures, with the same name/expression table the terminal UI has.
+
+  Both editors now offer the functions as you type. The terminal wizard
+  completes the word being typed in an expression cell — including one inside
+  another call, so `concat(sha` still finds `sha256` — and the GUI has a
+  function menu on each row. Either way what is offered is the *signature*:
+  thirty-five functions is more than anyone will remember the spelling of, and
+  `hmac_sha256(key, message)` says which argument comes first, which the name
+  alone does not.
+
+  And both say what is wrong with a row while it is still a typo: an unknown
+  function, the wrong number of arguments, an expression that doesn't parse.
+  Not a name the block cannot see — an editor is often open on a request whose
+  environment isn't loaded, and flagging `{{ api_key }}` there would train the
+  user to ignore the one part of this that is always a real mistake.
+
+- **Postman's pre-request and test scripts now carry across as far as Hurl can
+  state them.** They used to be dropped whole, with a note. A pre-request
+  script's `pm.environment.set` / `pm.collectionVariables.set` / `pm.variables.set`
+  assignments now become `[Gen]` rows where the value is one PaperBoy can
+  compute — `uuid.v4()`, `Date.now()`, `Math.floor(Date.now() / 1000)`,
+  `new Date().toISOString()`, `pm.variables.replaceIn('{{$guid}}')`, and plain
+  literals — so the nonce and stamp a collection is built around survive the
+  import. A test script's `pm.response.to.have.status(…)` becomes the request's
+  expected status, and `pm.expect(…)` checks on the body, headers and response
+  time become `[Asserts]`.
+
+  Only assertions the script runs *every* time are taken. Anything inside an
+  `if`, a loop or a helper function is left out, however plainly it reads: a
+  collection that asserts "Matched" down one branch and "NotMatched" down the
+  other would otherwise import as a request that fails whichever way the
+  response goes, which is worse than importing no assertion at all. A
+  `pm.test(…, () => { … })` callback body is the exception, since it always
+  runs.
+
+  Scripts declared on a **folder or on the collection** are now read as well.
+  Postman runs them for every request inside, and PaperBoy was reading only the
+  request's own — so a collection whose ninety-five requests get their
+  transaction id from one folder script imported with none of them having one.
+  A note about an inherited script is filed against the folder that holds it,
+  once, rather than repeated under every request that inherits it.
+
+  A script that chose what ran next (`pm.execution.setNextRequest`) is called
+  out separately: it is a lost *order*, not a lost assertion, and every request
+  in such a collection still looks correct while the run does something else.
+  And an empty script tab — Postman writes `"exec": [""]` for one that was
+  opened and never used — no longer reports a script as lost when there was
+  never one there.
+
+- **The Requests list is a folder tree, so more than one folder can be open at
+  once.** A collection with folders behaved like a directory browser: entering
+  one replaced the list with its contents, and the way to see the request next
+  to it in a sibling folder was to walk back out and down again. Real imports
+  are not shaped for that — an imported Postman collection is mostly folders,
+  and comparing two of them is the normal thing to want. The list now draws the
+  same expand/collapse tree the Workspace pane and the GUI already use:
+  `Enter`/`→` opens the folder under the cursor and leaves it open, `←` or
+  `Backspace` closes it, everything stays indented in place, and any number of
+  folders can be open at the same time. Closing a folder also closes what was
+  open inside it, so reopening it doesn't unfold three levels nobody asked for.
+  Which folders are open isn't saved — a restored session opens the ones around
+  the request it restores, which is the answer that is right whatever was open
+  when it closed. Nesting is still unlimited, and requests still run in the
+  file's order regardless of how the tree is folded.
+
+### Changed
+
+- **The banner row is gone.** It spent three rows — a bordered block — on the
+  app name, a `[English]` language tag and the occasional runner error. The
+  language tag said nothing that every other word on screen doesn't; the name
+  moves to the terminal's own window title (restored on exit, and on a panic)
+  and to the help overlay's heading, where it now carries the version; and the
+  error joins the status message on the menu row, which is where the eye
+  already goes for "what just happened". The request and its response get the
+  three rows.
+
+### Changed
+
+- **A failed `# [Gen]` block is reported by its cause, not its cascade.** One
+  undefined name at the top of a block fails every row that reads it, and every
+  row that reads those — eight rows, one mistake, and the report was eight
+  sentences of which seven said only that something else had gone wrong first,
+  with the one that named the fault buried among them. Now: `message: nothing
+  defines session_nonce; 7 further rows below it could not be worked out
+  either`. Where every row failed that way, and there is no cause among them to
+  name, they are all still described. The Response panel additionally stacks
+  the faults one per line under the heading rather than joining them with
+  semicolons — it is a panel, not a status bar, and joined into a paragraph the
+  faults wrapped into each other.
+
+- **Generated row names are checked.** A row's name is how its value reaches
+  the request, and nothing was checking it: a row with an expression and no
+  name computed a value under an empty key that no `{{placeholder}}` could ask
+  for; a name like `my name` is one Hurl will never carry in a `{{…}}`; and two
+  rows sharing a name both evaluated, the later silently overwriting the
+  earlier, so what the request sent depended on the order of two rows that
+  looked independent. All three are now refused, by the editor's live check and
+  by the send in the same words — the earlier of two rows with one name is the
+  one that stands.
+
+- **Postman environment values that reference other variables are worked out on
+  import.** Postman treats a value as a template and expands it when it is
+  used, so `base_url = {{scheme}}://{{host}}` is ordinary there; a `.vars` value
+  is not a template and nothing downstream expands one, so `{{host}}` used to
+  arrive as text — or, when it was the whole value, be taken for an
+  unrecognised provider reference and shown as unresolved. Chains are followed;
+  `{{ op://… }}` and `{{ ssm:… }}` are left alone as the provider references
+  they are. A reference this file cannot reach (a collection variable, a
+  Postman global, or a loop) is left as written and named in a conversion note,
+  rather than quietly becoming an empty string.
+
+- The Generated section's column header now reads `Expression   (Enter list
+  functions)` rather than `(Enter lists the functions)`, matching the
+  key-then-verb shape every other shortcut hint in the terminal UI uses.
+
+- **One word for the feature: "Generated".** The file marker has always been
+  `# [Gen]`, the module is `generators.rs` and the errors are `GenError`, but
+  the screen said *Computed* — so the thing you read about in the README and
+  the thing you clicked on had different names. The user-facing wording is now
+  *Generated* throughout (section tab, the ＋ button, the substitution legend,
+  the theme colour), in all three languages. The marker in the file is
+  unchanged, so existing `.hurl` files are unaffected.
+
+- **The expression field completes what you type; the function button is gone.**
+  Thirty-five functions is more than a menu is good for: you have to recognise
+  the name you want in a list, when what you actually have in mind is the first
+  three letters of it. And whatever the button beside the field was labelled
+  (`Function…`, `ƒ Insert…`, a bare `ƒ`) it read as a command that would
+  overwrite what was in the field. So the desktop field does the whole job
+  itself now, from the same table the terminal wizard completes against, so the
+  two front-ends cannot drift on what exists:
+
+  - Type, and the functions whose names match are offered. ↑↓ move through the
+    list, Enter or Tab accepts, Esc puts it away without leaving the field.
+  - The list follows the *word the caret is in*, so completing the inner call of
+    `base64(up` does not throw the outer one away.
+  - An empty cell offers the whole list to browse, and Ctrl+Space asks for it
+    back at any time — which is what the button was for.
+  - The highlighted entry is explained in a line under the list, so you can tell
+    `hmac_sha256` from `sha256` without leaving the field.
+  - Accepting a call writes its argument *names* and selects the first, so
+    `hmac_sha256(key, message)` says what it wants and the next keystroke fills
+    it in, rather than leaving you inside empty brackets.
+  - The variables the expression may read are offered alongside the functions,
+    since a `[Gen]` expression names them bare: the environment's variables, the
+    collection's captures and the rows *above* this one — but not the rows below
+    it or the row itself, which the block would reject.
+  - The empty field's hint says so: *Type to search functions, or Ctrl+Space to
+    list them all*.
+  - Typing in *front* of what is already there builds a call around it: the
+    list filters on what has been typed (the word straddling the caret in
+    `t|uuid` is `tuuid`, which matches nothing, so it used to go blank exactly
+    when it was wanted), and accepting `base64` over `b|sha256(body)` gives
+    `base64(sha256(body))` rather than losing the call that was there. The
+    terminal wizard wraps on the same rule.
+
+### Changed
+
+- **The generated block reads as part of the request in the terminal UI.** A
+  `# [Gen]` block has to be spelled as comments -- that is what keeps the file
+  runnable by `hurl` itself -- but the Request Hurl view showed it as exactly
+  that: unmarked text below the request, indistinguishable from a note somebody
+  left. Its rows are now summarised above the divider beside `[Captures]` and
+  `[Asserts]`, and the block below is coloured as a section. The `#` stays, so
+  copying the pane still gives valid Hurl.
+
+### Changed
+
+- **The GUI's status message is drawn in the outcome's colour, as the terminal
+  UI has always drawn it.** Every message shared the one dim grey the rest of
+  the status bar uses, so "could not write file" looked exactly like a note
+  about which theme was loaded. It now carries a tick or a warning sign and the
+  matching colour -- the icon saying the same thing as the colour, for anyone
+  who cannot tell the two apart -- and clicking it copies the text, which the
+  terminal UI has long offered with `^y`. It has also moved up to the menu row,
+  where the terminal UI puts it: at the foot of the window it sat among the
+  logo, the theme name and the environment, none of which ever change on their
+  own, and as far from the request just sent as the window allows. Those three
+  stay where they were.
+
+### Fixed
+
+- **Postman collections written against the older script API import their
+  captures again.** `postman.setEnvironmentVariable(...)` and
+  `postman.setGlobalVariable(...)` -- the sandbox `pm.` replaced, and still
+  what most untouched collections contain -- were not recognised, so every
+  capture and every generated value in such a script was dropped *and* the
+  conversion note said the script had nothing left in it.
+  `JSON.parse(responseBody)` is now read as the response body it is, under
+  whatever name the script gives it.
+- **A script that reads part of the response through a name of its own is
+  translated.** `const data = body.data;` followed by
+  `pm.environment.set("id", data.id)` is an ordinary way to write against a
+  response that nests everything one level down, and every call through such a
+  name was dropped as unreadable. Names standing for part of the body -- and
+  names built on those in turn -- now resolve, except where one is declared
+  twice and the script alone cannot say which meaning applies.
+- **A query parameter that appears more than once keeps all its values.**
+  `?tag=a&tag=b` is how a list is sent, and the importer treated a name as
+  accounted for the first time it saw it -- quietly narrowing the request to a
+  single value.
+- **Importing a Postman environment now says when it has written a secret into
+  a plain file.** A variable Postman masks arrives here in the clear, and a
+  `.vars` file has nowhere to hide it, so the import names the variables
+  affected and the provider references (`{{ op://… }}`, `{{ ssm:… }}`) that
+  keep the value out of the file.
+- **A request deleted or reordered and left unsaved survives a restart.** The
+  restored session adopted whatever was on screen when PaperBoy was closed as
+  its record of the file, so a deletion or a drag came back looking as though
+  it had been saved: the collection showed nothing to save, and closing a
+  second time threw the change away without asking. The file is now re-read on
+  restore and the list checked against it, so the change is still there to save
+  (and an untouched session still comes back clean).
+- **Completing an expression into a two-argument function no longer drops the
+  second argument.** In the terminal UI, accepting `hmac_sha256` in front of
+  `payload` wrote `hmac_sha256(payload)` -- which reads as a finished call and
+  only reveals itself at send time, as "expects 2 arguments". The separator is
+  now written in, so what is still missing is visible while the expression is
+  on screen.
+- **An edit that ends where it started no longer leaves a pencil on the
+  request.** The terminal UI's request wizard marked a request edited on any
+  difference from the one it opened on, rather than on a difference from the
+  file: change a URL and change it back, add a header and remove it, and the
+  pencil stayed -- and so did the collection's "unsaved changes", which is also
+  why reverting a request appeared not to take. The marker is now re-derived by
+  comparing against the saved text, as it already was everywhere else.
+- **The GUI's Code tab no longer loses a request's link to its file.** Re-
+  parsing the edited Hurl text produced a whole new request, and only the
+  "added by hand" marker was carried across; the saved text it compares itself
+  against, and its identity within the request list, were not. The request was
+  left permanently marked as edited -- typing the original text back would not
+  clear it -- and the collection reported that its list of requests had changed
+  shape when it had not.
+- **A request whose `# [Gen]` block failed is no longer sent by a whole-file
+  run.** A failed row leaves its name unbound, and something else of that name
+  is then used in its place -- an environment value, a capture from an earlier
+  request -- so the request went out looking perfectly well-formed, signed with
+  the wrong thing, and was answered `200`. The run *passed*. A single send has
+  always refused; "Run All" and the CLI reported the error and sent it anyway.
+  A streaming run now skips that one request and marks it failed; a batch run,
+  which is a single Hurl call over the whole file and so cannot skip less than
+  everything, refuses the run.
+
+- **A `# [Gen]` block written above its request is no longer deleted when its
+  row count is wrong.** A block whose count doesn't describe the lines below it
+  is deliberately not read as a block -- that is the safe way for a signing
+  block to fail -- and below a request those lines round-trip verbatim as
+  prose. Above one, nothing claimed them: the title walk skips past a block
+  marker on sight (a mangled `# [Gen]` written back as a title is worse), and
+  the prose scan began at the method line. So the first save silently deleted
+  the block the user was in the middle of fixing.
+
+- **A row that reads a row that failed says so.** It was reported as "refers to
+  itself, or to a row below it": the earlier row is unbound, which from the
+  inside looks exactly like a row that has not run yet. One typo produced two
+  errors, and the invented one was the louder.
+
+- **A refused send is reported the way the pre-flight check reports it, once.**
+  A request stopped by a failed `# [Gen]` row was shown as "Request error:
+  broken: nothing defines nothing_defines_this" -- an English sentence from the
+  runner (which has no `Strings`) under a heading naming a request that was
+  never made. The failures now travel with the response, so both front-ends say
+  what the check says, in the reader's language: "Generated values not set:
+  ...". And they say it once: the check and the refusal are two channels
+  carrying one finding, and printing it twice a few rows apart read as two
+  things having gone wrong.
+
+- **A request that cannot be built now stops sending.** A failed `# [Gen]` row
+  (or an unreadable body file, or a parse error) means no entry ever runs, and
+  the "nothing ran" path set the error and said nothing else — so the request
+  stayed marked in-flight, showing the pending marker and "Sending…" until the
+  app was restarted. The one case where the client knows *immediately* that
+  the send is hopeless was the one case that looked like a wait on a dead
+  server. Refusing to send is now announced like any other ending: the entry is
+  marked failed and the response carries the reason.
+
+### Added
+
+- **The assert palette marks the value it is talking about.** The palette lists
+  paths while the response shows text, so naming `$.data[0].token` to someone
+  looking at six plausible tokens left them to solve the puzzle by reading. The
+  row under the cursor is now marked where the response pane is showing it, and
+  the pane scrolls to it if it is off screen. It is a mark, not a selection:
+  `y` still copies whatever was selected by hand.
+
+- **A hovered field lights its name as well as its value.** The pointer is
+  usually on the name when a field is being aimed at, so a wash that started at
+  the colon looked like a highlight that had stopped short. Name and value are
+  washed alike: `exists`, `isEmpty` and `count` are assertions about the field
+  rather than about its value, so the field is what the highlight points at --
+  the same promise the headers tab makes with its whole row. Copying still
+  takes the value alone.
+
+- **The assert palette closed on keys that were not meant for it.** ←/→ switch
+  response section in the pane behind the palette, and passed straight through
+  it: the subject you had just hunted down was thrown away, and the next
+  keystroke landed in the main view. One backspace too many while clearing the
+  filter did the same. The palette now closes on Esc and nothing else, and any
+  key with nothing to do does nothing.
+
+- **The collapsed headers row said "{0} headers".** `i18n::fill` substitutes
+  `{}`; the row was written with the numbered form and the placeholder went
+  out as text. The table is now held to that rule by a test, along with the
+  rule that a row's three translations take the same number of values.
+
+- **`counter()` counted each send twice.** A `# [Gen]` block is evaluated twice
+  on the way out -- once to find out whether anything in it is broken, so the
+  cause can be named instead of the 401 it would produce, and once for real --
+  and the check drew from the same counters the send does. A request numbering
+  its pages went 1, 3, 5. The check now reads the counter it is about to
+  report on rather than claiming a number from it.
+
+- **A single assert sat in the middle of an empty tab.** The row was laid out
+  right to left so the remove ✕ could be pinned to the right edge, but such a
+  region claims the whole remaining height of the panel and centres its content
+  in it: one assert floated halfway down the section and pushed
+  "+ Add assert" and the expected status off the bottom. The row now reserves
+  the ✕'s width and fills the rest, like every other table -- which also puts
+  the field's left edge back in line with the sections above it, instead of
+  indented by the width the right-aligned field was not using.
+
+- **Aiming at a response header, not at its text.** A header row is the full
+  width of the list, so the gap between the columns and the space after a short
+  value belong to the row -- but the pointer had to be over one of the two
+  labels for the row to light up or to offer "Assert this...". The whole row is
+  now the target.
+
+- **A collection whose path ended in a `/` could not be saved.** `collection.hurl/`
+  and `collection.hurl` name the same file to a human and two different things
+  to the kernel: writing to the first fails with "Is a directory" however
+  ordinary the file is, and it cannot be read back or reverted either -- the tab
+  was quietly cut off from its file. A trailing separator is now taken off
+  wherever a path enters the app, including one already saved in a previous
+  session, and a failed write says "Is a directory" rather than
+  "Is a directory (os error 21)".
+
+- **A pencil that would never clear is put right on restart.** Builds before the
+  last fix re-stamped every restored request's record of its file from its own
+  *edited* text, freezing whatever was unsaved into it: undoing the edit made
+  the request differ from its "file" again, so the pencil stayed for good, and
+  reverting would have restored the unsaved edit as though it were saved work.
+  A record the file does not recognise is now re-read from the file.
+
+- **A generated row you have named but not filled in says what is missing.** It
+  used to be reported as a parse failure -- "can't read the expression
+  (expression is empty)" -- which said the same thing twice and read as though
+  the editor had broken, on a row that was simply half-written. Both the editor
+  and the send now say "needs an expression".
+
+- **Completing a function builds it around what is already there.** Putting the
+  caret in front of `uuid` and choosing `timestamp` wrote `timestamp` over the
+  `uuid` -- both editors asked whether a function *had* to be given an argument
+  rather than whether it *could* be, so every function with an optional
+  argument threw away the expression it was being wrapped around. Only a
+  function that can hold nothing (`uuid`, `timestamp_ms`) replaces the word
+  now, because there is nowhere else for it to go.
+
+- **Pointing at a suggestion describes it.** The note and the preview under the
+  list describe the highlighted row, but only the arrow keys moved the
+  highlight — so scrolling the list with the mouse left them describing
+  whatever the keyboard had last landed on. Hovering a row now selects it, and
+  Enter takes the row being pointed at.
+
+- **The suggestion list shows what the highlighted row would produce.** Whether
+  a row replaces the word at the caret or builds a call around it depends on
+  where the caret is and what the function can hold: good rules, but not ones
+  anyone should have to work out from the result. The GUI's list now reads
+  `-> timestamp(uuid)` under the highlighted row, before it is accepted.
+
+- **"Revert to saved" works again after a restart.** A tab restored from the
+  previous session brings back what was on screen, unsaved additions and all,
+  and PaperBoy took that list as a description of the file — so if a request had
+  been added and never saved, the list and the file disagreed about their
+  length and *every* request in that tab refused to revert ("Nothing to
+  revert"), leaving the pencil on requests whose saved version was sitting in
+  the file all along. Each request now remembers the text its file held across
+  the restart, and reverting falls back to finding itself in the file by that
+  text.
+
+- **A reverted request stops claiming to be edited.** Reverting throws away a
+  request's edits by re-reading it out of the file, but the request was left
+  with nothing to measure later edits against — so the next thing to touch it
+  latched the pencil back on, over a request that matched the file exactly. It
+  now takes the file it just came from as its baseline, as a request read or
+  written at any other moment does. Reverting a whole workspace file does the
+  same for every request in it.
+
+- **Ctrl+Z belongs to whatever is being typed into.** The desktop window's
+  global Ctrl+Z (undo the last request delete) consumed the key before any text
+  field saw it, so undo did nothing in a URL, a header cell or a generated
+  expression — it brought back a deleted request instead, which is not what the
+  keyboard was aimed at. The global binding now stands down whenever a widget
+  holds the keyboard, the way the `?` help key already did.
+
+- **An edit undone stops counting as an edit.** Changing a request — a generated
+  expression, a header, a URL — and then changing it back left the pencil marker
+  on it, so it went on offering to save a file it already matched. Each request
+  now remembers its text as of the last read or write and compares against it,
+  the way a reordered collection already decided whether it was still reordered.
+  A request restored from the saved session has no file to have agreed with, so
+  there the marker latches as before.
+
+- **A folder's requests are drawn under that folder.** A `.hurl` file is free to
+  interleave folders — `Auth/Login`, `Users/List`, `Auth/Logout` is a perfectly
+  ordinary import — and the tree drew each request where the file listed it, so
+  the second `Auth` request appeared below the `Users` row, apparently inside a
+  folder it is not in. Each folder's requests are now gathered under its row.
+  The order requests *run* in is unchanged: it is the file's, whatever the tree
+  looks like.
+
+- **The substitution legend reads as a legend again.** The computed-value
+  colour was labelled `computed at send` among a row of one-word labels
+  (`loaded`, `literal`, `missing`), where it was three times the width of its
+  neighbours in a pane that has none to spare. It is now `computed`; none of
+  the other labels explain their timing either.
+
+- **The terminal-background match was being read from a blank screen.** The
+  colour used to extend PaperBoy's background into the strip below the last row
+  was sampled after `Terminal::draw` returned — by which point ratatui has
+  swapped its buffers and cleared the one it hands back, so the sample was
+  always empty and the strip kept the terminal's own colour. It is now read
+  from the frame while it is still being drawn.
+
+- **The assert builder says what it is asking, and shows it in the response.**
+  The dialog listed rows of `jsonpath "$…"` with nothing to say what the
+  question was, and acted on the first click, so a row could not be looked at
+  before it was chosen. Each step now leads with what it is asking and what the
+  answer will do; rows are selected first and committed by a button, a
+  double-click or Enter; and whichever value is under the pointer or the cursor
+  is highlighted in the response body itself — as a real selection, so Ctrl+C
+  yields exactly that value. A *Copy value* button, and a *Copy this value* item
+  on the response's own context menu, reuse the same section-isolating logic for
+  the far commoner case of just wanting the value. The buttons name what they
+  do (*Add this check*, *Add capture*) and sit centred under the list.
+
+- **The builder's rows no longer wrap, jitter or lose their title.** A long
+  bearer token holds no break opportunity, so a wrapped row tore the literal off
+  after its opening quote and left a `"` alone on a line; rows are now clipped
+  with an ellipsis. A hovered or selected row picked up an outline that the
+  resting state does not have, and grew by it — moving the row under the pointer
+  and every row below it. And egui shrinks a window to its content, which elided
+  this one's title to "Assert or capture from the res…", on the one dialog whose
+  whole job is to say what it is for.
+
+- **The terminal UI can browse the computed-value functions.** The expression
+  cell completed a name you had started typing, which is no use to anyone who
+  does not know there is a `hmac_sha256` to type — the GUI has had a function
+  menu all along. Enter on an empty expression cell now lists every function
+  with its arguments; typing narrows the list, Enter writes the call with the
+  caret on the first argument, and Esc dismisses it. The column header says so,
+  because that is where anyone stuck is already looking.
+
+- **The Response section tabs step with the arrow keys.** They are a row of
+  tabs, and Left/Right are what moves along a row of tabs everywhere else in
+  the app; `i` was a shortcut nobody would guess, and is still there for anyone
+  who learned it.
+
+- **The response's status can be right-clicked.** It is the one subject with
+  nothing in the body to aim at, so the only route to `HTTP 201` was the top row
+  of the builder's list — not where anyone reading "201 Created" looks.
+
+- **The terminal UI's header rows no longer bury the body.** A reply carries a
+  dozen headers nobody opened the palette for, and listed flat they pushed the
+  body — the reason it was opened — off the bottom of the box. They collapse to
+  one row that opens them, in the place they used to occupy, and Esc closes that
+  list rather than the whole palette. Typing still reaches a header by name
+  without opening the group first.
+
+- **The response says what "Assert this…" means before it is clicked.** The
+  body is a wall of near-identical tokens, and a few pixels of pointer travel
+  is the difference between a key, its value and the object around them.
+  Hovering the body now washes the whole JSON value under the pointer in the
+  accent colour, and the menu that opens acts on exactly what was lit. Header
+  rows light in full — either half is the same subject — for the same reason.
+
+- **The computed-values catalogue offers ready-made date formats.**
+  `date(format)` named its argument and said nothing about what a format is,
+  and the failure it produced — "date takes 1 arguments, not 0" — said less.
+  There are some forty strftime specifiers, so the list is a handful of whole
+  working calls (`date("%Y-%m-%d")`, `date("%d/%m/%Y")`, an ISO timestamp and
+  so on) shown under the signature in both front-ends; picking one writes it
+  complete. They double as examples of the syntax for anyone who wants a
+  format that isn't offered.
+
+- **The Function… button lines up with the row it is in.** It kept its default
+  button padding, so it top-aligned against the fields beside it and hung below
+  them — it is now sized and de-padded like the delete button on the same row.
+
+- **The strip below the last row follows the theme.** A terminal window is
+  rarely a whole number of character cells tall, and the leftover band at the
+  bottom is not addressable — it kept the emulator's own background under an
+  otherwise themed screen. PaperBoy now tells the terminal what its background
+  is (OSC 11), updates it whenever the theme changes, and puts it back on exit
+  and on a panic. The colour sent is the one on the bottom row of the frame —
+  the footer's panel shade — rather than the theme's window background, which
+  this layout covers everywhere and so never actually shows. Terminals that
+  don't implement it are unaffected, and the emulator's own scrollbar is its
+  chrome and stays in its own colours.
+
+- **Postman deep-equality assertions carry across.**
+  `pm.expect(pm.response.json().user).to.eql({ id: 7, name: 'Ada' })` is an
+  ordinary Postman test whose argument is not a scalar, so the whole thing used
+  to be dropped. Hurl has no predicate that takes a document, so it is now
+  written out one leaf at a time (`jsonpath "$.user.id" == 7`, …) — which is
+  also the better report, since a failure names the field that differed rather
+  than printing two documents side by side. An array's length is pinned too,
+  because per-index asserts alone pass on a longer list that starts the same
+  way. A literal holding an expression is still dropped whole and noted: half a
+  deep equality is an assertion nobody wrote. Chai's `.to.equal` on an object is
+  *reference* equality, which no two parsed documents satisfy, so it is
+  deliberately not read as a deep one.
+
+- **`setNextRequest` is now four notes, not one.** A script choosing what runs
+  next is a lost *order*, and there are four different orders with four
+  different fixes: a request that re-ran itself is a polling loop (Hurl writes
+  that as `[Options] retry`), an unconditional jump is an order you can write
+  down (in the file, or as `REQUEST` lines in a PaperTrail flow),
+  `setNextRequest(null)` means the requests after it did *not* run and now
+  will, and a name built at run time is not in the file to reorder at all. One
+  note covering all four sent every reader looking for the wrong fix.
+
+- **A note about a folder's script is filed against the folder again.** The
+  test asking whether a request had a script of its own answered "yes" for a
+  request carrying its own assertions *and* an inherited jump, so the folder's
+  problem was reported once per request underneath it — eighteen identical
+  notes on a real collection. Each note now goes to whoever actually wrote the
+  script it came from.
+
+- **`$randomAlphaNumeric` is computed rather than left to be supplied**, as the
+  one character Postman documents it to be. The `pm.variables.replaceIn` table
+  is now read off the same list as plain placeholders, so the two can no longer
+  come to disagree about which names PaperBoy claims.
+
+- **"Run All" ignored `# [Gen]` blocks entirely.** A collection whose requests
+  signed themselves ran correctly one request at a time and sent a literal
+  `{{sig}}` when run as a whole, which comes back as an unexplained 401. Run
+  All now evaluates each block the same way the headless runner does.
+
+- **A Postman assertion on the first line of a script escaped the "only
+  sometimes" rule.** `if (ok) pm.expect(…)` written as line one imported as an
+  unconditional assert, because the guard looked for the end of a previous
+  statement and read *no previous statement* as *nothing in front of it*. An
+  assertion that only sometimes applies, imported as one that always does,
+  turns a passing collection into a failing one.
+
+- **An expected string's spaces survive the import.** Tails were read off
+  whitespace-stripped text, so `.to.equal("Not Found")` became an assert for
+  `"NotFound"` — one that fails on a perfectly correct response.
+
+- **A batch run silently gave two requests one nonce.** Batch is a single Hurl
+  call over the whole file, so it has one variable set: where two requests each
+  compute a `nonce`, they share the first one's value and the second request's
+  signature is computed over the wrong input. Nothing said so. Both front-ends
+  now name the colliding rows before starting a batch Run All, and `--batch`
+  prints the same warning — pointing out that a streaming run gives each
+  request its own.
+
+- **A computed value no longer reads as an undefined one.** A report that used
+  a name the request computes was warned about on every validation — "may not
+  be set", of a value that is set, by the request, every time it is sent — and
+  a panel full of warnings nobody can act on is a panel nobody reads. A `[Gen]`
+  row now defines its name for its own request and for the ones after it, the
+  same way a capture does.
+
+- **Choosing a function writes the whole call, where the caret is — and
+  Ctrl+Z takes it back.** Picking one from the list left a half-written
+  `sha256(` tacked onto the *end* of the expression, so completing inside
+  `base64(` produced `base64(sha256(`, with two brackets to close by hand and a
+  fault reported until they were. Both editors now write `sha256()` at the
+  caret, replacing the part-typed name, and leave the caret between the
+  brackets ready for the argument; in the GUI the field takes focus back, so
+  the next keystroke goes where it was aimed. Undo works through it too: the
+  insert is recorded as one reversible step, where before Ctrl+Z jumped back
+  past it to whatever the field last held — usually nothing — with no way to
+  return.
+
+- **The request wizard's text fields undo.** They bound Ctrl+Z to nothing at
+  all — every other text surface in the app has undone since 0.4 — and they
+  recorded no history either, because a wizard cell is driven a keystroke at a
+  time rather than through the shared editor key handler. Typing runs are now
+  recorded by the editor itself, so `Ctrl+Z` / `Ctrl+Shift+Z` step back and
+  forward in whichever cell has focus, one typing run at a time. Leaving a cell
+  ends its run, so coming back and typing more is its own step.
+
+- **Accepting a function suggestion no longer jumps out of the cell.** Focus
+  moved on to the next field the way it does after a header name — but a
+  header name is a finished value and `sha256()` is not, so the caret waiting
+  between the brackets was abandoned along with the call.
+
+- **"Revert to saved" is offered on a plain collection's requests, not only a
+  workspace's.** Discarding one request's edits was reachable by right-click in
+  a workspace tree and nowhere else, so a collection opened as a single file
+  had no way back to what was on disk short of closing the tab and losing every
+  other edit with it. The same item — same confirmation, since a revert has no
+  undo — now sits below Delete on any edited request whose collection has a
+  file behind it.
+
+- **A report run refuses a request whose computed value failed.** It evaluated
+  the block, threw the errors away, and sent the request with `{{sig}}` still
+  in it — a 401 whose cause was three screens away, on the one path that by
+  definition has nobody watching. The interactive send already refused; now
+  both do, naming the row and what is wrong with it.
+
+- **The README is a third of its former length.** It had grown to 9,000 words
+  of prose aimed at nobody in particular, and a reference nobody finishes is not
+  a reference. It is now written for people who already know what an HTTP client
+  is: the rationale essays are gone (the reasoning lives here and in the code),
+  the shortcut tables keep the keys worth memorising and defer the rest to the
+  in-app `?` overlay, and the facts that actually catch people out — the build
+  prerequisites, that a loaded environment substitutes nothing until it is
+  activated or linked, that a temporary git workspace is never cleaned up — are
+  still there.
+
+- **A `{{ variable.name }}` Hurl would quietly mangle is now refused instead of
+  sent.** Hurl reads a variable name only as far as the first character outside
+  letters, digits, `_` and `-`, and then discards the rest without a word — so
+  `{{ api.key }}` went on the wire as the value of `api`. PaperBoy's own
+  substitution accepts the dotted name happily, which meant the request preview
+  showed the correct value while the server was asked something else entirely,
+  and the only symptom was an answer that made no sense. Sending is now blocked,
+  and the message names the placeholder and what Hurl would have made of it
+  (`{{ api.key }} → api`). A name Hurl can't read at all — `{{ $timestamp }}`
+  pasted out of Postman, say — is caught in the same place, rather than
+  surfacing later as a collection that loads as nothing. Hurl's own
+  `{{ newUuid }}` and `{{ newDate }}` are unaffected.
+
+- **"Extract to parameter" no longer offers a name Hurl can't use.** The prompt
+  accepted anything PaperBoy's own substitution would match, so `api.key` was
+  allowed — building a request that the check above then refuses to send. It is
+  now held to the same rule at the point the name is typed.
+
+- **An assert built from a response is one stock `hurl` can read.** A field
+  name holding a quote, a backslash or a newline was escaped for the Hurl
+  string but not for the jsonpath inside it, so a capture on `a"b` produced a
+  file that either refused to parse or — worse — parsed into a query for a key
+  that is not there and quietly matched nothing. A response value containing
+  `{` was another: written literally, it became a Hurl template, and the
+  request asserted against whatever that template expanded to. Both are now
+  escaped at both layers, and every generated line is parsed back with Hurl's
+  own parser as part of the test suite.
+
+- **A number in exponent notation is asserted as the number.** A response
+  saying `1e3` produced `jsonpath "$.n" == 1e3`, which Hurl does not read as a
+  number; the value is now written out in full. Something too large to spell
+  that way offers `exists` instead of an `==` that would quietly assert a
+  rounded value the server never sent.
+
+- **"Revert to saved" reverts the request you asked for.** It matched by
+  position in the list, so reverting after adding, deleting or reordering
+  anything restored a *different* request's text over the selected one. It now
+  resolves the request through the identity it was loaded with, and declines —
+  saying so — where that is ambiguous, such as an unsaved duplicate that still
+  shares its original's identity.
+
+- **The Postman importer no longer mis-reads the scripts it converts.** The
+  pass over a script's JavaScript was defeated by ordinary code: a regex
+  literal containing a brace ended the enclosing block early, so whole folders
+  of assertions were silently dropped — importing a real 98-request collection
+  now yields 46 asserts where it yielded 16. A string containing an escaped
+  quote ended in the wrong place, taking the rest of the statement with it.
+  Assertions inside a condition were taken as unconditional in several shapes
+  the earlier check missed, which is exactly the case that imports as a request
+  failing whichever way the response goes. And the notes explaining what was
+  dropped are attributed to the script that actually contained it.
+
+- **A generator can no longer hang or crash the run that evaluates it.** A row
+  referring to itself, directly or around a cycle, recursed until the stack ran
+  out; nesting is now bounded and reported as the error it is. `timestamp`
+  arithmetic that overflowed panicked rather than complaining. And a `# [Gen]`
+  block written above its request line — the layout this README's own example
+  uses — was parsed into the *previous* request's title; both positions are now
+  read, and the block is written below the line on save.
+
+- **The assert/capture palette says what it needs and shows where it is.**
+  `a` with nothing to build from reported "No response to save.", which is
+  about a file rather than about the request that has not been sent yet. A key
+  with nothing to do on the palette's second step used to close the palette and
+  leak the *next* keystroke into the main view, so typing "contains" out of
+  habit threw away the field just chosen and opened the New Request wizard on
+  the `n`. A list longer than its box now says how far down it is, `a` is
+  advertised in the Response footer where it works, and capturing a field that
+  is already captured offers the name it already has rather than writing the
+  same jsonpath under a second one.
+
+- **The GUI's assert builder quotes the response, not the view of it.** With
+  the Compact overview on, a selection in the body produced a `body contains`
+  holding the *shortened* text — `"aneh...ureol"` — which no reply ever
+  contains, so the assert could only fail. The selection is now translated back
+  through the same shortening map, so a partial selection inside a compacted
+  string expands to the text the server actually sent. The response body's
+  cursor state is also per-request now: selecting a value, sending a different
+  request and right-clicking used to build an assert out of the previous
+  reply's selection. A request is addressed by its identity rather than its
+  position, so a builder left open across a reorder writes where it was opened.
+  An empty capture name keeps the dialog open and says the name is needed
+  instead of closing it and writing nothing, and a `204 No Content` — which has
+  a status and headers worth asserting on — offers the button at all.
+
+- **The Computed table's cells stay with their rows.** In the GUI, a cell was
+  identified by where it sat, so deleting a row moved the row below it into the
+  deleted row's editing state — cursor, selection and undo history — and
+  switching request while a cell was focused carried that state onto whatever
+  row now sat in that position. Cells are now keyed by the request they belong
+  to and by their own contents. A bad variable name is flagged as you type
+  rather than at send time.
+
+  In the terminal wizard, function completion now works inside a call you have
+  already accepted (`concat(sha` finds `sha256`), suggests functions whose
+  arguments are all optional, and writes the completion at the caret instead of
+  at the end of the cell. A single edit is a single undo step again — pressing
+  Enter recorded two identical checkpoints, so the first Ctrl+Z appeared to do
+  nothing.
+
+- **"Revert to saved" says no before you commit, not after.** A request the
+  file has never held — one added in this session, or a duplicate that still
+  shares its original's identity — has no saved version of its own to go back
+  to. Both front-ends asked for confirmation anyway and then did nothing, which
+  reads as a broken command. They now say so up front, through the same check
+  the revert itself uses, so the two cannot drift apart.
+
+- **A run reports every pre-flight warning, not just the first.** A broken
+  generator hid a batch collision behind it, so fixing what the status line
+  complained about surfaced the next problem and the same run failed twice over
+  one set of mistakes.
+
+- **The request list marks the requests that compute values**, and the wizard's
+  computed-error line ends in an ellipsis rather than being cut mid-sentence by
+  the edge of a narrow terminal — a truncated "unknown function" reads as a
+  different, shorter complaint.
+
+
 ## [0.5.4] - 2026-09-04
 
 ### Added
@@ -50,16 +931,6 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   discard back. Off by default, so nobody gets it by accident.
 
 ### Changed
-
-- **The README is a third of its former length.** It had grown to 9,000 words
-  of prose aimed at nobody in particular, and a reference nobody finishes is not
-  a reference. It is now written for people who already know what an HTTP client
-  is: the rationale essays are gone (the reasoning lives here and in the code),
-  the shortcut tables keep the keys worth memorising and defer the rest to the
-  in-app `?` overlay, and the facts that actually catch people out — the build
-  prerequisites, that a loaded environment substitutes nothing until it is
-  activated or linked, that a temporary git workspace is never cleaned up — are
-  still there.
 
 - **The saved key references are a dropdown hanging off the key field**, like
   the request wizard's header-name suggestions: anchored under the field, in a

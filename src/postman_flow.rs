@@ -1599,6 +1599,11 @@ impl PostmanFlow {
 
     /// Put a workspace's collection listing in the cache as though it had been
     /// fetched, so the picker's tree can be opened without a Postman API.
+    ///
+    /// Only the GUI's picker draws that tree, so this has no caller in a test
+    /// build without the `gui` feature — the same reason other GUI-only items
+    /// carry this attribute.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub(crate) fn seed_peek_cache(&mut self, workspace_id: &str, collections: Vec<String>) {
         self.peek_cache
             .insert(workspace_id.to_string(), collections);

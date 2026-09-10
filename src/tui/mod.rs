@@ -13,6 +13,7 @@ mod line_editor;
 mod listscroll;
 mod new_request;
 mod postman;
+mod probe_menu;
 pub(crate) mod remote;
 // Shared with the GUI (`gui::report_editor`'s Source view) so a PaperTrail
 // script is coloured identically in both front-ends: it produces `ratatui`
@@ -21,6 +22,7 @@ pub(crate) mod remote;
 pub(crate) mod report_highlight;
 mod report_nodes;
 mod reports;
+pub(crate) mod term_bg;
 #[cfg(test)]
 mod tests;
 pub(crate) mod theme;
@@ -51,12 +53,49 @@ pub fn run() -> io::Result<()> {
     let guard = TerminalGuard::install(true)?;
     let enhanced = guard.keyboard_enhancement_active();
 
+    // The app names itself in the terminal's own title bar rather than in a
+    // row of the layout: it costs no rows, it is where a terminal app's name
+    // is looked for, and it is still there when the window is one of twenty in
+    // a tab bar. `SetTitle` is a plain escape sequence, so a terminal that
+    // does not support it simply ignores it -- but one that *does* keeps the
+    // title after we exit, so the teardown below pops it again.
+    let _ = ratatui::crossterm::execute!(
+        io::stdout(),
+        ratatui::crossterm::terminal::SetTitle(crate::i18n::APP_NAME)
+    );
+
     let mut app = TuiApp::restored();
     app.enhanced_keys = enhanced;
+    // A window is rarely a whole number of rows tall, and the part-row at the
+    // bottom belongs to the terminal, not to us: it keeps the emulator's own
+    // background unless the emulator is told what ours is. The panic hook the
+    // guard installed has already run by the time this one does, so the reset
+    // joins the rest of the teardown rather than replacing any of it.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        term_bg::reset();
+        // A panic leaves the shell in the window we renamed, so the title has
+        // to be dropped here too, next to the rest of the teardown.
+        let _ =
+            ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::terminal::SetTitle(""));
+        previous_hook(info);
+    }));
+    let mut terminal_bg: Option<(u8, u8, u8)> = None;
     let result = loop {
-        if let Err(e) = terminal.draw(|f| draw(f, &mut app)) {
+        // The colour to match is the one on the bottom row of the frame -- the
+        // footer's `panel`, not the theme's `bg`, which nothing in this layout
+        // leaves uncovered. Read *inside* the closure: `draw` swaps the two
+        // buffers on its way out and clears the one it hands back, so asking
+        // the terminal for its current buffer afterwards yields a blank screen
+        // and a colour of `Reset`.
+        let mut bottom = ratatui::style::Color::Reset;
+        if let Err(e) = terminal.draw(|f| {
+            draw(f, &mut app);
+            bottom = term_bg::bottom_row_bg(f.buffer_mut());
+        }) {
             break Err(e);
         }
+        term_bg::sync(bottom, &mut terminal_bg);
         // Apply any background secret-resolution results (non-blocking).
         app.poll_env_updates();
         // Apply completed response captures so later requests can use them.
@@ -176,6 +215,8 @@ pub fn run() -> io::Result<()> {
         }
     };
 
+    term_bg::reset();
+    let _ = ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::terminal::SetTitle(""));
     drop(guard); // pops keyboard-enhancement flags + disables mouse capture
     ratatui::restore();
     result

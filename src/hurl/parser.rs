@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use super::entry::{
     BASE64_FILE_CT_MARKER, CommentAnchor, EntryComment, FormField, FormFieldKind, HurlEntry, KvRow,
-    RunStatus, decode_body_line, parse_body_marker,
+    RunStatus, decode_body_line, parse_body_marker, parse_gen_marker, parse_gen_row,
 };
 use super::json_comments;
 
@@ -207,7 +207,10 @@ fn title_block_top(lines: &[&str], method: usize, floor: usize) -> usize {
         if !prev.starts_with('#') {
             break;
         }
-        if is_reports_marker(prev) || parse_body_marker(prev).is_some() {
+        if is_reports_marker(prev)
+            || parse_body_marker(prev).is_some()
+            || parse_gen_marker(prev).is_some()
+        {
             return method;
         }
         top -= 1;
@@ -509,6 +512,21 @@ fn map_entry(
         captures,
         asserts,
         reports: reports_from_span(lines, scan_start, scan_end),
+        // A `# [Gen]` block may sit above its request as well as below it (the
+        // layout README documents). Widen the scan up over the comments that
+        // lead into the method line so an above block is read, not eaten by the
+        // title walk — and stop it at the *next* request's own leading comments
+        // so this scan can't reach down into that request's above block. The
+        // last entry has no next request, so its scan runs to end-of-file.
+        generators: {
+            let gen_start = leading_comment_top(lines, scan_start);
+            let gen_end = if scan_end > lines.len() {
+                scan_end
+            } else {
+                leading_comment_top(lines, scan_end)
+            };
+            generators_from_span(lines, gen_start, gen_end)
+        },
         comments: scan_comments(
             lines,
             &landmarks,
@@ -520,6 +538,7 @@ fn map_entry(
         ),
         user_added: false,
         modified: false,
+        baseline: None,
         last_run: RunStatus::default(),
         last_response: None,
     }
@@ -705,6 +724,8 @@ fn scan_comments(
             m..j
         })
     };
+    // … the `# [Gen]` block, claimed by its declared row count …
+    let gen_block = gen_block_range(lines, method_line, scan_end);
     // … and the next entry's title block (the contiguous comment lines directly
     // above the next entry's method line, which `title_from_span` will claim as
     // that entry's title). Only when there *is* a next entry in the window.
@@ -725,6 +746,37 @@ fn scan_comments(
     };
 
     let mut out = Vec::new();
+
+    // Comment lines in this entry's own leading block that neither its title
+    // nor a well-formed PaperBoy block claims — the lines of a `# [Gen]` block
+    // whose row count is wrong, most often. Kept as prose so they round-trip
+    // verbatim, which is what the same damaged block does when it sits *below*
+    // its request. Without this they belonged to nobody and were deleted by
+    // the first save.
+    {
+        let lead_top = leading_comment_top(lines, method_line);
+        let title_top = title_text_start(
+            lines,
+            lead_top.saturating_sub(1),
+            method_line.saturating_sub(1),
+        ) + 1;
+        let claimed = lead_block_lines(lines, lead_top, method_line);
+        for ln in lead_top..title_top {
+            if claimed.contains(&ln) {
+                continue;
+            }
+            if let Some(t) = lines
+                .get(ln - 1)
+                .map(|l| l.trim())
+                .filter(|t| t.starts_with('#'))
+            {
+                out.push(EntryComment {
+                    anchor: CommentAnchor::Lead,
+                    text: t.to_string(),
+                });
+            }
+        }
+    }
 
     // File-leading comments above the very first entry (everything above this
     // entry's own title block), kept as `Lead`.
@@ -761,6 +813,7 @@ fn scan_comments(
             || in_body(line_no)
             || is_disabled_row(line_no)
             || reports_block.contains(&line_no)
+            || gen_block.contains(&line_no)
             || body_block.as_ref().is_some_and(|r| r.contains(&line_no))
             || next_title.contains(&line_no)
         {
@@ -1249,6 +1302,58 @@ fn reports_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, S
     reports
 }
 
+/// Recover a request's `# [Gen] <n>` block from raw source, within the entry's
+/// 1-based line window `[start, end)`.
+///
+/// Unlike the `# [Reports]` scan above, the block is claimed by its declared row
+/// count rather than by scanning until a line stops looking like a row. A
+/// generator row (`# name = expr`) is close enough to an ordinary prose comment
+/// (`# note = see ticket 42`) that adjacency alone would sometimes swallow one;
+/// the count means the block either describes the lines below it exactly or is
+/// not a block at all. A block that fails to validate falls through to the prose
+/// scan and round-trips verbatim — the definitions stop being live, which is the
+/// safe way for a signing block to fail.
+fn generators_from_span(lines: &[&str], start: usize, end: usize) -> Vec<(String, String)> {
+    let to = end.saturating_sub(1).min(lines.len());
+    for i in start.saturating_sub(1)..to {
+        let Some(n) = parse_gen_marker(lines[i]) else {
+            continue;
+        };
+        let Some(last) = i.checked_add(1).and_then(|f| f.checked_add(n)) else {
+            continue;
+        };
+        if last > to {
+            continue;
+        }
+        let rows: Option<Vec<(String, String)>> =
+            (i + 1..last).map(|j| parse_gen_row(lines[j])).collect();
+        if let Some(rows) = rows {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
+/// The lines a valid `# [Gen]` block occupies in `[start, end)` — the marker and
+/// its rows — so the prose-comment scan doesn't also capture them and duplicate
+/// the block on the next save.
+fn gen_block_range(lines: &[&str], start: usize, end: usize) -> Range<usize> {
+    let to = end.saturating_sub(1).min(lines.len());
+    for i in start.saturating_sub(1)..to {
+        let Some(n) = parse_gen_marker(lines[i]) else {
+            continue;
+        };
+        let Some(last) = i.checked_add(1).and_then(|f| f.checked_add(n)) else {
+            continue;
+        };
+        if last <= to && (i + 1..last).all(|j| parse_gen_row(lines[j]).is_some()) {
+            // Back to the 1-based line numbering the comment scan works in.
+            return i + 1..last + 1;
+        }
+    }
+    0..0
+}
+
 /// Find every `# [Body]` block candidate in an entry's source window, as
 /// `(claimed line range, decoded body text)`.
 ///
@@ -1385,7 +1490,16 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
         .iter()
         .rposition(|l| !l.trim().starts_with('#'))
         .map_or(0, |i| i + 1);
-    lines[block_start..method]
+    // A PaperBoy block (`# [Gen]`, `# [Reports]`, `# [Body]`) may sit inside
+    // that comment span — above its own request, the layout README documents —
+    // and it belongs to the request, never to its title. The walk must never
+    // turn one into a title: the next save would write the title back as a
+    // single mangled `# …` line, which for a `# [Gen]` block is the
+    // irreversible loss of a signing block (`title_block_top` guards the
+    // request-splitter's walk for the same reason). Keep only the comment lines
+    // *below* the last such block; everything at or above it is the block.
+    let title_start = title_text_start(lines, block_start, method);
+    lines[title_start..method]
         .iter()
         .map(|l| {
             l.trim_start_matches('#')
@@ -1399,10 +1513,158 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
         .join(" ")
 }
 
+/// Where an entry's title text begins, given `block_start` — the top of the
+/// contiguous comment block leading into its method line — and `method`, the
+/// method line itself (both 0-based).
+///
+/// Everything at or above the last PaperBoy block marker in that span belongs
+/// to the *request*, not to its title. Shared with the prose-comment scan,
+/// which keeps whatever this leaves out and is not a block (see
+/// `lead_block_lines`): the two must agree on the boundary, or a line is
+/// either claimed twice — duplicated on the next save — or by nobody, and
+/// deleted.
+fn title_text_start(lines: &[&str], block_start: usize, method: usize) -> usize {
+    let mut title_start = block_start;
+    let mut i = block_start;
+    while i < method {
+        if let Some(n) = parse_gen_marker(lines[i]).or_else(|| parse_body_marker(lines[i])) {
+            let end = i.saturating_add(1).saturating_add(n).min(method);
+            title_start = end;
+            i = end;
+            continue;
+        }
+        if is_reports_marker(lines[i]) {
+            let mut j = i + 1;
+            while j < method && parse_report_row(lines[j]).is_some() {
+                j += 1;
+            }
+            title_start = j;
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    title_start
+}
+
+/// The 1-based lines of `[top, method)` — an entry's leading comment block —
+/// that a *well-formed* PaperBoy block occupies, and which are therefore
+/// already carried by the model (`generators`, the body, `reports`).
+///
+/// Well-formed is the point. `title_text_start` skips past a marker on sight,
+/// because a mangled `# [Gen]` block written back as a title is the
+/// irreversible loss of a signing block. But a block whose row count doesn't
+/// describe the lines below it isn't read as a block either — so those lines
+/// were claimed by nobody and vanished on the next save, which is the same
+/// loss by a quieter route. Everything this doesn't list is kept as prose.
+fn lead_block_lines(lines: &[&str], top: usize, method: usize) -> Vec<usize> {
+    let mut claimed = Vec::new();
+    let mut i = top.saturating_sub(1);
+    let end = method.saturating_sub(1).min(lines.len());
+    while i < end {
+        if let Some(n) = parse_gen_marker(lines[i]) {
+            let last = i + 1 + n;
+            if last <= end && (i + 1..last).all(|j| parse_gen_row(lines[j]).is_some()) {
+                claimed.extend((i + 1..=last).map(|l| l));
+                i = last;
+                continue;
+            }
+        }
+        if let Some(n) = parse_body_marker(lines[i]) {
+            let last = i + 1 + n;
+            if last <= end && (i + 1..last).all(|j| lines[j].trim_start().starts_with('#')) {
+                claimed.extend((i + 1..=last).map(|l| l));
+                i = last;
+                continue;
+            }
+        }
+        if is_reports_marker(lines[i]) {
+            let mut j = i + 1;
+            while j < end && parse_report_row(lines[j]).is_some() {
+                j += 1;
+            }
+            claimed.extend((i + 1..=j).map(|l| l));
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    claimed
+}
+
+/// The 1-based line where the contiguous `#`-comment block that leads directly
+/// into the method line at `method` (1-based) begins — stopping at the first
+/// blank or non-comment line above it. Equal to `method` when the line above is
+/// not a comment.
+///
+/// A `# [Gen]` block may be written *above* its request as well as below it
+/// (the layout README documents, and stock `hurl` ignores the difference).
+/// Reading such a block means widening a request's scan up over the comments
+/// that lead into its method line — and, so the request *above* doesn't also
+/// claim it, ending that earlier request's scan at the same line. This computes
+/// the shared boundary for both.
+fn leading_comment_top(lines: &[&str], method: usize) -> usize {
+    let mut top = method;
+    while top > 1 {
+        let above = top - 1;
+        if lines
+            .get(above - 1)
+            .is_some_and(|l| l.trim().starts_with('#'))
+        {
+            top = above;
+        } else {
+            break;
+        }
+    }
+    top
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::entry::collection_to_hurl;
     use super::*;
+
+    /// A `# [Gen]` block whose row count doesn't describe the lines below it
+    /// is not read as a block -- and when it sat *above* its request, nothing
+    /// else claimed those lines either: the title walk skips past a marker on
+    /// sight (a mangled signing block written back as a title is worse), and
+    /// the prose scan began at the method line. So the first save deleted the
+    /// user's block. The same damage below a request round-trips verbatim.
+    #[test]
+    fn a_damaged_gen_block_above_a_request_survives_a_save() {
+        let src = "# [Gen] 3\n# n = uuid\n# s = timestamp\nGET http://h/a\n";
+        let col = parse_hurl(src);
+        assert!(
+            col[0].generators.is_empty(),
+            "a block whose count is wrong is not live -- that is the safe way \
+             for a signing block to fail"
+        );
+        let out = collection_to_hurl(&col);
+        for line in ["# [Gen] 3", "# n = uuid", "# s = timestamp"] {
+            assert!(out.contains(line), "{line} was deleted by the save:\n{out}");
+        }
+        // And a second pass is stable: the recovered prose must not be
+        // re-claimed, duplicated, or dropped again.
+        let again = collection_to_hurl(&parse_hurl(&out));
+        assert_eq!(again, out, "saving twice must not keep changing the file");
+    }
+
+    /// The block that *is* well-formed is still read as a block, not kept as
+    /// prose as well -- which would duplicate it on every save.
+    #[test]
+    fn a_good_gen_block_above_a_request_is_still_a_block() {
+        let src = "# [Gen] 2\n# n = uuid\n# s = timestamp\nGET http://h/a\n";
+        let col = parse_hurl(src);
+        assert_eq!(col[0].generators.len(), 2, "read as a block");
+        assert!(
+            !col[0]
+                .comments
+                .iter()
+                .any(|c| c.text.contains("[Gen]") || c.text.contains("uuid")),
+            "and not also kept as prose: {:?}",
+            col[0].comments
+        );
+    }
 
     #[test]
     fn parse_error_explains_captures_needing_a_response_line() {
@@ -1793,6 +2055,125 @@ mod tests {
             parsed[1].reports.is_empty(),
             "second entry must not inherit the first's Reports block"
         );
+    }
+
+    // ── The `# [Gen]` block ────────────────────────────────────────────
+
+    /// The definitions survive a save/load, and the file they are written into
+    /// is still ordinary Hurl: every placeholder in the request itself is a
+    /// plain variable, so `hurl_core` parses the document unchanged and stock
+    /// `hurl` would run it given the values.
+    #[test]
+    fn a_gen_block_round_trips_and_leaves_the_file_valid_hurl() {
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://h/orders?n={{nonce}}",
+            vec![KvRow::new("X-Sig", "{{sig}}")],
+            "",
+        );
+        e.generators = vec![
+            ("nonce".to_string(), "random_hex(32)".to_string()),
+            (
+                "sig".to_string(),
+                r#"hmac_sha256(SECRET, concat("GET\n/orders\n", nonce))"#.to_string(),
+            ),
+        ];
+
+        let text = e.to_hurl();
+        assert!(text.contains("# [Gen] 2\n"), "\n{text}");
+        assert!(text.contains("# nonce = random_hex(32)\n"), "\n{text}");
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        assert_eq!(parse_hurl(&text)[0].generators, e.generators);
+
+        // Saving what was loaded must produce the same bytes. Reader and writer
+        // drifting apart here is not hypothetical — see `encode_body_block`.
+        assert_eq!(parse_hurl(&text)[0].to_hurl(), text);
+    }
+
+    /// An expression may contain the characters that mark up the rest of the
+    /// file — `:` (a row separator), `#` (a comment) and quotes — because a
+    /// date format or a canonical signing string genuinely contains them.
+    #[test]
+    fn a_gen_expression_may_contain_colons_hashes_and_quotes() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![
+            ("stamp".to_string(), r#"date("%H:%M:%S")"#.to_string()),
+            ("frag".to_string(), r#"concat("a#b", ":", "c")"#.to_string()),
+        ];
+        let text = e.to_hurl();
+        assert_eq!(parse_hurl_error(&text), None, "\n{text}");
+        let back = parse_hurl(&text);
+        assert_eq!(back[0].generators, e.generators);
+        // Crucially, not mistaken for disabled `key: value` request rows — the
+        // reason the rows are written with `=` (see `parse_gen_row`).
+        assert!(back[0].headers.is_empty(), "{:?}", back[0].headers);
+        assert!(back[0].comments.is_empty(), "{:?}", back[0].comments);
+    }
+
+    /// The block sits at the end of its request, so in a collection it lands
+    /// directly above the *next* request's line — exactly where the title walk
+    /// would otherwise absorb it, taking the first request's signature with it.
+    #[test]
+    fn a_gen_block_is_not_pulled_into_the_next_request() {
+        let mut a = HurlEntry::from_fields("First", "GET", "http://h/a", vec![], "");
+        a.generators = vec![("n".to_string(), "uuid".to_string())];
+        let b = HurlEntry::from_fields("Second", "GET", "http://h/b", vec![], "");
+
+        let doc = collection_to_hurl(&[a.clone(), b.clone()]);
+        let parsed = parse_hurl(&doc);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].generators, a.generators);
+        assert!(
+            parsed[1].generators.is_empty(),
+            "the second request must not inherit the first's block"
+        );
+        assert_eq!(parsed[1].title, "Second", "the title must survive intact");
+        assert!(
+            parsed[1].comments.is_empty(),
+            "nor should it arrive as prose: {:?}",
+            parsed[1].comments
+        );
+    }
+
+    /// A disabled request row is `# key: value` and a generator row is
+    /// `# name = expr`; neither may be read as the other, even when they are
+    /// adjacent.
+    #[test]
+    fn a_disabled_row_beside_a_gen_block_stays_a_disabled_row() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.headers = vec![KvRow::toggled("X-Trace", "on", false)];
+        e.generators = vec![("n".to_string(), "uuid".to_string())];
+
+        let text = e.to_hurl();
+        let back = parse_hurl(&text);
+        assert_eq!(back[0].generators, e.generators);
+        assert_eq!(back[0].headers, e.headers);
+        assert_eq!(back[0].to_hurl(), text);
+    }
+
+    /// A count that doesn't describe the lines below it is not a block. The
+    /// rows fall through to the prose scan and round-trip verbatim, so a
+    /// hand-edited or badly merged block degrades to comments rather than
+    /// half-loading — the safe direction for something a request is signed with.
+    #[test]
+    fn a_gen_block_whose_count_is_wrong_is_kept_as_prose_not_half_read() {
+        let text = concat!(
+            "# T\n",
+            "GET http://h/a\n",
+            "# [Gen] 3\n",
+            "# n = uuid\n",
+            "# s = timestamp\n",
+        );
+        let back = parse_hurl(&text);
+        assert!(
+            back[0].generators.is_empty(),
+            "a block claiming 3 rows over 2 must not be trusted"
+        );
+        let out = back[0].to_hurl();
+        for line in ["# [Gen] 3", "# n = uuid", "# s = timestamp"] {
+            assert!(out.contains(line), "{line} was dropped:\n{out}");
+        }
     }
 
     #[test]
@@ -3315,6 +3696,102 @@ mod recovery_tests {
         let with_reports: Vec<_> = es.iter().filter(|e| !e.reports.is_empty()).collect();
         assert_eq!(with_reports.len(), 1, "exactly one request has reports");
         assert_eq!(with_reports[0].url, "http://h/1");
+    }
+
+    /// A half-typed row (the `("", "")` an editor's "+ Add" leaves behind) must
+    /// not take the good rows with it. The writer drops what it cannot read
+    /// back rather than emitting a row that poisons the whole block on reload.
+    #[test]
+    fn a_half_typed_row_does_not_destroy_the_rows_beside_it() {
+        let mut e = HurlEntry::from_fields(
+            "Signed",
+            "GET",
+            "http://h/orders",
+            vec![KvRow::new("X-Nonce", "{{nonce}}")],
+            "",
+        );
+        e.generators = vec![
+            ("nonce".to_string(), "random_hex(16)".to_string()),
+            (String::new(), String::new()),
+        ];
+
+        let text = e.to_hurl();
+        assert_eq!(parse_hurl_error(&text), None, "still valid hurl:\n{text}");
+        let back = parse_hurl(&text);
+        assert!(
+            back[0].generators.iter().any(|(n, _)| n == "nonce"),
+            "the good row must survive a blank one beside it.\n\
+             written:\n{text}\nread back: {:?}",
+            back[0].generators,
+        );
+    }
+
+    /// A name an editor lets the user type (it only trims) must survive a save.
+    /// The reader no longer rejects a name that isn't a bare identifier, so the
+    /// writer never has to drop it.
+    #[test]
+    fn a_name_the_editor_accepts_survives_a_save() {
+        let mut e = HurlEntry::from_fields("T", "GET", "http://h/a", vec![], "");
+        e.generators = vec![
+            ("api.key".to_string(), "uuid".to_string()),
+            ("nonce".to_string(), "uuid".to_string()),
+        ];
+        let text = e.to_hurl();
+        let back = parse_hurl(&text);
+        assert_eq!(
+            back[0].generators, e.generators,
+            "a name no editor refuses must round-trip.\nwritten:\n{text}"
+        );
+    }
+
+    /// The layout the README documents — the `# [Gen]` block *above* the method
+    /// line — must be read as the request's block, not mistaken for its title
+    /// and written back out as one mangled prose line.
+    #[test]
+    fn a_block_above_its_request_is_not_eaten_by_the_title() {
+        let text = concat!(
+            "# [Gen] 1\n",
+            "# nonce = uuid\n",
+            "POST http://h/orders\n",
+            "X-Nonce: {{nonce}}\n",
+        );
+        assert_eq!(parse_hurl_error(text), None);
+        let back = parse_hurl(text);
+        assert!(
+            back[0].generators.iter().any(|(n, _)| n == "nonce"),
+            "the block above the request must be read: title {:?}, generators {:?}",
+            back[0].title,
+            back[0].generators,
+        );
+        let saved = back[0].to_hurl();
+        assert!(
+            saved.contains("# nonce = uuid"),
+            "saving must not destroy the block:\n{saved}",
+        );
+    }
+
+    /// With no blank line between two requests the title walk must still stop at
+    /// the first request's boundary: the second request's block (and title) are
+    /// its own, never a copy carried across from above.
+    #[test]
+    fn a_block_is_not_copied_into_the_next_requests_title() {
+        let doc = concat!(
+            "# First\n",
+            "GET http://h/a\n",
+            "# [Gen] 1\n",
+            "# nonce = uuid\n",
+            "# Second\n",
+            "POST http://h/b\n",
+            "X-N: {{nonce}}\n",
+        );
+        let back = parse_hurl(doc);
+        assert_eq!(back.len(), 2);
+        assert_eq!(
+            back[1].title,
+            "Second",
+            "the second request's title must be its own.\nre-saved:\n{}",
+            collection_to_hurl(&back)
+        );
     }
 }
 

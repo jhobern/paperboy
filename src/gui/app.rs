@@ -30,6 +30,7 @@ pub enum EditorSection {
     Options,
     Asserts,
     Captures,
+    Computed,
     Code,
 }
 
@@ -56,6 +57,10 @@ pub enum Dialog {
         range: Option<std::ops::Range<usize>>,
         name: String,
     },
+    /// Building an `[Asserts]` line or a `[Captures]` row out of the response
+    /// on screen (right-click in the response viewer). See
+    /// [`super::probe::ProbeBuilder`].
+    ProbeBuilder(Box<super::probe::ProbeBuilder>),
     /// The theme editor.
     Theme(Box<super::menu::ThemeEditState>),
     /// Simple text prompt (base URL, new env name, …).
@@ -338,6 +343,19 @@ fn logo_color_image() -> Option<egui::ColorImage> {
         [w as usize, h as usize],
         img.as_raw(),
     ))
+}
+
+/// How a status message is marked: its icon and its colour.
+///
+/// The two say the same thing twice on purpose -- colour alone is no answer for
+/// someone who cannot tell these two apart, and this line is where a failed
+/// save is reported.
+fn status_badge(status: &crate::i18n::Status, theme: &GuiTheme) -> (&'static str, egui::Color32) {
+    if status.is_ok() {
+        (super::icons::PASS, theme.ok)
+    } else {
+        (super::icons::WARNING, theme.err)
+    }
 }
 
 impl GuiApp {
@@ -1156,7 +1174,14 @@ impl GuiApp {
         // key here would take it away from that editor while it is the surface
         // the keyboard is aimed at, so the global binding stands down whenever
         // the report editor is up and only claims Ctrl+Z otherwise.
+        //
+        // Gated on nothing being typed into for the same reason: every text
+        // field in the window has its own Ctrl+Z, and a global binding that
+        // consumed the key first took undo away from all of them -- typing in a
+        // URL, a header or a generated expression and pressing Ctrl+Z resurrected
+        // a deleted request instead of undoing what had just been typed.
         if self.report_editor.is_none()
+            && no_widget_focus
             && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z))
         {
             self.undo_delete_request();
@@ -1401,6 +1426,45 @@ impl GuiApp {
         }
     }
 
+    /// The transient status message ("Saved", "Could not write file: …"),
+    /// drawn on the menu row where the terminal UI puts it.
+    ///
+    /// Deliberately not down in the status bar with the logo, the theme name
+    /// and the active environment. Those never change unless the user changes
+    /// them, so nothing down there is ever worth a second look -- and a message
+    /// that appears for a moment, among things trained to be ignored, at the
+    /// far end of the window from the request just sent, was missed. Up here it
+    /// shares the row the user is already using.
+    ///
+    /// Coloured and marked by outcome, with the icon repeating what the colour
+    /// says for anyone who cannot tell the two apart.
+    pub(super) fn status_message(&mut self, ui: &mut egui::Ui) {
+        let Some(status) = self.session.status.as_ref() else {
+            return;
+        };
+        let (icon, color) = status_badge(status, &self.theme);
+        let text = status.text(&self.strings);
+        // Clickable, because the terminal UI advertises a copy key for this
+        // line and a long parse error is exactly what someone wants to paste
+        // somewhere. The message is left on screen afterwards rather than
+        // replaced with "copied": what was copied is the thing worth still
+        // being able to read.
+        if ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(format!("{icon} {text}"))
+                        .color(color)
+                        .strong(),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(self.strings.gui_status_copy_hint)
+            .clicked()
+        {
+            ui.ctx().copy_text(text);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // The PaperBoy logo badge, lazily uploaded on first use. Drawn at
@@ -1415,13 +1479,6 @@ impl GuiApp {
             let h = ui.text_style_height(&egui::TextStyle::Body);
             ui.add(egui::Image::new((logo.id(), egui::vec2(h, h))));
             ui.add_space(4.0);
-            let msg = self
-                .session
-                .status
-                .as_ref()
-                .map(|s| s.text(&self.strings))
-                .unwrap_or_default();
-            ui.colored_label(self.theme.dim, msg);
             // An import that was sent to the background reports from here, and
             // clicking it is the way back to the dialog. Computed before the
             // click so `self.postman` isn't borrowed twice.
@@ -1786,6 +1843,87 @@ fn report_id_clashes(_ctx: &egui::Context) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A message that appears for a moment has to appear where the user is
+    /// looking. At the foot of the window it sat among the logo, the theme name
+    /// and the environment -- none of which ever change on their own, so
+    /// nothing down there is worth a second look -- and as far from the request
+    /// just sent as the window allows. The terminal UI puts it on the menu row,
+    /// and so does this.
+    #[test]
+    fn the_status_message_is_drawn_on_the_menu_row() {
+        super::super::requests::tests::redirect_saved_state();
+        let mut app = GuiApp::for_test(Session::default());
+        app.session.status = Some(crate::i18n::Status::Error("disc on fire".into()));
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        let height = 800.0;
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1200.0, height),
+        ));
+        let out = ctx.run_ui(input, |ui| app.draw(ui));
+
+        let mut found = Vec::new();
+        fn walk(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                    out.push(t.visual_bounding_rect())
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, needle, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, "disc on fire", &mut found);
+        }
+        let rect = found
+            .first()
+            .unwrap_or_else(|| panic!("the status message was not painted at all"));
+        assert!(
+            rect.top() < 80.0,
+            "the message should ride the menu row, but was painted at y={} of {height}",
+            rect.top()
+        );
+
+        // The frame really is laid out full-height, so that coordinate means
+        // something: the theme name -- which belongs at the foot of the window
+        // and stays there -- is painted right at the bottom of the same frame.
+        let mut bottom = Vec::new();
+        for c in &out.shapes {
+            walk(&c.shape, app.strings.gui_theme_status_label, &mut bottom);
+        }
+        let theme_rect = bottom
+            .first()
+            .unwrap_or_else(|| panic!("the status bar was not painted"));
+        assert!(
+            theme_rect.top() > height - 80.0,
+            "the ambient status bar should still be at the foot: y={}",
+            theme_rect.top()
+        );
+    }
+
+    /// The terminal UI has always drawn this line in the outcome's colour;
+    /// the GUI drew every message in the one dim grey the rest of the bar uses,
+    /// so a failed save read like a note about which theme was loaded.
+    #[test]
+    fn a_status_message_is_marked_by_its_outcome() {
+        let theme = GuiTheme::from_spec(&crate::theme::default_preset());
+        let (ok_icon, ok_color) = status_badge(&crate::i18n::Status::Saved, &theme);
+        let (bad_icon, bad_color) = status_badge(&crate::i18n::Status::Error("no".into()), &theme);
+
+        assert_eq!(ok_color, theme.ok);
+        assert_eq!(bad_color, theme.err);
+        assert_ne!(
+            bad_color, theme.dim,
+            "a failure has to be told apart from the rest of the status bar"
+        );
+        assert_ne!(
+            ok_icon, bad_icon,
+            "colour alone is no answer for someone who cannot tell these two apart"
+        );
+    }
 
     fn edited_collection(name: &str) -> crate::collection::Collection {
         let mut e = crate::hurl::HurlEntry::default();
@@ -2282,6 +2420,27 @@ mod tests {
             "an open dialog freezes the tree keys entirely"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every text field in the window has its own Ctrl+Z. The global binding
+    /// consumed the key before any of them saw it, so undo did not work in a
+    /// URL, a header cell or a generated expression -- it resurrected the last
+    /// deleted request instead, which is not what the keyboard was aimed at.
+    #[test]
+    fn ctrl_z_belongs_to_whatever_is_being_typed_into() {
+        let mut session = Session::default();
+        session.collections[0].entries = vec![req("a"), req("b")];
+        session.confirm_on_delete_request = false;
+        let mut app = GuiApp::for_test(session);
+        app.delete_request_now(0, 1);
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("a-text-field")));
+        press(&mut app, &ctx, Key::Z, Modifiers::COMMAND);
+        assert_eq!(
+            app.session.collections[0].entries.len(),
+            1,
+            "the field being typed into owns Ctrl+Z"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Headless CLI runner: `paperboy -c collection.hurl [-e env.vars] [--batch]`.
 //!
 //! Parsing, HTTP and `[Captures]`/`[Asserts]` evaluation are all delegated to
-//! the Hurl runner (via [`crate::hurl::run_hurl`] / [`crate::hurl::run_hurl_streaming`]);
+//! the Hurl runner (via [`crate::hurl::run_hurl`] / [`crate::hurl::run_hurl_streaming_with`]);
 //! this module only handles file I/O, environment loading and formatting the
 //! results.
 
@@ -12,9 +12,10 @@ use std::io::IsTerminal;
 use ratatui::crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
+use crate::generators::SystemSource;
 use crate::hurl::{
-    EntryOutcome, FormFieldKind, collection_to_hurl, expand_base64_form_fields, parse_hurl_error,
-    run_hurl, run_hurl_streaming,
+    EntryOutcome, EntrySetup, FormFieldKind, RunOutput, collection_to_hurl,
+    expand_base64_form_fields, parse_hurl_error, run_hurl, run_hurl_streaming_with,
 };
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::request;
@@ -24,7 +25,7 @@ use crate::shared_utils::stem;
 /// By default each request's result is printed as soon as it finishes
 /// (`batch: false`); `batch: true` waits for the whole collection to run
 /// (the original behaviour), which is the only mode that preserves Hurl's
-/// automatic cookie jar across every request — see [`run_hurl_streaming`]'s
+/// automatic cookie jar across every request — see [`run_hurl_streaming_with`]'s
 /// docs for why streaming mode can't do that too.
 pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i32 {
     let col_content = match fs::read_to_string(&collection_path) {
@@ -200,30 +201,144 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     let mut per_request: Vec<Option<bool>> = vec![None; total];
     let mut record = |eo: &EntryOutcome| credit(&mut per_request, eo);
 
-    let out = if batch {
-        let out = run_hurl(&run_content, &vars, file_root);
-        for eo in out.entries.iter() {
-            print_entry(
-                color,
-                eo.entry_index,
-                total,
-                titles.get(eo.entry_index).copied(),
-                eo,
+    // `# [Gen]` blocks. A block belongs to one request and is evaluated per
+    // send, so it cannot simply be folded into the run's variables up front:
+    // two requests that each compute a `nonce` must each get their own.
+    // Streaming already runs one entry at a time, so each block is evaluated
+    // in its window — which also lets a generator read a value an earlier
+    // request captured. Batch is a single Hurl call over the whole file and
+    // has no such window, so there every block is evaluated once, before the
+    // run, against the environment alone; a name computed by two requests
+    // takes the first request's value for both.
+    let gen_entries = entries.clone();
+    let mut gen_reported: Vec<bool> = vec![false; gen_entries.len()];
+    let strings = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+    let report_gen = |title: &str, errors: &[crate::generators::GenError]| {
+        // Summarised: a block where one broken row fails six others has one
+        // mistake in it, and six lines saying "something else went wrong" bury
+        // the line that says what.
+        for detail in crate::i18n::summarise_gen_errors(&strings, errors) {
+            eprintln!(
+                "{}",
+                paint(color, Hue::Red, &format!("  ! {title}: {detail}"))
             );
-            record(eo);
         }
-        out
+    };
+
+    let out = if batch {
+        let mut vars = vars.clone();
+        let blocks =
+            crate::request::expand_batch_generators(&gen_entries, &vars, &SystemSource::new());
+        for (title, errors) in &blocks.errors {
+            report_gen(title, errors);
+        }
+        // Nothing is sent when a block failed. Batch is one Hurl call over
+        // the whole file, so there is no way to skip the one request and run
+        // the rest (streaming does exactly that -- see `EntrySetup::Skip`),
+        // and going on would leave the failed row's name to whatever else
+        // binds it: the request goes out signed with the wrong thing and is
+        // answered. Dropping `--batch` runs the rest.
+        if !blocks.errors.is_empty() {
+            let flat: Vec<crate::generators::GenError> = blocks
+                .errors
+                .iter()
+                .flat_map(|(_, errs)| errs.iter().cloned())
+                .collect();
+            RunOutput {
+                entries: vec![],
+                error: Some(crate::i18n::summarise_gen_errors(&strings, &flat).join("; ")),
+            }
+        } else {
+            // Said out loud rather than silently resolved: in batch the two
+            // requests share one value, so the second one's signature is computed
+            // over the first one's nonce. Streaming (the default) gives each its
+            // own, so the fix is usually to drop `--batch` — which is what the
+            // message suggests.
+            for name in &blocks.collisions {
+                eprintln!(
+                    "{}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
+                    )
+                );
+            }
+            // A generator whose name the environment already binds computes nothing
+            // in batch: one shared value set can't shadow the value from this
+            // request on without rewriting it for the requests above too, so the
+            // environment value stands. Say so — dropping `--batch` is the fix.
+            for name in &blocks.shadowed {
+                eprintln!(
+                    "{}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("  ! {}", strings.cli_gen_shadow.replace("{name}", name))
+                    )
+                );
+            }
+            vars.extend(blocks.bound);
+            let out = run_hurl(&run_content, &vars, file_root);
+            for eo in out.entries.iter() {
+                print_entry(
+                    color,
+                    eo.entry_index,
+                    total,
+                    titles.get(eo.entry_index).copied(),
+                    eo,
+                );
+                record(eo);
+            }
+            out
+        }
     } else {
-        run_hurl_streaming(&run_content, &vars, file_root, |eo| {
-            print_entry(
-                color,
-                eo.entry_index,
-                total,
-                titles.get(eo.entry_index).copied(),
-                eo,
-            );
-            record(eo);
-        })
+        run_hurl_streaming_with(
+            &run_content,
+            &vars,
+            file_root,
+            |i, known| {
+                let Some(entry) = gen_entries.get(i) else {
+                    return EntrySetup::Bind(Vec::new());
+                };
+                if entry.generators.is_empty() {
+                    return EntrySetup::Bind(Vec::new());
+                }
+                let mut merged = known.clone();
+                let errors =
+                    crate::generators::expand(&entry.generators, &mut merged, &SystemSource::new());
+                // Reported once per request however often it repeats, so a
+                // `[Options] retry` does not print the same typo five times.
+                if !std::mem::replace(&mut gen_reported[i], true) {
+                    report_gen(&entry.title, &errors);
+                }
+                // Not sent when the block failed -- see `EntrySetup::Skip`.
+                if !errors.is_empty() {
+                    let english =
+                        crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+                    return EntrySetup::Skip {
+                        reason: crate::i18n::summarise_gen_errors(&english, &errors).join("; "),
+                    };
+                }
+                EntrySetup::Bind(
+                    entry
+                        .generators
+                        .iter()
+                        .filter_map(|(name, _)| merged.get(name).map(|v| (name.clone(), v.clone())))
+                        .collect(),
+                )
+            },
+            |eo| {
+                print_entry(
+                    color,
+                    eo.entry_index,
+                    total,
+                    titles.get(eo.entry_index).copied(),
+                    eo,
+                );
+                record(eo);
+            },
+        )
     };
     let passed = per_request.iter().filter(|r| **r == Some(true)).count();
     let failed = per_request.iter().filter(|r| **r == Some(false)).count();

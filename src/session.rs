@@ -888,12 +888,28 @@ impl Session {
             self.status = Some(Status::BodyFormConflict(conflicts));
             return Vec::new();
         }
+        // Refused for the same reason: a truncated `{{ api.key }}` is sent as
+        // `api` and answered, so nothing about the response says it was wrong.
+        let truncated = request::truncated_placeholders(&self.collections[ci]);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
+            return Vec::new();
+        }
+        // A `# [Gen]` failure is said in preference to the undefined-variable
+        // report it would otherwise produce: "there is no function called
+        // hmac_sha526" is the same finding as "nothing defines sig", but
+        // actionable.
+        let gen_errors = request::generator_problems(&self.collections[ci], env.as_ref());
         let undefined = request::undefined_request_keys(&self.collections[ci], env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        self.status = if !gen_errors.is_empty() {
+            Some(Status::GeneratorErrors(gen_errors))
+        } else {
+            (!undefined.is_empty()).then_some(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            })
+        };
         self.begin_request();
         let selected = self.collections[ci].selected_entry;
         if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
@@ -903,6 +919,10 @@ impl Session {
             request::run_collection(&self.collections[ci], env.as_ref(), self.response.clone())
         {
             self.pending_captures.push(rx);
+        } else if let Some(entry) = self.collections[ci].entries.get_mut(selected) {
+            // No thread was started, so no completion will ever arrive: undo
+            // the in-flight mark here or the entry spins forever.
+            entry.last_run = RunStatus::Failed;
         }
         Vec::new()
     }
@@ -927,12 +947,47 @@ impl Session {
             self.status = Some(Status::BodyFormConflict(conflicts));
             return Vec::new();
         }
+        let truncated = request::truncated_placeholders_all(col);
+        if !truncated.is_empty() {
+            self.status = Some(Status::TruncatedPlaceholders(truncated));
+            return Vec::new();
+        }
+        let gen_errors = request::generator_problems_all(col, env.as_ref());
+        // Only batch shares one variable set across the file, so only batch
+        // turns two requests computing the same name into one value for both.
+        // Reported, not refused: sharing is occasionally what was meant, and
+        // the run is about to happen either way.
+        let collisions = if self.run_all_batch_mode {
+            request::generator_collisions(col)
+        } else {
+            Vec::new()
+        };
+        // Same reasoning as collisions: only batch shares one value set, so
+        // only batch drops a generator that an environment value already binds.
+        let shadows = if self.run_all_batch_mode {
+            request::generator_env_shadows(col, env.as_ref())
+        } else {
+            Vec::new()
+        };
         let undefined = request::undefined_request_keys_all(col, env.as_ref());
         let in_envs = self.envs_defining_keys(ci, &undefined);
-        self.status = (!undefined.is_empty()).then_some(Status::UndefinedVars {
-            keys: undefined,
-            in_envs,
-        });
+        let mut warnings = Vec::new();
+        if !gen_errors.is_empty() {
+            warnings.push(Status::GeneratorErrors(gen_errors));
+        }
+        if !collisions.is_empty() {
+            warnings.push(Status::GeneratorCollisions(collisions));
+        }
+        if !shadows.is_empty() {
+            warnings.push(Status::GeneratorShadows(shadows));
+        }
+        if !undefined.is_empty() {
+            warnings.push(Status::UndefinedVars {
+                keys: undefined,
+                in_envs,
+            });
+        }
+        self.status = crate::i18n::preflight_status(warnings);
         self.begin_request();
         for entry in self.collections[ci].entries.iter_mut() {
             entry.last_run = RunStatus::Running;
@@ -1280,6 +1335,124 @@ mod param_memory_tests {
 
 #[cfg(test)]
 mod workspace_tests {
+    /// A tab restored from the previous session can still put a request back
+    /// the way the file has it.
+    ///
+    /// The list a restart brings back is whatever was on screen, unsaved edits
+    /// included, so a request added and never saved made the restored list one
+    /// longer than its file. That difference used to disable revert for
+    /// *every* request in the tab -- "Nothing to revert", and the pencil
+    /// stayed on a request whose saved version was sitting right there.
+    #[test]
+    fn a_restored_tab_can_still_revert_a_request() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_restore_revert_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "# A\nGET https://h/a\n\n# B\nGET https://h/b\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        // A structural edit left unsaved before the restart: one more request
+        // in the list than the file holds.
+        let extra = s.collections[0].entries[0].clone();
+        s.collections[0].entries.push(extra);
+        s.collections[0].entries[2].user_added = true;
+        // And an ordinary edit on the request we are about to revert.
+        s.collections[0].entries[1]
+            .generators
+            .push(("nonce".into(), "uuid".into()));
+        s.collections[0].entries[1].mark_edited();
+
+        let state = s.to_persisted();
+        let mut back = Session::default();
+        back.apply_persisted(state);
+
+        // The edit survives the restart, pencil and all.
+        assert!(back.collections[0].entries[1].modified);
+        assert!(back.collections[0].has_saved_version(1));
+        assert!(back.collections[0].revert_request(1).is_some());
+        assert!(back.collections[0].entries[1].generators.is_empty());
+        assert!(!back.collections[0].entries[1].modified);
+        // The untouched request was never marked, and the unsaved addition
+        // still is.
+        assert!(!back.collections[0].entries[0].modified);
+        assert!(back.collections[0].structure_modified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that ends in a separator names no file the kernel will open:
+    /// writing to it fails with "Is a directory" however ordinary the file is.
+    /// One stored in a previous session is repaired on the way back in, rather
+    /// than leaving the tab unable to save for as long as the state survives.
+    #[test]
+    fn a_restored_path_with_a_trailing_slash_is_cleaned_up() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_slashy_path_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "GET https://h/a\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        let mut state = s.to_persisted();
+        state.tabs[0].path = Some(format!("{}/", path.display()));
+
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        assert_eq!(back.collections[0].path.as_deref(), Some(path.as_path()));
+        // And the file it names can actually be written.
+        let text = back.collections[0].to_hurl();
+        std::fs::write(back.collections[0].path.as_ref().unwrap(), text).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Builds before the restore path kept baselines re-stamped every restored
+    /// request from its own edited text, so an unsaved edit became the record
+    /// of what the file said. Undoing the edit then made the request differ
+    /// from its "file" and the pencil never cleared. Such a baseline is not in
+    /// the file, which is how it is recognised and thrown away.
+    #[test]
+    fn a_baseline_the_file_does_not_recognise_is_re_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "paperboy_bad_baseline_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.hurl");
+        std::fs::write(&path, "# A\nGET https://h/a\n").unwrap();
+        let mut s = Session::default();
+        s.collections.clear();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(s.load_collection_text("c".into(), &text, Some(path.clone())));
+        // What the older build left behind: a baseline nobody wrote to disk.
+        s.collections[0].entries[0].baseline = Some("# A\nGET https://h/INVENTED\n".into());
+        s.collections[0].entries[0].mark_edited();
+        assert!(s.collections[0].entries[0].modified);
+
+        let state = s.to_persisted();
+        let mut back = Session::default();
+        back.apply_persisted(state);
+        assert!(
+            !back.collections[0].entries[0].modified,
+            "the request matches the file, so nothing about it is unsaved"
+        );
+        assert!(back.collections[0].revert_request(0).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::collection::WsRow;
     use crate::remote_flow::WorkspaceGitFilter;

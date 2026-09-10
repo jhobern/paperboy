@@ -3,11 +3,14 @@
 //! can encode one by using `/` as a path separator (e.g. `"Auth/Login"`,
 //! `"Auth/Tokens/Refresh"`) — the same convention Postman collections use for
 //! nested folders once imported (see [`crate::postman::import_postman`]).
-//! This module turns that convention into a flat, navigable view: at any
-//! given folder, you see its direct subfolders and direct requests, never a
-//! deep indented tree.
+//! This module turns that convention into an expand/collapse tree: folders
+//! appear where the file first mentions them, and a folder's contents are
+//! listed under it, indented, when it is expanded. Any number of folders can
+//! be open at once -- the earlier model showed one folder at a time and made
+//! comparing two of them a matter of walking in and out of each.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use crate::hurl::HurlEntry;
 
@@ -62,25 +65,18 @@ pub fn cmp_names(mode: SortMode, a: &str, b: &str) -> Ordering {
     }
 }
 
-/// Reorder `rows` in place under `mode`.
+/// Reorder a **flat** list of rows in place under `mode`.
 ///
-/// `Row::Up` is pinned to the top whichever way the rest is ordered: it is the
-/// way out of the folder, not one of its contents, and a "go up" row that sank
-/// to the bottom under Z-A would be a trap. Folders and requests sort together
-/// by the name on screen rather than in separate blocks, so A-Z means what it
-/// looks like.
+/// Only ever applied to a filtered list, which has no folder rows and no
+/// nesting: sorting a tree by name as one flat sequence would tear children
+/// away from their folders. The GUI sorts its unfiltered tree level by level
+/// in its own builder, and the terminal UI leaves the order the file's.
 pub fn sort_rows(rows: &mut [Row], entries: &[HurlEntry], mode: SortMode) {
     let name = |row: &Row| match row {
-        Row::Up => String::new(),
-        Row::Folder(n) => n.clone(),
+        Row::Folder { path, .. } => path.last().cloned().unwrap_or_default(),
         Row::Entry(i) => entries.get(*i).map(leaf_name).unwrap_or_default(),
     };
-    rows.sort_by(|a, b| {
-        let pinned = |r: &Row| u8::from(!matches!(r, Row::Up));
-        pinned(a)
-            .cmp(&pinned(b))
-            .then_with(|| cmp_names(mode, &name(a), &name(b)))
-    });
+    rows.sort_by(|a, b| cmp_names(mode, &name(a), &name(b)));
 }
 
 /// Split a request title into its folder path, e.g. `"Auth/Login"` →
@@ -104,45 +100,110 @@ pub fn entry_path(title: &str) -> Vec<String> {
 /// One row in the folder-aware requests list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    /// Go up to the parent folder (only present when not at the root).
-    Up,
-    /// Descend into a subfolder of the current one.
-    Folder(String),
-    /// A request directly in the current folder (index into the collection's
-    /// flat `entries`).
+    /// A folder, given by its full path from the root, and whether it is
+    /// currently expanded.
+    ///
+    /// The whole path rather than just the name: two folders can be called
+    /// `Tokens`, and every caller (toggling it, indenting it, prefilling a new
+    /// request's name with it) needs to know which one this is.
+    Folder { path: Vec<String>, expanded: bool },
+    /// A request, as an index into the collection's flat `entries`.
     Entry(usize),
 }
 
-/// The rows to show for `folder` (the current breadcrumb path, root = `[]`):
-/// an optional `Up` row, then this folder's direct requests and subfolders
-/// **in the order the file lists them**, a subfolder appearing where its first
-/// request does.
+impl Row {
+    /// How far in to draw the row: the number of folders above it.
+    pub fn depth(&self, entries: &[HurlEntry]) -> usize {
+        match self {
+            Self::Folder { path, .. } => path.len() - 1,
+            Self::Entry(i) => entries
+                .get(*i)
+                .map(|e| entry_path(&e.title).len() - 1)
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// The rows to show for a collection whose expanded folders are `expanded`:
+/// every folder and every request that no collapsed folder is hiding, **in the
+/// order the file lists them**, a folder appearing where its first request
+/// does.
 ///
 /// The file is the source of truth for order: a `.hurl` collection is a
 /// sequence, requests that share state have to run in sequence, and the author
 /// put them in that sequence deliberately. Sorting the folders, or hoisting
 /// them above the loose requests, would show a different collection to the one
 /// on disk and to the one Run All executes.
-pub fn rows_for(entries: &[HurlEntry], folder: &[String]) -> Vec<Row> {
+///
+/// A folder row is emitted the first time a request needs it, and only while
+/// every folder above it is open -- so collapsing a folder hides its
+/// subfolders as well as its requests, which is the whole point of collapsing
+/// it.
+pub fn rows_for(entries: &[HurlEntry], expanded: &HashSet<Vec<String>>) -> Vec<Row> {
+    let items: Vec<(usize, Vec<String>)> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let path = entry_path(&e.title);
+            (i, path[..path.len() - 1].to_vec())
+        })
+        .collect();
     let mut rows = Vec::with_capacity(entries.len() + 1);
-    if !folder.is_empty() {
-        rows.push(Row::Up);
-    }
-    for (i, e) in entries.iter().enumerate() {
-        let path = entry_path(&e.title);
-        if path.len() <= folder.len() || path[..folder.len()] != *folder {
+    push_level(&items, &[], expanded, &mut rows);
+    rows
+}
+
+/// Emit the rows for one level of the tree: `items` is every request at or
+/// below `prefix`, paired with the folder path it lives in.
+///
+/// Each folder's requests are gathered under its row even when the file
+/// interleaves them with other folders' — `A/one, B/one, A/two` puts both `A`
+/// requests under `A`. Emitting them where the file lists them instead would
+/// draw `A/two` below the `B` row, i.e. inside a folder it is not in. The
+/// file's order still decides where each folder and each loose request lands,
+/// and the order requests run in is the file's regardless of how they are
+/// grouped on screen.
+fn push_level(
+    items: &[(usize, Vec<String>)],
+    prefix: &[String],
+    expanded: &HashSet<Vec<String>>,
+    rows: &mut Vec<Row>,
+) {
+    let depth = prefix.len();
+    let mut done: Vec<&String> = Vec::new();
+    for (i, folders) in items {
+        // Directly in this folder: a row of its own, in file order.
+        if folders.len() == depth {
+            rows.push(Row::Entry(*i));
             continue;
         }
-        if path.len() == folder.len() + 1 {
-            rows.push(Row::Entry(i));
-        } else {
-            let row = Row::Folder(path[folder.len()].clone());
-            if !rows.contains(&row) {
-                rows.push(row);
-            }
+        let name = &folders[depth];
+        if done.contains(&name) {
+            continue;
+        }
+        done.push(name);
+        let mut path = prefix.to_vec();
+        path.push(name.clone());
+        let open = expanded.contains(&path);
+        rows.push(Row::Folder {
+            path: path.clone(),
+            expanded: open,
+        });
+        if open {
+            let inside: Vec<(usize, Vec<String>)> = items
+                .iter()
+                .filter(|(_, f)| f.len() > depth && &f[depth] == name)
+                .cloned()
+                .collect();
+            push_level(&inside, &path, expanded, rows);
         }
     }
-    rows
+}
+
+/// Every folder on the way down to `folder`, itself included: the set that has
+/// to be open for a row inside it to be visible.
+pub fn ancestors_of(folder: &[String]) -> HashSet<Vec<String>> {
+    (0..folder.len()).map(|d| folder[..=d].to_vec()).collect()
 }
 
 /// The rows to show when the Requests list is being filtered by a typed query:
@@ -186,6 +247,21 @@ pub fn folder_of(entries: &[HurlEntry], idx: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The set of open folders named as slash paths, for readability.
+    fn open(paths: &[&str]) -> HashSet<Vec<String>> {
+        paths
+            .iter()
+            .map(|p| p.split('/').map(str::to_string).collect())
+            .collect()
+    }
+
+    fn folder(path: &str, expanded: bool) -> Row {
+        Row::Folder {
+            path: path.split('/').map(str::to_string).collect(),
+            expanded,
+        }
+    }
+
     fn entry(title: &str) -> HurlEntry {
         HurlEntry {
             title: title.to_string(),
@@ -219,16 +295,13 @@ mod tests {
             entry("Auth/Logout"),
             entry("Files/Upload/Big"),
         ];
-        let rows = rows_for(&entries, &[]);
+        let rows = rows_for(&entries, &open(&[]));
         // `plain` is first because the file puts it first, and Auth precedes
-        // Files for the same reason, not alphabetically.
+        // Files for the same reason, not alphabetically. Closed folders show
+        // as one row each and hide everything inside them.
         assert_eq!(
             rows,
-            vec![
-                Row::Entry(0),
-                Row::Folder("Auth".into()),
-                Row::Folder("Files".into()),
-            ]
+            vec![Row::Entry(0), folder("Auth", false), folder("Files", false),]
         );
     }
 
@@ -236,40 +309,107 @@ mod tests {
     fn a_folder_keeps_the_position_of_its_first_request() {
         let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
         assert_eq!(
-            rows_for(&entries, &[]),
-            vec![
-                Row::Folder("Zed".into()),
-                Row::Entry(1),
-                Row::Folder("Abe".into()),
-            ]
+            rows_for(&entries, &open(&[])),
+            vec![folder("Zed", false), Row::Entry(1), folder("Abe", false)]
         );
     }
 
+    /// The point of the tree: more than one folder can be open at a time, and
+    /// each one's contents appear under it rather than replacing the list.
     #[test]
-    fn descending_a_folder_shows_its_direct_children_with_an_up_row() {
+    fn several_folders_can_be_open_at_once() {
         let entries = vec![
             entry("plain"),
             entry("Auth/Login"),
             entry("Auth/Tokens/Refresh"),
-            entry("Auth/Logout"),
+            entry("Files/Upload/Big"),
         ];
-        let rows = rows_for(&entries, &["Auth".to_string()]);
+        let rows = rows_for(&entries, &open(&["Auth", "Files"]));
         assert_eq!(
             rows,
             vec![
-                Row::Up,
+                Row::Entry(0),
+                folder("Auth", true),
                 Row::Entry(1),
-                Row::Folder("Tokens".into()),
-                Row::Entry(3)
+                folder("Auth/Tokens", false),
+                folder("Files", true),
+                folder("Files/Upload", false),
+            ],
+            "opening Auth should not have closed Files"
+        );
+    }
+
+    /// A folder's requests are drawn under it even when the file interleaves
+    /// them with another folder's. Emitting each request where the file lists
+    /// it put `Auth/Logout` below the `Users` row -- under a folder it is not
+    /// in.
+    #[test]
+    fn a_folders_requests_are_gathered_under_it_even_when_the_file_interleaves_them() {
+        let entries = vec![
+            entry("Auth/Login"),
+            entry("Users/List"),
+            entry("Auth/Logout"),
+        ];
+        assert_eq!(
+            rows_for(&entries, &open(&["Auth"])),
+            vec![
+                folder("Auth", true),
+                Row::Entry(0),
+                Row::Entry(2),
+                folder("Users", false),
             ]
         );
     }
 
+    /// A folder inside a closed folder is not drawn at all -- neither its own
+    /// row nor its contents. Hiding the requests but leaving the subfolder
+    /// rows behind would make a collapsed folder look half-open.
     #[test]
-    fn nested_folders_stay_flat_at_each_level() {
+    fn a_closed_folder_hides_its_subfolders_as_well_as_its_requests() {
         let entries = vec![entry("Files/Upload/Big"), entry("Files/Upload/Small")];
-        let rows = rows_for(&entries, &["Files".to_string(), "Upload".to_string()]);
-        assert_eq!(rows, vec![Row::Up, Row::Entry(0), Row::Entry(1)]);
+        assert_eq!(rows_for(&entries, &open(&[])), vec![folder("Files", false)]);
+        assert_eq!(
+            rows_for(&entries, &open(&["Files"])),
+            vec![folder("Files", true), folder("Files/Upload", false)]
+        );
+        assert_eq!(
+            rows_for(&entries, &open(&["Files", "Files/Upload"])),
+            vec![
+                folder("Files", true),
+                folder("Files/Upload", true),
+                Row::Entry(0),
+                Row::Entry(1),
+            ]
+        );
+    }
+
+    /// Opening a deep folder without its parent shows nothing new: the parent
+    /// is what is hiding it, and an open child inside a closed parent is a
+    /// state the user cannot see and so cannot undo.
+    #[test]
+    fn opening_a_folder_inside_a_closed_one_changes_nothing() {
+        let entries = vec![entry("Files/Upload/Big")];
+        assert_eq!(
+            rows_for(&entries, &open(&["Files/Upload"])),
+            vec![folder("Files", false)]
+        );
+    }
+
+    /// How far in each row is drawn -- the folder rows above it.
+    #[test]
+    fn depth_counts_the_folders_above_a_row() {
+        let entries = vec![entry("Files/Upload/Big"), entry("plain")];
+        assert_eq!(folder("Files", false).depth(&entries), 0);
+        assert_eq!(folder("Files/Upload", false).depth(&entries), 1);
+        assert_eq!(Row::Entry(0).depth(&entries), 2);
+        assert_eq!(Row::Entry(1).depth(&entries), 0);
+    }
+
+    #[test]
+    fn the_ancestors_of_a_folder_are_every_step_down_to_it() {
+        let path = vec!["Files".to_string(), "Upload".to_string()];
+        assert_eq!(ancestors_of(&path), open(&["Files", "Files/Upload"]));
+        assert!(ancestors_of(&[]).is_empty());
     }
 
     #[test]
@@ -298,12 +438,15 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_reaches_requests_the_current_folder_would_hide() {
+    fn a_filter_reaches_requests_a_closed_folder_would_hide() {
         let entries = vec![entry("Auth/Login"), entry("Files/Upload/Big")];
-        // Browsing inside Auth, `rows_for` cannot see the Files request at all
-        // — which is exactly the case a filter exists to solve.
-        let browsing = rows_for(&entries, &["Auth".to_string()]);
-        assert_eq!(browsing, vec![Row::Up, Row::Entry(0)]);
+        // With Files closed, `rows_for` does not show its request at all —
+        // which is exactly the case a filter exists to solve.
+        let browsing = rows_for(&entries, &open(&["Auth"]));
+        assert_eq!(
+            browsing,
+            vec![folder("Auth", true), Row::Entry(0), folder("Files", false)]
+        );
         assert_eq!(rows_matching(&entries, "upload"), vec![Row::Entry(1)]);
     }
 
@@ -318,43 +461,24 @@ mod tests {
         );
     }
 
+    /// Sorting is only ever applied to the flat, filtered list: a tree sorted
+    /// as one sequence would tear requests away from the folder they are drawn
+    /// under.
     #[test]
-    fn sorting_orders_folders_and_requests_together_and_pins_the_up_row() {
+    fn sorting_orders_a_flat_list_of_matches() {
         let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
-        let mut rows = rows_for(&entries, &[]);
-
+        let mut rows = rows_matching(&entries, "");
         sort_rows(&mut rows, &entries, SortMode::Alpha);
-        assert_eq!(
-            rows,
-            vec![
-                Row::Folder("Abe".into()),
-                Row::Entry(1),
-                Row::Folder("Zed".into()),
-            ],
-            "folders and requests sort into one A-Z run, not separate blocks"
-        );
+        assert_eq!(rows, vec![Row::Entry(1), Row::Entry(0), Row::Entry(2)]);
 
         sort_rows(&mut rows, &entries, SortMode::ReverseAlpha);
-        assert_eq!(
-            rows,
-            vec![
-                Row::Folder("Zed".into()),
-                Row::Entry(1),
-                Row::Folder("Abe".into()),
-            ]
-        );
-
-        // The Up row is the way out of a folder, not one of its contents, so
-        // it stays on top even when everything else is reversed.
-        let mut nested = rows_for(&entries, &["Zed".to_string()]);
-        sort_rows(&mut nested, &entries, SortMode::ReverseAlpha);
-        assert_eq!(nested.first(), Some(&Row::Up));
+        assert_eq!(rows, vec![Row::Entry(2), Row::Entry(0), Row::Entry(1)]);
     }
 
     #[test]
     fn file_order_is_restored_by_switching_back_rather_than_left_half_sorted() {
         let entries = vec![entry("Zed/One"), entry("loose"), entry("Abe/Two")];
-        let mut rows = rows_for(&entries, &[]);
+        let mut rows = rows_matching(&entries, "");
         let original = rows.clone();
         sort_rows(&mut rows, &entries, SortMode::Alpha);
         // `File` compares every pair equal and the sort is stable, so it is a
@@ -362,7 +486,7 @@ mod tests {
         // back to the file's order because `Collection::rows` rebuilds them.
         sort_rows(&mut rows, &entries, SortMode::File);
         assert_ne!(rows, original);
-        let mut fresh = rows_for(&entries, &[]);
+        let mut fresh = rows_matching(&entries, "");
         sort_rows(&mut fresh, &entries, SortMode::File);
         assert_eq!(fresh, original);
     }

@@ -414,12 +414,15 @@ pub struct Collection {
     /// Values captured from responses (Hurl `[Captures]`), available as
     /// `{{ name }}` in subsequent requests. Runtime-only (not persisted).
     pub captures: HashMap<String, String>,
-    /// The folder currently being browsed in the Requests list, encoded as a
-    /// breadcrumb path (root = empty). Requests are grouped into folders by
-    /// splitting their `title` on `/` (see [`crate::tree`]) — this is purely
-    /// view state, never persisted, and is kept in sync with `selected_entry`
-    /// whenever it changes outside of normal list navigation.
-    pub folder: Vec<String>,
+    /// The folders currently open in the Requests list, each as a full path
+    /// from the root. Requests are grouped into folders by splitting their
+    /// `title` on `/` (see [`crate::tree`]).
+    ///
+    /// Purely view state, never persisted: a restored session re-derives it
+    /// from the selected request, which is the one folder the user is
+    /// guaranteed to want open. Anything else would either hide what they were
+    /// looking at or restore a shape of the tree they had since left behind.
+    pub expanded: HashSet<Vec<String>>,
     /// Index into the current folder's rows (see [`crate::tree::rows_for`]),
     /// i.e. which row is highlighted in the Requests list. Not persisted.
     pub list_cursor: usize,
@@ -624,7 +627,7 @@ impl Collection {
             request_json_buf: String::new(),
             request_json_for: None,
             captures: HashMap::new(),
-            folder: Vec::new(),
+            expanded: HashSet::new(),
             list_cursor: 0,
             list_query: String::new(),
             list_sort: tree::SortMode::default(),
@@ -677,17 +680,51 @@ impl Collection {
         self.request_json_for = None;
     }
 
-    /// The rows to show in the Requests list: the folder currently being
-    /// browsed, or — while a filter is typed — every match across the whole
-    /// collection.
+    /// The rows to show in the Requests list: the folder tree with whatever is
+    /// open in it, or — while a filter is typed — every match across the whole
+    /// collection, flat.
+    ///
+    /// Only the flat list is sorted. A tree sorted as one sequence would tear
+    /// requests away from the folders they are drawn under; the GUI sorts its
+    /// own tree a level at a time, and the terminal UI leaves the order the
+    /// file's, which is the order Run All uses.
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows = if self.list_filter_active() {
-            tree::rows_matching(&self.entries, &self.list_query)
+        if self.list_filter_active() {
+            let mut rows = tree::rows_matching(&self.entries, &self.list_query);
+            tree::sort_rows(&mut rows, &self.entries, self.list_sort);
+            return rows;
+        }
+        tree::rows_for(&self.entries, &self.expanded)
+    }
+
+    /// The folder a new request made from the list should land in: the folder
+    /// under the cursor, or the one holding the request under it.
+    ///
+    /// The old breadcrumb model had one obvious answer -- the folder being
+    /// browsed. In a tree the answer is what the cursor is pointing at, which
+    /// is the same thing anyone looking at the screen would say.
+    pub fn cursor_folder(&self) -> Vec<String> {
+        match self.rows().get(self.list_cursor) {
+            Some(Row::Folder { path, .. }) => path.clone(),
+            Some(Row::Entry(i)) => tree::folder_of(&self.entries, *i),
+            None => Vec::new(),
+        }
+    }
+
+    /// Open or close the folder at `path`, closing every folder inside it too.
+    ///
+    /// Collapsing a folder shuts what was open within it rather than
+    /// remembering it: reopening a folder to find three levels of it already
+    /// unfolded is not what "open this folder" means, and the memory would be
+    /// invisible state the user cannot see to correct.
+    pub fn toggle_folder(&mut self, path: &[String]) {
+        let path = path.to_vec();
+        if self.expanded.remove(&path) {
+            self.expanded
+                .retain(|open| !(open.len() > path.len() && open[..path.len()] == path[..]));
         } else {
-            tree::rows_for(&self.entries, &self.folder)
-        };
-        tree::sort_rows(&mut rows, &self.entries, self.list_sort);
-        rows
+            self.expanded.insert(path);
+        }
     }
 
     /// How many rows the left-hand list pane is showing, whichever kind of tab
@@ -1201,9 +1238,139 @@ impl Collection {
     /// Called wherever the list and the file are brought into agreement:
     /// reading a file, writing one, and constructing a collection from entries
     /// that came straight off disk.
+    /// Adopt a list restored from `state.json`: stamp identities, but keep what
+    /// each entry already recorded the file as saying.
+    ///
+    /// A restored snapshot is *not* a moment of agreement — it is whatever the
+    /// user had on screen when they quit, unsaved edits and all. Treating it as
+    /// one (which building any collection from entries does) overwrote each
+    /// request's record of its file with its own edited text, so a restarted
+    /// session lost the pencil on requests that genuinely had unsaved changes,
+    /// and could no longer find any of them in their file to revert them.
+    ///
+    /// `modified` is re-derived here rather than trusted from the saved state,
+    /// for the same reason it is derived everywhere else: the text and the
+    /// baseline together are the answer, and a stored flag can only disagree
+    /// with them.
+    ///
+    /// The baselines have to be handed in because building the collection has
+    /// already restamped them: this puts back what the snapshot recorded.
+    pub fn adopt_restored_entries(&mut self, baselines: Vec<Option<String>>) {
+        for (e, baseline) in self.entries.iter_mut().zip(baselines) {
+            if let Some(baseline) = baseline {
+                e.baseline = Some(baseline);
+                e.mark_edited();
+            }
+        }
+        // The list itself may differ from the file (a request added, deleted or
+        // dragged and left unsaved), and the stamps that would say so were
+        // runtime-only and went with the last session. All that can be answered
+        // here is the added case, which `user_added` records; the rest needs the
+        // file, so `rebuild_restored_structure_baseline` refines this once the
+        // path is known.
+        self.structure_modified = self.entries.iter().any(|e| e.user_added);
+    }
+
+    /// Check each restored baseline against the file, and re-derive any the
+    /// file does not recognise.
+    ///
+    /// A baseline is a record of *what the file says*, so it must appear in the
+    /// file. One that does not was invented: builds before the restore path
+    /// kept baselines re-stamped every restored entry from its own edited text,
+    /// freezing whatever was unsaved at the time into the record of the file.
+    /// The pencil then never cleared -- undoing the edit made the request
+    /// differ from its "file" again -- and reverting would have put the unsaved
+    /// edit back as though it were saved work.
+    ///
+    /// Only attempted when the list and the file are the same length, which is
+    /// the same condition every other position-based answer here is given
+    /// under: with a request added or deleted, position means nothing and a
+    /// guess would be a silent, wrong answer about which file text belongs to
+    /// which request.
+    pub fn repair_restored_baselines(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let disk = crate::postman::parse_collection(&content);
+        if disk.len() != self.entries.len() {
+            return;
+        }
+        let texts: Vec<String> = disk.iter().map(|e| e.to_hurl()).collect();
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            let recognised = e
+                .baseline
+                .as_ref()
+                .is_some_and(|b| texts.iter().any(|t| t == b));
+            if !recognised {
+                e.baseline = Some(texts[i].clone());
+                e.mark_edited();
+            }
+        }
+    }
+
+    /// Rebuild the structural baseline from the *file* after a restore, so a
+    /// request deleted or dragged and left unsaved is still counted.
+    ///
+    /// Building a collection stamps its entries and adopts that list as the
+    /// baseline, which for a restored session means adopting whatever was on
+    /// screen when the user quit -- including a deletion or a reorder they had
+    /// not saved. The tab then came back looking clean, and quitting a second
+    /// time asked nothing: the change was simply lost, which is the one
+    /// outcome the unsaved-changes prompt exists to prevent. (An *added*
+    /// request survived only because `user_added` is persisted and was checked
+    /// separately.)
+    ///
+    /// The stamps themselves cannot answer -- they are runtime-only and went
+    /// with the last session -- but each entry's recorded baseline text can:
+    /// it is what the file said about that request, so matching those against
+    /// the file reconstructs which of the file's requests the list still holds,
+    /// and in what order. A request the file holds that the list does not gets
+    /// an identity no live entry carries, so the two lists differ and the
+    /// deletion shows. Matches are consumed as they are used, so two identical
+    /// requests in a file are accounted for one each rather than both being
+    /// credited to the same entry.
+    ///
+    /// Run after [`Self::repair_restored_baselines`], which is what makes the
+    /// recorded texts trustworthy enough to match on.
+    pub fn rebuild_restored_structure_baseline(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let disk = crate::postman::parse_collection(&content);
+        let mut used = vec![false; self.entries.len()];
+        let mut baseline = Vec::with_capacity(disk.len());
+        for text in disk.iter().map(|e| e.to_hurl()) {
+            // A request built by hand this session is not one of the file's,
+            // whatever text it carries: a copy starts life holding the copied
+            // request's baseline.
+            let live = self.entries.iter().enumerate().position(|(i, e)| {
+                !used[i] && !e.user_added && e.baseline.as_deref() == Some(text.as_str())
+            });
+            match live {
+                Some(i) => {
+                    used[i] = true;
+                    baseline.push(self.entries[i].uid);
+                }
+                None => baseline.push(NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed)),
+            }
+        }
+        self.structure_baseline = baseline;
+        self.refresh_structure_modified();
+    }
+
     pub fn reset_structure_baseline(&mut self) {
         for e in &mut self.entries {
             e.uid = NEXT_ENTRY_UID.fetch_add(1, Ordering::Relaxed);
+            // The same moment settles each request's *content* baseline: this
+            // is where the list and the file agree, so it is where "what the
+            // file says" is worth recording (see `HurlEntry::baseline`).
+            e.set_baseline();
         }
         self.structure_baseline = self.structure_fingerprint();
         self.structure_modified = false;
@@ -1331,26 +1498,114 @@ impl Collection {
         entries.get(idx).is_some_and(|e| e.user_added || e.modified)
     }
 
-    /// Discard request `ei`'s in-memory edits by reloading that single entry,
-    /// from the same position, out of this collection's on-disk file (#19).
+    /// Discard request `ei`'s in-memory edits by reloading that single entry
+    /// out of this collection's on-disk file (#19).
+    ///
+    /// The entry is found on disk by the identity it has carried since the list
+    /// and the file last agreed ([`HurlEntry::uid`]), *not* by its position.
+    /// Position is only the same thing while nothing structural has happened,
+    /// and reverting is offered from the same menu as Duplicate and drag-
+    /// reorder: with an unsaved duplicate above it, request B sat at index 1 in
+    /// memory and index 2 on disk, so reverting B restored C over the top of it
+    /// and B's edits were gone — a silent, unrecoverable loss of exactly the
+    /// work the user was trying to keep.
     ///
     /// Returns the reverted request's HTTP method on success, or `None` when
     /// there's nothing to revert to — the collection has no file (scratch), the
-    /// file can't be read/parsed, or it holds no entry at that position (e.g. a
-    /// never-saved request). The other entries and their edits are untouched.
+    /// file can't be read/parsed, the entry was never saved (a new request, or
+    /// a duplicate that still shares its original's identity), or the file has
+    /// since changed underneath us so no entry can be confidently matched.
+    /// The other entries and their edits are untouched.
     pub fn revert_request(&mut self, ei: usize) -> Option<String> {
         let path = self.path.clone()?;
+        let uid = self.entries[ei].uid;
         let content = std::fs::read_to_string(&path).ok()?;
         let mut disk = crate::postman::parse_collection(&content);
-        if ei >= disk.len() || ei >= self.entries.len() {
-            return None;
-        }
-        let entry = disk.swap_remove(ei);
+        let di = self.disk_position_of(ei, &disk)?;
+        let entry = disk.swap_remove(di);
         let method = entry.method.clone();
-        self.entries[ei] = entry; // a freshly parsed entry is clean (not modified/added)
+        // A freshly parsed entry is clean (not modified/added) but carries no
+        // stamp; it has to keep the one it is replacing, or the list would
+        // suddenly read as structurally different from the file it just came
+        // from and the collection would claim unsaved changes it doesn't have.
+        self.entries[ei] = HurlEntry { uid, ..entry };
+        // It came straight out of the file, so the file is what later edits are
+        // measured against. Without a baseline `mark_edited` latches (see
+        // `HurlEntry::baseline`), so anything that so much as touched the
+        // reverted request afterwards put the pencil back on a request that
+        // matched what was on disk.
+        self.entries[ei].set_baseline();
         self.invalidate_request_json();
         self.sync_folder_to_selected();
         Some(method)
+    }
+
+    /// Where the request at `ei` sits in the file this collection was loaded
+    /// from, if it can be matched to it at all.
+    ///
+    /// Split out of [`Self::revert_request`] because the front-ends need to ask
+    /// the same question *before* they offer to revert: confirming a revert and
+    /// only then reporting "nothing to revert" makes the user commit to
+    /// something that was never going to happen. Every reason to decline that
+    /// can be answered without reading the file is answered here, so the two
+    /// cannot drift apart; the rest (the file changed, or can't be read since)
+    /// necessarily stays with the read.
+    /// Which entry of the file just read is request `ei`, if it can be pointed
+    /// at with confidence.
+    ///
+    /// Two ways of asking, because the first only holds while the list and the
+    /// file are still the same shape:
+    ///
+    /// * by identity and position — the stamp the entry has carried since the
+    ///   list and the file last agreed, looked up in the baseline. Only
+    ///   meaningful while the file is still the length that baseline describes.
+    /// * by the text the entry recorded the file as holding
+    ///   ([`HurlEntry::baseline`]), matched against the file. This is what
+    ///   answers after a restart: a restored list adopts itself as its
+    ///   structural baseline, so a request added and left unsaved before the
+    ///   restart made the baseline describe a file one request longer than the
+    ///   real one -- and *every* request in the tab then failed the length
+    ///   check and could not be reverted at all. A unique text match is asked
+    ///   for: two identical requests in a file cannot be told apart, and
+    ///   restoring the wrong one would be a silent, unrecoverable loss of
+    ///   exactly the work the user was trying to keep.
+    fn disk_position_of(&self, ei: usize, disk: &[HurlEntry]) -> Option<usize> {
+        if let Some(di) = self.saved_position_of(ei)
+            && disk.len() == self.structure_baseline.len()
+            && di < disk.len()
+        {
+            return Some(di);
+        }
+        let entry = self.entries.get(ei)?;
+        // A request the user built by hand has no saved version, whatever text
+        // it carries: a copy of another request starts life with the copied
+        // request's baseline, and matching on that would "revert" the new
+        // request into the one it was copied from.
+        if entry.user_added {
+            return None;
+        }
+        let baseline = entry.baseline.as_ref()?;
+        let mut hits = disk
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| &e.to_hurl() == baseline)
+            .map(|(i, _)| i);
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
+    pub fn saved_position_of(&self, ei: usize) -> Option<usize> {
+        self.path.as_ref()?;
+        let uid = self.entries.get(ei)?.uid;
+        // Zero is "never stamped" -- a request built in this session, which the
+        // file has never held. A duplicate is a clone, and so carries its
+        // original's stamp until the file is saved: two entries answering to
+        // one identity means we cannot say which of them the file's entry
+        // belongs to, so we decline.
+        if uid == 0 || self.entries.iter().filter(|e| e.uid == uid).count() != 1 {
+            return None;
+        }
+        self.structure_baseline.iter().position(|u| *u == uid)
     }
 
     /// Throw away every in-memory edit to the workspace collection file at
@@ -1361,6 +1616,21 @@ impl Collection {
     /// its requests are what the tree lists for it, so both places have to be
     /// dropped or the edits would come back the moment it was reopened. Errors
     /// if the file can't be re-read, and changes nothing in that case.
+    /// Whether request `ei` has a saved version to go back to at all, as far as
+    /// can be told without reading the file.
+    ///
+    /// The front-ends ask before offering to revert: confirming a revert and
+    /// only then reporting "nothing to revert" makes the user commit to
+    /// something that was never going to happen. Either route in
+    /// `disk_position_of` may find it, so either one being possible is enough.
+    pub fn has_saved_version(&self, ei: usize) -> bool {
+        let Some(e) = self.entries.get(ei) else {
+            return false;
+        };
+        self.path.is_some()
+            && (self.saved_position_of(ei).is_some() || (e.baseline.is_some() && !e.user_added))
+    }
+
     pub fn revert_workspace_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let entries = crate::postman::parse_collection(&std::fs::read_to_string(path)?);
         self.workspace_pending.remove(path);
@@ -1371,6 +1641,9 @@ impl Collection {
             // across the reload like they are across a file switch.
             self.park_run_results();
             self.entries = entries;
+            // Straight off disk, so that is what later edits are measured
+            // against -- see the note in `revert_request`.
+            self.reset_structure_baseline();
             self.restore_run_results(path);
             self.selected_entry = sel.min(self.entries.len().saturating_sub(1));
             self.invalidate_request_json();
@@ -1662,21 +1935,29 @@ impl Collection {
                 .min(self.entries.len().saturating_sub(1));
             self.selected_entry = idx;
             if !self.entries.is_empty() {
-                self.folder = tree::folder_of(&self.entries, idx);
+                self.reveal(idx);
             }
             self.sync_ws_cursor();
             return;
         }
         if self.entries.is_empty() {
-            self.folder = Vec::new();
+            self.expanded.clear();
             self.list_cursor = 0;
             return;
         }
         let idx = self.selected_entry.min(self.entries.len() - 1);
         self.selected_entry = idx;
-        self.folder = tree::folder_of(&self.entries, idx);
+        self.reveal(idx);
         let rows = self.rows();
         self.list_cursor = rows.iter().position(|r| *r == Row::Entry(idx)).unwrap_or(0);
+    }
+
+    /// Open every folder above `entries[idx]`, so a request that is selected
+    /// is a request that can be seen. Nothing else is closed: the user's other
+    /// open folders are theirs.
+    pub fn reveal(&mut self, idx: usize) {
+        self.expanded
+            .extend(tree::ancestors_of(&tree::folder_of(&self.entries, idx)));
     }
 
     /// Remove the entry at `idx`, recording it (with the index it came from)
@@ -2085,6 +2366,119 @@ mod revert_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Three requests on disk; the list is then rearranged in memory without
+    /// saving. Reverting has to follow the *request*, not its position — the
+    /// menu that offers Revert also offers Duplicate and drag-reorder, so the
+    /// two disagree routinely, and restoring the wrong entry destroys the edits
+    /// the user was trying to keep with no way back.
+    fn three_on_disk(name: &str) -> (PathBuf, Collection) {
+        let root = tmp_root(name);
+        let file = root.join("c.hurl");
+        fs::write(
+            &file,
+            "# A\nGET https://h/a\n\n# B\nGET https://h/b\n\n# C\nGET https://h/c\n",
+        )
+        .unwrap();
+        let mut col = Collection::new(
+            "c".into(),
+            crate::postman::parse_collection(&fs::read_to_string(&file).unwrap()),
+        );
+        col.path = Some(file.clone());
+        col.reset_structure_baseline();
+        (file, col)
+    }
+
+    #[test]
+    fn reverting_after_an_unsaved_duplicate_restores_the_request_that_was_asked_for() {
+        let (_file, mut col) = three_on_disk("dup");
+        // Duplicate A, unsaved: B now sits at index 2 in memory, index 1 on disk.
+        let copy = col.entries[0].clone();
+        col.entries.insert(1, copy);
+        let bi = 2;
+        assert_eq!(col.entries[bi].title, "B");
+        col.entries[bi].url = "https://h/b-EDITED".into();
+        col.entries[bi].modified = true;
+
+        col.revert_request(bi);
+
+        assert_eq!(col.entries[bi].title, "B", "reverting B must restore B");
+        assert_eq!(col.entries[bi].url, "https://h/b");
+        let titles: Vec<_> = col.entries.iter().map(|e| e.title.clone()).collect();
+        assert_eq!(titles, ["A", "A", "B", "C"], "no other request may change");
+    }
+
+    #[test]
+    fn reverting_after_an_unsaved_reorder_restores_the_request_that_was_asked_for() {
+        let (_file, mut col) = three_on_disk("reorder");
+        col.entries.swap(0, 1); // B, A, C in memory; A, B, C on disk
+        col.entries[0].url = "https://h/b-EDITED".into();
+        col.entries[0].modified = true;
+
+        col.revert_request(0);
+
+        assert_eq!(col.entries[0].title, "B");
+        assert_eq!(col.entries[0].url, "https://h/b");
+    }
+
+    #[test]
+    fn reverting_the_last_request_after_an_insertion_still_reverts_it() {
+        let (_file, mut col) = three_on_disk("shifted");
+        let copy = col.entries[0].clone();
+        col.entries.insert(0, copy); // C is now index 3, past the end of the file
+        let ci = 3;
+        assert_eq!(col.entries[ci].title, "C");
+        col.entries[ci].url = "https://h/c-EDITED".into();
+        col.entries[ci].modified = true;
+
+        assert_eq!(col.revert_request(ci).as_deref(), Some("GET"));
+        assert_eq!(col.entries[ci].url, "https://h/c");
+    }
+
+    #[test]
+    fn a_request_with_no_saved_version_reverts_to_nothing() {
+        let (_file, mut col) = three_on_disk("unsaved");
+        let mut fresh = col.entries[0].clone();
+        fresh.uid = 0; // never in the list that was saved
+        fresh.user_added = true;
+        col.entries.push(fresh);
+        assert_eq!(col.revert_request(3), None);
+        assert_eq!(col.entries.len(), 4, "the request must still be there");
+    }
+
+    /// A reverted request came straight out of the file, so the file is what
+    /// its later edits are measured against. Without that, the derived
+    /// `modified` flag had nothing to compare to and latched the moment
+    /// anything touched the request again — putting the pencil back on a
+    /// request that matched what was on disk.
+    #[test]
+    fn a_reverted_request_is_measured_against_the_file_again() {
+        let (_file, mut col) = three_on_disk("baseline");
+        col.entries[1].url = "https://h/b-EDITED".into();
+        col.entries[1].mark_edited();
+        assert!(col.entries[1].modified);
+        col.revert_request(1);
+        col.entries[1].mark_edited();
+        assert!(
+            !col.entries[1].modified,
+            "the request matches the file, so nothing about it is unsaved"
+        );
+        col.entries[1].url = "https://h/b-AGAIN".into();
+        col.entries[1].mark_edited();
+        assert!(col.entries[1].modified, "a real edit still counts");
+    }
+
+    #[test]
+    fn reverting_leaves_the_list_agreeing_with_the_file() {
+        let (_file, mut col) = three_on_disk("clean");
+        col.entries[1].url = "https://h/b-EDITED".into();
+        col.entries[1].modified = true;
+        col.revert_request(1);
+        assert!(
+            !col.has_unsaved_edits(),
+            "a reverted collection with no other edits has nothing left to save"
+        );
     }
 
     /// A file edited and then switched away from keeps its edits in

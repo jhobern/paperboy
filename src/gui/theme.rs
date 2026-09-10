@@ -19,6 +19,8 @@ pub struct GuiTheme {
     pub err: Color32,
     pub subst: Color32,
     pub pending: Color32,
+    /// A value the request computes at send time (see `crate::theme::Theme::computed`).
+    pub computed: Color32,
     pub select_bg: Color32,
     pub select_fg: Color32,
     pub line: Color32,
@@ -81,6 +83,7 @@ impl GuiTheme {
             err: c(s.err),
             subst: c(s.subst),
             pending: c(s.pending),
+            computed: c(s.computed),
             select_bg: c(s.select_bg),
             select_fg: c(s.select_fg),
             line: c(s.line),

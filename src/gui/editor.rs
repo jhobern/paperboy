@@ -29,6 +29,8 @@ struct SubstSeen {
     pending: bool,
     failed: bool,
     undefined: bool,
+    /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
+    computed: bool,
     shadowed: bool,
 }
 
@@ -36,6 +38,7 @@ impl SubstSeen {
     fn mark(&mut self, kind: SubstKind) {
         match kind {
             SubstKind::Loaded => self.loaded = true,
+            SubstKind::Computed => self.computed = true,
             SubstKind::Literal => self.literal = true,
             SubstKind::Pending => self.pending = true,
             SubstKind::Failed => self.failed = true,
@@ -44,7 +47,12 @@ impl SubstSeen {
     }
 
     fn any(&self) -> bool {
-        self.loaded || self.literal || self.pending || self.failed || self.undefined
+        self.loaded
+            || self.literal
+            || self.pending
+            || self.failed
+            || self.undefined
+            || self.computed
     }
 }
 
@@ -54,6 +62,7 @@ fn subst_color(kind: SubstKind, th: &GuiTheme) -> Color32 {
     match kind {
         SubstKind::Literal => th.subst,
         SubstKind::Loaded => th.ok,
+        SubstKind::Computed => th.computed,
         SubstKind::Pending => th.pending,
         SubstKind::Failed => th.err,
         SubstKind::Undefined => th.err,
@@ -73,6 +82,7 @@ fn subst_legend(ui: &mut egui::Ui, seen: &SubstSeen, th: &GuiTheme, s: &Strings)
             (seen.pending, s.subst_hint_loading, th.pending),
             (seen.failed, s.subst_hint_missing, th.err),
             (seen.undefined, s.subst_hint_undefined, th.err),
+            (seen.computed, s.subst_hint_generated, th.computed),
         ] {
             if present {
                 ui.colored_label(color, format!("\u{25cf} {word}"));
@@ -242,9 +252,18 @@ fn apply_code_edit(
         if entries.len() == 1 {
             let mut parsed = entries.into_iter().next().unwrap();
             let entry = &mut session.collections[ci].entries[sel];
-            // `user_added` is UI-only and never written to Hurl text, so a
-            // reparse always drops it; carry it over from the live entry.
+            // None of these are written to Hurl text, so a reparse always
+            // drops them; carry them over from the live entry. `baseline` and
+            // `uid` matter beyond the marker: without the baseline the entry
+            // has nothing to compare against and the pencil latches on for
+            // good (even after typing the text back), and a `uid` of zero
+            // reads as "this request was not in the list that was saved", so
+            // the collection claims its *structure* changed too.
             parsed.user_added = entry.user_added;
+            parsed.baseline = entry.baseline.take();
+            parsed.uid = entry.uid;
+            parsed.last_run = std::mem::take(&mut entry.last_run);
+            parsed.last_response = entry.last_response.take();
             *entry = parsed;
             code_edit.error = None;
             true
@@ -441,7 +460,11 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             match &entries[..] {
                 [only] if !only.is_unreadable() => {
                     let mut healed = only.clone();
-                    healed.modified = true;
+                    // Reparsed text is a fresh struct with no baseline of its
+                    // own; the one that matters belongs to the request it is
+                    // replacing.
+                    healed.baseline = col.entries[sel].baseline.clone();
+                    healed.mark_edited();
                     col.entries[sel] = healed;
                 }
                 _ => col.entries[sel].unparsed = Some(raw),
@@ -541,6 +564,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         let options_n = entry.options.len();
         let asserts_n = entry.asserts.len();
         let captures_n = entry.captures.len();
+        let computed_n = entry.generators.len();
         let has_body = entry
             .body_src
             .as_ref()
@@ -588,6 +612,14 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     widgets::count_suffix(captures_n)
                 ),
             ),
+            (
+                EditorSection::Computed,
+                format!(
+                    "{}{}",
+                    st.gui_sec_generated,
+                    widgets::count_suffix(computed_n)
+                ),
+            ),
             (EditorSection::Code, st.gui_sec_code.to_string()),
         ];
         ui.horizontal_wrapped(|ui| {
@@ -618,6 +650,32 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // key would have to walk the same entries and variables to notice a change,
     // so it would cost about what it saved. The highlighter downstream *is*
     // cached, which is where the frame time actually went.
+    // The names a `[Gen]` expression may read: everything substitution knows
+    // about, which is the environment's variables and the collection's
+    // captures. Worked out here, before the entry is borrowed mutably, for the
+    // same reason `subst_vars` is -- and only for the sections that show a
+    // block, since it walks every entry and every variable.
+    let gen_vars: Vec<String> = if matches!(section, EditorSection::Computed | EditorSection::All) {
+        let env = app.session.effective_env(ci);
+        let mut names: Vec<String> =
+            crate::request::subst_map(&app.session.collections[ci], env.as_ref())
+                .into_keys()
+                .collect();
+        // Substitution knows about this request's own `[Gen]` names too, but a
+        // row may only read the rows *above* it, and the table adds those as it
+        // is drawn. Leaving them in here would offer a row itself, and offer
+        // rows below it -- both of which `generators::check` calls an error.
+        let own: HashSet<String> = app.session.collections[ci].entries[sel]
+            .generators
+            .iter()
+            .map(|(n, _)| n.trim().to_string())
+            .collect();
+        names.retain(|n| !own.contains(n));
+        names.sort();
+        names
+    } else {
+        Vec::new()
+    };
     let (subst_vars, shadowed) = if section == EditorSection::Code {
         let env = app.session.effective_env(ci);
         (
@@ -667,7 +725,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                         // The combined view stacks every section, mirroring the
                         // TUI wizard's default "All" tab so the whole request is
                         // visible and editable without switching tabs.
-                        const STACK: [EditorSection; 8] = [
+                        const STACK: [EditorSection; 9] = [
                             EditorSection::Params,
                             EditorSection::Headers,
                             EditorSection::Body,
@@ -676,6 +734,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             EditorSection::Options,
                             EditorSection::Asserts,
                             EditorSection::Captures,
+                            EditorSection::Computed,
                         ];
                         for (i, sec) in STACK.iter().enumerate() {
                             if i > 0 {
@@ -687,14 +746,31 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     .strong()
                                     .color(theme.text),
                             );
-                            if draw_section(*sec, ui, &theme, st, entry, &mut browse, &mut extract)
-                            {
+                            if draw_section(
+                                *sec,
+                                ui,
+                                &theme,
+                                st,
+                                entry,
+                                &gen_vars,
+                                &mut browse,
+                                &mut extract,
+                            ) {
                                 changed = true;
                             }
                         }
                     }
                     other => {
-                        if draw_section(other, ui, &theme, st, entry, &mut browse, &mut extract) {
+                        if draw_section(
+                            other,
+                            ui,
+                            &theme,
+                            st,
+                            entry,
+                            &gen_vars,
+                            &mut browse,
+                            &mut extract,
+                        ) {
                             changed = true;
                         }
                     }
@@ -744,7 +820,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     app.show_hurl = code_show_hurl;
     if changed {
         let col = &mut app.session.collections[ci];
-        col.entries[sel].modified = true;
+        col.entries[sel].mark_edited();
         col.invalidate_request_json();
     }
     if send {
@@ -846,6 +922,7 @@ fn section_title(section: EditorSection, s: &Strings) -> &'static str {
         EditorSection::Options => s.gui_sec_options,
         EditorSection::Asserts => s.gui_sec_asserts,
         EditorSection::Captures => s.gui_sec_captures,
+        EditorSection::Computed => s.gui_sec_generated,
         EditorSection::Code => s.gui_sec_code,
     }
 }
@@ -972,6 +1049,10 @@ fn draw_section(
     theme: &super::theme::GuiTheme,
     st: &Strings,
     entry: &mut HurlEntry,
+    // The variable names a `[Gen]` expression may read, for its completion
+    // list. Resolved by the caller because the section body holds the
+    // collection mutably and so cannot ask the session anything.
+    vars: &[String],
     // Where a `[Form]` file picker opens when the field is still blank.
     browse: &mut Option<usize>,
     // Where a right-click "Extract to parameter…" lands, to be confirmed in a
@@ -980,6 +1061,18 @@ fn draw_section(
 ) -> bool {
     let mut changed = false;
     let ex_label = st.gui_extract_parameter;
+    // A stable identity for this request, mixed into every row table's ids so
+    // a cell's caret and undo history (which egui keys by widget id) belong to
+    // this request rather than to the table slot — otherwise switching to
+    // another request in the list hands its first row the previous request's
+    // undo stack. Named the way `body_mode` names a request.
+    let req = egui::Id::new((
+        "req",
+        entry.uid,
+        entry.title.as_str(),
+        entry.method.as_str(),
+        entry.url.as_str(),
+    ));
     match section {
         EditorSection::All | EditorSection::Code => {}
         EditorSection::Params => {
@@ -989,7 +1082,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "params",
+                ("params", req),
                 &mut entry.queries,
                 st.gui_hint_key,
                 st.gui_hint_value,
@@ -1009,7 +1102,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "headers",
+                ("headers", req),
                 &mut entry.headers,
                 st.gui_hint_header,
                 st.gui_hint_value,
@@ -1139,7 +1232,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "cookies",
+                ("cookies", req),
                 &mut entry.cookies,
                 st.gui_hint_name,
                 st.gui_hint_value,
@@ -1177,7 +1270,7 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "options",
+                ("options", req),
                 &mut entry.options,
                 st.gui_hint_option,
                 st.gui_hint_value,
@@ -1218,13 +1311,19 @@ fn draw_section(
                 ui,
                 theme,
                 st,
-                "captures",
+                ("captures", req),
                 &mut entry.captures,
                 st.gui_hint_name,
                 st.gui_hint_query,
                 st.hdr_name,
                 st.hdr_query,
             ) {
+                changed = true;
+            }
+        }
+        EditorSection::Computed => {
+            ui.label(RichText::new(st.gui_generated_help).color(theme.dim));
+            if widgets::computed_editor(ui, theme, st, req, &mut entry.generators, vars) {
                 changed = true;
             }
         }
@@ -1241,30 +1340,42 @@ fn assert_editor(
 ) -> bool {
     let mut changed = false;
     let mut remove = None;
-    for i in 0..asserts.len() {
-        // Pin the remove ✕ to the right and let the value fill everything to its
-        // left: an infinite-width field laid out left-to-right would instead
-        // claim the whole row and shove the ✕ off the edge (see `kv_editor`).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button(RichText::new(super::icons::CLOSE).color(theme.err))
-                .clicked()
-            {
-                remove = Some(i);
-            }
-            let r = widgets::wrapping_field_font(
-                ui,
-                ui.available_width(),
-                &mut asserts[i],
-                s.gui_hint_assert,
-                theme.text,
-                egui::TextStyle::Monospace,
-            );
-            if r.changed() {
-                changed = true;
-            }
-        });
-    }
+    // Reserve the ✕'s width and give the field the rest, rather than laying the
+    // row out right-to-left (see `pair_editor`). A right-to-left child region
+    // takes the whole remaining height of the panel and centres its content in
+    // it, which stranded a single assert in the middle of the tab and pushed
+    // "+ Add assert" off the bottom; it also right-aligns the field, so the
+    // margin `wrapping_field_font` doesn't use showed up as a left indent that
+    // the neighbouring tables don't have.
+    let x_w = widgets::remove_width(ui);
+    let row_h = ui.spacing().interact_size.y;
+    widgets::table_rows(ui, |ui| {
+        for i in 0..asserts.len() {
+            widgets::table_row(ui, |ui| {
+                let val_w = (ui.available_width() - x_w - 8.0).max(40.0);
+                let r = widgets::wrapping_field_font(
+                    ui,
+                    val_w,
+                    &mut asserts[i],
+                    s.gui_hint_assert,
+                    theme.text,
+                    egui::TextStyle::Monospace,
+                );
+                if r.changed() {
+                    changed = true;
+                }
+                let hit = widgets::flat_buttons(ui, |ui| {
+                    ui.add_sized(
+                        [x_w, row_h],
+                        egui::Button::new(RichText::new(super::icons::CLOSE).color(theme.err)),
+                    )
+                });
+                if hit.clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+    });
     if let Some(i) = remove {
         asserts.remove(i);
         changed = true;
@@ -1567,6 +1678,7 @@ mod tests {
                     &th,
                     &st,
                     entry,
+                    &[],
                     &mut browse,
                     &mut None,
                 );
@@ -1663,6 +1775,69 @@ mod tests {
             );
             assert_eq!(job.text, text, "layouter must not alter the buffer text");
         }
+    }
+
+    /// The Code tab replaces the entry with a freshly parsed one, and a parse
+    /// only ever recovers what Hurl text can say. `baseline` and `uid` cannot,
+    /// so dropping them left the request permanently pencilled (nothing to
+    /// compare against) and the collection claiming its request list had
+    /// changed shape.
+    #[test]
+    fn editing_the_hurl_buffer_keeps_what_the_text_cannot_say() {
+        let strings = Strings::for_language(&Language::English);
+        let mut session = session_with_entry();
+        let mut code = super::super::app::CodeEdit::default();
+        {
+            let e = &mut session.collections[0].entries[0];
+            e.baseline = Some(e.to_hurl());
+            e.uid = 42;
+            e.user_added = true;
+        }
+        let saved = session.collections[0].entries[0].baseline.clone();
+
+        // Add a header, then take it away again: the entry ends up matching
+        // the file, so nothing should be left marked.
+        let mut edited = session.collections[0].entries[0].clone();
+        edited.headers.push(KvRow::toggled("X-Test", "hello", true));
+        let text = edited.to_hurl();
+        assert!(apply_code_edit(
+            &mut session,
+            &mut code,
+            &strings,
+            0,
+            0,
+            true,
+            &text
+        ));
+        session.collections[0].entries[0].mark_edited();
+        assert!(
+            session.collections[0].entries[0].modified,
+            "a real change is marked"
+        );
+
+        let back = saved.clone().unwrap();
+        assert!(apply_code_edit(
+            &mut session,
+            &mut code,
+            &strings,
+            0,
+            0,
+            true,
+            &back
+        ));
+        session.collections[0].entries[0].mark_edited();
+
+        let e = &session.collections[0].entries[0];
+        assert_eq!(
+            e.baseline, saved,
+            "the file's text has to survive a reparse"
+        );
+        assert_eq!(e.uid, 42, "and the entry's identity in the list");
+        assert!(e.user_added, "and the UI-only marker");
+        assert!(
+            !e.modified,
+            "back to what the file says, so there is nothing to save"
+        );
     }
 
     #[test]
@@ -1991,7 +2166,7 @@ pub(super) fn apply_extract_parameter(
             true,
         ));
     }
-    e.modified = true;
+    e.mark_edited();
     col.invalidate_request_json();
 }
 
@@ -2020,7 +2195,7 @@ pub(super) fn apply_picked_form_file(
         return;
     };
     f.value = path.to_string_lossy().into_owned();
-    e.modified = true;
+    e.mark_edited();
     col.invalidate_request_json();
 }
 
@@ -2290,7 +2465,7 @@ mod unreadable_tests {
     use crate::gui::app::GuiApp;
     use crate::i18n::Language;
 
-    fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+    pub(super) fn painted(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
         fn walk(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
             match shape {
                 egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
@@ -2345,6 +2520,1140 @@ mod unreadable_tests {
         assert!(
             out.iter().any(|t| t.contains("[Captures]")),
             "expected the request's own text, painted: {out:?}"
+        );
+    }
+}
+
+/// The request editor's Computed section: the `# [Gen]` block, authored
+/// rather than imported.
+#[cfg(test)]
+mod computed_tests {
+    use super::unreadable_tests::painted;
+    use super::*;
+    use crate::i18n::Language;
+
+    /// The GUI could open a request carrying a `# [Gen]` block, save it, and
+    /// never show it — the block survived only because the editor writes back
+    /// what it parsed. A computed value is authored, not just imported, so it
+    /// needs a section of its own like every other part of the request.
+    #[test]
+    fn the_editor_has_a_section_for_computed_values() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![("nonce".into(), "random_hex(16)".into())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_sec_generated)),
+            "expected the section tab, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("random_hex(16)")),
+            "expected the row itself, painted: {out:?}"
+        );
+    }
+
+    /// The same warning the terminal UI gives while the row is being typed,
+    /// so neither front-end lets a block that cannot run reach a send.
+    #[test]
+    fn the_computed_section_says_when_a_row_cannot_run() {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = vec![("sig".into(), "hmac_sha526(k, m)".into())];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let st = Strings::for_language(&Language::English);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = painted(&full.shapes);
+        }
+        assert!(
+            out.iter().any(|t| t.contains(st.gui_generated_faults)),
+            "expected the heading, painted: {out:?}"
+        );
+        assert!(
+            out.iter().any(|t| t.contains("hmac_sha526")),
+            "and the offending name, painted: {out:?}"
+        );
+    }
+
+    /// A row whose name isn't a variable Hurl can resolve is dropped when the
+    /// block is saved. Rather than let the user's typing vanish silently, the
+    /// name is painted in the error colour the moment it stops being valid.
+    #[test]
+    fn a_name_that_is_not_a_variable_is_painted_as_an_error() {
+        fn coloured(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+            fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Color32)>) {
+                match shape {
+                    egui::epaint::Shape::Text(t) => {
+                        let colour = t
+                            .galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|s| s.format.color)
+                            .unwrap_or(egui::Color32::PLACEHOLDER);
+                        out.push((t.galley.text().to_string(), colour));
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for c in shapes {
+                walk(&c.shape, &mut out);
+            }
+            out
+        }
+
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        // A valid name and an invalid one, side by side.
+        entry.generators = vec![
+            ("good".into(), "uuid".into()),
+            ("no spaces".into(), "uuid".into()),
+        ];
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+        let mut out = Vec::new();
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let full = ctx.run_ui(input, |u| super::ui(&mut app, u));
+            out = coloured(&full.shapes);
+        }
+        let err = th.err;
+        let good = out
+            .iter()
+            .find(|(t, _)| t == "good")
+            .expect("valid name painted");
+        let bad = out
+            .iter()
+            .find(|(t, _)| t == "no spaces")
+            .expect("invalid name painted");
+        assert_ne!(good.1, err, "a valid name is not flagged");
+        assert_eq!(bad.1, err, "an invalid name is painted in the error colour");
+    }
+}
+
+/// A `[Gen]` cell's caret and undo history live in egui's per-widget state, so
+/// the widget id must belong to the *row* (and the *request*), not to the table
+/// slot the row currently occupies. These check that deleting a row above, or
+/// switching to another request, doesn't hand a cell someone else's history.
+#[cfg(test)]
+mod computed_cell_identity_tests {
+    use super::*;
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(900.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn placed(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// Click into the expression cell holding `needle` and return the id egui
+    /// gave that text field.
+    fn focus_cell(app: &mut GuiApp, ctx: &egui::Context, needle: &str) -> egui::Id {
+        let mut at = None;
+        for _ in 0..3 {
+            let out = ctx.run_ui(raw(vec![]), |u| super::ui(app, u));
+            at = placed(&out.shapes)
+                .into_iter()
+                .find(|(t, _)| t == needle)
+                .map(|(_, r)| r.center());
+        }
+        let at = at.unwrap_or_else(|| panic!("{needle} was never painted"));
+        let _ = ctx.run_ui(raw(click(at)), |u| super::ui(app, u));
+        let _ = ctx.run_ui(raw(vec![]), |u| super::ui(app, u));
+        ctx.memory(|m| m.focused())
+            .unwrap_or_else(|| panic!("clicking {needle} focused nothing"))
+    }
+
+    /// The row a cell's undo history belongs to must be the row, not the slot:
+    /// after the first row is removed, the second slides up into its widget id
+    /// and — with it — its caret and its undo stack.
+    #[test]
+    fn a_removed_rows_undo_history_is_not_inherited_by_the_row_below() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+
+        let first_id = focus_cell(&mut app, &ctx, "uuid");
+        let second_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_ne!(first_id, second_id, "two rows, two fields");
+
+        // Remove the first row — exactly what its ✕ does.
+        app.session.collections[0].entries[0].generators.remove(0);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw(vec![]), |u| super::ui(&mut app, u));
+        }
+        let moved_up_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_eq!(
+            moved_up_id, second_id,
+            "the surviving row kept its own field identity (id {second_id:?} vs {moved_up_id:?}); \
+             if this fails it has inherited the deleted row's ({first_id:?})"
+        );
+    }
+
+    /// The same question asked of the state itself: whatever egui remembers for
+    /// the slot the deleted row occupied must not now be driving the row that
+    /// took its place.
+    #[test]
+    fn the_surviving_row_does_not_inherit_the_deleted_rows_caret() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let th = GuiTheme::from_spec(&crate::theme::default_preset());
+        let ctx = egui::Context::default();
+        th.apply(&ctx);
+
+        let first_id = focus_cell(&mut app, &ctx, "uuid");
+        // Park a caret at char 4 (end of "uuid") in the first row's cell.
+        let mut st = egui::TextEdit::load_state(&ctx, first_id).expect("state for a focused field");
+        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+            egui::text::CCursor::new(4),
+        )));
+        egui::TextEdit::store_state(&ctx, first_id, st);
+
+        app.session.collections[0].entries[0].generators.remove(0);
+        for _ in 0..3 {
+            let _ = ctx.run_ui(raw(vec![]), |u| super::ui(&mut app, u));
+        }
+        let now_id = focus_cell(&mut app, &ctx, "timestamp");
+        assert_ne!(
+            now_id, first_id,
+            "the row that moved up is being drawn with the deleted row's field state"
+        );
+    }
+}
+
+/// The user-visible end of the id-inheritance problem: Ctrl+Z in a row that
+/// survived a deletion — or in another request's row — must not pull in the
+/// expression that used to live in that slot.
+#[cfg(test)]
+mod computed_cell_undo_tests {
+    use super::*;
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn placed(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()))
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    pub(super) struct Harness {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl Harness {
+        pub(super) fn new() -> Self {
+            let ctx = egui::Context::default();
+            GuiTheme::from_spec(&crate::theme::default_preset()).apply(&ctx);
+            Self { ctx, t: 0.0 }
+        }
+
+        /// One frame, `dt` seconds after the last (egui's text undoer only
+        /// records a state once the text has been still for a moment).
+        pub(super) fn frame(
+            &mut self,
+            app: &mut GuiApp,
+            events: Vec<egui::Event>,
+            dt: f64,
+        ) -> Vec<(String, egui::Rect)> {
+            self.t += dt;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(900.0, 700.0),
+                )),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let out = self.ctx.run_ui(input, |u| super::ui(app, u));
+            placed(&out.shapes)
+        }
+
+        fn settle(&mut self, app: &mut GuiApp) {
+            for _ in 0..6 {
+                self.frame(app, vec![], 0.4);
+            }
+        }
+
+        /// Put the pointer over painted text and leave it there.
+        pub(super) fn hover_text(&mut self, app: &mut GuiApp, needle: &str) {
+            let at = self
+                .frame(app, vec![], 0.05)
+                .into_iter()
+                .find(|(t, _)| t == needle)
+                .map(|(_, r)| r.center())
+                .unwrap_or_else(|| panic!("{needle} was never painted"));
+            self.frame(app, vec![egui::Event::PointerMoved(at)], 0.05);
+            self.frame(app, vec![], 0.05);
+        }
+
+        pub(super) fn click_text(&mut self, app: &mut GuiApp, needle: &str) {
+            let mut at = None;
+            for _ in 0..3 {
+                at = self
+                    .frame(app, vec![], 0.05)
+                    .into_iter()
+                    .find(|(t, _)| t == needle)
+                    .map(|(_, r)| r.center());
+            }
+            let at = at.unwrap_or_else(|| panic!("{needle} was never painted"));
+            let ev = vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            self.frame(app, ev, 0.05);
+            self.frame(app, vec![], 0.05);
+        }
+    }
+
+    fn rows(app: &GuiApp) -> Vec<(String, String)> {
+        app.session.collections[0].entries[0].generators.clone()
+    }
+
+    #[test]
+    fn ctrl_z_after_deleting_a_row_does_not_resurrect_it_into_the_row_below() {
+        let mut app = app_with_rows(&[("nonce", "uuid"), ("stamp", "timestamp")]);
+        let mut h = Harness::new();
+
+        // Edit the first row a little, so egui has an undo history for its cell.
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        let edited = rows(&app)[0].1.clone();
+        assert_ne!(edited, "uuid", "the first row was edited");
+
+        // Delete the first row (its ✕) and act straight away, the way a user
+        // does: click the row below and press Ctrl+Z.
+        app.session.collections[0].entries[0].generators.remove(0);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            rows(&app),
+            vec![("stamp".to_string(), "timestamp".to_string())]
+        );
+
+        // Now undo inside the row that is left.
+        h.click_text(&mut app, "timestamp");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.settle(&mut app);
+        assert_eq!(
+            rows(&app)[0].1,
+            "timestamp",
+            "Ctrl+Z in the surviving row rewrote it with the deleted row's expression"
+        );
+    }
+
+    /// The same positional identity, one level worse: the widget id of a
+    /// `[Gen]` cell must be per *request*, not per slot, so switching to another
+    /// request in the list doesn't hand its first row the previous request's
+    /// caret and undo history — and let Ctrl+Z write one request's expression
+    /// into the other.
+    #[test]
+    fn switching_requests_does_not_carry_a_cells_undo_history_across() {
+        let mut session = crate::session::Session::default();
+        let mk = |title: &str, row: (&str, &str)| {
+            let mut e = HurlEntry::default();
+            e.method = "GET".into();
+            e.url = "https://h/a".into();
+            e.title = title.into();
+            e.generators = vec![(row.0.to_string(), row.1.to_string())];
+            e
+        };
+        session.collections[0].entries = vec![
+            mk("First", ("nonce", "uuid")),
+            mk("Second", ("stamp", "timestamp")),
+        ];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        let mut h = Harness::new();
+
+        // Edit the first request's row, so its cell has an undo history.
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        assert_ne!(
+            app.session.collections[0].entries[0].generators[0].1, "uuid",
+            "the first request's row was edited"
+        );
+
+        // Switch to the other request and undo in *its* expression cell.
+        app.session.collections[0].selected_entry = 1;
+        h.frame(&mut app, vec![], 0.05);
+        h.click_text(&mut app, "timestamp");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            app.session.collections[0].entries[1].generators[0].1, "timestamp",
+            "Ctrl+Z in the second request rewrote its row with the first request's expression"
+        );
+    }
+
+    /// Is the hazard peculiar to the new Computed table, or does the same
+    /// gesture cross requests in an older one? Headers, same steps — kept as a
+    /// control now that request identity is mixed into every row table's ids.
+    #[test]
+    fn switching_requests_does_not_carry_a_header_cells_undo_history_across() {
+        let mut session = crate::session::Session::default();
+        let mk = |title: &str, v: &str| {
+            let mut e = HurlEntry::default();
+            e.method = "GET".into();
+            e.url = "https://h/a".into();
+            e.title = title.into();
+            e.headers = vec![crate::hurl::KvRow {
+                key: "X-Thing".into(),
+                value: v.into(),
+                enabled: true,
+                ..Default::default()
+            }];
+            e
+        };
+        session.collections[0].entries = vec![mk("First", "alpha"), mk("Second", "bravo")];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Headers;
+        let mut h = Harness::new();
+
+        h.click_text(&mut app, "alpha");
+        h.frame(&mut app, vec![egui::Event::Text("X".into())], 0.05);
+        h.settle(&mut app);
+        assert_ne!(
+            app.session.collections[0].entries[0].headers[0].value,
+            "alpha"
+        );
+
+        app.session.collections[0].selected_entry = 1;
+        h.frame(&mut app, vec![], 0.05);
+        h.click_text(&mut app, "bravo");
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            app.session.collections[0].entries[1].headers[0].value, "bravo",
+            "Ctrl+Z in the second request rewrote its header with the first request's value"
+        );
+    }
+}
+
+/// The completion list on a `[Gen]` expression field.
+///
+/// The terminal wizard has always offered one; the GUI only had a menu of all
+/// thirty-five functions, which is a poor way to find the one whose name you
+/// half remember. These drive the field the way a user does -- click into it,
+/// type, press a key -- because the whole point is that the list answers the
+/// keyboard *before* the text field does.
+#[cfg(test)]
+mod computed_suggestion_tests {
+    use super::*;
+
+    fn app_with_row(name: &str, expr: &str) -> GuiApp {
+        app_with_rows(&[(name, expr)])
+    }
+
+    fn app_with_rows(rows: &[(&str, &str)]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.generators = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Computed;
+        app
+    }
+
+    fn expr(app: &GuiApp) -> String {
+        app.session.collections[0].entries[0].generators[0]
+            .1
+            .clone()
+    }
+
+    fn key(k: egui::Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+            egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// Reuses the undo tests' harness: same context, same frame loop, same
+    /// click-on-painted-text.
+    use super::computed_cell_undo_tests::Harness;
+
+    /// A caret put in front of what is already there means "build something
+    /// around this", whether or not the function *has* to be given an
+    /// argument. `timestamp([offset_seconds])` used to throw the word away
+    /// because its argument is optional.
+    #[test]
+    fn a_function_with_an_optional_argument_still_wraps_what_is_there() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "timestamp(uuid)",
+            "the word the caret was in front of should have been wrapped, not replaced"
+        );
+    }
+
+    /// A function that can hold nothing has nowhere to put the word, so it
+    /// replaces it.
+    #[test]
+    fn a_function_that_takes_nothing_replaces_the_word() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        // `timestamp_ms()` is the row under `timestamp([offset_seconds])`.
+        h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "timestamp_ms");
+    }
+
+    /// The note and the preview describe *the* highlighted row, so pointing at
+    /// a row has to highlight it -- a mouse that moved the eye without moving
+    /// the highlight left them describing whatever the arrow keys last landed
+    /// on.
+    #[test]
+    fn pointing_at_a_row_describes_that_row() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, vec![], 0.05);
+        h.hover_text(&mut app, "sha512(text)");
+        let texts: Vec<String> = h
+            .frame(&mut app, vec![], 0.05)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let s = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        assert!(
+            texts.iter().any(|t| t == s.gen_description("sha512")),
+            "the note still describes the row the keyboard was on: {texts:?}"
+        );
+        // And Enter takes the row being pointed at, not the one before it.
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert!(expr(&app).starts_with("sha512("), "{:?}", expr(&app));
+    }
+
+    /// Whether a row replaces the word or wraps it cannot be guessed, so the
+    /// list says which before it is accepted.
+    #[test]
+    fn the_list_shows_what_the_highlighted_row_would_produce() {
+        let mut app = app_with_row("id", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("timestamp(uuid)")),
+            "no preview of the highlighted row under the list: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn typing_a_prefix_offers_the_functions_that_match() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("sha256(")),
+            "no suggestion list under the field: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("uuid")),
+            "the list should be filtered by what was typed: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn enter_accepts_the_highlighted_suggestion() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert!(
+            expr(&app).starts_with("sha1("),
+            "Enter should have written the first match in, but the field says {:?}",
+            expr(&app)
+        );
+    }
+
+    /// Down moves the highlight, so the second match is reachable without the
+    /// mouse.
+    #[test]
+    fn down_then_enter_takes_the_next_suggestion() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_ne!(
+            expr(&app),
+            "sha",
+            "the second suggestion was never accepted"
+        );
+        assert!(
+            !expr(&app).starts_with("sha1("),
+            "Down should have moved past the first match, got {:?}",
+            expr(&app)
+        );
+    }
+
+    /// Esc means "not for this word", not "never again": another keystroke
+    /// brings the list back, or it would be a one-way door out of the feature.
+    #[test]
+    fn escape_dismisses_the_list_until_the_word_changes() {
+        let mut app = app_with_row("digest", "sha");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha");
+        // The click lands mid-word; put the caret at the end so the character
+        // typed further down extends the word instead of splitting it.
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        let before = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            before.iter().any(|(t, _)| t.contains("sha256(")),
+            "the list should have been up before Esc"
+        );
+        h.frame(&mut app, key(egui::Key::Escape), 0.05);
+        let after = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            !after.iter().any(|(t, _)| t.contains("sha256(")),
+            "Esc should have closed the list: {:?}",
+            after.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        let back = h.frame(&mut app, vec![egui::Event::Text("2".into())], 0.05);
+        let back = if back.iter().any(|(t, _)| t.contains("sha256(")) {
+            back
+        } else {
+            h.frame(&mut app, vec![], 0.05)
+        };
+        assert!(
+            back.iter().any(|(t, _)| t.contains("sha256(")),
+            "typing another character should offer the list again: {:?}",
+            back.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// An empty cell is a question, not a blank: with nothing typed there is
+    /// nothing to filter by, and what the user wants is to be shown what there
+    /// is. This is the job the function menu used to do, done by the field.
+    #[test]
+    fn an_empty_expression_offers_everything() {
+        let mut app = app_with_row("nonce", "");
+        let mut h = Harness::new();
+        // The empty cell paints its hint, which is where it is on screen.
+        let hint = app.strings.gui_generated_expr_hint;
+        h.click_text(&mut app, hint);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        // The popup scrolls, so only its first screenful is painted: what is
+        // being asserted is that it is the unfiltered list, not which entries
+        // happen to fit.
+        let calls = texts
+            .iter()
+            .filter(|t| t.contains('(') && t.ends_with(')'))
+            .count();
+        assert!(
+            calls >= 5,
+            "an empty cell should offer the list to browse: {texts:?}"
+        );
+    }
+
+    /// Ctrl+Space asks for the list back — after Esc, or over a word that has
+    /// already been completed, where nothing else would reopen it.
+    #[test]
+    fn ctrl_space_asks_for_the_list_again() {
+        let mut app = app_with_row("digest", "sha256");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha256");
+        h.frame(&mut app, key(egui::Key::Escape), 0.05);
+        let quiet = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            !quiet.iter().any(|(t, _)| t.contains("sha256(text)")),
+            "Escape should have put the list away"
+        );
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        h.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: ctrl,
+            }],
+            0.05,
+        );
+        let painted = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            painted.iter().any(|(t, _)| t.contains("sha256(text)")),
+            "Ctrl+Space should have opened the list: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Accepting a call leaves its argument names in place and the first of
+    /// them selected, so the next keystroke fills the argument in rather than
+    /// landing in an empty pair of brackets that says nothing about what is
+    /// wanted.
+    #[test]
+    fn accepting_a_call_selects_its_first_argument() {
+        let mut app = app_with_row("sig", "hmac_sha256");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "hmac_sha256");
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "hmac_sha256(key, message)");
+        h.frame(&mut app, vec![egui::Event::Text("API_SECRET".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "hmac_sha256(API_SECRET, message)",
+            "typing should have replaced the selected argument name"
+        );
+    }
+
+    /// Expressions read variables by bare name, so the names in scope belong in
+    /// the same list as the functions -- and the rows *below* this one do not,
+    /// since a block is evaluated top to bottom.
+    #[test]
+    fn the_list_offers_the_variables_the_expression_can_read() {
+        let mut app = app_with_rows(&[
+            ("scope_above", "uuid"),
+            ("target", ""),
+            ("scope_below", "uuid"),
+        ]);
+        let mut h = Harness::new();
+        let hint = app.strings.gui_generated_expr_hint;
+        h.click_text(&mut app, hint);
+        h.frame(&mut app, vec![egui::Event::Text("scope".into())], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        // Both names are painted once by their own name cell, so what is being
+        // counted is the second painting: the one in the list.
+        let count = |name: &str| painted.iter().filter(|(t, _)| t.as_str() == name).count();
+        assert_eq!(
+            count("scope_above"),
+            2,
+            "the row above is a variable this one can read: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            count("scope_below"),
+            1,
+            "a row below cannot be read, so offering it offers a mistake: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two rows may compute the same thing under different names, which used to
+    /// give their *name* cells the same widget id (each is keyed by its
+    /// neighbour's text, and the neighbours matched): egui painted a
+    /// duplicate-id warning over the table, and the two cells shared a caret.
+    #[test]
+    fn two_rows_with_the_same_expression_do_not_share_a_cell_id() {
+        let mut app = app_with_rows(&[("first", "uuid"), ("second", "uuid")]);
+        let mut h = Harness::new();
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let clash: Vec<&String> = painted
+            .iter()
+            .map(|(t, _)| t)
+            .filter(|t| t.contains("widget ID"))
+            .collect();
+        assert!(clash.is_empty(), "the two rows collided: {clash:?}");
+    }
+
+    /// Typing in front of what is already there is how a call gets built
+    /// around it. The word straddling the caret is then `tuuid`, which matches
+    /// nothing, so the list went blank exactly when it was wanted: it filters
+    /// on what has been *typed*, and the rest is what the call wraps.
+    #[test]
+    fn typing_in_front_of_an_expression_offers_a_call_to_wrap_it() {
+        let mut app = app_with_row("stamp", "uuid");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("base".into())], 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        assert!(
+            painted.iter().any(|(t, _)| t.contains("base64(")),
+            "the typed prefix should filter the list: {:?}",
+            painted.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(
+            expr(&app),
+            "base64(uuid)",
+            "the expression the caret was in front of is the call's argument"
+        );
+    }
+
+    /// The same, around a whole call rather than a bare name: the caret in
+    /// `b|sha256(x)` is in front of all of it.
+    #[test]
+    fn wrapping_takes_the_whole_call_the_caret_is_in_front_of() {
+        let mut app = app_with_row("stamp", "sha256(body)");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "sha256(body)");
+        h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("base64".into())], 0.05);
+        h.frame(&mut app, key(egui::Key::Enter), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "base64(sha256(body))");
+    }
+
+    /// An edit undone is not an edit: the pencil marker has to go away again.
+    ///
+    /// It used to latch -- change an expression, change it back, and the
+    /// request still offered to save a file it already matched.
+    #[test]
+    fn changing_an_expression_back_clears_the_edited_marker() {
+        let mut app = app_with_row("nonce", "uuid");
+        app.session.collections[0].reset_structure_baseline();
+        assert!(
+            !app.session.collections[0].entries[0].modified,
+            "a request straight off disk is not edited"
+        );
+        let mut h = Harness::new();
+        h.click_text(&mut app, "uuid");
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("4".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "uuid4");
+        assert!(
+            app.session.collections[0].entries[0].modified,
+            "the edit was never noticed"
+        );
+        h.frame(&mut app, key(egui::Key::Backspace), 0.05);
+        h.frame(&mut app, vec![], 0.05);
+        assert_eq!(expr(&app), "uuid");
+        assert!(
+            !app.session.collections[0].entries[0].modified,
+            "the request matches the file again, so the pencil should be gone"
+        );
+    }
+
+    /// The list follows the caret's word, not the whole cell: an expression is
+    /// often a call inside a call, and completing the outer one would throw the
+    /// inner one away.
+    #[test]
+    fn the_list_follows_the_word_the_caret_is_in() {
+        let mut app = app_with_row("v", "base64(up");
+        let mut h = Harness::new();
+        h.click_text(&mut app, "base64(up");
+        // The click lands mid-text; End puts the caret in the *inner* word,
+        // which is the case the whole rule exists for.
+        h.frame(&mut app, key(egui::Key::End), 0.05);
+        let painted = h.frame(&mut app, vec![], 0.05);
+        let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("upper(")),
+            "the word under the caret should drive the list: {texts:?}"
+        );
+    }
+}
+
+/// The `[Asserts]` section is a plain list of rows, so it has to sit at the top
+/// of the tab like every other table — and leave "+ Add assert" on screen.
+#[cfg(test)]
+mod assert_layout_tests {
+    use super::computed_cell_undo_tests::Harness;
+    use super::*;
+
+    fn app_with_asserts(rows: &[&str]) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        let mut entry = HurlEntry::default();
+        entry.method = "GET".into();
+        entry.url = "https://h/a".into();
+        entry.title = "Demo".into();
+        entry.asserts = rows.iter().map(|r| r.to_string()).collect();
+        session.collections[0].entries = vec![entry];
+        session.collections[0].selected_entry = 0;
+        let mut app = GuiApp::for_test(session);
+        app.editor_section = EditorSection::Asserts;
+        app
+    }
+
+    #[test]
+    fn one_assert_keeps_the_add_button_in_view() {
+        let mut app = app_with_asserts(&["jsonpath \"$.a\" exists"]);
+        let mut h = Harness::new();
+        let placed = h.frame(&mut app, vec![], 0.1);
+        let st = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let row = placed
+            .iter()
+            .find(|(t, _)| t.starts_with("jsonpath"))
+            .expect("the assert row should be painted")
+            .1;
+        let add = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_add_assert)
+            .expect("the add button should be painted")
+            .1;
+        let status = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_expected_status)
+            .expect("the status label should be painted")
+            .1;
+        // A single row used to be centred in the whole tab, which left the
+        // button (and everything under it) below the bottom of the window.
+        assert!(
+            add.min.y - row.max.y < 40.0,
+            "the add button should follow the row: row {row:?}, add {add:?}"
+        );
+        assert!(
+            status.max.y < 700.0,
+            "the rest of the section should stay on screen: {status:?}"
+        );
+    }
+
+    #[test]
+    fn an_assert_starts_where_the_help_above_it_starts() {
+        let mut app = app_with_asserts(&["jsonpath \"$.a\" exists"]);
+        let mut h = Harness::new();
+        let placed = h.frame(&mut app, vec![], 0.1);
+        let st = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
+        let help = placed
+            .iter()
+            .find(|(t, _)| t == st.gui_response_assertions)
+            .expect("the help line should be painted")
+            .1;
+        let row = placed
+            .iter()
+            .find(|(t, _)| t.starts_with("jsonpath"))
+            .expect("the assert row should be painted")
+            .1;
+        // Only the text edit's own margin should separate them; a right-aligned
+        // field left its unused width as a visible indent instead.
+        assert!(
+            row.min.x - help.min.x < 6.0,
+            "the assert field should line up with the section: help {help:?}, row {row:?}"
         );
     }
 }

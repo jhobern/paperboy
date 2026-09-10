@@ -118,6 +118,9 @@ cargo test                          # add --features gui for the GUI's tests
   collection, loops over environments or data, and writes CSV/JSON/HTML/XLSX.
   Editable as text or as [blocks](#the-papertrail-block-editor); runnable from
   the UI or [headlessly](#reports).
+- **Generated value** — a `# [Gen]` row: an expression evaluated just before a
+  request is sent, supplying the nonces, timestamps and signatures a pre-request
+  script used to. See [Generated values](#generated-values).
 - **Scratch Space** — tab 0. A collection with no file behind it until you save
   it.
 - **Request names encode folders.** `Auth/Tokens/Refresh` browses as a folder
@@ -146,6 +149,7 @@ Press `?` or `F1` for the full, current key list. The essentials:
 | `Alt+↑`/`↓` | Reorder requests — the order `Alt+F5` and the CLI follow |
 | `m` / `c` | Move / copy a request to another collection in the workspace |
 | `p` (Requests) | Link an environment to this collection |
+| `a` (Response) | Build an assert or a capture from what came back |
 | `a` (Env pane) | Make an environment active |
 | `r` (Env pane) | Retry a failed secret lookup |
 | `w` (Workspace tab) | Reopen the file-tree picker |
@@ -156,10 +160,11 @@ In the request wizard:
 
 | Key | Action |
 |---|---|
-| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Form│Body│Asserts│Captures`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
-| `Alt+1`–`6` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
+| `[`/`]`, `PageUp`/`PageDown` | Switch section tab (`All│Headers│Cookies│Queries│Options│Form│Body│Asserts│Captures│Reports│Generated`). `[`/`]` only when focus isn't on a text field, so brackets stay typable |
+| `Alt+1`–`9`, `Alt+0` | Jump straight to a section (`Alt` because most terminals can't report `Ctrl`+digit) |
 | `Ctrl+↑`/`↓` | Previous / next section |
 | `Ctrl+D` / `Ctrl+E` | Delete a row / toggle its enabled checkbox |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo within the focused text cell |
 | `←` from a Key cell | Reach the enabled checkbox — it's the leftmost column |
 | `Ctrl+F` or `Enter` on a File value | Open a file picker |
 | `F2`, `Ctrl+Enter` | Save |
@@ -175,6 +180,17 @@ Worth knowing:
   (relative to the collection's directory, matching where Hurl looks). A
   `Base64 File` field is encoded at send time behind a configurable prefix, so
   `data:image/png;base64,` yields a ready-made data URI.
+- **Asserts and captures can be built from a response.** With a reply on
+  screen, `a` in the Response pane opens a two-step palette: pick a value the
+  server actually sent — status, duration, any header, any value in the JSON
+  body, listed beside what it currently is — then pick what to say about it.
+  The rows are the Hurl lines themselves (`jsonpath "$.data.token" == "ey…"`),
+  so what you choose is what gets written. Typing narrows the list, and
+  anything selected in the body pre-fills the filter. The last row on every
+  value is *keep it in a variable*, which adds a `[Captures]` row under a name
+  taken from the field itself — the fastest way to chain one request into the
+  next. Choosing the status sets the `HTTP <status>` line rather than adding a
+  competing assert.
 - **The request preview substitutes `{{ VAR }}`** and colours each by status —
   green loaded, cyan literal, orange loading, red missing — while the editor
   keeps the original text. Secrets are masked as eight dots.
@@ -212,6 +228,13 @@ the same three languages. What differs:
   are text. Globally: `F5`/`Ctrl+Enter` run, `Ctrl+S`/`Ctrl+Shift+S` save,
   `Ctrl+W` closes, `Ctrl+Z` undoes a delete, `Alt+F` opens the File menu, `F1`
   shows every shortcut.
+- **Asserts and captures are built by right-clicking the response.** Click a
+  value in the body and choose *Assert this…* — the field under the caret is
+  worked out from the raw JSON, so it works on a minified body as well as a
+  pretty-printed one. Right-clicking a header row does the same for that
+  header, and the **Assert…** button beside Copy opens the same builder on the
+  whole list of values the reply carried. The list is filterable by name or by
+  value, and "keep it in a variable" adds the `[Captures]` row.
 - **The File menu is grouped by verb** (New / Import / Open / Save). Open ▸
   Collection and Load ▸ Environment take Postman exports too — they work out
   what the file holds. Every dialog reopens where you left it.
@@ -237,12 +260,12 @@ block's own silhouette, at its real width and indent.
 Editable on the blocks: the request a step runs, its alias, response format and
 `SHOW(…)`/`HIDE(…)`/`STATISTICS(…)` lists; a `FOR` loop's binder, source, roles
 and `PARALLEL(n)` concurrency; and the report's own settings — `collection`,
-`output`, `environment`, `root`, `baseline`, `columns` — in a boxed panel above
-`BEGIN`. Those apply to the report rather than running as a step, so they're
-deliberately not blocks. `output` names a *format* (`csv`, `json`, `html`,
-`xlsx`), not a filename; only the CLI's `-o` takes a path. Everything has hover
-help, and **Source** is highlighted with the terminal UI's colours, underlining
-whatever the parser rejected.
+`output`, `environment`, `root`, `baseline`, `columns` — in a boxed panel at the
+top of the flow. Those apply to the report rather than running as a step, so
+they're deliberately not blocks. `output` names a *format* (`csv`, `json`,
+`html`, `xlsx`), not a filename; only the CLI's `-o` takes a path. Everything has
+hover help, and **Source** is highlighted with the terminal UI's colours,
+underlining whatever the parser rejected.
 
 ### Desktop icon on Linux
 
@@ -289,6 +312,125 @@ always means this step was missed.
 A variable that is *defined but empty* is not undefined and warns about nothing
 — it substitutes as an empty string. With Basic Auth that produces a
 well-formed request that comes back `401`.
+
+## Generated values
+
+Some values can't be written down: a nonce, a timestamp, an HMAC over the two.
+Postman uses a pre-request script; PaperBoy uses a `# [Gen]` block of named
+expressions, evaluated immediately before the request is sent.
+
+```hurl
+# [Gen] 3
+# nonce = random_hex(16)
+# ts = timestamp
+# sig = hmac_sha256_b64(API_SECRET, concat(nonce, ts))
+POST https://api.example.com/orders
+X-Nonce: {{nonce}}
+X-Timestamp: {{ts}}
+Authorization: HMAC {{sig}}
+```
+
+The expressions stay in comments and the request refers to results as ordinary
+`{{name}}` placeholders, so the file remains a plain `.hurl` file: stock `hurl`
+parses it byte for byte and runs it given `--variable nonce=… --variable sig=…`.
+Nothing else could work — Hurl reads a placeholder only as far as the first
+character outside `A-Za-z0-9_-` and discards the rest silently, so
+`{{ hmac_sha256(K, M) }}` would be sent as the value of `hmac_sha256`. PaperBoy
+now refuses to save such a placeholder rather than let it truncate.
+
+The block may sit above the request line, as here, or immediately below it;
+both are read. PaperBoy writes it below when it saves, so a hand-written file
+in the other order moves its block down the first time it is saved and is
+otherwise unchanged.
+
+A bare identifier is a variable reference — an environment variable, a request
+parameter, or an earlier row in the same block. Calls nest. Rows are evaluated
+in order and a row may only refer to one above it. Values are computed per run,
+never previewed, and never written to `state.json`; a secret read through
+`{{ op://… }}` is no more exposed by signing with it than by sending it.
+
+What a block computes stays available to the rest of the session, exactly as a
+`[Captures]` value does: sign a request, and the request after it can echo the
+same `{{nonce}}` — including when you run it on its own. (Memory only, for the
+reason above: a fresh PaperBoy computes fresh values.) A `[Captures]` row of
+the same name is the later, more specific statement and wins.
+
+One request per name, though. "Run All" and `paperboy -c` normally run one
+request at a time, so each block is evaluated in its own window and two
+requests may each have their own `nonce`. A **batch** run (the `--batch` flag,
+or the Run All batch preference) is a single Hurl call over the whole file with
+one variable set, so there the two share the first request's value — a
+signature computed over another request's nonce. Both front-ends say so before
+starting such a run, and `--batch` prints the warning too; the fix is usually
+to not use batch.
+
+The same applies to a name the environment already defines. Running one request
+at a time, a block's value overrides the environment's from that request
+onwards; a batch has one variable set for the whole file, so it cannot override
+from partway through without changing what the *earlier* requests send. Batch
+therefore leaves the environment's value in place and says which names it
+did that to.
+
+`counter` counts within the process, not within a run: it starts at 1 the first
+time it is evaluated and keeps going for as long as PaperBoy is open, so sending
+the same request three times gives 1, 2, 3. It is a sequence, not a setting, and
+is not saved — a restarted PaperBoy counts from 1 again.
+
+Edit the block in the request wizard's **Generated** section (`Alt+0`), in the
+GUI editor's **Generated** tab, or as text. Both editors offer the functions as
+you type — with their arguments named — and the GUI's **Function…** menu lists
+them all; either way the call is written at the caret, over any part-typed
+name, with the caret left between the brackets. Both say what is wrong with a
+row while
+it is still a typo rather than leaving it to be a 401: an unknown function, the
+wrong number of arguments, an expression that doesn't parse. Placeholders that a
+generator will fill render in the theme's *generated* colour and keep their
+braces, because the value doesn't exist yet.
+
+| | |
+|---|---|
+| Time | `timestamp`, `timestamp_ms`, `iso8601`, `date(fmt)` (strftime, UTC) |
+| Random | `uuid`, `counter`, `random_int(lo, hi)`, `random_hex(n)`, `random_alnum(n)`, `random_base64(n)` |
+| Encoding | `base64`, `base64url`, `base64_decode`, `hex`, `urlencode`, `urldecode`, `json_string` |
+| Hashes | `md5`, `sha1`, `sha256`, `sha512` |
+| MACs | `hmac_sha1(key, msg)`, `hmac_sha256`, `hmac_sha512` |
+| Text | `concat(…)`, `upper`, `lower`, `trim` |
+
+Every hash and MAC returns lowercase hex — matching `sha256sum` and CryptoJS's
+`.toString()`, so a ported Postman script lands right — and each has a `_b64`
+variant returning standard padded Base64. The encoding is in the name rather
+than a default because a signature in the wrong one is the right length,
+entirely plausible to look at, and rejected with the same `401` as a wrong
+secret. Note that `base64(sha256(m))` is *not* `sha256_b64(m)`: the first
+encodes 64 hex characters, the second the 32 bytes they spell.
+
+**Canonicalisation is yours.** PaperBoy signs exactly the bytes you assemble; it
+will not build a canonical request from the live headers, so AWS SigV4 and
+friends are out of scope. Chaining a MAC into the *key* of the next one isn't
+expressible either, since every value here is text.
+
+The block works headlessly too. `paperboy -c …` evaluates each request's rows
+in its own window, so a generator can read a value an earlier request captured
+and two requests each get their own nonce. `--batch` is a single Hurl call over
+the whole file and has no such window: there every block is evaluated once
+before the run, a name computed by two requests takes the first one's value for
+both, and the run says so before it starts.
+
+A row that fails — unknown function, wrong arity, a name nothing defines —
+reports rather than blocks the send. It binds nothing, so `{{sig}}` goes out
+literally and comes back a loud `401`, which is easier to diagnose than a
+refusal.
+
+Importing from Postman maps the dynamic variables that have an exact equivalent:
+`$guid`/`$randomUUID` and `$isoTimestamp` become Hurl's own `{{newUuid}}` and
+`{{newDate}}`, while `$timestamp`, `$randomInt` and `$randomAlphaNumeric` become
+`[Gen]` rows. The rest
+are renamed and listed in `CONVERSION-NOTES.md` as values you must supply —
+guessing at `$randomFirstName` would send a plausible wrong value, which is
+harder to notice than a request that won't run.
+
+Worked examples — collections to import, and the `.hurl` file they should become
+— are in [`examples/postman/`](examples/postman/).
 
 ## Git remotes
 
@@ -390,9 +532,37 @@ titles), headers, query parameters, raw bodies and form/multipart fields, plus:
 - **Collection variables**, which have nowhere to live in a `.hurl` file, as
   `<name> (collection variables).vars` beside the environments.
 - `pm.<store>.set("NAME", body.a.b)` calls in test scripts, as `[Captures]`.
+- **Dynamic variables.** `{{$guid}}` and `{{$isoTimestamp}}` become Hurl's own
+  `{{newUuid}}`/`{{newDate}}`; `{{$timestamp}}`, `{{$randomInt}}` and
+  `{{$randomAlphaNumeric}}` become [generated values](#generated-values). The rest
+  are listed as values to supply.
+- **Pre-request scripts**, as far as they reduce to values PaperBoy can compute:
+  `pm.environment.set("id", uuid.v4())`, `Date.now()`,
+  `Math.floor(Date.now() / 1000)`, `new Date().toISOString()`,
+  `pm.variables.replaceIn("{{$guid}}")` and literals become
+  [generated values](#generated-values).
+- **Test scripts**, as the status and assertions they always make:
+  `pm.response.to.have.status(400)` becomes the request's expected status, and
+  `pm.expect(...)` checks on the body, headers and response time become
+  `[Asserts]`. A deep equality against a literal document
+  (`.to.eql({ id: 7, name: "Ada" })`) is written out one leaf at a time, since
+  Hurl has no predicate that takes a document — which also makes a failure name
+  the field that differed. Only checks that run *unconditionally* are taken —
+  anything inside an `if`, a loop or a helper function is left for you, since an
+  assertion that was meant for one branch fails every run.
+- **`setNextRequest`**, as a note saying which of the four things it was doing:
+  polling (which Hurl writes as `[Options] retry`), an order you can write down
+  in the file or as `REQUEST` lines in a
+  [PaperTrail flow](#the-papertrail-block-editor), a run that stopped early, or
+  a request name built as the script ran. PaperBoy runs a
+  collection in file order, so none of them convert — but they are four
+  different problems with four different fixes.
+- **Scripts on a folder or on the collection**, which Postman runs for every
+  request inside; they are converted for each request they cover, and reported
+  once against the folder that holds them.
 
-Hurl doesn't cover everything Postman does. Anything dropped — pre-request
-scripts, OAuth 2, GraphQL bodies — is listed per request in
+Hurl doesn't cover everything Postman does. Anything dropped — the rest of a
+script, OAuth 2, GraphQL bodies — is listed per request in
 `CONVERSION-NOTES.md` at the root of the import; no file means nothing was lost.
 A collection this build can't read is written out as its original JSON, so
 converting can't cost you data.
