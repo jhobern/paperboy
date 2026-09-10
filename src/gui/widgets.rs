@@ -1023,7 +1023,7 @@ pub fn computed_editor(
                 .color(theme.err)
                 .strong(),
         );
-        for line in crate::i18n::describe_gen_errors(s, &faults) {
+        for line in crate::i18n::summarise_gen_errors(s, &faults) {
             ui.label(RichText::new(line).color(theme.err));
         }
     }

@@ -848,7 +848,7 @@ pub fn run_resolved_entry_reporting(
         return (
             RunOutput {
                 entries: vec![],
-                error: Some(crate::i18n::describe_gen_errors(&english, &gen_errors).join("; ")),
+                error: Some(crate::i18n::summarise_gen_errors(&english, &gen_errors).join("; ")),
             },
             HashMap::new(),
             gen_errors,
@@ -1143,7 +1143,7 @@ pub fn run_all_entries(
                 let english = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
                 let mut r = state.lock().unwrap();
                 r.loading = false;
-                r.error = crate::i18n::describe_gen_errors(&english, &flat).join("; ");
+                r.error = crate::i18n::summarise_gen_errors(&english, &flat).join("; ");
                 r.gen_errors = flat;
                 // No update is sent: dropping `tx` disconnects the receiver,
                 // and the drain takes that as "the run is over", clearing the
@@ -1211,7 +1211,7 @@ pub fn run_all_entries(
                     if !errs.is_empty() {
                         let english =
                             crate::i18n::Strings::for_language(&crate::i18n::Language::English);
-                        let reason = crate::i18n::describe_gen_errors(&english, &errs).join("; ");
+                        let reason = crate::i18n::summarise_gen_errors(&english, &errs).join("; ");
                         record_errs.borrow_mut().extend(errs);
                         return crate::hurl::EntrySetup::Skip { reason };
                     }
@@ -1254,7 +1254,7 @@ pub fn run_all_entries(
                     let english =
                         crate::i18n::Strings::for_language(&crate::i18n::Language::English);
                     streamed.error =
-                        Some(crate::i18n::describe_gen_errors(&english, &errs).join("; "));
+                        Some(crate::i18n::summarise_gen_errors(&english, &errs).join("; "));
                 }
             }
             streamed

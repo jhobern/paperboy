@@ -119,6 +119,27 @@ impl ApiResponse {
         }
         format!("{} {}", s.req_error_prefix, self.error)
     }
+
+    /// The same error laid out for a panel rather than a status bar: the
+    /// heading on its own line and one fault per line under it.
+    ///
+    /// A refused send can have several things wrong with it, and a status line
+    /// has to join them with semicolons because it is one line. The Response
+    /// panel is not; joined into a paragraph there, the faults wrap into each
+    /// other and the reader has to find the semicolons to tell where one ends.
+    /// The sentences are the ones [`Self::error_text`] uses -- the same words,
+    /// only stacked.
+    pub fn error_detail(&self, s: &crate::i18n::Strings) -> String {
+        if self.gen_errors.is_empty() {
+            return self.error_text(s);
+        }
+        let mut out = String::from(s.gen_status);
+        for line in crate::i18n::summarise_gen_errors(s, &self.gen_errors) {
+            out.push_str("\n  \u{2022} ");
+            out.push_str(&line);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +175,53 @@ mod tests {
                 "and not under a heading naming a request that was never made"
             );
         }
+    }
+
+    /// The Response panel is not a status bar. Joined into one paragraph the
+    /// faults wrap into each other and the reader has to hunt for semicolons to
+    /// see where one ends; stacked, the shape of the report is the shape of the
+    /// problem. Same sentences either way.
+    #[test]
+    fn the_panel_stacks_the_faults_the_status_bar_has_to_join() {
+        let errors = vec![
+            GenError::UndefinedReference {
+                name: "message".into(),
+                reference: "session_nonce".into(),
+            },
+            GenError::FailedDependency {
+                name: "as_hex".into(),
+                reference: "message".into(),
+            },
+        ];
+        let r = ApiResponse {
+            gen_errors: errors,
+            ..Default::default()
+        };
+        let s = Strings::for_language(&Language::English);
+        let detail = r.error_detail(&s);
+        let lines: Vec<&str> = detail.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "the heading, the cause, and the count: {detail}"
+        );
+        assert!(lines[0] == s.gen_status, "{detail}");
+        assert!(
+            lines[1].contains("session_nonce") && lines[2].contains('1'),
+            "{detail}"
+        );
+        assert!(
+            !r.error_text(&s).contains('\n'),
+            "the status-bar form is still one line: {}",
+            r.error_text(&s)
+        );
+        // A failure that isn't a generator failure has one thing to say and
+        // says it the same way in both.
+        let plain = ApiResponse {
+            error: "connection refused".into(),
+            ..Default::default()
+        };
+        assert_eq!(plain.error_detail(&s), plain.error_text(&s));
     }
 
     /// Everything else still is a runner error, and still says so.

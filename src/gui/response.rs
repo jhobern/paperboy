@@ -108,7 +108,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             // Headed and localised -- a request refused because a `# [Gen]`
             // row failed says so the way the pre-flight check does, rather
             // than under "Request error:" (see `ApiResponse::error_text`).
-            r.error_text(&app.strings),
+            // The panel form, one fault per line: there is room here that the
+            // status bar does not have (`ApiResponse::error_detail`).
+            r.error_detail(&app.strings),
             r.headers.clone(),
             r.assert_results.clone(),
             r.duration_ms,

@@ -933,6 +933,7 @@ strings! {
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
     gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
     gen_err_failed_dep => "{row}: {reference} above it could not be worked out", "{row} : {reference} au-dessus n'a pas pu être calculé", "{row}: {reference} ovenover kunne ikke beregnes";
+    gen_err_cascade => "{n} further row(s) below it could not be worked out either", "{n} ligne(s) supplémentaire(s) en dessous n'ont pas pu être calculées non plus", "{n} yderligere række(r) nedenunder kunne heller ikke beregnes";
     gen_err_name_missing => "A generated row has an expression but no name — nothing can ask for its value", "Une ligne générée a une expression mais pas de nom — rien ne peut demander sa valeur", "En genereret række har et udtryk, men intet navn — intet kan bede om dens værdi";
     gen_err_name_invalid => "{row}: a name can only use letters, digits, _ and -", "{row} : un nom ne peut contenir que des lettres, des chiffres, _ et -", "{row}: et navn må kun bruge bogstaver, tal, _ og -";
     gen_err_name_duplicate => "{row}: two rows are named this; only the first is used", "{row} : deux lignes portent ce nom ; seule la première est utilisée", "{row}: to rækker hedder dette; kun den første bruges";
@@ -2263,11 +2264,14 @@ impl Status {
             Status::BodyFormConflict(names) => {
                 format!("{} {}", s.body_form_conflict_status, names.join(", "))
             }
+            // Summarised, not listed: this is one line on a status bar, and a
+            // block whose rows all read one broken row would otherwise fill it
+            // with seven ways of saying "something else went wrong".
             Status::GeneratorErrors(errors) => {
                 format!(
                     "{} {}",
                     s.gen_status,
-                    describe_gen_errors(s, errors).join("; ")
+                    summarise_gen_errors(s, errors).join("; ")
                 )
             }
             Status::GeneratorCollisions(names) => names
@@ -2529,6 +2533,35 @@ mod tests {
     }
 }
 
+/// The same failures with the knock-on rows collapsed into a single sentence.
+///
+/// One undefined name at the top of a block fails every row that reads it, and
+/// every row that reads *those*: eight rows, one mistake, and seven sentences
+/// saying only that something else went wrong first. That is a wall of text
+/// whose one useful line is buried in the middle of it. Only the rows that
+/// actually broke are described; the rest are counted.
+///
+/// When *everything* failed that way there is nothing else to say, so they are
+/// all described rather than reporting a count of nothing.
+pub fn summarise_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) -> Vec<String> {
+    use crate::generators::GenError as G;
+    let (knock_on, causes): (Vec<_>, Vec<_>) = errors
+        .iter()
+        .cloned()
+        .partition(|e| matches!(e, G::FailedDependency { .. }));
+    if causes.is_empty() {
+        return describe_gen_errors(s, errors);
+    }
+    let mut out = describe_gen_errors(s, &causes);
+    if !knock_on.is_empty() {
+        out.push(
+            s.gen_err_cascade
+                .replace("{n}", &knock_on.len().to_string()),
+        );
+    }
+    out
+}
+
 /// Render `# [Gen]` failures in the active language, one string per failing row.
 ///
 /// Shared by the status line and the headless runner: the block is evaluated by
@@ -2582,6 +2615,74 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
             G::NameDuplicate { name } => s.gen_err_name_duplicate.replace("{row}", name),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::generators::GenError as G;
+
+    /// One undefined name at the top of a block fails every row that reads it,
+    /// and every row that reads those. Eight rows, one mistake -- and the
+    /// report used to be eight sentences, seven of which said only that
+    /// something else had gone wrong first, with the one that named the fault
+    /// buried among them.
+    #[test]
+    fn a_cascade_is_reported_as_its_cause_and_a_count() {
+        let english = Strings::for_language(&Language::English);
+        let mut errors = vec![G::UndefinedReference {
+            name: "message".into(),
+            reference: "session_nonce".into(),
+        }];
+        for row in [
+            "as_hex",
+            "as_b64",
+            "as_b64url",
+            "digest_hex",
+            "digest_b64",
+            "sig_hex",
+            "sig_b64",
+        ] {
+            errors.push(G::FailedDependency {
+                name: row.into(),
+                reference: "message".into(),
+            });
+        }
+        let said = summarise_gen_errors(&english, &errors);
+        assert_eq!(said.len(), 2, "the cause, and how far it spread: {said:?}");
+        assert!(
+            said[0].contains("session_nonce"),
+            "the cause is named first: {said:?}"
+        );
+        assert!(
+            said[1].contains('7'),
+            "and the rows it took with it are counted: {said:?}"
+        );
+        // The status line is built from the same summary, so it fits.
+        let line = Status::GeneratorErrors(errors).text(&english);
+        assert!(line.len() < 140, "a status line has to be one line: {line}");
+    }
+
+    /// When every row failed that way there is no cause among them to report --
+    /// the block reads something defined elsewhere -- so counting them would
+    /// leave nothing at all. They are described instead.
+    #[test]
+    fn knock_on_rows_with_no_cause_beside_them_are_still_described() {
+        let english = Strings::for_language(&Language::English);
+        let errors = vec![
+            G::FailedDependency {
+                name: "a".into(),
+                reference: "gone".into(),
+            },
+            G::FailedDependency {
+                name: "b".into(),
+                reference: "gone".into(),
+            },
+        ];
+        let said = summarise_gen_errors(&english, &errors);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said.iter().all(|l| l.contains("gone")), "{said:?}");
+    }
 }
 
 #[cfg(test)]

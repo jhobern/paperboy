@@ -214,7 +214,10 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
     let mut gen_reported: Vec<bool> = vec![false; gen_entries.len()];
     let strings = crate::i18n::Strings::for_language(&crate::i18n::Language::English);
     let report_gen = |title: &str, errors: &[crate::generators::GenError]| {
-        for detail in crate::i18n::describe_gen_errors(&strings, errors) {
+        // Summarised: a block where one broken row fails six others has one
+        // mistake in it, and six lines saying "something else went wrong" bury
+        // the line that says what.
+        for detail in crate::i18n::summarise_gen_errors(&strings, errors) {
             eprintln!(
                 "{}",
                 paint(color, Hue::Red, &format!("  ! {title}: {detail}"))
@@ -243,7 +246,7 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 .collect();
             RunOutput {
                 entries: vec![],
-                error: Some(crate::i18n::describe_gen_errors(&strings, &flat).join("; ")),
+                error: Some(crate::i18n::summarise_gen_errors(&strings, &flat).join("; ")),
             }
         } else {
             // Said out loud rather than silently resolved: in batch the two
@@ -314,7 +317,7 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                     let english =
                         crate::i18n::Strings::for_language(&crate::i18n::Language::English);
                     return EntrySetup::Skip {
-                        reason: crate::i18n::describe_gen_errors(&english, &errors).join("; "),
+                        reason: crate::i18n::summarise_gen_errors(&english, &errors).join("; "),
                     };
                 }
                 EntrySetup::Bind(

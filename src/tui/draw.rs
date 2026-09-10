@@ -4180,7 +4180,9 @@ pub(crate) fn draw_response(
                 r.status_text.clone(),
                 r.body.clone(),
                 // Already headed and localised -- see `ApiResponse::error_text`.
-                r.error_text(s),
+                // The panel form: one fault per line, since unlike the status
+                // bar there is room for them (`ApiResponse::error_detail`).
+                r.error_detail(s),
                 r.assert_results.clone(),
                 r.duration_ms,
                 r.headers.clone(),

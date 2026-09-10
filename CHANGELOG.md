@@ -216,6 +216,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **A failed `# [Gen]` block is reported by its cause, not its cascade.** One
+  undefined name at the top of a block fails every row that reads it, and every
+  row that reads those — eight rows, one mistake, and the report was eight
+  sentences of which seven said only that something else had gone wrong first,
+  with the one that named the fault buried among them. Now: `message: nothing
+  defines session_nonce; 7 further rows below it could not be worked out
+  either`. Where every row failed that way, and there is no cause among them to
+  name, they are all still described. The Response panel additionally stacks
+  the faults one per line under the heading rather than joining them with
+  semicolons — it is a panel, not a status bar, and joined into a paragraph the
+  faults wrapped into each other.
+
 - **Generated row names are checked.** A row's name is how its value reaches
   the request, and nothing was checking it: a row with an expression and no
   name computed a value under an empty key that no `{{placeholder}}` could ask
