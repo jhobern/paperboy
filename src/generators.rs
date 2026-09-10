@@ -68,6 +68,82 @@ use std::collections::HashMap;
 /// reason `Importer` holds its clock (see `postman_import.rs`). A signature is
 /// only checkable against a known-good vector if the nonce and timestamp that
 /// went into it can be pinned.
+/// What the request a `[Gen]` block belongs to is about to send, for the
+/// functions that read it (`method`, `url`, `path`, `query`, `header`, `body`,
+/// `request_name`).
+///
+/// Held as written -- `{{ name }}` and all -- and substituted at the moment a
+/// function asks for it, against the variables known *at that point in the
+/// block*. That is the only ordering that can be explained in one sentence: a
+/// row reading `body()` sees the rows above it filled in and a row below it
+/// still as its `{{name}}`, because the row below has not been worked out yet.
+/// Substituting eagerly would instead freeze the body before the block ran,
+/// and substituting at the end would make a value depend on a row that depends
+/// on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestFacts {
+    pub method: String,
+    pub url: String,
+    /// Name/value pairs in the order the request carries them; a name may
+    /// repeat, and `header()` answers with the first match, as a server reading
+    /// the request would.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+    /// The request's title, which is what a Postman `pm.info.requestName`
+    /// becomes.
+    pub name: String,
+}
+
+impl RequestFacts {
+    /// What a request looks like to its own `[Gen]` block.
+    ///
+    /// The body is [`crate::hurl::entry::HurlEntry::body_wire`] -- what
+    /// actually goes on the wire -- so a signature computed over `body()`
+    /// signs the bytes the server will hash, not the user's JSON comments.
+    /// Disabled header rows are left out for the same reason: they are not
+    /// sent.
+    pub fn of(entry: &crate::hurl::HurlEntry) -> Self {
+        Self {
+            method: entry.method.clone(),
+            url: entry.url.clone(),
+            headers: entry
+                .headers
+                .iter()
+                .filter(|h| h.enabled)
+                .map(|h| (h.key.clone(), h.value.clone()))
+                .collect(),
+            body: entry.body_wire().unwrap_or_default().into_owned(),
+            name: entry.title.clone(),
+        }
+    }
+
+    /// The URL's path: everything after the host and before the `?`. Empty if
+    /// the URL is still a bare `{{base}}` -- a template we cannot parse is not
+    /// an error here, it is simply a URL that has no path *yet*.
+    pub fn path(&self, url: &str) -> String {
+        let after_scheme = match url.find("://") {
+            Some(i) => &url[i + 3..],
+            None => url,
+        };
+        let end = after_scheme.find(['?', '#']).unwrap_or(after_scheme.len());
+        match after_scheme[..end].find('/') {
+            Some(i) => after_scheme[..end][i..].to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// The URL's query string, without the `?`. Empty when there is none.
+    pub fn query(&self, url: &str) -> String {
+        match url.find('?') {
+            Some(i) => {
+                let rest = &url[i + 1..];
+                rest[..rest.find('#').unwrap_or(rest.len())].to_string()
+            }
+            None => String::new(),
+        }
+    }
+}
+
 pub trait GenSource {
     /// Now, as a Unix timestamp in seconds, and the nanosecond part.
     fn now(&self) -> (i64, u32);
@@ -75,6 +151,16 @@ pub trait GenSource {
     fn fill_random(&self, buf: &mut [u8]);
     /// The next value of the named counter, starting at 1.
     fn counter(&self, name: &str) -> u64;
+    /// The request this block belongs to, when there is one.
+    ///
+    /// Defaulted to `None` so every existing source -- and every test fixture
+    /// that only had to answer for time, randomness and counters -- keeps
+    /// working: a block evaluated with no request behind it (the editor's live
+    /// check, a unit test) reports `NoRequest` for these functions rather than
+    /// inventing an empty one, which would quietly sign the wrong thing.
+    fn request(&self) -> Option<&RequestFacts> {
+        None
+    }
 }
 
 /// Why a generator couldn't be evaluated. Every variant names the row, because
@@ -92,6 +178,14 @@ pub enum GenError {
     Syntax { name: String, detail: String },
     /// No such function.
     UnknownFunction { name: String, function: String },
+    /// A function that reads the request was used where there is no request to
+    /// read: the wizard's live check, or a `[Gen]` block evaluated on its own.
+    ///
+    /// Its own variant rather than an empty answer, because the functions it
+    /// guards are the ones used to *sign* a request -- an `hmac_sha256` over a
+    /// silently empty body is a signature that looks fine and authorises
+    /// nothing.
+    NoRequest { name: String, function: String },
     /// A function called with the wrong number of arguments.
     Arity {
         name: String,
@@ -145,6 +239,7 @@ impl GenError {
             GenError::Empty { name }
             | GenError::Syntax { name, .. }
             | GenError::UnknownFunction { name, .. }
+            | GenError::NoRequest { name, .. }
             | GenError::Arity { name, .. }
             | GenError::BadArgument { name, .. }
             | GenError::UndefinedReference { name, .. }
@@ -344,11 +439,20 @@ fn is_name_char(c: char) -> bool {
 /// the process, which a global is and a per-collection field is not. It resets
 /// on restart, which is the documented "starting at 1".
 #[derive(Default)]
-pub struct SystemSource;
+pub struct SystemSource {
+    request: Option<RequestFacts>,
+}
 
 impl SystemSource {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The same source, able to answer for the request being sent.
+    pub fn for_request(facts: RequestFacts) -> Self {
+        Self {
+            request: Some(facts),
+        }
     }
 }
 
@@ -371,6 +475,10 @@ impl GenSource for SystemSource {
         // signature that looks fine and is reproducible by anyone, so a failure
         // here is fatal rather than papered over with a fallback.
         getrandom::fill(buf).expect("the operating system's random source");
+    }
+
+    fn request(&self) -> Option<&RequestFacts> {
+        self.request.as_ref()
     }
 
     fn counter(&self, name: &str) -> u64 {
@@ -397,11 +505,11 @@ pub struct DryRunSource;
 
 impl GenSource for DryRunSource {
     fn now(&self) -> (i64, u32) {
-        SystemSource.now()
+        SystemSource::new().now()
     }
 
     fn fill_random(&self, buf: &mut [u8]) {
-        SystemSource.fill_random(buf)
+        SystemSource::new().fill_random(buf)
     }
 
     fn counter(&self, name: &str) -> u64 {
@@ -644,7 +752,7 @@ fn eval(
             // whereas resolving it by whichever happens to exist would make the
             // meaning of a row depend on the loaded environment.
             if is_function(name.as_str()) {
-                return call(name, &[], row, src);
+                return call(name, &[], row, vars, src);
             }
             // An earlier row that was tried and failed is a *consequence*,
             // not a second mistake: say which row is missing so the reader
@@ -685,7 +793,7 @@ fn eval(
             for a in args {
                 values.push(eval(a, row, vars, declared, done, failed, src)?);
             }
-            call(function, &values, row, src)
+            call(function, &values, row, vars, src)
         }
     }
 }
@@ -695,6 +803,7 @@ fn call(
     function: &str,
     args: &[String],
     row: &str,
+    vars: &HashMap<String, String>,
     src: &dyn GenSource,
 ) -> Result<String, GenError> {
     let arity = |expected: &str, ok: bool| -> Result<(), GenError> {
@@ -851,13 +960,13 @@ fn call(
         // `toString()` produce, which is what a ported script expects), `_b64`
         // is standard padded Base64 (what Twilio, AWS and friends want).
         "md5" | "sha1" | "sha256" | "sha512" | "md5_b64" | "sha1_b64" | "sha256_b64"
-        | "sha512_b64" => {
+        | "sha512_b64" | "md5_b64url" | "sha1_b64url" | "sha256_b64url" | "sha512_b64url" => {
             arity("1", args.len() == 1)?;
             let (alg, as_b64) = split_encoding(function);
             Ok(encode_digest(&hash_bytes(alg, args[0].as_bytes()), as_b64))
         }
         "hmac_sha1" | "hmac_sha256" | "hmac_sha512" | "hmac_sha1_b64" | "hmac_sha256_b64"
-        | "hmac_sha512_b64" => {
+        | "hmac_sha512_b64" | "hmac_sha1_b64url" | "hmac_sha256_b64url" | "hmac_sha512_b64url" => {
             arity("2", args.len() == 2)?;
             let (alg, as_b64) = split_encoding(function);
             let alg = alg.strip_prefix("hmac_").expect("matched an hmac_ name");
@@ -881,6 +990,103 @@ fn call(
         "trim" => {
             arity("1", args.len() == 1)?;
             Ok(args[0].trim().to_string())
+        }
+        // Taking *part* of a string is what a ported script needs most often:
+        // a test-case number off the end of a request name, a token out of a
+        // header, an id out of a path. `n` counts from 0, and from the end
+        // when negative, so "the last piece" -- JavaScript's `.pop()`, the
+        // shape these scripts are written in -- is `-1` rather than a length
+        // the block has no way to work out.
+        "split" => {
+            arity("3", args.len() == 3)?;
+            let pieces: Vec<&str> = if args[1].is_empty() {
+                // Splitting on nothing yields one empty piece per character in
+                // Rust, which is a silent trap: an empty separator here is
+                // almost always a `{{sep}}` that resolved to nothing.
+                return Err(bad("the separator cannot be empty".to_string()));
+            } else {
+                args[0].split(args[1].as_str()).collect()
+            };
+            let n = args[2]
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| bad("the piece number must be a whole number".to_string()))?;
+            let idx = if n < 0 { pieces.len() as i64 + n } else { n };
+            // Out of range is a fault, not an empty answer: this text goes on
+            // to be signed, sent or asserted against, and a silently empty
+            // piece is the kind of wrong that looks like the server's fault.
+            usize::try_from(idx)
+                .ok()
+                .and_then(|i| pieces.get(i))
+                .map(|p| p.to_string())
+                .ok_or_else(|| {
+                    bad(format!(
+                        "there is no piece {n}; the text splits into {}",
+                        pieces.len()
+                    ))
+                })
+        }
+        // The escape hatch for everything `split` cannot reach. The first
+        // capture group if the pattern has one -- which is how a pattern says
+        // "this part" -- and otherwise the whole match.
+        "regex" => {
+            arity("2", args.len() == 2)?;
+            let re = regex::Regex::new(&args[1])
+                .map_err(|e| bad(format!("the pattern is not valid: {e}")))?;
+            let caps = re
+                .captures(&args[0])
+                .ok_or_else(|| bad("the pattern matched nothing".to_string()))?;
+            Ok(caps
+                .get(1)
+                .or_else(|| caps.get(0))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default())
+        }
+
+        // ── The request this block belongs to ───────────────────────────
+        //
+        // Every one of these reads `RequestFacts`, whose text is stored as
+        // written and substituted here against the variables worked out so
+        // far, so a row reading the body sees the rows above it filled in.
+        // Without a request behind the block -- the editor's live check --
+        // they fail rather than answer with nothing, because the whole point
+        // of reading the request is to sign or record what is actually sent.
+        "method" | "url" | "path" | "query" | "body" | "request_name" => {
+            arity("0", args.is_empty())?;
+            let facts = src.request().ok_or_else(|| GenError::NoRequest {
+                name: row.to_string(),
+                function: function.to_string(),
+            })?;
+            let fill = |t: &str| crate::environment::substitute(t, vars);
+            Ok(match function {
+                "method" => facts.method.to_ascii_uppercase(),
+                "url" => fill(&facts.url),
+                "path" => facts.path(&fill(&facts.url)),
+                "query" => facts.query(&fill(&facts.url)),
+                "body" => fill(&facts.body),
+                // The title as typed: it is a label, not a URL, and a
+                // migration that reads it back is comparing it with the
+                // Postman request name it came from.
+                _ => facts.name.clone(),
+            })
+        }
+        "header" => {
+            arity("1", args.len() == 1)?;
+            let facts = src.request().ok_or_else(|| GenError::NoRequest {
+                name: row.to_string(),
+                function: function.to_string(),
+            })?;
+            // Case-insensitively, and the first of a repeated name wins --
+            // both are how a server reads the request being described.
+            // Missing is empty rather than an error: a signature over "the
+            // Content-Type if there is one" is a real thing to write, and an
+            // absent header is not a mistake in the block.
+            Ok(facts
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(args[0].trim()))
+                .map(|(_, v)| crate::environment::substitute(v, vars))
+                .unwrap_or_default())
         }
 
         _ => Err(GenError::UnknownFunction {
@@ -956,6 +1162,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "body",
+        signature: "body()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
         name: "concat",
         signature: "concat(a, b, …)",
         min_args: 0,
@@ -986,6 +1199,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         ],
     },
     GenFunction {
+        name: "header",
+        signature: "header(name)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
         name: "hex",
         signature: "hex(text)",
         min_args: 1,
@@ -1007,6 +1227,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "hmac_sha1_b64url",
+        signature: "hmac_sha1_b64url(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
         name: "hmac_sha256",
         signature: "hmac_sha256(key, message)",
         min_args: 2,
@@ -1021,6 +1248,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "hmac_sha256_b64url",
+        signature: "hmac_sha256_b64url(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
         name: "hmac_sha512",
         signature: "hmac_sha512(key, message)",
         min_args: 2,
@@ -1030,6 +1264,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
         name: "hmac_sha512_b64",
         signature: "hmac_sha512_b64(key, message)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "hmac_sha512_b64url",
+        signature: "hmac_sha512_b64url(key, message)",
         min_args: 2,
         max_args: Some(2),
         examples: &[],
@@ -1070,6 +1311,34 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "md5_b64url",
+        signature: "md5_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "method",
+        signature: "method()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "path",
+        signature: "path()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
+        name: "query",
+        signature: "query()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
         name: "random_alnum",
         signature: "random_alnum(length)",
         min_args: 1,
@@ -1098,6 +1367,20 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "regex",
+        signature: "regex(text, pattern)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "request_name",
+        signature: "request_name()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
         name: "sha1",
         signature: "sha1(text)",
         min_args: 1,
@@ -1107,6 +1390,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
         name: "sha1_b64",
         signature: "sha1_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1_b64url",
+        signature: "sha1_b64url(text)",
         min_args: 1,
         max_args: Some(1),
         examples: &[],
@@ -1126,6 +1416,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "sha256_b64url",
+        signature: "sha256_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
         name: "sha512",
         signature: "sha512(text)",
         min_args: 1,
@@ -1137,6 +1434,20 @@ pub const FUNCTIONS: &[GenFunction] = &[
         signature: "sha512_b64(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512_b64url",
+        signature: "sha512_b64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "split",
+        signature: "split(text, separator, n)",
+        min_args: 3,
+        max_args: Some(3),
         examples: &[],
     },
     GenFunction {
@@ -1165,6 +1476,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         signature: "upper(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "url",
+        signature: "url()",
+        min_args: 0,
+        max_args: Some(0),
         examples: &[],
     },
     GenFunction {
@@ -1369,18 +1687,36 @@ fn utc(src: &dyn GenSource) -> chrono::DateTime<chrono::Utc> {
 
 /// Split a hash or MAC function name into the algorithm and whether its result
 /// is wanted as Base64 rather than hex.
-fn split_encoding(function: &str) -> (&str, bool) {
-    match function.strip_suffix("_b64") {
-        Some(alg) => (alg, true),
-        None => (function, false),
+/// How a digest is written out, taken from the tail of the function's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestEncoding {
+    /// Bare: lowercase hex, what `sha256sum` and CryptoJS's `toString()` give.
+    Hex,
+    /// `_b64`: standard padded Base64, what Twilio, AWS and friends want.
+    B64,
+    /// `_b64url`: URL-safe Base64 without padding -- the encoding a JWT is
+    /// made of, and the reason this variant exists: `header.payload.signature`
+    /// is three of these joined by dots, and the standard alphabet's `+`, `/`
+    /// and `=` are all wrong in that position.
+    B64Url,
+}
+
+/// `_b64url` is tried before `_b64` because the latter is its prefix.
+fn split_encoding(function: &str) -> (&str, DigestEncoding) {
+    if let Some(alg) = function.strip_suffix("_b64url") {
+        (alg, DigestEncoding::B64Url)
+    } else if let Some(alg) = function.strip_suffix("_b64") {
+        (alg, DigestEncoding::B64)
+    } else {
+        (function, DigestEncoding::Hex)
     }
 }
 
-fn encode_digest(bytes: &[u8], as_b64: bool) -> String {
-    if as_b64 {
-        b64(bytes, false)
-    } else {
-        to_hex(bytes)
+fn encode_digest(bytes: &[u8], how: DigestEncoding) -> String {
+    match how {
+        DigestEncoding::Hex => to_hex(bytes),
+        DigestEncoding::B64 => b64(bytes, false),
+        DigestEncoding::B64Url => b64(bytes, true),
     }
 }
 
@@ -1565,6 +1901,7 @@ mod tests {
     struct FakeSource {
         secs: i64,
         counters: std::sync::Mutex<HashMap<String, u64>>,
+        request: Option<RequestFacts>,
     }
 
     impl FakeSource {
@@ -1572,7 +1909,13 @@ mod tests {
             FakeSource {
                 secs,
                 counters: std::sync::Mutex::new(HashMap::new()),
+                request: None,
             }
+        }
+
+        fn sending(mut self, request: RequestFacts) -> Self {
+            self.request = Some(request);
+            self
         }
     }
 
@@ -1585,6 +1928,10 @@ mod tests {
                 *b = (i % 251) as u8;
             }
         }
+        fn request(&self) -> Option<&RequestFacts> {
+            self.request.as_ref()
+        }
+
         fn counter(&self, name: &str) -> u64 {
             let mut c = self.counters.lock().unwrap();
             let n = c.entry(name.to_string()).or_insert(0);
@@ -1595,6 +1942,39 @@ mod tests {
 
     fn run(rows: &[(&str, &str)]) -> (HashMap<String, String>, Vec<GenError>) {
         run_with(rows, HashMap::new())
+    }
+
+    /// The same walk, but with a request behind the block, which is what the
+    /// runner always has and the editor's live check never does.
+    fn run_sending(
+        request: RequestFacts,
+        rows: &[(&str, &str)],
+    ) -> (HashMap<String, String>, Vec<GenError>) {
+        let rows: Vec<(String, String)> = rows
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect();
+        let mut vars = HashMap::new();
+        let errors = expand(
+            &rows,
+            &mut vars,
+            &FakeSource::at(1_700_000_000).sending(request),
+        );
+        (vars, errors)
+    }
+
+    fn facts() -> RequestFacts {
+        RequestFacts {
+            method: "post".to_string(),
+            url: "https://api.example.net/v2/orders?page=2&size=10#top".to_string(),
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("X-Trace".to_string(), "first".to_string()),
+                ("X-Trace".to_string(), "second".to_string()),
+            ],
+            body: r#"{"id":7}"#.to_string(),
+            name: "Create order".to_string(),
+        }
     }
 
     fn run_with(
@@ -1688,6 +2068,224 @@ mod tests {
         );
     }
 
+    /// The URL-safe alphabet is not cosmetic: `+`, `/` and `=` are all wrong
+    /// in a JWT segment or a query parameter, which is the only reason these
+    /// variants exist.
+    #[test]
+    fn the_url_safe_digests_use_the_alphabet_a_jwt_needs() {
+        let (v, e) = run(&[
+            ("padded", r#"sha256_b64("abc")"#),
+            ("safe", r#"sha256_b64url("abc")"#),
+            ("mac", r#"hmac_sha256_b64url("key", "message")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        // The same digest as the padded vector above, with `+` -> `-`,
+        // `/` -> `_` and the padding dropped.
+        assert_eq!(v["padded"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=");
+        assert_eq!(v["safe"], "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0");
+        assert_eq!(
+            v["mac"],
+            encode_digest(
+                &hmac_bytes("sha256", b"key", b"message"),
+                DigestEncoding::B64Url
+            )
+        );
+        for name in ["safe", "mac"] {
+            assert!(
+                !v[name].contains(['+', '/', '=']),
+                "{name} produced {:?}, which cannot go in a URL or a JWT",
+                v[name]
+            );
+        }
+    }
+
+    /// The pieces a script would reach for: the last segment of a path, a
+    /// field out of a header, the token after a space.
+    #[test]
+    fn split_counts_from_either_end_and_refuses_to_guess() {
+        let (v, e) = run(&[
+            ("first", r#"split("a/b/c", "/", 0)"#),
+            ("last", r#"split("a/b/c", "/", -1)"#),
+            ("but_one", r#"split("a/b/c", "/", -2)"#),
+            ("token", r#"split("Bearer abc123", " ", 1)"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["first"], "a");
+        assert_eq!(v["last"], "c");
+        assert_eq!(v["but_one"], "b");
+        assert_eq!(v["token"], "abc123");
+
+        // Out of range, an empty separator and a non-numeric index are all
+        // faults rather than an empty answer: this text goes on to be signed
+        // or sent, and quietly nothing is the hardest kind of wrong to find.
+        for expr in [
+            r#"split("a/b", "/", 5)"#,
+            r#"split("a/b", "/", -5)"#,
+            r#"split("a/b", "", 0)"#,
+            r#"split("a/b", "/", "last")"#,
+        ] {
+            let (v, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::BadArgument { .. }]),
+                "{expr} gave {e:?}"
+            );
+            assert!(!v.contains_key("v"), "{expr} still set a value");
+        }
+    }
+
+    #[test]
+    fn regex_answers_with_the_capture_group_when_the_pattern_names_one() {
+        let (v, e) = run(&[
+            ("whole", r#"regex("order-4711-x", "[0-9]+")"#),
+            ("part", r#"regex("order-4711-x", "order-([0-9]+)")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["whole"], "4711");
+        assert_eq!(v["part"], "4711");
+
+        for expr in [
+            r#"regex("nothing here", "[0-9]+")"#,
+            r#"regex("text", "([")"#,
+        ] {
+            let (_, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::BadArgument { .. }]),
+                "{expr} gave {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_reads_the_request_it_belongs_to() {
+        let (v, e) = run_sending(
+            facts(),
+            &[
+                ("m", "method()"),
+                ("u", "url()"),
+                ("p", "path()"),
+                ("q", "query()"),
+                ("b", "body()"),
+                ("n", "request_name()"),
+                ("ct", r#"header("content-type")"#),
+                ("trace", r#"header("X-Trace")"#),
+                ("absent", r#"header("X-Nope")"#),
+            ],
+        );
+        assert!(e.is_empty(), "{e:?}");
+        // Upper-cased: what goes in a signing string is the method as sent,
+        // not as typed.
+        assert_eq!(v["m"], "POST");
+        assert_eq!(
+            v["u"],
+            "https://api.example.net/v2/orders?page=2&size=10#top"
+        );
+        assert_eq!(v["p"], "/v2/orders");
+        assert_eq!(v["q"], "page=2&size=10");
+        assert_eq!(v["b"], r#"{"id":7}"#);
+        assert_eq!(v["n"], "Create order");
+        // Case-insensitive, first of a repeated name wins, and a header that
+        // isn't there is empty rather than a fault.
+        assert_eq!(v["ct"], "application/json");
+        assert_eq!(v["trace"], "first");
+        assert_eq!(v["absent"], "");
+    }
+
+    /// A URL that is still `{{base}}/x` has no host to strip, and half a URL
+    /// is not a mistake in the block -- it is a URL whose front end arrives
+    /// from the environment.
+    #[test]
+    fn a_templated_url_still_yields_the_part_that_is_written_down() {
+        let mut r = facts();
+        r.url = "{{base}}/v2/orders?page=2".to_string();
+        let (v, e) = run_sending(r, &[("p", "path()"), ("q", "query()")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["p"], "/v2/orders");
+        assert_eq!(v["q"], "page=2");
+
+        let mut bare = facts();
+        bare.url = "{{base}}".to_string();
+        let (v, e) = run_sending(bare, &[("p", "path()"), ("q", "query()")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["p"], "");
+        assert_eq!(v["q"], "");
+    }
+
+    /// The ordering rule, stated as a test: a row reading the request sees the
+    /// rows above it substituted and the rows below it still as `{{name}}`.
+    /// Anything else makes a value depend on a row that depends on it.
+    #[test]
+    fn a_row_reading_the_request_sees_the_rows_above_it_filled_in() {
+        let mut r = facts();
+        r.body = r#"{"first":"{{a}}","second":"{{z}}"}"#.to_string();
+        let (v, e) = run_sending(
+            r,
+            &[
+                ("a", r#"hex("41")"#),
+                ("snapshot", "body()"),
+                ("z", "hex(\"5A\")"),
+            ],
+        );
+        assert!(e.is_empty(), "{e:?}");
+        // `hex` encodes the text "41", i.e. "3431" -- the point is which
+        // rows had run by the time `body()` was asked, not the value itself.
+        assert_eq!(v["snapshot"], r#"{"first":"3431","second":"{{z}}"}"#);
+    }
+
+    /// Without a request -- the editor's live check on a block being typed --
+    /// these say so rather than answering with nothing, because an HMAC over a
+    /// silently empty body is a signature that authorises nothing.
+    #[test]
+    fn a_request_function_with_no_request_behind_it_says_so() {
+        for expr in [
+            "method()",
+            "url()",
+            "path()",
+            "query()",
+            "body()",
+            "request_name()",
+            r#"header("Accept")"#,
+        ] {
+            let (v, e) = run(&[("v", expr)]);
+            assert!(
+                matches!(e.as_slice(), [GenError::NoRequest { .. }]),
+                "{expr} gave {e:?}"
+            );
+            assert!(!v.contains_key("v"), "{expr} still set a value");
+        }
+    }
+
+    /// What the block reads is what Hurl will send: the wire body, without the
+    /// JSON comments the editor keeps, and without header rows the user has
+    /// switched off.
+    #[test]
+    fn the_request_a_block_reads_is_the_one_that_will_be_sent() {
+        let entry = crate::hurl::HurlEntry {
+            title: "Create order".to_string(),
+            method: "POST".to_string(),
+            url: "https://api.example.net/v2/orders".to_string(),
+            headers: vec![
+                crate::hurl::KvRow::new("Accept", "application/json"),
+                crate::hurl::KvRow::toggled("X-Debug", "1", false),
+            ],
+            body_src: Some("{\n  // the id the server assigns\n  \"id\": 7\n}".to_string()),
+            ..Default::default()
+        };
+        let f = RequestFacts::of(&entry);
+        assert_eq!(f.name, "Create order");
+        assert_eq!(f.method, "POST");
+        assert_eq!(
+            f.headers,
+            vec![("Accept".to_string(), "application/json".to_string())],
+            "a switched-off header is not sent, so it is not part of what is signed"
+        );
+        assert!(
+            !f.body.contains("//"),
+            "the block signed the editor's comments, not the bytes on the wire: {:?}",
+            f.body
+        );
+        assert!(f.body.contains("\"id\""), "{:?}", f.body);
+    }
+
     /// The shape real signing takes: a nonce and a timestamp computed here,
     /// then signed, with the signature reading the rows above it.
     #[test]
@@ -1713,7 +2311,7 @@ mod tests {
                 b"s3cr3t",
                 format!("{}:{}", v["nonce"], v["stamp"]).as_bytes(),
             ),
-            true,
+            DigestEncoding::B64,
         );
         assert_eq!(
             v["sig"], expected,
@@ -2119,18 +2717,18 @@ mod tests {
                 f.min_args
             );
             if f.min_args > 0 {
-                let e = call(f.name, &arg(f.min_args - 1), "row", &src)
+                let e = call(f.name, &arg(f.min_args - 1), "row", &HashMap::new(), &src)
                     .expect_err(&format!("{} accepted too few arguments", f.name));
                 assert!(is_arity(&e), "{}: {e:?}", f.name);
             }
             if let Some(max) = f.max_args {
-                let e = call(f.name, &arg(max + 1), "row", &src)
+                let e = call(f.name, &arg(max + 1), "row", &HashMap::new(), &src)
                     .expect_err(&format!("{} accepted too many arguments", f.name));
                 assert!(is_arity(&e), "{}: {e:?}", f.name);
             }
             // The right number may still be the wrong *value* — `date("1")` is
             // a format string that formats nothing — so only arity is asserted.
-            if let Err(e) = call(f.name, &arg(f.min_args), "row", &src) {
+            if let Err(e) = call(f.name, &arg(f.min_args), "row", &HashMap::new(), &src) {
                 assert!(!is_arity(&e), "{} rejected its own arity: {e:?}", f.name);
             }
         }

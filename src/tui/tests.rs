@@ -23028,7 +23028,11 @@ fn the_expression_cell_suggests_generator_functions() {
     let dd = form_ref(&app).key_dropdown().expect("suggestions");
     assert_eq!(
         dd.1,
-        vec!["hmac_sha256(key, message)", "hmac_sha256_b64(key, message)"]
+        vec![
+            "hmac_sha256(key, message)",
+            "hmac_sha256_b64(key, message)",
+            "hmac_sha256_b64url(key, message)"
+        ]
     );
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
@@ -23093,7 +23097,10 @@ fn a_suggestion_replaces_only_the_word_being_typed() {
     open_form_on_computed_expression(&mut app);
     type_str(&mut app, "concat(sha25");
     let dd = form_ref(&app).key_dropdown().expect("suggestions");
-    assert_eq!(dd.1, vec!["sha256(text)", "sha256_b64(text)"]);
+    assert_eq!(
+        dd.1,
+        vec!["sha256(text)", "sha256_b64(text)", "sha256_b64url(text)"]
+    );
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Enter);
     let form = form_ref(&app);

@@ -687,7 +687,13 @@ pub fn effective_vars_reporting<'a>(
     base: &HurlEntry,
     vars: &'a HashMap<String, String>,
 ) -> (Cow<'a, HashMap<String, String>>, Vec<GenError>) {
-    effective_vars_with(base, vars, &crate::generators::SystemSource::new())
+    // The source is told which request it is working for, so a block can sign
+    // or record what is about to be sent (`body()`, `url()`, `header(..)`).
+    effective_vars_with(
+        base,
+        vars,
+        &crate::generators::SystemSource::for_request(crate::generators::RequestFacts::of(base)),
+    )
 }
 
 /// [`effective_vars_reporting`] against a chosen world, so a caller that is
@@ -1201,7 +1207,9 @@ pub fn run_all_entries(
                     let errs = crate::generators::expand(
                         &entry.generators,
                         &mut merged,
-                        &crate::generators::SystemSource::new(),
+                        &crate::generators::SystemSource::for_request(
+                            crate::generators::RequestFacts::of(entry),
+                        ),
                     );
                     // A block that failed leaves its name unbound, and the
                     // environment (or an earlier capture) may well bind the

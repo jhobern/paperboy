@@ -305,8 +305,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                     return EntrySetup::Bind(Vec::new());
                 }
                 let mut merged = known.clone();
-                let errors =
-                    crate::generators::expand(&entry.generators, &mut merged, &SystemSource::new());
+                // With the request behind it, exactly as a single send has it,
+                // so `body()` and its neighbours mean the same thing headless.
+                let errors = crate::generators::expand(
+                    &entry.generators,
+                    &mut merged,
+                    &SystemSource::for_request(crate::generators::RequestFacts::of(entry)),
+                );
                 // Reported once per request however often it repeats, so a
                 // `[Options] retry` does not print the same typo five times.
                 if !std::mem::replace(&mut gen_reported[i], true) {

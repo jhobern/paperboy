@@ -12,6 +12,36 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A `[Gen]` block can now read the request it belongs to.** `method`, `url`,
+  `path`, `query`, `header(name)`, `body` and `request_name` answer with what
+  Hurl is about to send — the body as it goes on the wire, without the JSON
+  comments the editor keeps or the header rows the user switched off — which is
+  what a signature over "the thing I am about to send" has to be computed over.
+  Until now the only way to sign a body was to paste it into the block a second
+  time, and the copy that drifted was the one being signed. They read the text
+  as authored and substitute it against the rows above them, so a row reading
+  `body()` sees earlier rows filled in and later ones still as `{{name}}` —
+  the one ordering in which a value cannot depend on a row that depends on it.
+  With no request behind the block (the editor's live check on a row you are
+  still typing) they report rather than answering with nothing: an HMAC over a
+  silently empty body is a signature that authorises nothing.
+
+- Every hash and MAC gained a `_b64url` variant — `sha256_b64url`,
+  `hmac_sha256_b64url` and the rest — returning URL-safe Base64 without
+  padding. That is the encoding a JWT is made of: `header.payload.signature` is
+  three of them joined by dots, and the standard alphabet's `+`, `/` and `=`
+  are all wrong in that position, so the existing `_b64` variants left anyone
+  assembling a token to do the substitution by hand.
+
+- Two text functions for taking a value apart: `split(text, separator, n)`,
+  which counts from the end when `n` is negative — the last segment of a path
+  is `split(path(), "/", -1)`, JavaScript's `.pop()`, which is the shape the
+  scripts being ported are written in — and `regex(text, pattern)`, which
+  answers with the first capture group if the pattern has one and the whole
+  match otherwise. Both treat "no such piece" and "matched nothing" as faults
+  rather than an empty answer, because that text goes on to be signed, sent or
+  asserted against, and quietly nothing is the hardest kind of wrong to find.
+
 - The Response panel's per-assert list now folds too, with the same `z`. A run
   whose checks all passed already says so in the `[Asserts] ✓ 8/8` badge beside
   the status, and listing all eight underneath spends the panel repeating it

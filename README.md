@@ -394,15 +394,35 @@ braces, because the value doesn't exist yet.
 | Encoding | `base64`, `base64url`, `base64_decode`, `hex`, `urlencode`, `urldecode`, `json_string` |
 | Hashes | `md5`, `sha1`, `sha256`, `sha512` |
 | MACs | `hmac_sha1(key, msg)`, `hmac_sha256`, `hmac_sha512` |
-| Text | `concat(…)`, `upper`, `lower`, `trim` |
+| Text | `concat(…)`, `upper`, `lower`, `trim`, `split(text, sep, n)`, `regex(text, pattern)` |
+| Request | `method`, `url`, `path`, `query`, `header(name)`, `body`, `request_name` |
 
 Every hash and MAC returns lowercase hex — matching `sha256sum` and CryptoJS's
 `.toString()`, so a ported Postman script lands right — and each has a `_b64`
-variant returning standard padded Base64. The encoding is in the name rather
+variant returning standard padded Base64 and a `_b64url` variant returning the
+URL-safe alphabet without padding — the encoding a JWT segment is made of,
+where `+`, `/` and `=` are all wrong. The encoding is in the name rather
 than a default because a signature in the wrong one is the right length,
 entirely plausible to look at, and rejected with the same `401` as a wrong
 secret. Note that `base64(sha256(m))` is *not* `sha256_b64(m)`: the first
 encodes 64 hex characters, the second the 32 bytes they spell.
+
+The **Request** functions read the request the block belongs to — the method as
+sent, the body as it goes on the wire (no JSON comments, no switched-off
+headers) — which is how a signature over "the thing I am about to send" is
+written. They read the text as authored, substituted against the rows above
+them: a row reading `body()` sees earlier rows filled in and later ones still as
+`{{name}}`, so a value can never depend on a row that depends on it. Without a
+request behind the block — the editor's live check on a row you are still
+typing — they say so rather than answering with nothing, because an HMAC over a
+silently empty body is a signature that authorises nothing.
+
+`split` counts pieces from the end when given a negative index, so the last
+segment of a path is `split(path(), "/", -1)` — JavaScript's `.pop()`, which is
+the shape these scripts are written in. `regex` is the escape hatch for what
+`split` can't reach: the first capture group if the pattern has one, otherwise
+the whole match. Both treat "no such piece" and "matched nothing" as faults
+rather than an empty answer, since that text goes on to be signed or sent.
 
 **Canonicalisation is yours.** PaperBoy signs exactly the bytes you assemble; it
 will not build a canonical request from the live headers, so AWS SigV4 and

@@ -933,6 +933,7 @@ strings! {
     gen_status => "⚠ Generated values not set:", "⚠ Valeurs générées non définies :", "⚠ Genererede værdier ikke angivet:";
     gen_err_empty => "{row}: needs an expression", "{row} : nécessite une expression", "{row}: mangler et udtryk";
     gen_err_syntax => "{row}: can't read the expression ({detail})", "{row} : expression illisible ({detail})", "{row}: kan ikke læse udtrykket ({detail})";
+    gen_err_no_request => "{row}: {function} reads the request being sent, and there isn't one here", "{row} : {function} lit la requête envoyée, or il n'y en a pas ici", "{row}: {function} læser anmodningen, der sendes, og her er ingen";
     gen_err_unknown => "{row}: there is no function called {function}", "{row} : la fonction {function} n'existe pas", "{row}: der findes ingen funktion ved navn {function}";
     gen_err_arity => "{row}: {function} takes {expected} arguments, not {got}", "{row} : {function} prend {expected} arguments, pas {got}", "{row}: {function} tager {expected} argumenter, ikke {got}";
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
@@ -1022,6 +1023,22 @@ strings! {
     gen_desc_upper => "Upper-cases the text.", "Met le texte en majuscules.", "Gør teksten til store bogstaver.";
     gen_desc_lower => "Lower-cases the text.", "Met le texte en minuscules.", "Gør teksten til små bogstaver.";
     gen_desc_trim => "Removes whitespace from both ends.", "Supprime les espaces aux deux extrémités.", "Fjerner mellemrum i begge ender.";
+    gen_desc_method => "The request's method, in capitals.", "La méthode de la requête, en majuscules.", "Anmodningens metode med store bogstaver.";
+    gen_desc_url => "The request's full URL, with its variables filled in.", "L'URL complète de la requête, variables remplacées.", "Anmodningens fulde URL med variabler indsat.";
+    gen_desc_path => "The path part of the request's URL.", "La partie chemin de l'URL de la requête.", "Stidelen af anmodningens URL.";
+    gen_desc_query => "The query string of the request's URL, without the question mark.", "La chaîne de requête de l'URL, sans le point d'interrogation.", "Forespørgselsstrengen i anmodningens URL, uden spørgsmålstegn.";
+    gen_desc_header => "The named header of this request, or empty if it has none.", "L'en-tête nommé de cette requête, ou vide s'il n'y en a pas.", "Den navngivne header i denne anmodning, eller tom hvis den ikke findes.";
+    gen_desc_body => "This request's body, with its variables filled in.", "Le corps de cette requête, variables remplacées.", "Denne anmodnings brødtekst med variabler indsat.";
+    gen_desc_request_name => "This request's name.", "Le nom de cette requête.", "Denne anmodnings navn.";
+    gen_desc_md5_b64url => "MD5, as URL-safe Base64 without padding.", "MD5, en Base64 URL sans remplissage.", "MD5 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_sha1_b64url => "SHA-1, as URL-safe Base64 without padding.", "SHA-1, en Base64 URL sans remplissage.", "SHA-1 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_sha256_b64url => "SHA-256, as URL-safe Base64 without padding — the encoding a JWT uses.", "SHA-256, en Base64 URL sans remplissage — l'encodage des JWT.", "SHA-256 som URL-sikker Base64 uden udfyldning — den kodning en JWT bruger.";
+    gen_desc_sha512_b64url => "SHA-512, as URL-safe Base64 without padding.", "SHA-512, en Base64 URL sans remplissage.", "SHA-512 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_hmac_sha1_b64url => "HMAC-SHA-1, as URL-safe Base64 without padding.", "HMAC-SHA-1, en Base64 URL sans remplissage.", "HMAC-SHA-1 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_hmac_sha256_b64url => "HMAC-SHA-256, as URL-safe Base64 without padding — a JWT's signature.", "HMAC-SHA-256, en Base64 URL sans remplissage — la signature d'un JWT.", "HMAC-SHA-256 som URL-sikker Base64 uden udfyldning — en JWT-signatur.";
+    gen_desc_hmac_sha512_b64url => "HMAC-SHA-512, as URL-safe Base64 without padding.", "HMAC-SHA-512, en Base64 URL sans remplissage.", "HMAC-SHA-512 som URL-sikker Base64 uden udfyldning.";
+    gen_desc_split => "The nth piece of the text, split on the separator; negative counts from the end.", "La n-ième partie du texte, découpé sur le séparateur\u{a0}; négatif compte depuis la fin.", "Den n'te del af teksten, delt ved separatoren; negativ tæller fra enden.";
+    gen_desc_regex => "The first capture group the pattern matches, or the whole match.", "Le premier groupe capturé par le motif, ou la correspondance entière.", "Den første indfangede gruppe i mønsteret, eller hele match'et.";
     gui_generated_var_note => "A variable this expression can read", "Une variable que cette expression peut lire", "En variabel som dette udtryk kan læse";
     gui_generated_expr_hint => "Type to search functions, or Ctrl+Space to list them all", "Tapez pour chercher une fonction, ou Ctrl+Espace pour les lister toutes", "Skriv for at søge efter funktioner, eller Ctrl+Mellemrum for at vise dem alle";
     gui_generated_bad_name => "This name isn't a valid variable, so the row is dropped when you save", "Ce nom n'est pas une variable valide ; la ligne est supprimée à l'enregistrement", "Dette navn er ikke en gyldig variabel, så rækken fjernes når du gemmer";
@@ -1782,6 +1799,22 @@ impl Strings {
             "upper" => self.gen_desc_upper,
             "lower" => self.gen_desc_lower,
             "trim" => self.gen_desc_trim,
+            "method" => self.gen_desc_method,
+            "url" => self.gen_desc_url,
+            "path" => self.gen_desc_path,
+            "query" => self.gen_desc_query,
+            "header" => self.gen_desc_header,
+            "body" => self.gen_desc_body,
+            "request_name" => self.gen_desc_request_name,
+            "md5_b64url" => self.gen_desc_md5_b64url,
+            "sha1_b64url" => self.gen_desc_sha1_b64url,
+            "sha256_b64url" => self.gen_desc_sha256_b64url,
+            "sha512_b64url" => self.gen_desc_sha512_b64url,
+            "hmac_sha1_b64url" => self.gen_desc_hmac_sha1_b64url,
+            "hmac_sha256_b64url" => self.gen_desc_hmac_sha256_b64url,
+            "hmac_sha512_b64url" => self.gen_desc_hmac_sha512_b64url,
+            "split" => self.gen_desc_split,
+            "regex" => self.gen_desc_regex,
             _ => "",
         }
     }
@@ -2584,6 +2617,10 @@ pub fn describe_gen_errors(s: &Strings, errors: &[crate::generators::GenError]) 
                 .gen_err_syntax
                 .replace("{row}", name)
                 .replace("{detail}", detail),
+            G::NoRequest { name, function } => s
+                .gen_err_no_request
+                .replace("{row}", name)
+                .replace("{function}", function),
             G::UnknownFunction { name, function } => s
                 .gen_err_unknown
                 .replace("{row}", name)
