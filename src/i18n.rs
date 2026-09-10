@@ -303,7 +303,7 @@ strings! {
     report_expr => "Expression", "Expression", "Udtryk";
     generated_name => "Name", "Nom", "Navn";
     generated_expr => "Expression", "Expression", "Udtryk";
-    generated_fn_hint => "Expression   (Enter lists the functions)", "Expression   (Entrée affiche les fonctions)", "Udtryk   (Enter viser funktionerne)";
+    generated_fn_hint => "Expression   (Enter list functions)", "Expression   (Entrée lister les fonctions)", "Udtryk   (Enter vis funktioner)";
     load_environment => "Load Environment…", "Charger l'environnement…", "Indlæs miljø…";
     env_heading => "Global Environments", "Environnements globaux", "Globale miljøer";
     env_no_env => "(no environment loaded)", "(aucun environnement chargé)", "(intet miljø indlæst)";

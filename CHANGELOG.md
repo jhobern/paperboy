@@ -216,6 +216,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- The Generated section's column header now reads `Expression   (Enter list
+  functions)` rather than `(Enter lists the functions)`, matching the
+  key-then-verb shape every other shortcut hint in the terminal UI uses.
+
 - **One word for the feature: "Generated".** The file marker has always been
   `# [Gen]`, the module is `generators.rs` and the errors are `GenError`, but
   the screen said *Computed* — so the thing you read about in the README and
