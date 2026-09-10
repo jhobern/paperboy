@@ -207,7 +207,7 @@ mod tests {
         );
         assert!(lines[0] == s.gen_status, "{detail}");
         assert!(
-            lines[1].contains("session_nonce") && lines[2].contains('1'),
+            lines[1].contains("session_nonce") && lines[2].starts_with("  \u{2022} 1 further row "),
             "{detail}"
         );
         assert!(

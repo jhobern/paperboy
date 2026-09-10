@@ -7783,6 +7783,109 @@ fn response_panel_shows_assert_results_supplemental_to_status() {
     );
 }
 
+/// A run whose checks all passed says so in the `[Asserts] 8/8` badge; listing
+/// all eight of them underneath spends the panel repeating it, and pushes the
+/// body -- the thing that badge cannot show -- off the bottom. So the list
+/// starts folded when nothing failed, and `z` opens it.
+#[test]
+fn a_wall_of_passing_asserts_is_folded_away_from_the_response() {
+    use crate::hurl::AssertOutcome;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+        col.entries[0].last_response = Some(crate::http::ApiResponse {
+            status: 200,
+            status_text: "OK".into(),
+            body: "the body nobody could see".into(),
+            assert_results: (0..8)
+                .map(|i| AssertOutcome {
+                    expr: format!("jsonpath \"$.field{i}\" exists"),
+                    passed: true,
+                    detail: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+    }
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+    let ci = app.active_tab;
+
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("8/8"),
+        "the badge still reports every check:\n{out}"
+    );
+    assert_eq!(
+        out.matches("jsonpath").count(),
+        0,
+        "no row per check while folded:\n{out}"
+    );
+    assert!(
+        out.contains("the body nobody could see"),
+        "the room goes to the body:\n{out}"
+    );
+
+    press(&mut app, KeyCode::Char('z'));
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.matches("jsonpath").count() > 1,
+        "z lists the checks:\n{out}"
+    );
+}
+
+/// The banner row is gone: the name moves to the terminal's window title and
+/// the help overlay's heading, the language tag is dropped (every other word
+/// on screen is already in that language), and the runner error joins the
+/// status message on the menu row. Three rows the request and its response get
+/// to keep.
+#[test]
+fn the_banner_row_gives_its_three_rows_to_the_body() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    {
+        let ci = app.active_tab;
+        let col = &mut app.collections[ci];
+        col.entries.push(HurlEntry::default());
+        col.selected_entry = 0;
+    }
+    app.response.lock().unwrap().error = "the wire went nowhere".into();
+
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let t = buffer_text(term.backend().buffer());
+    let rows: Vec<&str> = t.lines().collect();
+
+    assert!(
+        !t.contains(&format!("[{}]", s.lang_english)),
+        "no language tag anywhere:\n{t}"
+    );
+    assert!(
+        rows[0].contains("the wire went nowhere"),
+        "the runner error rides the menu row:\n{t}"
+    );
+    assert!(
+        rows.iter().all(|r| !r.contains("PaperBoy")),
+        "the name is in the window title, not in a row of the layout:\n{t}"
+    );
+}
+
 /// #3: the Response pane shows the request's duration when the runner reported
 /// one (the same figure reports surface as the per-request "Time" column).
 #[test]

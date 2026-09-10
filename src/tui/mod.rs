@@ -53,6 +53,17 @@ pub fn run() -> io::Result<()> {
     let guard = TerminalGuard::install(true)?;
     let enhanced = guard.keyboard_enhancement_active();
 
+    // The app names itself in the terminal's own title bar rather than in a
+    // row of the layout: it costs no rows, it is where a terminal app's name
+    // is looked for, and it is still there when the window is one of twenty in
+    // a tab bar. `SetTitle` is a plain escape sequence, so a terminal that
+    // does not support it simply ignores it -- but one that *does* keeps the
+    // title after we exit, so the teardown below pops it again.
+    let _ = ratatui::crossterm::execute!(
+        io::stdout(),
+        ratatui::crossterm::terminal::SetTitle(crate::i18n::APP_NAME)
+    );
+
     let mut app = TuiApp::restored();
     app.enhanced_keys = enhanced;
     // A window is rarely a whole number of rows tall, and the part-row at the
@@ -63,6 +74,10 @@ pub fn run() -> io::Result<()> {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         term_bg::reset();
+        // A panic leaves the shell in the window we renamed, so the title has
+        // to be dropped here too, next to the rest of the teardown.
+        let _ =
+            ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::terminal::SetTitle(""));
         previous_hook(info);
     }));
     let mut terminal_bg: Option<(u8, u8, u8)> = None;
@@ -201,6 +216,7 @@ pub fn run() -> io::Result<()> {
     };
 
     term_bg::reset();
+    let _ = ratatui::crossterm::execute!(io::stdout(), ratatui::crossterm::terminal::SetTitle(""));
     drop(guard); // pops keyboard-enhancement flags + disables mouse capture
     ratatui::restore();
     result

@@ -48,8 +48,13 @@ macro_rules! strings {
     };
 }
 
+/// The application's own name. Not a `Strings` row: it is the same word in
+/// every language, and the terminal window title is set before a language is
+/// known.
+pub const APP_NAME: &str = "PaperBoy";
+
 strings! {
-    app_heading => "🦀 PaperBoy", "🦀 PaperBoy", "🦀 PaperBoy";
+    app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
     response_heading => "Response", "Réponse", "Svar";
@@ -933,7 +938,8 @@ strings! {
     gen_err_argument => "{row}: {function} can't use that argument ({detail})", "{row} : {function} ne peut pas utiliser cet argument ({detail})", "{row}: {function} kan ikke bruge det argument ({detail})";
     gen_err_undefined => "{row}: nothing defines {reference}", "{row} : rien ne définit {reference}", "{row}: intet definerer {reference}";
     gen_err_failed_dep => "{row}: {reference} above it could not be worked out", "{row} : {reference} au-dessus n'a pas pu être calculé", "{row}: {reference} ovenover kunne ikke beregnes";
-    gen_err_cascade => "{n} further row(s) below it could not be worked out either", "{n} ligne(s) supplémentaire(s) en dessous n'ont pas pu être calculées non plus", "{n} yderligere række(r) nedenunder kunne heller ikke beregnes";
+    gen_err_cascade_one => "1 further row below it could not be worked out either", "1 ligne supplémentaire en dessous n'a pas pu être calculée non plus", "1 yderligere række nedenunder kunne heller ikke beregnes";
+    gen_err_cascade => "{n} further rows below it could not be worked out either", "{n} lignes supplémentaires en dessous n'ont pas pu être calculées non plus", "{n} yderligere rækker nedenunder kunne heller ikke beregnes";
     gen_err_name_missing => "A generated row has an expression but no name — nothing can ask for its value", "Une ligne générée a une expression mais pas de nom — rien ne peut demander sa valeur", "En genereret række har et udtryk, men intet navn — intet kan bede om dens værdi";
     gen_err_name_invalid => "{row}: a name can only use letters, digits, _ and -", "{row} : un nom ne peut contenir que des lettres, des chiffres, _ et -", "{row}: et navn må kun bruge bogstaver, tal, _ og -";
     gen_err_name_duplicate => "{row}: two rows are named this; only the first is used", "{row} : deux lignes portent ce nom ; seule la première est utilisée", "{row}: to rækker hedder dette; kun den første bruges";
@@ -2553,11 +2559,12 @@ pub fn summarise_gen_errors(s: &Strings, errors: &[crate::generators::GenError])
         return describe_gen_errors(s, errors);
     }
     let mut out = describe_gen_errors(s, &causes);
-    if !knock_on.is_empty() {
-        out.push(
-            s.gen_err_cascade
-                .replace("{n}", &knock_on.len().to_string()),
-        );
+    // One row is not "1 row(s)": a count written as a form is a count the
+    // reader has to translate back into a sentence.
+    match knock_on.len() {
+        0 => {}
+        1 => out.push(s.gen_err_cascade_one.to_string()),
+        n => out.push(s.gen_err_cascade.replace("{n}", &n.to_string())),
     }
     out
 }

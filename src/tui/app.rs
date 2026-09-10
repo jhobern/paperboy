@@ -1221,6 +1221,15 @@ pub struct TuiApp {
     /// `draw_collection_main` decides by size; `z` writes a `Some` and that
     /// choice then sticks for the session.
     pub(crate) request_meta_folded: Option<bool>,
+    /// Whether the Response panel's per-assert list is folded away. `None`
+    /// means nobody has said, so `draw_response` decides: a run where every
+    /// assert passed has nothing to read there that the `✓ 4/4` badge beside
+    /// the status does not already say, while a `✗` is the thing the reader
+    /// came for.
+    pub(crate) response_asserts_folded: Option<bool>,
+    /// What that fold came out as on the last frame, so `z` flips what is on
+    /// screen rather than re-deriving the automatic answer.
+    pub(crate) response_asserts_folded_now: bool,
     /// What that fold actually came out as on the last frame, so `z` can flip
     /// what the user can see instead of re-deriving the automatic answer.
     pub(crate) request_meta_folded_now: bool,
@@ -1561,6 +1570,8 @@ impl Default for TuiApp {
             resp_max_scroll: 0,
             main_max_scroll: 0,
             request_meta_folded: None,
+            response_asserts_folded: None,
+            response_asserts_folded_now: false,
             request_meta_folded_now: false,
             list_hscroll: 0,
             global_env_hscroll: 0,

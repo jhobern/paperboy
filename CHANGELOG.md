@@ -12,6 +12,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- The Response panel's per-assert list now folds too, with the same `z`. A run
+  whose checks all passed already says so in the `[Asserts] ✓ 8/8` badge beside
+  the status, and listing all eight underneath spends the panel repeating it
+  while pushing the body — the thing the badge cannot show — off the bottom. So
+  the list starts folded when nothing failed and open when anything did, which
+  is the case the reader came for; `z` overrides either way, and with the
+  Response pane focused it acts on that list rather than on the request's
+  summary.
+
 - The terminal UI's `[Captures]`, `[Asserts]` and `[Generated]` summary above a
   request now folds, with `z`, and starts folded. A request that checks its
   response thoroughly can list more of those rows than the request itself has
@@ -213,6 +222,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   the request it restores, which is the answer that is right whatever was open
   when it closed. Nesting is still unlimited, and requests still run in the
   file's order regardless of how the tree is folded.
+
+### Changed
+
+- **The banner row is gone.** It spent three rows — a bordered block — on the
+  app name, a `[English]` language tag and the occasional runner error. The
+  language tag said nothing that every other word on screen doesn't; the name
+  moves to the terminal's own window title (restored on exit, and on a panic)
+  and to the help overlay's heading, where it now carries the version; and the
+  error joins the status message on the menu row, which is where the eye
+  already goes for "what just happened". The request and its response get the
+  three rows.
 
 ### Changed
 

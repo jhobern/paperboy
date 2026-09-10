@@ -1950,6 +1950,14 @@ impl TuiApp {
             // description and leave three rows for the request itself. The flip
             // is against what was last drawn, so the first press always does
             // the visible thing whichever way the automatic choice went.
+            // In the Response pane it folds that response's per-assert list
+            // instead -- the pane-scoped reading of "show me less of this",
+            // matching how `x`, `u` and `/` already mean "the thing in this
+            // pane". Both flips are against what was last drawn, so the first
+            // press always does the visible thing.
+            KeyCode::Char('z') if self.focus == Pane::Response => {
+                self.response_asserts_folded = Some(!self.response_asserts_folded_now);
+            }
             KeyCode::Char('z') => {
                 self.request_meta_folded = Some(!self.request_meta_folded_now);
             }

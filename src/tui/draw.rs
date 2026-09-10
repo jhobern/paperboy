@@ -9,7 +9,7 @@ use ratatui::widgets::{
 use crate::collection::{Collection, WsRow};
 use crate::environment::ValueSource;
 use crate::hurl::RunStatus;
-use crate::i18n::{Language, Strings};
+use crate::i18n::Strings;
 use crate::request;
 use crate::tree;
 
@@ -1884,9 +1884,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
 
     f.render_widget(Block::default().style(Style::default().bg(th.bg)), f.area());
 
+    // No banner row. It used to spend three rows (a bordered block) on the
+    // app name, a `[English]` tag and the occasional runner error -- the name
+    // now rides the footer with the shortcuts, the language is evident from
+    // every other word on screen, and the error joins the status message on
+    // the menu row, which is where the eye already goes for "what just
+    // happened". Three rows back for the request and its response.
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(3),
         Constraint::Length(1),
@@ -1894,10 +1899,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut TuiApp) {
     .split(f.area());
 
     draw_menu(f, rows[0], app, &s, &th);
-    draw_topbar(f, rows[1], app, &s, &th);
-    draw_tabs(f, rows[2], app, &s, &th);
-    draw_body(f, rows[3], app, &s, &th);
-    draw_footer(f, rows[4], app, &s, &th);
+    draw_tabs(f, rows[1], app, &s, &th);
+    draw_body(f, rows[2], app, &s, &th);
+    draw_footer(f, rows[3], app, &s, &th);
 
     // Painted after the panels themselves so it reflects this frame's
     // content (the Main/Response caches used to compute it are refreshed by
@@ -2025,6 +2029,24 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             Style::default().fg(th.dim),
         ));
     }
+    // The last runner error (transport failure / failed assert / parse error)
+    // rides here too, so it is never silently swallowed.
+    //
+    // `error_text`, not `error`: a request refused because a `# [Gen]` row
+    // failed reports that in the reader's language, under the heading the
+    // pre-flight check uses. And not at all when the status message beside it
+    // is already saying it, word for word -- a refused send reports the same
+    // finding through both channels (the check that saw it coming and the
+    // response that carries the refusal), and printing it twice on one row
+    // reads as two things having gone wrong.
+    let error = { app.response.lock().unwrap().error_text(s) };
+    let echoes_status = app.status.as_ref().is_some_and(|st| st.text(s) == error);
+    if !error.is_empty() && !echoes_status {
+        spans.push(Span::styled(
+            format!("     {error}"),
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
+        ));
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(th.panel)),
         area,
@@ -2050,44 +2072,6 @@ pub(crate) fn draw_menu(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th
             MouseHitTarget::MenuSettings,
         );
     }
-}
-
-pub(crate) fn draw_topbar(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, th: &Theme) {
-    let lang = match app.language {
-        Language::English => s.lang_english,
-        Language::French => s.lang_french,
-        Language::Danish => s.lang_danish,
-    };
-    let mut spans = vec![
-        Span::styled(
-            s.app_heading,
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(format!("[{lang}]"), Style::default().fg(th.dim)),
-    ];
-    // Surface the last runner error (transport failure / failed assert / parse
-    // error) here on the status bar so it is never silently swallowed.
-    // `error_text`, not `error`: a request refused because a `# [Gen]` row
-    // failed reports that in the reader's language, under the heading the
-    // pre-flight check uses.
-    let error = { app.response.lock().unwrap().error_text(s) };
-    // Not when the status line is already saying it, word for word. A refused
-    // send reports the same generator failure through both channels -- the
-    // pre-flight check that saw it coming and the response that carries the
-    // refusal -- and printing one finding twice, a few rows apart, reads as
-    // two things having gone wrong.
-    let echoes_status = app.status.as_ref().is_some_and(|st| st.text(s) == error);
-    if !error.is_empty() && !echoes_status {
-        spans.push(Span::styled(
-            format!("   {error}"),
-            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(panel(String::new(), false, th)),
-        area,
-    );
 }
 
 /// Icon prefix shown before a tab's name (in both the tab bar and the
@@ -4305,6 +4289,18 @@ pub(crate) fn draw_response(
         ));
     }
 
+    // A run with a dozen checks on it lists a dozen rows above the body, and
+    // when they all passed every one of them says what the `✓ 12/12` badge
+    // beside the status has already said -- so the reader pays most of the
+    // panel to be told twice. Folded when they all passed, open when one did
+    // not: a `✗` names the check and carries the reason, which is the thing
+    // that was worth coming for. `z` overrides either way, as it does for the
+    // request's own summary.
+    let folded = !asserts.is_empty()
+        && app
+            .response_asserts_folded
+            .unwrap_or(passed == total && error.is_empty());
+    app.response_asserts_folded_now = folded;
     // One line per assert (✓/✗ with the expression and, on failure, the actual).
     let assert_lines: Vec<Line> = asserts
         .iter()
@@ -4344,8 +4340,11 @@ pub(crate) fn draw_response(
     // headers as its body.
     let show_err_line = !error.is_empty() && passed == total;
     let err_h: u16 = u16::from(show_err_line);
-    let assert_h =
-        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h));
+    let assert_h = if folded {
+        0
+    } else {
+        (assert_lines.len() as u16).min(inner.height.saturating_sub(2).saturating_sub(err_h))
+    };
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(err_h),
@@ -4612,6 +4611,28 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     {
         hint.push(format!("a {}", s.foot_probe));
     }
+    // In the Response pane the same key folds that response's assert list, so
+    // the slot describes whichever of the two `z` would act on.
+    let response_asserts = app.focus == Pane::Response
+        && app
+            .collections
+            .get(app.active_tab)
+            .and_then(|c| {
+                c.entries
+                    .get(c.selected_entry.min(c.entries.len().saturating_sub(1)))
+            })
+            .and_then(|e| e.last_response.as_ref())
+            .is_some_and(|r| !r.assert_results.is_empty());
+    if response_asserts {
+        hint.push(format!(
+            "z {}",
+            if app.response_asserts_folded_now {
+                s.foot_meta_show
+            } else {
+                s.foot_meta_hide
+            }
+        ));
+    }
     // `z` shows or hides the captures/asserts/generated summary above the
     // request. It is folded by default, so without a slot here the only trace
     // of those rows is one line the eye reads as a heading — and a key nothing
@@ -4632,7 +4653,7 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
                     .iter()
                     .any(|(n, v)| !n.trim().is_empty() || !v.trim().is_empty())
         });
-    if has_meta {
+    if has_meta && !response_asserts {
         hint.push(format!(
             "z {}",
             if app.request_meta_folded_now {
@@ -5535,8 +5556,13 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
             let box_h = content_len as u16 + 2;
             let area = centered_rect(box_w, box_h, f.area());
             f.render_widget(Clear, area);
+            // The app names itself here rather than in a row of its own: the
+            // overlay is already a titled panel, and "what is this, and which
+            // version" is the question its reader is closest to asking.
             let title = format!(
-                "{} — {}",
+                "{} {} — {} — {}",
+                s.app_heading,
+                env!("CARGO_PKG_VERSION"),
                 s.help_title,
                 match *tab {
                     0 => s.help_tab_shortcuts,
