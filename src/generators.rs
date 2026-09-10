@@ -926,26 +926,47 @@ pub struct GenFunction {
 /// Every generator function, for the editors' suggestions and for
 /// documentation. Kept beside [`call`] so a function added there is offered
 /// here, which a test enforces in both directions.
+///
+/// **In alphabetical order**, and a test keeps it that way. This is the order
+/// both front-ends' dropdowns show, and browsing the whole list is what that
+/// dropdown is for: grouped by kind it read well as source, but it left a
+/// reader hunting for `sha256` with nothing to scan against. Where a related
+/// set matters -- the four `random_*`, the `hmac_*` pairs -- the shared prefix
+/// keeps it together anyway.
 pub const FUNCTIONS: &[GenFunction] = &[
     GenFunction {
-        name: "timestamp",
-        signature: "timestamp([offset_seconds])",
-        min_args: 0,
+        name: "base64",
+        signature: "base64(text)",
+        min_args: 1,
         max_args: Some(1),
         examples: &[],
     },
     GenFunction {
-        name: "timestamp_ms",
-        signature: "timestamp_ms()",
-        min_args: 0,
-        max_args: Some(0),
+        name: "base64_decode",
+        signature: "base64_decode(text)",
+        min_args: 1,
+        max_args: Some(1),
         examples: &[],
     },
     GenFunction {
-        name: "iso8601",
-        signature: "iso8601()",
+        name: "base64url",
+        signature: "base64url(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "concat",
+        signature: "concat(a, b, …)",
         min_args: 0,
-        max_args: Some(0),
+        max_args: None,
+        examples: &[],
+    },
+    GenFunction {
+        name: "counter",
+        signature: "counter(name)",
+        min_args: 1,
+        max_args: Some(1),
         examples: &[],
     },
     GenFunction {
@@ -965,148 +986,8 @@ pub const FUNCTIONS: &[GenFunction] = &[
         ],
     },
     GenFunction {
-        name: "uuid",
-        signature: "uuid()",
-        min_args: 0,
-        max_args: Some(0),
-        examples: &[],
-    },
-    GenFunction {
-        name: "counter",
-        signature: "counter(name)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_int",
-        signature: "random_int(low, high)",
-        min_args: 2,
-        max_args: Some(2),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_hex",
-        signature: "random_hex(length)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_alnum",
-        signature: "random_alnum(length)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "random_base64",
-        signature: "random_base64(bytes)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64",
-        signature: "base64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64url",
-        signature: "base64url(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "base64_decode",
-        signature: "base64_decode(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
         name: "hex",
         signature: "hex(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "urlencode",
-        signature: "urlencode(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "urldecode",
-        signature: "urldecode(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "json_string",
-        signature: "json_string(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "md5",
-        signature: "md5(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "md5_b64",
-        signature: "md5_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha1",
-        signature: "sha1(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha1_b64",
-        signature: "sha1_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha256",
-        signature: "sha256(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha256_b64",
-        signature: "sha256_b64(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha512",
-        signature: "sha512(text)",
-        min_args: 1,
-        max_args: Some(1),
-        examples: &[],
-    },
-    GenFunction {
-        name: "sha512_b64",
-        signature: "sha512_b64(text)",
         min_args: 1,
         max_args: Some(1),
         examples: &[],
@@ -1154,15 +1035,15 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
-        name: "concat",
-        signature: "concat(a, b, …)",
+        name: "iso8601",
+        signature: "iso8601()",
         min_args: 0,
-        max_args: None,
+        max_args: Some(0),
         examples: &[],
     },
     GenFunction {
-        name: "upper",
-        signature: "upper(text)",
+        name: "json_string",
+        signature: "json_string(text)",
         min_args: 1,
         max_args: Some(1),
         examples: &[],
@@ -1175,10 +1056,136 @@ pub const FUNCTIONS: &[GenFunction] = &[
         examples: &[],
     },
     GenFunction {
+        name: "md5",
+        signature: "md5(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "md5_b64",
+        signature: "md5_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_alnum",
+        signature: "random_alnum(length)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_base64",
+        signature: "random_base64(bytes)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_hex",
+        signature: "random_hex(length)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "random_int",
+        signature: "random_int(low, high)",
+        min_args: 2,
+        max_args: Some(2),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1",
+        signature: "sha1(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha1_b64",
+        signature: "sha1_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha256",
+        signature: "sha256(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha256_b64",
+        signature: "sha256_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512",
+        signature: "sha512(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "sha512_b64",
+        signature: "sha512_b64(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "timestamp",
+        signature: "timestamp([offset_seconds])",
+        min_args: 0,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "timestamp_ms",
+        signature: "timestamp_ms()",
+        min_args: 0,
+        max_args: Some(0),
+        examples: &[],
+    },
+    GenFunction {
         name: "trim",
         signature: "trim(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "upper",
+        signature: "upper(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "urldecode",
+        signature: "urldecode(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "urlencode",
+        signature: "urlencode(text)",
+        min_args: 1,
+        max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "uuid",
+        signature: "uuid()",
+        min_args: 0,
+        max_args: Some(0),
         examples: &[],
     },
 ];
@@ -1193,8 +1200,8 @@ pub fn is_function(name: &str) -> bool {
     FUNCTIONS.iter().any(|f| f.name == name)
 }
 
-/// The functions whose name begins with `prefix`, in table order, for a
-/// completion list. An empty prefix offers everything.
+/// The functions whose name begins with `prefix`, in table (alphabetical)
+/// order, for a completion list. An empty prefix offers everything.
 pub fn functions_starting_with(prefix: &str) -> impl Iterator<Item = &'static GenFunction> {
     let prefix = prefix.to_ascii_lowercase();
     FUNCTIONS
@@ -1505,6 +1512,18 @@ fn percent_decode(s: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The table is the order both dropdowns show, and it is alphabetical --
+    /// so a function added to the end of the list, where a new entry naturally
+    /// goes, is caught here rather than by a reader wondering why `zzz` sits
+    /// after `trim`.
+    #[test]
+    fn the_function_table_is_in_alphabetical_order() {
+        let names: Vec<&str> = FUNCTIONS.iter().map(|f| f.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "FUNCTIONS is out of alphabetical order");
+    }
+
     /// The two halves of the word at the caret mean different things: what is
     /// typed filters the list, what follows is what a call would wrap.
     #[test]

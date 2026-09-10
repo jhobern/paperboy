@@ -367,12 +367,25 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     // offered no assert -- which made the target the text
                     // rather than the row it is in.
                     let band = ui.max_rect().x_range();
+                    // Striped by hand rather than with `Grid::striped`: egui
+                    // paints that stripe across the *grid's* width, which is
+                    // as wide as the widest pair of labels, while the row --
+                    // the thing that hovers, and the thing the stripe is there
+                    // to delimit -- is the full width of the panel. The two
+                    // disagreeing left every stripe stopping short of the
+                    // highlight it was supposed to be under. One `row_rect`
+                    // now feeds both, so they cannot drift apart again.
+                    let stripe = ui.visuals().faint_bg_color;
                     egui::Grid::new("resp_headers")
                         .num_columns(2)
                         .spacing([12.0, 4.0])
-                        .striped(true)
                         .show(ui, |ui| {
                             for (i, (k, v)) in headers.iter().enumerate() {
+                                // Reserved before the labels and filled in
+                                // after: the row's extent is only known once
+                                // both are laid out, but the stripe has to be
+                                // painted *behind* them.
+                                let stripe_slot = ui.painter().add(egui::Shape::Noop);
                                 let name = ui.label(RichText::new(k).strong().color(theme.accent));
                                 let value =
                                     ui.label(RichText::new(v).monospace().color(theme.text));
@@ -381,6 +394,12 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                                     name.rect.union(value.rect).y_range(),
                                 )
                                 .expand2(egui::vec2(0.0, 2.0));
+                                if i % 2 == 1 {
+                                    ui.painter().set(
+                                        stripe_slot,
+                                        egui::epaint::RectShape::filled(row_rect, 2.0, stripe),
+                                    );
+                                }
                                 // Interacted with as one thing, after both
                                 // labels: the whole row is a single subject, so
                                 // it hovers and opens its menu as a single
@@ -707,6 +726,50 @@ mod probe_route_tests {
         assert!(
             washes.iter().all(|(r, _)| !r.contains(other)),
             "the highlight reached a row the pointer was nowhere near"
+        );
+    }
+
+    /// The zebra stripe and the hover highlight are the same row, so they are
+    /// the same size. `Grid::striped` painted only as far as the widest pair
+    /// of labels, which left the stripe stopping short of the highlight laid
+    /// over it -- two rectangles for one row, visibly disagreeing about where
+    /// it ended.
+    #[test]
+    fn a_header_stripe_is_as_wide_as_the_row_that_highlights() {
+        let mut app = app_with(
+            r#"{"a":1}"#,
+            vec![
+                ("X-Request-Id".into(), "r-42".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            200,
+        );
+        app.response_section = ResponseSection::Headers;
+        let ctx = themed_ctx();
+        panel_frame(&mut app, &ctx, vec![]);
+        let painted = panel_frame(&mut app, &ctx, vec![]);
+        let second = centre_of(&painted, "application/json");
+
+        panel_output(&mut app, &ctx, vec![egui::Event::PointerMoved(second)]);
+        let full = panel_output(&mut app, &ctx, vec![]);
+        let all = fills(&full);
+        let wash = all
+            .iter()
+            .filter(|(r, c)| c.a() > 0 && c.a() < 255 && r.contains(second))
+            .map(|(r, _)| *r)
+            .next()
+            .expect("the hovered row is washed");
+        // The striped row is the same row, drawn opaque underneath.
+        let faint = ctx.style_of(egui::Theme::Dark).visuals.faint_bg_color;
+        let stripe = all
+            .iter()
+            .filter(|(r, c)| *c == faint && r.contains(second))
+            .map(|(r, _)| *r)
+            .next()
+            .expect("the second row is striped");
+        assert!(
+            (stripe.width() - wash.width()).abs() < 0.5,
+            "stripe {stripe:?} is not the width of the highlight {wash:?}"
         );
     }
 

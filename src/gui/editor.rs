@@ -3192,12 +3192,17 @@ mod computed_suggestion_tests {
     /// around this", whether or not the function *has* to be given an
     /// argument. `timestamp([offset_seconds])` used to throw the word away
     /// because its argument is optional.
+    ///
+    /// Typed rather than picked out of the browse list by position: the list
+    /// is in alphabetical order, so "the row that happens to be first" is not
+    /// the function this test is about.
     #[test]
     fn a_function_with_an_optional_argument_still_wraps_what_is_there() {
         let mut app = app_with_row("id", "uuid");
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
         h.frame(&mut app, vec![], 0.05);
         h.frame(&mut app, key(egui::Key::Enter), 0.05);
         h.frame(&mut app, vec![], 0.05);
@@ -3216,6 +3221,8 @@ mod computed_suggestion_tests {
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
+        h.frame(&mut app, vec![], 0.05);
         // `timestamp_ms()` is the row under `timestamp([offset_seconds])`.
         h.frame(&mut app, key(egui::Key::ArrowDown), 0.05);
         h.frame(&mut app, key(egui::Key::Enter), 0.05);
@@ -3258,6 +3265,7 @@ mod computed_suggestion_tests {
         let mut h = Harness::new();
         h.click_text(&mut app, "uuid");
         h.frame(&mut app, key(egui::Key::Home), 0.05);
+        h.frame(&mut app, vec![egui::Event::Text("timestamp".into())], 0.05);
         h.frame(&mut app, vec![], 0.05);
         let painted = h.frame(&mut app, vec![], 0.05);
         let texts: Vec<&String> = painted.iter().map(|(t, _)| t).collect();

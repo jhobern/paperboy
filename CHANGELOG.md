@@ -225,6 +225,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- **The generator function dropdown is in alphabetical order.** The list was in
+  the order the table declares them, grouped by kind — which reads well as
+  source, but left anyone looking for `sha256` scanning two-thirds of a list
+  with nothing to scan against. The related sets that grouping protected keep
+  themselves together through their shared prefix (`random_*`, `hmac_*`), and
+  the variables offered above the functions are still their own block. Both
+  front-ends share the list, so both change together.
+
 - **The banner row is gone.** It spent three rows — a bordered block — on the
   app name, a `[English]` language tag and the occasional runner error. The
   language tag said nothing that every other word on screen doesn't; the name
@@ -339,6 +347,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   stay where they were.
 
 ### Fixed
+
+- **A response header row's stripe now reaches as far as its highlight.** The
+  zebra striping came from `Grid::striped`, which paints across the grid — as
+  wide as the widest name and value — while the row that hovers is the full
+  width of the panel, so every stripe stopped short of the highlight laid over
+  it. One rectangle now feeds both.
+
 
 - **Postman collections written against the older script API import their
   captures again.** `postman.setEnvironmentVariable(...)` and
