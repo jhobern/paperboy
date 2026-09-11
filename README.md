@@ -424,6 +424,16 @@ the shape these scripts are written in. `regex` is the escape hatch for what
 the whole match. Both treat "no such piece" and "matched nothing" as faults
 rather than an empty answer, since that text goes on to be signed or sent.
 
+**A name is written bare, not in braces.** Everywhere else in PaperBoy a
+variable is `{{name}}`; inside a generator expression it is just `name`, because
+an expression already names things — `concat("Bearer ", TOKEN)`. Writing
+`"{{TOKEN}}"` there is refused rather than accepted as a string, since a
+signature over the eight characters `{{TOKEN}}` is the right length, entirely
+plausible, and rejected with the same `401` as a wrong secret. (`\{` is the
+escape, for a string that really does want a brace.) A row can also be a plain
+literal — `expected = "APPROVED"` — which is how an assert compares against a
+per-request expectation: `jsonpath "$.status" == "{{expected}}"`.
+
 **Canonicalisation is yours.** PaperBoy signs exactly the bytes you assemble; it
 will not build a canonical request from the live headers, so AWS SigV4 and
 friends are out of scope. Chaining a MAC into the *key* of the next one isn't

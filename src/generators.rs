@@ -289,6 +289,37 @@ enum Expr {
 /// expression (`base64(hmac_sha256(k, concat(a, b)))` is four deep).
 const MAX_DEPTH: usize = 256;
 
+/// Why a `{{name}}` inside a generator expression is refused, worded as the fix.
+///
+/// Everywhere else in PaperBoy -- a URL, a header, a body, an assert -- a
+/// variable is written `{{name}}`, so reaching for the braces here is the
+/// natural mistake rather than a careless one. But an expression is not a
+/// template: a name is already a name, and `"{{SECRET}}"` is a perfectly good
+/// string literal, so accepting it would sign the eight characters `{{SECRET}}`
+/// and return a signature that is the right length, entirely plausible to look
+/// at, and rejected with the same `401` as a wrong secret. That is the exact
+/// failure this whole block exists to prevent, so the braces are a parse error
+/// at the moment they are typed instead.
+///
+/// Substituting them instead was the other option, and is rejected because it
+/// would give one thing two spellings and quietly bypass the ordering rules
+/// that `eval` applies to a reference -- a `{{row_below}}` would find an
+/// environment variable of the same name rather than reporting the cycle.
+fn braces_fault(text: &str) -> String {
+    match braced_name(text) {
+        Some(name) if !name.is_empty() => {
+            format!("write `{name}`, not `{{{{{name}}}}}`: an expression names a variable directly")
+        }
+        _ => "a variable is named directly here, not written in `{{ }}`".to_string(),
+    }
+}
+
+/// The name inside the first `{{ }}` of `text`, if it has a complete one.
+fn braced_name(text: &str) -> Option<&str> {
+    let rest = &text[text.find("{{")? + 2..];
+    Some(rest[..rest.find("}}")?].trim())
+}
+
 struct Parser<'a> {
     rest: &'a str,
 }
@@ -329,6 +360,7 @@ impl<'a> Parser<'a> {
             Some('"') => self.string(),
             Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
             Some(c) if is_name_char(c) => self.ident_or_call(depth),
+            Some('{') => Err(braces_fault(self.rest)),
             Some(c) => Err(format!("unexpected `{c}`")),
         }
     }
@@ -337,22 +369,42 @@ impl<'a> Parser<'a> {
         let mut out = String::new();
         let mut chars = self.rest.char_indices();
         chars.next(); // the opening quote
+        // Whether an unescaped `{{` has been seen: a placeholder inside a
+        // string is refused (see `braces_fault`), but `\{` is how a string that
+        // really does want a brace says so, and an escaped one must not trip
+        // the check.
+        let mut braced = false;
+        let mut prev_open_brace = false;
         while let Some((i, c)) = chars.next() {
             match c {
                 '"' => {
                     self.rest = &self.rest[i + 1..];
+                    if braced {
+                        return Err(braces_fault(&out));
+                    }
                     return Ok(Expr::Text(out));
                 }
-                '\\' => match chars.next() {
-                    Some((_, 'n')) => out.push('\n'),
-                    Some((_, 't')) => out.push('\t'),
-                    Some((_, 'r')) => out.push('\r'),
-                    Some((_, '"')) => out.push('"'),
-                    Some((_, '\\')) => out.push('\\'),
-                    Some((_, other)) => return Err(format!("unknown escape `\\{other}`")),
-                    None => return Err("string ends in a backslash".to_string()),
-                },
-                _ => out.push(c),
+                '\\' => {
+                    prev_open_brace = false;
+                    match chars.next() {
+                        Some((_, 'n')) => out.push('\n'),
+                        Some((_, 't')) => out.push('\t'),
+                        Some((_, 'r')) => out.push('\r'),
+                        Some((_, '"')) => out.push('"'),
+                        Some((_, '\\')) => out.push('\\'),
+                        // The way out of the rule below, for the rare string
+                        // that is meant to contain a placeholder rather than
+                        // stand in for one.
+                        Some((_, '{')) => out.push('{'),
+                        Some((_, other)) => return Err(format!("unknown escape `\\{other}`")),
+                        None => return Err("string ends in a backslash".to_string()),
+                    }
+                }
+                _ => {
+                    braced |= c == '{' && prev_open_brace;
+                    prev_open_brace = c == '{';
+                    out.push(c);
+                }
             }
         }
         Err("unterminated string".to_string())
@@ -2164,6 +2216,46 @@ mod tests {
         assert!(e.is_empty(), "{e:?}");
         assert_eq!(v["expected"], "APPROVED");
         assert_eq!(v["n"], "3");
+    }
+
+    /// The mistake every user of the rest of PaperBoy will make, because a URL,
+    /// a header, a body and an assert all take `{{name}}`. Accepting it inside
+    /// an expression would sign the braces themselves -- a wrong signature that
+    /// looks right -- so it is a parse error, worded as the fix.
+    #[test]
+    fn a_placeholder_in_an_expression_is_refused_not_signed() {
+        for expr in [
+            "{{VAR}}",
+            r#""{{VAR}}""#,
+            r#"hmac_sha256("{{SECRET}}", "m")"#,
+            r#"concat("x-", "{{VAR}}")"#,
+        ] {
+            let detail = parse(expr).expect_err(&format!("{expr} should not parse"));
+            assert!(
+                detail.contains("VAR") || detail.contains("SECRET"),
+                "{expr} said {detail:?}, which does not name the variable"
+            );
+            assert!(
+                detail.contains("not `{{"),
+                "{expr} said {detail:?}, which does not say what to write instead"
+            );
+        }
+        // Half a placeholder has no name to offer, so the message states the
+        // rule rather than guessing at one.
+        assert!(
+            parse(r#""{{oops""#)
+                .expect_err("unclosed braces")
+                .contains("named directly"),
+        );
+    }
+
+    /// The way out, for a string that really is meant to carry braces -- a body
+    /// template being built for something else to fill in.
+    #[test]
+    fn an_escaped_brace_is_a_brace() {
+        let (v, e) = run(&[("a", r#""\{{VAR}}""#)]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["a"], "{{VAR}}");
     }
 
     #[test]

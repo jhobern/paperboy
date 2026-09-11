@@ -10,6 +10,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.5.5] - 2026-09-08
 
+### Fixed
+
+- A `{{name}}` written inside a `[Gen]` expression is now refused, with a
+  message naming what to write instead. Everywhere else in PaperBoy a variable
+  is `{{name}}`, so reaching for the braces here is the natural mistake — but an
+  expression names variables directly, which made `"{{SECRET}}"` a perfectly
+  good *string literal* and `hmac_sha256("{{SECRET}}", m)` a signature over the
+  ten characters of the placeholder: the right length, entirely plausible, and
+  rejected with the same `401` as a wrong secret. That is precisely the class of
+  failure the block exists to prevent, so it is a parse error at the moment it
+  is typed. `\{` is the way out for a string that really does want a brace.
+
+- Importing a Postman script that assembles a value out of other variables —
+  `pm.environment.set("url", "{{base}}/orders")`, which is most of what these
+  scripts do — now emits `concat(base, "/orders")` rather than a row whose value
+  is the braces themselves. Hurl does not expand a value it has just
+  substituted, so the old row sent `{{base}}/orders` to the server verbatim. A
+  placeholder PaperBoy cannot name (`{{$randomFirstName}}`) is left to
+  `CONVERSION-NOTES.md` instead, on the same principle as every other unclaimed
+  dynamic: a plausible wrong value is harder to notice than a written-down gap.
+
 ### Added
 
 - **A `[Gen]` block can now read the request it belongs to.** `method`, `url`,

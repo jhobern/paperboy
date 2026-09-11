@@ -2526,7 +2526,10 @@ fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
     if let Some(text) = unquote(value) {
         // `[Gen]` has no escape syntax, so a literal carrying a quote or a
         // backslash cannot be written down as one and is left to the note.
-        return (!text.contains(['"', '\\'])).then(|| format!("\"{text}\""));
+        if text.contains(['"', '\\']) {
+            return None;
+        }
+        return literal_expression(text);
     }
     if is_hurl_number(value) {
         return Some(value.to_string());
@@ -2552,6 +2555,54 @@ fn gen_expression(value: &str, uuid_aliases: &[String]) -> Option<String> {
         | "Math.round(newDate().getTime()/1000)" => Some("timestamp".to_string()),
         "newDate().toISOString()" => Some("iso8601".to_string()),
         _ => replaced_dynamic(&c),
+    }
+}
+
+/// A string the script assigned, as a generator expression.
+///
+/// Plain text is itself, quoted. Text carrying `{{name}}` is *not*: a generator
+/// expression names variables directly, and a row that evaluated to the literal
+/// characters `{{base}}/orders` would be substituted into the request as those
+/// characters -- Hurl does not expand a value it has just substituted -- so the
+/// request would go out with the braces still in it. Joining the pieces with
+/// `concat` says what the script meant and is checked like any other row.
+///
+/// A placeholder that is not a plain variable name -- Postman's `{{$guid}}` and
+/// friends, or a name Hurl would read only part of -- is left to the conversion
+/// note instead of guessed at, for the reason every other unclaimed dynamic is:
+/// a plausible wrong value is harder to notice than a gap that is written down.
+fn literal_expression(text: &str) -> Option<String> {
+    if !text.contains("{{") {
+        return Some(format!("\"{text}\""));
+    }
+    let mut pieces: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("{{") {
+        let close = rest.find("}}")?;
+        if close < open {
+            return None;
+        }
+        let name = rest[open + 2..close].trim();
+        if !crate::hurl::is_variable_name(name) {
+            return None;
+        }
+        if open > 0 {
+            pieces.push(format!("\"{}\"", &rest[..open]));
+        }
+        pieces.push(name.to_string());
+        rest = &rest[close + 2..];
+    }
+    // A trailing `}}` with no `{{` before it is text, not half a placeholder.
+    if rest.contains("{{") {
+        return None;
+    }
+    if !rest.is_empty() {
+        pieces.push(format!("\"{rest}\""));
+    }
+    match pieces.len() {
+        0 => None,
+        1 => Some(pieces.remove(0)),
+        _ => Some(format!("concat({})", pieces.join(", "))),
     }
 }
 
@@ -5383,6 +5434,68 @@ mod script_tests {
         assert_eq!(
             back[0].generators, c.entries[0].generators,
             "and the block reads back"
+        );
+    }
+
+    /// A script that assembles a value out of other variables is the common
+    /// shape `pm.environment.set` takes, and the braces cannot survive into the
+    /// row: a generator names variables directly, and a value substituted into
+    /// the request is not expanded again, so the braces would go out on the
+    /// wire. They become `concat` of the pieces instead.
+    #[test]
+    fn a_templated_literal_becomes_the_pieces_it_is_made_of() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('whole', '{{base}}');",
+             "pm.environment.set('tail', '{{base}}/orders');",
+             "pm.environment.set('mid', 'a{{base}}b{{leg}}c');",
+             "pm.environment.set('plain', 'nothing here');"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert_eq!(
+            c.entries[0].generators,
+            vec![
+                // One placeholder and nothing else is simply the name: wrapping
+                // it in `concat` would be a toll booth.
+                ("whole".to_string(), "base".to_string()),
+                ("tail".to_string(), r#"concat(base, "/orders")"#.to_string()),
+                (
+                    "mid".to_string(),
+                    r#"concat("a", base, "b", leg, "c")"#.to_string()
+                ),
+                ("plain".to_string(), "\"nothing here\"".to_string()),
+            ]
+        );
+        // Every row it emits must be a row the generator language accepts --
+        // an importer that writes an expression the parser refuses produces a
+        // block that is one long error.
+        for (_, expr) in &c.entries[0].generators {
+            assert!(
+                crate::generators::check(&[(String::from("v"), expr.clone())]).is_empty(),
+                "{expr} is not a valid generator expression"
+            );
+        }
+    }
+
+    /// A placeholder PaperBoy cannot name -- Postman's own dynamics, or a name
+    /// Hurl would read only part of -- is left to the conversion note rather
+    /// than guessed at.
+    #[test]
+    fn a_placeholder_that_is_not_a_plain_name_is_left_to_the_note() {
+        let json = r#"{"info":{"name":"d","schema":"x"},"item":[
+          {"name":"x","event":[{"listen":"prerequest","script":{"exec":[
+             "pm.environment.set('a', '{{$randomFirstName}}');",
+             "pm.environment.set('b', '{{not a name}}');"]}}],
+           "request":{"method":"GET","url":"https://h/x"}}]}"#;
+        let c = convert_postman(json);
+        assert!(
+            c.entries[0].generators.is_empty(),
+            "{:?}",
+            c.entries[0].generators
+        );
+        assert!(
+            !c.notes.is_empty(),
+            "the script was dropped without saying so"
         );
     }
 
