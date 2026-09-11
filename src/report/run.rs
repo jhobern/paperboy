@@ -299,6 +299,8 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
+        skipped: ex.skipped,
+        warnings: ex.warnings,
         timing_columns: ex.timing_columns.into_iter().collect(),
         column_stats: flow.column_stats(),
         column_images: flow.column_images(),
@@ -560,6 +562,31 @@ struct Exec<'a> {
     /// Non-fatal problems (unresolved request, transport failure, …). Every
     /// issue still leaves a row.
     errors: Vec<String>,
+    /// Steps not run because a dependency did not succeed — see
+    /// [`ReportResult::skipped`].
+    skipped: Vec<String>,
+    /// Problems that must not change the verdict — see
+    /// [`ReportResult::warnings`].
+    warnings: Vec<String>,
+    /// Step names in the order they ran, so a teardown can be ordered against
+    /// the setup it mirrors.
+    step_order: Vec<String>,
+    /// The request each step ran, so a dependency can be worked out from the
+    /// captures that request *declares*.
+    ///
+    /// Declared, not observed: a request that failed captured nothing, which is
+    /// precisely the moment a teardown needs to know it depended on it. Reading
+    /// the runtime capture map instead would make the edge disappear exactly
+    /// when it matters and run the cleanup against a resource that was never
+    /// created.
+    step_request: HashMap<String, String>,
+    /// Whether each step that has run so far succeeded, by step name.
+    ///
+    /// Kept as execution state rather than output because it is read *during*
+    /// the run: it is what tells a region whether a step's dependencies held,
+    /// and what tells a `CLEANUP` whether the thing it exists to tear down was
+    /// ever built.
+    step_ok: HashMap<String, bool>,
     /// Field names from the flow's `ENVS BASELINE(…) SHOW(…)` clause. These
     /// count as explicitly-shown fields for *every* request in the run, because
     /// the finalize-phase copy that produces `baseline.<alias>.<field>` can only
@@ -582,6 +609,9 @@ struct ExecState {
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
     step_captures: HashMap<String, HashMap<String, String>>,
+    step_ok: HashMap<String, bool>,
+    step_order: Vec<String>,
+    step_request: HashMap<String, String>,
     key_parts: Vec<String>,
     path: Vec<(usize, usize)>,
     target: Option<String>,
@@ -597,6 +627,8 @@ struct IterOut {
     columns: Vec<String>,
     timing_columns: Vec<String>,
     errors: Vec<String>,
+    skipped: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl<'a> Exec<'a> {
@@ -607,6 +639,9 @@ impl<'a> Exec<'a> {
             lists: HashMap::new(),
             captures: HashMap::new(),
             step_captures: HashMap::new(),
+            step_ok: HashMap::new(),
+            step_order: Vec::new(),
+            step_request: HashMap::new(),
             key_parts: Vec::new(),
             path: Vec::new(),
             target: None,
@@ -615,6 +650,8 @@ impl<'a> Exec<'a> {
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             errors: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
             baseline_show: Vec::new(),
         }
     }
@@ -628,6 +665,9 @@ impl<'a> Exec<'a> {
             lists: self.lists.clone(),
             captures: self.captures.clone(),
             step_captures: self.step_captures.clone(),
+            step_ok: self.step_ok.clone(),
+            step_order: self.step_order.clone(),
+            step_request: self.step_request.clone(),
             key_parts: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
@@ -646,6 +686,9 @@ impl<'a> Exec<'a> {
             lists: state.lists,
             captures: state.captures,
             step_captures: state.step_captures,
+            step_ok: state.step_ok,
+            step_order: state.step_order,
+            step_request: state.step_request,
             key_parts: state.key_parts,
             path: state.path,
             target: state.target,
@@ -654,6 +697,8 @@ impl<'a> Exec<'a> {
             column_order: Vec::new(),
             timing_columns: Vec::new(),
             errors: Vec::new(),
+            skipped: Vec::new(),
+            warnings: Vec::new(),
             baseline_show: state.baseline_show,
         }
     }
@@ -729,6 +774,20 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Record whether a step succeeded.
+    ///
+    /// "Succeeded" is the runner's own verdict for the entry — status, asserts
+    /// and transport all satisfied — and a step that never got as far as being
+    /// sent counts as failed, because the one thing that must not follow from a
+    /// missing result is that everything downstream is safe to run.
+    fn note_step(&mut self, step: &str, request: &str, ok: bool) {
+        if self.step_ok.insert(step.to_string(), ok).is_none() {
+            self.step_order.push(step.to_string());
+        }
+        self.step_request
+            .insert(step.to_string(), request.to_string());
+    }
+
     /// Look up a single variable across the full precedence stack.
     fn lookup(&self, key: &str) -> Option<String> {
         if let Some((step, var)) = key.split_once('.')
@@ -798,6 +857,10 @@ impl<'a> Exec<'a> {
         let mut own: HashMap<String, String> = HashMap::new();
         let mut child_rows: Vec<ReportRow> = Vec::new();
         let mut has_loop = false;
+        // Cleanups are collected as they are passed and run once the block is
+        // finished, so a teardown is written beside the thing it tears down
+        // rather than at the far end of the flow.
+        let mut cleanups: Vec<&FlowNode> = Vec::new();
 
         for (node_index, node) in nodes.iter().enumerate() {
             match node {
@@ -832,7 +895,9 @@ impl<'a> Exec<'a> {
                         Err(e) => self.errors.push(e),
                     }
                 }
-                FlowNode::Request { name, alias, using } => {
+                FlowNode::Request {
+                    name, alias, using, ..
+                } => {
                     self.run_request(name, alias.as_deref(), using);
                 }
                 FlowNode::Report(stmt) => {
@@ -880,8 +945,11 @@ impl<'a> Exec<'a> {
                 // has to be observable only through ordering, or the migration
                 // path onto the feature doesn't exist.
                 FlowNode::Graph { body, .. } => self.run_graph(body, &mut own),
+                FlowNode::Cleanup { .. } => cleanups.push(node),
             }
         }
+
+        self.run_cleanups(&cleanups);
 
         if has_loop {
             for row in &mut child_rows {
@@ -893,6 +961,140 @@ impl<'a> Exec<'a> {
         } else {
             vec![self.emit_row(own)]
         }
+    }
+
+    /// Run a block's `CLEANUP` statements, once the block has finished.
+    ///
+    /// Order is the reverse of the order the things being torn down were built:
+    /// a cleanup runs before any cleanup whose dependencies finished earlier,
+    /// which for the ordinary create-then-destroy shape unwinds the flow the
+    /// way it was wound. A cleanup that depends on nothing sorts last, because
+    /// nothing constrains it and the thing set up first is torn down last.
+    ///
+    /// A cleanup is skipped only when one of *its own* dependencies did not
+    /// succeed — never because some unrelated step failed. That is the whole
+    /// reason it is a construct rather than a trailing `REQUEST`: teardown has
+    /// to survive exactly the failures it exists to clean up after, and a
+    /// blanket "something went wrong, skip the cleanup" leaks the resource
+    /// every time.
+    fn run_cleanups(&mut self, cleanups: &[&FlowNode]) {
+        if cleanups.is_empty() {
+            return;
+        }
+        // Work out every cleanup's dependencies and position *before* running
+        // any of them. A cleanup sends a request, which records a step of its
+        // own, and a dependency set computed as we go would start seeing those
+        // — so two cleanups could end up ordered against each other by nothing
+        // more than which was resolved first.
+        let mut planned: Vec<(usize, Option<usize>, &FlowNode, String, Vec<String>)> = Vec::new();
+        for (written, node) in cleanups.iter().enumerate() {
+            let FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } = node
+            else {
+                continue;
+            };
+            let step = alias.clone().unwrap_or_else(|| leaf(name).to_string());
+            let deps = self.cleanup_deps(name, depends, using);
+            // How late the cleanup's latest dependency ran. `None` — it depends
+            // on nothing — sorts first here, and therefore last once reversed.
+            let depth = deps
+                .iter()
+                .filter_map(|d| self.step_order.iter().position(|s| s == d))
+                .max();
+            planned.push((written, depth, node, step, deps));
+        }
+        // Reverse-dependency order: the last thing built is the first thing
+        // torn down, which for the ordinary create-then-destroy shape unwinds
+        // the flow exactly the way it was wound.
+        planned.sort_by_key(|(written, depth, ..)| {
+            (std::cmp::Reverse(*depth), std::cmp::Reverse(*written))
+        });
+
+        for (_, _, node, step, deps) in planned {
+            let FlowNode::Cleanup {
+                name, alias, using, ..
+            } = node
+            else {
+                continue;
+            };
+            if let Some(dep) = deps
+                .into_iter()
+                .find(|d| !self.step_ok.get(d).copied().unwrap_or(false))
+            {
+                // Not an error. A cleanup whose subject was never created has
+                // nothing to do, and saying "failed" about it would bury the
+                // real failure under a second one caused entirely by the first.
+                self.skipped.push(step.clone());
+                self.note_step(&step, name, false);
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_skipped,
+                    &[&step, &dep],
+                ));
+                continue;
+            }
+            let before = self.errors.len();
+            self.run_request(name, alias.as_deref(), using);
+            // A failing cleanup is a warning, not an error: the requests under
+            // test already passed or failed on their own terms, and letting a
+            // leaked test resource turn a green run red would train everyone to
+            // ignore the exit code. The error it raised is moved, not copied,
+            // so it can't count twice.
+            let failed = !self.step_ok.get(&step).copied().unwrap_or(false);
+            let raised: Vec<String> = self.errors.drain(before..).collect();
+            if failed {
+                let detail = raised.into_iter().next().unwrap_or_else(|| step.clone());
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_failed,
+                    &[&step, &detail],
+                ));
+            }
+        }
+    }
+
+    /// The steps one `CLEANUP` depends on: whatever it names explicitly, plus
+    /// whatever its own request and `USING(…)` values read.
+    ///
+    /// Only names that are actually steps count. A reference to an ordinary
+    /// variable says nothing about ordering, and treating one as a dependency
+    /// would skip the teardown over a name that was never going to "succeed".
+    fn cleanup_deps(&self, name: &str, depends: &[String], using: &[UsingItem]) -> Vec<String> {
+        let mut out: Vec<String> = depends.to_vec();
+        let mut refs: Vec<String> = Vec::new();
+        if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
+            refs.extend(crate::request::entry_referenced_keys(entry));
+        }
+        for item in using {
+            if let UsingItem::Override { value, .. } = item {
+                refs.extend(crate::environment::referenced_keys(value));
+            }
+        }
+        for r in refs {
+            // A qualified reference names its step outright; a flat one is
+            // matched against the steps that captured it.
+            match r.split_once('.') {
+                Some((step, _)) if self.step_ok.contains_key(step) => out.push(step.to_string()),
+                Some(_) => {}
+                None => {
+                    for (step, request) in &self.step_request {
+                        let Some(entry) =
+                            resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
+                        else {
+                            continue;
+                        };
+                        if entry.captures.iter().any(|(c, _)| *c == r) {
+                            out.push(step.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Build the single row for a loop-free (innermost) block: this-block's
@@ -931,11 +1133,13 @@ impl<'a> Exec<'a> {
         alias: Option<&str>,
         using: &[UsingItem],
     ) -> Option<EntryOutcome> {
+        let step = alias.unwrap_or_else(|| leaf(name)).to_string();
         let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
                 self.errors
                     .push(format!("request '{name}' could not be resolved"));
+                self.note_step(&step, name, false);
                 return None;
             }
         };
@@ -943,6 +1147,7 @@ impl<'a> Exec<'a> {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e);
+                self.note_step(&step, name, false);
                 return None;
             }
         };
@@ -951,9 +1156,12 @@ impl<'a> Exec<'a> {
             self.errors.push(format!("{name}: {err}"));
         }
         let eo = out.entries.into_iter().next();
-        if let Some(eo) = &eo {
-            let step = alias.unwrap_or_else(|| leaf(name)).to_string();
-            self.record_captures(&step, &eo.captures);
+        match &eo {
+            Some(eo) => {
+                self.record_captures(&step, &eo.captures);
+                self.note_step(&step, name, eo.ok);
+            }
+            None => self.note_step(&step, name, false),
         }
         eo
     }
@@ -1032,6 +1240,7 @@ impl<'a> Exec<'a> {
                 show,
                 hide,
                 with,
+                ..
             } => self.eval_report_request(
                 name,
                 alias.as_deref(),
@@ -1099,6 +1308,7 @@ impl<'a> Exec<'a> {
                     format!("{alias}.Error"),
                     format!("unresolved request '{name}'"),
                 ));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
@@ -1111,6 +1321,7 @@ impl<'a> Exec<'a> {
             Err(e) => {
                 self.errors.push(e.clone());
                 cells.push((format!("{alias}.Error"), e));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
@@ -1123,6 +1334,7 @@ impl<'a> Exec<'a> {
                     .unwrap_or_else(|| "request produced no response".into());
                 self.errors.push(format!("{name}: {err}"));
                 cells.push((format!("{alias}.Error"), err));
+                self.note_step(&alias, name, false);
                 return cells;
             }
         };
@@ -1131,6 +1343,7 @@ impl<'a> Exec<'a> {
         // and never touch the capture chain). The alias doubles as the step
         // name, so `{{alias.var}}` reaches exactly this statement's captures.
         self.record_captures(&alias, &eo.captures);
+        self.note_step(&alias, name, eo.ok);
 
         // Resolve the response format: per-statement / WITH override, else the
         // prelude default.
@@ -1306,6 +1519,8 @@ impl<'a> Exec<'a> {
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
+                skipped: sub.skipped,
+                warnings: sub.warnings,
             }
         };
         self.run_iterations(items.len(), parallel, run_one)
@@ -1358,8 +1573,36 @@ impl<'a> Exec<'a> {
                 }
             }
 
+            // A step whose dependency did not produce a result cannot be run,
+            // and must not be reported as anything but skipped. Checking only
+            // the *direct* predecessors is enough to skip recursively, because
+            // `plan.order` is topological: a step's predecessors have all been
+            // decided by the time it is reached, and a skipped one is already
+            // recorded as not-succeeded.
+            let blocker = plan.incoming(idx).into_iter().find_map(|e| {
+                let dep = &plan.steps[e.from].name;
+                (!self.step_ok.get(dep).copied().unwrap_or(false)).then(|| dep.clone())
+            });
+            if let Some(dep) = blocker {
+                self.note_step(&step.name, &step.request, false);
+                self.skipped.push(step.name.clone());
+                // The row still gets a cell, and it says *skipped* rather than
+                // being left blank: an empty cell is indistinguishable from a
+                // request that returned nothing, and the whole point of the
+                // verdict is that the reader must not mistake this for a pass.
+                if let FlowNode::Report(ReportStmt::Request { .. }) = &body[step.written] {
+                    let key = format!("{}.Error", step.name);
+                    let text = crate::i18n::fill(self.ctx.strings.run_step_skipped, &[&dep]);
+                    self.note_column(&key);
+                    own.insert(key, text);
+                }
+                continue;
+            }
+
             match &body[step.written] {
-                FlowNode::Request { name, alias, using } => {
+                FlowNode::Request {
+                    name, alias, using, ..
+                } => {
                     self.run_request(name, alias.as_deref(), using);
                 }
                 FlowNode::Report(stmt) => {
@@ -1464,6 +1707,8 @@ impl<'a> Exec<'a> {
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
+                skipped: sub.skipped,
+                warnings: sub.warnings,
             }
         };
         let mut rows = self.run_iterations(live.len(), parallel, run_one);
@@ -1556,6 +1801,8 @@ impl<'a> Exec<'a> {
                 self.note_timing_column(c);
             }
             self.errors.extend(out.errors);
+            self.skipped.extend(out.skipped);
+            self.warnings.extend(out.warnings);
             rows.extend(out.rows);
         }
         rows
@@ -2967,6 +3214,199 @@ mod tests {
         );
         assert_eq!(fake.call_count(), 0);
         assert!(!res.errors.is_empty());
+    }
+
+    /// A canned response that fails, so a step can be made to not succeed.
+    fn failing(title: &str) -> (&str, Canned) {
+        (
+            title,
+            Canned {
+                status: 500,
+                error: Some("boom".into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn depends_orders_two_steps_that_share_no_data() {
+        // The case inference cannot reach: an upload whose result is fetched
+        // later by an id that was a parameter all along captures nothing, so
+        // nothing in the text ties the two together. `DEPENDS` is how the
+        // author supplies the edge that is genuinely invisible.
+        let entries = [graph_entry("fetch", &[], &[]), graph_entry("put", &[], &[])];
+        let fake = Fake::new(&[ok("fetch"), ok("put")]);
+        let res = run(
+            "GRAPH\n    REQUEST fetch DEPENDS put\n    REQUEST put\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["put", "fetch"]);
+    }
+
+    #[test]
+    fn a_failed_step_skips_everything_downstream_of_it() {
+        // Recursively, and only downstream: `c` depends on `b` depends on `a`,
+        // and `d` on nothing. `a` failing must take `b` and `c` with it and
+        // leave `d` alone — an unrelated branch has no reason to stop.
+        let entries = [
+            graph_entry("a", &["t"], &[]),
+            graph_entry("b", &["u"], &["t"]),
+            graph_entry("c", &[], &["u"]),
+            graph_entry("d", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("a"), ok("b"), ok("c"), ok("d")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["a", "d"]);
+        assert_eq!(res.skipped, ["b", "c"]);
+    }
+
+    #[test]
+    fn a_skipped_reported_step_says_so_in_its_row() {
+        // The one thing a reader must not be able to conclude is that it
+        // passed, so the cell is filled rather than left blank: an empty cell
+        // is indistinguishable from a request that returned nothing.
+        let entries = [graph_entry("a", &["t"], &[]), graph_entry("b", &[], &["t"])];
+        let fake = Fake::new(&[failing("a"), ok("b")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REPORT REQUEST b\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.skipped, ["b"]);
+        let cell = res.rows[0]
+            .cells
+            .get("b.Error")
+            .cloned()
+            .unwrap_or_default();
+        assert!(cell.contains("skipped"), "{cell}");
+        assert!(cell.contains('a'), "{cell}");
+    }
+
+    #[test]
+    fn a_cleanup_runs_after_the_block_not_where_it_is_written() {
+        // Written beside the thing it tears down, run when the work is done.
+        let entries = [
+            graph_entry("purge", &[], &[]),
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok("purge"), ok("a"), ok("b")]);
+        let res = run(
+            "CLEANUP purge\nREQUEST a\nREQUEST b\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["a", "b", "purge"]);
+    }
+
+    #[test]
+    fn cleanups_unwind_in_reverse_order_of_what_they_tear_down() {
+        // `close_session` needs the session, `revoke` needs the token, and the
+        // token was obtained first — so the session is closed before the token
+        // is revoked, which is the only order that works.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("open", &["sid"], &["token"]),
+            graph_entry("revoke", &[], &["token"]),
+            graph_entry("close", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            ok_capturing("open", &[("sid", "S")]),
+            ok("revoke"),
+            ok("close"),
+        ]);
+        let res = run(
+            "REQUEST login\nREQUEST open\nCLEANUP revoke\nCLEANUP close\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["login", "open", "close", "revoke"]);
+    }
+
+    #[test]
+    fn a_cleanup_survives_a_failure_it_does_not_depend_on() {
+        // The whole reason `CLEANUP` is a construct rather than a trailing
+        // `REQUEST`: teardown has to stay alive through exactly the failures it
+        // exists to clean up after. `work` failing must not leak the session.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("work", &[], &["token"]),
+            graph_entry("revoke", &[], &["token"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            failing("work"),
+            ok("revoke"),
+        ]);
+        let res = run(
+            "REQUEST login\nREQUEST work\nCLEANUP revoke\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(fake.call_order().contains(&"revoke".to_string()));
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+    }
+
+    #[test]
+    fn a_cleanup_is_skipped_when_the_thing_it_tears_down_was_never_built() {
+        // Nothing to tear down, and saying "failed" about it would bury the
+        // real failure under a second one caused entirely by the first.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("revoke", &[], &["token"]),
+        ];
+        let fake = Fake::new(&[failing("login"), ok("revoke")]);
+        let res = run("REQUEST login\nCLEANUP revoke\n", &entries, &[], &[], &fake);
+        assert_eq!(fake.call_order(), ["login"]);
+        assert_eq!(res.skipped, ["revoke"]);
+        assert!(
+            res.warnings.iter().any(|w| w.contains("revoke")),
+            "{:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_needs_nothing_always_runs() {
+        // The intended degenerate case, not an omission.
+        let entries = [graph_entry("a", &[], &[]), graph_entry("purge", &[], &[])];
+        let fake = Fake::new(&[failing("a"), ok("purge")]);
+        let res = run("REQUEST a\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert_eq!(fake.call_order(), ["a", "purge"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+    }
+
+    #[test]
+    fn a_failing_cleanup_warns_rather_than_erroring() {
+        // Letting a leaked test resource turn a green run red would train
+        // everyone to ignore the exit code.
+        let entries = [graph_entry("a", &[], &[]), graph_entry("purge", &[], &[])];
+        let fake = Fake::new(&[ok("a"), failing("purge")]);
+        let res = run("REQUEST a\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.warnings.len(), 1, "{:?}", res.warnings);
+        assert!(res.warnings[0].contains("purge"), "{:?}", res.warnings);
     }
 
     #[test]

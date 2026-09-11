@@ -378,7 +378,20 @@ pub fn run(
         r
     };
 
-    // --- errors ----------------------------------------------------------
+    // --- warnings, skips, errors -----------------------------------------
+    if !result.warnings.is_empty() {
+        decor.line(&format!("  Warnings   : {}", result.warnings.len()));
+        for w in &result.warnings {
+            decor.line(&format!("    ~ {w}"));
+        }
+    }
+    if !result.skipped.is_empty() {
+        decor.line(&format!(
+            "  Skipped    : {} ({})",
+            result.skipped.len(),
+            result.skipped.join(", ")
+        ));
+    }
     if !result.errors.is_empty() {
         decor.line(&format!("  Errors     : {}", result.errors.len()));
         for e in &result.errors {
@@ -400,11 +413,25 @@ pub fn run(
         }
     }
 
-    // The report was produced either way, but rows that errored mean the run
-    // did not do what was asked of it, and a caller scripting this needs to
-    // hear about that in the exit code rather than by scraping the output.
-    i32::from(!result.errors.is_empty())
+    // The report was produced either way, but a caller scripting this needs to
+    // hear what happened in the exit code rather than by scraping the output.
+    //
+    // 3 beats 1 because it is the more informative of the two, and a skip only
+    // ever arises *from* a failure — so exit 3 already implies exit 1's
+    // condition while adding the fact that part of the run never happened at
+    // all. (2 is left alone: clap uses it for argument errors, and a caller
+    // must be able to tell "you invoked me wrongly" from "your API is broken".)
+    match (result.skipped.is_empty(), result.errors.is_empty()) {
+        (false, _) => EXIT_SKIPPED,
+        (true, false) => 1,
+        (true, true) => 0,
+    }
 }
+
+/// The run finished, but some steps never ran because something they depended
+/// on failed. Documented in the README; changing it is a breaking change for
+/// anyone scripting a release check.
+pub const EXIT_SKIPPED: i32 = 3;
 
 /// Where the rendered report ended up (for the closing summary line).
 enum OutputTarget {

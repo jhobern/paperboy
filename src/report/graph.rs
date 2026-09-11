@@ -33,6 +33,12 @@ pub enum EdgeKind {
     /// so `--dry-run` can show *which* value — that is what makes a missing or
     /// surprising edge visible by eye.
     Data(String),
+    /// The author wrote `DEPENDS`. Kept distinct from an inferred edge in the
+    /// dry-run listing, because the two answer different questions: an inferred
+    /// edge can be checked against the collection, and a declared one can only
+    /// be taken on trust — so the reader needs to know which they are looking
+    /// at.
+    Declared,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +119,15 @@ pub fn step_name(node: &FlowNode) -> Option<(String, &str)> {
     Some((step, name.as_str()))
 }
 
+/// The `DEPENDS` names on a node.
+pub fn declared_deps(node: &FlowNode) -> &[String] {
+    match node {
+        FlowNode::Request { depends, .. } => depends,
+        FlowNode::Report(ReportStmt::Request { depends, .. }) => depends,
+        _ => &[],
+    }
+}
+
 /// The `USING(…)` values on a node — PaperTrail source text, so the only place
 /// a qualified reference can be written.
 fn using_values(node: &FlowNode) -> &[UsingItem] {
@@ -165,6 +180,30 @@ pub fn build(
 
     let mut errors = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+
+    // Declared edges first, so that when a step is named by both a `DEPENDS`
+    // and a data reference the edge keeps the reason the author wrote down.
+    // The pair says the same thing about order either way, and the explicit one
+    // is the one they will be looking for in the listing.
+    for (i, step) in steps.iter().enumerate() {
+        for dep in declared_deps(&body[step.written]) {
+            match by_name.get(dep.as_str()) {
+                // A step depending on itself is never a typo worth guessing at:
+                // it is a cycle of length one, and saying so here beats letting
+                // the toposort report it as an unorderable region.
+                Some(&j) if j == i => {
+                    errors.push(fill(strings.diag_graph_depends_self, &[&step.name]))
+                }
+                Some(&j) => add_edge(&mut edges, j, i, EdgeKind::Declared),
+                // `DEPENDS` names a *step*, and only a region's own steps are
+                // ordered by the graph. A name from outside it is either a typo
+                // or a misunderstanding of the barrier — everything before the
+                // region has already finished — and both are worth saying.
+                None => errors.push(fill(strings.diag_graph_depends_unknown, &[&step.name, dep])),
+            }
+        }
+    }
+
     for (i, step) in steps.iter().enumerate() {
         let node = &body[step.written];
         // Everything the step reads: the request's own `{{VAR}}`s, plus the
@@ -355,6 +394,9 @@ pub fn explain(
                     .map(|e| match &e.kind {
                         EdgeKind::Data(var) => {
                             format!("data: {}.{var}", plan.steps[e.from].name)
+                        }
+                        EdgeKind::Declared => {
+                            format!("declared: {}", plan.steps[e.from].name)
                         }
                     })
                     .collect();

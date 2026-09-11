@@ -690,3 +690,55 @@ whole report. Naming a step that no region declares is an error rather than a
 silent empty run. `--dry-run` lists the steps grouped by how deep in the graph
 they sit, which is how you check the shape of a region without sending
 anything.
+
+`DEPENDS` states an ordering the data doesn't show. Inference only sees values
+flowing from a capture to a reference, and some dependencies leave no such
+trace — uploading a file that a later request fetches by an id it already had,
+say. `REQUEST dfa/result DEPENDS upload` says so outright. Names are the step
+names, separated by commas, and a `DEPENDS` is only meaningful inside a region:
+outside one, written order already *is* the order, so PaperBoy rejects it
+rather than let it look like it did something.
+
+Clauses may be written in any order, and a long statement may gather them into
+a bracketed group opening on the statement's own line:
+
+```
+GRAPH
+    REQUEST dfa/result AS result (
+        DEPENDS upload, session
+        USING(query.id = "{{session.id}}")
+    )
+END
+```
+
+#### Cleanup
+
+`CLEANUP` marks a request that undoes something — deleting a session, releasing
+a lock. It is written where it belongs logically but runs at the end of its
+block: at the end of the flow at the top level, at the end of each iteration
+inside a `FOR`. Cleanups run in reverse dependency order, so a thing is torn
+down before whatever it was built on.
+
+```
+REQUEST auth/login AS login
+CLEANUP auth/logout USING(header.Authorization = "{{login.token}}")
+REQUEST orders/create
+```
+
+A cleanup whose dependency never succeeded is skipped — there is nothing to
+undo — and a cleanup that fails is reported as a warning rather than an error,
+because a teardown failing is nearly always a consequence of the real failure
+and shouldn't be allowed to bury it.
+
+#### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Everything ran and every assertion passed. |
+| `1`  | Something failed: a request, an assertion, or the report itself. |
+| `3`  | Steps were skipped because something they depended on failed. |
+
+`3` implies `1` — a skip only ever follows a failure — and says the run is
+additionally incomplete, so a pipeline that only cares about pass/fail can
+treat any non-zero code the same way while one that reruns can tell the
+difference. `2` is left alone: it is what `clap` uses for a bad command line.

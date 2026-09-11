@@ -227,7 +227,33 @@ pub enum FlowNode {
         /// request is invoked exactly once in the flow. Validation enforces
         /// both, so two invocations can never silently collapse into one node.
         alias: Option<String>,
+        /// `DEPENDS a, b` — steps this one must run after, for orderings the
+        /// data does not reveal. Inference can only see values flowing between
+        /// requests; a server-side effect (an upload whose result is fetched
+        /// later by an id that was a parameter all along) leaves no trace in
+        /// the text, and this clause is how the author supplies it. Empty = no
+        /// clause. Only meaningful inside a `GRAPH`, where order is the graph's
+        /// to decide; validation rejects it elsewhere.
+        depends: Vec<String>,
         /// See [`ReportStmt::Request::using`].
+        using: Vec<UsingItem>,
+    },
+    /// `CLEANUP <name> [AS <step>] [DEPENDS …] [USING(…)]` — teardown.
+    ///
+    /// Deferred, not sequential: a cleanup runs at the end of the block it is
+    /// written in, after everything that block does. Written where the resource
+    /// is created, run when the work with it is finished — which is the only
+    /// placement that survives the statements around it being reordered.
+    ///
+    /// It is skipped when something it depends on did not succeed, because
+    /// there is then nothing to tear down; it is *not* skipped merely because
+    /// some unrelated step failed, which is the whole reason it is a separate
+    /// construct rather than a trailing `REQUEST`. Teardown has to stay alive
+    /// through exactly the failures it exists to clean up after.
+    Cleanup {
+        name: String,
+        alias: Option<String>,
+        depends: Vec<String>,
         using: Vec<UsingItem>,
     },
     /// `REPORT …` — send/compute and emit column(s) into the current row.
@@ -532,6 +558,14 @@ pub enum ReportStmt {
     Request {
         name: String,
         alias: Option<String>,
+        /// `DEPENDS a, b` — steps this one must run after, for orderings the
+        /// data does not reveal. Inference can only see values flowing between
+        /// requests; a server-side effect (an upload whose result is fetched
+        /// later by an id that was a parameter all along) leaves no trace in
+        /// the text, and this clause is how the author supplies it. Empty = no
+        /// clause. Only meaningful inside a `GRAPH`, where order is the graph's
+        /// to decide; validation rejects it elsewhere.
+        depends: Vec<String>,
         /// The `USING(…)` clause: required parameters and/or call-site
         /// overrides. Empty = no clause, which stays the common case.
         using: Vec<UsingItem>,
@@ -1164,11 +1198,30 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         FlowNode::Comment(text) => {
             let _ = writeln!(out, "#{text}");
         }
-        FlowNode::Request { name, alias, using } => {
+        FlowNode::Request {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
             let _ = write!(out, "REQUEST {}", name_text(name));
             if let Some(a) = alias {
                 let _ = write!(out, " AS {}", name_text(a));
             }
+            out.push_str(&depends_text(depends));
+            let _ = writeln!(out, "{}", using_text(using));
+        }
+        FlowNode::Cleanup {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
+            let _ = write!(out, "CLEANUP {}", name_text(name));
+            if let Some(a) = alias {
+                let _ = write!(out, " AS {}", name_text(a));
+            }
+            out.push_str(&depends_text(depends));
             let _ = writeln!(out, "{}", using_text(using));
         }
         FlowNode::Report(stmt) => write_report(out, stmt, depth),
@@ -1228,6 +1281,15 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
     }
 }
 
+/// The ` DEPENDS a, b` clause a step serializes with (empty when it has none).
+fn depends_text(depends: &[String]) -> String {
+    if depends.is_empty() {
+        String::new()
+    } else {
+        format!(" DEPENDS {}", depends.join(", "))
+    }
+}
+
 /// The `PARALLEL[(n)] ` prefix a loop serializes with (empty when sequential).
 fn parallel_prefix(p: &Option<ParallelSpec>) -> String {
     match p {
@@ -1242,6 +1304,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
         ReportStmt::Request {
             name,
             alias,
+            depends,
             using,
             response_fmt,
             show,
@@ -1252,6 +1315,7 @@ fn write_report(out: &mut String, stmt: &ReportStmt, depth: usize) {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {}", name_text(a));
             }
+            out.push_str(&depends_text(depends));
             out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));
@@ -1553,12 +1617,37 @@ impl FlowNode {
             }
             FlowNode::Param(p) => param_text(p),
             FlowNode::Comment(text) => format!("#{text}"),
-            FlowNode::Request { name, alias, using } => {
+            FlowNode::Request {
+                name,
+                alias,
+                depends,
+                using,
+            } => {
                 let as_text = alias
                     .as_ref()
                     .map(|a| format!(" AS {a}"))
                     .unwrap_or_default();
-                format!("REQUEST {name}{as_text}{}", using_text(using))
+                format!(
+                    "REQUEST {name}{as_text}{}{}",
+                    depends_text(depends),
+                    using_text(using)
+                )
+            }
+            FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } => {
+                let as_text = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {a}"))
+                    .unwrap_or_default();
+                format!(
+                    "CLEANUP {name}{as_text}{}{}",
+                    depends_text(depends),
+                    using_text(using)
+                )
             }
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {
@@ -1663,6 +1752,7 @@ fn report_label(stmt: &ReportStmt) -> String {
         ReportStmt::Request {
             name,
             alias,
+            depends,
             using,
             response_fmt,
             show,
@@ -1673,6 +1763,7 @@ fn report_label(stmt: &ReportStmt) -> String {
             if let Some(a) = alias {
                 let _ = write!(out, " AS {a}");
             }
+            out.push_str(&depends_text(depends));
             out.push_str(&using_text(using));
             if let Some(fmt) = response_fmt {
                 let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));

@@ -507,7 +507,7 @@ fn walk(
                     .unwrap()
                     .insert(name.clone(), producer.clone());
             }
-            FlowNode::Request { name, using, .. } => {
+            FlowNode::Request { name, using, .. } | FlowNode::Cleanup { name, using, .. } => {
                 check_request_name(name, ctx, diags);
                 check_using(name, using, ctx, diags);
             }
@@ -914,6 +914,10 @@ fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut
                         FlowNode::Comment(_)
                         | FlowNode::Request { .. }
                         | FlowNode::Report(ReportStmt::Request { .. }) => {}
+                        // Reported by the recursive walk below, which knows it
+                        // is in a region; naming it here as well would say the
+                        // same thing twice.
+                        FlowNode::Cleanup { .. } => {}
                         FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. } => {
                             diags.push(Diagnostic::error(s.diag_graph_loop_inside.to_string()));
                         }
@@ -933,7 +937,28 @@ fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut
                 }
                 check_regions(body, ctx, in_region, diags);
             }
-            _ => {}
+            // A cleanup is already deferred and already ordered by what it
+            // depends on, so its `DEPENDS` means something wherever it is
+            // written. Everything else needs a region.
+            FlowNode::Cleanup { .. } => {
+                if in_region {
+                    diags.push(Diagnostic::error(s.diag_cleanup_in_graph.to_string()));
+                }
+            }
+            // `DEPENDS` places a step in a graph, and there is only a graph
+            // inside a region. Written anywhere else it is not merely useless
+            // but misleading: statements already run in the order they are
+            // written, so the clause would read as a constraint while
+            // constraining nothing. That covers the `FOR` case too — a region
+            // may not appear in a loop, so a loop body is never in one.
+            other => {
+                if !in_region && !super::graph::declared_deps(other).is_empty() {
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_depends_outside_graph,
+                        &[&other.label()],
+                    )));
+                }
+            }
         }
     }
 }
@@ -1626,6 +1651,15 @@ fn check_var_availability(
             FlowNode::Request { name, .. } => {
                 warn_if_vars_undefined(name, ctx, defined, diags);
                 add_entry_captures(name, ctx, defined);
+            }
+            // A cleanup is checked where it is written even though it runs at
+            // the end of its block, so a variable defined *after* it can warn
+            // when it would in fact be available. That is the conservative
+            // direction for a warning, and a teardown written above the setup
+            // it tears down is worth a second look anyway. Its own captures are
+            // not threaded forward: nothing runs after a teardown to read them.
+            FlowNode::Cleanup { name, .. } => {
+                warn_if_vars_undefined(name, ctx, defined, diags);
             }
             // A REPORT statement — only the REQUEST form sends HTTP.
             FlowNode::Report(stmt) => {
@@ -3265,6 +3299,59 @@ mod tests {
     }
 
     #[test]
+    fn depends_on_a_name_no_step_carries_is_an_error() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b DEPENDS nope\nEND\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(errs.iter().any(|e| e.contains("nope")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_may_not_depend_on_itself() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a AS one DEPENDS one\nEND\n",
+            &[capturing_entry("a", &[])],
+        );
+        assert!(!errs.is_empty(), "a self-dependency must be rejected");
+    }
+
+    #[test]
+    fn depends_outside_a_region_is_an_error() {
+        // Outside a GRAPH the written order *is* the order, so a dependency
+        // has nothing to reorder and would quietly mean nothing.
+        let errs = ref_errors(
+            "# collection: c\n\nREQUEST a AS one\nREQUEST b DEPENDS one\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            !errs.is_empty(),
+            "DEPENDS outside a region must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_live_inside_a_region() {
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    CLEANUP b\nEND\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            !errs.is_empty(),
+            "a CLEANUP inside a GRAPH must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_outside_a_region_may_declare_dependencies() {
+        let errs = ref_errors(
+            "# collection: c\n\nREQUEST a AS one\nCLEANUP b DEPENDS one\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
     fn a_step_name_survives_the_report_toggle_both_ways() {
         // `AS` is identity, not a reporting option, so upgrading a REQUEST to a
         // REPORT REQUEST (and back) must not silently rename the step.
@@ -3272,6 +3359,7 @@ mod tests {
         let mut node = FlowNode::Request {
             name: "up".into(),
             alias: Some("u".into()),
+            depends: Vec::new(),
             using: Vec::new(),
         };
         assert!(attach_to_node(&mut node, Modifier::Report));

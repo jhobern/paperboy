@@ -1442,11 +1442,38 @@ fn build_node_chips(
         FlowNode::Comment(text) => {
             vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
         }
-        FlowNode::Request { name, alias, using } => {
+        FlowNode::Request {
+            name,
+            alias,
+            using,
+            depends,
+        } => {
             let mut chips = vec![Chip::request(name, req_col).with_help(s.chip_help_request)];
             if let Some(a) = alias {
                 chips.push(Chip::base(format!("AS {a}"), th.accent).with_help(s.chip_help_alias));
             }
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
+            chips.extend(using_chip(using, th.subst, s.chip_help_using));
+            chips
+        }
+        // A cleanup reads as a request with a different verb: it is one, and
+        // what makes it special — running at the end of its block — is not a
+        // property the chips can show, so the keyword carries it.
+        FlowNode::Cleanup {
+            name,
+            alias,
+            depends,
+            using,
+        } => {
+            let mut chips = vec![
+                Chip::modifier("CLEANUP".into(), th.pending, DetachWhich::Report)
+                    .with_help(s.chip_help_cleanup),
+            ];
+            chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
+            if let Some(a) = alias {
+                chips.push(Chip::base(format!("AS {a}"), th.accent).with_help(s.chip_help_alias));
+            }
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
             chips.extend(using_chip(using, th.subst, s.chip_help_using));
             chips
         }
@@ -1458,12 +1485,14 @@ fn build_node_chips(
             show,
             hide,
             with,
+            depends,
         }) => {
             let mut chips = vec![
                 Chip::modifier("REPORT".into(), th.subst, DetachWhich::Report)
                     .with_help(s.chip_help_report),
             ];
             chips.push(Chip::request(name, req_col).with_help(s.chip_help_request));
+            chips.extend(depends_chip(depends, th.subst, s.chip_help_depends));
             // Shown as its own chip so a required parameter is visible in the
             // block editor too — a clause the graphical view silently omitted
             // would be worse than no clause at all.
@@ -1714,6 +1743,23 @@ fn build_node_chips(
 /// column has no statistics. Tethered, because the statistics belong to the
 /// column named immediately before them rather than to the statement as a
 /// whole — so the two are drawn as one segmented pill (see [`link_tethers`]).
+/// The `DEPENDS` chip for a request statement, or nothing when there is no
+/// clause.
+///
+/// Read-only, for the same reason as [`using_chip`]: the editor can't author a
+/// dependency yet, but a clause the graphical view silently omitted would be
+/// worse than no clause at all — and this one decides when the request runs.
+fn depends_chip(depends: &[String], color: Color32, help: &'static str) -> Option<Chip> {
+    if depends.is_empty() {
+        return None;
+    }
+    Some(
+        Chip::base(format!("DEPENDS {}", depends.join(", ")), color)
+            .with_help(help)
+            .tether(),
+    )
+}
+
 /// The `USING(…)` chip for a request statement, or nothing when there is no
 /// clause.
 ///

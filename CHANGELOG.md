@@ -85,6 +85,59 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   steps one at a time. A degree is a cap — *up to* n may overlap — so that is a
   legal schedule; the scheduler that actually uses the permission comes next.
 
+- **`DEPENDS` states an edge the data does not show.** Inference can only see a
+  value flowing from a capture to a reference, and real dependencies exist that
+  leave no such trace: uploading a document that a later request fetches by an
+  id it held all along ties the two together with nothing passing between them.
+  Written order used to carry that by luck. `REQUEST dfa/result DEPENDS upload`
+  says it, as a comma-separated list of step names.
+
+  A declared edge is added before the inferred ones, so a step named by both
+  keeps the reason the author wrote down. Depending on a name no step carries,
+  or on itself, is an error. `DEPENDS` outside a `GRAPH` is also an error:
+  written order already is the order there, so accepting it would let it look
+  like it had done something.
+
+- **Clauses may be written in any order, and gathered into a group.** `AS`,
+  `DEPENDS`, `USING`, `RESPONSE`, `SHOW` and `HIDE` are now accepted in any
+  order and each at most once, and a long statement may put them in brackets
+  opening on the statement's own line:
+
+  ```
+  REQUEST dfa/result AS result (
+      DEPENDS upload, session
+      USING(query.id = "{{session.id}}")
+  )
+  ```
+
+  Saving writes them back in one canonical order, so a file's shape doesn't
+  depend on the order its author happened to type.
+
+- **`CLEANUP` runs a request at the end of its block, in reverse dependency
+  order.** It is written where it belongs — next to the thing it undoes — and
+  deferred to the end of the flow, or to the end of each iteration inside a
+  `FOR`. What it depends on is read from its own data references, so a logout
+  holding `{{login.token}}` runs after everything else that needed the login,
+  and before nothing.
+
+  A cleanup whose dependency never succeeded is skipped: there is nothing to
+  undo. A cleanup that *fails* is a warning, not an error — a teardown failing
+  is nearly always a consequence of the real failure, and reporting it as a
+  second error buries the first.
+
+- **A step whose dependency failed is skipped rather than run.** Sending a
+  request that is guaranteed to fail wastes a call and produces a second,
+  misleading error. The skip is recursive — anything depending on a skipped
+  step is skipped too — and each skipped step's row records which step it was
+  waiting on, so the report says why it is empty instead of just being empty.
+
+- **Exit code 3 means "ran, but incomplete".** A run that skipped steps now
+  exits 3 rather than 1. It implies 1 — a skip only ever follows a failure —
+  and adds that the run did not cover everything, which is the difference
+  between a release check that found a problem and one that never got far
+  enough to look. The summary gained `Warnings` and `Skipped` lines, and the
+  README now documents the exit codes, which it never did.
+
 
 ## [0.5.6] - 2026-09-11
 

@@ -71,6 +71,24 @@ pub struct ReportResult {
     /// Non-fatal problems encountered during the run (a request that failed, a
     /// producer that matched nothing, …). Every issue still leaves a row.
     pub errors: Vec<String>,
+    /// Problems that are worth saying but must not change the verdict — a
+    /// `CLEANUP` that failed, so far the only kind.
+    ///
+    /// Teardown failing does not make the run's answer wrong: the requests
+    /// under test already passed or failed on their own terms, and letting a
+    /// leaked test resource turn a green run red would train everyone to
+    /// ignore the exit code.
+    pub warnings: Vec<String>,
+    /// Steps that were not run because something they depend on did not
+    /// succeed, in the order they were skipped.
+    ///
+    /// Kept apart from `errors` because a skip is a distinct verdict, not a
+    /// quieter failure: the step has no result at all, nothing about it is
+    /// known, and the one thing a reader must not conclude is that it passed.
+    /// It is also what separates exit code 3 from exit code 1 — "some of this
+    /// run never happened" is a different fact from "some of it went wrong",
+    /// and a release check wants to act on it differently.
+    pub skipped: Vec<String>,
     /// Summary statistics requested per output-column *header* by a
     /// `REPORT … AS <header> STATISTICS(…)` statement. Merged into the resolved
     /// columns at render time (a `columns:` directive's own `STATISTICS(…)`

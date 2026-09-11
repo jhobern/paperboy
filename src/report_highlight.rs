@@ -56,6 +56,8 @@ pub(crate) struct HlCtx {
 const KEYWORDS: &[&str] = &[
     "REQUEST",
     "REPORT",
+    "DEPENDS",
+    "CLEANUP",
     "FOR",
     "IN",
     "FILES",
@@ -139,6 +141,9 @@ fn keyword_color(upper: &str, th: &Theme) -> Color {
         // as one more structural keyword.
         "USING" => th.subst,
         "AS" | "BASELINE" | "COMPARISON" => th.pending,
+        // `DEPENDS` states a requirement the same way `USING` does — one about
+        // when the step may run rather than what it sends.
+        "DEPENDS" => th.subst,
         "PARALLEL" => th.err,
         // The column clauses take the substitution hue their GUI chips carry,
         // which also sets them apart from the structural keywords they sit on
