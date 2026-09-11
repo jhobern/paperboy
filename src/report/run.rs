@@ -712,11 +712,17 @@ struct Sched {
 /// `step_order` to be deep against. This is a Kahn sort over just those edges,
 /// always taking the ready cleanup that came earliest in the incoming order —
 /// so a flow with no cleanup-to-cleanup dependency comes out exactly as it went
-/// in. A cycle (which validation refuses) leaves the remainder as it was rather
-/// than dropping it.
+/// in.
+///
+/// Returns the cyclic remainder alongside the order. Validation refuses a cycle
+/// written with `DEPENDS`, but an edge can also be *inferred* from one cleanup
+/// reading another's capture, and those are not knowable before the run — so
+/// the ring has to be caught here too. It is left in the order it arrived and
+/// reported, because a ring that quietly skips itself leaks every resource it
+/// covers while the run still reads as green.
 type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
 
-fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> Vec<PlannedCleanup<'_>> {
+fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>, Vec<String>) {
     let index: HashMap<&str, usize> = planned
         .iter()
         .enumerate()
@@ -737,9 +743,11 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> Vec<PlannedCleanup<'_>> {
     }
     let mut done = vec![false; n];
     let mut out_idx: Vec<usize> = Vec::with_capacity(n);
+    let mut cyclic: Vec<String> = Vec::new();
     while out_idx.len() < n {
         let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
             // A cycle: emit what is left in the order it arrived.
+            cyclic.extend((0..n).filter(|&i| !done[i]).map(|i| planned[i].3.clone()));
             out_idx.extend((0..n).filter(|&i| !done[i]));
             break;
         };
@@ -750,10 +758,11 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> Vec<PlannedCleanup<'_>> {
         }
     }
     let mut slots: Vec<Option<PlannedCleanup<'_>>> = planned.into_iter().map(Some).collect();
-    out_idx
+    let ordered = out_idx
         .into_iter()
         .filter_map(|i| slots[i].take())
-        .collect()
+        .collect();
+    (ordered, cyclic)
 }
 
 /// Decrements the in-flight count and wakes the sleepers if the worker holding
@@ -1454,7 +1463,14 @@ impl<'a> Exec<'a> {
         // sees its prerequisite as unsuccessful and skips itself. Honour those
         // edges explicitly, keeping the reverse order above as the tie-break so
         // the ordinary unwinding is unchanged.
-        planned = order_cleanups(planned);
+        let cyclic;
+        (planned, cyclic) = order_cleanups(planned);
+        if !cyclic.is_empty() {
+            self.errors.push(crate::i18n::fill(
+                self.ctx.strings.diag_graph_cycle,
+                &[&cyclic.join(", ")],
+            ));
+        }
 
         for (_, _, node, step, deps) in planned {
             let FlowNode::Cleanup {
@@ -1520,6 +1536,9 @@ impl<'a> Exec<'a> {
             resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
                 .is_some_and(|e| e.captures.iter().any(|(c, _)| c == var))
         };
+        // Everything the cleanup could already read: environment, assignments,
+        // loop binds and the capture chain.
+        let have = self.vars_for();
         let mut refs: Vec<String> = Vec::new();
         if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             refs.extend(crate::request::entry_referenced_keys(entry));
@@ -1554,8 +1573,8 @@ impl<'a> Exec<'a> {
                     // Nothing has written the name yet. Every step that
                     // declares it is a candidate producer — which is what makes
                     // a single producer that failed before capturing still skip
-                    // the cleanup — and so is any sibling cleanup, whose own
-                    // capture would land before this one reads it.
+                    // the cleanup: it ran, and the value it was supposed to
+                    // leave is missing.
                     out.extend(
                         self.step_order
                             .iter()
@@ -1566,12 +1585,22 @@ impl<'a> Exec<'a> {
                             })
                             .cloned(),
                     );
-                    out.extend(
-                        siblings
-                            .iter()
-                            .filter(|(s, req)| s != self_step && declares(req, &r))
-                            .map(|(s, _)| s.clone()),
-                    );
+                    // A sibling cleanup is different: none of them has run, so
+                    // "no step wrote this name" is not evidence about any of
+                    // them, and gating on one unconditionally would skip a
+                    // teardown whose value was in the environment all along —
+                    // leaking the resource over a name collision. It counts
+                    // only when nothing else can answer the reference, which is
+                    // the one case where the sibling's capture must be what was
+                    // meant.
+                    if !have.contains_key(&r) {
+                        out.extend(
+                            siblings
+                                .iter()
+                                .filter(|(s, req)| s != self_step && declares(req, &r))
+                                .map(|(s, _)| s.clone()),
+                        );
+                    }
                 }
             }
         }
@@ -3624,6 +3653,54 @@ mod tests {
             fake.call_order()
         );
         assert!(res.skipped.iter().any(|s| s.contains("purge")));
+    }
+
+    #[test]
+    fn a_sibling_cleanup_does_not_claim_a_name_the_environment_already_answers() {
+        // No cleanup has run when the order is worked out, so "nothing wrote
+        // this name" is not evidence about any of them. Gating on a sibling
+        // unconditionally skipped a teardown whose value was in the environment
+        // all along — leaking the resource over nothing but a name collision,
+        // and reporting it as a warning so the run still read as green.
+        let entries = [
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[failing("rotate")]);
+        run(
+            "CLEANUP purge\nCLEANUP rotate\n",
+            &entries,
+            &[("sid", "from-env")],
+            &[],
+            &fake,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the teardown had its value all along: {:?}",
+            fake.call_order()
+        );
+    }
+
+    #[test]
+    fn a_ring_of_cleanups_is_an_error_not_a_silent_skip() {
+        // This edge is inferred, so validation cannot see it before the run:
+        // each reads the other's capture. Left alone, every member reads its
+        // prerequisite as unsuccessful and skips, and the whole ring is torn
+        // down by nobody while the run still exits clean.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let entries = [a, b];
+        let fake = Fake::new(&[]);
+        let res = run("CLEANUP a\nCLEANUP b\n", &entries, &[], &[], &fake);
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.contains("a") && e.contains("b")),
+            "the ring has to be said out loud: {:?}",
+            res.errors
+        );
     }
 
     #[test]

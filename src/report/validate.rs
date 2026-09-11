@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::flow::{
-    EnvClause, FlowNode, OverrideTarget, ParamKind, Pattern, Producer, ReportFlow, ReportStmt,
-    RoleRef, ShowField, UsingItem,
+    Element, EnvClause, FlowNode, OverrideTarget, ParamKind, Pattern, Producer, ReportFlow,
+    ReportStmt, RoleRef, ShowField, UsingItem,
 };
 use crate::i18n::{Strings, fill};
 
@@ -965,6 +965,10 @@ fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec
 struct StepUse<'a> {
     request: &'a str,
     alias: Option<&'a str>,
+    /// A cleanup runs when its *block* unwinds, not where it is written, which
+    /// is what makes an inner block's reference to one in an enclosing block
+    /// unsatisfiable — see the `DEPENDS` check in [`walk_step_names`].
+    is_cleanup: bool,
 }
 
 fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
@@ -972,10 +976,12 @@ fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
         FlowNode::Request { name, alias, .. } => Some(StepUse {
             request: name,
             alias: alias.as_deref(),
+            is_cleanup: false,
         }),
         FlowNode::Report(ReportStmt::Request { name, alias, .. }) => Some(StepUse {
             request: name,
             alias: alias.as_deref(),
+            is_cleanup: false,
         }),
         // A cleanup is a step: it is sent, it can be named, and `DEPENDS` and
         // `{{step.var}}` both refer to it. Leaving it out let two steps share
@@ -984,6 +990,7 @@ fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
         FlowNode::Cleanup { name, alias, .. } => Some(StepUse {
             request: name,
             alias: alias.as_deref(),
+            is_cleanup: true,
         }),
         _ => None,
     }
@@ -1106,6 +1113,8 @@ struct StepInfo {
     /// The request this step runs, so a `{{step.var}}` reference can be checked
     /// against the captures that request actually declares.
     request: String,
+    /// Whether the step is a `CLEANUP`.
+    is_cleanup: bool,
 }
 
 /// The step name a use contributes, before validity is considered.
@@ -1206,7 +1215,24 @@ fn walk_step_names(
                     ctx.strings.diag_graph_depends_self,
                     &[here],
                 )));
-            } else if !path.iter().rev().any(|f| f.contains_key(dep.as_str())) {
+            } else if let Some((depth, info)) = path
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, f)| f.get(dep.as_str()).map(|info| (i, info)))
+            {
+                // A cleanup runs when its own block unwinds. An enclosing
+                // block unwinds *after* this one, so a cleanup out there
+                // cannot have succeeded by the time this one is asked — it
+                // would be skipped on every iteration, every run, with only a
+                // warning to show for it.
+                if info.is_cleanup && depth + 1 < path.len() {
+                    diags.push(Diagnostic::error(fill(
+                        ctx.strings.diag_cleanup_depends_outer,
+                        &[here, dep, dep],
+                    )));
+                }
+            } else {
                 diags.push(Diagnostic::error(fill(
                     ctx.strings.diag_graph_depends_unknown,
                     &[here, dep],
@@ -1286,17 +1312,34 @@ pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
     // looked at could carry a name that silently resolves to nothing.
     fn producer<'p>(p: &'p Producer, out: &mut Vec<&'p str>) {
         match p {
-            Producer::Files { dir, glob } | Producer::Folders { dir, glob, .. } => {
+            Producer::Files { dir, glob } => {
                 out.push(dir.as_str());
                 out.extend(glob.as_deref());
             }
+            Producer::Folders { dir, glob, roles } => {
+                out.push(dir.as_str());
+                out.extend(glob.as_deref());
+                out.extend(roles.iter().map(|r| r.glob.as_str()));
+            }
             Producer::Tuples { path } => out.push(path.as_str()),
+            // A list literal's elements are interpolated too — `expand_producer`
+            // substitutes each one — so a reference written there is as real as
+            // one in a path.
+            Producer::List(items) => {
+                for item in items {
+                    match item {
+                        Element::Scalar(v) => out.push(v.as_str()),
+                        Element::Tuple(parts) => out.extend(parts.iter().map(String::as_str)),
+                    }
+                }
+            }
             Producer::Zip(ps) | Producer::Concat(ps) => {
                 for p in ps {
                     producer(p, out);
                 }
             }
-            Producer::List(_) | Producer::Named(_) => {}
+            // A named list is checked where it is declared.
+            Producer::Named(_) => {}
         }
     }
     match node {
@@ -1460,6 +1503,7 @@ fn register_step(
             StepInfo {
                 written: use_.alias.is_some(),
                 request: use_.request.to_string(),
+                is_cleanup: use_.is_cleanup,
             },
         );
     }
@@ -2291,6 +2335,48 @@ mod tests {
             diags.iter().any(|d| d.severity == Severity::Error
                 && d.message.contains("purge_a")
                 && d.message.contains("purge_b")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_depend_on_one_in_an_enclosing_block() {
+        // The enclosing block unwinds after the inner one, so the outer cleanup
+        // has not run when the inner one is asked whether it may. Accepted, it
+        // was skipped on every iteration of every run, saying only "didn't
+        // succeed" — the quietly-skipped teardown this check exists to prevent.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP outer\n\
+             FOR X IN [\"a\"]\n    REQUEST create\n    CLEANUP inner DEPENDS outer\nEND\n",
+            &[
+                capturing_entry("outer", &[]),
+                capturing_entry("create", &[]),
+                capturing_entry("inner", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("inner")
+                && d.message.contains("outer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_depend_on_one_in_its_own_block() {
+        // The boundary: same block, same unwinding, so the ordering is real and
+        // the edge is exactly what DEPENDS between cleanups is for.
+        let diags = diags_with_entries(
+            "# collection: c\n\nFOR X IN [\"a\"]\n    REQUEST create\n\
+             CLEANUP first\n    CLEANUP second DEPENDS first\nEND\n",
+            &[
+                capturing_entry("create", &[]),
+                capturing_entry("first", &[]),
+                capturing_entry("second", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
             "{diags:?}"
         );
     }

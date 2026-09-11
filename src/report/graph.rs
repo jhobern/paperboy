@@ -434,26 +434,61 @@ fn for_each_node(nodes: &[FlowNode], f: &mut impl FnMut(&FlowNode)) {
     }
 }
 
-/// Visit every step in `nodes` as `(step name, request)`, loop bodies included.
-fn for_each_step(nodes: &[FlowNode], f: &mut impl FnMut(&str, &str)) {
-    for_each_node(nodes, &mut |n| {
-        if let Some((step, request)) = step_name(n) {
-            f(&step, request);
+/// The capture names produced *in this scope*: the steps written here and in
+/// any region here, but not those inside a loop body.
+///
+/// A loop iteration runs on a fork whose captures are discarded at `END` — that
+/// is what makes an iteration independent — so a name produced only inside a
+/// loop is not available to anything after it. Counting one as still-produced
+/// would keep a teardown that then reads a variable nobody in this run ever
+/// set, which is the exact outcome pruning a stranded cleanup exists to avoid.
+fn scope_captures(
+    nodes: &[FlowNode],
+    entries: &[HurlEntry],
+    helpers: &[HelperCollection],
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut visit = |nodes: &[FlowNode]| {
+        for n in nodes {
+            if let Some((_, request)) = step_name(n)
+                && let Some(e) = resolve_qualified(entries, helpers, request)
+            {
+                out.extend(e.captures.iter().map(|(c, _)| c.clone()));
+            }
         }
-    });
+    };
+    visit(nodes);
+    for n in nodes {
+        // A region is not a scope: its steps are named in the enclosing one and
+        // its captures are merged back at the closing barrier.
+        if let FlowNode::Graph { body, .. } = n {
+            visit(body);
+        }
+    }
+    out
 }
 
-/// Drop the cleanups `keep` rejects, at every depth.
-fn retain_cleanups(nodes: &mut Vec<FlowNode>, keep: &mut impl FnMut(&str, &[String]) -> bool) {
+/// Drop the cleanups `keep` rejects, at every depth, telling it which capture
+/// names are visible where each one is written.
+fn retain_cleanups(
+    nodes: &mut Vec<FlowNode>,
+    visible: &HashSet<String>,
+    entries: &[HurlEntry],
+    helpers: &[HelperCollection],
+    keep: &mut impl FnMut(&str, &[String], &HashSet<String>) -> bool,
+) {
+    let mut here = visible.clone();
+    here.extend(scope_captures(nodes, entries, helpers));
     nodes.retain(|n| match n {
-        FlowNode::Cleanup { name, depends, .. } => keep(name, depends),
+        FlowNode::Cleanup { name, depends, .. } => keep(name, depends, &here),
         _ => true,
     });
     for n in nodes {
         match n {
-            FlowNode::ForEach { body, .. }
-            | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => retain_cleanups(body, keep),
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                retain_cleanups(body, &here, entries, helpers, keep)
+            }
+            FlowNode::Graph { body, .. } => retain_cleanups(body, visible, entries, helpers, keep),
             _ => {}
         }
     }
@@ -471,7 +506,6 @@ pub fn prune_to_targets(
     // What pruning took away, so the cleanups can be pruned with it below.
     let mut dropped_names: HashSet<String> = HashSet::new();
     let mut dropped_captures: HashSet<String> = HashSet::new();
-    let mut kept_captures: HashSet<String> = HashSet::new();
     for node in &mut flow.nodes {
         let FlowNode::Graph { body, .. } = node else {
             continue;
@@ -520,9 +554,11 @@ pub fn prune_to_targets(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            if keep_written.contains(&step.written) {
-                kept_captures.extend(caps);
-            } else {
+            // What survives is not tracked here: `retain_cleanups` works it out
+            // per scope, from the flow as it stands once every region has been
+            // pruned, which is the only place that knows where a name can
+            // actually be read.
+            if !keep_written.contains(&step.written) {
                 dropped_names.insert(step.name.clone());
                 dropped_captures.extend(caps);
             }
@@ -537,17 +573,6 @@ pub fn prune_to_targets(
             keep_written.contains(&idx)
         });
     }
-    // Everything still standing produces what it always produced. A step
-    // outside a region is never pruned, so its captures are kept captures too
-    // — counting only the region's survivors let `--targets` drop a cleanup
-    // whose value came from an ordinary step that is still there, silently
-    // leaking whatever that step created.
-    for_each_step(&flow.nodes, &mut |_, request| {
-        if let Some(e) = resolve_qualified(entries, helpers, request) {
-            kept_captures.extend(e.captures.iter().map(|(c, _)| c.clone()));
-        }
-    });
-
     // A cleanup undoes what a step did. If pruning removed every step it was
     // undoing, there is nothing left to tear down, and keeping it is worse than
     // useless: a declared dependency on a vanished step becomes a skip and an
@@ -556,20 +581,32 @@ pub fn prune_to_targets(
     //
     // Cleanups nested in a loop body count: the body runs once per item, and a
     // teardown inside it is no less stranded for being written there.
-    retain_cleanups(&mut flow.nodes, &mut |name, depends| {
-        if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
-            return false;
-        }
-        let Some(entry) = resolve_qualified(entries, helpers, name) else {
-            return true;
-        };
-        // Only a name that *was* produced by a pruned step and is not produced
-        // by a surviving one: anything else comes from the environment or from
-        // outside the region, and is none of pruning's business.
-        !crate::request::entry_referenced_keys(entry)
-            .iter()
-            .any(|r| dropped_captures.contains(r.as_str()) && !kept_captures.contains(r.as_str()))
-    });
+    //
+    // "Still produced" is scope-aware: a step outside a region is never pruned,
+    // so its captures count — but only where they can actually be read, which
+    // for a step inside a loop body is that body alone.
+    let outer = HashSet::new();
+    retain_cleanups(
+        &mut flow.nodes,
+        &outer,
+        entries,
+        helpers,
+        &mut |name, depends, visible| {
+            if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
+                return false;
+            }
+            let Some(entry) = resolve_qualified(entries, helpers, name) else {
+                return true;
+            };
+            // Only a name that *was* produced by a pruned step and is not
+            // produced by a surviving one in scope: anything else comes from the
+            // environment or from outside the region, and is none of pruning's
+            // business.
+            !crate::request::entry_referenced_keys(entry)
+                .iter()
+                .any(|r| dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str()))
+        },
+    );
 
     // Pruning removes steps, and what is left may still name one. A qualified
     // reference to a step that is no longer in the run cannot resolve: the
@@ -1007,6 +1044,65 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn a_capture_made_only_inside_a_loop_does_not_save_an_outer_cleanup() {
+        // A loop iteration runs on a fork whose captures are discarded at END,
+        // so `sid` never reaches the teardown written after the loop. Counting
+        // it as still-produced kept a cleanup that would then be sent with the
+        // literal `{{sid}}` — worse than dropping it, and the exact thing
+        // pruning a stranded cleanup exists to avoid.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("make", &["sid"], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             FOR ITEM IN [1]\n    REQUEST make\nEND\n\
+             CLEANUP teardown\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_inside_the_loop_that_still_makes_its_value_is_kept() {
+        // The other side of the scope rule: written inside the body, the
+        // teardown can read what the body captured, so it has work to do.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("make", &["sid"], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             FOR ITEM IN [1]\n    REQUEST make\n    CLEANUP teardown\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn pruning_refuses_to_strand_a_reference_written_in_a_list() {
+        // A list literal's elements are interpolated like any other producer
+        // text, so a reference there is as strandable as one in a column.
+        let entries = [entry("create", &["sid"], &[]), entry("health", &[], &[])];
+        let errs = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST health\nEND\n\
+             FOR ITEM IN [\"{{create.sid}}\"]\n    REPORT ITEM AS S\nEND\n",
+            &["health"],
+            &entries,
+        )
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("create.sid")), "{errs:?}");
     }
 
     #[test]

@@ -214,6 +214,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 - A helper-qualified call such as `helper/ping` no longer counts as using an
   embedded request named `ping`. The alias resolves first, so the embedded
   request really was dead text and the warning was being suppressed.
+- A cleanup is no longer gated on a sibling cleanup that merely declares a
+  capture of the same name. No cleanup has run when the order is worked out, so
+  "nothing wrote this name" was not evidence about any of them: a teardown whose
+  value came from the environment was skipped over a name collision, leaking the
+  resource while the run still read as green. A sibling counts only when nothing
+  else can answer the reference.
+- A cycle among cleanups is now reported as a run error. Validation refuses one
+  written with `DEPENDS`, but an edge can also be inferred from one cleanup
+  reading another's capture, and that ring was skipping itself in silence.
+- A cleanup may no longer `DEPENDS` on one in an enclosing block. The outer
+  block unwinds after the inner one, so it could never have run in time — the
+  teardown was skipped on every iteration of every run, with only a warning.
+- `--targets` no longer keeps a cleanup on the strength of a capture made only
+  inside a loop body. An iteration runs on a fork whose captures are discarded
+  at `END`, so the name never reaches a teardown written after the loop, and the
+  request went out with the placeholder unsubstituted.
+- A reference written in a list literal (`FOR X IN ["{{step.var}}"]`) or a
+  `FOLDERS … WITH` role glob is now validated, and counted by the `--targets`
+  strand check, like any other interpolated text.
 
 - **A step-qualified name can no longer be answered by an environment
   variable.** `.vars` keys are not restricted to identifiers, so an environment

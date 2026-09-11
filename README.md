@@ -806,7 +806,9 @@ be authorised by one step and then sent with a different, failed step's
 identifier. Cleanups can depend on each other, by `DEPENDS` or by reading one
 another's captures, and are ordered accordingly; a cycle between them is
 refused, since every member of a ring waits on a member that has not run and
-the whole ring would silently skip.
+the whole ring would silently skip. A cleanup can only depend on one in its own
+block: an enclosing block unwinds after this one, so a cleanup out there could
+never have run in time.
 
 #### Carrying the requests in the report
 
