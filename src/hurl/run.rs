@@ -298,7 +298,9 @@ impl From<i64> for RetryLimit {
 /// that name has to have been *captured*: Hurl demands a number there, and
 /// every variable PaperBoy binds from an environment file is text, so an
 /// environment-set limit is a run Hurl stops with "Invalid expression type"
-/// before any of this matters. Reading it
+/// before any of this matters. It does not stand in a number of its own in that
+/// case -- no default, no "don't retry" -- so `Unknown` is only ever reported
+/// for a request that is not about to retry at all. Reading it
 /// early cannot go stale, either: Hurl resolves an entry's options once, before
 /// its retry loop starts (`get_entry_options` is called outside `run_request`),
 /// so a capture made *during* the poll does not change the limit the poll is
@@ -979,6 +981,49 @@ mod tests {
             limits.iter().all(|l| *l == RetryLimit::Unknown),
             "got {limits:?}"
         );
+    }
+
+    /// A limit Hurl cannot make a number of is not quietly taken as some
+    /// particular number -- it fails the entry, before the request is sent, and
+    /// explicitly without retrying (an error evaluating an entry's options is
+    /// not a retryable one). Which is what makes `RetryLimit::Unknown` safe to
+    /// report: there is never a retry for it to be wrong about.
+    ///
+    /// Pinned because the alternative -- a silent fallback to "don't retry", or
+    /// to some default count -- would turn a typo in a poll's limit into a
+    /// request that quietly checks once and reports whatever it happened to
+    /// find, which is the failure mode `retry` exists to remove.
+    #[test]
+    fn a_limit_hurl_cannot_resolve_stops_the_entry_rather_than_standing_in_for_a_number() {
+        let port = polling_server(99);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: {{{{n}}}}\nretry-interval: 20\n\
+             HTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        for (label, vars, expected) in [
+            ("undefined", HashMap::new(), "Undefined variable"),
+            // Every value PaperBoy binds from an environment file is text, even
+            // one that reads like a number -- so this is the case a user who
+            // writes `retry: {{max_attempts}}` in a `.vars` file actually hits.
+            (
+                "text that looks like a number",
+                HashMap::from([("n".to_string(), "3".to_string())]),
+                "Invalid expression type",
+            ),
+        ] {
+            let mut retries = 0;
+            let out = run_hurl_watching(&content, &vars, None, |_, attempt, _| {
+                retries = retries.max(attempt)
+            });
+
+            assert_eq!(retries, 0, "{label}: nothing should have been retried");
+            assert_eq!(out.entries.len(), 1, "{label}: the request was not sent");
+            let error = out.error.unwrap_or_default();
+            assert!(
+                error.contains(expected),
+                "{label}: expected {expected:?}, got {error:?}"
+            );
+        }
     }
 
     /// `retry: -1` is "forever": it has no number to count towards, but that is
