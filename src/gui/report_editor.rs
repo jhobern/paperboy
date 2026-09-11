@@ -1596,6 +1596,21 @@ fn build_node_chips(
             };
             vec![Chip::base(node.label(), col).with_help(help)]
         }
+        // A region's head is its own chip pair: the `PARALLEL` cap (when
+        // present) and the `GRAPH` opener with its optional name. Nothing else
+        // belongs on the line — the edges live on the steps inside it.
+        FlowNode::Graph { name, parallel, .. } => {
+            let mut chips = Vec::new();
+            if let Some(spec) = parallel {
+                chips.push(Chip::parallel(spec.degree, th.err).with_help(s.chip_help_parallel));
+            }
+            let head = match name {
+                Some(n) => format!("GRAPH {n}"),
+                None => "GRAPH".to_string(),
+            };
+            chips.push(Chip::base(head, th.accent).with_help(s.chip_help_graph));
+            chips
+        }
         FlowNode::ForEach { parallel, .. } | FlowNode::ForEnvs { parallel, .. } => {
             let mut chips = Vec::new();
             if let Some(spec) = parallel {

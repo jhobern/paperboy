@@ -250,6 +250,32 @@ pub enum FlowNode {
         body: Vec<FlowNode>,
         parallel: Option<ParallelSpec>,
     },
+    /// `[PARALLEL[(n)]] GRAPH [<name>] … END` — a region in which written order
+    /// is only a tie-break, and the declared dependency graph is authoritative.
+    ///
+    /// The region is an *assertion by the author*: that every ordering
+    /// constraint which matters is written down, as an inferred data edge or an
+    /// explicit clause. That assertion cannot be derived and cannot be checked,
+    /// which is exactly why it is a construct the author opts into rather than
+    /// something inferred from a file that merely looks like a list of
+    /// independent requests. Two features are licensed by it and by nothing
+    /// else: overlapping execution, and pruning a run to a subset of steps.
+    ///
+    /// Outside a region nothing changes — statements run in written order — so
+    /// a region is one statement's worth of ordering to the code around it, and
+    /// wrapping an existing sequential block in one is a no-op.
+    Graph {
+        /// The optional region name. It carries no semantics today; the grammar
+        /// reserves it for a JUnit `testsuite` name once one file can hold
+        /// several sibling regions.
+        name: Option<String>,
+        body: Vec<FlowNode>,
+        /// `Some(..)` caps how many steps may overlap. A cap is a *permission*,
+        /// not an instruction: running one at a time is always a legal schedule
+        /// for any `PARALLEL(n)`, which is what lets the scheduler arrive after
+        /// the grammar does.
+        parallel: Option<ParallelSpec>,
+    },
 }
 
 /// The `PARALLEL` marker on a loop: run its iterations concurrently.
@@ -1183,6 +1209,22 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
             indent(out, depth);
             out.push_str("END\n");
         }
+        FlowNode::Graph {
+            name,
+            body,
+            parallel,
+        } => {
+            let _ = write!(out, "{}GRAPH", parallel_prefix(parallel));
+            if let Some(n) = name {
+                let _ = write!(out, " {}", name_text(n));
+            }
+            out.push('\n');
+            for n in body {
+                write_node(out, n, depth + 1);
+            }
+            indent(out, depth);
+            out.push_str("END\n");
+        }
     }
 }
 
@@ -1540,6 +1582,11 @@ impl FlowNode {
                 parallel_prefix(parallel),
                 env_clause_text(clause)
             ),
+            FlowNode::Graph { name, parallel, .. } => format!(
+                "{}GRAPH{}",
+                parallel_prefix(parallel),
+                name.as_ref().map(|n| format!(" {n}")).unwrap_or_default()
+            ),
         }
     }
 
@@ -1602,7 +1649,9 @@ impl FlowNode {
     /// The loop body of a `FOR …` node (mutable), or `None` for a leaf node.
     pub fn body_mut(&mut self) -> Option<&mut Vec<FlowNode>> {
         match self {
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => Some(body),
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => Some(body),
             _ => None,
         }
     }

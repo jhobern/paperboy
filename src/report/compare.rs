@@ -163,7 +163,7 @@ fn collect_roles(
                 }
                 collect_roles(body, params, baseline, comparisons, baseline_show);
             }
-            FlowNode::ForEach { body, .. } => {
+            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
                 collect_roles(body, params, baseline, comparisons, baseline_show)
             }
             _ => {}

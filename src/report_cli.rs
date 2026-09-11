@@ -49,6 +49,7 @@ pub fn run(
     report_path: String,
     output: Option<String>,
     dry_run: bool,
+    targets: Vec<String>,
 ) -> i32 {
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
     // "decorative" stream, which is stderr in that case and stdout otherwise.
@@ -62,7 +63,7 @@ pub fn run(
             return 1;
         }
     };
-    let flow = match report.flow() {
+    let mut flow = match report.flow() {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: report '{report_path}' has a syntax error: {e}");
@@ -248,6 +249,26 @@ pub fn run(
         return 1;
     }
 
+    // --- targets ---------------------------------------------------------
+    // Pruning happens after validation and before the run, on the flow itself,
+    // so a dry run previews exactly the subset a live run would send. It is
+    // refused outright on an unknown target: running a different set of steps
+    // than the one asked for is a worse answer than running none.
+    if !targets.is_empty()
+        && let Err(errs) = crate::report::graph::prune_to_targets(
+            &mut flow,
+            &targets,
+            &entries,
+            &helpers,
+            &cli_strings,
+        )
+    {
+        for e in errs {
+            eprintln!("error: {e}");
+        }
+        return 1;
+    }
+
     // --- run context -----------------------------------------------------
     // Live requests are rooted at the collection's directory so relative
     // form-file paths resolve as they would when sent by hand.
@@ -273,6 +294,22 @@ pub fn run(
     }
     if dry_run {
         decor.line("  Mode       : DRY RUN (no requests sent)");
+    }
+    if !targets.is_empty() {
+        decor.line(&format!("  Targets    : {}", targets.join(", ")));
+    }
+    // The plan, printed as waves rather than a numbered sequence: a numbered
+    // list would imply a total order that a graph does not have, and the reason
+    // to print it at all is to show what the graph does and does not constrain.
+    if dry_run {
+        let lines = crate::report::graph::explain(&flow, &entries, &helpers, &cli_strings);
+        if !lines.is_empty() {
+            decor.line("");
+            for l in lines {
+                decor.line(&l);
+            }
+            decor.line("");
+        }
     }
 
     // --- run -------------------------------------------------------------
@@ -561,6 +598,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP
+            Vec::new(),
         );
         assert_eq!(code, 0, "dry run should succeed");
 
@@ -600,6 +638,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP, but the ENVS loop still expands per env
+            Vec::new(),
         );
         assert_eq!(code, 0, "a multi-env dry run should succeed");
 
@@ -641,6 +680,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some("-".to_string()),
             true,
+            Vec::new(),
         );
         assert_eq!(code, 1, "a duplicate env stem is a fatal setup error");
 
@@ -663,6 +703,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some("-".to_string()),
             true,
+            Vec::new(),
         );
         assert_eq!(code, 1, "a missing collection is a fatal setup error");
 
@@ -687,6 +728,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some(dir.join("out.docx").to_string_lossy().into_owned()),
             true,
+            Vec::new(),
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
 
@@ -730,6 +772,7 @@ mod tests {
                 report.to_string_lossy().into_owned(),
                 Some(out.to_string_lossy().into_owned()),
                 true, // dry-run: no HTTP
+                Vec::new(),
             );
             assert_eq!(code, 0, ".{ext} output should succeed");
             let bytes = fs::read(&out).unwrap();
@@ -770,6 +813,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP
+            Vec::new(),
         );
         assert_eq!(code, 0, "header-resolved run should succeed");
 
@@ -794,6 +838,7 @@ mod tests {
             report.to_string_lossy().into_owned(),
             Some("-".to_string()),
             true,
+            Vec::new(),
         );
         assert_eq!(
             code, 1,

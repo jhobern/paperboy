@@ -21,6 +21,7 @@ pub mod dry_run;
 pub mod edit;
 pub mod filter;
 pub mod flow;
+pub mod graph;
 pub mod image;
 pub mod indent;
 pub mod jsondiff;

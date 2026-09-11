@@ -665,3 +665,28 @@ staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")
 the first is also the base variable layer. `-o`'s extension picks the format
 (`.csv`, `.json`, `.html`, `.xlsx`), `-` writes CSV to stdout, and omitting it
 derives the filename from the report's own headers.
+
+#### Dependency graphs
+
+Inside a `GRAPH … END` region the order statements are written in stops being
+the order they run in. PaperBoy reads what each request needs and what each
+produces, works out the ordering that satisfies those, and runs that. A region
+that cannot be ordered — two requests each waiting on the other — is an error,
+and nothing in the report is sent: the author has said written order is not the
+specification, so falling back to it would be the one answer guaranteed to be
+wrong.
+
+```
+GRAPH release
+    REQUEST auth/login AS login          # captures token
+    REQUEST orders/create AS order       # uses {{token}}
+    REQUEST orders/get USING(id = {{order.id}})
+END
+```
+
+`--targets a,b` runs only the named steps and whatever they transitively
+depend on, so a release check can ask for one answer without paying for the
+whole report. Naming a step that no region declares is an error rather than a
+silent empty run. `--dry-run` lists the steps grouped by how deep in the graph
+they sit, which is how you check the shape of a region without sending
+anything.

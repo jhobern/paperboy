@@ -874,6 +874,12 @@ impl<'a> Exec<'a> {
                         &own,
                     ));
                 }
+                // A region reorders its body and nothing else: its steps emit
+                // their cells into this block's row exactly as they would have
+                // written inline. Wrapping a sequential block in `GRAPH … END`
+                // has to be observable only through ordering, or the migration
+                // path onto the feature doesn't exist.
+                FlowNode::Graph { body, .. } => self.run_graph(body, &mut own),
             }
         }
 
@@ -1303,6 +1309,91 @@ impl<'a> Exec<'a> {
             }
         };
         self.run_iterations(items.len(), parallel, run_one)
+    }
+
+    /// Run a `GRAPH` region: order its steps by the graph, then execute them.
+    ///
+    /// Two things distinguish this from running the body inline.
+    ///
+    /// The order is computed (see [`super::graph`]) rather than written, with
+    /// written order as the tie-break — so a region with no edges is
+    /// indistinguishable from the block it wraps.
+    ///
+    /// And each step sees only its **transitive ancestors'** captures, instead
+    /// of everything that happens to have run already. That is what converts
+    /// the data half of the author's completeness promise from a promise into a
+    /// checked property: a step that reads a value without depending on the
+    /// step that produces it now fails with an undefined variable, where
+    /// outside a region it would quietly succeed and break the first time
+    /// anything reordered.
+    fn run_graph(&mut self, body: &[FlowNode], own: &mut HashMap<String, String>) {
+        let plan =
+            match super::graph::build(body, self.ctx.entries, self.ctx.helpers, self.ctx.strings) {
+                Ok(p) => p,
+                Err(errs) => {
+                    // An unorderable region runs nothing. Falling back to written
+                    // order would be the one behaviour guaranteed to be wrong: the
+                    // author declared that written order is not the specification.
+                    self.errors.extend(errs);
+                    return;
+                }
+            };
+
+        let base_captures = self.captures.clone();
+        let base_steps = self.step_captures.clone();
+        // What each step captured, kept out of the shared chain so the next
+        // step can be handed a chain assembled from its ancestors alone.
+        let mut produced: Vec<HashMap<String, String>> = vec![HashMap::new(); plan.steps.len()];
+
+        for &idx in &plan.order {
+            let step = &plan.steps[idx];
+            self.captures = base_captures.clone();
+            self.step_captures = base_steps.clone();
+            for anc in plan.ancestors(idx) {
+                let caps = &produced[anc];
+                self.step_captures
+                    .insert(plan.steps[anc].name.clone(), caps.clone());
+                for (k, v) in caps {
+                    self.captures.insert(k.clone(), v.clone());
+                }
+            }
+
+            match &body[step.written] {
+                FlowNode::Request { name, alias, using } => {
+                    self.run_request(name, alias.as_deref(), using);
+                }
+                FlowNode::Report(stmt) => {
+                    for (k, v) in self.eval_report(stmt) {
+                        self.note_column(&k);
+                        own.insert(k, v);
+                    }
+                }
+                // Validation confines a region to requests; anything else here
+                // is a node that check let through, so skipping it is the
+                // conservative choice over guessing where it belongs in the
+                // order.
+                _ => {}
+            }
+            produced[idx] = self
+                .step_captures
+                .get(&step.name)
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        // The closing barrier: everything in the region has run, so everything
+        // it captured is visible to what follows, exactly as if the block had
+        // been sequential.
+        self.captures = base_captures;
+        self.step_captures = base_steps;
+        for &idx in &plan.order {
+            let caps = &produced[idx];
+            self.step_captures
+                .insert(plan.steps[idx].name.clone(), caps.clone());
+            for (k, v) in caps {
+                self.captures.insert(k.clone(), v.clone());
+            }
+        }
     }
 
     /// Run a `FOR <var> IN ENVS <clause>` loop: swap the target-env layer per
@@ -2013,6 +2104,15 @@ mod tests {
             self.delay_ms = ms;
             self
         }
+        /// The titles sent, in the order they were sent.
+        fn call_order(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect()
+        }
         fn call_vars(&self, title: &str) -> HashMap<String, String> {
             self.calls
                 .lock()
@@ -2691,6 +2791,182 @@ mod tests {
             "dotted names leaked to the runner: {:?}",
             vars.keys().collect::<Vec<_>>()
         );
+    }
+
+    // ---- GRAPH regions -----------------------------------------------------
+
+    /// An entry that captures `captures` and reads `url_vars` from its URL.
+    fn graph_entry(title: &str, captures: &[&str], url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            title: title.into(),
+            method: "GET".into(),
+            url: format!(
+                "http://x/{}",
+                url_vars
+                    .iter()
+                    .map(|v| format!("{{{{{v}}}}}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            captures: captures
+                .iter()
+                .map(|c| ((*c).to_string(), "jsonpath \"$.t\"".to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ok(title: &str) -> (&str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                captures: Vec::new(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn ok_capturing<'a>(title: &'a str, caps: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                captures: caps
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn wrapping_a_sequential_block_in_a_region_changes_nothing() {
+        // The guarantee the whole migration path rests on. Same flow, same
+        // collection, one wrapped and one not — the rows have to match, or
+        // nobody can adopt the feature by wrapping what they already have.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c")];
+        let plain = Fake::new(&canned);
+        let flat = run(
+            "REQUEST a\nREPORT REQUEST b\nREQUEST c\n",
+            &entries,
+            &[],
+            &[],
+            &plain,
+        );
+        let wrapped_fake = Fake::new(&canned);
+        let wrapped = run(
+            "GRAPH\n    REQUEST a\n    REPORT REQUEST b\n    REQUEST c\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &wrapped_fake,
+        );
+        assert_eq!(flat.rows.len(), wrapped.rows.len());
+        assert_eq!(flat.rows[0].cells, wrapped.rows[0].cells);
+        assert_eq!(plain.call_order(), wrapped_fake.call_order());
+    }
+
+    #[test]
+    fn a_region_runs_a_producer_written_below_its_consumer_first() {
+        // Written order is only the tie-break inside a region, so a flow may be
+        // written in the order that reads best rather than the order that runs.
+        let entries = [
+            graph_entry("api", &[], &["token"]),
+            graph_entry("login", &["token"], &[]),
+        ];
+        let fake = Fake::new(&[ok("api"), ok_capturing("login", &[("token", "T")])]);
+        let res = run(
+            "GRAPH\n    REQUEST api\n    REQUEST login\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_order(), ["login", "api"]);
+        assert_eq!(fake.call_vars("api").get("token"), Some(&"T".to_string()));
+    }
+
+    #[test]
+    fn a_step_in_a_region_is_not_handed_a_non_ancestors_captures() {
+        // The payoff: inside a region a step sees only what it depends on, so a
+        // data edge nobody declared fails loudly instead of working by accident
+        // and breaking the first time anything reorders.
+        let entries = [
+            graph_entry("side", &["secret"], &[]),
+            graph_entry("api", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("side", &[("secret", "S")]), ok("api")]);
+        let res = run(
+            "GRAPH\n    REQUEST side\n    REQUEST api\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_vars("api").get("secret"), None);
+        // Outside a region the same pair leaks, which is the behaviour the
+        // region exists to tighten — and which stays untouched for every flow
+        // that hasn't opted in.
+        let loose = Fake::new(&[ok_capturing("side", &[("secret", "S")]), ok("api")]);
+        run("REQUEST side\nREQUEST api\n", &entries, &[], &[], &loose);
+        assert_eq!(loose.call_vars("api").get("secret"), Some(&"S".to_string()));
+    }
+
+    #[test]
+    fn a_regions_captures_are_all_visible_after_it() {
+        // The closing barrier: everything in the region has run by the time
+        // anything after it does, so the ancestor scoping stops at the `END`.
+        let entries = [
+            graph_entry("side", &["secret"], &[]),
+            graph_entry("api", &[], &[]),
+            graph_entry("after", &[], &["secret"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("side", &[("secret", "S")]),
+            ok("api"),
+            ok("after"),
+        ]);
+        run(
+            "GRAPH\n    REQUEST side\n    REQUEST api\nEND\nREQUEST after\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(
+            fake.call_vars("after").get("secret"),
+            Some(&"S".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unorderable_region_sends_nothing() {
+        // Falling back to written order would be the one behaviour guaranteed
+        // to be wrong: the author declared that written order is not the
+        // specification.
+        let entries = [
+            graph_entry("a", &["x"], &["y"]),
+            graph_entry("b", &["y"], &["x"]),
+        ];
+        let fake = Fake::new(&[ok("a"), ok("b")]);
+        let res = run(
+            "GRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_count(), 0);
+        assert!(!res.errors.is_empty());
     }
 
     #[test]

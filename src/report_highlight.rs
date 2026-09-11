@@ -72,6 +72,7 @@ const KEYWORDS: &[&str] = &[
     "COMPARISON",
     "END",
     "PARALLEL",
+    "GRAPH",
     "AS",
     "RESPONSE",
     "RAW",

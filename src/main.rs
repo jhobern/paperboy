@@ -135,6 +135,13 @@ struct Cli {
     #[arg(long, requires = "report")]
     dry_run: bool,
 
+    /// With `-r`: run only these steps and whatever they depend on
+    /// (comma-separated step names). Every named step must be inside a `GRAPH`
+    /// region — only a region declares the complete graph that a closure needs,
+    /// so a target anywhere else is an error rather than a silent full run.
+    #[arg(long, value_name = "STEPS", value_delimiter = ',', requires = "report")]
+    targets: Vec<String>,
+
     /// With `-r`: where to write the report output. `-` writes CSV to stdout
     /// (for piping); a path's extension selects the format (`.csv`, `.json`,
     /// `.html` or `.xlsx`); omitted derives the file from the report's
@@ -231,6 +238,7 @@ fn main() {
             report,
             cli.output,
             cli.dry_run,
+            cli.targets,
         ));
     }
 

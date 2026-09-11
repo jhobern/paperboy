@@ -273,6 +273,10 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     // to identify one step within the scopes that can see it.
     check_step_names(flow, ctx, &mut diags);
 
+    // `GRAPH` regions: what may appear inside one, where one may appear, and
+    // whether the graph it declares can be ordered at all.
+    check_regions(&flow.nodes, ctx, false, &mut diags);
+
     // Variable-availability analysis: walk the flow in execution order and
     // warn when a request references a `{{VAR}}` that is provably not defined
     // at that point. Only runs when both the base-env variable names AND the
@@ -526,6 +530,10 @@ fn walk(
                 walk(body, ctx, scopes, diags);
                 scopes.pop();
             }
+            // A region is not a scope — it holds only requests, and the names
+            // they use come from outside it. It reorders its body; it does not
+            // enclose anything.
+            FlowNode::Graph { body, .. } => walk(body, ctx, scopes, diags),
         }
     }
 }
@@ -883,9 +891,70 @@ fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
 /// shared set of columns — a deliberate idiom, since a column is identified by
 /// its name rather than by which statement filled it. A flow-global rule would
 /// reject both, and would be rejecting readable, unambiguous flows to no end.
+/// Check every `GRAPH` region's shape and its graph.
+///
+/// The restrictions are v1 restrictions, all relaxable later, and all errors
+/// rather than warnings. The reason they are errors is the same one that makes
+/// the region a construct at all: a region is an assertion about ordering, and
+/// a construct whose ordering the region cannot describe — a loop, a variable
+/// assignment that later steps read, a nested region with its own promise —
+/// would silently narrow the assertion to something weaker than it reads as.
+fn check_regions(nodes: &[FlowNode], ctx: &Context, in_region: bool, diags: &mut Vec<Diagnostic>) {
+    let s = ctx.strings;
+    for node in nodes {
+        match node {
+            FlowNode::Graph { body, .. } => {
+                if in_region {
+                    diags.push(Diagnostic::error(s.diag_graph_nested.to_string()));
+                }
+                for inner in body {
+                    match inner {
+                        // A comment is not a step and orders nothing, so it is
+                        // simply carried; everything else in the body is.
+                        FlowNode::Comment(_)
+                        | FlowNode::Request { .. }
+                        | FlowNode::Report(ReportStmt::Request { .. }) => {}
+                        FlowNode::ForEach { .. } | FlowNode::ForEnvs { .. } => {
+                            diags.push(Diagnostic::error(s.diag_graph_loop_inside.to_string()));
+                        }
+                        FlowNode::Graph { .. } => {}
+                        other => diags.push(Diagnostic::error(fill(
+                            s.diag_graph_only_requests,
+                            &[&other.label()],
+                        ))),
+                    }
+                }
+                check_regions(body, ctx, true, diags);
+                check_region_graph(body, ctx, diags);
+            }
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                if body.iter().any(|n| matches!(n, FlowNode::Graph { .. })) {
+                    diags.push(Diagnostic::error(s.diag_graph_in_loop.to_string()));
+                }
+                check_regions(body, ctx, in_region, diags);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Order the region's graph now, so a cycle or an ambiguous reference is
+/// reported when the file is opened rather than partway through a run that has
+/// already sent requests.
+fn check_region_graph(body: &[FlowNode], ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    // Without a bound collection nothing is knowable about captures, so every
+    // inferred edge would be missing and the "graph" would be a list.
+    let Some(entries) = ctx.request_entries else {
+        return;
+    };
+    if let Err(errs) = super::graph::build(body, entries, ctx.helpers, ctx.strings) {
+        diags.extend(errs.into_iter().map(Diagnostic::error));
+    }
+}
+
 fn check_step_names(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let mut path: Vec<HashMap<String, StepInfo>> = vec![HashMap::new()];
-    walk_step_names(&flow.nodes, ctx, &mut path, diags);
+    walk_step_names(&flow.nodes, ctx, &mut path, false, diags);
 }
 
 /// What the lexical walk remembers about a step already in scope.
@@ -900,65 +969,67 @@ struct StepInfo {
     request: String,
 }
 
+/// The step name a use contributes, before validity is considered.
+fn step_name_of(use_: &StepUse<'_>) -> String {
+    match use_.alias {
+        Some(a) => a.to_string(),
+        None => use_
+            .request
+            .rsplit('/')
+            .next()
+            .unwrap_or(use_.request)
+            .to_string(),
+    }
+}
+
 fn walk_step_names(
     nodes: &[FlowNode],
     ctx: &Context,
     path: &mut Vec<HashMap<String, StepInfo>>,
+    in_region: bool,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let s = ctx.strings;
     for node in nodes {
-        // Checked *before* this node's own name is recorded, which is what
-        // makes a step unable to refer to itself: its captures don't exist
-        // until it has run.
-        check_qualified_refs(node, ctx, path, diags);
-        if let Some(use_) = step_use(node) {
-            let name = match use_.alias {
-                Some(a) => {
-                    if !super::parser::is_ident(a) {
-                        diags.push(Diagnostic::error(fill(s.diag_step_name_invalid, &[a])));
-                        continue;
-                    }
-                    a
-                }
-                None => {
-                    let leaf = use_.request.rsplit('/').next().unwrap_or(use_.request);
-                    if !super::parser::is_ident(leaf) {
-                        diags.push(Diagnostic::error(fill(
-                            s.diag_step_name_not_identifier,
-                            &[use_.request],
-                        )));
-                        continue;
-                    }
-                    leaf
-                }
-            };
-            // `written` records how the *existing* name got there, so the
-            // message names the mistake actually made.
-            if let Some(prev) = path.iter().find_map(|f| f.get(name)) {
-                let msg = if prev.written || use_.alias.is_some() {
-                    fill(s.diag_step_name_duplicate, &[name, "2"])
-                } else {
-                    fill(s.diag_step_name_ambiguous, &[use_.request, "2"])
-                };
-                diags.push(Diagnostic::error(msg));
-            } else {
-                path.last_mut().unwrap().insert(
-                    name.to_string(),
-                    StepInfo {
-                        written: use_.alias.is_some(),
-                        request: use_.request.to_string(),
-                    },
-                );
+        // Outside a region, checked *before* this node's name is recorded,
+        // which is what makes a step unable to refer to itself: its captures
+        // don't exist until it has run. Inside one the names are registered up
+        // front (a reference may point forward), so the same rule has to be
+        // stated rather than fall out of the order.
+        let own = if in_region {
+            step_use(node).map(|u| step_name_of(&u))
+        } else {
+            None
+        };
+        check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        if in_region {
+            // Already registered by the region pass below.
+            if let FlowNode::Graph { body, .. } = node {
+                walk_step_names(body, ctx, path, true, diags);
             }
+            continue;
+        }
+        if let Some(use_) = step_use(node) {
+            register_step(&use_, ctx, path, diags);
         }
         // A loop body is a new lexical frame: names inside it are visible to
         // the body and to nothing outside it.
         match node {
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 path.push(HashMap::new());
-                walk_step_names(body, ctx, path, diags);
+                walk_step_names(body, ctx, path, false, diags);
                 path.pop();
+            }
+            // A region is not a lexical frame — its steps are named in the
+            // enclosing one — but its names are registered *before* its body is
+            // checked, because inside a region a reference may point at a step
+            // written below it. That is the whole difference a region makes.
+            FlowNode::Graph { body, .. } => {
+                for inner in body {
+                    if let Some(use_) = step_use(inner) {
+                        register_step(&use_, ctx, path, diags);
+                    }
+                }
+                walk_step_names(body, ctx, path, true, diags);
             }
             _ => {}
         }
@@ -1004,6 +1075,7 @@ fn check_qualified_refs(
     node: &FlowNode,
     ctx: &Context,
     path: &[HashMap<String, StepInfo>],
+    own: Option<&str>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let s = ctx.strings;
@@ -1012,6 +1084,16 @@ fn check_qualified_refs(
             let Some((step, var)) = key.split_once('.') else {
                 continue;
             };
+            // A step's own captures don't exist until it has run. Outside a
+            // region that falls out of the walk order; inside one the names are
+            // registered up front, so it has to be said explicitly.
+            if own == Some(step) {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_unknown,
+                    &[&key, step],
+                )));
+                continue;
+            }
             let Some(info) = path.iter().rev().find_map(|f| f.get(step)) else {
                 diags.push(Diagnostic::error(fill(
                     s.diag_step_ref_unknown,
@@ -1039,6 +1121,54 @@ fn check_qualified_refs(
                 )));
             }
         }
+    }
+}
+
+/// Validate one step's name and record it in the innermost frame.
+fn register_step(
+    use_: &StepUse<'_>,
+    ctx: &Context,
+    path: &mut [HashMap<String, StepInfo>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    let s = ctx.strings;
+    let name = match use_.alias {
+        Some(a) => {
+            if !super::parser::is_ident(a) {
+                diags.push(Diagnostic::error(fill(s.diag_step_name_invalid, &[a])));
+                return;
+            }
+            a
+        }
+        None => {
+            let leaf = use_.request.rsplit('/').next().unwrap_or(use_.request);
+            if !super::parser::is_ident(leaf) {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_name_not_identifier,
+                    &[use_.request],
+                )));
+                return;
+            }
+            leaf
+        }
+    };
+    // `written` records how the *existing* name got there, so the message
+    // names the mistake actually made.
+    if let Some(prev) = path.iter().find_map(|f| f.get(name)) {
+        let msg = if prev.written || use_.alias.is_some() {
+            fill(s.diag_step_name_duplicate, &[name, "2"])
+        } else {
+            fill(s.diag_step_name_ambiguous, &[use_.request, "2"])
+        };
+        diags.push(Diagnostic::error(msg));
+    } else {
+        path.last_mut().unwrap().insert(
+            name.to_string(),
+            StepInfo {
+                written: use_.alias.is_some(),
+                request: use_.request.to_string(),
+            },
+        );
     }
 }
 
@@ -1545,7 +1675,34 @@ fn check_var_availability(
                 // If all_env_var_names is None, skip the body — we can't know
                 // what the environment will provide, so no warnings here.
             }
+            // A region reorders its body, so "written earlier" no longer means
+            // "runs earlier": a step may legitimately read a capture from a
+            // step written below it. Every capture the region produces is
+            // therefore made available to all of it before the walk, and the
+            // question of whether a particular step may see a particular
+            // capture is left to the graph itself, which alone knows ancestry.
+            //
+            // They stay in `defined` afterwards: the region's closing barrier
+            // means everything in it has run by the time anything after it
+            // does.
+            FlowNode::Graph { body, .. } => {
+                for node in body {
+                    if let Some(name) = step_request_name(node) {
+                        add_entry_captures(name, ctx, defined);
+                    }
+                }
+                check_var_availability(body, ctx, defined, diags);
+            }
         }
+    }
+}
+
+/// The request a step node sends, for the node kinds that send one.
+fn step_request_name(node: &FlowNode) -> Option<&str> {
+    match node {
+        FlowNode::Request { name, .. } => Some(name),
+        FlowNode::Report(ReportStmt::Request { name, .. }) => Some(name),
+        _ => None,
     }
 }
 
@@ -3000,6 +3157,111 @@ mod tests {
         let src =
             "# collection: c\n\nBASE = \"http://x\"\nREQUEST api USING(header.X = \"{{BASE}}\")\n";
         assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    // ---- GRAPH regions -----------------------------------------------------
+
+    #[test]
+    fn a_region_may_hold_only_requests_and_comments() {
+        let errs = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    # a note\n",
+            "    REQUEST a\n",
+            "    REPORT REQUEST b\n",
+            "END\n",
+        ));
+        assert_eq!(errs, Vec::<String>::new());
+
+        // An assignment inside a region has no place in the order: later steps
+        // read it, but it is not a step, so nothing can depend on it.
+        let errs = step_errors("# collection: c\n\nGRAPH\n    X = \"1\"\n    REQUEST a\nEND\n");
+        assert!(errs.iter().any(|e| e.contains("GRAPH")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_region_and_a_loop_may_not_contain_one_another() {
+        let in_loop = step_errors(concat!(
+            "# collection: c\n\n",
+            "FOR F IN FILES \"x\"\n",
+            "    GRAPH\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!in_loop.is_empty(), "a region inside a loop");
+        let loop_in = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    FOR F IN FILES \"x\"\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!loop_in.is_empty(), "a loop inside a region");
+    }
+
+    #[test]
+    fn a_region_may_not_contain_another_region() {
+        let errs = step_errors(concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    GRAPH\n",
+            "        REQUEST a\n",
+            "    END\n",
+            "END\n",
+        ));
+        assert!(!errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn a_reference_inside_a_region_may_point_forward() {
+        // Outside a region this is an unknown step, because nothing below has
+        // run yet. Inside one, order is computed, so it is ordinary.
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let forward = concat!(
+            "# collection: c\n\n",
+            "GRAPH\n",
+            "    REQUEST api USING(header.X = \"{{login.token}}\")\n",
+            "    REQUEST login\n",
+            "END\n",
+        );
+        assert_eq!(ref_errors(forward, &entries), Vec::<String>::new());
+        // The same two statements outside a region are not reorderable, so the
+        // reference really is to something that hasn't happened.
+        let flat = concat!(
+            "# collection: c\n\n",
+            "REQUEST api USING(header.X = \"{{login.token}}\")\n",
+            "REQUEST login\n",
+        );
+        assert!(!ref_errors(flat, &entries).is_empty());
+    }
+
+    #[test]
+    fn a_step_in_a_region_still_cannot_reference_itself() {
+        let entries = [capturing_entry("login", &["token"])];
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST login AS me USING(header.X = \"{{me.token}}\")\nEND\n",
+            &entries,
+        );
+        assert!(errs.iter().any(|e| e.contains("me")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_cycle_in_a_region_is_reported_when_the_report_is_opened() {
+        // Not partway through a run that has already sent requests.
+        let mut a = capturing_entry("a", &["x"]);
+        a.url = "http://x/{{y}}".into();
+        let mut b = capturing_entry("b", &["y"]);
+        b.url = "http://x/{{x}}".into();
+        let errs = ref_errors(
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            &[a, b],
+        );
+        assert!(errs.iter().any(|e| e.contains("cycle")), "{errs:?}");
     }
 
     #[test]

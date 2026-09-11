@@ -71,6 +71,8 @@ field-def    := name ':' hurl-query                    # full Hurl query + filte
 
 for-each     := [ parallel ] 'FOR' pattern 'IN' producer statement* 'END'
 for-envs     := [ parallel ] 'FOR' IDENT 'IN' 'ENVS' env-clause statement* 'END'
+graph        := [ parallel ] 'GRAPH' [ IDENT ] graph-stmt* 'END'
+graph-stmt   := request | report               # enforced by validation, not here
 parallel     := 'PARALLEL' [ '(' UINT ')' ]            # concurrent iterations
 end          := 'END'                                  # closes the nearest FOR
 
@@ -275,7 +277,9 @@ fn header_line(i: &str) -> IResult<&str, HeaderLine> {
 // ---------------------------------------------------------------------------
 
 fn node(i: &str) -> IResult<&str, FlowNode> {
-    alt((for_stmt, list_decl, param_decl, request, report, assign))(i)
+    alt((
+        for_stmt, graph_stmt, list_decl, param_decl, request, report, assign,
+    ))(i)
 }
 
 /// `IDENT = <rest of line>` — value is untokenized (may contain `=`, `&`, …).
@@ -395,6 +399,47 @@ fn for_stmt(i: &str) -> IResult<&str, FlowNode> {
             },
         ))
     }
+}
+
+/// `[PARALLEL[(n)]] GRAPH [<name>] … END`.
+fn graph_stmt(i: &str) -> IResult<&str, FlowNode> {
+    let (i, parallel) = opt(parallel_prefix)(i)?;
+    let (i, _) = kw("GRAPH")(i)?;
+    let (i, name) = opt(same_line_ident)(i)?;
+    // `GRAPH END` on one line would otherwise name the region `END` and then
+    // run off the end of the file looking for a terminator.
+    if name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case("END"))
+    {
+        return Err(perr(i));
+    }
+    let (i, body) = block_body(i)?;
+    Ok((
+        i,
+        FlowNode::Graph {
+            name,
+            body,
+            parallel,
+        },
+    ))
+}
+
+/// An identifier on the *current* line — spaces and tabs are skipped, a newline
+/// is not.
+///
+/// The region name is optional and the body starts on the next line, so a
+/// newline-crossing parser would read `GRAPH\n    REQUEST oauth2` as a region
+/// named `REQUEST`. Everywhere else in the grammar an optional argument is
+/// introduced by its own keyword, so this is the one place the distinction
+/// between "whitespace" and "end of line" carries meaning.
+fn same_line_ident(i: &str) -> IResult<&str, String> {
+    let (i, _) = take_while(|c| c == ' ' || c == '\t')(i)?;
+    let (rest, s) = recognize(pair(
+        satisfy(|c: char| c.is_ascii_alphabetic() || c == '_'),
+        take_while(|c: char| c.is_ascii_alphanumeric() || c == '_'),
+    ))(i)?;
+    Ok((rest, s.to_string()))
 }
 
 /// `PARALLEL` / `PARALLEL(n)` (n ≥ 1).
@@ -1085,9 +1130,12 @@ pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
 /// keywords by hand, so it can't drift out of sync with the language. Leading
 /// indentation is ignored (the token parsers skip it).
 pub fn opens_block(line: &str) -> bool {
-    // `[PARALLEL[(n)]] FOR …`
+    // `[PARALLEL[(n)]] FOR …` and `[PARALLEL[(n)]] GRAPH …`
     let for_head = preceded(opt(parallel_prefix), kw("FOR"));
-    map(for_head, |_| ())(line).is_ok() || with_block_head(line).is_ok()
+    let graph_head = preceded(opt(parallel_prefix), kw("GRAPH"));
+    map(for_head, |_| ())(line).is_ok()
+        || map(graph_head, |_| ())(line).is_ok()
+        || with_block_head(line).is_ok()
 }
 
 /// The opener line of a `REPORT REQUEST … WITH … END` block: the statement head
@@ -1852,6 +1900,41 @@ mod tests {
     fn error_reports_a_line_number() {
         let err = parse_flow("REQUEST ok\nFOR\n").unwrap_err();
         assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn a_region_round_trips_with_its_name_and_parallel_marker() {
+        for src in [
+            "# collection: c\n\nGRAPH\n    REQUEST a\n    REQUEST b\nEND\n",
+            "# collection: c\n\nGRAPH release_smoke\n    REQUEST a\nEND\n",
+            "# collection: c\n\nPARALLEL(5) GRAPH\n    REQUEST a\nEND\n",
+            "# collection: c\n\nPARALLEL GRAPH smoke\n    REQUEST a\nEND\n",
+        ] {
+            let flow = parse_flow(src).expect("parses");
+            assert_eq!(flow.to_text(), src, "round-trip of {src:?}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_region_does_not_swallow_its_first_statement() {
+        // The region name is optional and the body starts on the next line, so
+        // a newline-crossing name parser would read this as `GRAPH REQUEST`.
+        let flow =
+            parse_flow("# collection: c\n\nGRAPH\n    REQUEST oauth2\nEND\n").expect("parses");
+        let FlowNode::Graph { name, body, .. } = &flow.nodes[0] else {
+            panic!("expected a region, got {:?}", flow.nodes[0]);
+        };
+        assert_eq!(name, &None);
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn a_region_is_a_block_opener_for_indentation() {
+        // The editors indent from this, so a region that isn't recognised as an
+        // opener would silently produce a flat, unreadable body.
+        assert!(opens_block("GRAPH"));
+        assert!(opens_block("GRAPH release_smoke"));
+        assert!(opens_block("PARALLEL(5) GRAPH"));
     }
 
     #[test]

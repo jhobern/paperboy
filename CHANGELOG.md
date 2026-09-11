@@ -46,6 +46,45 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   reference cannot reach sideways into a sibling block, nor back at itself), and
   it must be a step whose request actually declares that capture.
 
+- **`GRAPH … END` regions: order from dependencies, not from written order.**
+  Inside a region PaperTrail reads what each request needs — the variables its
+  Hurl entry interpolates, and the values given to it in `USING(…)` — and what
+  each produces, its captures, and runs the ordering those imply. Writing the
+  login after the request that needs its token now works, because the region
+  says the graph is what is meant and the text is just where it was typed.
+
+  A region can be named (`GRAPH release`) so that a run can be asked for part
+  of it. It is otherwise transparent: wrapping an existing block in `GRAPH …
+  END` changes the order requests are sent in and nothing else. The same rows
+  come out, with the same columns, because a region is not a new kind of row —
+  its `REPORT` cells merge into the enclosing block's row exactly as if the
+  statements had been written inline.
+
+  Two things are errors rather than guesses. A cycle — two requests each
+  waiting on the other — stops the run before anything is sent, because the
+  author has just said written order is not the specification, so falling back
+  to it would be the one answer guaranteed to be wrong. And a bare `{{token}}`
+  inside a region where two steps both capture `token` is ambiguous for the
+  same reason: outside a region last-writer-wins has a written order to mean
+  something, and inside one it does not. Qualifying it (`{{login.token}}`)
+  says which.
+
+- **`--targets a,b` runs part of a report.** The named steps and everything
+  they transitively depend on are kept, and the rest of the flow is dropped
+  before the run starts — so `--dry-run --targets` shows exactly what a real
+  run would do. A target that no region declares is an error, not a silent
+  empty run.
+
+- **`--dry-run` lists a region's steps by depth.** Steps that nothing blocks
+  are shown first, then the steps those release, and so on, which is how you
+  check the shape of a region without sending anything. The grouping is a
+  description of the graph, not the schedule: execution still takes each step
+  as soon as it is ready.
+
+  `PARALLEL(n) GRAPH` parses, validates and round-trips, but for now runs its
+  steps one at a time. A degree is a cap — *up to* n may overlap — so that is a
+  legal schedule; the scheduler that actually uses the permission comes next.
+
 
 ## [0.5.6] - 2026-09-11
 

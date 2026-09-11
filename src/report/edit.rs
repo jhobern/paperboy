@@ -419,7 +419,9 @@ pub(crate) fn insert_pos_after(rows: &[NodeRow], sel: usize) -> InsertPos {
 
 fn loop_body(node: &FlowNode) -> Option<&Vec<FlowNode>> {
     match node {
-        FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => Some(body),
+        FlowNode::ForEach { body, .. }
+        | FlowNode::ForEnvs { body, .. }
+        | FlowNode::Graph { body, .. } => Some(body),
         _ => None,
     }
 }
@@ -1018,7 +1020,9 @@ pub(crate) fn reported_requests(body: &[FlowNode]) -> Vec<String> {
                 // A bare `REQUEST x` sends but emits nothing, so it has no
                 // fields to offer; only `REPORT REQUEST x` does.
                 FlowNode::Report(ReportStmt::Request { name, .. }) => out.push(name.clone()),
-                FlowNode::ForEnvs { body, .. } | FlowNode::ForEach { body, .. } => walk(body, out),
+                FlowNode::ForEnvs { body, .. }
+                | FlowNode::ForEach { body, .. }
+                | FlowNode::Graph { body, .. } => walk(body, out),
                 _ => {}
             }
         }
