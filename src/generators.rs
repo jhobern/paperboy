@@ -2155,6 +2155,17 @@ mod tests {
         }
     }
 
+    /// A row may be a plain string: the common case for "this test case
+    /// expects this" is data, not a computation, and making the user wrap it
+    /// in `concat()` to satisfy the grammar would be a toll booth.
+    #[test]
+    fn a_row_may_be_a_plain_literal() {
+        let (v, e) = run(&[("expected", r#""APPROVED""#), ("n", "3")]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["expected"], "APPROVED");
+        assert_eq!(v["n"], "3");
+    }
+
     #[test]
     fn a_block_reads_the_request_it_belongs_to() {
         let (v, e) = run_sending(
