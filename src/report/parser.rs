@@ -1258,7 +1258,34 @@ fn report_flow(i: &str) -> IResult<'_, ReportFlow> {
     let (i, header) = parse_headers(i)?;
     let (i, nodes) = many0(preceded(multispace0, node_or_comment))(i)?;
     let (i, _) = trivia(i)?;
-    Ok((i, ReportFlow { header, nodes }))
+    Ok((
+        i,
+        ReportFlow {
+            header,
+            nodes,
+            requests: None,
+        },
+    ))
+}
+
+/// Split a flow's source at its `REQUESTS` line: the statements before it, and
+/// the verbatim Hurl after it.
+///
+/// Recognised only as a line of its own with no indentation, because everything
+/// after it is Hurl and Hurl has lines that begin with words too. The *first*
+/// such line wins — a later one is part of the embedded text, not a second
+/// section, which is what "must be last in the file" means operationally.
+fn split_requests_section(input: &str) -> (&str, Option<String>) {
+    let mut at = 0usize;
+    for line in input.split_inclusive('\n') {
+        if !line.starts_with(char::is_whitespace)
+            && line.trim_end().eq_ignore_ascii_case("REQUESTS")
+        {
+            return (&input[..at], Some(input[at + line.len()..].to_string()));
+        }
+        at += line.len();
+    }
+    (input, None)
 }
 
 /// A parse failure, carrying the 1-based line where it occurred so the TUI
@@ -1293,8 +1320,16 @@ fn err_at(input: &str, at: &str, message: impl Into<String>) -> ParseError {
 
 /// Parse PaperTrail source into a [`ReportFlow`].
 pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
+    // Taken off the front before the grammar runs, so the flow parser never
+    // sees Hurl and the Hurl parser never sees PaperTrail. `head` is a prefix
+    // of `input`, so error line numbers are still the file's own.
+    let (head, requests) = split_requests_section(input);
+    let input = head;
     match report_flow(input) {
-        Ok((rest, flow)) if rest.trim().is_empty() => Ok(flow),
+        Ok((rest, mut flow)) if rest.trim().is_empty() => {
+            flow.requests = requests;
+            Ok(flow)
+        }
         Ok((rest, _)) => {
             let near = rest.lines().next().unwrap_or("").trim();
             Err(err_at(
@@ -2168,6 +2203,49 @@ mod tests {
             "{:?}",
             flow.nodes[1]
         );
+    }
+
+    #[test]
+    fn a_requests_section_is_kept_verbatim_and_round_trips() {
+        let src = "# collection: c\n\nREQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n[Asserts]\nstatus == 200\n";
+        let flow = parse_flow(src).expect("parses");
+        assert_eq!(flow.nodes.len(), 1, "the Hurl must not reach the grammar");
+        assert_eq!(
+            flow.requests.as_deref(),
+            Some("\n# ping\nGET https://x/ping\n[Asserts]\nstatus == 200\n"),
+            "everything after the keyword line is the section, byte for byte"
+        );
+        assert_eq!(flow.to_text(), src);
+        assert_eq!(
+            flow.embedded_entries()
+                .iter()
+                .map(|e| e.title.clone())
+                .collect::<Vec<_>>(),
+            vec!["ping".to_string()]
+        );
+    }
+
+    #[test]
+    fn only_the_first_requests_line_opens_the_section() {
+        // A later one is Hurl text — a request may perfectly well be called
+        // `REQUESTS`, and the section is defined as running to end of file.
+        let src = "# collection: c\n\nREQUESTS\n\n# a\nGET https://x/a\n\nREQUESTS\n";
+        let flow = parse_flow(src).expect("parses");
+        assert!(
+            flow.requests.as_deref().unwrap().contains("REQUESTS"),
+            "the second keyword belongs to the embedded text"
+        );
+        assert_eq!(flow.to_text(), src);
+    }
+
+    #[test]
+    fn an_indented_requests_line_is_not_a_section() {
+        // The section is defined at column zero. Anything indented is inside a
+        // block, where it has to be a statement — and there is no such
+        // statement, so this is a parse error rather than a silent truncation
+        // of the flow.
+        let src = "# collection: c\n\nFOR x IN LIST y\n    REQUESTS\nEND\n";
+        assert!(parse_flow(src).is_err());
     }
 
     #[test]

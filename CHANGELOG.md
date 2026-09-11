@@ -165,6 +165,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   enough to look. The summary gained `Warnings` and `Skipped` lines, and the
   README now documents the exit codes, which it never did.
 
+- **A report can now carry its own requests, in a `REQUESTS` section.** Plain
+  Hurl, last in the file, after which `paperboy -r health.trail` runs with no
+  `# collection:` line and no sibling `.hurl` file at all — the single-file
+  monitor that a container image can hold one copy of. The section is kept
+  verbatim, so the editor never reformats someone's Hurl, and it is split off
+  before the flow grammar sees the text, so neither parser can be confused by
+  the other's syntax. A flow may embed *and* reference a collection; both sets
+  of requests are then available and a name declared by both is an error,
+  because a reference has to mean one thing. An embedded request nothing calls
+  is a warning — dead text in the one file that was supposed to be
+  self-contained.
+
+### Fixed
+
+- **A `GRAPH` region no longer trips the "this report emits no columns"
+  warning.** The check looked inside loops but not inside regions, so a report
+  whose only `REPORT` statements were in a `GRAPH` was told it would produce an
+  empty table while producing a perfectly good one.
+
 
 ## [0.5.6] - 2026-09-11
 

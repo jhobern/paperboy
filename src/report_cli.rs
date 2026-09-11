@@ -92,26 +92,46 @@ pub fn run(
     // `-c` re-points the report at any collection; when omitted, fall back to
     // the report's own `# collection:` header (resolved relative to the report's
     // folder) so a workspace report "just runs" without repeating the path.
+    // A flow that embeds its own requests needs no collection at all: the
+    // `REQUESTS` section *is* the collection, which is the whole point of a
+    // monitor that ships as one file.
+    let embedded = flow.embedded_entries();
     let collection_path = match collection_path {
-        Some(c) => c,
+        Some(c) => Some(c),
         None => match report.collection_ref() {
-            Some(c) => resolve_path(report_dir, &c).to_string_lossy().into_owned(),
+            Some(c) => Some(resolve_path(report_dir, &c).to_string_lossy().into_owned()),
+            None if !embedded.is_empty() => None,
             None => {
                 eprintln!(
-                    "error: no collection to run against — pass -c/--collection, or add a '# collection:' header to '{report_path}'"
+                    "error: no collection to run against — pass -c/--collection, add a '# collection:' header to '{report_path}', or embed the requests in a REQUESTS section"
                 );
                 return 1;
             }
         },
     };
-    let col_content = match fs::read_to_string(&collection_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: cannot read collection file '{collection_path}': {e}");
-            return 1;
-        }
+    let col_content = match &collection_path {
+        Some(path) => match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: cannot read collection file '{path}': {e}");
+                return 1;
+            }
+        },
+        None => String::new(),
     };
-    let entries = parse_collection(&col_content);
+    let mut entries = match &collection_path {
+        Some(_) => parse_collection(&col_content),
+        None => Vec::new(),
+    };
+    // Appended, so an external collection's requests keep the names they had
+    // and a collision is visible to validation rather than resolved silently
+    // by whichever list was searched first.
+    let embedded_count = embedded.len();
+    entries.extend(embedded);
+    let collection_path = collection_path.unwrap_or_else(|| {
+        let s = if embedded_count == 1 { "" } else { "s" };
+        format!("(embedded: {embedded_count} request{s})")
+    });
     if entries.is_empty() {
         // As in `cli.rs`: prefer the concrete Hurl parse reason (line + what's
         // wrong) when the source is Hurl — one malformed line rejects the whole

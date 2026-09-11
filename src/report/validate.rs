@@ -122,7 +122,9 @@ impl Default for Context<'_> {
 fn emits_a_column(nodes: &[FlowNode]) -> bool {
     nodes.iter().any(|n| match n {
         FlowNode::Report(_) => true,
-        FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => emits_a_column(body),
+        FlowNode::ForEach { body, .. }
+        | FlowNode::ForEnvs { body, .. }
+        | FlowNode::Graph { body, .. } => emits_a_column(body),
         _ => false,
     })
 }
@@ -132,12 +134,19 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let s = ctx.strings;
 
-    // Header: collection binding + output format.
+    // Header: collection binding + output format. A `REQUESTS` section is its
+    // own declaration — a flow that carries its requests needs no binding, and
+    // demanding one would make the single-file monitor impossible.
+    let embedded = flow.embedded_entries();
     match flow.header.collection() {
+        None if !embedded.is_empty() => {}
         None => diags.push(Diagnostic::error(s.diag_collection_unset)),
-        Some(c) if c.trim().is_empty() => diags.push(Diagnostic::error(s.diag_collection_unset)),
+        Some(c) if c.trim().is_empty() && embedded.is_empty() => {
+            diags.push(Diagnostic::error(s.diag_collection_unset))
+        }
         Some(_) => {}
     }
+    check_embedded_requests(flow, &embedded, ctx, &mut diags);
     check_collection_directives(flow, ctx, &mut diags);
     if let Some(out) = flow.header.output() {
         let out = out.trim();
@@ -789,6 +798,79 @@ fn split_helper<'a>(
 /// The `# collection:` directives: exactly one primary (unaliased, first), every
 /// helper aliased, aliases distinct identifiers that don't collide with a
 /// top-level virtual folder, and every declared helper actually loadable.
+/// Check a `REQUESTS` section: that the keyword bought something, that no
+/// embedded name collides, and that nothing embedded is dead weight.
+fn check_embedded_requests(
+    flow: &ReportFlow,
+    embedded: &[crate::hurl::HurlEntry],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(text) = &flow.requests else {
+        return;
+    };
+    if embedded.is_empty() {
+        // A section that parsed to nothing is nearly always a malformed one,
+        // and the Hurl parser's own reason is far more useful than "no
+        // requests" on its own.
+        let why = crate::hurl::parse_hurl_error(text);
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_requests_section_empty,
+            &[why.as_deref().unwrap_or("")],
+        )));
+        return;
+    }
+
+    // A collision is counted against the merged title list rather than against
+    // the external collection alone, so two embedded requests sharing a name
+    // are caught by the same rule — both leave a reference meaning one of two
+    // things, which is the actual problem.
+    if let Some(titles) = ctx.request_titles {
+        for e in embedded {
+            if titles.iter().filter(|t| **t == e.title).count() > 1 {
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_requests_name_collision,
+                    &[&e.title],
+                )));
+            }
+        }
+    }
+
+    // Unreferenced is a warning, not an error: "unused by this --targets
+    // selection" is ordinary, but "unused by any step" is worth saying, because
+    // an embedded request nothing calls is dead text in the one file that was
+    // supposed to be self-contained.
+    let mut called = Vec::new();
+    collect_called(&flow.nodes, &mut called);
+    for e in embedded {
+        let used = called
+            .iter()
+            .any(|c| *c == e.title || c.rsplit('/').next() == Some(e.title.as_str()));
+        if !used {
+            diags.push(Diagnostic::warning(fill(
+                ctx.strings.diag_requests_unreferenced,
+                &[&e.title],
+            )));
+        }
+    }
+}
+
+/// Every request name the flow calls, at any depth.
+fn collect_called(nodes: &[FlowNode], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            FlowNode::Request { name, .. } | FlowNode::Cleanup { name, .. } => {
+                out.push(name.clone())
+            }
+            FlowNode::Report(ReportStmt::Request { name, .. }) => out.push(name.clone()),
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => collect_called(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let s = ctx.strings;
     let refs = flow.header.collections();
@@ -1768,6 +1850,84 @@ mod tests {
             ..Default::default()
         };
         validate(&flow, &ctx)
+    }
+
+    /// Diagnostics for a flow with a `REQUESTS` section, with the title list
+    /// assembled the way [`super::super::context::bound_entries`] assembles it
+    /// at run time: the external collection's entries, then the embedded ones.
+    /// Building it any other way would test a context that never occurs.
+    fn diags_embedded(src: &str, external: &[crate::hurl::HurlEntry]) -> Vec<Diagnostic> {
+        let flow = parse_flow(src).expect("test source should parse");
+        let mut entries = external.to_vec();
+        entries.extend(flow.embedded_entries());
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_entries: Some(&entries),
+            ..Default::default()
+        };
+        validate(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_flow_that_embeds_its_requests_needs_no_collection() {
+        // The single-file monitor. The section's presence is the declaration,
+        // so demanding a `# collection:` as well would make it impossible.
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[],
+        );
+        let errs: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn an_embedded_name_may_not_collide_with_an_external_one() {
+        let diags = diags_embedded(
+            "# collection: c\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[capturing_entry("ping", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("ping")),
+            "a reference would mean either of two requests: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_embedded_request_nothing_calls_is_a_warning_not_an_error() {
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n\n# spare\nGET https://x/spare\n",
+            &[],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("spare")),
+            "{diags:?}"
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("spare")),
+            "unused is normal enough not to fail the file: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_requests_section_that_declares_nothing_is_an_error() {
+        // The keyword bought nothing, which is nearly always a malformed
+        // section rather than a deliberately empty one.
+        let diags = diags_embedded("# name: solo\n\nREQUESTS\nnot hurl at all\n", &[]);
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
     }
 
     /// A request declaring the parameter, for the `USING` checks.

@@ -135,14 +135,29 @@ pub fn bound_entries(
     flow: &ReportFlow,
     report_path: Option<&Path>,
 ) -> Option<Vec<HurlEntry>> {
+    // Appended to whatever the flow is bound to, rather than replacing it: a
+    // flow may embed *and* reference, and a name that exists in both is a
+    // collision validation must be able to see.
+    let embedded = flow.embedded_entries();
+    let with_embedded = |mut es: Vec<HurlEntry>| {
+        es.extend(embedded.iter().cloned());
+        Some(es)
+    };
+    // No external collection at all is still a complete report when the
+    // requests are in the file.
+    let alone = || (!embedded.is_empty()).then(|| embedded.clone());
     if let Some(ci) = resolve_bound_collection(collections, flow, report_path) {
-        return Some(collections[ci].entries.clone());
+        return with_embedded(collections[ci].entries.clone());
     }
-    let cref = flow.header.collection()?;
+    let Some(cref) = flow.header.collection() else {
+        return alone();
+    };
     if cref.starts_with("git:") {
-        return None;
+        return alone();
     }
-    let text = std::fs::read_to_string(resolve_ref_path(report_path, cref)).ok()?;
+    let Ok(text) = std::fs::read_to_string(resolve_ref_path(report_path, cref)) else {
+        return alone();
+    };
     // A bound collection is not necessarily Hurl text: the workspace tree lists
     // Postman `.json` exports as collections, opening one imports it, and the
     // settings dropdown offers it — so a report can perfectly reasonably bind
@@ -150,7 +165,7 @@ pub fn bound_entries(
     // than failing to parse JSON as Hurl and then telling the user the
     // collection they just picked "isn't loaded".
     if crate::postman::looks_like_postman(&text) {
-        return Some(crate::postman::import_postman(&text));
+        return with_embedded(crate::postman::import_postman(&text));
     }
     // An unparseable file is not a collection; saying "not loaded" of it is
     // more honest than validating against the handful of requests that did
@@ -158,7 +173,7 @@ pub fn bound_entries(
     if crate::hurl::parse_hurl_error(&text).is_some() {
         return None;
     }
-    Some(crate::hurl::parse_hurl(&text))
+    with_embedded(crate::hurl::parse_hurl(&text))
 }
 
 /// One selectable request across the primary collection and every declared

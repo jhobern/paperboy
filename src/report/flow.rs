@@ -17,6 +17,15 @@ use super::model::StatKind;
 pub struct ReportFlow {
     pub header: Header,
     pub nodes: Vec<FlowNode>,
+    /// The verbatim Hurl after a `REQUESTS` line, when the flow embeds its own
+    /// requests. `None` when it has no such section — which is the declaration:
+    /// there is no header directive to disagree with.
+    ///
+    /// Kept as text rather than parsed entries so that extraction is a
+    /// byte-range move plus a `# collection:` line, and so a flow round-trips
+    /// through the editor without its requests being reformatted by a parser
+    /// that never claimed to be a formatter.
+    pub requests: Option<String>,
 }
 
 /// The header block: the `# key: value` directives (and any free `#` comments)
@@ -949,7 +958,29 @@ impl ReportFlow {
         for node in &self.nodes {
             write_node(&mut out, node, 0);
         }
+        if let Some(hurl) = &self.requests {
+            // Last in the file, by definition: everything after the keyword is
+            // Hurl, so nothing can follow it.
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str("REQUESTS\n");
+            out.push_str(hurl);
+        }
         out
+    }
+
+    /// The requests this flow embeds, parsed.
+    ///
+    /// Empty when there is no `REQUESTS` section. Parse errors are not reported
+    /// here — the Hurl parser is lenient by design and a malformed section
+    /// simply yields nothing, which validation reports as "the section declares
+    /// no requests" with the real reason attached.
+    pub fn embedded_entries(&self) -> Vec<crate::hurl::HurlEntry> {
+        match &self.requests {
+            Some(text) => crate::hurl::parse_hurl(text),
+            None => Vec::new(),
+        }
     }
 
     /// Collect the per-column summary statistics requested by

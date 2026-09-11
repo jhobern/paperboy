@@ -58,6 +58,7 @@ const KEYWORDS: &[&str] = &[
     "REPORT",
     "DEPENDS",
     "CLEANUP",
+    "REQUESTS",
     "FOR",
     "IN",
     "FILES",

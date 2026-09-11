@@ -757,6 +757,38 @@ undo — and a cleanup that fails is reported as a warning rather than an error,
 because a teardown failing is nearly always a consequence of the real failure
 and shouldn't be allowed to bury it.
 
+#### Carrying the requests in the report
+
+A report normally names a collection to draw its requests from. It can instead
+carry them itself, in a `REQUESTS` section — plain Hurl, which must be the last
+thing in the file:
+
+```
+# name: Health check
+
+GRAPH
+    REPORT REQUEST ping
+END
+
+REQUESTS
+
+# ping
+GET https://example.com/ping
+[Asserts]
+status == 200
+```
+
+That runs with no `# collection:` line and no sibling `.hurl` file:
+`paperboy -r health.trail`. A report that embeds its requests may still name a
+collection as well, in which case both sets are available and a name used by
+both is an error — a reference has to mean one thing.
+
+Embed when the requests exist only to serve the flow, so that the whole check
+travels as one file and nothing can be moved out from under it. Reference a
+collection when the requests *are* the API surface under test and other things
+use them too. Note what embedding does and doesn't buy: it removes the sibling
+collection file, not a fixture directory that `FOR … IN FILES` reads.
+
 #### Exit codes
 
 | Code | Meaning |
