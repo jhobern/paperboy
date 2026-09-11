@@ -179,6 +179,44 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A step-qualified name can no longer be answered by an environment
+  variable.** `.vars` keys are not restricted to identifiers, so an environment
+  could carry a flat `login.token` — and it answered `{{login.token}}` exactly
+  when the step `login` had *not* captured one, which is precisely when the
+  reference must fail. A run could therefore send a stale credential instead of
+  reporting a missing capture. The qualified namespace is now kept to itself.
+
+- **`CLEANUP` is a step, and is now validated like one.** Its name is checked
+  for validity and uniqueness, its `USING` values for unknown qualified
+  references, and its `DEPENDS` for unknown and self names — a typo in a
+  teardown used to be a runtime warning and exit 0, so CI reported success
+  while the cleanup never ran. Because a cleanup runs at the end of its block,
+  its references are checked against the whole block rather than only what was
+  written above it.
+
+- **A step-qualified name written in a request's own Hurl is now refused.**
+  Hurl has no dotted path, so the placeholder was passed through verbatim and
+  the run failed on an undefined variable with no hint as to why.
+
+- **A `CLEANUP` now follows the capture that actually won.** The flat chain is
+  last-successful-writer-wins, but every step declaring the name was treated as
+  required — so an earlier producer that failed skipped the teardown, leaking
+  what the later, successful one had created.
+
+- **A `CLEANUP` that depends on another `CLEANUP` runs after it.** Neither has
+  run when the order is decided, so there was no depth to sort them by and
+  reverse-written order could run the dependent first, which then skipped
+  itself.
+
+- **The report outline shows `DEPENDS` on a statement with a `WITH` block.**
+  The expanded heading omitted it, which was the only view of such a statement
+  — so the dependency was invisible everywhere in the editor.
+
+- **CI now runs the GUI test suites it was only compiling**, and a build
+  without the terminal UI no longer advertises one. A GUI-only build called
+  itself headless and told the user to reinstall to get a front-end it already
+  had.
+
 - **Dependency inference now sees every field Hurl evaluates.** `[Options]`,
   `[Asserts]`, `[Captures]` queries, response headers and body, and a form
   field's content type all carry `{{…}}` and are all substituted, but none of

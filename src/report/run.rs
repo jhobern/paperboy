@@ -693,6 +693,59 @@ struct Sched {
 /// supplies the ordering the graph forgot. Picking randomly among the ready set
 /// turns that latent hazard into a failure, and seeding it makes the failure
 /// reproducible rather than intermittent.
+/// Reorder cleanups so that one naming another runs after it, keeping the
+/// given order as the tie-break.
+///
+/// `planned` arrives in reverse-dependency order, which is right for the
+/// ordinary create-then-destroy shape but says nothing about cleanups that
+/// depend on each other: none of them has run, so none has a position in
+/// `step_order` to be deep against. This is a Kahn sort over just those edges,
+/// always taking the ready cleanup that came earliest in the incoming order —
+/// so a flow with no cleanup-to-cleanup dependency comes out exactly as it went
+/// in. A cycle (which validation refuses) leaves the remainder as it was rather
+/// than dropping it.
+type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
+
+fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> Vec<PlannedCleanup<'_>> {
+    let index: HashMap<&str, usize> = planned
+        .iter()
+        .enumerate()
+        .map(|(i, (_, _, _, step, _))| (step.as_str(), i))
+        .collect();
+    let n = planned.len();
+    let mut waiting = vec![0usize; n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_, _, _, _, deps)) in planned.iter().enumerate() {
+        for d in deps {
+            if let Some(&j) = index.get(d.as_str())
+                && j != i
+            {
+                succ[j].push(i);
+                waiting[i] += 1;
+            }
+        }
+    }
+    let mut done = vec![false; n];
+    let mut out_idx: Vec<usize> = Vec::with_capacity(n);
+    while out_idx.len() < n {
+        let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
+            // A cycle: emit what is left in the order it arrived.
+            out_idx.extend((0..n).filter(|&i| !done[i]));
+            break;
+        };
+        done[next] = true;
+        out_idx.push(next);
+        for &k in &succ[next] {
+            waiting[k] -= 1;
+        }
+    }
+    let mut slots: Vec<Option<PlannedCleanup<'_>>> = planned.into_iter().map(Some).collect();
+    out_idx
+        .into_iter()
+        .filter_map(|i| slots[i].take())
+        .collect()
+}
+
 /// Decrements the in-flight count and wakes the sleepers if the worker holding
 /// it unwinds. See the comment at its only construction site.
 struct InFlight<'s> {
@@ -1094,6 +1147,14 @@ impl<'a> Exec<'a> {
     /// ordinary, standalone-runnable Hurl.
     fn vars_for_source(&self) -> HashMap<String, String> {
         let mut m = self.vars_for();
+        // A dotted name means one thing in PaperTrail source: step, then
+        // capture. `.vars` keys are not restricted to identifiers, so an
+        // environment could carry a flat `login.token` — and left in the map it
+        // would answer `{{login.token}}` whenever the step `login` had *not*
+        // captured a token, which is exactly when the reference must fail.
+        // Silently sending a stale credential is the worst available outcome,
+        // so the qualified namespace is kept to itself.
+        m.retain(|k, _| !k.contains('.'));
         for (step, caps) in &self.step_captures {
             for (k, v) in caps {
                 m.insert(format!("{step}.{k}"), v.clone());
@@ -1355,6 +1416,13 @@ impl<'a> Exec<'a> {
         planned.sort_by_key(|(written, depth, ..)| {
             (std::cmp::Reverse(*depth), std::cmp::Reverse(*written))
         });
+        // A cleanup may depend on another cleanup, and none of them has run
+        // yet, so `step_order` has nothing to say about their relative depth.
+        // Reverse-written order alone can then run the dependent first, which
+        // sees its prerequisite as unsuccessful and skips itself. Honour those
+        // edges explicitly, keeping the reverse order above as the tie-break so
+        // the ordinary unwinding is unchanged.
+        planned = order_cleanups(planned);
 
         for (_, _, node, step, deps) in planned {
             let FlowNode::Cleanup {
@@ -1421,16 +1489,36 @@ impl<'a> Exec<'a> {
                 Some((step, _)) if self.step_ok.contains_key(step) => out.push(step.to_string()),
                 Some(_) => {}
                 None => {
-                    for (step, request) in &self.step_request {
-                        let Some(entry) =
-                            resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
-                        else {
-                            continue;
-                        };
-                        if entry.captures.iter().any(|(c, _)| *c == r) {
-                            out.push(step.clone());
-                        }
+                    // A flat reference reads the flat chain, which is
+                    // last-successful-writer-wins. So the step it actually
+                    // depends on is the *latest successful* capturer, not every
+                    // step that declares the name: an earlier producer that
+                    // failed was overwritten by a later one that didn't, and
+                    // skipping the teardown on its account leaks the resource
+                    // the later one created.
+                    //
+                    // With no successful writer there is no value to attribute,
+                    // so every declared producer counts — which is what makes a
+                    // single failed producer still skip the cleanup.
+                    let mut capturers: Vec<&String> = self
+                        .step_order
+                        .iter()
+                        .filter(|step| {
+                            self.step_request
+                                .get(*step)
+                                .and_then(|req| {
+                                    resolve_qualified(self.ctx.entries, self.ctx.helpers, req)
+                                })
+                                .is_some_and(|e| e.captures.iter().any(|(c, _)| *c == r))
+                        })
+                        .collect();
+                    if let Some(last_ok) = capturers
+                        .iter()
+                        .rposition(|step| self.step_ok.get(*step).copied().unwrap_or(false))
+                    {
+                        capturers = vec![capturers[last_ok]];
                     }
+                    out.extend(capturers.into_iter().cloned());
                 }
             }
         }
@@ -3410,6 +3498,98 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn a_cleanup_follows_the_capture_that_actually_won() {
+        // The flat chain is last-successful-writer-wins, so an earlier producer
+        // that failed was overwritten by a later one that didn't. Treating
+        // every declared producer as required skipped the teardown on the
+        // failed one's account and leaked what the successful one created.
+        let entries = [
+            graph_entry("first", &["sid"], &[]),
+            graph_entry("second", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("first")]);
+        run(
+            "REQUEST first AS first\nREQUEST second AS second\nCLEANUP purge\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the teardown must still run: {:?}",
+            fake.call_order()
+        );
+    }
+
+    #[test]
+    fn a_failed_sole_producer_still_skips_the_cleanup() {
+        // The other half of the same rule: with no successful writer there is
+        // no value to attribute, so the teardown has nothing to tear down.
+        let entries = [
+            graph_entry("create", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("create")]);
+        let res = run("REQUEST create\nCLEANUP purge\n", &entries, &[], &[], &fake);
+        assert!(!fake.call_order().contains(&"purge".to_string()));
+        assert!(res.skipped.iter().any(|s| s.contains("purge")));
+    }
+
+    #[test]
+    fn a_cleanup_that_depends_on_another_cleanup_runs_after_it() {
+        // Neither has run when the order is worked out, so `step_order` has no
+        // depth to sort them by; without an explicit edge, reverse-written
+        // order ran the dependent first and it skipped itself.
+        let entries = [
+            graph_entry("setup", &[], &[]),
+            graph_entry("c1", &[], &[]),
+            graph_entry("c2", &[], &[]),
+        ];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "REQUEST setup\nCLEANUP c1 DEPENDS setup\nCLEANUP c2 DEPENDS setup, c1\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        let order = fake.call_order();
+        let c1 = order.iter().position(|t| t == "c1").expect("c1 ran");
+        let c2 = order.iter().position(|t| t == "c2").expect("c2 ran");
+        assert!(c1 < c2, "{order:?}");
+    }
+
+    #[test]
+    fn a_dotted_environment_variable_cannot_answer_a_step_reference() {
+        // `.vars` keys are not restricted to identifiers, so an environment can
+        // carry a flat `login.token`. Left in the map it would answer
+        // `{{login.token}}` precisely when the step `login` had *not* captured
+        // one — which is exactly when the reference must fail. Silently sending
+        // a stale credential is the worst outcome available here.
+        let entries = [
+            graph_entry("producer", &["token"], &[]),
+            graph_entry("consumer", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("producer")]);
+        run(
+            "REQUEST producer AS login\nREQUEST consumer USING(url = \"http://x/{{login.token}}\")\n",
+            &entries,
+            &[("login.token", "STALE")],
+            &[],
+            &fake,
+        );
+        let sent = fake.sent_entry("consumer").expect("consumer was sent");
+        assert!(
+            !sent.url.contains("STALE"),
+            "the environment must not stand in for a capture: {}",
+            sent.url
+        );
     }
 
     #[test]

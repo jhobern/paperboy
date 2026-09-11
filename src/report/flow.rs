@@ -1740,6 +1740,7 @@ impl FlowNode {
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
+                depends,
                 using,
                 response_fmt,
                 show,
@@ -1750,6 +1751,10 @@ impl FlowNode {
                 if let Some(a) = alias {
                     let _ = write!(out, " AS {}", name_text(a));
                 }
+                // The outline is the only view of a statement that has a `WITH`
+                // block, so a `DEPENDS` left out here is a dependency the author
+                // cannot see anywhere in the editor at all.
+                out.push_str(&depends_text(depends));
                 out.push_str(&using_text(using));
                 if let Some(fmt) = response_fmt {
                     let _ = write!(out, " RESPONSE {}", fmt_text(*fmt));

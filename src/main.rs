@@ -63,20 +63,44 @@ mod workspace;
 
 use clap::Parser;
 
-/// PaperBoy — a Rust API client with a terminal UI and a headless runner.
-#[derive(Parser)]
-#[command(
-    name = "paperboy",
-    version,
-    about = "PaperBoy — a Rust-native API client (a Postman alternative).",
-    long_about = "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
-Runs in one of four modes:\n\
-\x20 TUI  (default)          a terminal user interface\n\
+/// How this build describes the mode it runs in when given no `-c`/`-r`.
+///
+/// A build without the TUI must not advertise one: the help is the only thing
+/// telling a container user what their binary can actually do, and "TUI
+/// (default)" on a binary that has none is a bug report waiting to happen.
+#[cfg(feature = "tui")]
+const DEFAULT_MODE: &str = "\x20 TUI  (default)          a terminal user interface\n";
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+const DEFAULT_MODE: &str =
+    "\x20 GUI  (-g/--gui)         a native graphical interface (this build has no TUI)\n";
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+const DEFAULT_MODE: &str = "";
+
+#[cfg(feature = "tui")]
+const DEFAULT_EXAMPLE: &str =
+    "\x20 paperboy                            Launch the terminal UI (default)\n";
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+const DEFAULT_EXAMPLE: &str = "\x20 paperboy --gui                      Launch the graphical UI\n";
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+const DEFAULT_EXAMPLE: &str = "";
+
+/// Built at first use rather than written as a literal so the mode list and the
+/// examples can differ by feature — see [`DEFAULT_MODE`].
+static LONG_ABOUT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "PaperBoy — a Rust-native API client (a Postman alternative).\n\n\
+Runs in one of these modes:\n\
+{DEFAULT_MODE}\
 \x20 CLI  (-c/--collection)  run a Hurl or Postman collection headlessly, then exit\n\
 \x20 Report (-r/--report)    run a PaperTrail report against a collection, then exit\n\
-\x20 Import (--postman-import)  download a Postman workspace over the API, then exit",
-    after_help = "Examples:\n\
-\x20 paperboy                            Launch the terminal UI (default)\n\
+\x20 Import (--postman-import)  download a Postman workspace over the API, then exit"
+    )
+});
+
+static AFTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "Examples:\n\
+{DEFAULT_EXAMPLE}\
 \x20 paperboy -c collection.hurl         Run a collection headlessly\n\
 \x20 paperboy -c collection.hurl -e environment.vars   Run a collection with an environment\n\
 \x20 paperboy -c collection.hurl --batch    Run as one batch (preserves cookies across requests)\n\
@@ -96,6 +120,17 @@ Environment (.vars) entries are KEY=value, where the value is a literal or a\n\
 \x20 AWS SSM parameter   DB_PASSWORD={{ ssm:/path/to/param }}\n\n\
 Collections are Hurl files (.hurl) or Postman collection exports (.json);\n\
 Postman JSON is imported automatically."
+    )
+});
+
+/// PaperBoy — a Rust API client with a terminal UI and a headless runner.
+#[derive(Parser)]
+#[command(
+    name = "paperboy",
+    version,
+    about = "PaperBoy — a Rust-native API client (a Postman alternative).",
+    long_about = LONG_ABOUT.as_str(),
+    after_help = AFTER_HELP.as_str()
 )]
 struct Cli {
     /// Run the given collection (Hurl `.hurl` or Postman `.json`) headlessly and print the results.
@@ -286,11 +321,24 @@ fn run_tui() -> i32 {
     0
 }
 
-#[cfg(not(feature = "tui"))]
+/// A build with the GUI but not the TUI has a front-end — it just isn't this
+/// one. Calling itself headless and telling the user to reinstall would be
+/// advice to rebuild something they already have.
+#[cfg(all(not(feature = "tui"), feature = "gui"))]
+fn run_tui() -> i32 {
+    eprintln!(
+        "This build of PaperBoy has no terminal UI.\n\
+         Pass `-g/--gui` for the graphical one, or `-c <collection.hurl>` or \
+         `-r <report.trail>` to run headlessly."
+    );
+    1
+}
+
+#[cfg(all(not(feature = "tui"), not(feature = "gui")))]
 fn run_tui() -> i32 {
     eprintln!(
         "This build of PaperBoy is headless: it runs collections and reports, \
-         but has no terminal UI.\n\
+         but has no user interface.\n\
          Pass `-c <collection.hurl>` or `-r <report.trail>`, or reinstall with \
          the terminal UI:\n\
          \x20   cargo install paperboy --locked"

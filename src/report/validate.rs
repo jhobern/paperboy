@@ -967,6 +967,14 @@ fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
             request: name,
             alias: alias.as_deref(),
         }),
+        // A cleanup is a step: it is sent, it can be named, and `DEPENDS` and
+        // `{{step.var}}` both refer to it. Leaving it out let two steps share
+        // one identity, and let a cleanup carry a name that is not an
+        // identifier at all.
+        FlowNode::Cleanup { name, alias, .. } => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+        }),
         _ => None,
     }
 }
@@ -1110,6 +1118,12 @@ fn walk_step_names(
     in_region: bool,
     diags: &mut Vec<Diagnostic>,
 ) {
+    // A cleanup is written where it belongs logically but runs at the end of
+    // its block, so every step in that block has already run by the time it
+    // sends. Checking it in written position would reject the ordinary shape —
+    // a teardown written beside the thing it tears down, above the rest of the
+    // setup — so its references are checked once the block's frame is complete.
+    let mut deferred: Vec<&FlowNode> = Vec::new();
     for node in nodes {
         // Outside a region, checked *before* this node's name is recorded,
         // which is what makes a step unable to refer to itself: its captures
@@ -1121,7 +1135,12 @@ fn walk_step_names(
         } else {
             None
         };
-        check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        check_hurl_side_qualified(node, ctx, path, diags);
+        if matches!(node, FlowNode::Cleanup { .. }) {
+            deferred.push(node);
+        } else {
+            check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        }
         if in_region {
             // Already registered by the region pass below.
             if let FlowNode::Graph { body, .. } = node {
@@ -1155,6 +1174,34 @@ fn walk_step_names(
             _ => {}
         }
     }
+    // The block's frame is complete now, so a cleanup may name anything in it.
+    for node in deferred {
+        let own = step_use(node).map(|u| step_name_of(&u));
+        check_qualified_refs(node, ctx, path, own.as_deref(), diags);
+        // A cleanup runs only if what it depends on succeeded, so a `DEPENDS`
+        // naming no step at all reads as "it didn't succeed" and the teardown
+        // is quietly skipped — a typo that leaves things behind and says
+        // nothing. The name has to exist.
+        let FlowNode::Cleanup { depends, .. } = node else {
+            continue;
+        };
+        let here = own.as_deref().unwrap_or_default();
+        for dep in depends {
+            if dep == here {
+                // It can never have succeeded when it is asked, so it would
+                // always skip itself — a cycle of one, said plainly.
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_graph_depends_self,
+                    &[here],
+                )));
+            } else if !path.iter().rev().any(|f| f.contains_key(dep.as_str())) {
+                diags.push(Diagnostic::error(fill(
+                    ctx.strings.diag_graph_depends_unknown,
+                    &[here, dep],
+                )));
+            }
+        }
+    }
 }
 
 /// The PaperTrail source text on `node` that is `{{VAR}}`-interpolated at run
@@ -1177,9 +1224,46 @@ fn interpolated_source(node: &FlowNode) -> Vec<&str> {
     match node {
         FlowNode::Assign { value, .. } => vec![value.as_str()],
         FlowNode::Request { using: u, .. } => using(u),
+        FlowNode::Cleanup { using: u, .. } => using(u),
         FlowNode::Report(ReportStmt::Request { using: u, .. }) => using(u),
         FlowNode::Report(ReportStmt::Computed { template, .. }) => vec![template.as_str()],
         _ => vec![],
+    }
+}
+
+/// Catch a step-qualified name written in a *request's own* Hurl, where it
+/// cannot work: PaperTrail resolves `{{step.var}}` in its own source before the
+/// request is built, and never hands a dotted name to Hurl — whose expression
+/// grammar has no dotted path, so the placeholder is left verbatim and the run
+/// fails on an undefined variable with no hint as to why.
+///
+/// Only reported when the prefix names a step in scope. A dotted `.vars` key is
+/// legal (environment keys are not restricted to identifiers), so the mere
+/// presence of a dot proves nothing; a prefix that matches a step the author
+/// can see is what makes the intent unambiguous.
+fn check_hurl_side_qualified(
+    node: &FlowNode,
+    ctx: &Context,
+    path: &[HashMap<String, StepInfo>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(use_) = step_use(node) else { return };
+    let Some(entry) = resolve_entry_qualified(use_.request, ctx) else {
+        return;
+    };
+    let mut bad: Vec<String> = crate::request::entry_referenced_keys(entry)
+        .into_iter()
+        .filter(|k| {
+            k.split_once('.')
+                .is_some_and(|(step, _)| path.iter().rev().any(|f| f.contains_key(step)))
+        })
+        .collect();
+    bad.sort();
+    for key in bad {
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_step_ref_in_hurl,
+            &[use_.request, &key],
+        )));
     }
 }
 
@@ -2015,6 +2099,75 @@ mod tests {
             !diags
                 .iter()
                 .any(|d| d.severity == Severity::Warning && d.message.contains("never called")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_a_step_and_may_not_share_another_steps_name() {
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST a AS same\nCLEANUP b AS same\n",
+            &[capturing_entry("a", &[]), capturing_entry("b", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("same")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_name_a_step_written_below_it() {
+        // It runs at the end of its block, so the ordinary shape — a teardown
+        // written beside the thing it tears down, above the rest of the setup —
+        // must not be rejected.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP teardown USING(url = \"{{create.sid}}\")\nREQUEST create\n",
+            &[
+                capturing_entry("create", &["sid"]),
+                capturing_entry("teardown", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_depending_on_nothing_that_exists_is_refused() {
+        // Unchecked, the missing name reads as "it didn't succeed" and the
+        // teardown is quietly skipped — a typo that leaves things behind and
+        // says nothing about it.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST a\nCLEANUP teardown DEPENDS ghost\n",
+            &[capturing_entry("a", &[]), capturing_entry("teardown", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("ghost")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_name_in_a_requests_own_hurl_is_refused() {
+        // PaperTrail resolves `{{step.var}}` in its own source and never hands
+        // a dotted name to Hurl, which has no dotted path — so left in the
+        // request it fails at run time on an undefined variable, with nothing
+        // to say why.
+        let mut consumer = capturing_entry("consumer", &[]);
+        consumer.url = "http://x/{{login.token}}".into();
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST auth AS login\nREQUEST consumer\n",
+            &[capturing_entry("auth", &["token"]), consumer],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("login.token")),
             "{diags:?}"
         );
     }

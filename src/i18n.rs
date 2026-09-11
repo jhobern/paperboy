@@ -1671,6 +1671,7 @@ strings! {
     // halves are checked: an unknown step, and a step that doesn't produce the
     // value asked of it, are the two ways the reference can quietly resolve to
     // somebody else's copy at run time.
+    diag_step_ref_in_hurl => "Request '{}' writes '{}' in its own Hurl, where a step-qualified name means nothing — Hurl has no dotted path. Move it into a USING(…) override in the report.", "La requête « {} » écrit « {} » dans son propre Hurl, où un nom qualifié par étape n'a aucun sens — Hurl n'a pas de chemin pointé. Déplacez-le dans un remplacement USING(…) du rapport.", "Forespørgslen '{}' skriver '{}' i sin egen Hurl, hvor et trin-kvalificeret navn intet betyder — Hurl har ingen punkteret sti. Flyt det til en USING(…)-tilsidesættelse i rapporten.";
     diag_step_ref_unknown => "'{}' refers to step '{}', which isn't a step in scope here.", "« {} » fait référence à l'étape « {} », qui n'est pas une étape visible ici.", "'{}' henviser til trinnet '{}', som ikke er et trin i omfang her.";
     diag_step_ref_no_capture => "Step '{}' runs request '{}', which doesn't capture '{}'.", "L'étape « {} » exécute la requête « {} », qui ne capture pas « {} ».", "Trinnet '{}' kører forespørgslen '{}', som ikke fanger '{}'.";
     // A `GRAPH` region's diagnostics. All are errors: inside a region the
