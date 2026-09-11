@@ -49,6 +49,20 @@ pub struct EntryOutcome {
     /// result up by one and show a response against the wrong request, which
     /// in an API client is the worst kind of wrong.
     pub entry_index: usize,
+    /// A retry attempt that a later attempt of the same request replaced.
+    ///
+    /// `[Options] retry` means "keep asking until it holds", so a poll that
+    /// answered `ResultUnavailable` twice and then succeeded is one request
+    /// that passed -- not two failures and a pass. Hurl returns every attempt
+    /// and settles the question with the last one for a given entry (its own
+    /// `is_success` does exactly this), so PaperBoy marks the superseded ones
+    /// here rather than leaving each reader of the result list to rediscover
+    /// the rule and disagree about it.
+    ///
+    /// Only ever set for a request that asks to be retried. `[Options] repeat`
+    /// also produces several outcomes per request, but those are N real runs
+    /// the user asked for, and every one of them counts.
+    pub superseded: bool,
     /// The method/URL actually sent (fully substituted, incl. chained captures).
     pub method: String,
     pub url: String,
@@ -182,16 +196,24 @@ pub fn run_hurl(
     );
 
     let lines: Vec<&str> = content.lines().collect();
-    let mut error: Option<String> = None;
     let mut entries = Vec::new();
+    let mut errors: Vec<Option<String>> = Vec::new();
 
     for e in &result.entries {
         let (outcome, entry_error) = map_entry_result(e, &lines);
-        if error.is_none() {
-            error = entry_error;
-        }
         entries.push(outcome);
+        errors.push(entry_error);
     }
+    mark_superseded(&mut entries, |i| {
+        hurl_file.entries.get(i).is_some_and(entry_retries)
+    });
+    // The run's error is the first *surviving* failure. Taking the first of any
+    // kind would report a poll that eventually succeeded as a failed run, on
+    // the strength of the attempt that was supposed to be thrown away.
+    let error = entries
+        .iter()
+        .zip(&errors)
+        .find_map(|(e, err)| (!e.superseded).then_some(err.clone()).flatten());
 
     RunOutput { entries, error }
 }
@@ -200,6 +222,34 @@ pub fn run_hurl(
 /// pairs — the defaults a `# [Gen]` block is allowed to read (see the streaming
 /// runner above). Placeholder-valued definitions are rendered as written; a
 /// literal like `SAMPLE_KEY=s3cret` comes back verbatim.
+/// Whether a request asks Hurl to retry it until its asserts pass.
+///
+/// Read from the parsed entry rather than from PaperBoy's own `[Options]` rows,
+/// because this has to agree with what the runner actually did -- and the
+/// runner read the same AST.
+fn entry_retries(entry: &hurl_core::ast::Entry) -> bool {
+    use hurl_core::ast::OptionKind;
+    entry
+        .request
+        .options()
+        .iter()
+        .any(|opt| matches!(opt.kind, OptionKind::Retry(_)))
+}
+
+/// Mark every outcome that a later attempt of the same request replaced.
+///
+/// `outcomes` must be the results of one runner call, in the order the runner
+/// produced them: attempts of one entry are consecutive, so "another result
+/// with my index follows" is exactly "I was retried".
+fn mark_superseded(outcomes: &mut [EntryOutcome], retries: impl Fn(usize) -> bool) {
+    for i in 0..outcomes.len().saturating_sub(1) {
+        let index = outcomes[i].entry_index;
+        if outcomes[i + 1].entry_index == index && retries(index) {
+            outcomes[i].superseded = true;
+        }
+    }
+}
+
 fn entry_variable_defaults(entry: &hurl_core::ast::Entry) -> Vec<(String, String)> {
     use hurl_core::ast::OptionKind;
     entry
@@ -335,9 +385,20 @@ pub fn run_hurl_streaming_with(
         // Carry captures forward into the next entry's window.
         variables = result.variables;
 
+        // Mapped as a batch before any is reported: whether an attempt was
+        // superseded is only knowable once the attempt after it is in hand, and
+        // `on_entry` is what stamps the caller's pass/fail marker.
+        let mut window: Vec<EntryOutcome> = Vec::new();
+        let mut window_errors: Vec<Option<String>> = Vec::new();
         for e in &result.entries {
             let (outcome, entry_error) = map_entry_result(e, &lines);
-            if error.is_none() {
+            window.push(outcome);
+            window_errors.push(entry_error);
+        }
+        let retried = entry_retries(&hurl_file.entries[i - 1]);
+        mark_superseded(&mut window, |_| retried);
+        for (outcome, entry_error) in window.into_iter().zip(window_errors) {
+            if error.is_none() && !outcome.superseded {
                 error = entry_error;
             }
             on_entry(&outcome);
@@ -478,6 +539,9 @@ fn map_entry_result(e: &EntryResult, lines: &[&str]) -> (EntryOutcome, Option<St
     (
         EntryOutcome {
             entry_index: e.entry_index.to_zero_based(),
+            // Decided by `mark_superseded` once the attempt after this one is
+            // known; a single result is never superseded.
+            superseded: false,
             method,
             url,
             status,
@@ -607,6 +671,120 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A server that answers "not ready" `pending` times and then succeeds,
+    /// on an ephemeral port. The shape a polling request is written against.
+    fn polling_server(pending: usize) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            while let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                seen += 1;
+                let state = if seen > pending { "Matched" } else { "Pending" };
+                let body = format!("{{\"result\":\"{state}\"}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// A poll that succeeds on its third go is one request that passed, not two
+    /// failures and a pass. Hurl hands back every attempt and settles it with
+    /// the last (its own `is_success` does the same); PaperBoy used to treat
+    /// each attempt as an outcome in its own right, so the request it had just
+    /// retried into success was reported as a failure -- `[Options] retry`
+    /// undone at the last step, and exactly what a converted Postman polling
+    /// loop relies on.
+    #[test]
+    fn a_poll_that_succeeds_on_the_third_go_is_a_pass() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+
+        assert_eq!(out.entries.len(), 3, "every attempt is still reported");
+        let surviving: Vec<&EntryOutcome> = out.entries.iter().filter(|e| !e.superseded).collect();
+        assert_eq!(surviving.len(), 1, "one request, one outcome that counts");
+        assert!(surviving[0].ok, "{:?}", surviving[0].error);
+        assert!(
+            out.error.is_none(),
+            "the run reported {:?} for a poll that succeeded",
+            out.error
+        );
+    }
+
+    /// The other half of the rule: retries that never succeed are still a
+    /// failure, and the *last* attempt is the one that says so.
+    #[test]
+    fn a_poll_that_never_comes_good_still_fails() {
+        let port = polling_server(99);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 1\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        let surviving: Vec<&EntryOutcome> = out.entries.iter().filter(|e| !e.superseded).collect();
+        assert_eq!(surviving.len(), 1);
+        assert!(!surviving[0].ok);
+        assert!(out.error.is_some(), "a failed run must say why");
+    }
+
+    /// `repeat` is not `retry`: those are N runs the user asked for, and every
+    /// one of them counts. Nothing may be marked away, or a repeat that failed
+    /// twice and passed once would report as a pass.
+    #[test]
+    fn a_repeated_request_keeps_every_run() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nrepeat: 3\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let out = run_hurl(&content, &HashMap::new(), None);
+        assert_eq!(out.entries.len(), 3);
+        assert!(
+            out.entries.iter().all(|e| !e.superseded),
+            "a repeat's runs are all real"
+        );
+        assert!(out.error.is_some(), "two of the three runs failed");
+    }
+
+    /// The streaming path runs each entry in its own window, so it has to apply
+    /// the same rule on its own -- and it is the path the terminal UI and a
+    /// plain `paperboy -c` both take.
+    #[test]
+    fn streaming_marks_the_superseded_attempts_too() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, bool, bool)> = Vec::new();
+        let out = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |eo| seen.push((eo.entry_index, eo.ok, eo.superseded)),
+        );
+        assert_eq!(
+            seen,
+            vec![(0, false, true), (0, false, true), (0, true, false)],
+            "the caller is told which attempts to ignore, as they happen"
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
     }
 
     /// Feature: the transfer time is reported both whole and broken into its

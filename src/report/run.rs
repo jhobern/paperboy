@@ -111,6 +111,7 @@ impl EntryRunner for DryRunner {
         RunOutput {
             entries: vec![EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 0,
@@ -1998,6 +1999,7 @@ mod tests {
             let c = self.canned.get(&base.title).cloned().unwrap_or_default();
             let eo = EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: c.status,
@@ -3466,6 +3468,7 @@ mod tests {
                 RunOutput {
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3559,6 +3562,7 @@ mod tests {
                 RunOutput {
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -3663,6 +3667,7 @@ mod tests {
                 RunOutput {
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -4696,6 +4701,7 @@ mod tests {
                 RunOutput {
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -5236,6 +5242,7 @@ mod helper_collection_tests {
                 RunOutput {
                     entries: vec![EntryOutcome {
                         entry_index: 0,
+                        superseded: false,
                         method: base.method.clone(),
                         url: base.url.clone(),
                         status: 200,
@@ -5319,6 +5326,7 @@ mod timing_column_tests {
             RunOutput {
                 entries: vec![EntryOutcome {
                     entry_index: 0,
+                    superseded: false,
                     method: base.method.clone(),
                     url: base.url.clone(),
                     status: 200,

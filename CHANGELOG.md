@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A request that succeeded after retrying is no longer reported as a
+  failure.** `[Options] retry` means "keep asking until it holds", and Hurl
+  duly hands back every attempt, settling the question with the last one for a
+  given request. PaperBoy counted each attempt as an outcome in its own right,
+  so a poll that answered `ResultUnavailable` twice and then succeeded printed
+  `Passed: 0  Failed: 1` and exited non-zero — the one thing `retry` exists to
+  prevent, undone at the last step. Superseded attempts are now marked at the
+  point the result is read, so the runner, the terminal UI and `paperboy -c`
+  cannot drift apart on the rule; the run's error line ignores them too, rather
+  than reporting a successful poll by quoting the attempt that was thrown away.
+  They are still printed, labelled `(retried)` — that a poll was pending twice
+  is most of what you want to know about it. `[Options] repeat` is untouched:
+  those are N runs that were asked for, and every one of them still counts.
+
 - A `{{name}}` written inside a `[Gen]` expression is now refused, with a
   message naming what to write instead. Everywhere else in PaperBoy a variable
   is `{{name}}`, so reaching for the braces here is the natural mistake — but an

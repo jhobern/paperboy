@@ -1232,6 +1232,13 @@ pub fn run_all_entries(
                     crate::hurl::EntrySetup::Bind(bound)
                 },
                 |eo| {
+                    // A superseded retry attempt is not an outcome: it would
+                    // paint the request red for as long as the poll runs, and
+                    // in batch (where results arrive at the end) it would be
+                    // the reading that stuck.
+                    if eo.superseded {
+                        return;
+                    }
                     if let Some(&at) = run_positions.get(eo.entry_index) {
                         results[at] = Some(eo.ok);
                         // Computed values first so a `[Captures]` row of the same
@@ -1296,7 +1303,7 @@ pub fn run_all_entries(
         // vectors from the final result set and send a single update.
         // (Streaming already emitted its final cumulative snapshot above.)
         if batch {
-            for eo in out.entries.iter() {
+            for eo in out.entries.iter().filter(|eo| !eo.superseded) {
                 // Keyed by the request Hurl says produced this outcome, not by
                 // the outcome's position: see the streaming path above.
                 let Some(&at) = run_positions.get(eo.entry_index) else {

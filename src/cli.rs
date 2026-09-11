@@ -375,6 +375,13 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
 /// run of that request passed. Out-of-range indices are ignored rather than
 /// panicking — the runner is the authority on how many entries there were.
 fn credit(per_request: &mut [Option<bool>], eo: &EntryOutcome) {
+    // A retry attempt that a later one replaced decides nothing: the request
+    // asked to be tried until it held, and it held. Counting it would report a
+    // poll that succeeded on its third go as a failure -- which is the whole
+    // reason `[Options] retry` exists, undone at the last step.
+    if eo.superseded {
+        return;
+    }
     if let Some(slot) = per_request.get_mut(eo.entry_index) {
         *slot = Some(slot.unwrap_or(true) && eo.ok);
     }
@@ -383,12 +390,24 @@ fn credit(per_request: &mut [Option<bool>], eo: &EntryOutcome) {
 /// Print one request's result to stdout, coloured if `color` is enabled.
 fn print_entry(color: bool, idx: usize, total: usize, title: Option<&str>, eo: &EntryOutcome) {
     println!();
+    // A superseded attempt is still printed -- seeing that a poll answered
+    // "not ready" twice is most of what you want from a poll -- but it is
+    // labelled, so three blocks with two red ones read as one request that
+    // took three goes rather than as two failures.
+    let attempt = if eo.superseded { "  (retried)" } else { "" };
     println!(
         "{}",
         paint(
             color,
             Hue::Cyan,
-            &format!("[{}/{}] {} {}", idx + 1, total, eo.method, eo.url)
+            &format!(
+                "[{}/{}] {} {}{}",
+                idx + 1,
+                total,
+                eo.method,
+                eo.url,
+                attempt
+            )
         )
     );
     if let Some(title) = title.filter(|t| !t.is_empty()) {
@@ -536,6 +555,30 @@ mod tests {
         );
         let passed = per_request.iter().filter(|r| **r == Some(true)).count();
         assert_eq!(passed, 1, "never more passes than there are requests");
+    }
+
+    /// The counterpart for `retry`: an attempt a later one replaced decides
+    /// nothing. Counted, it made a poll that succeeded on its third go report
+    /// `Passed: 0  Failed: 1` -- and exit non-zero -- which is the one thing
+    /// `[Options] retry` is there to prevent.
+    #[test]
+    fn a_superseded_retry_attempt_does_not_fail_the_request() {
+        use crate::hurl::run::EntryOutcome;
+        let attempt = |ok: bool, superseded: bool| EntryOutcome {
+            entry_index: 0,
+            ok,
+            superseded,
+            ..EntryOutcome::default()
+        };
+        let mut per_request = vec![None; 1];
+        for eo in [
+            attempt(false, true),
+            attempt(false, true),
+            attempt(true, false),
+        ] {
+            super::credit(&mut per_request, &eo);
+        }
+        assert_eq!(per_request, vec![Some(true)]);
     }
 
     /// An outcome for a request the collection doesn't have is ignored rather

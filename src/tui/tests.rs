@@ -20806,6 +20806,7 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
         crate::hurl::RunOutput {
             entries: vec![crate::hurl::EntryOutcome {
                 entry_index: 0,
+                superseded: false,
                 method: base.method.clone(),
                 url: base.url.clone(),
                 status: 200,
