@@ -227,6 +227,35 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
 
     let out = if batch {
         let mut vars = vars.clone();
+        // Two requests that each compute a `nonce` would share one value in
+        // batch (see above), and be sent each other's. Rename the later
+        // claimants instead, rewriting their own references to match, so every
+        // request gets a value computed for it — as streaming gives it. Only a
+        // colliding name is touched, so an ordinary file is unchanged.
+        let mut gen_entries = gen_entries.clone();
+        let renames = crate::request::uniquify_batch_generators(&mut gen_entries, &vars);
+        let run_content = if renames.is_empty() {
+            run_content.clone()
+        } else {
+            collection_to_hurl(&gen_entries)
+        };
+        for r in &renames {
+            eprintln!(
+                "{}",
+                paint(
+                    color,
+                    Hue::Yellow,
+                    &format!(
+                        "  * {}",
+                        strings
+                            .cli_gen_renamed
+                            .replace("{name}", &r.original)
+                            .replace("{new}", &r.renamed)
+                            .replace("{title}", &r.title)
+                    )
+                )
+            );
+        }
         let blocks =
             crate::request::expand_batch_generators(&gen_entries, &vars, &SystemSource::new());
         for (title, errors) in &blocks.errors {
@@ -249,21 +278,10 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 error: Some(crate::i18n::summarise_gen_errors(&strings, &flat).join("; ")),
             }
         } else {
-            // Said out loud rather than silently resolved: in batch the two
-            // requests share one value, so the second one's signature is computed
-            // over the first one's nonce. Streaming (the default) gives each its
-            // own, so the fix is usually to drop `--batch` — which is what the
-            // message suggests.
-            for name in &blocks.collisions {
-                eprintln!(
-                    "{}",
-                    paint(
-                        color,
-                        Hue::Yellow,
-                        &format!("  ! {}", strings.cli_gen_collision.replace("{name}", name))
-                    )
-                );
-            }
+            // No collision loop here: `uniquify_batch_generators` above has
+            // already given each claimant its own name, so `blocks.collisions`
+            // is empty by construction. What the user is told instead is the
+            // rename itself, printed where the renaming happened.
             // A generator whose name the environment already binds computes nothing
             // in batch: one shared value set can't shadow the value from this
             // request on without rewriting it for the requests above too, so the

@@ -954,9 +954,10 @@ impl Session {
         }
         let gen_errors = request::generator_problems_all(col, env.as_ref());
         // Only batch shares one variable set across the file, so only batch
-        // turns two requests computing the same name into one value for both.
-        // Reported, not refused: sharing is occasionally what was meant, and
-        // the run is about to happen either way.
+        // has to run the later of two requests computing the same name under a
+        // numbered name of its own (see `uniquify_batch_generators`). Said out
+        // loud rather than done silently, so the `nonce_2` that appears among
+        // the results is accounted for.
         let collisions = if self.run_all_batch_mode {
             request::generator_collisions(col)
         } else {

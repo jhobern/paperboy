@@ -1963,8 +1963,10 @@ impl TuiApp {
         }
         let gen_errors = request::generator_problems_all(col, env.as_ref());
         // Batch alone shares one variable set across the file, so batch alone
-        // makes two requests computing the same name settle on one value.
-        // Reported rather than refused: it is occasionally what was meant.
+        // has to give the later of two requests computing the same name a
+        // numbered name of its own (see `uniquify_batch_generators`). Said out
+        // loud rather than done silently: the run is correct either way, but a
+        // `nonce_2` turning up in the captures panel should not be a surprise.
         let collisions = if self.run_all_batch_mode {
             request::generator_collisions(col)
         } else {

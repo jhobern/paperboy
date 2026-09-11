@@ -12,6 +12,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **Two requests that compute the same `# [Gen]` name no longer share one value
+  in a batch run.** A batch run is a single Hurl call over the whole file, so
+  every generator was evaluated once into one shared set of variables — and two
+  requests that each computed a `nonce` were both sent the first one's, which is
+  exactly how a signature ends up computed over the wrong nonce. PaperBoy used
+  to warn about this and send it anyway. The later claimants are now run under a
+  name of their own (`nonce`, `nonce_2`, `nonce_3`), with that request's own
+  references — placeholders *and* the bare names its expressions read — rewritten
+  to match, so each gets a value computed for it and batch behaves as streaming
+  always did. Only a name that actually collides is touched, and a minted name is
+  checked against every environment key, generator name, capture,
+  `[Options] variable:` and `{{reference}}` in the collection first, so it can
+  never take one that is already spoken for.
+
 - **A `jsonpath(text, path)` generator.** The generator language could hash,
   encode and sign a value but not *look one up*, so a `[Gen]` block that needed
   one field out of a JSON document had no way to get at it — a signature over
