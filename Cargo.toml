@@ -1,6 +1,6 @@
 [package]
 name = "paperboy"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 description = "A Rust TUI API tester"
 readme = "README.md"
@@ -12,18 +12,38 @@ license = "MIT"
 build = "build.rs"
 
 [features]
-# The terminal UI and the headless runner are always built. The native GUI is
-# opt-in because it drags in eframe/winit/wgpu and the Phosphor font, which
-# together dominate build time — a cost a user who only wants `paperboy` in a
-# terminal should not pay:
+# Three front-ends share one core, and each is a Cargo feature so a build only
+# pays for what it will actually run.
+#
+# `tui` is the terminal UI and is on by default, because `paperboy` with no
+# arguments is a TUI. The headless runner (`-c` / `-r`) is *not* a feature: it
+# is always built, since it is the one part every configuration needs. Turning
+# `tui` off therefore yields a CLI-only binary — the shape wanted for CI images
+# and Docker containers, where a terminal UI is dead weight:
+#
+#     cargo install paperboy --no-default-features
+#
+# `gui` is opt-in for the same reason in reverse: it drags in eframe/winit/wgpu
+# and the Phosphor font, which dominate build time, and a terminal user should
+# not pay for them:
 #
 #     cargo install paperboy --features gui
 #
-# Everything the GUI needs is optional and enabled only by this feature; the
-# saved-state format is unaffected, so a terminal-only build still round-trips
-# a GUI user's window/panel geometry rather than dropping it.
-default = []
+# Both front-ends draw with ratatui types (the GUI converts the shared `.trail`
+# highlighter's ratatui spans into egui sections rather than duplicating the
+# rules), so `ratatui` belongs to both rather than to `tui` alone. The
+# saved-state format is independent of all of this: `ThemeSpec` is plain RGB, so
+# every configuration round-trips every other one's themes and geometry rather
+# than dropping them.
+default = ["tui"]
+tui = [
+    "dep:ratatui",
+    "dep:ratatui-explorer",
+    "dep:tui-panel-select",
+    "dep:tui-rgb-picker",
+]
 gui = [
+    "dep:ratatui",
     "dep:eframe",
     "dep:egui_extras",
     "dep:egui-phosphor",
@@ -32,8 +52,8 @@ gui = [
 
 
 [dependencies]
-tui-panel-select = "0.1.6"
-tui-rgb-picker = "0.1"
+tui-panel-select = { version = "0.1.6", optional = true }
+tui-rgb-picker = { version = "0.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps JSON object key order when we pretty-print a response
 # body (serde_json otherwise sorts keys). Reports must never silently reorder /
@@ -50,9 +70,15 @@ hurl_core = "~8.0"
 # shim. Cargo feature-unifies onto the same `curl` crate `hurl` already uses.
 curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
 base64 = "0.22"
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
-ratatui-explorer = "0.3.0"
+# Terminal styling and raw-mode/event handling. Named directly rather than
+# reached through ratatui's re-export, because the headless runner colours its
+# output too and must keep doing so in a build with no terminal UI. Pinned to
+# the 0.29 line ratatui 0.30 uses, so a default build compiles one crossterm
+# rather than two.
+crossterm = "0.29"
+ratatui-explorer = { version = "0.3.0", optional = true }
 uuid = { version = "1", features = ["v4"] }
 # Randomness for the `# [Gen]` block's nonces and keys. Already compiled as a
 # transitive dependency of `uuid`, so naming it directly costs no extra build;

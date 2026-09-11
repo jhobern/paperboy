@@ -29,8 +29,9 @@ all three.
 ## Install
 
 ```sh
-cargo install paperboy --locked                 # terminal UI + headless runner
-cargo install paperboy --locked --features gui  # …and the graphical UI
+cargo install paperboy --locked                       # terminal UI + headless runner
+cargo install paperboy --locked --features gui        # …and the graphical UI
+cargo install paperboy --locked --no-default-features # headless runner only
 ```
 
 `--locked` is recommended: it builds the dependency versions PaperBoy was
@@ -42,6 +43,13 @@ Cargo resolves optional dependencies whether or not their feature is on.)
 The `gui` feature is opt-in because eframe/winit/wgpu roughly double the
 dependency tree. Both builds share the same state file, so you lose nothing by
 switching. Running `--gui` without it prints the command to install one with it.
+
+`--no-default-features` turns the terminal UI off and leaves the headless
+runner, which is the shape wanted for CI images and Docker containers: it drops
+40 dependencies and about a third of PaperBoy's own source, none of which a
+scripted `-c`/`-r` run would ever execute. The resulting binary takes the same
+arguments and writes the same reports; only the interactive front-end is
+missing, and running it with no arguments says so rather than doing nothing.
 
 ### Build prerequisites
 
@@ -102,8 +110,15 @@ From a checkout:
 ```sh
 cargo run                           # terminal UI
 cargo run --features gui -- --gui   # graphical UI
+cargo run --no-default-features -- -c collection.hurl   # headless only
 cargo test                          # add --features gui for the GUI's tests
 ```
+
+PaperBoy builds in four shapes — headless, terminal, terminal + GUI, and GUI
+alone — and CI checks all four, because a configuration nothing builds is a
+configuration that stops compiling. Each must also stay warning-free; the
+dead-code analysis is carried by the two shapes that include the terminal UI
+(see the note at the top of `src/main.rs` for why).
 
 ## Concepts
 

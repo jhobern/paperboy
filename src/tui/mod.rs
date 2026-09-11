@@ -17,9 +17,6 @@ mod probe_menu;
 pub(crate) mod remote;
 // Shared with the GUI (`gui::report_editor`'s Source view) so a PaperTrail
 // script is coloured identically in both front-ends: it produces `ratatui`
-// spans, which the GUI converts to egui text sections rather than reimplementing
-// the rules and letting the two drift.
-pub(crate) mod report_highlight;
 mod report_nodes;
 mod reports;
 pub(crate) mod term_bg;

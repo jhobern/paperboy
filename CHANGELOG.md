@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [0.5.6] - 2026-09-11
+
+### Added
+
+- **The terminal UI is now a Cargo feature, so `--no-default-features` builds a
+  headless-only binary.** A scripted `-c collection.hurl` or `-r report.trail`
+  run in a CI image or Docker container never draws a frame, but it was still
+  paying to compile the whole terminal front-end. Turning `tui` off drops 40
+  dependencies and roughly a third of PaperBoy's own source, and the binary is
+  otherwise identical — same arguments, same output, same reports. Run it with
+  no arguments and it explains that this build is headless and how to get one
+  that is not, rather than exiting silently as though something had run.
+
+  `default = ["tui"]`, so `cargo install paperboy` is unchanged.
+
+- **Continuous integration.** There was none. Every build shape — headless,
+  terminal, terminal + GUI, and GUI alone — is now checked and kept
+  warning-free, and the suite runs for both shipped shapes.
+
+### Fixed
+
+- **`--no-default-features --features gui` did not compile.** The GUI reached
+  into the terminal UI for the `.trail` highlighter and for one remote helper,
+  so asking for the graphical front-end without the terminal one failed
+  outright. Nothing ever built that combination, so nothing caught it. The
+  highlighter now lives alongside the other front-end-agnostic code (both
+  front-ends draw from it, which was always the intent), and the remote helper
+  is taken from `remote_flow`, where it was defined all along — the terminal UI
+  was only re-exporting it.
+
+
 ## [0.5.5] - 2026-09-08
 
 ### Added

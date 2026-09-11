@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The vendored libcurl/OpenSSL build (see the `curl` dependency in Cargo.toml)
+  # dominates a cold build, so a warm cache is the difference between a two
+  # minute job and a twenty minute one.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # The feature matrix is the point of this job. PaperBoy builds in four shapes
+  # and each one has to stay both compiling *and* warning-free on its own:
+  #
+  #   headless  -- no front-end at all; the shape used in CI images and Docker
+  #   tui       -- the default, and what `cargo install paperboy` gives you
+  #   gui       -- tui + gui, what `--features gui` gives you
+  #   gui-only  -- the GUI without the terminal UI
+  #
+  # Without this job the non-default shapes rot silently: `gui-only` did not
+  # compile at all until the front-ends were split apart, because nothing ever
+  # built it. `-D warnings` is deliberate — the dead-code suppression in
+  # `main.rs` is keyed on the `tui` feature, and this is what proves the two
+  # front-end-complete configurations are still carrying full analysis.
+  check:
+    name: check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: headless
+            features: --no-default-features
+          - name: tui
+            features: ""
+          - name: gui
+            features: --features gui
+          - name: gui-only
+            features: --no-default-features --features gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      # eframe pulls in winit, which needs the X11/Wayland and xkbcommon headers
+      # at build time. The terminal and headless shapes need none of this, which
+      # is a large part of why the GUI is opt-in in the first place.
+      - name: Install GUI build dependencies
+        if: contains(matrix.features, 'gui')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+      - run: cargo check ${{ matrix.features }} --all-targets
+        env:
+          RUSTFLAGS: -D warnings
+
+  # Tests run for the two shapes that are actually shipped to users and that
+  # differ in what they compile: the default terminal build, and the headless
+  # one. The headless run is not redundant — it is the only thing proving the
+  # core still passes its suite with no front-end linked in, which is what a
+  # CI-image user is installing.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: headless
+            features: --no-default-features
+          - name: tui
+            features: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.name }}
+      # `paperboy` is a binary crate with no lib target, so the unit tests are
+      # compiled into `src/main.rs` and plain `cargo test` is the only form that
+      # works (`--lib` fails outright).
+      - run: cargo test ${{ matrix.features }}

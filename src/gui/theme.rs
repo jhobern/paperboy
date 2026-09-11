@@ -34,7 +34,7 @@ fn c([r, g, b]: [u8; 3]) -> Color32 {
 }
 
 /// Convert a `ratatui` colour to an egui one, so the shared PaperTrail
-/// highlighter (`tui::report_highlight`, which speaks in ratatui spans) can
+/// highlighter (`report_highlight`, which speaks in ratatui spans) can
 /// paint the GUI's Source view.
 ///
 /// Every colour a theme produces is an RGB triple — `ThemeSpec::to_theme` only

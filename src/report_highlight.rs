@@ -27,7 +27,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 
-use super::theme::Theme;
+use crate::theme::Theme;
 
 /// Context the highlighter needs to colour *references* by whether they
 /// currently resolve: the parser's rejected line, whether the report's
@@ -440,7 +440,7 @@ pub(crate) fn highlight_source(text: &str, ctx: &HlCtx, th: &Theme) -> Vec<Line<
 mod tests {
     use super::*;
     use crate::i18n::Language;
-    use crate::tui::theme::theme;
+    use crate::theme::theme;
 
     fn th() -> Theme {
         theme(&Language::English)

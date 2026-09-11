@@ -27,7 +27,7 @@ use crate::report::indent::{
 use crate::report::model::ReportResult;
 use crate::report::validate::{Diagnostic, Severity};
 
-use crate::tui::report_highlight::{self, HlCtx};
+use crate::report_highlight::{self, HlCtx};
 
 use super::app::GuiApp;
 use super::report_run::{self, ParkedRun, RowState, RunHandle, RunKey, RunProgress};
@@ -2519,7 +2519,7 @@ fn highlight_ctx_key(ed: &ReportEditor, app: &GuiApp) -> u64 {
 
 /// Lay `text` out as a syntax-highlighted [`egui::text::LayoutJob`], reusing the
 /// terminal UI's PaperTrail highlighter so both front-ends colour a script
-/// identically (see [`crate::tui::report_highlight`]).
+/// identically (see [`crate::report_highlight`]).
 ///
 /// The highlighter works a line at a time and drops the line breaks, so the
 /// newlines are re-inserted here as their own sections — otherwise the whole
@@ -13626,7 +13626,7 @@ mod results_render_tests {
     /// is cached — but it has to follow every input the highlighter colours by.
     #[test]
     fn the_highlight_key_notices_every_input_it_guards() {
-        use crate::tui::report_highlight::HlCtx;
+        use crate::report_highlight::HlCtx;
         let text = "REPORT REQUEST login AS l\n";
         let ctx = HlCtx {
             error_line: None,

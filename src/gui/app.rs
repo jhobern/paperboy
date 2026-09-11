@@ -915,7 +915,7 @@ impl GuiApp {
         ci: usize,
         reload: crate::persistence::PendingWorkspaceReload,
     ) {
-        let rx = crate::tui::remote::spawn_workspace_redownload(reload.origin);
+        let rx = crate::remote_flow::spawn_workspace_redownload(reload.origin);
         self.workspace_redownload = Some((ci, reload.relative_selected_path, rx));
     }
 

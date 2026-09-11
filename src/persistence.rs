@@ -614,7 +614,7 @@ pub struct PersistedState {
     pub discard_request_edits_on_esc: bool,
     /// User-created themes (Settings → Theme). Built-in presets are not stored.
     #[serde(default)]
-    pub custom_themes: Vec<crate::tui::theme::ThemeSpec>,
+    pub custom_themes: Vec<crate::theme::ThemeSpec>,
     /// The explicitly-chosen theme name, or `None` to follow the language
     /// preset. Persisted so a manual theme choice survives restarts.
     #[serde(default)]

@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::IsTerminal;
 
-use ratatui::crossterm::style::Stylize;
+// Imported from `crossterm` directly rather than through ratatui's re-export:
+// the headless runner keeps its coloured output in builds that have no
+// terminal UI (and therefore no ratatui) at all.
+use crossterm::style::Stylize;
 
 use crate::environment::{looks_like_env, parse_vars};
 use crate::generators::SystemSource;

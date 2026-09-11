@@ -1,7 +1,22 @@
 //! PaperBoy — a Rust-native API client (Postman alternative). Front-ends over
-//! one core: a terminal UI (default), a headless CLI runner
-//! (`-c collection.hurl [-e environment.vars]`), and — behind the `gui` Cargo
-//! feature — a native graphical UI.
+//! one core: a terminal UI (default, behind the `tui` Cargo feature), a
+//! headless CLI runner (`-c collection.hurl [-e environment.vars]`, always
+//! built), and — behind the `gui` Cargo feature — a native graphical UI.
+
+// Dead-code analysis is authoritative in the configurations that include the
+// terminal UI — the default build and `--features gui`. A build without it
+// (`--no-default-features`, with or without `gui`) is a partial configuration:
+// it drops several hundred core items that exist to serve a front-end — wizard
+// state machines, draw helpers, the `Strings` table's rows, and the re-exports
+// that feed them — and reporting each one would be noise, not a finding.
+//
+// Keying the suppression on `tui` works because the terminal UI is the superset
+// front-end: everything shared is used by it, and the items that belong to the
+// GUI alone already carry the mirror-image `not(feature = "gui")` annotation at
+// their definitions. So nothing escapes analysis — an item dead in every
+// configuration is still reported by the two builds above, which CI runs
+// alongside the partial ones.
+#![cfg_attr(not(feature = "tui"), allow(dead_code, unused_imports))]
 
 mod cli;
 mod collection;
@@ -28,12 +43,21 @@ mod probe;
 mod remote_flow;
 mod report;
 mod report_cli;
+// The `.trail` syntax highlighter. It lives at the top level, not under `tui`,
+// because both front-ends draw from it: it emits ratatui spans, which the GUI
+// converts to egui text sections rather than reimplementing the rules and
+// letting the two drift. Keeping it here means a GUI-only build does not have
+// to pull in the terminal UI just to reach it. It is still drawing code, so a
+// headless build leaves it out entirely.
+#[cfg(any(feature = "tui", feature = "gui"))]
+mod report_highlight;
 mod request;
 mod save_flow;
 mod session;
 mod shared_utils;
 mod theme;
 mod tree;
+#[cfg(feature = "tui")]
 mod tui;
 mod workspace;
 
@@ -226,11 +250,34 @@ fn main() {
     }
 
     // Terminal UI (the default).
+    std::process::exit(run_tui());
+}
+
+/// Launch the terminal UI, or explain why this build can't.
+///
+/// A `--no-default-features` build is headless on purpose (CI images, Docker),
+/// so reaching here means the user ran `paperboy` with no `-c`/`-r` and wanted
+/// the interactive front-end. Tell them how to get it rather than failing
+/// silently or, worse, exiting 0 as though something had run.
+#[cfg(feature = "tui")]
+fn run_tui() -> i32 {
     if let Err(e) = tui::run() {
         eprintln!("tui error: {e}");
-        std::process::exit(1);
+        return 1;
     }
-    std::process::exit(0);
+    0
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_tui() -> i32 {
+    eprintln!(
+        "This build of PaperBoy is headless: it runs collections and reports, \
+         but has no terminal UI.\n\
+         Pass `-c <collection.hurl>` or `-r <report.trail>`, or reinstall with \
+         the terminal UI:\n\
+         \x20   cargo install paperboy --locked"
+    );
+    1
 }
 
 /// Launch the GUI, or explain why this build can't.
