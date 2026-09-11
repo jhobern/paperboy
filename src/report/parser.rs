@@ -1264,6 +1264,7 @@ fn report_flow(i: &str) -> IResult<'_, ReportFlow> {
             header,
             nodes,
             requests: None,
+            requests_line: 0,
         },
     ))
 }
@@ -1275,17 +1276,23 @@ fn report_flow(i: &str) -> IResult<'_, ReportFlow> {
 /// after it is Hurl and Hurl has lines that begin with words too. The *first*
 /// such line wins — a later one is part of the embedded text, not a second
 /// section, which is what "must be last in the file" means operationally.
-fn split_requests_section(input: &str) -> (&str, Option<String>) {
+fn split_requests_section(input: &str) -> (&str, Option<String>, usize) {
     let mut at = 0usize;
-    for line in input.split_inclusive('\n') {
+    for (n, line) in input.split_inclusive('\n').enumerate() {
         if !line.starts_with(char::is_whitespace)
             && line.trim_end().eq_ignore_ascii_case("REQUESTS")
         {
-            return (&input[..at], Some(input[at + line.len()..].to_string()));
+            // `n` is 0-based and names the keyword line, so the text begins on
+            // file line `n + 2`.
+            return (
+                &input[..at],
+                Some(input[at + line.len()..].to_string()),
+                n + 2,
+            );
         }
         at += line.len();
     }
-    (input, None)
+    (input, None, 0)
 }
 
 /// A parse failure, carrying the 1-based line where it occurred so the TUI
@@ -1323,11 +1330,12 @@ pub fn parse_flow(input: &str) -> Result<ReportFlow, ParseError> {
     // Taken off the front before the grammar runs, so the flow parser never
     // sees Hurl and the Hurl parser never sees PaperTrail. `head` is a prefix
     // of `input`, so error line numbers are still the file's own.
-    let (head, requests) = split_requests_section(input);
+    let (head, requests, requests_line) = split_requests_section(input);
     let input = head;
     match report_flow(input) {
         Ok((rest, mut flow)) if rest.trim().is_empty() => {
             flow.requests = requests;
+            flow.requests_line = requests_line;
             Ok(flow)
         }
         Ok((rest, _)) => {

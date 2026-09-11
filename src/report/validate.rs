@@ -137,11 +137,15 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     // Header: collection binding + output format. A `REQUESTS` section is its
     // own declaration — a flow that carries its requests needs no binding, and
     // demanding one would make the single-file monitor impossible.
+    // The declaration is the section, not the requests it yielded: a malformed
+    // one must be reported as malformed, not compounded with "and you have no
+    // collection either".
     let embedded = flow.embedded_entries();
+    let declares = flow.requests.is_some();
     match flow.header.collection() {
-        None if !embedded.is_empty() => {}
+        None if declares => {}
         None => diags.push(Diagnostic::error(s.diag_collection_unset)),
-        Some(c) if c.trim().is_empty() && embedded.is_empty() => {
+        Some(c) if c.trim().is_empty() && !declares => {
             diags.push(Diagnostic::error(s.diag_collection_unset))
         }
         Some(_) => {}
@@ -813,7 +817,9 @@ fn check_embedded_requests(
         // A section that parsed to nothing is nearly always a malformed one,
         // and the Hurl parser's own reason is far more useful than "no
         // requests" on its own.
-        let why = crate::hurl::parse_hurl_error(text);
+        // Offset to the file's own numbering: the section is a slice of a
+        // `.trail`, and the `.trail` is the file the reader has open.
+        let why = crate::hurl::parse_hurl_error_from(text, flow.requests_line.max(1));
         diags.push(Diagnostic::error(fill(
             ctx.strings.diag_requests_section_empty,
             &[why.as_deref().unwrap_or("")],
@@ -842,10 +848,18 @@ fn check_embedded_requests(
     // supposed to be self-contained.
     let mut called = Vec::new();
     collect_called(&flow.nodes, &mut called);
+    let titles = ctx.request_titles.unwrap_or(&[]);
     for e in embedded {
-        let used = called
-            .iter()
-            .any(|c| *c == e.title || c.rsplit('/').next() == Some(e.title.as_str()));
+        // Resolution order, not a looser guess: a call is only a use of this
+        // embedded request if it names it exactly, or if it is a path whose
+        // leaf matches *and* nothing declares that exact path. Otherwise
+        // `REQUEST folder/ping` against an external `folder/ping` would count
+        // as calling an embedded `ping` that in fact never runs.
+        let used = called.iter().any(|c| {
+            *c == e.title
+                || (c.rsplit('/').next() == Some(e.title.as_str())
+                    && !titles.iter().any(|t| t == c))
+        });
         if !used {
             diags.push(Diagnostic::warning(fill(
                 ctx.strings.diag_requests_unreferenced,
@@ -1926,6 +1940,81 @@ mod tests {
         let diags = diags_embedded("# name: solo\n\nREQUESTS\nnot hurl at all\n", &[]);
         assert!(
             diags.iter().any(|d| d.severity == Severity::Error),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_section_is_reported_as_malformed_not_as_a_missing_collection() {
+        // The declaration is the keyword, not the requests it yielded. Telling
+        // an author who wrote a `REQUESTS` section that they have no collection
+        // buries the one thing they need to know: why their Hurl didn't parse.
+        let diags = diags_embedded("# name: solo\n\nREQUESTS\nnot hurl at all\n", &[]);
+        let errs: Vec<&str> = diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            errs.iter().any(|m| m.contains("REQUESTS")),
+            "the malformed section must be named: {errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|m| *m == Strings::english().diag_collection_unset),
+            "and it must not also be accused of having no collection: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_hurl_error_in_the_section_counts_lines_from_the_file() {
+        // The section is a slice of a `.trail`, and the `.trail` is the only
+        // file the reader has open — a line number counted from the section
+        // sends them to the wrong place in it.
+        let diags = diags_embedded(
+            "# name: solo\n# out: csv\n\nREQUESTS\nnot hurl at all\n",
+            &[],
+        );
+        let msg = diags
+            .iter()
+            .find(|d| d.severity == Severity::Error)
+            .map(|d| d.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("line 5"),
+            "the bad line is file line 5, not section line 1: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_call_that_resolves_elsewhere_does_not_excuse_an_embedded_request() {
+        // `folder/ping` names an external request exactly, so it is not a use
+        // of the embedded `ping`, which never runs and should be reported.
+        let diags = diags_embedded(
+            "# collection: c\n\nREPORT REQUEST folder/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[capturing_entry("folder/ping", &[])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("ping")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_call_still_reaches_an_embedded_request_by_its_leaf_name() {
+        // The other half of the same rule: with nothing declaring the exact
+        // path, a leaf match is how the call resolves, so it is a use.
+        let diags = diags_embedded(
+            "# name: solo\n\nREPORT REQUEST folder/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+            &[],
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("never called")),
             "{diags:?}"
         );
     }

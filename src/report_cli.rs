@@ -100,7 +100,10 @@ pub fn run(
         Some(c) => Some(c),
         None => match report.collection_ref() {
             Some(c) => Some(resolve_path(report_dir, &c).to_string_lossy().into_owned()),
-            None if !embedded.is_empty() => None,
+            // The *declaration* is what excuses the missing collection, not
+            // how many requests it yielded. A section that parsed to nothing
+            // must reach validation, which knows why it did.
+            None if flow.requests.is_some() => None,
             None => {
                 eprintln!(
                     "error: no collection to run against — pass -c/--collection, add a '# collection:' header to '{report_path}', or embed the requests in a REQUESTS section"
@@ -136,10 +139,17 @@ pub fn run(
         // As in `cli.rs`: prefer the concrete Hurl parse reason (line + what's
         // wrong) when the source is Hurl — one malformed line rejects the whole
         // file, so "no requests found" alone hides the real cause.
-        match (!looks_like_postman(&col_content))
-            .then(|| crate::hurl::parse_hurl_error(&col_content))
-            .flatten()
-        {
+        // A `REQUESTS` section that yielded nothing is the likelier cause when
+        // the flow has one, and it knows its own line numbers within the file.
+        let embedded_why = flow
+            .requests
+            .as_deref()
+            .and_then(|t| crate::hurl::parse_hurl_error_from(t, flow.requests_line.max(1)));
+        match embedded_why.or_else(|| {
+            (!looks_like_postman(&col_content))
+                .then(|| crate::hurl::parse_hurl_error(&col_content))
+                .flatten()
+        }) {
             Some(why) => eprintln!("error: no requests found in '{collection_path}' — {why}"),
             None => eprintln!("error: no requests found in '{collection_path}'"),
         }

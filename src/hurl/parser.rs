@@ -264,10 +264,19 @@ fn first_method_line(lines: &[&str], start_line: usize) -> usize {
 /// rejects them as unknown *request* sections. We surface that case with a
 /// concrete fix (`HTTP *` matches any status) rather than the raw parser jargon.
 pub fn parse_hurl_error(content: &str) -> Option<String> {
+    parse_hurl_error_from(content, 1)
+}
+
+/// As [`parse_hurl_error`], but for Hurl that is a *slice* of a larger file —
+/// PaperTrail's embedded `REQUESTS` section, whose first line is `first_line`
+/// of the `.trail` file. Without the offset the reported line counts from the
+/// section rather than from the file, which sends the reader to the wrong place
+/// in the only file there is.
+pub fn parse_hurl_error_from(content: &str, first_line: usize) -> Option<String> {
     use hurl_core::error::DisplaySourceError;
     use hurl_core::parser::ParseErrorKind;
     let err = parse_hurl_file(content).err()?;
-    let line = err.pos.line;
+    let line = err.pos.line + first_line - 1;
     let reason = match &err.kind {
         ParseErrorKind::RequestSectionName { name }
             if matches!(name.as_str(), "Captures" | "Asserts") =>

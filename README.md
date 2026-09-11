@@ -734,9 +734,18 @@ ready, which turns that into a failure now, and prints the seed:
   Shuffle    : seed 4711 (replay with --shuffle=4711)
 ```
 
-`--shuffle=4711` replays it exactly, so a failure found this way is
-reproducible rather than intermittent. Shuffling only reorders steps that may
+`--shuffle=4711` replays that run. Shuffling only reorders steps that may
 legally run in any order; it never runs a step before what it depends on.
+
+How exact the replay is depends on the degree. A sequential region replays
+*exactly*: the seed alone decides every choice. A `PARALLEL(n)` region replays
+its dispatch *preferences* exactly, but which step becomes ready next also
+depends on which request came back first, and no seed controls the network. So
+a shuffled failure in a parallel region is far more likely to reproduce under
+its seed than without one, but it is not guaranteed to. If you find one and
+want it nailed down, re-run the seed with `PARALLEL(1)` — a missing dependency
+is a property of the ordering, not of the concurrency, so it will still be
+there.
 
 #### Cleanup
 

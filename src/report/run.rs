@@ -693,6 +693,30 @@ struct Sched {
 /// supplies the ordering the graph forgot. Picking randomly among the ready set
 /// turns that latent hazard into a failure, and seeding it makes the failure
 /// reproducible rather than intermittent.
+/// Decrements the in-flight count and wakes the sleepers if the worker holding
+/// it unwinds. See the comment at its only construction site.
+struct InFlight<'s> {
+    sched: &'s Mutex<Sched>,
+    idle: &'s Condvar,
+    armed: bool,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The panic happened in the step, which holds no lock, so this mutex is
+        // unpoisoned in practice; `if let Ok` rather than `unwrap` only because
+        // panicking inside a `Drop` during unwind aborts the process, and a
+        // miscounted region is still better than that.
+        if let Ok(mut s) = self.sched.lock() {
+            s.running -= 1;
+        }
+        self.idle.notify_all();
+    }
+}
+
 fn schedule_graph<'a>(
     ctx: &'a RunContext<'a>,
     plan: &super::graph::Plan,
@@ -765,12 +789,24 @@ fn schedule_graph<'a>(
                 break;
             };
 
+            // A step that panics must not leave the region counted as busy.
+            // Every other worker would then sleep on the condvar waiting for an
+            // arrival that can never come, and `thread::scope` would block
+            // joining those sleepers instead of propagating the panic — turning
+            // a crash into a hang, which is the one failure a CI job cannot
+            // diagnose.
+            let mut flight = InFlight {
+                sched: &sched,
+                idle: &idle,
+                armed: true,
+            };
             let out = run_step(ctx, plan, body, idx, state);
 
             let mut s = sched.lock().unwrap();
             let ok = out.ok;
             s.out[idx] = Some(out);
             s.running -= 1;
+            flight.armed = false;
             finish(&mut s, &succ, idx, ok);
             drop(s);
             idle.notify_all();
@@ -2603,6 +2639,9 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay_ms: u64,
+        /// A title whose request panics, standing in for anything that can
+        /// unwind inside a worker thread.
+        panic_on: Option<String>,
     }
 
     impl Fake {
@@ -2617,11 +2656,17 @@ mod tests {
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 delay_ms: 0,
+                panic_on: None,
             }
         }
         /// Add a per-call delay so overlapping (parallel) calls are observable.
         fn with_delay(mut self, ms: u64) -> Self {
             self.delay_ms = ms;
+            self
+        }
+        /// Make one request panic, to exercise unwinding out of a worker.
+        fn panicking_on(mut self, title: &str) -> Self {
+            self.panic_on = Some(title.to_string());
             self
         }
         /// The titles sent, in the order they were sent.
@@ -2664,6 +2709,9 @@ mod tests {
         fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(now, Ordering::SeqCst);
+            if self.panic_on.as_deref() == Some(base.title.as_str()) {
+                panic!("deliberate test panic in {}", base.title);
+            }
             if self.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             }
@@ -3412,6 +3460,42 @@ mod tests {
             shuffle: Some(seed),
         };
         run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_step_that_panics_ends_the_run_instead_of_hanging_it() {
+        // The failure mode this guards: the panicking worker never decrements
+        // the in-flight count, so every other worker sleeps on the condvar
+        // waiting for an arrival that cannot come, and `thread::scope` blocks
+        // joining those sleepers rather than propagating the panic. A crash
+        // becomes a hang, which is the one failure a CI job cannot diagnose.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let entries = [
+                graph_entry("a", &[], &[]),
+                graph_entry("b", &[], &[]),
+                graph_entry("c", &[], &[]),
+                graph_entry("d", &[], &[]),
+            ];
+            let fake = Fake::new(&[]).with_delay(20).panicking_on("a");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    "PARALLEL(2) GRAPH\n    REPORT REQUEST a\n    REPORT REQUEST b\n    REPORT REQUEST c\n    REPORT REQUEST d\nEND\n",
+                    &entries,
+                    &[],
+                    &[],
+                    &fake,
+                )
+            }));
+            let _ = tx.send(outcome.is_err());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(panicked) => assert!(
+                panicked,
+                "the panic must reach the caller, not be swallowed"
+            ),
+            Err(_) => panic!("the region hung instead of failing"),
+        }
     }
 
     #[test]

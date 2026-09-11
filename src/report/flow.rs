@@ -13,7 +13,7 @@ use super::model::StatKind;
 
 /// A whole report flow: a comment/directive header plus the ordered statements
 /// the interpreter executes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Eq)]
 pub struct ReportFlow {
     pub header: Header,
     pub nodes: Vec<FlowNode>,
@@ -26,6 +26,24 @@ pub struct ReportFlow {
     /// through the editor without its requests being reformatted by a parser
     /// that never claimed to be a formatter.
     pub requests: Option<String>,
+    /// The 1-based line of the file the embedded section's text starts on — the
+    /// line after the `REQUESTS` keyword. Provenance, not content: it exists so
+    /// that a Hurl parse error inside the section can be reported against the
+    /// line of the `.trail` file the reader is looking at, rather than against
+    /// the section, which is not a file anyone has open.
+    ///
+    /// Deliberately left out of [`PartialEq`] below, because it describes where
+    /// a flow was read from and not what it says. Two flows that differ only in
+    /// where their section happened to start are the same flow, and a
+    /// round-trip through [`ReportFlow::to_text`] renumbers it whenever the
+    /// serializer's canonical layout differs from the author's.
+    pub requests_line: usize,
+}
+
+impl PartialEq for ReportFlow {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.nodes == other.nodes && self.requests == other.requests
+    }
 }
 
 /// The header block: the `# key: value` directives (and any free `#` comments)

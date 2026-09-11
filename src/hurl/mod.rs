@@ -23,7 +23,7 @@ pub use entry::{
 // the block exactly as the parser does rather than by their own guess at it.
 pub(crate) use entry::{parse_gen_marker, parse_gen_row};
 pub(crate) use parser::parse_file_form_value;
-pub use parser::{parse_hurl, parse_hurl_error};
+pub use parser::{parse_hurl, parse_hurl_error, parse_hurl_error_from};
 pub use run::{
     AssertOutcome, EntryOutcome, EntrySetup, RetryLimit, RunOutput, run_hurl,
     run_hurl_streaming_with,

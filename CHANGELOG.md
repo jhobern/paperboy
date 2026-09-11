@@ -179,6 +179,25 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A step that panics no longer hangs the whole run.** The worker that
+  unwound never decremented the region's in-flight count, so every other
+  worker slept waiting for an arrival that could not come and `thread::scope`
+  blocked joining them — turning a crash into a hang, which is the one failure
+  a CI job cannot diagnose. The count is now released by a guard on unwind.
+
+- **A malformed `REQUESTS` section is reported as malformed.** It used to be
+  reported as "no collection to run against", because the check asked how many
+  requests the section yielded rather than whether it existed — burying the one
+  thing the author needed, which is why their Hurl didn't parse. The Hurl
+  parser's reason is now shown, and its line number is counted from the
+  `.trail` file rather than from the section, since the `.trail` is the only
+  file the reader has open.
+
+- **An embedded request is no longer counted as used by a call that resolves
+  elsewhere.** `REQUEST folder/ping` against an external `folder/ping` was
+  treated as a use of an embedded `ping` that in fact never ran, so the
+  "never called" warning stayed silent.
+
 - **A `GRAPH` region no longer trips the "this report emits no columns"
   warning.** The check looked inside loops but not inside regions, so a report
   whose only `REPORT` statements were in a `GRAPH` was told it would produce an
