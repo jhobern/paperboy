@@ -179,6 +179,42 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A `CLEANUP` is now gated on the step that actually produced each value it
+  reads, rather than on the last step that succeeded. Captures are recorded
+  whether or not the request passed — a status or assertion can fail on a
+  response that captured perfectly well — so the two are not the same step, and
+  a teardown could be authorised by the one that succeeded and then sent with
+  the identifier captured by the one that failed: the wrong resource deleted,
+  and the right one leaked.
+- A cleanup that reads another cleanup's capture now runs after it. The edge was
+  inferred from the steps that had already run, and no cleanup has when the
+  order is worked out, so the reference was dropped and the dependent could run
+  first and fail substitution.
+- A `DEPENDS` cycle between two or more cleanups is now refused. Nothing could
+  order the ring, so every member read its prerequisite as unsuccessful and
+  skipped — silently leaking every resource the ring was written to reclaim.
+- A variable read by a `# [Gen]` row's expression now creates a dependency.
+  Generator expressions are not templates and their bare identifiers carry no
+  braces, but they are resolved from the same map, so a step whose only use of a
+  capture was a generator got no edge and could be ordered before its producer.
+- A `{{…}}` in a `[Reports]` field no longer creates one. Report queries are
+  PaperBoy's own metadata and are evaluated verbatim, so the edge ordered a
+  region — and made `--targets` drag in a producer — for a field that still
+  failed to match.
+- `--targets` no longer drops a cleanup whose value is still being produced by a
+  surviving step outside the region, and now prunes cleanups written inside loop
+  bodies rather than only those at the top level.
+- `--targets` now refuses a selection that leaves out a step the rest of the
+  report still refers to. The flow is not revalidated after pruning, so the
+  reference would have reached the run as a literal `{{create.sid}}` — reported
+  in a column, or sent in a URL.
+- A dotted name in a producer path (`FILES "{{…}}"`, `TUPLES FROM "{{…}}"`) is
+  now validated like any other step reference, so a prefix naming no step is an
+  error rather than a path that silently resolves to nothing.
+- A helper-qualified call such as `helper/ping` no longer counts as using an
+  embedded request named `ping`. The alias resolves first, so the embedded
+  request really was dead text and the warning was being suppressed.
+
 - **A step-qualified name can no longer be answered by an environment
   variable.** `.vars` keys are not restricted to identifiers, so an environment
   could carry a flat `login.token` — and it answered `{{login.token}}` exactly

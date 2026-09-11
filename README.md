@@ -700,11 +700,27 @@ point of the region rather than accidents of it:
   steps in its region capture is refused. Name the one you mean —
   `{{login.token}}` — and it is unambiguous again.
 
+A dotted name in a report's own text always means *step, then capture*. The
+namespace is reserved: an environment variable whose key happens to contain a
+dot cannot answer one, because it would answer precisely when the step had not
+captured — quietly supplying a stale credential at the moment the reference was
+supposed to fail. A dotted name whose prefix is not a step in scope is an error,
+wherever it is written: a `USING` value, a computed column, or a producer path.
+
+Inference reads every place a value can actually be used: a URL, a header, a
+body, a `[Captures]` or `[Asserts]` expression, and the bare identifiers of a
+`# [Gen]` row, which are variable references despite having no braces. It does
+not read a disabled row or a `[Reports]` field — nothing substitutes into
+either, so an edge drawn from one would reorder a region for text that never
+runs.
+
 `--targets a,b` runs only the named steps and whatever they transitively
 depend on, so a release check can ask for one answer without paying for the
 whole report. Naming a step that no region declares is an error rather than a
-silent empty run. `--dry-run` lists the steps grouped by how deep in the graph
-they sit, which is how you check the shape of a region without sending
+silent empty run, and so is naming a set of targets that leaves out a step the
+rest of the report still refers to: the reference could only reach the run as a
+literal `{{create.sid}}`. `--dry-run` lists the steps grouped by how deep in the
+graph they sit, which is how you check the shape of a region without sending
 anything.
 
 `DEPENDS` states an ordering the data doesn't show. Inference only sees values
@@ -781,6 +797,16 @@ A cleanup whose dependency never succeeded is skipped — there is nothing to
 undo — and a cleanup that fails is reported as a warning rather than an error,
 because a teardown failing is nearly always a consequence of the real failure
 and shouldn't be allowed to bury it.
+
+"Its dependency" means whatever it names in `DEPENDS`, plus whichever step
+actually produced each value it reads. A request that fails can still have
+captured, so the step a cleanup is gated on is the one whose value it will be
+handed, not the last one that happened to succeed — otherwise a teardown could
+be authorised by one step and then sent with a different, failed step's
+identifier. Cleanups can depend on each other, by `DEPENDS` or by reading one
+another's captures, and are ordered accordingly; a cycle between them is
+refused, since every member of a ring waits on a member that has not run and
+the whole ring would silently skip.
 
 #### Carrying the requests in the report
 

@@ -537,6 +537,15 @@ struct Exec<'a> {
     /// so this feeds [`Exec::vars_for_source`] only, which substitutes
     /// PaperTrail's own text.
     step_captures: HashMap<String, HashMap<String, String>>,
+    /// Which step wrote the value currently standing in `captures` under each
+    /// name. The flat chain is last-*writer*-wins, and a request that failed
+    /// its status or an assertion can still have captured — Hurl reports both —
+    /// so "who owns this value" cannot be re-derived afterwards from
+    /// `step_ok`. A `CLEANUP` reading a flat name has to be ordered against,
+    /// and gated on, the step whose value it will actually be handed; guessing
+    /// the latest *successful* capturer instead let a teardown be authorised by
+    /// one step and then sent with a different, failed step's identifier.
+    capture_owner: HashMap<String, String>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
     /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
     key_parts: Vec<String>,
@@ -613,6 +622,7 @@ struct ExecState {
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
     step_captures: HashMap<String, HashMap<String, String>>,
+    capture_owner: HashMap<String, String>,
     step_ok: HashMap<String, bool>,
     step_order: Vec<String>,
     step_request: HashMap<String, String>,
@@ -934,6 +944,8 @@ fn view_for(plan: &super::graph::Plan, base: &ExecState, s: &Sched, idx: usize) 
             .insert(plan.steps[anc].name.clone(), out.produced.clone());
         for (k, v) in &out.produced {
             st.captures.insert(k.clone(), v.clone());
+            st.capture_owner
+                .insert(k.clone(), plan.steps[anc].name.clone());
         }
     }
     st
@@ -1032,6 +1044,7 @@ impl<'a> Exec<'a> {
             lists: HashMap::new(),
             captures: HashMap::new(),
             step_captures: HashMap::new(),
+            capture_owner: HashMap::new(),
             step_ok: HashMap::new(),
             step_order: Vec::new(),
             step_request: HashMap::new(),
@@ -1058,6 +1071,7 @@ impl<'a> Exec<'a> {
             lists: self.lists.clone(),
             captures: self.captures.clone(),
             step_captures: self.step_captures.clone(),
+            capture_owner: self.capture_owner.clone(),
             step_ok: self.step_ok.clone(),
             step_order: self.step_order.clone(),
             step_request: self.step_request.clone(),
@@ -1079,6 +1093,7 @@ impl<'a> Exec<'a> {
             lists: state.lists,
             captures: state.captures,
             step_captures: state.step_captures,
+            capture_owner: state.capture_owner,
             step_ok: state.step_ok,
             step_order: state.step_order,
             step_request: state.step_request,
@@ -1172,6 +1187,7 @@ impl<'a> Exec<'a> {
         }
         for (k, v) in captures {
             self.captures.insert(k.clone(), v.clone());
+            self.capture_owner.insert(k.clone(), step.to_string());
         }
     }
 
@@ -1389,6 +1405,22 @@ impl<'a> Exec<'a> {
         // own, and a dependency set computed as we go would start seeing those
         // — so two cleanups could end up ordered against each other by nothing
         // more than which was resolved first.
+        //
+        // The cleanups' own step names have to be known before any dependency
+        // is worked out, too: a cleanup may read `{{other_cleanup.token}}`, and
+        // since none of them has run there is nothing in `step_ok` to recognise
+        // that prefix by. Without this the edge was silently dropped and the
+        // dependent could run first and fail substitution.
+        let siblings: Vec<(String, String)> = cleanups
+            .iter()
+            .filter_map(|node| match node {
+                FlowNode::Cleanup { name, alias, .. } => Some((
+                    alias.clone().unwrap_or_else(|| leaf(name).to_string()),
+                    name.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
         let mut planned: Vec<(usize, Option<usize>, &FlowNode, String, Vec<String>)> = Vec::new();
         for (written, node) in cleanups.iter().enumerate() {
             let FlowNode::Cleanup {
@@ -1401,7 +1433,7 @@ impl<'a> Exec<'a> {
                 continue;
             };
             let step = alias.clone().unwrap_or_else(|| leaf(name).to_string());
-            let deps = self.cleanup_deps(name, depends, using);
+            let deps = self.cleanup_deps(name, depends, using, &step, &siblings);
             // How late the cleanup's latest dependency ran. `None` — it depends
             // on nothing — sorts first here, and therefore last once reversed.
             let depth = deps
@@ -1471,8 +1503,23 @@ impl<'a> Exec<'a> {
     /// Only names that are actually steps count. A reference to an ordinary
     /// variable says nothing about ordering, and treating one as a dependency
     /// would skip the teardown over a name that was never going to "succeed".
-    fn cleanup_deps(&self, name: &str, depends: &[String], using: &[UsingItem]) -> Vec<String> {
+    ///
+    /// `siblings` is every cleanup in this block as `(step name, request)`,
+    /// including this one: cleanups are ordered against each other too, and
+    /// none of them has run yet, so they cannot be recognised from `step_ok`.
+    fn cleanup_deps(
+        &self,
+        name: &str,
+        depends: &[String],
+        using: &[UsingItem],
+        self_step: &str,
+        siblings: &[(String, String)],
+    ) -> Vec<String> {
         let mut out: Vec<String> = depends.to_vec();
+        let declares = |request: &str, var: &str| {
+            resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
+                .is_some_and(|e| e.captures.iter().any(|(c, _)| c == var))
+        };
         let mut refs: Vec<String> = Vec::new();
         if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             refs.extend(crate::request::entry_referenced_keys(entry));
@@ -1486,39 +1533,45 @@ impl<'a> Exec<'a> {
             // A qualified reference names its step outright; a flat one is
             // matched against the steps that captured it.
             match r.split_once('.') {
-                Some((step, _)) if self.step_ok.contains_key(step) => out.push(step.to_string()),
+                Some((step, _))
+                    if self.step_ok.contains_key(step)
+                        || siblings.iter().any(|(s, _)| s == step && s != self_step) =>
+                {
+                    out.push(step.to_string())
+                }
                 Some(_) => {}
                 None => {
-                    // A flat reference reads the flat chain, which is
-                    // last-successful-writer-wins. So the step it actually
-                    // depends on is the *latest successful* capturer, not every
-                    // step that declares the name: an earlier producer that
-                    // failed was overwritten by a later one that didn't, and
-                    // skipping the teardown on its account leaks the resource
-                    // the later one created.
-                    //
-                    // With no successful writer there is no value to attribute,
-                    // so every declared producer counts — which is what makes a
-                    // single failed producer still skip the cleanup.
-                    let mut capturers: Vec<&String> = self
-                        .step_order
-                        .iter()
-                        .filter(|step| {
-                            self.step_request
-                                .get(*step)
-                                .and_then(|req| {
-                                    resolve_qualified(self.ctx.entries, self.ctx.helpers, req)
-                                })
-                                .is_some_and(|e| e.captures.iter().any(|(c, _)| *c == r))
-                        })
-                        .collect();
-                    if let Some(last_ok) = capturers
-                        .iter()
-                        .rposition(|step| self.step_ok.get(*step).copied().unwrap_or(false))
-                    {
-                        capturers = vec![capturers[last_ok]];
+                    // A flat reference is answered by whatever is standing in
+                    // the flat chain, so the step it depends on is the step
+                    // that *wrote* that value — recorded at the time, because a
+                    // request that failed a status or an assertion can still
+                    // have captured, and the winner is therefore not always the
+                    // latest successful one.
+                    if let Some(owner) = self.capture_owner.get(&r) {
+                        out.push(owner.clone());
+                        continue;
                     }
-                    out.extend(capturers.into_iter().cloned());
+                    // Nothing has written the name yet. Every step that
+                    // declares it is a candidate producer — which is what makes
+                    // a single producer that failed before capturing still skip
+                    // the cleanup — and so is any sibling cleanup, whose own
+                    // capture would land before this one reads it.
+                    out.extend(
+                        self.step_order
+                            .iter()
+                            .filter(|step| {
+                                self.step_request
+                                    .get(*step)
+                                    .is_some_and(|req| declares(req, &r))
+                            })
+                            .cloned(),
+                    );
+                    out.extend(
+                        siblings
+                            .iter()
+                            .filter(|(s, req)| s != self_step && declares(req, &r))
+                            .map(|(s, _)| s.clone()),
+                    );
                 }
             }
         }
@@ -2032,6 +2085,8 @@ impl<'a> Exec<'a> {
                 .insert(plan.steps[idx].name.clone(), out.produced.clone());
             for (k, v) in &out.produced {
                 self.captures.insert(k.clone(), v.clone());
+                self.capture_owner
+                    .insert(k.clone(), plan.steps[idx].name.clone());
             }
         }
     }
@@ -3502,16 +3557,16 @@ mod tests {
 
     #[test]
     fn a_cleanup_follows_the_capture_that_actually_won() {
-        // The flat chain is last-successful-writer-wins, so an earlier producer
-        // that failed was overwritten by a later one that didn't. Treating
-        // every declared producer as required skipped the teardown on the
-        // failed one's account and leaked what the successful one created.
+        // An earlier producer that failed was overwritten by a later one that
+        // captured. Treating every declared producer as required skipped the
+        // teardown on the failed one's account and leaked what the successful
+        // one created.
         let entries = [
             graph_entry("first", &["sid"], &[]),
             graph_entry("second", &["sid"], &[]),
             graph_entry("purge", &[], &["sid"]),
         ];
-        let fake = Fake::new(&[failing("first")]);
+        let fake = Fake::new(&[failing("first"), ok_capturing("second", &[("sid", "B")])]);
         run(
             "REQUEST first AS first\nREQUEST second AS second\nCLEANUP purge\n",
             &entries,
@@ -3523,6 +3578,81 @@ mod tests {
             fake.call_order().contains(&"purge".to_string()),
             "the teardown must still run: {:?}",
             fake.call_order()
+        );
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("B"),
+            "and with the value it was ordered against"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_gated_on_whichever_step_wrote_the_value_it_gets() {
+        // Captures are recorded whether or not the request passed — Hurl
+        // reports both — so the flat chain is last-*writer*-wins, not
+        // last-successful-writer-wins. Reading it as the latter let a teardown
+        // be authorised by the step that succeeded and then sent with the
+        // identifier captured by the one that failed: the wrong resource
+        // deleted, and the right one leaked.
+        let entries = [
+            graph_entry("first", &["sid"], &[]),
+            graph_entry("second", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("first", &[("sid", "A")]),
+            (
+                "second",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "B".into())],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let res = run(
+            "REQUEST first AS first\nREQUEST second AS second\nCLEANUP purge\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "the teardown must not run against a failed step's value: {:?}",
+            fake.call_order()
+        );
+        assert!(res.skipped.iter().any(|s| s.contains("purge")));
+    }
+
+    #[test]
+    fn a_cleanup_that_reads_another_cleanups_capture_runs_after_it() {
+        // The inferred counterpart of the explicit `DEPENDS` edge. Nothing has
+        // run when the order is worked out, so the prefix of `{{parent.token}}`
+        // can't be recognised from the steps that have — and without the edge
+        // reverse-written order runs `child` first, where the reference
+        // resolves to nothing.
+        let entries = [
+            graph_entry("setup", &[], &[]),
+            graph_entry("parent", &["token"], &[]),
+            graph_entry("child", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("parent", &[("token", "T")])]);
+        run(
+            "REQUEST setup\n\
+             CLEANUP parent DEPENDS setup\n\
+             CLEANUP child DEPENDS setup USING(query.token = \"{{parent.token}}\")\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let order = fake.call_order();
+        let at = |n: &str| order.iter().position(|s| s == n);
+        assert!(
+            at("parent") < at("child"),
+            "the cleanup holding the value must run first: {order:?}"
         );
     }
 

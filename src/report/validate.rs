@@ -856,9 +856,19 @@ fn check_embedded_requests(
         // `REQUEST folder/ping` against an external `folder/ping` would count
         // as calling an embedded `ping` that in fact never runs.
         let used = called.iter().any(|c| {
-            *c == e.title
-                || (c.rsplit('/').next() == Some(e.title.as_str())
-                    && !titles.iter().any(|t| t == c))
+            if *c == e.title {
+                return true;
+            }
+            // A helper alias is resolved *before* any title, so `helper/ping`
+            // is a call on the helper collection and says nothing about an
+            // embedded `ping` — which stays dead text, and has to still be
+            // reported as such.
+            if c.split_once('/')
+                .is_some_and(|(alias, _)| ctx.helpers.iter().any(|h| h.alias == alias))
+            {
+                return false;
+            }
+            c.rsplit('/').next() == Some(e.title.as_str()) && !titles.iter().any(|t| t == c)
         });
         if !used {
             diags.push(Diagnostic::warning(fill(
@@ -1175,6 +1185,7 @@ fn walk_step_names(
         }
     }
     // The block's frame is complete now, so a cleanup may name anything in it.
+    let mut cleanup_deps: Vec<(String, Vec<String>)> = Vec::new();
     for node in deferred {
         let own = step_use(node).map(|u| step_name_of(&u));
         check_qualified_refs(node, ctx, path, own.as_deref(), diags);
@@ -1186,6 +1197,7 @@ fn walk_step_names(
             continue;
         };
         let here = own.as_deref().unwrap_or_default();
+        cleanup_deps.push((here.to_string(), depends.clone()));
         for dep in depends {
             if dep == here {
                 // It can never have succeeded when it is asked, so it would
@@ -1202,6 +1214,53 @@ fn walk_step_names(
             }
         }
     }
+    check_cleanup_cycles(&cleanup_deps, ctx, diags);
+}
+
+/// Reject a `DEPENDS` cycle between two or more cleanups.
+///
+/// A self-dependency is caught above and says something clearer; this is for
+/// the longer ring, which has no honest execution at all: every member is
+/// waiting on another member that has not run, so each in turn reads its
+/// prerequisite as unsuccessful and skips — the whole ring is silently torn
+/// down by nobody, leaking exactly the resources it was written to reclaim.
+/// Ordering cannot break the tie, so it has to be refused before the run.
+fn check_cleanup_cycles(
+    deps: &[(String, Vec<String>)],
+    ctx: &Context,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let names: HashSet<&str> = deps.iter().map(|(n, _)| n.as_str()).collect();
+    // Kahn's algorithm over the cleanup-to-cleanup edges alone: a dependency on
+    // an ordinary step is a real edge but never part of a cleanup ring, and
+    // pulling it in here would only report the innocent step as a member.
+    let mut waiting: Vec<(&str, Vec<&str>)> = deps
+        .iter()
+        .map(|(n, d)| {
+            let edges: Vec<&str> = d
+                .iter()
+                .map(String::as_str)
+                .filter(|x| names.contains(x) && *x != n.as_str())
+                .collect();
+            (n.as_str(), edges)
+        })
+        .collect();
+    loop {
+        let Some(at) = waiting.iter().position(|(_, edges)| edges.is_empty()) else {
+            break;
+        };
+        let (done, _) = waiting.remove(at);
+        for (_, edges) in &mut waiting {
+            edges.retain(|e| *e != done);
+        }
+    }
+    if !waiting.is_empty() {
+        let stuck: Vec<&str> = waiting.iter().map(|(n, _)| *n).collect();
+        diags.push(Diagnostic::error(fill(
+            ctx.strings.diag_graph_cycle,
+            &[&stuck.join(", ")],
+        )));
+    }
 }
 
 /// The PaperTrail source text on `node` that is `{{VAR}}`-interpolated at run
@@ -1211,7 +1270,7 @@ fn walk_step_names(
 /// alone deliberately: Hurl's expression grammar has no dotted path, so a
 /// qualified name can't be written there in the first place, and the request
 /// stays runnable on its own outside any flow.
-fn interpolated_source(node: &FlowNode) -> Vec<&str> {
+pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
     fn using(items: &[UsingItem]) -> Vec<&str> {
         items
             .iter()
@@ -1221,7 +1280,36 @@ fn interpolated_source(node: &FlowNode) -> Vec<&str> {
             })
             .collect()
     }
+    // A producer path is interpolated the same way and against the same map,
+    // so a dotted name written there means a step reference there too. Without
+    // this the one text `vars_for_source` substitutes that validation never
+    // looked at could carry a name that silently resolves to nothing.
+    fn producer<'p>(p: &'p Producer, out: &mut Vec<&'p str>) {
+        match p {
+            Producer::Files { dir, glob } | Producer::Folders { dir, glob, .. } => {
+                out.push(dir.as_str());
+                out.extend(glob.as_deref());
+            }
+            Producer::Tuples { path } => out.push(path.as_str()),
+            Producer::Zip(ps) | Producer::Concat(ps) => {
+                for p in ps {
+                    producer(p, out);
+                }
+            }
+            Producer::List(_) | Producer::Named(_) => {}
+        }
+    }
     match node {
+        FlowNode::ForEach { producer: p, .. } => {
+            let mut out = Vec::new();
+            producer(p, &mut out);
+            out
+        }
+        FlowNode::ListDecl { producer: p, .. } => {
+            let mut out = Vec::new();
+            producer(p, &mut out);
+            out
+        }
         FlowNode::Assign { value, .. } => vec![value.as_str()],
         FlowNode::Request { using: u, .. } => using(u),
         FlowNode::Cleanup { using: u, .. } => using(u),
@@ -1984,6 +2072,37 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_qualified_call_does_not_count_as_using_an_embedded_request() {
+        // A helper alias resolves before any title, so `helper/ping` runs the
+        // helper's request and says nothing about the embedded `ping` — which
+        // is dead text in the one file that was supposed to be self-contained,
+        // and has to still be reported as such.
+        let flow = parse_flow(
+            "# collection: c\n\nREPORT REQUEST helper/ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
+        )
+        .expect("test source should parse");
+        let entries = flow.embedded_entries();
+        let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+        let helpers = [crate::report::run::HelperCollection {
+            alias: "helper".into(),
+            entries: vec![capturing_entry("ping", &[])],
+        }];
+        let ctx = Context {
+            request_titles: Some(&titles),
+            request_entries: Some(&entries),
+            helpers: &helpers,
+            ..Default::default()
+        };
+        let diags = validate(&flow, &ctx);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Warning && d.message.contains("ping")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
     fn an_embedded_name_may_not_collide_with_an_external_one() {
         let diags = diags_embedded(
             "# collection: c\n\nREPORT REQUEST ping\n\nREQUESTS\n\n# ping\nGET https://x/ping\n",
@@ -2148,6 +2267,50 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.severity == Severity::Error && d.message.contains("ghost")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn two_cleanups_that_depend_on_each_other_are_refused() {
+        // A ring has no honest execution: each member waits on another that has
+        // not run, so each in turn reads its prerequisite as unsuccessful and
+        // skips itself. Every resource the ring covers leaks, silently — and
+        // ordering cannot break the tie, so it has to be refused up front.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST setup\n\
+             CLEANUP purge_a DEPENDS setup, purge_b\n\
+             CLEANUP purge_b DEPENDS setup, purge_a\n",
+            &[
+                capturing_entry("setup", &[]),
+                capturing_entry("purge_a", &[]),
+                capturing_entry("purge_b", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("purge_a")
+                && d.message.contains("purge_b")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn cleanups_in_a_chain_are_not_a_cycle() {
+        // The boundary of the rule above: a chain is exactly what `DEPENDS`
+        // between cleanups is for, and rejecting it would take the feature away.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST setup\n\
+             CLEANUP purge_a DEPENDS setup\n\
+             CLEANUP purge_b DEPENDS purge_a\n",
+            &[
+                capturing_entry("setup", &[]),
+                capturing_entry("purge_a", &[]),
+                capturing_entry("purge_b", &[]),
+            ],
+        );
+        assert!(
+            !diags.iter().any(|d| d.severity == Severity::Error),
             "{diags:?}"
         );
     }

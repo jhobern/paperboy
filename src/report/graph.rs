@@ -421,6 +421,44 @@ pub fn explain(
 /// so a target naming a step out there is an error rather than a no-op — the
 /// closure would be meaningless, and silently running the whole flow instead
 /// would be the worst of the available answers.
+/// Visit every node in `nodes`, descending into loop bodies and regions.
+fn for_each_node(nodes: &[FlowNode], f: &mut impl FnMut(&FlowNode)) {
+    for n in nodes {
+        f(n);
+        match n {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => for_each_node(body, f),
+            _ => {}
+        }
+    }
+}
+
+/// Visit every step in `nodes` as `(step name, request)`, loop bodies included.
+fn for_each_step(nodes: &[FlowNode], f: &mut impl FnMut(&str, &str)) {
+    for_each_node(nodes, &mut |n| {
+        if let Some((step, request)) = step_name(n) {
+            f(&step, request);
+        }
+    });
+}
+
+/// Drop the cleanups `keep` rejects, at every depth.
+fn retain_cleanups(nodes: &mut Vec<FlowNode>, keep: &mut impl FnMut(&str, &[String]) -> bool) {
+    nodes.retain(|n| match n {
+        FlowNode::Cleanup { name, depends, .. } => keep(name, depends),
+        _ => true,
+    });
+    for n in nodes {
+        match n {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => retain_cleanups(body, keep),
+            _ => {}
+        }
+    }
+}
+
 pub fn prune_to_targets(
     flow: &mut ReportFlow,
     targets: &[String],
@@ -499,15 +537,26 @@ pub fn prune_to_targets(
             keep_written.contains(&idx)
         });
     }
+    // Everything still standing produces what it always produced. A step
+    // outside a region is never pruned, so its captures are kept captures too
+    // — counting only the region's survivors let `--targets` drop a cleanup
+    // whose value came from an ordinary step that is still there, silently
+    // leaking whatever that step created.
+    for_each_step(&flow.nodes, &mut |_, request| {
+        if let Some(e) = resolve_qualified(entries, helpers, request) {
+            kept_captures.extend(e.captures.iter().map(|(c, _)| c.clone()));
+        }
+    });
+
     // A cleanup undoes what a step did. If pruning removed every step it was
     // undoing, there is nothing left to tear down, and keeping it is worse than
     // useless: a declared dependency on a vanished step becomes a skip and an
     // exit code saying the run was incomplete, while an inferred one can send
     // the teardown with a variable nobody in this run ever set.
-    flow.nodes.retain(|n| {
-        let FlowNode::Cleanup { name, depends, .. } = n else {
-            return true;
-        };
+    //
+    // Cleanups nested in a loop body count: the body runs once per item, and a
+    // teardown inside it is no less stranded for being written there.
+    retain_cleanups(&mut flow.nodes, &mut |name, depends| {
         if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
             return false;
         }
@@ -521,6 +570,31 @@ pub fn prune_to_targets(
             .iter()
             .any(|r| dropped_captures.contains(r.as_str()) && !kept_captures.contains(r.as_str()))
     });
+
+    // Pruning removes steps, and what is left may still name one. A qualified
+    // reference to a step that is no longer in the run cannot resolve: the
+    // placeholder would be sent verbatim, or reported as a literal
+    // `{{create.sid}}` in a column. The flow validated before pruning and is
+    // never revalidated after it, so the one thing pruning can break is checked
+    // here — and refused, because sending something other than what was asked
+    // for is worse than not running.
+    let mut stranded: Vec<String> = Vec::new();
+    for_each_node(&flow.nodes, &mut |node| {
+        for text in crate::report::validate::interpolated_source(node) {
+            for key in crate::environment::referenced_keys(text) {
+                if let Some((step, _)) = key.split_once('.')
+                    && dropped_names.contains(step)
+                    && !stranded.contains(&key)
+                {
+                    stranded.push(key.clone());
+                }
+            }
+        }
+    });
+    for key in stranded {
+        let step = key.split_once('.').map(|(s, _)| s).unwrap_or(&key);
+        errors.push(fill(strings.diag_graph_target_strands, &[&key, step]));
+    }
 
     // A target nobody matched is a typo or a step outside a region, and either
     // way running something other than what was asked for is worse than
@@ -599,6 +673,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&p, &p.order), ["producer", "consumer"]);
+    }
+
+    #[test]
+    fn a_generator_reading_a_capture_still_orders_the_step() {
+        // A `# [Gen]` expression is not a template: a bare identifier is a
+        // variable reference, resolved from the same map a `{{…}}` would be.
+        // Scanning only the braces meant a step whose sole use of a capture was
+        // inside a generator got no edge, and could run first.
+        let mut consumer = entry("consumer", &[], &["sig"]);
+        consumer
+            .generators
+            .push(("sig".into(), "sha256(token)".into()));
+        let entries = [consumer, entry("producer", &["token"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(names(&p, &p.order), ["producer", "consumer"]);
+    }
+
+    #[test]
+    fn a_generators_own_row_and_its_functions_are_not_dependencies() {
+        // `uuid` is a call and `seed` is declared by the block itself, so
+        // neither reaches the variable map. An edge from either would order a
+        // region by a name nothing outside it ever defines.
+        let mut consumer = entry("consumer", &[], &[]);
+        consumer.generators.push(("seed".into(), "uuid".into()));
+        consumer
+            .generators
+            .push(("sig".into(), "sha256(seed)".into()));
+        let entries = [consumer, entry("producer", &["seed"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert!(p.edges.is_empty(), "{:?}", p.edges);
+    }
+
+    #[test]
+    fn a_placeholder_in_a_reports_field_does_not_invent_a_dependency() {
+        // `[Reports]` looks like `[Captures]` but is PaperBoy's own metadata:
+        // the query is handed to `eval_field` verbatim and nothing substitutes
+        // into it. An edge drawn from it reordered the region, and made
+        // `--targets` drag in a producer, for a field that still failed to
+        // match.
+        let mut consumer = entry("consumer", &[], &[]);
+        consumer
+            .reports
+            .push(("selected".into(), "jsonpath \"{{path}}\"".into()));
+        let entries = [consumer, entry("producer", &["path"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert!(p.edges.is_empty(), "{:?}", p.edges);
+        assert_eq!(names(&p, &p.order), ["consumer", "producer"]);
     }
 
     #[test]
@@ -851,6 +984,64 @@ mod tests {
         )
         .unwrap();
         assert!(!text.contains("CLEANUP"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_keeps_a_capture_a_surviving_step_still_makes() {
+        // The pruned region is not the only producer. A step outside any region
+        // is never pruned, so the value the teardown reads is still there —
+        // dropping it anyway leaked whatever that step created, which is the
+        // one outcome a cleanup exists to prevent.
+        let entries = [
+            entry("outside", &["sid"], &[]),
+            entry("discarded", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "REQUEST outside\n\
+             GRAPH\n    REQUEST discarded\n    REQUEST target\nEND\n\
+             CLEANUP teardown\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_inside_a_loop_is_pruned_like_any_other() {
+        // A loop body runs once per item; a teardown written there is no less
+        // stranded for being nested, and only the top level was being swept.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("b", &[], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST b\nEND\n\
+             FOR ITEM IN [1, 2]\n    CLEANUP teardown\nEND\n",
+            &["b"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP"), "{text}");
+    }
+
+    #[test]
+    fn pruning_refuses_to_strand_a_reference_to_the_step_it_removed() {
+        // The flow validated before pruning and is never revalidated after it,
+        // so a reference to a step the targets left out would reach the run as
+        // a literal `{{create.sid}}` — reported in a column, or sent in a URL.
+        let entries = [entry("create", &["sid"], &[]), entry("health", &[], &[])];
+        let errs = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST health\nEND\n\
+             REPORT \"{{create.sid}}\" AS Session\n",
+            &["health"],
+            &entries,
+        )
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("create.sid")), "{errs:?}");
     }
 
     #[test]

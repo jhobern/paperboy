@@ -1519,15 +1519,23 @@ fn for_each_wire_text(entry: &HurlEntry, mut visit: impl FnMut(&str)) {
     // as it does into a URL. Leaving them out meant a step whose only use of a
     // capture was in an assert had no edge to the step that produced it, and so
     // could be ordered before it.
-    for (_, q) in entry.captures.iter().chain(&entry.reports) {
+    for (_, q) in &entry.captures {
         visit(q);
     }
+    // `[Reports]` is deliberately *not* scanned, though it looks just like
+    // `[Captures]`: report queries are PaperBoy's own metadata, carried in
+    // comments, and `eval_report_request` hands each one to `eval_field`
+    // verbatim. Nothing substitutes into them, so a `{{…}}` written there is
+    // not a use of that variable — counting it invented a dependency edge that
+    // could reorder a region, and made `--targets` drag in a producer, while
+    // the field itself still failed to match.
     for a in &entry.asserts {
         visit(a);
     }
-    // The expression's *bare* identifiers are a separate namespace (see
-    // `rename_expression_identifiers`) and are not scanned here; only the
-    // `{{…}}` a generator expression may also contain.
+    // Only the `{{…}}` a generator expression may contain. Its *bare*
+    // identifiers are variable references too, but they are not placeholders
+    // and so belong to `entry_referenced_keys` alone — see
+    // [`entry_generator_refs`].
     for (_, expr) in &entry.generators {
         visit(expr);
     }
@@ -1539,7 +1547,38 @@ pub fn entry_referenced_keys(entry: &HurlEntry) -> std::collections::HashSet<Str
     for_each_wire_text(entry, |text| {
         keys.extend(crate::environment::referenced_keys(text))
     });
+    keys.extend(entry_generator_refs(entry));
     keys
+}
+
+/// Variables a request's `# [Gen]` rows read as **bare identifiers**.
+///
+/// A generator expression is not a template: `sig = hmac_sha256(SECRET, body)`
+/// reads `SECRET` and `body` from the same map a `{{…}}` would, without any
+/// braces (see [`crate::generators`]). They are therefore real references —
+/// leaving them out meant a step whose only use of a capture was inside a
+/// generator got no dependency edge, and could be ordered before the step that
+/// produced it.
+///
+/// A name that is a generator function (`uuid`, `timestamp`, …) is a call, not
+/// a reference, and a name this same request declares is resolved from the
+/// block itself; neither reaches the variable map, so neither counts. Nor does
+/// a bare number, which is an argument.
+pub fn entry_generator_refs(entry: &HurlEntry) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for (_, expr) in &entry.generators {
+        for (a, b) in expression_identifier_spans(expr) {
+            let word = &expr[a..b];
+            if word.starts_with(|c: char| c.is_ascii_digit())
+                || crate::generators::is_function(word)
+                || entry.generators.iter().any(|(n, _)| n == word)
+            {
+                continue;
+            }
+            out.insert(word.to_string());
+        }
+    }
+    out
 }
 
 /// Placeholders in `entry` that Hurl would read differently from PaperBoy — see
@@ -1864,29 +1903,19 @@ fn expression_identifiers(expr: &str) -> Vec<String> {
     out
 }
 
-/// Rewrite the bare identifiers of a generator expression, leaving string
-/// literals (and everything that is not a whole word) alone.
-fn rename_expression_identifiers(expr: &str, renames: &HashMap<String, String>) -> String {
-    if renames.is_empty() {
-        return expr.to_string();
-    }
-    let mut out = String::with_capacity(expr.len());
-    let mut cur = String::new();
+/// The byte ranges of the bare words in a generator expression — everything
+/// outside a string literal that could be an identifier.
+///
+/// One definition, shared by the renamer and by [`entry_generator_refs`]: if
+/// "what counts as an identifier here" were written twice, a rename could move
+/// a name the dependency planner still looked for under the old one.
+fn expression_identifier_spans(expr: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
     let mut in_str = false;
     let mut escaped = false;
-    let flush = |cur: &mut String, out: &mut String| {
-        if cur.is_empty() {
-            return;
-        }
-        match renames.get(cur.as_str()) {
-            Some(new) => out.push_str(new),
-            None => out.push_str(cur),
-        }
-        cur.clear();
-    };
-    for ch in expr.chars() {
+    for (i, ch) in expr.char_indices() {
         if in_str {
-            out.push(ch);
             if escaped {
                 escaped = false;
             } else if ch == '\\' {
@@ -1897,16 +1926,39 @@ fn rename_expression_identifiers(expr: &str, renames: &HashMap<String, String>) 
             continue;
         }
         if ch.is_alphanumeric() || ch == '_' {
-            cur.push(ch);
+            start.get_or_insert(i);
             continue;
         }
-        flush(&mut cur, &mut out);
+        if let Some(a) = start.take() {
+            out.push((a, i));
+        }
         if ch == '"' {
             in_str = true;
         }
-        out.push(ch);
     }
-    flush(&mut cur, &mut out);
+    if let Some(a) = start {
+        out.push((a, expr.len()));
+    }
+    out
+}
+
+/// Rewrite the bare identifiers of a generator expression, leaving string
+/// literals (and everything that is not a whole word) alone.
+fn rename_expression_identifiers(expr: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() {
+        return expr.to_string();
+    }
+    let mut out = String::with_capacity(expr.len());
+    let mut at = 0usize;
+    for (a, b) in expression_identifier_spans(expr) {
+        out.push_str(&expr[at..a]);
+        match renames.get(&expr[a..b]) {
+            Some(new) => out.push_str(new),
+            None => out.push_str(&expr[a..b]),
+        }
+        at = b;
+    }
+    out.push_str(&expr[at..]);
     out
 }
 
