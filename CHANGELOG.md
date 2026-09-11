@@ -20,8 +20,11 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   attempt as it starts (deliberately before it sleeps for the interval), and
   PaperBoy now listens: the Response pane's spinner reads `⟳ Sending… (retry 2
   of 5)`, and `paperboy -c` prints a line per attempt as it happens instead of
-  the whole story at the end. `retry: -1` counts without claiming a total,
-  since "forever" has none.
+  the whole story at the end. `retry: -1` reads `retry 3 of ∞` — "will this
+  stop?" is the question, and the answer is worth keeping in the shape of the
+  sentence. A limit written `retry: {{max_attempts}}` is looked up rather than
+  given up on, so it counts like any other; only a name nothing binds drops the
+  total, since an invented one is worse than none.
 
 - **The request summary lists the request's `[Options]` rows.** They were shown
   nowhere in the terminal UI, which is a poor place for the setting that

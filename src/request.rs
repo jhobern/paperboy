@@ -602,9 +602,8 @@ pub struct BatchRunUpdate {
     /// for it.
     pub responses: Vec<Option<ApiResponse>>,
     /// The entry Hurl is currently retrying, if any: its position in `results`,
-    /// the attempt being made, and the `retry:` limit when it is a plain
-    /// number. `None` once that entry produces an outcome.
-    pub retrying: Option<(usize, usize, Option<usize>)>,
+    /// the attempt being made, and how many attempts the request allows. `None` once that entry produces an outcome.
+    pub retrying: Option<(usize, usize, crate::hurl::RetryLimit)>,
 }
 
 /// Build the Hurl entry to run for the selected entry, honoring an edited
@@ -840,7 +839,7 @@ pub fn run_resolved_entry_watching(
     vars: &HashMap<String, String>,
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
-    on_attempt: impl FnMut(usize, usize, Option<usize>),
+    on_attempt: impl FnMut(usize, usize, crate::hurl::RetryLimit),
 ) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an

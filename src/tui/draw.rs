@@ -4237,18 +4237,16 @@ pub(crate) fn draw_response(
         // through the entry it is retrying.
         let retry = entry_retry.or_else(|| app.response.lock().ok().and_then(|r| r.retry_attempt));
         let text = match retry {
-            Some((attempt, Some(limit))) => format!(
-                "⟳ {} ({})",
-                s.sending,
-                s.retry_attempt
-                    .replace("{n}", &attempt.to_string())
-                    .replace("{m}", &limit.to_string())
-            ),
-            Some((attempt, None)) => format!(
-                "⟳ {} ({})",
-                s.sending,
-                s.retry_attempt_open.replace("{n}", &attempt.to_string())
-            ),
+            Some((attempt, limit)) => {
+                let hint = match limit.total() {
+                    Some(total) => s
+                        .retry_attempt
+                        .replace("{n}", &attempt.to_string())
+                        .replace("{m}", &total),
+                    None => s.retry_attempt_open.replace("{n}", &attempt.to_string()),
+                };
+                format!("⟳ {} ({hint})", s.sending)
+            }
             None => format!("⟳ {}", s.sending),
         };
         f.render_widget(

@@ -353,7 +353,7 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 if attempt == 0 {
                     return;
                 }
-                let of = limit.map_or(String::new(), |l| format!(" of {l}"));
+                let of = limit.total().map_or(String::new(), |t| format!(" of {t}"));
                 println!(
                     "  {}",
                     paint(

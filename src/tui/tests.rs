@@ -7992,7 +7992,7 @@ fn the_response_panel_says_which_retry_is_being_waited_on() {
     let ci = app.active_tab;
     app.collections[ci].entries.push(HurlEntry::default());
     app.collections[ci].entries[0].last_run = RunStatus::Running;
-    app.collections[ci].entries[0].retry_attempt = Some((2, Some(5)));
+    app.collections[ci].entries[0].retry_attempt = Some((2, crate::hurl::RetryLimit::Times(5)));
 
     let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
     term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
@@ -8003,16 +8003,29 @@ fn the_response_panel_says_which_retry_is_being_waited_on() {
         "the spinner should say which attempt is running:\n{out}"
     );
 
-    // `retry: -1` (forever) has no denominator to count towards, so the hint
-    // states the attempt and stops there rather than inventing a total.
-    app.collections[ci].entries[0].retry_attempt = Some((3, None));
+    // `retry: -1` is a poll that will go on asking, which is worth saying: it
+    // keeps the shape of the sentence and answers the question the reader
+    // actually has.
+    app.collections[ci].entries[0].retry_attempt = Some((3, crate::hurl::RetryLimit::Forever));
     let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
     term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
         .unwrap();
     let out = buffer_text(term.backend().buffer());
     assert!(
-        out.contains("retry 3") && !out.contains(" of "),
-        "an open-ended retry should not claim a limit:\n{out}"
+        out.contains("retry 3 of ∞"),
+        "a forever-poll should say so rather than drop the total:\n{out}"
+    );
+
+    // A `{{placeholder}}` limit nothing could resolve has no total at all, so
+    // the hint states the attempt and stops rather than inventing one.
+    app.collections[ci].entries[0].retry_attempt = Some((4, crate::hurl::RetryLimit::Unknown));
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 4") && !out.contains(" of "),
+        "an unknown limit should not claim a total:\n{out}"
     );
 }
 
@@ -18710,7 +18723,7 @@ fn a_run_all_pass_marks_the_entry_it_is_retrying() {
         results: vec![Some(true), None],
         captures: std::collections::HashMap::new(),
         responses: vec![None, None],
-        retrying: Some((1, 2, Some(5))),
+        retrying: Some((1, 2, crate::hurl::RetryLimit::Times(5))),
     };
     tx.send(update.clone()).unwrap();
     app.pending_batch_runs.push(rx);
@@ -18719,7 +18732,7 @@ fn a_run_all_pass_marks_the_entry_it_is_retrying() {
     let col = &app.collections[1];
     assert_eq!(
         col.entries[1].retry_attempt,
-        Some((2, Some(5))),
+        Some((2, crate::hurl::RetryLimit::Times(5))),
         "the retried entry should carry the attempt it is on"
     );
     assert_eq!(

@@ -72,15 +72,15 @@ pub struct ApiResponse {
     pub body: Arc<str>,
     pub loading: bool,
     /// While a request is in flight and Hurl is *retrying* it: the attempt
-    /// being made (counting the first send as 0) and the `retry:` limit when
-    /// the request states it as a plain number.
+    /// being made (counting the first send as 0) and how many the request
+    /// allows.
     ///
     /// A poll written `retry: 30, retry-interval: 2000` is a minute of silence
     /// otherwise — all of a retried entry's results arrive together, so without
     /// this the spinner says "Sending…" for the whole wait and there is no way
     /// to tell a working poll from a hung one. Transient: cleared the moment
     /// `loading` goes false.
-    pub retry_attempt: Option<(usize, Option<usize>)>,
+    pub retry_attempt: Option<(usize, crate::hurl::RetryLimit)>,
     pub error: String,
     /// Response headers (name, value).
     pub headers: Vec<(String, String)>,
