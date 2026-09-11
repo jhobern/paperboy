@@ -884,18 +884,34 @@ fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
 /// its name rather than by which statement filled it. A flow-global rule would
 /// reject both, and would be rejecting readable, unambiguous flows to no end.
 fn check_step_names(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
-    let mut path: Vec<HashMap<String, bool>> = vec![HashMap::new()];
+    let mut path: Vec<HashMap<String, StepInfo>> = vec![HashMap::new()];
     walk_step_names(&flow.nodes, ctx, &mut path, diags);
+}
+
+/// What the lexical walk remembers about a step already in scope.
+struct StepInfo {
+    /// Whether the name was written with `AS`. Recorded so a clash can name the
+    /// mistake actually made: two `AS Foo`s are a duplicate the author chose,
+    /// while two bare requests with the same leaf are an accident of naming
+    /// that `AS` is the fix for.
+    written: bool,
+    /// The request this step runs, so a `{{step.var}}` reference can be checked
+    /// against the captures that request actually declares.
+    request: String,
 }
 
 fn walk_step_names(
     nodes: &[FlowNode],
     ctx: &Context,
-    path: &mut Vec<HashMap<String, bool>>,
+    path: &mut Vec<HashMap<String, StepInfo>>,
     diags: &mut Vec<Diagnostic>,
 ) {
     let s = ctx.strings;
     for node in nodes {
+        // Checked *before* this node's own name is recorded, which is what
+        // makes a step unable to refer to itself: its captures don't exist
+        // until it has run.
+        check_qualified_refs(node, ctx, path, diags);
         if let Some(use_) = step_use(node) {
             let name = match use_.alias {
                 Some(a) => {
@@ -919,17 +935,21 @@ fn walk_step_names(
             };
             // `written` records how the *existing* name got there, so the
             // message names the mistake actually made.
-            if let Some(written) = path.iter().find_map(|f| f.get(name)) {
-                let msg = if *written || use_.alias.is_some() {
+            if let Some(prev) = path.iter().find_map(|f| f.get(name)) {
+                let msg = if prev.written || use_.alias.is_some() {
                     fill(s.diag_step_name_duplicate, &[name, "2"])
                 } else {
                     fill(s.diag_step_name_ambiguous, &[use_.request, "2"])
                 };
                 diags.push(Diagnostic::error(msg));
             } else {
-                path.last_mut()
-                    .unwrap()
-                    .insert(name.to_string(), use_.alias.is_some());
+                path.last_mut().unwrap().insert(
+                    name.to_string(),
+                    StepInfo {
+                        written: use_.alias.is_some(),
+                        request: use_.request.to_string(),
+                    },
+                );
             }
         }
         // A loop body is a new lexical frame: names inside it are visible to
@@ -941,6 +961,83 @@ fn walk_step_names(
                 path.pop();
             }
             _ => {}
+        }
+    }
+}
+
+/// The PaperTrail source text on `node` that is `{{VAR}}`-interpolated at run
+/// time, and so may carry a step-qualified capture reference.
+///
+/// Only PaperTrail's own text is collected. A `.hurl` request body is left
+/// alone deliberately: Hurl's expression grammar has no dotted path, so a
+/// qualified name can't be written there in the first place, and the request
+/// stays runnable on its own outside any flow.
+fn interpolated_source(node: &FlowNode) -> Vec<&str> {
+    fn using(items: &[UsingItem]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                UsingItem::Override { value, .. } => Some(value.as_str()),
+                UsingItem::Require(_) => None,
+            })
+            .collect()
+    }
+    match node {
+        FlowNode::Assign { value, .. } => vec![value.as_str()],
+        FlowNode::Request { using: u, .. } => using(u),
+        FlowNode::Report(ReportStmt::Request { using: u, .. }) => using(u),
+        FlowNode::Report(ReportStmt::Computed { template, .. }) => vec![template.as_str()],
+        _ => vec![],
+    }
+}
+
+/// Check every `{{step.var}}` written on `node` against the steps visible at
+/// this point in the walk.
+///
+/// A dotted placeholder is unambiguously a step reference: PaperTrail variable
+/// names are identifiers, so a `.` can only be the qualifier. Both halves are
+/// checked — the step has to be one that has already run in an enclosing scope,
+/// and it has to be a step whose request declares that capture — because the
+/// failure this feature exists to prevent is a value silently resolving to the
+/// wrong producer's copy.
+fn check_qualified_refs(
+    node: &FlowNode,
+    ctx: &Context,
+    path: &[HashMap<String, StepInfo>],
+    diags: &mut Vec<Diagnostic>,
+) {
+    let s = ctx.strings;
+    for text in interpolated_source(node) {
+        for key in crate::environment::referenced_keys(text) {
+            let Some((step, var)) = key.split_once('.') else {
+                continue;
+            };
+            let Some(info) = path.iter().rev().find_map(|f| f.get(step)) else {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_unknown,
+                    &[&key, step],
+                )));
+                continue;
+            };
+            // Unbound collection: the request's captures aren't knowable, so
+            // the second half of the check is skipped rather than guessed at.
+            if ctx.request_entries.is_none() {
+                continue;
+            }
+            let Some(entry) = resolve_entry_qualified(&info.request, ctx) else {
+                continue; // unresolvable request — already reported
+            };
+            let known = entry
+                .captures
+                .iter()
+                .chain(entry.generators.iter())
+                .any(|(n, _)| n == var);
+            if !known {
+                diags.push(Diagnostic::error(fill(
+                    s.diag_step_ref_no_capture,
+                    &[step, &info.request, var],
+                )));
+            }
         }
     }
 }
@@ -2777,6 +2874,132 @@ mod tests {
             !step_errors("# collection: c\n\nREQUEST \"a/session\"\nREQUEST \"b/session\"\n")
                 .is_empty()
         );
+    }
+
+    // ---- Qualified capture references --------------------------------------
+
+    /// A request that captures `captures` under `title`.
+    fn capturing_entry(title: &str, captures: &[&str]) -> crate::hurl::HurlEntry {
+        crate::hurl::HurlEntry {
+            title: title.into(),
+            method: "POST".into(),
+            url: "http://x".into(),
+            captures: captures
+                .iter()
+                .map(|c| ((*c).to_string(), "jsonpath \"$.t\"".to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ref_errors(src: &str, entries: &[crate::hurl::HurlEntry]) -> Vec<String> {
+        diags_with_entries(src, entries)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn a_qualified_reference_resolves_to_the_named_step() {
+        // The motivating case: two steps both capture `token`, and the flat
+        // name would silently mean whichever ran last. Qualifying says which.
+        let entries = [capturing_entry("login", &["token"]), {
+            let mut e = capturing_entry("api", &[]);
+            e.title = "api".into();
+            e
+        }];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "REQUEST login AS second\n",
+            "REQUEST api USING(header.Authorization = \"{{second.token}}\")\n",
+        );
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_qualified_reference_to_an_unknown_step_is_an_error() {
+        let entries = [capturing_entry("login", &["token"])];
+        let src = "# collection: c\n\nREQUEST login USING(header.X = \"{{nope.token}}\")\n";
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("nope")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_cannot_reference_its_own_captures() {
+        // They don't exist until it has run, so this is always a mistake —
+        // and it reads plausibly enough to be worth catching.
+        let entries = [capturing_entry("login", &["token"])];
+        let src = "# collection: c\n\nREQUEST login AS me USING(header.X = \"{{me.token}}\")\n";
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("me")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_qualified_reference_to_a_value_the_step_does_not_capture_is_an_error() {
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "REQUEST api USING(header.X = \"{{first.session}}\")\n",
+        );
+        let errs = ref_errors(src, &entries);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("session") && e.contains("first")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_reference_cannot_reach_sideways_into_a_sibling_block() {
+        // Sibling scopes are exactly why uniqueness is lexical; the same rule
+        // has to govern what a reference can see, or the two disagree.
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST login AS first\n",
+            "END\n",
+            "FOR B IN FILES \"y\"\n",
+            "    REQUEST api USING(header.X = \"{{first.token}}\")\n",
+            "END\n",
+        );
+        let errs = ref_errors(src, &entries);
+        assert!(errs.iter().any(|e| e.contains("first")), "{errs:?}");
+    }
+
+    #[test]
+    fn an_enclosing_step_is_visible_from_inside_a_block() {
+        let entries = [
+            capturing_entry("login", &["token"]),
+            capturing_entry("api", &[]),
+        ];
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST login AS first\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST api USING(header.X = \"{{first.token}}\")\n",
+            "END\n",
+        );
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_undotted_reference_is_not_treated_as_a_step_reference() {
+        // Ordinary variables outnumber qualified ones by a long way; the check
+        // must not fire on them.
+        let entries = [capturing_entry("api", &[])];
+        let src =
+            "# collection: c\n\nBASE = \"http://x\"\nREQUEST api USING(header.X = \"{{BASE}}\")\n";
+        assert_eq!(ref_errors(src, &entries), Vec::<String>::new());
     }
 
     #[test]

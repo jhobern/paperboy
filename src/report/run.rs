@@ -522,6 +522,15 @@ struct Exec<'a> {
     /// Forward capture chain (values captured by requests, threaded to later
     /// requests). Highest precedence in [`Exec::vars_for`].
     captures: HashMap<String, String>,
+    /// The same captures, kept per *step* so a reference can say which step it
+    /// meant. `captures` above is flat and last-writer-wins, which is exactly
+    /// the ambiguity `{{step.var}}` exists to resolve: two steps that both
+    /// capture `token` leave only one of them visible under the bare name.
+    ///
+    /// Qualified names never reach Hurl — `{{a.b}}` is not valid Hurl syntax —
+    /// so this feeds [`Exec::vars_for_source`] only, which substitutes
+    /// PaperTrail's own text.
+    step_captures: HashMap<String, HashMap<String, String>>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
     /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
     key_parts: Vec<String>,
@@ -572,6 +581,7 @@ struct ExecState {
     scopes: Vec<HashMap<String, String>>,
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
+    step_captures: HashMap<String, HashMap<String, String>>,
     key_parts: Vec<String>,
     path: Vec<(usize, usize)>,
     target: Option<String>,
@@ -596,6 +606,7 @@ impl<'a> Exec<'a> {
             scopes: vec![HashMap::new()],
             lists: HashMap::new(),
             captures: HashMap::new(),
+            step_captures: HashMap::new(),
             key_parts: Vec::new(),
             path: Vec::new(),
             target: None,
@@ -616,6 +627,7 @@ impl<'a> Exec<'a> {
             scopes: self.scopes.clone(),
             lists: self.lists.clone(),
             captures: self.captures.clone(),
+            step_captures: self.step_captures.clone(),
             key_parts: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
@@ -633,6 +645,7 @@ impl<'a> Exec<'a> {
             scopes: state.scopes,
             lists: state.lists,
             captures: state.captures,
+            step_captures: state.step_captures,
             key_parts: state.key_parts,
             path: state.path,
             target: state.target,
@@ -686,8 +699,43 @@ impl<'a> Exec<'a> {
         m
     }
 
+    /// [`Exec::vars_for`] plus the `step.var` names.
+    ///
+    /// Only for substituting **PaperTrail's own text** — `USING(…)` values,
+    /// computed columns, producer paths. Hurl never sees these: its expression
+    /// grammar has no dotted path, so `{{oauth2.token}}` inside a `.hurl` would
+    /// be a parse error rather than a lookup that misses. That asymmetry is the
+    /// whole reason qualification lives at the call site: request text stays
+    /// ordinary, standalone-runnable Hurl.
+    fn vars_for_source(&self) -> HashMap<String, String> {
+        let mut m = self.vars_for();
+        for (step, caps) in &self.step_captures {
+            for (k, v) in caps {
+                m.insert(format!("{step}.{k}"), v.clone());
+            }
+        }
+        m
+    }
+
+    /// Thread one request's captures forward: into the flat chain, and under
+    /// the step's own name so a later reference can disambiguate.
+    fn record_captures(&mut self, step: &str, captures: &[(String, String)]) {
+        let own = self.step_captures.entry(step.to_string()).or_default();
+        for (k, v) in captures {
+            own.insert(k.clone(), v.clone());
+        }
+        for (k, v) in captures {
+            self.captures.insert(k.clone(), v.clone());
+        }
+    }
+
     /// Look up a single variable across the full precedence stack.
     fn lookup(&self, key: &str) -> Option<String> {
+        if let Some((step, var)) = key.split_once('.')
+            && let Some(v) = self.step_captures.get(step).and_then(|c| c.get(var))
+        {
+            return Some(v.clone());
+        }
         if let Some(v) = self.captures.get(key) {
             return Some(v.clone());
         }
@@ -757,7 +805,7 @@ impl<'a> Exec<'a> {
                 // them; they do nothing at run time.
                 FlowNode::Comment(_) => {}
                 FlowNode::Assign { key, value } => {
-                    let v = substitute(&unquote(value), &self.vars_for());
+                    let v = substitute(&unquote(value), &self.vars_for_source());
                     self.set_var(key, v);
                 }
                 FlowNode::ListDecl { name, producer } => {
@@ -778,14 +826,14 @@ impl<'a> Exec<'a> {
                 FlowNode::Param(p) => {
                     match super::params::value_for(p, &self.ctx.params, self.ctx.strings) {
                         Ok(raw) => {
-                            let v = substitute(&raw, &self.vars_for());
+                            let v = substitute(&raw, &self.vars_for_source());
                             self.set_var(&p.name, v);
                         }
                         Err(e) => self.errors.push(e),
                     }
                 }
-                FlowNode::Request { name, using, .. } => {
-                    self.run_request(name, using);
+                FlowNode::Request { name, alias, using } => {
+                    self.run_request(name, alias.as_deref(), using);
                 }
                 FlowNode::Report(stmt) => {
                     let cells = self.eval_report(stmt);
@@ -871,7 +919,12 @@ impl<'a> Exec<'a> {
     /// Send a request by name (no column emitted), threading its captures
     /// forward. Records an error (but does not abort) if the name is unresolved
     /// or the send fails.
-    fn run_request(&mut self, name: &str, using: &[UsingItem]) -> Option<EntryOutcome> {
+    fn run_request(
+        &mut self,
+        name: &str,
+        alias: Option<&str>,
+        using: &[UsingItem],
+    ) -> Option<EntryOutcome> {
         let base = match resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             Some(e) => e.clone(),
             None => {
@@ -880,23 +933,21 @@ impl<'a> Exec<'a> {
                 return None;
             }
         };
-        let vars = self.vars_for();
-        let base = match self.apply_using(name, base, using, &vars) {
+        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e);
                 return None;
             }
         };
-        let out = self.ctx.runner.run(&base, &vars);
+        let out = self.ctx.runner.run(&base, &self.vars_for());
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
         }
         let eo = out.entries.into_iter().next();
         if let Some(eo) = &eo {
-            for (k, v) in &eo.captures {
-                self.captures.insert(k.clone(), v.clone());
-            }
+            let step = alias.unwrap_or_else(|| leaf(name)).to_string();
+            self.record_captures(&step, &eo.captures);
         }
         eo
     }
@@ -964,7 +1015,7 @@ impl<'a> Exec<'a> {
                 vec![(name.clone(), self.lookup(var).unwrap_or_default())]
             }
             ReportStmt::Computed { template, name, .. } => {
-                let value = substitute(template, &self.vars_for());
+                let value = substitute(template, &self.vars_for_source());
                 vec![(name.clone(), value)]
             }
             ReportStmt::Request {
@@ -1046,11 +1097,10 @@ impl<'a> Exec<'a> {
             }
         };
 
-        let vars = self.vars_for();
         // An unmet `USING` requirement means the request would send something
         // other than what the flow asked for, so it is not sent at all: the row
         // gets an `Error` cell instead of a plausible-looking success.
-        let base = match self.apply_using(name, base, using, &vars) {
+        let base = match self.apply_using(name, base, using, &self.vars_for_source()) {
             Ok(base) => base,
             Err(e) => {
                 self.errors.push(e.clone());
@@ -1058,7 +1108,7 @@ impl<'a> Exec<'a> {
                 return cells;
             }
         };
-        let out = self.ctx.runner.run(&base, &vars);
+        let out = self.ctx.runner.run(&base, &self.vars_for());
         let eo = match out.entries.into_iter().next() {
             Some(eo) => eo,
             None => {
@@ -1072,10 +1122,9 @@ impl<'a> Exec<'a> {
         };
 
         // Thread real captures forward (report fields are evaluated separately
-        // and never touch the capture chain).
-        for (k, v) in &eo.captures {
-            self.captures.insert(k.clone(), v.clone());
-        }
+        // and never touch the capture chain). The alias doubles as the step
+        // name, so `{{alias.var}}` reaches exactly this statement's captures.
+        self.record_captures(&alias, &eo.captures);
 
         // Resolve the response format: per-statement / WITH override, else the
         // prelude default.
@@ -1284,7 +1333,7 @@ impl<'a> Exec<'a> {
         // `PARAM` written any later — so by the time a loop is reached they are
         // ordinary variables, and `finalize` reaches the same names from the
         // declarations themselves.
-        let vars = self.vars_for();
+        let vars = self.vars_for_source();
         let resolve = |s: &String| crate::environment::substitute(s, &vars);
         match clause {
             EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
@@ -1544,7 +1593,7 @@ impl<'a> Exec<'a> {
 
     /// Substitute `{{var}}`s in `s` (after stripping a whole-string quote).
     fn subst_unquoted(&self, s: &str) -> String {
-        substitute(&unquote(s), &self.vars_for())
+        substitute(&unquote(s), &self.vars_for_source())
     }
 }
 
@@ -2544,6 +2593,104 @@ mod tests {
         // `me` has a [Reports] field (`name`), so has_declared=true and intrinsics
         // are suppressed by default — HttpStatus is not in the output.
         assert_eq!(res.rows[0].cells.get("me.HttpStatus"), None);
+    }
+
+    #[test]
+    fn a_qualified_reference_reaches_past_the_last_writer() {
+        // Two steps capture `token`; the flat chain keeps only the second, so
+        // the bare name is the *later* value. `{{first.token}}` is the way to
+        // ask for the earlier one, and it must actually reach the request.
+        let fake = Fake::new(&[
+            (
+                "login_a",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "A".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "login_b",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "B".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "api",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [
+            entry("login_a", &[]),
+            entry("login_b", &[]),
+            entry("api", &[]),
+        ];
+        let res = run(
+            concat!(
+                "REQUEST login_a AS first\n",
+                "REQUEST login_b AS second\n",
+                "REPORT REQUEST api USING(header.X-First = \"{{first.token}}\", ",
+                "header.X-Last = \"{{token}}\")\n",
+            ),
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let sent = fake.sent_entry("api").expect("api was sent");
+        let header = |k: &str| {
+            sent.headers
+                .iter()
+                .find(|h| h.key == k)
+                .map(|h| h.value.clone())
+        };
+        assert_eq!(header("X-First"), Some("A".into()));
+        assert_eq!(header("X-Last"), Some("B".into()));
+    }
+
+    #[test]
+    fn a_qualified_name_is_never_handed_to_hurl() {
+        // Hurl's expression grammar has no dotted path, so a variable *named*
+        // `first.token` in the map it receives is at best ignored and at worst
+        // a parse error. Qualification is resolved before the request is built.
+        let fake = Fake::new(&[
+            (
+                "login_a",
+                Canned {
+                    status: 200,
+                    captures: vec![("token".into(), "A".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                "api",
+                Canned {
+                    status: 200,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let entries = [entry("login_a", &[]), entry("api", &[])];
+        run(
+            "REQUEST login_a AS first\nREPORT REQUEST api\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let vars = fake.call_vars("api");
+        assert_eq!(vars.get("token"), Some(&"A".to_string()));
+        assert!(
+            vars.keys().all(|k| !k.contains('.')),
+            "dotted names leaked to the runner: {:?}",
+            vars.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -1659,6 +1659,12 @@ strings! {
     diag_step_name_duplicate => "Step name '{}' is used {} times — every step needs a name of its own.", "Le nom d'étape '{}' est utilisé {} fois — chaque étape doit avoir son propre nom.", "Trinnavnet '{}' bruges {} gange — hvert trin skal have sit eget navn.";
     diag_step_name_ambiguous => "Request '{}' is run {} times, so 'AS <step>' is needed to tell the runs apart.", "La requête '{}' est exécutée {} fois : 'AS <étape>' est nécessaire pour les distinguer.", "Forespørgslen '{}' køres {} gange, så 'AS <trin>' er nødvendigt for at skelne dem.";
     diag_step_name_not_identifier => "Request '{}' can't name its own step — add 'AS <step>' with a name that starts with a letter or underscore.", "La requête '{}' ne peut pas nommer son étape — ajoutez 'AS <étape>' avec un nom commençant par une lettre ou un tiret bas.", "Forespørgslen '{}' kan ikke navngive sit eget trin — tilføj 'AS <trin>' med et navn, der begynder med et bogstav eller en understreg.";
+    // A qualified reference, `{{step.var}}`, names the producer it means. Both
+    // halves are checked: an unknown step, and a step that doesn't produce the
+    // value asked of it, are the two ways the reference can quietly resolve to
+    // somebody else's copy at run time.
+    diag_step_ref_unknown => "'{}' refers to step '{}', which isn't a step in scope here.", "« {} » fait référence à l'étape « {} », qui n'est pas une étape visible ici.", "'{}' henviser til trinnet '{}', som ikke er et trin i omfang her.";
+    diag_step_ref_no_capture => "Step '{}' runs request '{}', which doesn't capture '{}'.", "L'étape « {} » exécute la requête « {} », qui ne capture pas « {} ».", "Trinnet '{}' kører forespørgslen '{}', som ikke fanger '{}'.";
     report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
     report_alias_unset => "alias", "alias", "alias";
     // The two halves of a `# labels:` class. The hints are examples rather than

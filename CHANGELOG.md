@@ -31,6 +31,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   columns — a column is identified by its name, not by which statement filled
   it. A nested block may not reuse a name from a block enclosing it.
 
+- **A capture reference can now say which step it means: `{{step.var}}`.** Two
+  requests that both capture `token` used to leave only one of them reachable —
+  the chain is flat and last-writer-wins, so `{{token}}` silently meant whichever
+  ran most recently. `{{login.token}}` reaches that step's copy regardless.
+
+  Qualified names are resolved in PaperTrail's own text — `USING(…)` values,
+  assignments, computed columns — and are never handed to Hurl, whose expression
+  grammar has no dotted path. Requests stay ordinary Hurl, runnable on their own
+  outside any flow.
+
+  Both halves are validated: the step must be one visible from where the
+  reference is written (the same lexical scope rule as step names, so a
+  reference cannot reach sideways into a sibling block, nor back at itself), and
+  it must be a step whose request actually declares that capture.
+
 
 ## [0.5.6] - 2026-09-11
 
