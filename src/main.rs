@@ -142,6 +142,15 @@ struct Cli {
     #[arg(long, value_name = "STEPS", value_delimiter = ',', requires = "report")]
     targets: Vec<String>,
 
+    /// With `-r`: vary the order steps are taken within a `GRAPH` region, and
+    /// print the seed used. A region is a *claim* that its dependency edges are
+    /// the complete set, and that claim cannot be verified — but it can be
+    /// falsified. Without this the earliest-written tie-break silently supplies
+    /// the ordering a missing edge forgot, and the gap is never found. Pass
+    /// `--shuffle=SEED` to replay a failure exactly.
+    #[arg(long, value_name = "SEED", num_args = 0..=1, requires = "report")]
+    shuffle: Option<Option<u64>>,
+
     /// With `-r`: where to write the report output. `-` writes CSV to stdout
     /// (for piping); a path's extension selects the format (`.csv`, `.json`,
     /// `.html` or `.xlsx`); omitted derives the file from the report's
@@ -239,6 +248,7 @@ fn main() {
             cli.output,
             cli.dry_run,
             cli.targets,
+            cli.shuffle,
         ));
     }
 

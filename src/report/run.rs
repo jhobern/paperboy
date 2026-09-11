@@ -37,8 +37,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use crate::environment::substitute;
 use crate::hurl::HurlEntry;
@@ -199,6 +199,10 @@ pub struct RunContext<'a> {
     /// collect-at-the-end run (CSV export, dry run, tests); `Some` when a
     /// front-end wants each row as it completes to fill a live grid.
     pub sink: Option<&'a RowSink<'a>>,
+    /// Seed for the `GRAPH` ready-set shuffle, or `None` for the default
+    /// earliest-written tie-break. See [`schedule_graph`]: a region *claims*
+    /// its edge set is complete, and shuffling is how that claim is falsified.
+    pub shuffle: Option<u64>,
 }
 
 /// A helper collection loaded for a report, under the alias its requests are
@@ -631,6 +635,306 @@ struct IterOut {
     warnings: Vec<String>,
 }
 
+/// What one step of a `GRAPH` region produced, collected from the forked
+/// [`Exec`] that ran it so the region can be merged back in plan order however
+/// many workers were used.
+struct StepOut {
+    /// The step's own captures, kept out of the shared chain so the next step
+    /// can be handed a chain assembled from its ancestors alone.
+    produced: HashMap<String, String>,
+    ok: bool,
+    /// Set when the step was never sent because something it depends on didn't
+    /// succeed, as opposed to sent and failed. Both are `ok: false`; only this
+    /// one is a *skip*.
+    was_skipped: bool,
+    /// The request the step ran, so a later `CLEANUP` can work out what it
+    /// depended on from the captures that request declares.
+    request: String,
+    cells: HashMap<String, String>,
+    columns: Vec<String>,
+    timing_columns: Vec<String>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+}
+
+/// The mutable half of the region scheduler, behind one lock.
+struct Sched {
+    /// How many dependencies each step is still waiting on.
+    waiting: Vec<usize>,
+    /// Steps whose dependencies have all been decided, kept sorted by written
+    /// position so the default tie-break is "earliest written".
+    ready: Vec<usize>,
+    /// `None` until the step has been decided; `false` for failed *or* skipped.
+    ok: Vec<Option<bool>>,
+    out: Vec<Option<StepOut>>,
+    /// Steps dispatched but not yet finished. The region is done when the ready
+    /// set is empty *and* nothing is in flight — an empty ready set on its own
+    /// only means the remaining steps are still waiting on a worker.
+    running: usize,
+    rng: u64,
+    /// Whether the tie-break is random at all. Kept beside the state rather
+    /// than inferred from it: `0` is a legal seed to ask for and must not read
+    /// as "off".
+    rng_on: bool,
+}
+
+/// Run a region's steps, up to `degree` at once, taking each the moment its
+/// dependencies are decided.
+///
+/// Not wave-at-a-time: waves are how the plan is *explained*, not how it runs.
+/// Holding a ready step back because a sibling in its wave is slow would make
+/// the region as slow as the sum of its slowest members per depth, which is the
+/// cost the feature exists to avoid.
+///
+/// `seed` turns on the falsification mode from 07 §6.4. A `GRAPH` is a *claim*
+/// that the declared and inferred edges are the complete set, and that claim
+/// cannot be verified — but it can be falsified. With the earliest-written
+/// tie-break a missing edge is masked forever, because written order silently
+/// supplies the ordering the graph forgot. Picking randomly among the ready set
+/// turns that latent hazard into a failure, and seeding it makes the failure
+/// reproducible rather than intermittent.
+fn schedule_graph<'a>(
+    ctx: &'a RunContext<'a>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    base: &ExecState,
+    degree: usize,
+    seed: Option<u64>,
+) -> Vec<Option<StepOut>> {
+    let n = plan.steps.len();
+    // Deduplicated: a step may be named by `DEPENDS` *and* be reachable by an
+    // inferred data edge, and counting that pair twice would leave the
+    // dependent waiting on an arrival that can only happen once.
+    let mut seen = std::collections::HashSet::new();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut waiting = vec![0usize; n];
+    for e in &plan.edges {
+        if seen.insert((e.from, e.to)) {
+            succ[e.from].push(e.to);
+            waiting[e.to] += 1;
+        }
+    }
+    let ready: Vec<usize> = (0..n).filter(|&i| waiting[i] == 0).collect();
+
+    let sched = Mutex::new(Sched {
+        waiting,
+        ready,
+        ok: vec![None; n],
+        out: (0..n).map(|_| None).collect(),
+        running: 0,
+        // Zero is the one state a xorshift generator cannot leave, so a `0`
+        // seed would silently mean "no shuffle at all" — the opposite of what
+        // was asked for.
+        rng: seed.unwrap_or(0) | 1,
+        rng_on: seed.is_some(),
+    });
+    let idle = Condvar::new();
+
+    let work = || {
+        loop {
+            // Claim a step, resolving any skips along the way, or find that the
+            // region is finished. Both decisions need the lock, and building
+            // the step's view of the world does too (it reads what its
+            // ancestors produced), so it is all done here and the request
+            // itself is sent with the lock released.
+            let claimed = {
+                let mut s = sched.lock().unwrap();
+                loop {
+                    if let Some(pos) = pick(&mut s) {
+                        let idx = s.ready.remove(pos);
+                        if let Some(dep) = blocker(&s, plan, idx) {
+                            s.out[idx] = Some(skip_out(ctx, plan, body, idx, &dep));
+                            finish(&mut s, &succ, idx, false);
+                            continue;
+                        }
+                        let state = view_for(plan, base, &s, idx);
+                        s.running += 1;
+                        break Some((idx, state));
+                    }
+                    if s.running == 0 {
+                        break None;
+                    }
+                    s = idle.wait(s).unwrap();
+                }
+            };
+            let Some((idx, state)) = claimed else {
+                // Nothing left and nothing in flight: every worker can leave,
+                // including the ones asleep waiting for work that will never
+                // come.
+                idle.notify_all();
+                break;
+            };
+
+            let out = run_step(ctx, plan, body, idx, state);
+
+            let mut s = sched.lock().unwrap();
+            let ok = out.ok;
+            s.out[idx] = Some(out);
+            s.running -= 1;
+            finish(&mut s, &succ, idx, ok);
+            drop(s);
+            idle.notify_all();
+        }
+    };
+
+    if degree <= 1 {
+        work();
+    } else {
+        std::thread::scope(|sc| {
+            for _ in 0..degree {
+                sc.spawn(work);
+            }
+        });
+    }
+
+    let sched = sched.into_inner().unwrap();
+    sched.out
+}
+
+/// Choose a position in the ready set, or `None` when it is empty.
+fn pick(s: &mut Sched) -> Option<usize> {
+    if s.ready.is_empty() {
+        return None;
+    }
+    if !s.rng_on {
+        return Some(0);
+    }
+    let mut x = s.rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    s.rng = x;
+    Some((x % s.ready.len() as u64) as usize)
+}
+
+/// The dependency that stops `idx` running, if any.
+///
+/// Only the *direct* predecessors are checked, which is enough to skip
+/// recursively: a step is claimed only once every predecessor has been decided,
+/// and a skipped one is recorded as not-succeeded like a failed one.
+fn blocker(s: &Sched, plan: &super::graph::Plan, idx: usize) -> Option<String> {
+    plan.incoming(idx)
+        .into_iter()
+        .find(|e| !s.ok[e.from].unwrap_or(false))
+        .map(|e| plan.steps[e.from].name.clone())
+}
+
+/// Record a decision and release whatever was waiting on it.
+fn finish(s: &mut Sched, succ: &[Vec<usize>], idx: usize, ok: bool) {
+    s.ok[idx] = Some(ok);
+    for &to in &succ[idx] {
+        s.waiting[to] -= 1;
+        if s.waiting[to] == 0 {
+            // Kept sorted so "earliest written" is `ready[0]` without a scan,
+            // and so the ready set itself doesn't depend on completion order.
+            let at = s.ready.partition_point(|&i| i < to);
+            s.ready.insert(at, to);
+        }
+    }
+}
+
+/// The execution state one step sees: the region's entry state plus exactly
+/// what its ancestors produced, in execution order (the flat capture map is
+/// last-writer-wins, so "last" has to mean the same thing here as it does
+/// outside a region).
+fn view_for(plan: &super::graph::Plan, base: &ExecState, s: &Sched, idx: usize) -> ExecState {
+    let mut st = base.clone();
+    for anc in plan.ancestors(idx) {
+        let Some(out) = &s.out[anc] else { continue };
+        st.step_captures
+            .insert(plan.steps[anc].name.clone(), out.produced.clone());
+        for (k, v) in &out.produced {
+            st.captures.insert(k.clone(), v.clone());
+        }
+    }
+    st
+}
+
+/// The verdict for a step that was never sent.
+fn skip_out(
+    ctx: &RunContext<'_>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    idx: usize,
+    dep: &str,
+) -> StepOut {
+    let step = &plan.steps[idx];
+    let mut out = StepOut {
+        produced: HashMap::new(),
+        ok: false,
+        was_skipped: true,
+        request: step.request.clone(),
+        cells: HashMap::new(),
+        columns: Vec::new(),
+        timing_columns: Vec::new(),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    // The row still gets a cell, and it says *skipped* rather than being left
+    // blank: an empty cell is indistinguishable from a request that returned
+    // nothing, and the whole point of the verdict is that the reader must not
+    // mistake this for a pass.
+    if let FlowNode::Report(ReportStmt::Request { .. }) = &body[step.written] {
+        let key = format!("{}.Error", step.name);
+        out.cells.insert(
+            key.clone(),
+            crate::i18n::fill(ctx.strings.run_step_skipped, &[dep]),
+        );
+        out.columns.push(key);
+    }
+    out
+}
+
+/// Run one step on a forked [`Exec`], so that steps running at the same time
+/// cannot see each other's captures — the visibility rule and the ordering rule
+/// are the same rule.
+fn run_step(
+    ctx: &RunContext<'_>,
+    plan: &super::graph::Plan,
+    body: &[FlowNode],
+    idx: usize,
+    state: ExecState,
+) -> StepOut {
+    let step = &plan.steps[idx];
+    let mut ex = Exec::from_state(ctx, state);
+    let mut cells = HashMap::new();
+    match &body[step.written] {
+        FlowNode::Request {
+            name, alias, using, ..
+        } => {
+            ex.run_request(name, alias.as_deref(), using);
+        }
+        FlowNode::Report(stmt) => {
+            for (k, v) in ex.eval_report(stmt) {
+                ex.note_column(&k);
+                cells.insert(k, v);
+            }
+        }
+        // Validation confines a region to requests; anything else here is a
+        // node that check let through, so skipping it is the conservative
+        // choice over guessing where it belongs in the order.
+        _ => {}
+    }
+    StepOut {
+        produced: ex
+            .step_captures
+            .get(&step.name)
+            .cloned()
+            .unwrap_or_default(),
+        // A node that ran nothing (the arm above) never records a verdict. It
+        // counts as succeeded: it cannot have failed, and treating it as a
+        // failure would skip everything written after it.
+        ok: ex.step_ok.get(&step.name).copied().unwrap_or(true),
+        was_skipped: false,
+        request: step.request.clone(),
+        cells,
+        columns: ex.column_order,
+        timing_columns: ex.timing_columns,
+        errors: ex.errors,
+        warnings: ex.warnings,
+    }
+}
+
 impl<'a> Exec<'a> {
     fn new(ctx: &'a RunContext<'a>) -> Self {
         Exec {
@@ -944,7 +1248,9 @@ impl<'a> Exec<'a> {
                 // written inline. Wrapping a sequential block in `GRAPH … END`
                 // has to be observable only through ordering, or the migration
                 // path onto the feature doesn't exist.
-                FlowNode::Graph { body, .. } => self.run_graph(body, &mut own),
+                FlowNode::Graph { body, parallel, .. } => {
+                    self.run_graph(body, parallel.as_ref(), &mut own)
+                }
                 FlowNode::Cleanup { .. } => cleanups.push(node),
             }
         }
@@ -1541,7 +1847,12 @@ impl<'a> Exec<'a> {
     /// step that produces it now fails with an undefined variable, where
     /// outside a region it would quietly succeed and break the first time
     /// anything reordered.
-    fn run_graph(&mut self, body: &[FlowNode], own: &mut HashMap<String, String>) {
+    fn run_graph(
+        &mut self,
+        body: &[FlowNode],
+        parallel: Option<&ParallelSpec>,
+        own: &mut HashMap<String, String>,
+    ) {
         let plan =
             match super::graph::build(body, self.ctx.entries, self.ctx.helpers, self.ctx.strings) {
                 Ok(p) => p,
@@ -1554,86 +1865,48 @@ impl<'a> Exec<'a> {
                 }
             };
 
-        let base_captures = self.captures.clone();
-        let base_steps = self.step_captures.clone();
-        // What each step captured, kept out of the shared chain so the next
-        // step can be handed a chain assembled from its ancestors alone.
-        let mut produced: Vec<HashMap<String, String>> = vec![HashMap::new(); plan.steps.len()];
+        let base = self.to_state();
+        // A degree is a *cap*, not an instruction: one at a time is a legal
+        // schedule for any `PARALLEL(n)`, and is what a region without one gets.
+        let degree = match parallel {
+            Some(spec) => self.parallel_degree(spec, plan.steps.len()),
+            None => 1,
+        };
+        let outs = schedule_graph(self.ctx, &plan, body, &base, degree, self.ctx.shuffle);
 
+        // Merged in `plan.order` rather than in the order the steps finished,
+        // so the report a region produces does not depend on how many workers
+        // ran it — column order, error order and last-writer-wins cells are the
+        // same at any degree, and under `--shuffle`. What varies is *execution*
+        // order, which is the only thing shuffling is meant to vary.
         for &idx in &plan.order {
             let step = &plan.steps[idx];
-            self.captures = base_captures.clone();
-            self.step_captures = base_steps.clone();
-            for anc in plan.ancestors(idx) {
-                let caps = &produced[anc];
-                self.step_captures
-                    .insert(plan.steps[anc].name.clone(), caps.clone());
-                for (k, v) in caps {
-                    self.captures.insert(k.clone(), v.clone());
-                }
-            }
-
-            // A step whose dependency did not produce a result cannot be run,
-            // and must not be reported as anything but skipped. Checking only
-            // the *direct* predecessors is enough to skip recursively, because
-            // `plan.order` is topological: a step's predecessors have all been
-            // decided by the time it is reached, and a skipped one is already
-            // recorded as not-succeeded.
-            let blocker = plan.incoming(idx).into_iter().find_map(|e| {
-                let dep = &plan.steps[e.from].name;
-                (!self.step_ok.get(dep).copied().unwrap_or(false)).then(|| dep.clone())
-            });
-            if let Some(dep) = blocker {
-                self.note_step(&step.name, &step.request, false);
+            let Some(out) = &outs[idx] else { continue };
+            self.note_step(&step.name, &out.request, out.ok);
+            if out.was_skipped {
                 self.skipped.push(step.name.clone());
-                // The row still gets a cell, and it says *skipped* rather than
-                // being left blank: an empty cell is indistinguishable from a
-                // request that returned nothing, and the whole point of the
-                // verdict is that the reader must not mistake this for a pass.
-                if let FlowNode::Report(ReportStmt::Request { .. }) = &body[step.written] {
-                    let key = format!("{}.Error", step.name);
-                    let text = crate::i18n::fill(self.ctx.strings.run_step_skipped, &[&dep]);
-                    self.note_column(&key);
-                    own.insert(key, text);
-                }
-                continue;
             }
-
-            match &body[step.written] {
-                FlowNode::Request {
-                    name, alias, using, ..
-                } => {
-                    self.run_request(name, alias.as_deref(), using);
-                }
-                FlowNode::Report(stmt) => {
-                    for (k, v) in self.eval_report(stmt) {
-                        self.note_column(&k);
-                        own.insert(k, v);
-                    }
-                }
-                // Validation confines a region to requests; anything else here
-                // is a node that check let through, so skipping it is the
-                // conservative choice over guessing where it belongs in the
-                // order.
-                _ => {}
+            for c in &out.columns {
+                self.note_column(c);
             }
-            produced[idx] = self
-                .step_captures
-                .get(&step.name)
-                .cloned()
-                .unwrap_or_default();
+            for c in &out.timing_columns {
+                self.note_timing_column(c);
+            }
+            self.errors.extend(out.errors.iter().cloned());
+            self.warnings.extend(out.warnings.iter().cloned());
+            for (k, v) in &out.cells {
+                own.insert(k.clone(), v.clone());
+            }
         }
 
         // The closing barrier: everything in the region has run, so everything
         // it captured is visible to what follows, exactly as if the block had
         // been sequential.
-        self.captures = base_captures;
-        self.step_captures = base_steps;
         for &idx in &plan.order {
-            let caps = &produced[idx];
+            let Some(out) = &outs[idx] else { continue };
             self.step_captures
-                .insert(plan.steps[idx].name.clone(), caps.clone());
-            for (k, v) in caps {
+                .insert(plan.steps[idx].name.clone(), out.produced.clone());
+            for (k, v) in &out.produced {
                 self.captures.insert(k.clone(), v.clone());
             }
         }
@@ -2484,6 +2757,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -2521,6 +2795,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -2826,6 +3101,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }
@@ -3118,6 +3394,212 @@ mod tests {
         assert_eq!(flat.rows.len(), wrapped.rows.len());
         assert_eq!(flat.rows[0].cells, wrapped.rows[0].cells);
         assert_eq!(plain.call_order(), wrapped_fake.call_order());
+    }
+
+    /// Run `src` with a shuffle seed, so the ready-set tie-break is random.
+    fn run_shuffled(src: &str, entries: &[HurlEntry], fake: &Fake, seed: u64) -> ReportResult {
+        let flow = parse_flow(src).expect("flow parses");
+        let ctx = RunContext {
+            entries,
+            helpers: &[],
+            base_vars: HashMap::new(),
+            named_envs: HashMap::new(),
+            root: None,
+            runner: fake,
+            strings: crate::i18n::Strings::english(),
+            params: Default::default(),
+            sink: None,
+            shuffle: Some(seed),
+        };
+        run_flow(&flow, &ctx)
+    }
+
+    #[test]
+    fn a_parallel_region_overlaps_steps_that_do_not_depend_on_each_other() {
+        // The point of the degree: four independent steps should not cost four
+        // round trips one after another.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok("a"), ok("b"), ok("c"), ok("d")]).with_delay(40);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.call_count(), 4);
+        assert!(
+            fake.peak_concurrency() > 1,
+            "a degree of 4 over four independent steps ran them one at a time"
+        );
+    }
+
+    #[test]
+    fn a_degree_never_overlaps_a_step_with_the_one_it_depends_on() {
+        // A cap is permission to overlap what *may* overlap, and nothing else.
+        // The chain here is total, so the correct peak is 1 however high the
+        // degree is set.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("order", &["id"], &["token"]),
+            graph_entry("fetch", &[], &["id"]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("login", &[("token", "T")]),
+            ok_capturing("order", &[("id", "7")]),
+            ok("fetch"),
+        ])
+        .with_delay(20);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST fetch\n    REQUEST order\n    REQUEST login\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(fake.peak_concurrency(), 1, "a chain cannot be overlapped");
+        assert_eq!(
+            fake.call_order(),
+            vec!["login".to_string(), "order".into(), "fetch".into()],
+            "and it still runs in dependency order, not written order"
+        );
+    }
+
+    #[test]
+    fn a_degree_does_not_change_what_a_region_reports() {
+        // Concurrency is an execution detail. If it showed in the output,
+        // nobody could turn it on for a report anyone reads.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("a", &[], &["token"]),
+            graph_entry("b", &[], &["token"]),
+        ];
+        let canned = [ok_capturing("login", &[("token", "T")]), ok("a"), ok("b")];
+        let body = "    REQUEST login\n    REPORT REQUEST a\n    REPORT REQUEST b\nEND\n";
+        let one = Fake::new(&canned);
+        let seq = run(&format!("GRAPH\n{body}"), &entries, &[], &[], &one);
+        let many = Fake::new(&canned);
+        let par = run(
+            &format!("PARALLEL(4) GRAPH\n{body}"),
+            &entries,
+            &[],
+            &[],
+            &many,
+        );
+        assert_eq!(seq.rows.len(), par.rows.len());
+        assert_eq!(seq.rows[0].cells, par.rows[0].cells);
+        assert_eq!(
+            seq.column_order, par.column_order,
+            "column order must not depend on which worker finished first"
+        );
+    }
+
+    #[test]
+    fn a_parallel_region_still_skips_a_step_whose_dependency_failed() {
+        // The verdict rule has to survive the scheduler: a dependent must never
+        // be dispatched on the strength of a worker being free.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("order", &[], &["token"]),
+            graph_entry("other", &[], &[]),
+        ];
+        let fake = Fake::new(&[failing("login"), ok("order"), ok("other")]);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST login\n    REPORT REQUEST order\n    REQUEST other\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert_eq!(res.skipped, vec!["order".to_string()]);
+        assert!(
+            !fake.call_order().contains(&"order".to_string()),
+            "a skipped step must not be sent: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            fake.call_order().contains(&"other".to_string()),
+            "an unrelated step is not collateral damage"
+        );
+    }
+
+    #[test]
+    fn the_same_shuffle_seed_reproduces_the_same_order() {
+        // A shuffled failure is only useful if it can be replayed, which is why
+        // the seed is printed.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c"), ok("d")];
+        let src = "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n";
+        let one = Fake::new(&canned);
+        run_shuffled(src, &entries, &one, 12345);
+        let two = Fake::new(&canned);
+        run_shuffled(src, &entries, &two, 12345);
+        assert_eq!(one.call_order(), two.call_order());
+    }
+
+    #[test]
+    fn shuffling_varies_the_order_among_steps_that_may_run_in_any_order() {
+        // The falsification mode from 07 §6.4. Four independent steps have 24
+        // legal orders; the default tie-break always picks the written one,
+        // which is exactly what hides a missing edge.
+        let entries = [
+            graph_entry("a", &[], &[]),
+            graph_entry("b", &[], &[]),
+            graph_entry("c", &[], &[]),
+            graph_entry("d", &[], &[]),
+        ];
+        let canned = [ok("a"), ok("b"), ok("c"), ok("d")];
+        let src = "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST c\n    REQUEST d\nEND\n";
+        let written = vec!["a".to_string(), "b".into(), "c".into(), "d".into()];
+        let plain = Fake::new(&canned);
+        run(src, &entries, &[], &[], &plain);
+        assert_eq!(plain.call_order(), written, "the default is written order");
+
+        let varied = (1..40u64).any(|seed| {
+            let f = Fake::new(&canned);
+            run_shuffled(src, &entries, &f, seed);
+            f.call_order() != written
+        });
+        assert!(varied, "no seed in 39 varied the order of four free steps");
+    }
+
+    #[test]
+    fn shuffling_never_breaks_a_dependency() {
+        // Shuffling picks among the steps that are *ready*. It is not licence
+        // to run a step before the thing it needs — that would make the mode
+        // report failures that say nothing about the graph.
+        let entries = [
+            graph_entry("login", &["token"], &[]),
+            graph_entry("free", &[], &[]),
+            graph_entry("order", &[], &["token"]),
+        ];
+        let canned = [
+            ok_capturing("login", &[("token", "T")]),
+            ok("free"),
+            ok("order"),
+        ];
+        let src = "GRAPH\n    REQUEST login\n    REQUEST free\n    REQUEST order\nEND\n";
+        for seed in 1..30u64 {
+            let f = Fake::new(&canned);
+            let res = run_shuffled(src, &entries, &f, seed);
+            assert!(res.errors.is_empty(), "seed {seed}: {:?}", res.errors);
+            let order = f.call_order();
+            let li = order.iter().position(|t| t == "login").unwrap();
+            let oi = order.iter().position(|t| t == "order").unwrap();
+            assert!(li < oi, "seed {seed} ran order before login: {order:?}");
+        }
     }
 
     #[test]
@@ -3746,6 +4228,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -3821,6 +4304,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let streamed = streamed.into_inner().unwrap();
@@ -3896,6 +4380,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let result = run_flow_raw(&flow, &ctx);
         let events = events.into_inner().unwrap();
@@ -4019,6 +4504,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -4159,6 +4645,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per matched jpg");
@@ -4206,6 +4693,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 2, "one row per case folder: {:?}", res.rows);
@@ -4251,6 +4739,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.rows.is_empty());
@@ -4389,6 +4878,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -4472,6 +4962,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -4492,6 +4983,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let second = run_flow(&flow2, &ctx2);
 
@@ -4578,6 +5070,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&base_flow, &base_ctx);
         let snap_path = dir.join("prod.baseline");
@@ -4606,6 +5099,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let cmp = run_flow(&cmp_flow, &cmp_ctx);
 
@@ -4689,6 +5183,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let first = run_flow(&flow, &ctx);
         let snap_path = dir.join("proc.baseline");
@@ -4726,6 +5221,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(res.rows.len(), 1, "rows still produced");
@@ -5453,6 +5949,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -5522,6 +6019,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
 
@@ -5627,6 +6125,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         std::fs::remove_dir_all(&dir).ok();
@@ -5691,6 +6190,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         // The snapshot answers `yes` everywhere: right on row a, wrong on row b.
         let first = run_flow(&parse_flow(body).expect("flow parses"), &ctx);
@@ -5730,6 +6230,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(
@@ -5759,6 +6260,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -5794,6 +6296,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.errors.is_empty(), "{:?}", res.errors);
@@ -5829,6 +6332,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -5857,6 +6361,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert_eq!(
@@ -5881,6 +6386,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.verdicts.is_empty() && res.truths.is_empty());
@@ -5907,6 +6413,7 @@ mod tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let res = run_flow(&flow, &ctx);
         assert!(res.images.is_empty());
@@ -6153,6 +6660,7 @@ mod helper_collection_tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         let result = run_flow(&flow, &ctx);
         assert_eq!(
@@ -6237,6 +6745,7 @@ mod timing_column_tests {
             strings: crate::i18n::Strings::english(),
             params: Default::default(),
             sink: None,
+            shuffle: None,
         };
         run_flow(&flow, &ctx)
     }

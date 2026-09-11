@@ -261,6 +261,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
                 strings: &strings,
                 params: params.clone(),
                 sink: None,
+                shuffle: None,
             };
             run_flow_raw(&flow, &dry_ctx)
         };
@@ -295,6 +296,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             strings: &strings,
             params: params.clone(),
             sink: Some(&sink),
+            shuffle: None,
         };
         let mut result = run_flow_raw(&flow, &ctx);
         // 3. Finalize (comparison/baseline collapse) off the raw rows.

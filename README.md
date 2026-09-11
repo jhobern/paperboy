@@ -711,6 +711,33 @@ GRAPH
 END
 ```
 
+#### Running a region in parallel
+
+`PARALLEL(n) GRAPH … END` lets up to `n` steps overlap. Each is taken the
+moment its dependencies are done — not a wave at a time, which would make the
+region cost the slowest step at every depth. A cap is permission, not an
+instruction: a chain still runs one at a time however high `n` is set, and the
+report is identical at any degree, because rows, columns and errors are merged
+in plan order rather than in the order workers happened to finish.
+
+#### Shuffling, and why
+
+A region is a *claim* that its edges — inferred and declared — are the complete
+set. PaperBoy cannot verify that claim. It can help you falsify it.
+
+With the default tie-break, ready steps run in written order, so a dependency
+nobody declared keeps working by accident and surfaces months later when
+something unrelated moves. `--shuffle` picks at random among the steps that are
+ready, which turns that into a failure now, and prints the seed:
+
+```
+  Shuffle    : seed 4711 (replay with --shuffle=4711)
+```
+
+`--shuffle=4711` replays it exactly, so a failure found this way is
+reproducible rather than intermittent. Shuffling only reorders steps that may
+legally run in any order; it never runs a step before what it depends on.
+
 #### Cleanup
 
 `CLEANUP` marks a request that undoes something — deleting a session, releasing

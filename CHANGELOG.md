@@ -81,9 +81,7 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   description of the graph, not the schedule: execution still takes each step
   as soon as it is ready.
 
-  `PARALLEL(n) GRAPH` parses, validates and round-trips, but for now runs its
-  steps one at a time. A degree is a cap — *up to* n may overlap — so that is a
-  legal schedule; the scheduler that actually uses the permission comes next.
+  `PARALLEL(n) GRAPH` caps how many steps may overlap (see below).
 
 - **`DEPENDS` states an edge the data does not show.** Inference can only see a
   value flowing from a capture to a reference, and real dependencies exist that
@@ -130,6 +128,35 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   misleading error. The skip is recursive — anything depending on a skipped
   step is skipped too — and each skipped step's row records which step it was
   waiting on, so the report says why it is empty instead of just being empty.
+
+- **`PARALLEL(n) GRAPH` now overlaps steps, taking each the moment its
+  dependencies are done.** Not wave at a time: waves are how the plan is
+  *explained*, not how it runs, and holding a ready step back because a sibling
+  at the same depth is slow would make a region cost the sum of its slowest
+  member per depth — the cost the feature exists to remove. A degree is a cap,
+  so a chain still runs one at a time however high it is set.
+
+  Concurrency does not show in the output. Rows, cells, column order and the
+  order errors are reported are merged in plan order, not completion order, so
+  a report reads identically at any degree. Steps running at the same time also
+  cannot see each other's captures: a step is handed its ancestors' values and
+  nothing else, which is the same visibility rule a sequential region already
+  had.
+
+- **`--shuffle` varies the order among steps that may run in any order, and
+  prints the seed.** A `GRAPH` is a *claim* that the declared and inferred
+  edges are the complete set, and that claim cannot be verified. It can be
+  falsified. With the default earliest-written tie-break, a missing edge is
+  masked forever — written order quietly supplies the ordering the graph
+  forgot, and the gap surfaces the first time something unrelated changes.
+  Picking at random among the ready steps turns that latent hazard into a
+  failure now.
+
+  Seeded so the failure is reproducible rather than intermittent: the seed is
+  printed on every shuffled run, and `--shuffle=SEED` replays it exactly. This
+  is the path `go test -shuffle` and RSpec's `--order random` take for the
+  identical problem. Shuffling only reorders steps that are *ready*; it is
+  never licence to run a step before what it depends on.
 
 - **Exit code 3 means "ran, but incomplete".** A run that skipped steps now
   exits 3 rather than 1. It implies 1 — a skip only ever follows a failure —

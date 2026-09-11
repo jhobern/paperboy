@@ -43,6 +43,18 @@ use crate::shared_utils::sanitize_file_stem;
 /// chooses the output (`-` = stdout; a path whose extension selects the format;
 /// omitted = the `# output:` format written to a `# name:`-derived file next to
 /// the report, honouring the `{time}` token).
+/// A seed for a bare `--shuffle`, from the clock.
+///
+/// Not cryptographic and not meant to be: it only has to differ between runs so
+/// that repeated runs explore different legal orders, and it is printed, which
+/// is what makes a failure reproducible.
+fn random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
 pub fn run(
     collection_path: Option<String>,
     env_paths: Vec<String>,
@@ -50,6 +62,7 @@ pub fn run(
     output: Option<String>,
     dry_run: bool,
     targets: Vec<String>,
+    shuffle: Option<Option<u64>>,
 ) -> i32 {
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
     // "decorative" stream, which is stderr in that case and stdout otherwise.
@@ -298,6 +311,15 @@ pub fn run(
     if !targets.is_empty() {
         decor.line(&format!("  Targets    : {}", targets.join(", ")));
     }
+    // Printed whether or not a seed was supplied, because a shuffled run that
+    // fails is only useful if it can be repeated, and the seed is the whole of
+    // what has to be carried from the failing run to the reproduction.
+    let shuffle = shuffle.map(|s| s.unwrap_or_else(random_seed));
+    if let Some(seed) = shuffle {
+        decor.line(&format!(
+            "  Shuffle    : seed {seed} (replay with --shuffle={seed})"
+        ));
+    }
     // The plan, printed as waves rather than a numbered sequence: a numbered
     // list would imply a total order that a graph does not have, and the reason
     // to print it at all is to show what the graph does and does not constrain.
@@ -324,6 +346,7 @@ pub fn run(
             strings: &cli_strings,
             params: Default::default(),
             sink: None,
+            shuffle,
         };
         let mut r = run_flow_raw(&flow, &ctx);
         finalize(&mut r, &flow, &ctx);
@@ -344,6 +367,7 @@ pub fn run(
                 strings: &cli_strings,
                 params: Default::default(),
                 sink: None,
+                shuffle,
             };
             run_flow_raw(&flow, &ctx).rows.len()
         };
@@ -371,6 +395,7 @@ pub fn run(
             strings: &cli_strings,
             params: Default::default(),
             sink: Some(&sink),
+            shuffle,
         };
         let mut r = run_flow_raw(&flow, &ctx);
         finalize(&mut r, &flow, &ctx);
@@ -626,6 +651,7 @@ mod tests {
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP
             Vec::new(),
+            None,
         );
         assert_eq!(code, 0, "dry run should succeed");
 
@@ -666,6 +692,7 @@ mod tests {
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP, but the ENVS loop still expands per env
             Vec::new(),
+            None,
         );
         assert_eq!(code, 0, "a multi-env dry run should succeed");
 
@@ -708,6 +735,7 @@ mod tests {
             Some("-".to_string()),
             true,
             Vec::new(),
+            None,
         );
         assert_eq!(code, 1, "a duplicate env stem is a fatal setup error");
 
@@ -731,6 +759,7 @@ mod tests {
             Some("-".to_string()),
             true,
             Vec::new(),
+            None,
         );
         assert_eq!(code, 1, "a missing collection is a fatal setup error");
 
@@ -756,6 +785,7 @@ mod tests {
             Some(dir.join("out.docx").to_string_lossy().into_owned()),
             true,
             Vec::new(),
+            None,
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
 
@@ -800,6 +830,7 @@ mod tests {
                 Some(out.to_string_lossy().into_owned()),
                 true, // dry-run: no HTTP
                 Vec::new(),
+                None,
             );
             assert_eq!(code, 0, ".{ext} output should succeed");
             let bytes = fs::read(&out).unwrap();
@@ -841,6 +872,7 @@ mod tests {
             Some(out.to_string_lossy().into_owned()),
             true, // dry-run: no HTTP
             Vec::new(),
+            None,
         );
         assert_eq!(code, 0, "header-resolved run should succeed");
 
@@ -866,6 +898,7 @@ mod tests {
             Some("-".to_string()),
             true,
             Vec::new(),
+            None,
         );
         assert_eq!(
             code, 1,
