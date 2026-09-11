@@ -757,6 +757,13 @@ pub struct HurlEntry {
     /// since it's never persisted.
     #[serde(skip)]
     pub last_response: Option<crate::http::ApiResponse>,
+    /// Set while a "Run All" pass is *retrying* this entry: the attempt being
+    /// made and the `retry:` limit when the request states it as a plain
+    /// number. See [`crate::http::ApiResponse::retry_attempt`], which says the
+    /// same thing for a single send. Cleared as soon as the entry produces an
+    /// outcome. Transient UI state; `#[serde(skip)]`.
+    #[serde(skip)]
+    pub retry_attempt: Option<(usize, Option<usize>)>,
 }
 
 /// Why a name typed into the "extract to parameter" prompt can't be used.

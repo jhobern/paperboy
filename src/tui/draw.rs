@@ -3688,6 +3688,14 @@ pub(crate) fn draw_collection_main(
     let entry = &col.entries[idx];
     let method = entry.method.clone();
     let url = entry.url.clone();
+    // Enabled rows only: a disabled `[Options]` row round-trips as a comment and
+    // is not applied, exactly like a disabled header.
+    let options: Vec<(String, String)> = entry
+        .options
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| (r.key.clone(), r.value.clone()))
+        .collect();
     let captures = entry.captures.clone();
     let asserts = entry.asserts.clone();
     let generators = entry.generators.clone();
@@ -3874,6 +3882,26 @@ pub(crate) fn draw_collection_main(
     let mut meta_lines: Vec<Line> = Vec::new();
     // (section label, row count) for that folded summary line.
     let mut meta_counts: Vec<(String, usize)> = Vec::new();
+    // First, because these are the only rows that change what *happens* rather
+    // than describing what came back -- and because nothing else in the UI says
+    // so. A request carrying `retry: 5` and `retry-interval: 10000` can sit on
+    // "Sending…" for the best part of a minute, and without this the reader has
+    // no way to know that is the request doing as it was told.
+    if !options.is_empty() {
+        meta_counts.push(("[Options]".to_string(), options.len()));
+        meta_lines.push(Line::styled(
+            "[Options]",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+        for (name, value) in &options {
+            meta_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(name.clone(), Style::default().fg(th.text)),
+                Span::styled(": ", Style::default().fg(th.dim)),
+                Span::styled(value.clone(), Style::default().fg(th.dim)),
+            ]));
+        }
+    }
     if !captures.is_empty() {
         meta_counts.push(("[Captures]".to_string(), captures.len()));
         meta_lines.push(Line::styled(
@@ -4157,6 +4185,9 @@ pub(crate) fn draw_response(
     let loading = entry
         .map(|e| e.last_run == RunStatus::Running)
         .unwrap_or(false);
+    // Copied out here, not read in the loading branch below: `entry` borrows
+    // `app`, which that branch writes to.
+    let entry_retry = entry.and_then(|e| e.retry_attempt);
     let (status, status_text, body, error, asserts, duration, headers) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
@@ -4199,11 +4230,29 @@ pub(crate) fn draw_response(
         app.resp_panel.clear();
         app.resp_panel.set_scroll(0);
         app.resp_scrollbar_area = Rect::default();
+        // A retried request says nothing until the poll settles, so without
+        // this a `retry: 30, retry-interval: 2000` poll is a minute of
+        // "Sending…" that looks exactly like a hung request. A single send
+        // reports through the shared response; a "Run All" pass reports
+        // through the entry it is retrying.
+        let retry = entry_retry.or_else(|| app.response.lock().ok().and_then(|r| r.retry_attempt));
+        let text = match retry {
+            Some((attempt, Some(limit))) => format!(
+                "⟳ {} ({})",
+                s.sending,
+                s.retry_attempt
+                    .replace("{n}", &attempt.to_string())
+                    .replace("{m}", &limit.to_string())
+            ),
+            Some((attempt, None)) => format!(
+                "⟳ {} ({})",
+                s.sending,
+                s.retry_attempt_open.replace("{n}", &attempt.to_string())
+            ),
+            None => format!("⟳ {}", s.sending),
+        };
         f.render_widget(
-            Paragraph::new(Line::styled(
-                format!("⟳ {}", s.sending),
-                Style::default().fg(th.accent),
-            )),
+            Paragraph::new(Line::styled(text, Style::default().fg(th.accent))),
             inner,
         );
         return;

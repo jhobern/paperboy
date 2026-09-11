@@ -10,6 +10,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ## [0.5.5] - 2026-09-08
 
+### Added
+
+- **A retrying request now says so, while it is retrying.** A request carrying
+  `[Options] retry: 5` with a `retry-interval` of a couple of seconds can be in
+  flight for ten seconds or more, and every one of its attempts comes back at
+  once when the poll finally settles — so PaperBoy showed a motionless
+  "Sending…" that was indistinguishable from a hung server. Hurl reports each
+  attempt as it starts (deliberately before it sleeps for the interval), and
+  PaperBoy now listens: the Response pane's spinner reads `⟳ Sending… (retry 2
+  of 5)`, and `paperboy -c` prints a line per attempt as it happens instead of
+  the whole story at the end. `retry: -1` counts without claiming a total,
+  since "forever" has none.
+
+- **The request summary lists the request's `[Options]` rows.** They were shown
+  nowhere in the terminal UI, which is a poor place for the setting that
+  decides how long a send can take: `retry`, `retry-interval` and `delay` all
+  change what happens rather than describing what came back. They are listed
+  first, above `[Captures]`, and fold away with the other sections. Disabled
+  rows are left out, exactly as a disabled header is — they round-trip as
+  comments and are not applied.
+
 ### Fixed
 
 - **A request that succeeded after retrying is no longer reported as a

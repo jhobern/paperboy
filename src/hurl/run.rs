@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use hurl::runner::{
-    self, AssertResult, EntryResult, RunnerError, RunnerOptionsBuilder, Value, VariableSet,
+    self, AssertResult, EntryResult, EventListener, RunnerError, RunnerOptionsBuilder, Value,
+    VariableSet,
 };
 use hurl::util::logger::{Logger, LoggerOptionsBuilder};
 use hurl::util::path::ContextDir;
@@ -159,6 +160,22 @@ pub fn run_hurl(
     vars: &HashMap<String, String>,
     file_root: Option<&Path>,
 ) -> RunOutput {
+    run_hurl_watching(content, vars, file_root, |_, _, _| {})
+}
+
+/// [`run_hurl`], plus a hook called as each attempt at an entry starts.
+///
+/// `on_attempt` receives `(entry index, attempt number counting from 0, the
+/// `retry:` limit when it is a plain number)`. Everything a retry does happens
+/// inside the single `run_entries` call below, so this is the only way for a
+/// caller to say anything at all while a poll is in progress — see
+/// [`AttemptReporter`].
+pub fn run_hurl_watching(
+    content: &str,
+    vars: &HashMap<String, String>,
+    file_root: Option<&Path>,
+    mut on_attempt: impl FnMut(usize, usize, Option<usize>),
+) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
         Ok(h) => h,
         Err(e) => {
@@ -184,6 +201,13 @@ pub fn run_hurl(
     let mut stdout = Stdout::new(WriteMode::Buffered);
     let mut logger = Logger::new(&logger_opts, Stderr::new(WriteMode::Buffered), &secrets);
 
+    // One limit for the whole file: a `run_hurl` call is a single request in
+    // every front-end that reports attempts, so there is no per-entry ambiguity
+    // worth carrying here.
+    let reporter = AttemptReporter {
+        on_attempt: std::cell::RefCell::new(&mut on_attempt),
+        limit: hurl_file.entries.first().and_then(entry_retry_limit),
+    };
     let result = runner::run_entries(
         &hurl_file.entries,
         content,
@@ -191,7 +215,7 @@ pub fn run_hurl(
         &runner_opts,
         &variables,
         &mut stdout,
-        None,
+        Some(&reporter),
         &mut logger,
     );
 
@@ -222,6 +246,48 @@ pub fn run_hurl(
 /// pairs — the defaults a `# [Gen]` block is allowed to read (see the streaming
 /// runner above). Placeholder-valued definitions are rendered as written; a
 /// literal like `SAMPLE_KEY=s3cret` comes back verbatim.
+/// How many attempts a request allows, when it says so as a plain number.
+///
+/// `None` for `retry: -1` (forever) and for a `{{placeholder}}`: both are real,
+/// and both mean there is no honest denominator to put in "retry 2 of N".
+fn entry_retry_limit(entry: &hurl_core::ast::Entry) -> Option<usize> {
+    use hurl_core::ast::OptionKind;
+    entry
+        .request
+        .options()
+        .iter()
+        .find_map(|opt| match &opt.kind {
+            OptionKind::Retry(count) => count.to_string().parse::<usize>().ok(),
+            _ => None,
+        })
+}
+
+/// Hurl's own progress hook, forwarded to a PaperBoy closure.
+///
+/// This is the only way to know about a retry *while it is happening*: a
+/// retried entry's results all arrive together when the runner finally gives
+/// up or succeeds, so without this a request configured `retry: 5,
+/// retry-interval: 10000` sits silently for the best part of a minute. Hurl
+/// fires the event just *before* it sleeps for the interval, precisely so a
+/// front-end can say what the wait is for.
+struct AttemptReporter<'a> {
+    /// `RefCell` because the trait hands out `&self`, while a caller that wants
+    /// to record what it sees needs `&mut`.
+    on_attempt: std::cell::RefCell<&'a mut dyn FnMut(usize, usize, Option<usize>)>,
+    limit: Option<usize>,
+}
+
+impl EventListener for AttemptReporter<'_> {
+    fn on_entry_running(
+        &self,
+        current: hurl_core::types::Index,
+        _last: hurl_core::types::Index,
+        retry_count: usize,
+    ) {
+        (self.on_attempt.borrow_mut())(current.to_zero_based(), retry_count, self.limit);
+    }
+}
+
 /// Whether a request asks Hurl to retry it until its asserts pass.
 ///
 /// Read from the parsed entry rather than from PaperBoy's own `[Options]` rows,
@@ -290,6 +356,7 @@ pub fn run_hurl_streaming_with(
     file_root: Option<&Path>,
     mut before_entry: impl FnMut(usize, &HashMap<String, String>) -> EntrySetup,
     mut on_entry: impl FnMut(&EntryOutcome),
+    mut on_attempt: impl FnMut(usize, usize, Option<usize>),
 ) -> RunOutput {
     let hurl_file = match parse_hurl_file(content) {
         Ok(h) => h,
@@ -372,6 +439,12 @@ pub fn run_hurl_streaming_with(
         let mut stdout = Stdout::new(WriteMode::Buffered);
         let mut logger = Logger::new(&logger_opts, Stderr::new(WriteMode::Buffered), &secrets);
 
+        // Fresh per entry: the reporter borrows the caller's closure, and the
+        // borrow only has to last as long as this one window's run.
+        let reporter = AttemptReporter {
+            on_attempt: std::cell::RefCell::new(&mut on_attempt),
+            limit: entry_retry_limit(&hurl_file.entries[i - 1]),
+        };
         let result = runner::run_entries(
             &hurl_file.entries,
             content,
@@ -379,7 +452,7 @@ pub fn run_hurl_streaming_with(
             &runner_opts,
             &variables,
             &mut stdout,
-            None,
+            Some(&reporter),
             &mut logger,
         );
         // Carry captures forward into the next entry's window.
@@ -726,6 +799,95 @@ mod tests {
         );
     }
 
+    /// Every attempt is announced *as it starts*, which is the only way a
+    /// front-end can say anything at all during a poll: all of a retried
+    /// entry's results arrive together when it finally settles, so a request
+    /// written `retry: 30, retry-interval: 2000` would otherwise be a minute of
+    /// silence indistinguishable from a hung connection.
+    #[test]
+    fn each_attempt_is_reported_while_the_poll_is_still_running() {
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: 5\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let out = run_hurl_watching(&content, &HashMap::new(), None, |i, attempt, limit| {
+            seen.push((i, attempt, limit))
+        });
+
+        assert!(out.entries.iter().any(|e| e.ok), "the poll did succeed");
+        assert_eq!(
+            seen,
+            vec![(0, 0, Some(5)), (0, 1, Some(5)), (0, 2, Some(5))],
+            "the first send plus the two retries, each with the stated limit"
+        );
+    }
+
+    /// A request nobody retries reports its one attempt and no limit, so a
+    /// caller can tell "sending" from "retrying" by the attempt number alone.
+    #[test]
+    fn a_request_that_is_not_retried_reports_a_single_first_attempt() {
+        let port = polling_server(0);
+        let content = format!("GET http://127.0.0.1:{port}/\nHTTP 200\n");
+        let mut seen: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let _ = run_hurl_watching(&content, &HashMap::new(), None, |i, attempt, limit| {
+            seen.push((i, attempt, limit))
+        });
+
+        assert_eq!(seen, vec![(0, 0, None)]);
+    }
+
+    /// `retry: -1` is "forever", and a `{{placeholder}}` limit is not knowable
+    /// here at all: both are real, and neither has an honest denominator, so
+    /// the hook says so rather than inventing one.
+    #[test]
+    fn a_limit_that_is_not_a_plain_number_is_reported_as_no_limit() {
+        let port = polling_server(1);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/\n[Options]\nretry: -1\nretry-interval: 20\nHTTP 200\n\
+             [Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut limits: Vec<Option<usize>> = Vec::new();
+        let _ = run_hurl_watching(&content, &HashMap::new(), None, |_, _, limit| {
+            limits.push(limit)
+        });
+
+        assert!(
+            limits.iter().all(|l| l.is_none()),
+            "retry: -1 has no number to count towards, got {limits:?}"
+        );
+    }
+
+    /// Streaming reports attempts per entry, and the index is the entry's --
+    /// not the attempt's ordinal, which is what a retry makes different.
+    #[test]
+    fn streaming_reports_which_entry_is_being_retried() {
+        // Two pending answers: one spent on `/first`, so `/second` needs a
+        // retry to see "Matched".
+        let port = polling_server(2);
+        let content = format!(
+            "GET http://127.0.0.1:{port}/first\nHTTP 200\n\n\
+             GET http://127.0.0.1:{port}/second\n[Options]\nretry: 3\nretry-interval: 20\n\
+             HTTP 200\n[Asserts]\njsonpath \"$.result\" == \"Matched\"\n"
+        );
+        let mut seen: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let _ = run_hurl_streaming_with(
+            &content,
+            &HashMap::new(),
+            None,
+            |_, _| EntrySetup::Bind(Vec::new()),
+            |_| {},
+            |i, attempt, limit| seen.push((i, attempt, limit)),
+        );
+
+        assert_eq!(
+            seen,
+            vec![(0, 0, None), (1, 0, Some(3)), (1, 1, Some(3))],
+            "the retry belongs to the second entry, and only it has a limit"
+        );
+    }
+
     /// The other half of the rule: retries that never succeed are still a
     /// failure, and the *last* attempt is the one that says so.
     #[test]
@@ -778,6 +940,7 @@ mod tests {
             None,
             |_, _| EntrySetup::Bind(Vec::new()),
             |eo| seen.push((eo.entry_index, eo.ok, eo.superseded)),
+            |_, _, _| {},
         );
         assert_eq!(
             seen,

@@ -541,6 +541,7 @@ fn map_entry(
         baseline: None,
         last_run: RunStatus::default(),
         last_response: None,
+        retry_attempt: None,
     }
 }
 

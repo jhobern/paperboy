@@ -7976,6 +7976,46 @@ fn response_panel_shows_other_entrys_response_while_one_is_sending() {
     );
 }
 
+/// A request Hurl is retrying says which attempt it is on. Every attempt of a
+/// retried entry comes back at once, when the poll finally settles, so a
+/// `retry: 5, retry-interval: 2000` request would otherwise sit on a bare
+/// "Sending…" for ten seconds — indistinguishable from a hung server.
+#[test]
+fn the_response_panel_says_which_retry_is_being_waited_on() {
+    use crate::hurl::RunStatus;
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    app.collections[ci].entries.push(HurlEntry::default());
+    app.collections[ci].entries[0].last_run = RunStatus::Running;
+    app.collections[ci].entries[0].retry_attempt = Some((2, Some(5)));
+
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 2 of 5"),
+        "the spinner should say which attempt is running:\n{out}"
+    );
+
+    // `retry: -1` (forever) has no denominator to count towards, so the hint
+    // states the attempt and stops there rather than inventing a total.
+    app.collections[ci].entries[0].retry_attempt = Some((3, None));
+    let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+    term.draw(|f| super::draw::draw_response(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = buffer_text(term.backend().buffer());
+    assert!(
+        out.contains("retry 3") && !out.contains(" of "),
+        "an open-ended retry should not claim a limit:\n{out}"
+    );
+}
+
 /// A failed status assertion (e.g. `HTTP 200` but the server returned 500)
 /// still shows the full response — status line, the failing assert marked ✗,
 /// and the response body — instead of replacing everything with the error text.
@@ -8627,6 +8667,52 @@ fn response_panel_shows_a_scrollbar_overlaid_on_the_border_outside_the_selectabl
     assert!(
         saw_thumb_or_track,
         "a scrollbar track or thumb should be drawn once the body overflows"
+    );
+}
+
+/// The request summary shows the request's `[Options]` rows. Nothing else in
+/// the TUI did: a request told to `retry: 5` with a two-second interval can sit
+/// on "Sending…" for ten seconds, and the reader had no way to see that this is
+/// the request doing exactly as it was told. Disabled rows are left out — they
+/// round-trip as comments and are not applied.
+#[test]
+fn the_request_summary_lists_the_options_a_request_carries() {
+    use crate::i18n::{Language, Strings};
+    use ratatui::{Terminal, backend::TestBackend};
+    let th = super::theme::theme(&Language::English);
+    let s = Strings::for_language(&Language::English);
+
+    let mut app = TuiApp::default();
+    let ci = app.active_tab;
+    let mut entry = HurlEntry::from_fields("t", "GET", "http://h/poll", vec![], "");
+    entry.options = vec![
+        crate::hurl::KvRow {
+            key: "retry".to_string(),
+            value: "5".to_string(),
+            enabled: true,
+            ..Default::default()
+        },
+        crate::hurl::KvRow {
+            key: "delay".to_string(),
+            value: "1000".to_string(),
+            enabled: false,
+            ..Default::default()
+        },
+    ];
+    app.collections[ci].entries = vec![entry];
+
+    let mut term = Terminal::new(TestBackend::new(70, 20)).unwrap();
+    term.draw(|f| super::draw::draw_collection_main(f, f.area(), &mut app, ci, &s, &th))
+        .unwrap();
+    let out = flattened_content(term.backend().buffer());
+    assert!(
+        out.contains("[Options]") && out.contains("retry: 5"),
+        "the summary should show the request's options:\n{out}"
+    );
+    assert!(
+        out.contains("[Options] 1"),
+        "only the enabled option counts — the disabled one appears in the Hurl \
+         text below as the comment it round-trips as:\n{out}"
     );
 }
 
@@ -18605,6 +18691,64 @@ fn undefined_variables_name_a_loaded_environment_that_defines_them() {
     assert!(app.status.is_none(), "got {:?}", app.status);
 }
 
+/// A "Run All" pass carries the retry hint through to the entry being retried,
+/// and drops it the moment the run ends — a stale "retry 2 of 5" on a finished
+/// request would be worse than none at all.
+#[test]
+fn a_run_all_pass_marks_the_entry_it_is_retrying() {
+    let col = Collection::new(
+        "t".to_string(),
+        vec![HurlEntry::default(), HurlEntry::default()],
+    );
+    let col_id = col.id;
+    let mut app = TuiApp::default();
+    app.collections.push(col);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let update = crate::request::BatchRunUpdate {
+        col_id,
+        results: vec![Some(true), None],
+        captures: std::collections::HashMap::new(),
+        responses: vec![None, None],
+        retrying: Some((1, 2, Some(5))),
+    };
+    tx.send(update.clone()).unwrap();
+    app.pending_batch_runs.push(rx);
+    app.poll_batch_run_updates();
+
+    let col = &app.collections[1];
+    assert_eq!(
+        col.entries[1].retry_attempt,
+        Some((2, Some(5))),
+        "the retried entry should carry the attempt it is on"
+    );
+    assert_eq!(
+        col.entries[0].retry_attempt, None,
+        "only the entry actually being retried is marked"
+    );
+
+    // The poll settles: the entry's outcome arrives, which ends the wait. (The
+    // runner sends exactly this — `retrying` is cleared by the same hook that
+    // stamps the result — so a finished request never keeps a stale hint.)
+    tx.send(crate::request::BatchRunUpdate {
+        results: vec![Some(true), Some(true)],
+        retrying: None,
+        ..update
+    })
+    .unwrap();
+    drop(tx);
+    for _ in 0..3 {
+        app.poll_batch_run_updates();
+    }
+    assert!(
+        app.collections[1]
+            .entries
+            .iter()
+            .all(|e| e.retry_attempt.is_none()),
+        "a finished run leaves no request claiming to be retrying"
+    );
+}
+
 #[test]
 fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
     let e1 = HurlEntry {
@@ -18647,6 +18791,7 @@ fn poll_batch_run_updates_applies_pass_fail_markers_captures_and_summary() {
         None,
     ];
     tx.send(crate::request::BatchRunUpdate {
+        retrying: None,
         col_id,
         results: vec![Some(true), Some(false), None],
         captures,

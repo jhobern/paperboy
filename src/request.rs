@@ -584,6 +584,7 @@ pub struct CaptureUpdate {
 
 /// The result of a "Run All" (Alt+F5) pass over an entire collection, routed
 /// back to its collection on the main thread.
+#[derive(Clone)]
 pub struct BatchRunUpdate {
     pub col_id: u64,
     /// Per-entry pass/fail, in the same order as `Collection::entries`.
@@ -600,6 +601,10 @@ pub struct BatchRunUpdate {
     /// than cleared, since that's still the last response actually received
     /// for it.
     pub responses: Vec<Option<ApiResponse>>,
+    /// The entry Hurl is currently retrying, if any: its position in `results`,
+    /// the attempt being made, and the `retry:` limit when it is a plain
+    /// number. `None` once that entry produces an outcome.
+    pub retrying: Option<(usize, usize, Option<usize>)>,
 }
 
 /// Build the Hurl entry to run for the selected entry, honoring an edited
@@ -667,6 +672,7 @@ fn to_run_entry(base: &HurlEntry, resolved: ResolvedRequest) -> HurlEntry {
         baseline: None,
         last_run: base.last_run,
         last_response: None,
+        retry_attempt: None,
     }
 }
 
@@ -822,6 +828,20 @@ pub fn run_resolved_entry_reporting(
     file_root: Option<&std::path::Path>,
     extra_captures: &[(String, String)],
 ) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
+    run_resolved_entry_watching(base, vars, file_root, extra_captures, |_, _, _| {})
+}
+
+/// [`run_resolved_entry_reporting`], plus a hook called as each attempt at the
+/// request starts — see [`crate::hurl::run::run_hurl_watching`]. A send that is
+/// retried says nothing at all until the poll settles, so a front-end that
+/// wants to show what the wait is for has to be told as it happens.
+pub fn run_resolved_entry_watching(
+    base: &HurlEntry,
+    vars: &HashMap<String, String>,
+    file_root: Option<&std::path::Path>,
+    extra_captures: &[(String, String)],
+    on_attempt: impl FnMut(usize, usize, Option<usize>),
+) -> (RunOutput, HashMap<String, String>, Vec<GenError>) {
     // Declared parameters are resolved *here*, not left to Hurl's own late
     // binding, because everything downstream works on resolved text: an
     // unresolved `{{FILE}}` in a `[Multipart]` file path would reach
@@ -890,7 +910,7 @@ pub fn run_resolved_entry_reporting(
     let run_root = staged_dir.as_deref().or(file_root);
 
     let content = run_entry.to_hurl();
-    let out = run_hurl(&content, &vars, run_root);
+    let out = crate::hurl::run::run_hurl_watching(&content, &vars, run_root, on_attempt);
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -952,10 +972,25 @@ pub fn run_collection(
         // and the report interpreter stay in exact lockstep. A base64/staging
         // failure comes back as `RunOutput { entries: [], error }` and surfaces
         // via the `None` arm below.
-        let (out, generated, gen_errors) =
-            run_resolved_entry_reporting(&base, &vars, file_root.as_deref(), &[]);
+        let watch = Arc::clone(&state);
+        let (out, generated, gen_errors) = run_resolved_entry_watching(
+            &base,
+            &vars,
+            file_root.as_deref(),
+            &[],
+            |_, attempt, limit| {
+                if attempt == 0 {
+                    return;
+                }
+                if let Ok(mut r) = watch.lock() {
+                    r.retry_attempt = Some((attempt, limit));
+                }
+            },
+        );
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // The wait is over however it ended, so the hint goes with it.
+        r.retry_attempt = None;
         // Kept structurally as well as in `error`: only the front-end knows
         // the language, and "Request error:" is the wrong heading for a
         // request that was never made (see `ApiResponse::error_text`).
@@ -1017,6 +1052,7 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         status_text: eo.status_text.clone(),
         body: Arc::from(eo.body.as_str()),
         loading: false,
+        retry_attempt: None,
         error: eo.error.clone().unwrap_or_default(),
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
@@ -1192,6 +1228,21 @@ pub fn run_all_entries(
             // so it can be surfaced as the run's error below.
             let gen_errors: Rc<RefCell<Vec<crate::generators::GenError>>> = Rc::default();
             let record_errs = Rc::clone(&gen_errors);
+            // The cumulative snapshot, shared rather than owned by the
+            // after-each-entry hook: the retry hook pushes an update of its own
+            // between entries, and it has to carry everything already known
+            // (the drain applies a snapshot wholesale) rather than blank the
+            // markers the run has earned so far.
+            let snapshot = Rc::new(RefCell::new(BatchRunUpdate {
+                col_id,
+                results: results.clone(),
+                captures: captures.clone(),
+                responses: responses.clone(),
+                retrying: None,
+            }));
+            let record_entry = Rc::clone(&snapshot);
+            let record_attempt = Rc::clone(&snapshot);
+            let tx_attempt = tx.clone();
             let mut streamed = crate::hurl::run::run_hurl_streaming_with(
                 &content,
                 &vars,
@@ -1239,25 +1290,39 @@ pub fn run_all_entries(
                     if eo.superseded {
                         return;
                     }
+                    let mut snap = record_entry.borrow_mut();
+                    // An outcome — of any kind — ends whatever wait was being
+                    // reported, including the failing one that ends a poll.
+                    snap.retrying = None;
                     if let Some(&at) = run_positions.get(eo.entry_index) {
-                        results[at] = Some(eo.ok);
+                        snap.results[at] = Some(eo.ok);
                         // Computed values first so a `[Captures]` row of the same
                         // name — the later, more specific statement — still wins.
-                        captures.extend(
-                            generated
-                                .borrow()
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.clone())),
-                        );
-                        captures.extend(eo.captures.iter().cloned());
-                        responses[at] = Some(entry_response(eo));
+                        let computed: Vec<(String, String)> = generated
+                            .borrow()
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        snap.captures.extend(computed);
+                        snap.captures.extend(eo.captures.iter().cloned());
+                        snap.responses[at] = Some(entry_response(eo));
                     }
-                    let _ = tx.send(BatchRunUpdate {
-                        col_id,
-                        results: results.clone(),
-                        captures: captures.clone(),
-                        responses: responses.clone(),
-                    });
+                    let _ = tx.send(snap.clone());
+                },
+                |i, attempt, limit| {
+                    // Sent as the attempt starts (Hurl reports it before it
+                    // sleeps for the interval), because every attempt's result
+                    // arrives only when the poll finally settles: without this
+                    // a long poll is a still, silent list.
+                    if attempt == 0 {
+                        return;
+                    }
+                    let Some(&at) = run_positions.get(i) else {
+                        return;
+                    };
+                    let mut snap = record_attempt.borrow_mut();
+                    snap.retrying = Some((at, attempt, limit));
+                    let _ = tx_attempt.send(snap.clone());
                 },
             );
             // Prefer the generator error over Hurl's downstream `Undefined
@@ -1279,6 +1344,8 @@ pub fn run_all_entries(
         }
         let mut r = state.lock().unwrap();
         r.loading = false;
+        // The run is over however it ended, so any retry hint goes with it.
+        r.retry_attempt = None;
         match out.entries.last() {
             Some(last) => {
                 r.status = last.status;
@@ -1318,6 +1385,7 @@ pub fn run_all_entries(
                 results,
                 captures,
                 responses,
+                retrying: None,
             });
         }
     });
@@ -3086,6 +3154,7 @@ mod tests {
                 )
             },
             |_| {},
+            |_, _, _| {},
         );
 
         assert!(
@@ -3222,6 +3291,7 @@ mod tests {
                 )
             },
             |_| {},
+            |_, _, _| {},
         );
 
         let sent = seen.lock().unwrap().join("\n");

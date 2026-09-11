@@ -2070,12 +2070,20 @@ impl TuiApp {
                             col.invalidate_request_json();
                             let mut passed = 0usize;
                             let mut failed = 0usize;
-                            for ((entry, result), response) in col
+                            for (i, ((entry, result), response)) in col
                                 .entries
                                 .iter_mut()
                                 .zip(update.results.iter())
                                 .zip(update.responses.iter())
+                                .enumerate()
                             {
+                                // At most one entry is being retried at a time
+                                // (the run is sequential), so this both sets
+                                // the hint and clears the previous one.
+                                entry.retry_attempt = update
+                                    .retrying
+                                    .filter(|(at, _, _)| *at == i)
+                                    .map(|(_, attempt, limit)| (attempt, limit));
                                 entry.last_run = match result {
                                     Some(true) => RunStatus::Passed,
                                     Some(false) => RunStatus::Failed,
@@ -2127,6 +2135,8 @@ impl TuiApp {
                     if entry.last_run == RunStatus::Running {
                         entry.last_run = RunStatus::NotRun;
                     }
+                    // Nothing is waiting on anything once the run has ended.
+                    entry.retry_attempt = None;
                 }
             }
             if !disconnected {

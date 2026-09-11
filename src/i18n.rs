@@ -57,6 +57,12 @@ strings! {
     app_heading => "PaperBoy", "PaperBoy", "PaperBoy";
     base_url => "Default New Request URL:", "URL par défaut des nouvelles requêtes\u{a0}:", "Standard-URL for nye anmodninger:";
     sending => "Sending…", "Envoi en cours…", "Sender…";
+    // Shown beside the spinner while Hurl is retrying a request (`[Options]
+    // retry`): `{n}` is the attempt being made, `{m}` the stated limit. The
+    // open form is for `retry: -1` (forever) and for a `{{placeholder}}`
+    // limit, neither of which has an honest number to count towards.
+    retry_attempt => "retry {n} of {m}", "tentative {n} sur {m}", "fors\u{f8}g {n} af {m}";
+    retry_attempt_open => "retry {n}", "tentative {n}", "fors\u{f8}g {n}";
     response_heading => "Response", "Réponse", "Svar";
     status_label => "Status:", "Statut :", "Status:";
     response_time_label => "Time:", "Durée :", "Tid:";

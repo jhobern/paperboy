@@ -343,6 +343,29 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 );
                 record(eo);
             },
+            |i, attempt, limit| {
+                // All of a retried entry's attempts come back at once, so
+                // without this the run goes silent for `retry` ×
+                // `retry-interval` — a minute of nothing for a poll that is
+                // working perfectly — and then prints the lot. Announced as
+                // each attempt starts instead, which is also before Hurl
+                // sleeps for the interval.
+                if attempt == 0 {
+                    return;
+                }
+                let of = limit.map_or(String::new(), |l| format!(" of {l}"));
+                println!(
+                    "  {}",
+                    paint(
+                        color,
+                        Hue::Yellow,
+                        &format!("\u{21bb} [{}/{total}] retry {attempt}{of}\u{2026}", i + 1)
+                    )
+                );
+                // Block-buffered when stdout is a pipe or a file, and the whole
+                // point of the line is to arrive now rather than at the end.
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            },
         )
     };
     let passed = per_request.iter().filter(|r| **r == Some(true)).count();
