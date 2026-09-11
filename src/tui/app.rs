@@ -2285,18 +2285,17 @@ impl TuiApp {
                 if let Some(col) = self.collections.get_mut(ci) {
                     let ei = col.selected_entry;
                     if let Some(entry) = col.entries.get_mut(ei) {
-                        let changed = entry.title != parsed.title
-                            || entry.method != parsed.method
-                            || entry.url != parsed.url
-                            || entry.headers != parsed.headers
-                            || entry.basic_auth != parsed.basic_auth
-                            || entry.form_fields != parsed.form_fields
-                            || entry.queries != parsed.queries
-                            || entry.cookies != parsed.cookies
-                            || entry.body_src != parsed.body_src
-                            || entry.expected_status != parsed.expected_status
-                            || entry.captures != parsed.captures
-                            || entry.asserts != parsed.asserts;
+                        // Compared as text rather than field by field. The list
+                        // this used to spell out had gone stale: `comments`,
+                        // `options`, `generators` and the response sections
+                        // were all missing from it, so an edit that touched
+                        // only one of them — adding a comment, or a `retry:`
+                        // row — was read, parsed, judged "unchanged" and
+                        // thrown away without a word. `to_hurl` is what the
+                        // user was just editing, and it covers every field
+                        // that reaches the file by construction, so it cannot
+                        // fall behind the struct the way a list of names does.
+                        let changed = entry.to_hurl() != parsed.to_hurl();
                         if changed {
                             // Reparsed entries never carry `user_added` (it is
                             // UI-only and never written to Hurl text); preserve

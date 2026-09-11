@@ -750,10 +750,10 @@ fn scan_comments(
 
     // Comment lines in this entry's own leading block that neither its title
     // nor a well-formed PaperBoy block claims — the lines of a `# [Gen]` block
-    // whose row count is wrong, most often. Kept as prose so they round-trip
-    // verbatim, which is what the same damaged block does when it sits *below*
-    // its request. Without this they belonged to nobody and were deleted by
-    // the first save.
+    // whose row count is wrong, most often, and any prose the user wrote above
+    // the request's name. Kept as prose so they round-trip verbatim, which is
+    // what the same damaged block does when it sits *below* its request.
+    // Without this they belonged to nobody and were deleted by the first save.
     {
         let lead_top = leading_comment_top(lines, method_line);
         let title_top = title_text_start(
@@ -761,8 +761,19 @@ fn scan_comments(
             lead_top.saturating_sub(1),
             method_line.saturating_sub(1),
         ) + 1;
+        // Only the title's *own* line is the title; everything above it in the
+        // same block is prose. Folding those lines into the name welded two
+        // comments into one on the next save — the user's second comment was
+        // overwritten by a title it had been glued onto, and there was nothing
+        // left to recover it from.
+        let title_ln = title_line_index(
+            lines,
+            title_top.saturating_sub(1),
+            method_line.saturating_sub(1),
+        )
+        .map_or(method_line, |i| i + 1);
         let claimed = lead_block_lines(lines, lead_top, method_line);
-        for ln in lead_top..title_top {
+        for ln in lead_top..title_ln {
             if claimed.contains(&ln) {
                 continue;
             }
@@ -1468,12 +1479,42 @@ fn parse_report_row(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), query.to_string()))
 }
 
-/// Title = the `#` comment lines immediately above the request's method line
-/// (reset by a blank line), with `#` and surrounding `-`/`=` decoration
-/// stripped — `# ---- Login ----` is titled "Login". Only the leading and
-/// trailing runs go: a hyphen or `=` *inside* the text is part of the name
-/// ("Get user-profile"), and stripping those made our own output unreadable
-/// by our own parser, permanently corrupting the name on the next save. The
+/// The text one comment line contributes to a title: `#` and any surrounding
+/// `-`/`=` decoration stripped, so `# ---- Login ----` reads "Login" and a
+/// rule of `# ------` reads as nothing at all. Only the leading and trailing
+/// runs go: a hyphen or `=` *inside* the text is part of the name ("Get
+/// user-profile"), and stripping those made our own output unreadable by our
+/// own parser, permanently corrupting the name on the next save.
+fn title_line_text(line: &str) -> String {
+    line.trim_start_matches('#')
+        .trim()
+        .trim_matches(|c| matches!(c, '-' | '='))
+        .trim()
+        .to_string()
+}
+
+/// Which line of a leading comment block is the request's *name*: the last one
+/// carrying text, i.e. the comment line closest to the method line.
+///
+/// A block can hold more than one comment, and only one of them can be the
+/// name. The last is chosen because that is the one PaperBoy itself writes —
+/// [`HurlEntry::to_hurl`] emits prose above the title and the title directly
+/// above the method line — so a file PaperBoy wrote reads back as the file it
+/// wrote. The lines above it are kept as `Lead` comments rather than folded
+/// into the name: merging them produced a single welded-together title that
+/// was written back over the user's two comments on the next save, which is
+/// lossy and cannot be undone.
+///
+/// `start` and `method` are 0-based; the answer indexes `lines`.
+fn title_line_index(lines: &[&str], start: usize, method: usize) -> Option<usize> {
+    (start..method.min(lines.len()))
+        .rev()
+        .find(|&i| !title_line_text(lines[i]).is_empty())
+}
+
+/// Title = the *last* `#` comment line immediately above the request's method
+/// line (the block being reset by a blank line), with `#` and surrounding
+/// `-`/`=` decoration stripped — `# ---- Login ----` is titled "Login". The
 /// entry's `source_info.start` is sometimes the leading comment and sometimes
 /// the method line (depending on how `hurl_core` attaches inter-entry
 /// comments), so we first locate the method line, then scan back for its block.
@@ -1500,18 +1541,9 @@ fn title_from_span(start_line: usize, lines: &[&str]) -> String {
     // request-splitter's walk for the same reason). Keep only the comment lines
     // *below* the last such block; everything at or above it is the block.
     let title_start = title_text_start(lines, block_start, method);
-    lines[title_start..method]
-        .iter()
-        .map(|l| {
-            l.trim_start_matches('#')
-                .trim()
-                .trim_matches(|c| matches!(c, '-' | '='))
-                .trim()
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    title_line_index(lines, title_start, method)
+        .map(|i| title_line_text(lines[i]))
+        .unwrap_or_default()
 }
 
 /// Where an entry's title text begins, given `block_start` — the top of the
@@ -3911,5 +3943,27 @@ mod recovery_hardening_tests {
         let entries = parse_hurl("# ==== Login ====\nGET http://h/x\n");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Login");
+    }
+
+    /// A note a user writes *above* a request's name is prose, not part of the
+    /// name. Only the last comment line above the method is the title — that is
+    /// the line `to_hurl` itself writes there — so everything above it is kept
+    /// verbatim as a lead comment instead of being welded onto the name.
+    #[test]
+    fn a_note_above_a_request_name_is_not_part_of_the_name() {
+        let src = "# a note about why this exists\n# Login\nGET http://h/x\nHTTP 200\n";
+        let entries = parse_hurl(src);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Login");
+        assert_eq!(
+            entries[0]
+                .comments
+                .iter()
+                .map(|c| c.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["# a note about why this exists"]
+        );
+        // And it survives a save byte-for-byte, without gaining a blank line.
+        assert_eq!(crate::hurl::collection_to_hurl(&entries), src);
     }
 }

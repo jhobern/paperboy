@@ -60,6 +60,23 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A note written above a request's name is no longer welded onto the name.**
+  A comment block above a request gives no syntactic clue as to which of its
+  lines is the name, and PaperBoy used to join the lot, so
+  `# why this exists` above `# Login` turned into a request called
+  `why this exists Login` — and was written back that way, losing the note for
+  good. Only the last comment line above the method is the name now (which is
+  exactly the line PaperBoy itself writes there), and everything above it is
+  kept verbatim as a lead comment. Such a block now round-trips byte for byte.
+
+- **An edit that only touches a comment is no longer thrown away.** Hurl Mode
+  decided whether you had changed anything by comparing a hand-written list of
+  fields, and that list had fallen behind: comments, `[Options]`, `[Gen]` and
+  the recorded response were all absent from it. Adding a comment — or a
+  `retry:` row — was parsed, judged identical to what you started with, and
+  discarded without a word. The comparison is now made on the Hurl text itself,
+  which covers every field by construction.
+
 - **A request that succeeded after retrying is no longer reported as a
   failure.** `[Options] retry` means "keep asking until it holds", and Hurl
   duly hands back every attempt, settling the question with the last one for a

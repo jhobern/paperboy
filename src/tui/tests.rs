@@ -14607,6 +14607,34 @@ fn raw_mode_edits_fields_the_wizard_does_not_expose() {
     assert!(e.modified);
 }
 
+/// An edit that touches only a comment is still an edit. The save path used to
+/// decide "did anything change?" from a hand-written list of fields that had
+/// fallen behind the struct, so a comment the user added in Hurl Mode was
+/// parsed, judged identical and silently discarded.
+#[test]
+fn raw_mode_keeps_an_edit_that_only_adds_a_comment() {
+    let entry = HurlEntry::from_fields("r", "GET", "http://h/x", vec![], "");
+    let mut app = TuiApp::default();
+    app.collections[0].entries.push(entry);
+    app.focus = Pane::Main;
+
+    app.on_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT));
+    if let Some(Overlay::Prompt { editor, .. }) = &mut app.overlay {
+        let new_text = format!("{}\n# a trailing note\n", editor.text().trim_end());
+        *editor = super::editor::Editor::new(&new_text, true);
+    }
+    app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+    assert!(app.overlay.is_none(), "valid hurl commits and closes");
+    let e = &app.collections[0].entries[0];
+    assert!(
+        e.comments.iter().any(|c| c.text == "# a trailing note"),
+        "a comment-only edit must be kept, got {:?}",
+        e.comments
+    );
+    assert!(e.modified);
+}
+
 /// Shift+Arrow inside the Raw Mode editor selects text (extending from
 /// wherever the cursor was when Shift was first held) without
 /// disturbing the underlying text, and Ctrl+Y copies exactly that
