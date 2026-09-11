@@ -3413,6 +3413,50 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_changes_what_happens_after_a_failure_and_that_is_the_point() {
+        // The companion to the no-op test above, pinning the boundary of the
+        // guarantee: while everything succeeds, wrapping changes nothing. Once
+        // something fails, it deliberately does. Flat, every later request goes
+        // out regardless; in a region the steps downstream of the failure are
+        // skipped, because a request that cannot work without a token nobody
+        // captured has nothing to tell you and costs a real call to ask.
+        let entries = [
+            graph_entry("producer", &["token"], &[]),
+            graph_entry("consumer", &[], &["token"]),
+        ];
+        let canned = [failing("producer")];
+
+        let flat_fake = Fake::new(&canned);
+        run(
+            "REPORT REQUEST producer\nREPORT REQUEST consumer\n",
+            &entries,
+            &[],
+            &[],
+            &flat_fake,
+        );
+        assert_eq!(flat_fake.call_order(), ["producer", "consumer"]);
+
+        let wrapped_fake = Fake::new(&canned);
+        let wrapped = run(
+            "GRAPH\n    REPORT REQUEST producer\n    REPORT REQUEST consumer\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &wrapped_fake,
+        );
+        assert_eq!(
+            wrapped_fake.call_order(),
+            ["producer"],
+            "the consumer must not be sent"
+        );
+        assert!(
+            wrapped.skipped.iter().any(|s| s.contains("consumer")),
+            "and it must be reported as skipped: {:?}",
+            wrapped.skipped
+        );
+    }
+
+    #[test]
     fn wrapping_a_sequential_block_in_a_region_changes_nothing() {
         // The guarantee the whole migration path rests on. Same flow, same
         // collection, one wrapped and one not — the rows have to match, or

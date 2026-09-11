@@ -684,6 +684,22 @@ GRAPH release
 END
 ```
 
+Wrapping an existing block in `GRAPH … END` changes nothing while everything
+succeeds: with no edges to reorder by, a region runs in written order. Two
+things do change once something goes wrong or is ambiguous, and both are the
+point of the region rather than accidents of it:
+
+- **A failure stops what depended on it.** Flat, every later request is sent
+  regardless; in a region, the steps downstream of a failure are skipped and
+  the run exits `3`. A request that cannot work without a token nobody
+  captured has nothing to tell you, and sending it anyway costs a real call
+  against a real service.
+- **An ambiguous capture is an error, not last-writer-wins.** Flat, two
+  requests capturing `token` are resolved by written order. In a region there
+  is no written order to fall back on, so a step reading `{{token}}` that two
+  steps in its region capture is refused. Name the one you mean —
+  `{{login.token}}` — and it is unambiguous again.
+
 `--targets a,b` runs only the named steps and whatever they transitively
 depend on, so a release check can ask for one answer without paying for the
 whole report. Naming a step that no region declares is an error rather than a

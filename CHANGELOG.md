@@ -179,6 +179,31 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Dependency inference now sees every field Hurl evaluates.** `[Options]`,
+  `[Asserts]`, `[Captures]` queries, response headers and body, and a form
+  field's content type all carry `{{…}}` and are all substituted, but none of
+  them were scanned. A step whose only use of a capture was in an assert had no
+  edge to the step that produced it and could be ordered before it, failing on
+  an undefined variable. Conversely, *disabled* rows were scanned, inventing
+  edges from text that is never sent. Both are fixed, and because the same scan
+  decides which variables a request "needs", a disabled row no longer blocks a
+  send on a secret it never uses.
+
+- **`--targets` no longer runs the regions it wasn't given a target in.**
+  A region containing none of the named targets was left entirely intact, so
+  `--targets a` still sent every request of every other region — the opposite
+  of what naming a target is for.
+
+- **A comment inside a region no longer shifts what `--targets` keeps.** The
+  filter counted steps while the plan counted body positions, so the two index
+  spaces drifted apart at the first comment and the wrong steps were dropped —
+  including, in the demonstrated case, the producer the target needed.
+
+- **A `CLEANUP` is pruned along with the steps it was undoing.** Left behind, a
+  declared dependency on a pruned step became a skip and an exit code saying
+  the run was incomplete, while an inferred one could send the teardown with a
+  variable nobody in this run ever set.
+
 - **A step that panics no longer hangs the whole run.** The worker that
   unwound never decremented the region's in-flight count, so every other
   worker slept waiting for an arrival that could not come and `thread::scope`

@@ -1476,26 +1476,60 @@ pub fn drain_capture_updates(
 /// never validated, which is the exact bug the validation exists to catch.
 fn for_each_wire_text(entry: &HurlEntry, mut visit: impl FnMut(&str)) {
     visit(&entry.url);
-    for r in entry.headers.iter().chain(&entry.queries) {
+    // Disabled rows are not sent, so a placeholder in one is not a use: it
+    // must not make a variable "needed", and — since this same set feeds the
+    // dependency planner — must not invent an edge from text nothing evaluates.
+    for r in entry
+        .headers
+        .iter()
+        .chain(&entry.queries)
+        .chain(&entry.cookies)
+        .chain(&entry.options)
+        .chain(&entry.response_headers)
+        .filter(|r| r.enabled)
+    {
         visit(&r.key);
         visit(&r.value);
     }
-    for f in &entry.form_fields {
+    for f in entry.form_fields.iter().filter(|f| f.enabled) {
         visit(&f.key);
         visit(&f.value);
-    }
-    for r in &entry.cookies {
-        visit(&r.key);
-        visit(&r.value);
+        if let Some(ct) = &f.content_type {
+            visit(ct);
+        }
+        if let Some(b64) = &f.base64_prefix {
+            visit(b64);
+        }
     }
     if let Some((u, p)) = &entry.basic_auth {
         visit(u);
         visit(p);
     }
     // A `{{ var }}` written inside a comment is never sent, so it doesn't
-    // count as a use of that variable.
+    // count as a use of that variable. A row's `desc` is a comment, which is
+    // why no `desc` is visited above.
     if let Some(body) = entry.body_wire() {
         visit(&body);
+    }
+    if let Some(rb) = &entry.response_body {
+        visit(rb);
+    }
+    // Response-side expressions are templates too — Hurl substitutes into a
+    // `[Captures]` query, an `[Asserts]` predicate and a `[Options]` value just
+    // as it does into a URL. Leaving them out meant a step whose only use of a
+    // capture was in an assert had no edge to the step that produced it, and so
+    // could be ordered before it.
+    for (_, q) in entry.captures.iter().chain(&entry.reports) {
+        visit(q);
+    }
+    for a in &entry.asserts {
+        visit(a);
+    }
+    // The expression's *bare* identifiers are a separate namespace (see
+    // `rename_expression_identifiers`) and are not scanned here; only the
+    // `{{…}}` a generator expression may also contain.
+    for (_, expr) in &entry.generators {
+        visit(expr);
     }
 }
 

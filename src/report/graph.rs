@@ -430,6 +430,10 @@ pub fn prune_to_targets(
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
     let mut matched: HashSet<String> = HashSet::new();
+    // What pruning took away, so the cleanups can be pruned with it below.
+    let mut dropped_names: HashSet<String> = HashSet::new();
+    let mut dropped_captures: HashSet<String> = HashSet::new();
+    let mut kept_captures: HashSet<String> = HashSet::new();
     for node in &mut flow.nodes {
         let FlowNode::Graph { body, .. } = node else {
             continue;
@@ -451,24 +455,73 @@ pub fn prune_to_targets(
                 i
             })
             .collect();
-        if wanted.is_empty() {
-            continue;
+        // A region holding none of the targets contributes nothing to what was
+        // asked for, so every step in it goes. Leaving it whole would mean
+        // `--targets a` still sent every request of every *other* region —
+        // which is the opposite of what naming a target is for, and dangerous
+        // in the release-testing case the flag exists to serve.
+        let mut keep_written: HashSet<usize> = HashSet::new();
+        if !wanted.is_empty() {
+            let mut keep: HashSet<usize> = wanted.iter().copied().collect();
+            for &w in &wanted {
+                keep.extend(plan.ancestors(w));
+            }
+            keep_written = keep.iter().map(|&i| plan.steps[i].written).collect();
         }
-        let mut keep: HashSet<usize> = wanted.iter().copied().collect();
-        for &w in &wanted {
-            keep.extend(plan.ancestors(w));
+        // `Step::written` indexes `body` including its comments, so the filter
+        // has to count the same way. Counting only steps made the two index
+        // spaces drift apart the moment a comment appeared above a request, and
+        // the wrong steps were dropped — silently, since the pruned flow is
+        // never revalidated.
+        for step in &plan.steps {
+            let caps = resolve_qualified(entries, helpers, &step.request)
+                .map(|e| {
+                    e.captures
+                        .iter()
+                        .map(|(c, _)| c.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if keep_written.contains(&step.written) {
+                kept_captures.extend(caps);
+            } else {
+                dropped_names.insert(step.name.clone());
+                dropped_captures.extend(caps);
+            }
         }
-        let keep_written: HashSet<usize> = keep.iter().map(|&i| plan.steps[i].written).collect();
-        let mut written = 0usize;
+        let mut at = 0usize;
         body.retain(|n| {
+            let idx = at;
+            at += 1;
             if step_name(n).is_none() {
                 return true; // comments carry through; they order nothing
             }
-            let w = written;
-            written += 1;
-            keep_written.contains(&w)
+            keep_written.contains(&idx)
         });
     }
+    // A cleanup undoes what a step did. If pruning removed every step it was
+    // undoing, there is nothing left to tear down, and keeping it is worse than
+    // useless: a declared dependency on a vanished step becomes a skip and an
+    // exit code saying the run was incomplete, while an inferred one can send
+    // the teardown with a variable nobody in this run ever set.
+    flow.nodes.retain(|n| {
+        let FlowNode::Cleanup { name, depends, .. } = n else {
+            return true;
+        };
+        if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
+            return false;
+        }
+        let Some(entry) = resolve_qualified(entries, helpers, name) else {
+            return true;
+        };
+        // Only a name that *was* produced by a pruned step and is not produced
+        // by a surviving one: anything else comes from the environment or from
+        // outside the region, and is none of pruning's business.
+        !crate::request::entry_referenced_keys(entry)
+            .iter()
+            .any(|r| dropped_captures.contains(r.as_str()) && !kept_captures.contains(r.as_str()))
+    });
+
     // A target nobody matched is a typo or a step outside a region, and either
     // way running something other than what was asked for is worse than
     // refusing.
@@ -507,6 +560,64 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_reference_only_an_assert_makes_still_orders_the_step() {
+        // Hurl substitutes into an `[Asserts]` predicate exactly as it does into
+        // a URL, so a step whose only use of a capture is there still depends on
+        // whoever produced it. Missing that meant the consumer could be ordered
+        // first and fail on an undefined variable.
+        let mut consumer = entry("consumer", &[], &[]);
+        consumer
+            .asserts
+            .push("jsonpath \"$.id\" == {{token}}".into());
+        let entries = [consumer, entry("producer", &["token"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&p, &p.order),
+            ["producer", "consumer"],
+            "{:?}",
+            p.order
+        );
+    }
+
+    #[test]
+    fn a_reference_only_an_option_makes_still_orders_the_step() {
+        let mut consumer = entry("consumer", &[], &[]);
+        consumer
+            .options
+            .push(crate::hurl::KvRow::new("retry", "{{attempts}}"));
+        let entries = [consumer, entry("producer", &["attempts"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(names(&p, &p.order), ["producer", "consumer"]);
+    }
+
+    #[test]
+    fn a_disabled_row_does_not_invent_a_dependency() {
+        // A disabled header never reaches the wire, so the placeholder in it is
+        // not a use — and an edge drawn from text nothing evaluates would
+        // reorder a region for no reason at all.
+        let mut consumer = entry("consumer", &[], &[]);
+        let mut row = crate::hurl::KvRow::new("X-Disabled", "{{token}}");
+        row.enabled = false;
+        consumer.headers.push(row);
+        let entries = [consumer, entry("producer", &["token"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST consumer\n    REQUEST producer\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert!(p.edges.is_empty(), "{:?}", p.edges);
+        assert_eq!(names(&p, &p.order), ["consumer", "producer"]);
     }
 
     /// Parse a flow whose first node is a region, and plan it.
@@ -667,6 +778,95 @@ mod tests {
         assert!(text.contains("REQUEST login"), "{text}");
         assert!(text.contains("REQUEST api"), "{text}");
         assert!(!text.contains("unrelated"), "{text}");
+    }
+
+    #[test]
+    fn a_comment_above_a_step_does_not_shift_what_pruning_keeps() {
+        // `Step::written` indexes the body including comments. A filter that
+        // counted only steps drifted out of that index space at the first
+        // comment and dropped the wrong ones — here, the producer the target
+        // needs, leaving a target that cannot run.
+        let entries = [
+            entry("login", &["token"], &[]),
+            entry("api", &[], &["token"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    # a comment shifts nothing\n    REQUEST login\n    REQUEST api\nEND\n",
+            &["api"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("REQUEST login"), "{text}");
+        assert!(text.contains("REQUEST api"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_goes_with_the_step_it_was_undoing() {
+        // Keeping it would turn a targeted run into a skip and an exit code
+        // saying the run was incomplete — when in fact nothing was left to tear
+        // down, because the thing it tears down was never built.
+        let entries = [
+            entry("a", &[], &[]),
+            entry("b", &[], &[]),
+            entry("teardown", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST a\n    REQUEST b\nEND\nCLEANUP teardown DEPENDS a\n",
+            &["b"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_whose_producer_survives_is_kept() {
+        let entries = [
+            entry("a", &[], &[]),
+            entry("b", &[], &[]),
+            entry("teardown", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST a\n    REQUEST b\nEND\nCLEANUP teardown DEPENDS b\n",
+            &["b"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_that_reads_a_pruned_capture_goes_too() {
+        // The inferred case, which is the worse one: kept, it would send the
+        // teardown with a variable nobody in this run ever set.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("b", &[], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST b\nEND\nCLEANUP teardown\n",
+            &["b"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP"), "{text}");
+    }
+
+    #[test]
+    fn a_region_holding_no_target_is_emptied_not_left_whole() {
+        // Naming a target must not still send every request of every other
+        // region — that is the opposite of what the flag is for, and in the
+        // release-testing case it is for, actively dangerous.
+        let entries = [entry("a", &[], &[]), entry("b", &[], &[])];
+        let text = pruned(
+            "GRAPH first\n    REQUEST a\nEND\nGRAPH second\n    REQUEST b\nEND\n",
+            &["a"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("REQUEST a"), "{text}");
+        assert!(!text.contains("REQUEST b"), "{text}");
     }
 
     #[test]
