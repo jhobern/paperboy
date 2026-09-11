@@ -395,7 +395,23 @@ braces, because the value doesn't exist yet.
 | Hashes | `md5`, `sha1`, `sha256`, `sha512` |
 | MACs | `hmac_sha1(key, msg)`, `hmac_sha256`, `hmac_sha512` |
 | Text | `concat(…)`, `upper`, `lower`, `trim`, `split(text, sep, n)`, `regex(text, pattern)` |
+| JSON | `jsonpath(text, path)` |
 | Request | `method`, `url`, `path`, `query`, `header(name)`, `body`, `request_name` |
+
+`jsonpath(text, path)` reads a value out of a JSON document the block already
+has in hand — this request's own `body()`, or a response an earlier request
+captured whole. When the value comes straight from a response a `[Captures]`
+row is the right tool; this is for the cases a capture can't reach, which is
+anything that has to be *computed* from the value: signing part of a payload,
+or building this request's body out of pieces of the last one's. It walks `$`,
+`.name`, `["name"]`, `[n]` and `[?(@.key == 'x')]` — the last of which is how
+you address an API that returns its fields as a list of key/value objects. A
+string comes back as its text (not with the quotes still on), an object or
+array as compact JSON, and `null` is an error rather than the four characters
+`null`. Wildcards, recursive descent, slices and unions are refused by name
+rather than half-implemented, pointing you at the `[Captures]` row that has
+Hurl's full JSONPath: the same path meaning two different things in one
+request is worse than not being able to write it.
 
 Every hash and MAC returns lowercase hex — matching `sha256sum` and CryptoJS's
 `.toString()`, so a ported Postman script lands right — and each has a `_b64`

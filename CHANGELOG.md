@@ -12,6 +12,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **A `jsonpath(text, path)` generator.** The generator language could hash,
+  encode and sign a value but not *look one up*, so a `[Gen]` block that needed
+  one field out of a JSON document had no way to get at it — a signature over
+  `$.order.id` meant pasting the id in by hand. It takes the same notation
+  `[Captures]` does, including `[?(@.name=='x')]` to pick an element out of a
+  list, and it is the same implementation underneath, so the two cannot drift.
+  What it will not do, it says: `..`, `*`, slices and unions are refused by
+  name, pointing at `[Captures]`, rather than quietly returning nothing.
+
+- **An imported pre-request wait becomes `[Options] delay`.** A Postman script
+  that slept before sending — whether written as `setTimeout` or, as half of
+  them are, a spin on the clock — was dropped along with the rest of the
+  script. It now arrives as the Hurl option that means the same thing,
+  *switched off*: the wait is real, but an imported collection that silently
+  runs two seconds slower per request is its own kind of surprise. A wait in a
+  *test* script is only reported, since it belongs to whatever ran next.
+
+- **The import names a polling loop's numbers.** A script that re-ran its own
+  request is the one `setNextRequest` shape Hurl expresses exactly, and the
+  note now quotes the interval, the attempt bound and the assert that ends the
+  poll — read off the script — so the reader can write the `[Options]` block
+  without going back to read the JavaScript a second time. Anything it could
+  not read is left as a blank to fill in rather than guessed at.
+
 - **A retrying request now says so, while it is retrying.** A request carrying
   `[Options] retry: 5` with a `retry-interval` of a couple of seconds can be in
   flight for ten seconds or more, and every one of its attempts comes back at

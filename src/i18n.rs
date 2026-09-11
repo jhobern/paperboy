@@ -1011,6 +1011,7 @@ strings! {
     gen_desc_urlencode => "Percent-encodes the text for a URL.", "Encode le texte en pourcentage pour une URL.", "Procent-koder teksten til en URL.";
     gen_desc_urldecode => "Decodes percent-encoding back to text.", "Décode l'encodage en pourcentage.", "Afkoder procent-kodning tilbage til tekst.";
     gen_desc_json_string => "Quotes and escapes the text as JSON.", "Met le texte entre guillemets et l'échappe en JSON.", "Sætter teksten i anførselstegn og escaper den som JSON.";
+    gen_desc_jsonpath => "Reads one value out of the JSON text at the given JSONPath.", "Lit une valeur dans le texte JSON au chemin JSONPath indiqué.", "Læser én værdi ud af JSON-teksten på den angivne JSONPath.";
     gen_desc_md5 => "MD5 digest of the text, in hex.", "Empreinte MD5 du texte, en hexadécimal.", "MD5-hash af teksten, i hex.";
     gen_desc_md5_b64 => "MD5 digest of the text, base64-encoded.", "Empreinte MD5 du texte, encodée en base64.", "MD5-hash af teksten, base64-kodet.";
     gen_desc_sha1 => "SHA-1 digest of the text, in hex.", "Empreinte SHA-1 du texte, en hexadécimal.", "SHA-1-hash af teksten, i hex.";
@@ -1787,6 +1788,7 @@ impl Strings {
             "urlencode" => self.gen_desc_urlencode,
             "urldecode" => self.gen_desc_urldecode,
             "json_string" => self.gen_desc_json_string,
+            "jsonpath" => self.gen_desc_jsonpath,
             "md5" => self.gen_desc_md5,
             "md5_b64" => self.gen_desc_md5_b64,
             "sha1" => self.gen_desc_sha1,

@@ -1002,6 +1002,19 @@ fn call(
             arity("1", args.len() == 1)?;
             Ok(serde_json::Value::String(args[0].clone()).to_string())
         }
+        // Reaching into a JSON document the block already has in hand -- a
+        // response an earlier request captured whole, or this request's own
+        // `body()`. A `[Captures]` row is the right tool when the value comes
+        // straight from a response; this is for the cases a capture cannot
+        // reach, which is anything that has to be *computed* from the value:
+        // signing part of a payload, or building the next request's body out of
+        // pieces of the last one's.
+        "jsonpath" => {
+            arity("2", args.len() == 2)?;
+            let doc: serde_json::Value =
+                serde_json::from_str(&args[0]).map_err(|e| bad(format!("not valid JSON ({e})")))?;
+            json_path(&doc, &args[1]).map_err(bad)
+        }
 
         // ── Hashes and signatures ───────────────────────────────────────
         // The digest is bytes; the request needs text. Which text is not a
@@ -1339,6 +1352,13 @@ pub const FUNCTIONS: &[GenFunction] = &[
         signature: "json_string(text)",
         min_args: 1,
         max_args: Some(1),
+        examples: &[],
+    },
+    GenFunction {
+        name: "jsonpath",
+        signature: "jsonpath(text, path)",
+        min_args: 2,
+        max_args: Some(2),
         examples: &[],
     },
     GenFunction {
@@ -1817,6 +1837,77 @@ fn b64(bytes: &[u8], url_safe: bool) -> String {
     }
 }
 
+/// Read a value out of a JSON document with a plain `$.a.b[0]` path.
+///
+/// The walk itself is [`crate::report::run::json_path_get`] -- the same one a
+/// report column uses -- rather than a second implementation: the same path
+/// written in two places in PaperBoy has to mean the same thing, and two
+/// hand-rolled walkers that agree on the easy paths and differ on the hard ones
+/// is the worst outcome available. What is added here is the *why*: a walk that
+/// finds nothing comes back as `None`, and a row that failed needs to say
+/// whether the document was not JSON, the path was not a path, or the value
+/// simply is not there.
+///
+/// The notation it does not implement is refused by name, pointing at the
+/// `[Captures]` row that has Hurl's full JSONPath. Refusing matters more than
+/// it looks: a `$..id` that quietly picked the wrong `id` yields a value that
+/// looks perfectly reasonable in the request it ends up in, which is the exact
+/// kind of wrong a generator block exists to stop.
+fn json_path(doc: &serde_json::Value, path: &str) -> Result<String, String> {
+    let path = path.trim();
+    let unsupported = |what: &str| {
+        Err(format!(
+            "{what} is not supported here — use a `[Captures]` row, which has \
+             Hurl's full JSONPath"
+        ))
+    };
+    if !path.starts_with('$') {
+        return Err(format!("a path starts with `$`, not {path:?}"));
+    }
+    if path.contains("..") {
+        return unsupported("recursive descent (`..`)");
+    }
+    if path.contains('*') {
+        return unsupported("a wildcard");
+    }
+    // Inside brackets only: a `:` or `,` can appear perfectly legitimately in a
+    // quoted key, and `[?(...)]` filters *are* supported.
+    for part in path.split('[').skip(1) {
+        let inside = part.split(']').next().unwrap_or_default().trim();
+        if inside.starts_with('?') {
+            continue;
+        }
+        if inside.starts_with('\'') || inside.starts_with('"') {
+            continue;
+        }
+        if inside.contains(':') {
+            return unsupported("a slice");
+        }
+        if inside.contains(',') {
+            return unsupported("a union");
+        }
+    }
+
+    // Missing is an error, not an empty answer: this text goes on to be signed,
+    // sent or asserted against, and quietly nothing is the kind of wrong that
+    // looks like the server's fault.
+    let found = crate::report::run::json_path_get(doc, path)
+        .ok_or_else(|| format!("there is nothing at {path}"))?;
+
+    Ok(match found {
+        // A string is its text, not its JSON spelling: a row reading `$.token`
+        // wants the token, not `"the-token"` with the quotes still on.
+        serde_json::Value::String(s) => s,
+        // `null` is refused rather than rendered: "null" is four plausible
+        // characters to sign or send, and never what was meant.
+        serde_json::Value::Null => return Err(format!("the value at {path} is null")),
+        // An object or array comes back as compact JSON -- the only sensible
+        // text for it, and what a script hashing part of a payload wants.
+        // Canonicalisation is the author's, as everywhere else in a block.
+        other => other.to_string(),
+    })
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -2182,6 +2273,129 @@ mod tests {
                 "{expr} gave {e:?}"
             );
             assert!(!v.contains_key("v"), "{expr} still set a value");
+        }
+    }
+
+    /// A JSON document written as a `[Gen]` string literal, quotes and all --
+    /// the shape a row gets it in when it comes from `body()` or a capture.
+    fn as_literal(json: &str) -> String {
+        format!("\"{}\"", json.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// The shapes a ported script reaches for: a field, a nested field, an
+    /// element, a key that cannot be written with a dot, and a whole
+    /// sub-document to hash.
+    #[test]
+    fn jsonpath_reaches_into_a_document_the_block_already_has() {
+        let doc = r#"{"a":{"b":"x"},"items":[{"id":7},{"id":8}],"odd key":"k",
+                      "n":42,"ok":true,"sub":{"z":1}}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            ("field", r#"jsonpath(doc, "$.a.b")"#),
+            ("element", r#"jsonpath(doc, "$.items[1].id")"#),
+            ("bracketed", r#"jsonpath(doc, "$['odd key']")"#),
+            ("number", r#"jsonpath(doc, "$.n")"#),
+            ("boolean", r#"jsonpath(doc, "$.ok")"#),
+            ("whole", r#"jsonpath(doc, "$.sub")"#),
+            ("root", r#"jsonpath(doc, "$")"#),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["field"], "x");
+        assert_eq!(v["element"], "8");
+        assert_eq!(v["bracketed"], "k");
+        // A number and a boolean come back as the text they are written as --
+        // not quoted, not rounded.
+        assert_eq!(v["number"], "42");
+        assert_eq!(v["boolean"], "true");
+        // A sub-document is compact JSON: the only sensible text for it, and
+        // what a script hashing part of a payload wants.
+        assert_eq!(v["whole"], r#"{"z":1}"#);
+        assert!(v["root"].starts_with('{'));
+    }
+
+    /// The one filter shape the report columns needed, which a `[Gen]` row gets
+    /// for free by sharing their walker: an API that returns its fields as a
+    /// *list of key/value objects* has no addressable path to a named field
+    /// without it.
+    #[test]
+    fn jsonpath_can_pick_an_element_out_of_a_list_by_one_of_its_fields() {
+        let doc = r#"{"CardInfo":[{"key":"full_name","value":"Ada"},
+                       {"key":"dob","value":"1815-12-10"}]}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            (
+                "name",
+                r#"jsonpath(doc, "$.CardInfo[?(@.key=='full_name')].value")"#,
+            ),
+        ]);
+        assert!(e.is_empty(), "{e:?}");
+        assert_eq!(v["name"], "Ada");
+    }
+
+    /// Everything that is not there is a fault, never an empty answer: the
+    /// value goes on to be signed or sent, and quietly nothing is the hardest
+    /// kind of wrong to find. `null` included -- "null" is four plausible
+    /// characters that are never what was meant.
+    #[test]
+    fn jsonpath_refuses_rather_than_answering_with_nothing() {
+        let doc = r#"{"a":{"b":"x"},"items":[1],"nothing":null}"#;
+        let (v, e) = run(&[
+            ("doc", &as_literal(doc)),
+            ("missing", r#"jsonpath(doc, "$.a.nope")"#),
+            ("past_end", r#"jsonpath(doc, "$.items[3]")"#),
+            ("into_scalar", r#"jsonpath(doc, "$.a.b.c")"#),
+            ("null_value", r#"jsonpath(doc, "$.nothing")"#),
+            ("no_dollar", r#"jsonpath(doc, "a.b")"#),
+            ("not_json", r#"jsonpath("<html>", "$.a")"#),
+            ("bad_index", r#"jsonpath(doc, "$.items[x]")"#),
+        ]);
+        for name in [
+            "missing",
+            "past_end",
+            "into_scalar",
+            "null_value",
+            "no_dollar",
+            "not_json",
+            "bad_index",
+        ] {
+            assert!(!v.contains_key(name), "{name} was given a value: {v:?}");
+        }
+        assert_eq!(e.len(), 7, "{e:?}");
+        assert!(
+            e.iter()
+                .all(|err| matches!(err, GenError::BadArgument { .. })),
+            "{e:?}"
+        );
+    }
+
+    /// The paths the shared walker does not implement say so, and say where to
+    /// go instead. Hurl's own JSONPath is a full implementation and its module
+    /// is private, so anything unsupported here has to *fail* rather than be
+    /// half-answered: the same path written in a `[Gen]` row and a `[Captures]`
+    /// row quietly meaning different things is the worst outcome available.
+    #[test]
+    fn jsonpath_refuses_the_notation_it_does_not_share_with_hurl() {
+        let doc = r#"{"items":[{"id":1},{"id":2}]}"#;
+        for path in [
+            "$..id",
+            "$.items[*].id",
+            "$.items[0:1]",
+            "$.items[0,1]",
+            "$.*",
+        ] {
+            let (v, e) = run(&[
+                ("doc", &as_literal(doc)),
+                ("v", &format!(r#"jsonpath(doc, "{path}")"#)),
+            ]);
+            assert!(!v.contains_key("v"), "{path} was answered");
+            let detail = match e.as_slice() {
+                [GenError::BadArgument { detail, .. }] => detail.clone(),
+                other => panic!("{path} gave {other:?}"),
+            };
+            assert!(
+                detail.contains("[Captures]"),
+                "{path} should point at the row that can do it, said {detail:?}"
+            );
         }
     }
 

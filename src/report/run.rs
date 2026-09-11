@@ -1766,7 +1766,14 @@ fn string_arg(s: &str) -> Option<String> {
 /// dotted path within the element.
 ///
 /// Wildcards and recursive descent remain unimplemented.
-fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+///
+/// Shared with the `jsonpath()` generator function (see `generators::json_path`,
+/// which wraps this to say *why* a path found nothing). One implementation
+/// rather than two on purpose: the same path written in a report column and in
+/// a `[Gen]` row has to mean the same thing, and two hand-rolled walkers that
+/// agree on the easy paths and differ on the hard ones is the worst outcome
+/// available.
+pub(crate) fn json_path_get(root: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
     let rest = path.strip_prefix('$')?;
     // A filter turns one node into *many*, so the walk carries a set rather
     // than a single node. Before any filter the set is the single root, which
