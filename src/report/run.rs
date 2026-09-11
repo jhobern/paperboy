@@ -784,7 +784,7 @@ impl<'a> Exec<'a> {
                         Err(e) => self.errors.push(e),
                     }
                 }
-                FlowNode::Request { name, using } => {
+                FlowNode::Request { name, using, .. } => {
                     self.run_request(name, using);
                 }
                 FlowNode::Report(stmt) => {

@@ -300,6 +300,7 @@ impl RequestForm {
             // `USING` describes the send, so it survives dropping REPORT.
             FlowNode::Request {
                 name: self.name.trim().to_string(),
+                alias: self.alias_opt(),
                 using: self.using_clause(),
             }
         }
@@ -759,10 +760,10 @@ fn build_request(
     node: &FlowNode,
 ) -> RequestForm {
     let (name, report, alias, response, show, hide, with, using) = match node {
-        FlowNode::Request { name, using } => (
+        FlowNode::Request { name, alias, using } => (
             name.clone(),
             false,
-            None,
+            alias.clone(),
             None,
             Vec::new(),
             Vec::new(),
@@ -2405,6 +2406,7 @@ mod tests {
         let nodes = vec![
             FlowNode::Request {
                 name: "warmup".into(),
+                alias: None,
                 using: Vec::new(),
             },
             FlowNode::Report(crate::report::flow::ReportStmt::Request {

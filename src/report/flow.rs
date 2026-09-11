@@ -212,9 +212,21 @@ pub enum FlowNode {
     /// Holds the text *after* the `#`, verbatim (leading space included), so a
     /// comment round-trips byte for byte.
     Comment(String),
-    /// `REQUEST <name> [USING(…)]` — send a request, emit no column.
+    /// `REQUEST <name> [AS <step>] [USING(…)]` — send a request, emit no column.
     Request {
         name: String,
+        /// The step name: `AS <step>`.
+        ///
+        /// A *step* is one execution of a request, and the step name — not the
+        /// request name — is the unit of identity. It is what a dependency
+        /// clause refers to and what qualifies a capture reference, which is
+        /// why it must be an identifier while request names stay path-like.
+        ///
+        /// `None` means "defaulted": the request's leaf name is used, which is
+        /// only legal when that leaf is already a valid identifier and the
+        /// request is invoked exactly once in the flow. Validation enforces
+        /// both, so two invocations can never silently collapse into one node.
+        alias: Option<String>,
         /// See [`ReportStmt::Request::using`].
         using: Vec<UsingItem>,
     },
@@ -1126,8 +1138,12 @@ fn write_node(out: &mut String, node: &FlowNode, depth: usize) {
         FlowNode::Comment(text) => {
             let _ = writeln!(out, "#{text}");
         }
-        FlowNode::Request { name, using } => {
-            let _ = writeln!(out, "REQUEST {}{}", name_text(name), using_text(using));
+        FlowNode::Request { name, alias, using } => {
+            let _ = write!(out, "REQUEST {}", name_text(name));
+            if let Some(a) = alias {
+                let _ = write!(out, " AS {}", name_text(a));
+            }
+            let _ = writeln!(out, "{}", using_text(using));
         }
         FlowNode::Report(stmt) => write_report(out, stmt, depth),
         FlowNode::ForEach {
@@ -1495,8 +1511,12 @@ impl FlowNode {
             }
             FlowNode::Param(p) => param_text(p),
             FlowNode::Comment(text) => format!("#{text}"),
-            FlowNode::Request { name, using } => {
-                format!("REQUEST {name}{}", using_text(using))
+            FlowNode::Request { name, alias, using } => {
+                let as_text = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {a}"))
+                    .unwrap_or_default();
+                format!("REQUEST {name}{as_text}{}", using_text(using))
             }
             FlowNode::Report(stmt) => report_label(stmt),
             FlowNode::ForEach {

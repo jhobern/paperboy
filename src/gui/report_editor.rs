@@ -1442,8 +1442,11 @@ fn build_node_chips(
         FlowNode::Comment(text) => {
             vec![Chip::base(format!("#{text}"), th.dim).with_help(s.chip_help_comment)]
         }
-        FlowNode::Request { name, using } => {
+        FlowNode::Request { name, alias, using } => {
             let mut chips = vec![Chip::request(name, req_col).with_help(s.chip_help_request)];
+            if let Some(a) = alias {
+                chips.push(Chip::base(format!("AS {a}"), th.accent).with_help(s.chip_help_alias));
+            }
             chips.extend(using_chip(using, th.subst, s.chip_help_using));
             chips
         }

@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
+## [Unreleased]
+
+### Added
+
+- **`AS` now names a step on a plain `REQUEST`, not just `REPORT REQUEST`.** A
+  *step* is one execution of a request, and its name — not the request's name —
+  is what identifies it. `REQUEST auth/session AS sess` is now legal, and `AS`
+  may be written on either side of `USING(…)`, as it already could on a reported
+  request. With no `AS`, the request's leaf name is used.
+
+- **PaperTrail now checks that every step can be named, and that a name
+  identifies one step.** Running the same request twice in one block without
+  naming the two invocations is reported rather than silently treated as one
+  thing, and a request whose name can't be an identifier (an imported
+  `43_ocr_result`, say) is told to carry an `AS`.
+
+  Uniqueness is lexical: a name must be unique along any one path from the top
+  of the flow to the statement, which is exactly the set of steps a reference
+  can see. Two sibling loops may therefore each contain a `CreateSession`, and
+  may each report `AS Liveness` so that both halves fill one shared set of
+  columns — a column is identified by its name, not by which statement filled
+  it. A nested block may not reuse a name from a block enclosing it.
+
+
 ## [0.5.6] - 2026-09-11
 
 ### Added

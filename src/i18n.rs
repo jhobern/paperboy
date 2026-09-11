@@ -1651,6 +1651,14 @@ strings! {
     diag_show_hide_conflict => "Field '{}' is in both SHOW and HIDE — these conflict.", "Le champ '{}' figure à la fois dans SHOW et HIDE — ces clauses sont contradictoires.", "Feltet '{}' er både i SHOW og HIDE — de er i konflikt.";
     diag_hide_unknown => "HIDE field '{}' on request '{}' isn't a field that request produces.", "Le champ HIDE '{}' de la requête '{}' n'est pas un champ produit par cette requête.", "HIDE-feltet '{}' på forespørgslen '{}' er ikke et felt, den forespørgsel producerer.";
     diag_request_ambiguous_title => "Request '{}' is ambiguous — {} requests share that title.", "La requête '{}' est ambiguë — {} requêtes portent ce titre.", "Forespørgslen '{}' er tvetydig — {} forespørgsler deler den titel.";
+    // A *step* is one execution of a request, and its name is the unit of
+    // identity: what a dependency clause refers to and what qualifies a capture
+    // reference. Step names are therefore identifiers, while request names stay
+    // path-like — hence a rule that a request name does not have to satisfy.
+    diag_step_name_invalid => "Step name '{}' isn't a valid name — it must start with a letter or underscore, then letters, digits or underscores.", "Le nom d'étape '{}' n'est pas valide — il doit commencer par une lettre ou un tiret bas, puis des lettres, chiffres ou tirets bas.", "Trinnavnet '{}' er ikke gyldigt — det skal begynde med et bogstav eller en understreg og derefter kun indeholde bogstaver, tal eller understreger.";
+    diag_step_name_duplicate => "Step name '{}' is used {} times — every step needs a name of its own.", "Le nom d'étape '{}' est utilisé {} fois — chaque étape doit avoir son propre nom.", "Trinnavnet '{}' bruges {} gange — hvert trin skal have sit eget navn.";
+    diag_step_name_ambiguous => "Request '{}' is run {} times, so 'AS <step>' is needed to tell the runs apart.", "La requête '{}' est exécutée {} fois : 'AS <étape>' est nécessaire pour les distinguer.", "Forespørgslen '{}' køres {} gange, så 'AS <trin>' er nødvendigt for at skelne dem.";
+    diag_step_name_not_identifier => "Request '{}' can't name its own step — add 'AS <step>' with a name that starts with a letter or underscore.", "La requête '{}' ne peut pas nommer son étape — ajoutez 'AS <étape>' avec un nom commençant par une lettre ou un tiret bas.", "Forespørgslen '{}' kan ikke navngive sit eget trin — tilføj 'AS <trin>' med et navn, der begynder med et bogstav eller en understreg.";
     report_add_helper_collection => "HELPER COLLECTION…", "COLLECTION D'APPOINT…", "HJÆLPESAMLING…";
     report_alias_unset => "alias", "alias", "alias";
     // The two halves of a `# labels:` class. The hints are examples rather than

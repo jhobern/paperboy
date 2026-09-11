@@ -269,6 +269,10 @@ pub fn validate(flow: &ReportFlow, ctx: &Context) -> Vec<Diagnostic> {
     let mut scopes: Vec<HashMap<String, Producer>> = vec![HashMap::new()];
     walk(&flow.nodes, ctx, &mut scopes, &mut diags);
 
+    // Step identity: every request statement has to be nameable, and a name has
+    // to identify one step within the scopes that can see it.
+    check_step_names(flow, ctx, &mut diags);
+
     // Variable-availability analysis: walk the flow in execution order and
     // warn when a request references a `{{VAR}}` that is provably not defined
     // at that point. Only runs when both the base-env variable names AND the
@@ -499,7 +503,7 @@ fn walk(
                     .unwrap()
                     .insert(name.clone(), producer.clone());
             }
-            FlowNode::Request { name, using } => {
+            FlowNode::Request { name, using, .. } => {
                 check_request_name(name, ctx, diags);
                 check_using(name, using, ctx, diags);
             }
@@ -836,6 +840,108 @@ fn check_collection_directives(flow: &ReportFlow, ctx: &Context, diags: &mut Vec
             s.diag_collection_helper_unreadable,
             &[reference, reason],
         )));
+    }
+}
+
+/// The step name a request statement contributes, and the request it names.
+///
+/// `alias` is `None` for a defaulted name, which is what tells the diagnostics
+/// apart: a clash between two written names is a different mistake from a
+/// clash between two names nobody wrote.
+struct StepUse<'a> {
+    request: &'a str,
+    alias: Option<&'a str>,
+}
+
+fn step_use(node: &FlowNode) -> Option<StepUse<'_>> {
+    match node {
+        FlowNode::Request { name, alias, .. } => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+        }),
+        FlowNode::Report(ReportStmt::Request { name, alias, .. }) => Some(StepUse {
+            request: name,
+            alias: alias.as_deref(),
+        }),
+        _ => None,
+    }
+}
+
+/// Check that every step can be named, and that a name identifies one step.
+///
+/// A *step* is one execution of a request. Its name is the unit of identity —
+/// what a dependency clause refers to and what qualifies a capture reference —
+/// so it has to be an identifier, and it has to be unambiguous. `AS` supplies
+/// it; with no `AS` the request's leaf name is used, which is only viable when
+/// that leaf is already an identifier.
+///
+/// **Uniqueness is lexical, not flow-global.** A name must be unique along any
+/// one root-to-leaf path, because that is exactly the set of steps a reference
+/// can see: a statement can refer to its own body and to enclosing ones, never
+/// sideways into a sibling block. Two sibling loops may therefore each contain
+/// a `CreateSession`, or each report `AS Liveness` to pour their rows into one
+/// shared set of columns — a deliberate idiom, since a column is identified by
+/// its name rather than by which statement filled it. A flow-global rule would
+/// reject both, and would be rejecting readable, unambiguous flows to no end.
+fn check_step_names(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
+    let mut path: Vec<HashMap<String, bool>> = vec![HashMap::new()];
+    walk_step_names(&flow.nodes, ctx, &mut path, diags);
+}
+
+fn walk_step_names(
+    nodes: &[FlowNode],
+    ctx: &Context,
+    path: &mut Vec<HashMap<String, bool>>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let s = ctx.strings;
+    for node in nodes {
+        if let Some(use_) = step_use(node) {
+            let name = match use_.alias {
+                Some(a) => {
+                    if !super::parser::is_ident(a) {
+                        diags.push(Diagnostic::error(fill(s.diag_step_name_invalid, &[a])));
+                        continue;
+                    }
+                    a
+                }
+                None => {
+                    let leaf = use_.request.rsplit('/').next().unwrap_or(use_.request);
+                    if !super::parser::is_ident(leaf) {
+                        diags.push(Diagnostic::error(fill(
+                            s.diag_step_name_not_identifier,
+                            &[use_.request],
+                        )));
+                        continue;
+                    }
+                    leaf
+                }
+            };
+            // `written` records how the *existing* name got there, so the
+            // message names the mistake actually made.
+            if let Some(written) = path.iter().find_map(|f| f.get(name)) {
+                let msg = if *written || use_.alias.is_some() {
+                    fill(s.diag_step_name_duplicate, &[name, "2"])
+                } else {
+                    fill(s.diag_step_name_ambiguous, &[use_.request, "2"])
+                };
+                diags.push(Diagnostic::error(msg));
+            } else {
+                path.last_mut()
+                    .unwrap()
+                    .insert(name.to_string(), use_.alias.is_some());
+            }
+        }
+        // A loop body is a new lexical frame: names inside it are visible to
+        // the body and to nothing outside it.
+        match node {
+            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                path.push(HashMap::new());
+                walk_step_names(body, ctx, path, diags);
+                path.pop();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2553,6 +2659,145 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("TOKEN") && w.contains("After")),
             "TOKEN IS captured by the time After runs: {warns_before:?}"
+        );
+    }
+    // ---- Step identity -----------------------------------------------------
+
+    /// Only the errors, as text — step-name checks need no collection context.
+    fn step_errors(src: &str) -> Vec<String> {
+        diags_for(src, None, None)
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn as_names_a_plain_request_step() {
+        let src = "# collection: c\n\nREQUEST auth/session AS sess\n";
+        let flow = parse_flow(src).expect("parses");
+        assert!(matches!(
+            &flow.nodes[0],
+            FlowNode::Request { name, alias: Some(a), .. }
+                if name == "auth/session" && a == "sess"
+        ));
+        // And it round-trips, so naming a step survives an editor save.
+        assert_eq!(flow.to_text(), src);
+    }
+
+    #[test]
+    fn as_and_using_are_accepted_in_either_order_on_a_plain_request() {
+        // The clause belongs to the send and the name to the step, so neither
+        // order is obviously wrong to reach for; both normalise on save.
+        let a = parse_flow("# collection: c\n\nREQUEST up AS u USING(FILE)\n").expect("parses");
+        let b = parse_flow("# collection: c\n\nREQUEST up USING(FILE) AS u\n").expect("parses");
+        assert_eq!(a.to_text(), b.to_text());
+    }
+
+    #[test]
+    fn two_steps_in_one_body_may_not_share_a_name() {
+        // The defect this whole rule exists for: two sends collapsing into one
+        // node, so a reference to `up` cannot say which one it meant.
+        let errs = step_errors("# collection: c\n\nREQUEST up AS u\nREQUEST up AS u\n");
+        assert!(
+            errs.iter().any(|e| e.contains("'u'") && e.contains("own")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn running_one_request_twice_without_as_is_ambiguous() {
+        let errs = step_errors("# collection: c\n\nREQUEST up\nREQUEST up\n");
+        assert!(
+            errs.iter().any(|e| e.contains("'up'") && e.contains("AS")),
+            "{errs:?}"
+        );
+        // Naming them resolves it.
+        assert!(step_errors("# collection: c\n\nREQUEST up AS a\nREQUEST up AS b\n").is_empty());
+    }
+
+    #[test]
+    fn sibling_blocks_may_reuse_a_step_name() {
+        // `liveness.trail` does exactly this: two sibling loops each create a
+        // session and each report `AS Liveness`, deliberately, so both halves
+        // pour into one set of columns. Nothing in either block can refer to
+        // the other, so neither name is ambiguous and a flow-global uniqueness
+        // rule would reject a working, readable flow.
+        let src = concat!(
+            "# collection: c\n\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST CreateSession\n",
+            "    REPORT REQUEST result AS Liveness\n",
+            "END\n",
+            "FOR B IN FILES \"y\"\n",
+            "    REQUEST CreateSession\n",
+            "    REPORT REQUEST result AS Liveness\n",
+            "END\n",
+        );
+        assert_eq!(step_errors(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_nested_block_may_not_shadow_an_enclosing_step_name() {
+        // Unlike siblings, a body *can* see its ancestors, so reusing the name
+        // there really would be ambiguous.
+        let src = concat!(
+            "# collection: c\n\n",
+            "REQUEST setup AS s\n",
+            "FOR A IN FILES \"x\"\n",
+            "    REQUEST other AS s\n",
+            "END\n",
+        );
+        assert!(!step_errors(src).is_empty());
+    }
+
+    #[test]
+    fn a_step_name_must_be_an_identifier() {
+        let errs = step_errors("# collection: c\n\nREQUEST up AS \"43_result\"\n");
+        assert!(errs.iter().any(|e| e.contains("43_result")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_request_whose_leaf_is_not_an_identifier_must_be_named() {
+        // Imported names routinely start with a digit; PaperTrail identifiers
+        // may not, so such a request cannot name its own step.
+        let errs = step_errors("# collection: c\n\nREQUEST \"folder/43_result\"\n");
+        assert!(errs.iter().any(|e| e.contains("43_result")), "{errs:?}");
+        // Naming it is the fix.
+        assert!(step_errors("# collection: c\n\nREQUEST \"folder/43_result\" AS v43\n").is_empty());
+    }
+
+    #[test]
+    fn a_path_like_request_names_its_step_from_the_leaf() {
+        // The leaf is an identifier even though the full name is not, so no
+        // `AS` is needed — and a second, differently-pathed request with the
+        // same leaf is then the ambiguous case.
+        assert!(step_errors("# collection: c\n\nREQUEST \"a/b/session\"\n").is_empty());
+        assert!(
+            !step_errors("# collection: c\n\nREQUEST \"a/session\"\nREQUEST \"b/session\"\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_step_name_survives_the_report_toggle_both_ways() {
+        // `AS` is identity, not a reporting option, so upgrading a REQUEST to a
+        // REPORT REQUEST (and back) must not silently rename the step.
+        use crate::report::edit::{DetachWhich, Modifier, attach_to_node, detach_from_node};
+        let mut node = FlowNode::Request {
+            name: "up".into(),
+            alias: Some("u".into()),
+            using: Vec::new(),
+        };
+        assert!(attach_to_node(&mut node, Modifier::Report));
+        assert!(
+            matches!(&node, FlowNode::Report(ReportStmt::Request { alias: Some(a), .. }) if a == "u"),
+            "{node:?}"
+        );
+        detach_from_node(&mut node, DetachWhich::Report);
+        assert!(
+            matches!(&node, FlowNode::Request { alias: Some(a), .. } if a == "u"),
+            "{node:?}"
         );
     }
 }

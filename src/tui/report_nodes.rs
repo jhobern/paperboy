@@ -1785,10 +1785,10 @@ impl TuiApp {
     ) -> Option<RequestForm> {
         let report_id = self.reports[idx].report.id;
         let (name, report, alias, response, current_show, current_hide, with, using) = match node {
-            FlowNode::Request { name, using } => (
+            FlowNode::Request { name, alias, using } => (
                 name.clone(),
                 false,
-                None,
+                alias.clone(),
                 None,
                 Vec::new(),
                 Vec::new(),
@@ -1930,6 +1930,7 @@ impl TuiApp {
             // `USING` describes the send itself and survives.
             FlowNode::Request {
                 name: form.request.clone(),
+                alias: form.alias_opt(),
                 using: edit::using_items(&form.params, &edit::override_items(&form.overrides)),
             }
         };

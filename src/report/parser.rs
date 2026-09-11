@@ -54,7 +54,7 @@ param-decl   := 'PARAM' [ param-kind ] IDENT [ '=' value ] [ 'LABEL' name ]
 param-kind   := 'TEXT' | 'NUMBER' | 'ENV' | 'FOLDER' | 'FILE'
               | 'CHOICE' '(' [ name (',' name)* ] ')'
 
-request      := 'REQUEST' name
+request      := 'REQUEST' name [ 'AS' name ] [ using ]
 report       := 'REPORT' report-target
 report-target:= 'REQUEST' name [ 'AS' name ] [ response-fmt ] [ show ] [ hide ] [ with-block ]
               | IDENT 'AS' name                          # renamed variable column
@@ -347,8 +347,15 @@ fn param_kind(i: &str) -> IResult<&str, ParamKind> {
 fn request(i: &str) -> IResult<&str, FlowNode> {
     let (i, _) = kw("REQUEST")(i)?;
     let (i, name) = str_or_word(i)?;
-    let (i, using) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
-    Ok((i, FlowNode::Request { name, using }))
+    // `AS` and `USING(…)` are accepted in either order, for the same reason
+    // `REPORT REQUEST` accepts both: the clause belongs to the *send* and the
+    // name to the *step*, so neither order is the obviously wrong one to reach
+    // for. The serialiser emits one order, so a file normalises on save.
+    let (i, using_first) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
+    let (i, alias) = opt(preceded(kw("AS"), str_or_word))(i)?;
+    let (i, using_last) = map(opt(using_clause), Option::unwrap_or_default)(i)?;
+    let using: Vec<UsingItem> = using_first.into_iter().chain(using_last).collect();
+    Ok((i, FlowNode::Request { name, alias, using }))
 }
 
 /// `[PARALLEL[(n)]] FOR <pattern> IN (ENVS <clause> | <producer>) … END`.
@@ -1807,6 +1814,7 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
+                alias: None,
                 name: "My Request".into(),
                 using: Vec::new(),
             }
@@ -1819,6 +1827,7 @@ mod tests {
         assert_eq!(
             flow.nodes[0],
             FlowNode::Request {
+                alias: None,
                 name: "auth/Oauth".into(),
                 using: Vec::new(),
             }
