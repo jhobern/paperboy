@@ -565,7 +565,10 @@ struct Exec<'a> {
     /// one step and then sent with a different, failed step's identifier.
     capture_owner: HashMap<String, String>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
-    /// key (the `ENVS`/`TARGET` axis is deliberately excluded).
+    /// key. A role-bearing `ENVS` axis is deliberately excluded: it is the
+    /// comparison axis, and baseline and candidate have to agree on the key to
+    /// be paired. A plain `ENVS "a","b"` list assigns no roles and is keyed
+    /// like any other loop.
     key_parts: Vec<String>,
     /// The **structural path** to the current position: one `(node index in its
     /// block, iteration index)` pair per enclosing loop. Stable and unique per
@@ -748,7 +751,9 @@ struct Sched {
 /// covers while the run still reads as green.
 type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
 
-fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>, Vec<String>) {
+fn order_cleanups(
+    planned: Vec<PlannedCleanup<'_>>,
+) -> (Vec<PlannedCleanup<'_>>, Vec<String>, Vec<String>) {
     let index: HashMap<&str, usize> = planned
         .iter()
         .enumerate()
@@ -770,6 +775,7 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>,
     let mut done = vec![false; n];
     let mut out_idx: Vec<usize> = Vec::with_capacity(n);
     let mut cyclic: Vec<String> = Vec::new();
+    let mut stalled: Vec<String> = Vec::new();
     while out_idx.len() < n {
         let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
             // A cycle: emit what is left in the order it arrived. The
@@ -803,6 +809,14 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>,
                     .filter(|&&i| reaches_itself(i))
                     .map(|&i| planned[i].3.clone()),
             );
+            // Every leftover, not just the members. Kahn only stalls on a node
+            // still waiting on another leftover, so following those edges
+            // backwards through a finite set always reaches a ring: each one of
+            // these depends, transitively, on a cleanup that has been refused,
+            // and so cannot run either. Reporting only the members left the
+            // rest to be dispatched in arrival order — before the very steps
+            // they follow.
+            stalled.extend(stuck.iter().map(|&i| planned[i].3.clone()));
             out_idx.extend((0..n).filter(|&i| !done[i]));
             break;
         };
@@ -817,7 +831,7 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>,
         .into_iter()
         .filter_map(|i| slots[i].take())
         .collect();
-    (ordered, cyclic)
+    (ordered, cyclic, stalled)
 }
 
 /// Decrements the in-flight count and wakes the sleepers if the worker holding
@@ -1521,25 +1535,31 @@ impl<'a> Exec<'a> {
         // edges explicitly, keeping the reverse order above as the tie-break so
         // the ordinary unwinding is unchanged.
         let cyclic;
-        (planned, cyclic) = order_cleanups(planned);
+        let stalled;
+        (planned, cyclic, stalled) = order_cleanups(planned);
         if !cyclic.is_empty() {
             self.errors.push(crate::i18n::fill(
                 self.ctx.strings.run_cleanup_cycle,
                 &[&cyclic.join(", ")],
             ));
         }
-        // Record the ring's verdict before anything is dispatched, not as the
-        // loop reaches each member. When Kahn stalls the leftovers come out in
-        // arrival order, which throws away the well-formed edges *out of* the
-        // ring — so a perfectly ordinary cleanup downstream of one can be
-        // dispatched first. Marking as we went left it asking about a ring
-        // member no verdict had been written for yet: the reference was
-        // silently dropped, nothing gated it, and the teardown went out with
-        // `{{a.tok}}` still literal in its URL while the run called it a
-        // success. A verdict written up front is true whatever order the
-        // leftovers arrive in.
-        for (_, _, node, step, _) in &planned {
-            if !cyclic.contains(step) {
+        // Record the verdict for everything the sort could not order before
+        // anything is dispatched, not as the loop reaches each one. When Kahn
+        // stalls the leftovers come out in arrival order, which throws away the
+        // well-formed edges *between* them — so one can be dispatched before
+        // the very cleanup it follows. Asking at that moment found no verdict
+        // written for the other yet: the reference was silently dropped,
+        // nothing gated it, and the teardown went out with `{{a.tok}}` still
+        // literal in its URL while the run called it a success. A verdict
+        // written up front is true whatever order the leftovers arrive in.
+        //
+        // All of them, not only the ring's members. A leftover is by
+        // construction downstream of a ring, so its prerequisite has been
+        // refused and it could never have run — but it is not itself part of a
+        // cycle, so it is warned about rather than named in the cycle error,
+        // which would send its author to a line that is perfectly well formed.
+        for (_, _, node, step, deps) in &planned {
+            if !stalled.contains(step) {
                 continue;
             }
             let FlowNode::Cleanup { name, .. } = node else {
@@ -1547,6 +1567,15 @@ impl<'a> Exec<'a> {
             };
             self.skipped.push(step.clone());
             self.note_step(step, name, false);
+            if cyclic.contains(step) {
+                continue;
+            }
+            if let Some(dep) = deps.iter().find(|d| stalled.contains(d)) {
+                self.warnings.push(crate::i18n::fill(
+                    self.ctx.strings.run_cleanup_skipped,
+                    &[step, dep],
+                ));
+            }
         }
 
         for (_, _, node, step, _) in planned {
@@ -1576,9 +1605,11 @@ impl<'a> Exec<'a> {
             // Its members read one another, so whichever goes first is looking
             // for a value nothing has written yet — and a flat name in that
             // state falls through to whatever older step last stood in the
-            // chain, which is a live resource belonging to somebody else. Their
-            // verdict was written above, before any of this ran.
-            if cyclic.contains(&step) {
+            // chain, which is a live resource belonging to somebody else. The
+            // same is true of everything downstream of the ring, which is why
+            // the verdict above covers every cleanup the sort had to leave
+            // unordered, not just the members.
+            if stalled.contains(&step) {
                 continue;
             }
             let deps = self.cleanup_deps(name, depends, using, &step, &[]);
@@ -2230,9 +2261,16 @@ impl<'a> Exec<'a> {
     }
 
     /// Run a `FOR <var> IN ENVS <clause>` loop: swap the target-env layer per
-    /// environment and run the body once each. `ENVS` is *not* part of the row
-    /// key (it is the comparison axis); baseline envs run first. Iterations are
-    /// independent and may run in parallel.
+    /// environment and run the body once each. Baseline envs run first.
+    /// Iterations are independent and may run in parallel.
+    ///
+    /// A *role* clause's axis is not part of the row key: baseline and
+    /// candidate are the same logical row seen in two places, and they can only
+    /// be paired if they agree on the key. A plain `ENVS "a","b"` list compares
+    /// nothing, so that reasoning does not reach it — it is an iteration axis
+    /// like `FILES` or a list, and leaving it out collapsed every iteration
+    /// onto one key, where a nested comparison found a single baseline standing
+    /// for the lot.
     fn run_for_envs(
         &mut self,
         node_index: usize,
@@ -2289,6 +2327,9 @@ impl<'a> Exec<'a> {
             seed.broadcast.insert(k.clone(), v.clone());
         }
         let ctx = self.ctx;
+        // A plain list assigns no roles, so nothing pairs across it and its
+        // value belongs in the key like any other loop's.
+        let keyed = matches!(clause, EnvClause::Plain(_));
         let run_one = |i: usize| -> IterOut {
             let name = &live[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
@@ -2301,6 +2342,9 @@ impl<'a> Exec<'a> {
             }
             sub.scopes.push(HashMap::new());
             sub.set_var(var, name.clone());
+            if keyed {
+                sub.key_parts.push(name.clone());
+            }
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
@@ -3939,6 +3983,63 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_envs_loop_around_a_comparison_keeps_each_pair_apart() {
+        // The `ENVS` axis is left out of the row key because it is the
+        // comparison axis — baseline and candidate have to share a key to be
+        // paired. That is a statement about the loop assigning the *roles*. A
+        // plain `ENVS "a","b"` list compares nothing; it is an ordinary
+        // iteration axis, and excluding it too collapsed every iteration onto
+        // key `[]`, so one baseline won the lot and each candidate was diffed
+        // against a stranger's — reported confidently, under the foreign
+        // baseline's name, with the other baseline's row gone from the report.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR E IN ENVS \"a\", \"b\"\n\
+             \x20 FOR T IN ENVS BASELINE(\"{{E}}-prod\"), COMPARISON(\"{{E}}-stg\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{who}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("a", &[("who", "A")][..]),
+                ("b", &[("who", "B")][..]),
+                ("a-prod", &[("who", "A-PROD")][..]),
+                ("a-stg", &[("who", "A-STG")][..]),
+                ("b-prod", &[("who", "B-PROD")][..]),
+                ("b-stg", &[("who", "B-STG")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(Option<String>, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.cells[crate::report::compare::RESULT_COLUMN].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            verdicts.len(),
+            2,
+            "one collapsed row per pair: {verdicts:?}"
+        );
+        for (target, verdict) in &verdicts {
+            let env = target.as_deref().unwrap_or_default();
+            let own = format!("{}-prod (baseline)", &env[..1]);
+            assert!(
+                verdict.contains(&own),
+                "{env} must be measured against {own}: {verdict}"
+            );
+        }
+    }
+
+    #[test]
     fn a_role_named_through_a_capture_is_the_one_the_collapse_looks_for() {
         // The run resolves a role target against everything in scope; the
         // collapse used to re-derive it from the declared parameters alone. A
@@ -4004,6 +4105,81 @@ mod tests {
         assert!(
             !fake.call_order().contains(&"c".to_string()),
             "c depends on ring member 'a' and must be skipped, not sent",
+        );
+        assert!(
+            res.skipped.contains(&"c".to_string()),
+            "c must be reported as skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    #[test]
+    fn a_cleanup_two_hops_from_a_ring_is_not_sent_with_an_unresolved_reference() {
+        // Marking only the ring's *members* left the rest of Kahn's leftovers
+        // unaccounted for. They come out in arrival order, so a teardown could
+        // be dispatched before the leftover it depends on — which had no
+        // verdict yet, so `{{d.dkey}}` matched nothing, was silently dropped,
+        // and went out literal in the URL while the run called it a success.
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let mut d = graph_entry("d", &["dkey"], &["a.tok"]);
+        d.title = "d".into();
+        let e = graph_entry("e", &[], &["d.dkey"]);
+        let entries = [a, b, d, e];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP d\nCLEANUP e\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"e".to_string()),
+            "e follows d, which the ring refused: {:?}",
+            fake.call_order()
+        );
+        assert!(
+            res.skipped.contains(&"e".to_string()),
+            "e must be reported as skipped: {:?}",
+            res.skipped
+        );
+    }
+
+    #[test]
+    fn a_flat_reference_to_a_ring_members_capture_does_not_fire_at_an_older_value() {
+        // Planning resolves a flat `{{tok}}` to the sibling cleanup declaring
+        // it — a capture shadows the environment. Dispatch re-derived the deps
+        // with no siblings, so that rule vanished and the name fell through to
+        // an earlier ordinary step's value: a destructive request aimed at a
+        // live resource belonging to somebody else, and reported green. The
+        // same flow written `{{a.tok}}` was correctly skipped, so the two
+        // spellings of one dependency disagreed and the silent one was the
+        // dangerous one.
+        let old = graph_entry("old", &["sid", "tok"], &[]);
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &["tok"]);
+        let entries = [old, a, b, c];
+        let fake = Fake::new(&[ok_capturing(
+            "old",
+            &[("sid", "OLD_SID"), ("tok", "OLD_TOK")],
+        )]);
+        let res = run(
+            "REQUEST old AS old\nCLEANUP a\nCLEANUP b\nCLEANUP c\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"c".to_string()),
+            "c reads a value only the refused ring could write: {:?}",
+            fake.call_order()
         );
         assert!(
             res.skipped.contains(&"c".to_string()),
@@ -5271,8 +5447,9 @@ mod tests {
         assert_eq!(res.rows.len(), 2);
         assert_eq!(res.rows[0].target, Some("au".to_string()));
         assert_eq!(res.rows[1].target, Some("eu".to_string()));
-        // ENVS is the comparison axis: not part of the row key.
-        assert!(res.rows[0].key.is_empty());
+        // A plain list assigns no roles, so nothing pairs across it: its value
+        // is part of the row key like any other loop's.
+        assert_eq!(res.rows[0].key, vec!["au".to_string()]);
         // The env's vars are visible in the row snapshot.
         assert_eq!(res.rows[0].vars.get("REGION"), Some(&"au-1".to_string()));
     }

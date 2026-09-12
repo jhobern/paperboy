@@ -179,6 +179,27 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- Every `CLEANUP` the teardown sort cannot order is now refused, not just the
+  members of the ring itself. Kahn's leftovers come out in arrival order, which
+  throws away the well-formed edges *between* them, so a teardown two hops from
+  a ring could be dispatched before the one it follows — whose verdict did not
+  exist yet, so the reference was silently dropped and the request went out with
+  `{{d.dkey}}` literal in its URL, counted as a success. A leftover is by
+  construction downstream of a ring and could never have run.
+- A `CLEANUP` reading a flat `{{tok}}` that only a refused ring could write is
+  no longer fired at an older step's value — a destructive request aimed at a
+  live resource belonging to somebody else, reported green. The same dependency
+  spelled `{{a.tok}}` was correctly skipped, so the two spellings disagreed and
+  the silent one was the dangerous one.
+- A plain `ENVS "a","b"` loop is now part of the row key. Leaving the `ENVS`
+  axis out is what lets a baseline and its candidate pair up, but that is true
+  only of the loop assigning the *roles*; a plain list compares nothing. With
+  both excluded, a comparison nested inside a plain `ENVS` loop collapsed every
+  iteration onto one key, where a single baseline stood for the lot: each
+  candidate was diffed against a stranger's baseline and labelled with that
+  environment's name, while the other baseline's row vanished from the report.
+  **Baseline snapshots taken before this change carry the old keys** and will
+  not match rows from a plain `ENVS` loop; retake them.
 - A `CLEANUP` that refreshes a name it was given is once again counted as
   producing it. "A request that reads a value is not the one that supplies it"
   is true of a request waiting on its own response and of nothing else: a
