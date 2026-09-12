@@ -1082,7 +1082,9 @@ fn collect_column_images(
                     }
                 }
             }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => {
                 collect_column_images(body, out);
             }
             _ => {}
@@ -1116,7 +1118,9 @@ fn collect_column_details(nodes: &[FlowNode], out: &mut std::collections::HashSe
                     }
                 }
             }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => {
                 collect_column_details(body, out);
             }
             _ => {}
@@ -1150,7 +1154,9 @@ fn collect_column_truths(nodes: &[FlowNode], out: &mut std::collections::HashMap
                     }
                 }
             }
-            FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => {
                 collect_column_truths(body, out);
             }
             _ => {}
@@ -1218,7 +1224,7 @@ fn collect_column_stats(
                 }
                 collect_column_stats(body, out);
             }
-            FlowNode::ForEach { body, .. } => {
+            FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
                 collect_column_stats(body, out);
             }
             _ => {}

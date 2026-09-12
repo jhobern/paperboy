@@ -2674,6 +2674,34 @@ REPORT Thumb AS Small IMAGE(FIT)
         }
     }
 
+    /// A region is a scheduling device, not a scope: a column declared inside
+    /// one is a column of the same report. The collectors walked loop bodies
+    /// but not `GRAPH` bodies, so a `TRUTH` written in a region was scored
+    /// against nothing and `STATISTICS`/`IMAGE`/`DETAIL` were dropped — silent
+    /// in every case, since a column with no metadata still renders.
+    #[test]
+    fn column_metadata_written_inside_a_region_still_reaches_the_report() {
+        let src = "# collection: c\n\nGRAPH\n    REPORT V AS Verdict STATISTICS(COUNT) IMAGE(HEIGHT 60) DETAIL TRUTH \"{{ e }}\"\nEND\n";
+        let flow = parse_flow(src).expect("parse");
+        assert_eq!(
+            flow.column_truths().get("Verdict").map(String::as_str),
+            Some("{{ e }}"),
+            "a TRUTH inside a region is checked"
+        );
+        assert!(
+            flow.column_stats().contains_key("Verdict"),
+            "STATISTICS inside a region still summarise"
+        );
+        assert!(
+            flow.column_images().contains_key("Verdict"),
+            "IMAGE inside a region still renders"
+        );
+        assert!(
+            flow.column_details().contains("Verdict"),
+            "DETAIL inside a region still opens"
+        );
+    }
+
     /// The template is arbitrary text, so words that happen to be clause
     /// keywords inside it must stay part of the value, and an escaped quote
     /// must not end it early.

@@ -18,8 +18,23 @@ use super::flow::{Header, ImageSpec};
 pub const TARGET_COLUMN: &str = "TARGET";
 
 /// Which side of an `ENVS` comparison a row was produced on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Four states, not three, because "this row was produced under a clause that
+/// assigns no roles" and "nobody recorded a role for this row" are different
+/// facts and only one of them may be guessed at. Collapsing them meant a row
+/// from a plain `ENVS "prod","staging"` loop was looked up by *name* in the
+/// role sets of an unrelated comparison elsewhere in the flow, dragged into
+/// that collapse, and written out with a confident verdict about a comparison
+/// it was never part of.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RowRole {
+    /// No role was recorded: a row from a stored snapshot, or one built outside
+    /// a run. The collapse may fall back to matching its target by name.
+    #[default]
+    Unknown,
+    /// Produced under a clause that assigns no roles — a plain `ENVS` list, so
+    /// this row compares against nothing and passes the collapse through.
+    Unassigned,
     Baseline,
     Candidate,
 }
@@ -60,7 +75,7 @@ pub struct ReportRow {
     /// one iteration and the baseline in the next, so asking whether a name is
     /// "a baseline" has no single answer. Recorded where the row is produced,
     /// which is the only place that knows.
-    pub role: Option<RowRole>,
+    pub role: RowRole,
 }
 
 /// A whole run's output: the rows plus the first-seen order of produced column
@@ -1309,7 +1324,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
-            role: None,
+            role: RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

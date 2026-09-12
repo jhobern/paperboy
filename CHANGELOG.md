@@ -179,6 +179,39 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A baseline snapshot taken before the row key changed is now refused outright
+  rather than loaded and matched against nothing. Matching is exact key
+  equality, so a stale file read cleanly, contributed no baseline to any row,
+  and the report said `no baseline` as though none had ever been taken. The
+  snapshot format carries a version; it is now `2`, and an older file asks to be
+  retaken.
+- A row produced under an `ENVS` loop that assigns no roles is no longer swept
+  into somebody else's comparison. "Produced under a clause that assigns no
+  roles" and "no side recorded" are different facts, and only the second may be
+  guessed at by name — collapsing them let a plain `ENVS "a","b"` row be
+  matched by name against an unrelated `BASELINE`/`COMPARISON` pair elsewhere in
+  the flow and given a confident verdict it had no standing to receive.
+- An ordinary step that refreshes a name is once again counted as producing it.
+  "A request that has to be told a value is not the one that supplies it" holds
+  of a request waiting on *its own response* — which is what a `CLEANUP` asks
+  about its own dispatch moment — and of nothing else. An ordinary step captures
+  long before any teardown runs, so the name is bound by then whatever bound it
+  first; applying the exclusion to every statement dropped teardowns that read
+  a perfectly well-supplied name.
+- A binding written *below* a loop no longer vouches for a `CLEANUP` inside it.
+  A loop body's teardowns run at the end of every iteration, so a name bound
+  further down the page is not bound yet on any of them. The teardown survived
+  pruning and went out with `{{sid}}` verbatim, once per item, with the run
+  still reading as green.
+- A `CLEANUP` that depends on a dropped `CLEANUP` is now dropped as well.
+  Pruning recorded only dropped *steps*, so a teardown whose prerequisite had
+  itself been pruned away stayed in the plan with a reference nothing could
+  answer.
+- A `TRUTH`, `STATISTICS`, `IMAGE` or `DETAIL` written inside a `GRAPH` region
+  now reaches the report. A region is a scheduling device, not a scope, but the
+  column collectors walked loop bodies and not region bodies — so the clause was
+  dead text, and silently so, since a column with no metadata still renders.
+
 - An environment that is a baseline in one comparison is no longer mistaken for
   one everywhere. A role is a position in a single comparison, not a property of
   the name: rolling pairs — `[("v1","v2"), ("v2","v3")]` against

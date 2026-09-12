@@ -222,9 +222,13 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
         // The set is the fallback for rows with no role recorded: those loaded
         // from a stored snapshot, and any produced before roles were tracked.
         let (is_baseline, is_candidate) = match row.role {
-            Some(RowRole::Baseline) => (true, false),
-            Some(RowRole::Candidate) => (false, true),
-            None => (
+            RowRole::Baseline => (true, false),
+            RowRole::Candidate => (false, true),
+            // A plain `ENVS` list assigns no roles, so its rows compare against
+            // nothing and pass straight through — even when the environment
+            // they name is used as a role by some *other* clause in the flow.
+            RowRole::Unassigned => (false, false),
+            RowRole::Unknown => (
                 target
                     .as_deref()
                     .is_some_and(|t| roles.baseline.contains(t)),
@@ -421,7 +425,7 @@ mod tests {
 
     fn row(key: &[&str], target: &str, cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
-            role: None,
+            role: RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

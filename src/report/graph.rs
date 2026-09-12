@@ -493,6 +493,16 @@ fn scope_captures(
                 FlowNode::Cleanup { name, .. } => cleanups.then_some(name.as_str()),
                 _ => step_name(n).map(|(_, r)| r),
             };
+            // The self-read exclusion belongs to teardowns alone. A cleanup is
+            // asking about its own dispatch moment, where a name it has to be
+            // handed cannot also be one it supplies. An ordinary step captures
+            // long before any teardown runs, so by the time a cleanup reads the
+            // name it is bound — whatever it was worth beforehand, and wherever
+            // that older value came from. Applying the rule to every node meant
+            // the ordinary rotate shape (read the current `{{sid}}` from the
+            // environment, capture the new one) produced nothing as far as
+            // pruning could see, and the teardown was dropped in silence.
+            let self_read_only = matches!(n, FlowNode::Cleanup { .. });
             if let Some(request) = request
                 && let Some(e) = effective_entry(entries, helpers, request, using_values(n))
             {
@@ -501,7 +511,7 @@ fn scope_captures(
                     e.captures
                         .iter()
                         .map(|(c, _)| c)
-                        .filter(|c| !reads.contains(c.as_str()))
+                        .filter(|c| !self_read_only || !reads.contains(c.as_str()))
                         .cloned(),
                 );
             }
@@ -580,30 +590,41 @@ fn retain_cleanups(
     visible: &HashSet<String>,
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-    keep: &mut impl FnMut(&str, &[String], &[UsingItem], &HashSet<String>) -> bool,
+    keep: &mut impl FnMut(&str, &str, &[String], &[UsingItem], &HashSet<String>) -> bool,
 ) {
     let mut here = visible.clone();
     here.extend(scope_captures(nodes, entries, helpers, true));
     nodes.retain(|n| match n {
         FlowNode::Cleanup {
             name,
+            alias,
             depends,
             using,
-            ..
-        } => keep(name, depends, using, &here),
+        } => {
+            let step = alias
+                .clone()
+                .unwrap_or_else(|| crate::report::run::leaf(name).to_string());
+            keep(name, &step, depends, using, &here)
+        }
         _ => true,
     });
     // A loop body is its own block: its cleanups run at the end of *every
     // iteration*, while this block's run once, after the whole loop is over. So
     // a teardown out here has not written anything yet when one in there is
     // dispatched, and cannot be what answers its reference — the body sees this
-    // scope's steps and not its cleanups. A region is not a scope and keeps the
-    // lot.
-    let mut body_visible = visible.clone();
-    body_visible.extend(scope_captures(nodes, entries, helpers, false));
-    for n in nodes {
-        match n {
+    // scope's steps and not its cleanups.
+    //
+    // And only what is written *above* the loop. The rest of this scope runs
+    // after the body has finished, so a name bound down the page is not bound
+    // yet on any iteration: counting it kept a teardown that then went out with
+    // `{{sid}}` verbatim, once per item, with the run still reading as green.
+    // A region is not a scope and keeps the lot.
+    for i in 0..nodes.len() {
+        let (above, rest) = nodes.split_at_mut(i);
+        match &mut rest[0] {
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
+                let mut body_visible = visible.clone();
+                body_visible.extend(scope_captures(above, entries, helpers, false));
                 retain_cleanups(body, &body_visible, entries, helpers, keep)
             }
             FlowNode::Graph { body, .. } => retain_cleanups(body, &here, entries, helpers, keep),
@@ -762,20 +783,35 @@ pub fn prune_to_targets(
             &outer,
             entries,
             helpers,
-            &mut |name, depends, using, visible| {
-                if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
-                    return false;
-                }
-                let Some(effective) = effective_entry(entries, helpers, name, using) else {
-                    return true;
+            &mut |name, step, depends, using, visible| {
+                // A cleanup dropped here is as gone as a pruned step, so it
+                // joins them: the fixed-point loop then applies the same
+                // doctrine transitively. Without it a teardown could survive
+                // naming a sibling that no longer appears anywhere in the flow,
+                // to be skipped at run time with a warning pointing at it — and
+                // its own resource left standing.
+                let decide = || -> bool {
+                    if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
+                        return false;
+                    }
+                    let Some(effective) = effective_entry(entries, helpers, name, using) else {
+                        return true;
+                    };
+                    // Only a name that *was* produced by a pruned step and is not
+                    // produced by a surviving one in scope: anything else comes from the
+                    // environment or from outside the region, and is none of pruning's
+                    // business.
+                    !crate::request::entry_referenced_keys(&effective)
+                        .iter()
+                        .any(|r| {
+                            dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str())
+                        })
                 };
-                // Only a name that *was* produced by a pruned step and is not
-                // produced by a surviving one in scope: anything else comes from the
-                // environment or from outside the region, and is none of pruning's
-                // business.
-                !crate::request::entry_referenced_keys(&effective)
-                    .iter()
-                    .any(|r| dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str()))
+                let keep = decide();
+                if !keep {
+                    dropped_names.insert(step.to_string());
+                }
+                keep
             },
         );
         if count_cleanups(&flow.nodes) == before {
@@ -1252,6 +1288,89 @@ mod tests {
             &Strings::english(),
         )
         .expect("the flow's truth is overridden and never evaluated");
+    }
+
+    #[test]
+    fn an_ordinary_step_that_refreshes_a_name_produces_it_whatever_bound_it_first() {
+        // The self-read exclusion belongs to teardowns alone. An ordinary step
+        // captures long before any cleanup runs, so the name is bound by the
+        // time one reads it — and where the *old* value came from is beside the
+        // point. Applying the rule to every node meant the plain rotate shape,
+        // reading the current `{{sid}}` out of the environment, produced
+        // nothing as far as pruning could see and its teardown was dropped.
+        let entries = [
+            entry("provision", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("rotate", &["sid"], &["sid"]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST provision\n    REQUEST target\nEND\n\
+             REQUEST rotate\nCLEANUP purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            text.contains("CLEANUP purge"),
+            "rotate runs and writes sid: {text}"
+        );
+    }
+
+    #[test]
+    fn a_binding_written_below_a_loop_does_not_vouch_for_a_cleanup_inside_it() {
+        // A loop body's teardowns run at the end of every iteration, so nothing
+        // written after the loop has happened yet on any of them. Counting the
+        // whole enclosing scope regardless of position kept the cleanup, which
+        // then went out with `{{sid}}` verbatim once per item.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("work", &[], &[]),
+            entry("purge", &[], &["sid"]),
+            entry("later", &["sid"], &[]),
+        ];
+        for tail in ["sid=later\n", "REQUEST later\n"] {
+            let text = pruned(
+                &format!(
+                    "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+                     FOR x IN [\"1\"]\n    REQUEST work\n    CLEANUP purge\nEND\n{tail}"
+                ),
+                &["target"],
+                &entries,
+            )
+            .unwrap();
+            assert!(
+                !text.contains("CLEANUP purge"),
+                "{tail} is bound after the loop has finished: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleanup_depending_on_a_dropped_cleanup_is_dropped_too() {
+        // A cleanup pruning removes is as gone as a pruned step. Leaving it out
+        // of the dropped set meant a teardown survived naming a sibling that no
+        // longer appears anywhere in the flow — skipped at run time, with a
+        // warning pointing at that vanished name, and its own resource left
+        // standing.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("purge", &[], &["sid"]),
+            entry("close", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP purge\nCLEANUP close DEPENDS purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP"),
+            "close depends on purge, which is gone: {text}"
+        );
     }
 
     #[test]

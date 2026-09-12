@@ -21,12 +21,19 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::compare::{self, NO_CANDIDATE, RESULT_COLUMN};
-use super::model::{ReportResult, ReportRow};
+use super::model::{ReportResult, ReportRow, RowRole};
 
 /// The on-disk schema version. Bumped only if the stored shape changes
 /// incompatibly; `load` rejects versions it doesn't understand so a stale file
 /// fails loudly rather than diffing against garbage.
-const BASELINE_VERSION: u32 = 1;
+///
+/// Version 2: a plain `ENVS "a","b"` loop's value became part of the row key.
+/// Snapshots written before that stored every such row keyed `[]`, and matching
+/// is exact key equality — so an old file loads cleanly and then matches
+/// nothing, verdicting every row `no baseline` and appending a `no candidate`
+/// row per stale key. Silence is the worst outcome available here: the report
+/// reads as though the run had changed everything.
+const BASELINE_VERSION: u32 = 2;
 
 /// A saved run snapshot: the rows a previous run produced, in a stable JSON
 /// schema decoupled from the in-memory [`ReportRow`] so model changes don't
@@ -62,7 +69,7 @@ impl BaselineRow {
             path: Vec::new(),
             // A stored snapshot row has no role of its own: it takes the one
             // the clause injecting it assigns.
-            role: None,
+            role: RowRole::Unknown,
             target: self.target.clone(),
         }
     }
@@ -179,7 +186,7 @@ mod tests {
 
     fn row(key: &[&str], cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
-            role: None,
+            role: RowRole::Unknown,
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -214,6 +221,21 @@ mod tests {
             back.rows[1].cells.get("proc.overall"),
             Some(&"REVIEW".to_string())
         );
+    }
+
+    #[test]
+    fn a_snapshot_from_before_the_row_key_changed_is_refused() {
+        // Version 1 stored a plain `ENVS` loop's rows keyed `[]`; they are now
+        // keyed by the environment. Matching is exact key equality, so such a
+        // file would load cleanly and match nothing — every row `no baseline`,
+        // a bogus `no candidate` per stale key, and not a word about why.
+        let json = r#"{"version":1,"rows":[]}"#;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pb_baseline_v1_{}.baseline", std::process::id()));
+        std::fs::write(&path, json).unwrap();
+        let err = Baseline::load(&path).expect_err("a version-1 snapshot must be refused");
+        assert!(err.contains("version"), "{err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

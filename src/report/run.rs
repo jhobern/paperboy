@@ -581,7 +581,7 @@ struct Exec<'a> {
     /// The role the current `ENVS` target was given, if its clause assigned
     /// one. A role belongs to a position in one comparison, not to the
     /// environment's name — see [`ReportRow::role`].
-    role: Option<RowRole>,
+    role: RowRole,
     /// The current `ENVS` target's variables, layered above pinned/global.
     target_env: Option<HashMap<String, String>>,
     /// Cells produced by REPORT statements in *enclosing* blocks (before this
@@ -658,7 +658,7 @@ struct ExecState {
     key_parts: Vec<String>,
     path: Vec<(usize, usize)>,
     target: Option<String>,
-    role: Option<RowRole>,
+    role: RowRole,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
@@ -1134,7 +1134,7 @@ impl<'a> Exec<'a> {
             key_parts: Vec::new(),
             path: Vec::new(),
             target: None,
-            role: None,
+            role: RowRole::Unknown,
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
@@ -2299,8 +2299,8 @@ impl<'a> Exec<'a> {
         // comparison, not a property of the name: rolling pairs make the same
         // environment the candidate here and the baseline next time round, so
         // the collapse cannot recover it by looking the name up in a set.
-        let mut live_roles: Vec<Option<RowRole>> = Vec::new();
-        let mut file_roles: Vec<Option<RowRole>> = Vec::new();
+        let mut live_roles: Vec<RowRole> = Vec::new();
+        let mut file_roles: Vec<RowRole> = Vec::new();
         // An environment (or a snapshot path) may be named through a parameter
         // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
         // another pair of stacks without being edited. Resolved against the
@@ -2313,7 +2313,7 @@ impl<'a> Exec<'a> {
         match clause {
             EnvClause::Plain(names) => {
                 live = names.iter().map(resolve).collect();
-                live_roles = vec![None; live.len()];
+                live_roles = vec![RowRole::Unassigned; live.len()];
             }
             EnvClause::Roles {
                 baseline,
@@ -2331,11 +2331,11 @@ impl<'a> Exec<'a> {
                     match r {
                         RoleRef::Env(_) => {
                             live.push(got);
-                            live_roles.push(Some(role));
+                            live_roles.push(role);
                         }
                         RoleRef::File(_) => {
                             files.push(got);
-                            file_roles.push(Some(role));
+                            file_roles.push(role);
                         }
                     }
                 }
@@ -2710,7 +2710,7 @@ pub(super) fn apply_override(
 }
 
 /// The leaf (last `/`-segment) of a request title — the default alias.
-fn leaf(name: &str) -> &str {
+pub(super) fn leaf(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
@@ -4008,6 +4008,52 @@ mod tests {
                 verdict.contains("matched"),
                 "{:?} was not collapsed: {verdict}",
                 row.target
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_envs_row_is_not_dragged_into_someone_elses_comparison() {
+        // A plain list assigns no roles, so its rows compare against nothing —
+        // even when the environment they name is a baseline or candidate for
+        // some *other* clause in the same flow. Treating "no role recorded" and
+        // "no role assigned" as one fact meant these rows were looked up by
+        // name in the other comparison's sets, pulled into its collapse, and
+        // written out with a confident verdict about a comparison they were
+        // never part of.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR E IN ENVS \"prod\", \"staging\"\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n\
+             FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"staging\")\n\
+             \x20 REPORT REQUEST r AS proc2 SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc2.v\"\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("prod", &[("who", "P")][..]),
+                ("staging", &[("who", "S")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let plain: Vec<&ReportRow> = res
+            .rows
+            .iter()
+            .filter(|r| r.cells.contains_key("proc.v"))
+            .collect();
+        assert_eq!(plain.len(), 2, "both plain rows survive: {:?}", res.rows);
+        for row in plain {
+            assert!(
+                !row.cells
+                    .contains_key(crate::report::compare::RESULT_COLUMN),
+                "{:?} compares against nothing: {:?}",
+                row.target,
+                row.cells
             );
         }
     }

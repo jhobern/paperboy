@@ -909,7 +909,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
-            role: None,
+            role: crate::report::model::RowRole::default(),
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
