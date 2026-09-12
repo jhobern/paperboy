@@ -462,16 +462,35 @@ pub fn explain(
 /// and capturing `sid` vouched for itself — and, by surviving, for every
 /// sibling that read the same name — while a pair doing it to each other
 /// vouched mutually and left the run reporting a teardown cycle nobody wrote.
+/// That is a statement about a request and its own response, and nothing more:
+/// where the name is *also* bound in scope — an assignment, a parameter,
+/// another step's capture — a rotate-shaped request that reads the old value
+/// and captures a new one produces it like anything else. Assignments and
+/// parameters are counted for exactly that reason; they bind a name in this
+/// scope as surely as a capture does.
+///
+/// `cleanups` says whether teardown captures count. Among siblings in one block
+/// they do — the runner orders two cleanups against each other on exactly that
+/// basis — but the answer is different one scope down, so the caller decides.
 fn scope_captures(
     nodes: &[FlowNode],
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
+    cleanups: bool,
 ) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut visit = |nodes: &[FlowNode]| {
         for n in nodes {
             let request = match n {
-                FlowNode::Cleanup { name, .. } => Some(name.as_str()),
+                FlowNode::Assign { key, .. } => {
+                    out.insert(key.clone());
+                    continue;
+                }
+                FlowNode::Param(p) => {
+                    out.insert(p.name.clone());
+                    continue;
+                }
+                FlowNode::Cleanup { name, .. } => cleanups.then_some(name.as_str()),
                 _ => step_name(n).map(|(_, r)| r),
             };
             if let Some(request) = request
@@ -514,23 +533,28 @@ fn scope_captures(
 /// the bug. `column_truths` is what the runner scores against, so asking it is
 /// the same question, and the header is added because it is the one site the
 /// node walk cannot reach.
+///
+/// A `columns:` directive *is* the resolved column set (`resolved_columns`):
+/// the flow's own truths are merged into it by resolved header, and never over
+/// an inline one. So when the directive is present the question is not "what
+/// was written" but "what will be scored" — a flow truth for a column the
+/// directive omits, or renames with `AS`, is dead text. Refusing a run over a
+/// template that is never evaluated is the false-positive class two earlier
+/// checks had to be withdrawn for, so the resolved question is asked here too
+/// rather than half of it re-derived.
 fn declared_truths(flow: &ReportFlow) -> Vec<String> {
     let mut from_flow = flow.column_truths();
     let mut out = Vec::new();
     if let Some(spec) = flow.header.columns() {
         for col in crate::report::model::parse_columns(spec) {
-            if let Some(t) = col.truth {
-                // An inline truth in the `columns:` directive is never
-                // overridden by the flow's own (`resolved_columns`), so the
-                // flow's is dead text for that column — and refusing a run over
-                // a template that will never be evaluated is the false-positive
-                // class two earlier checks had to be withdrawn for. Ask the
-                // resolved question, not the written one.
-                from_flow.remove(&col.header);
+            if let Some(t) = col.truth.or_else(|| from_flow.remove(&col.header)) {
                 out.push(t);
             }
         }
+        return out;
     }
+    // With no directive the columns are whatever the run produces, in
+    // first-seen order — not knowable here, so every flow truth is a candidate.
     out.extend(from_flow.into_values());
     out
 }
@@ -559,7 +583,7 @@ fn retain_cleanups(
     keep: &mut impl FnMut(&str, &[String], &[UsingItem], &HashSet<String>) -> bool,
 ) {
     let mut here = visible.clone();
-    here.extend(scope_captures(nodes, entries, helpers));
+    here.extend(scope_captures(nodes, entries, helpers, true));
     nodes.retain(|n| match n {
         FlowNode::Cleanup {
             name,
@@ -569,10 +593,18 @@ fn retain_cleanups(
         } => keep(name, depends, using, &here),
         _ => true,
     });
+    // A loop body is its own block: its cleanups run at the end of *every
+    // iteration*, while this block's run once, after the whole loop is over. So
+    // a teardown out here has not written anything yet when one in there is
+    // dispatched, and cannot be what answers its reference — the body sees this
+    // scope's steps and not its cleanups. A region is not a scope and keeps the
+    // lot.
+    let mut body_visible = visible.clone();
+    body_visible.extend(scope_captures(nodes, entries, helpers, false));
     for n in nodes {
         match n {
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
-                retain_cleanups(body, &here, entries, helpers, keep)
+                retain_cleanups(body, &body_visible, entries, helpers, keep)
             }
             FlowNode::Graph { body, .. } => retain_cleanups(body, &here, entries, helpers, keep),
             _ => {}
@@ -1220,6 +1252,86 @@ mod tests {
             &Strings::english(),
         )
         .expect("the flow's truth is overridden and never evaluated");
+    }
+
+    #[test]
+    fn a_flow_truth_for_a_column_the_header_never_resolves_is_not_checked() {
+        // A `columns:` directive *is* the resolved column set: a flow truth is
+        // merged in only where its column appears there. So a truth for a
+        // column the directive leaves out — or renames with `AS`, since the
+        // merge is keyed by the resolved header — is never evaluated, and
+        // refusing a run over it strands nothing.
+        let entries = [entry("create", &[], &[]), entry("target", &[], &[])];
+        for columns in ["D", "C AS Pretty"] {
+            let mut flow = crate::report::parser::parse_flow(&format!(
+                "# collection: c\n# columns: {columns}\n\n\
+                 GRAPH\n    REPORT REQUEST create SHOW(HttpStatus)\n\
+                 \x20   REPORT REQUEST target SHOW(HttpStatus)\nEND\n\
+                 REPORT \"x\" AS C TRUTH \"{{{{create.HttpStatus}}}}\"\n"
+            ))
+            .expect("parses");
+            prune_to_targets(
+                &mut flow,
+                &["target".to_string()],
+                &entries,
+                &[],
+                &Strings::english(),
+            )
+            .unwrap_or_else(|e| panic!("columns: {columns} never resolves column C: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn a_step_that_refreshes_a_name_it_was_given_still_produces_it() {
+        // "Reads it, so doesn't produce it" is true of a request waiting on its
+        // own response and of nothing else. A rotate reads the old value from
+        // an assignment in scope and captures a new one — it genuinely writes
+        // the name, and it sits outside every region, so it certainly runs.
+        // Dropping the teardown that reads it leaks the resource in silence.
+        let entries = [
+            entry("provision", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("rotate", &["sid"], &["sid"]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "sid=seed\nGRAPH\n    REQUEST provision\n    REQUEST target\nEND\n\
+             REQUEST rotate\nCLEANUP purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            text.contains("CLEANUP purge"),
+            "rotate runs and writes sid: {text}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_outside_a_loop_does_not_vouch_for_one_inside_it() {
+        // A loop body is its own block: its cleanups run at the end of *each
+        // iteration*, while the enclosing block's run once the whole loop is
+        // over. So an outer teardown's capture has not happened yet when an
+        // inner one is dispatched, and cannot be what answers its reference.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("work", &[], &[]),
+            entry("purge", &[], &["sid"]),
+            entry("rotate", &["sid"], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             FOR x IN [\"1\"]\n    REQUEST work\n    CLEANUP purge\nEND\n\
+             CLEANUP rotate\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP purge"),
+            "rotate runs after the loop, so nothing has written sid yet: {text}"
+        );
     }
 
     #[test]

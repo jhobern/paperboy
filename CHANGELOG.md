@@ -179,6 +179,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A `CLEANUP` that refreshes a name it was given is once again counted as
+  producing it. "A request that reads a value is not the one that supplies it"
+  is true of a request waiting on its own response and of nothing else: a
+  rotate that reads the old `{{sid}}` from an assignment and captures a new one
+  writes that name like anything else, and `--targets` was dropping the
+  teardown that reads it — leaking the resource in silence, with the run still
+  green. Assignments and parameters now count as binding a name too.
+- A `CLEANUP` inside a loop body is no longer kept alive by one written outside
+  it. A loop body is its own block: its teardowns run at the end of *every
+  iteration*, while the enclosing block's run once the whole loop is over, so
+  the outer capture has not happened when the inner one is dispatched. It went
+  out with the placeholder verbatim.
+- `--targets` no longer refuses a run over a `TRUTH` for a column the
+  `columns:` directive never resolves. The directive *is* the resolved column
+  set, so a flow truth whose column it omits — or renames with `AS` — is dead
+  text that is never scored.
 - An `ENVS` role named through anything but a parameter — a capture, a prelude
   assignment — now collapses. The run resolved the target against everything in
   scope, but the comparison re-derived it from the declared parameters alone, so
