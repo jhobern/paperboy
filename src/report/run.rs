@@ -1523,6 +1523,19 @@ impl<'a> Exec<'a> {
             // resource an earlier step had really made; a sibling that ran but
             // captured nothing vouched for a value that belonged to a step that
             // had failed.
+            //
+            // A ring is the one shape the dispatch-time question cannot answer.
+            // Its members read one another, so whichever goes first is looking
+            // for a value nothing has written yet — and a flat name in that
+            // state falls through to whatever older step last stood in the
+            // chain, which is a live resource belonging to somebody else. The
+            // ring is already known by name here, and the error above has just
+            // told the user none of it ran, so make that true.
+            if cyclic.contains(&step) {
+                self.skipped.push(step.clone());
+                self.note_step(&step, name, false);
+                continue;
+            }
             let deps = self.cleanup_deps(name, depends, using, &step, &[]);
             if let Some(dep) = deps
                 .into_iter()
@@ -2484,7 +2497,7 @@ impl<'a> Exec<'a> {
 /// A disabled row that is targeted is re-enabled: an override says "send this
 /// value", and honouring the value while leaving the row switched off would be
 /// a null-op nobody could explain.
-fn apply_override(
+pub(super) fn apply_override(
     entry: &mut HurlEntry,
     target: &OverrideTarget,
     value: String,
@@ -3812,6 +3825,40 @@ mod tests {
             fake.call_vars("purge")
         );
         assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_ring_of_cleanups_is_skipped_not_fired_at_stale_values() {
+        // The cycle error says none of them ran. Resolving the gate purely from
+        // what had already happened made that false: neither member could see
+        // the other, so nothing gated either of them and both were sent —
+        // against whatever value an unrelated earlier step had left in the
+        // chain, which is a destructive request aimed at a live resource.
+        let old = graph_entry("old", &["sid", "tok"], &[]);
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let entries = [old, a, b];
+        let fake = Fake::new(&[ok_capturing(
+            "old",
+            &[("sid", "OLD_SID"), ("tok", "OLD_TOK")],
+        )]);
+        let res = run(
+            "REQUEST old AS old\nCLEANUP a\nCLEANUP b\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        for m in ["a", "b"] {
+            assert!(
+                !fake.call_order().contains(&m.to_string()),
+                "{m} was fired at a stale value: {:?}",
+                fake.call_vars(m)
+            );
+            assert!(res.skipped.contains(&m.to_string()), "{m} must be skipped");
+        }
     }
 
     #[test]

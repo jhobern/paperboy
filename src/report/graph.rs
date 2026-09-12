@@ -458,6 +458,20 @@ fn scope_captures(
     out
 }
 
+/// How many `CLEANUP`s the flow holds, at every depth.
+fn count_cleanups(nodes: &[FlowNode]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match n {
+            FlowNode::Cleanup { .. } => 1,
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => count_cleanups(body),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Drop the cleanups `keep` rejects, at every depth, telling it which capture
 /// names are visible where each one is written.
 fn retain_cleanups(
@@ -465,12 +479,17 @@ fn retain_cleanups(
     visible: &HashSet<String>,
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-    keep: &mut impl FnMut(&str, &[String], &HashSet<String>) -> bool,
+    keep: &mut impl FnMut(&str, &[String], &[UsingItem], &HashSet<String>) -> bool,
 ) {
     let mut here = visible.clone();
     here.extend(scope_captures(nodes, entries, helpers));
     nodes.retain(|n| match n {
-        FlowNode::Cleanup { name, depends, .. } => keep(name, depends, &here),
+        FlowNode::Cleanup {
+            name,
+            depends,
+            using,
+            ..
+        } => keep(name, depends, using, &here),
         _ => true,
     });
     for n in nodes {
@@ -502,7 +521,21 @@ fn retain_cleanups(
 /// running the wrong thing when it is actually the wrong thing.
 fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
     for node in nodes {
-        for text in crate::report::validate::interpolated_source(node) {
+        // A `TRUTH` template is a real consumer of a step: `resolve_truths`
+        // builds its scope from the row's cells first, and those are keyed
+        // `step.field`, so `TRUTH "{{create.HttpStatus}}"` resolves. Validation
+        // must therefore *not* refuse it — but pruning must not strand it
+        // either. Dropping the step removes the cell, the placeholder survives
+        // substitution, and every row in the column silently scores `Untested`
+        // with nothing said about why.
+        let truth = match node {
+            FlowNode::Report(ReportStmt::Computed { truth, .. }) => truth.as_deref(),
+            _ => None,
+        };
+        for text in crate::report::validate::interpolated_source(node)
+            .into_iter()
+            .chain(truth)
+        {
             for key in crate::environment::referenced_keys(text) {
                 if let Some((step, _)) = key.split_once('.')
                     && dropped_names.contains(step)
@@ -619,28 +652,61 @@ pub fn prune_to_targets(
     // "Still produced" is scope-aware: a step outside a region is never pruned,
     // so its captures count — but only where they can actually be read, which
     // for a step inside a loop body is that body alone.
+    // Repeated to a fixed point. `scope_captures` counts a cleanup's own
+    // captures as produced — rightly, since the runner orders two cleanups
+    // against each other on them — but the scope is built before the retain
+    // runs, so a cleanup this very pass is about to drop could vouch for a
+    // sibling. The sibling survived on the strength of a name that, once the
+    // pass finished, nothing in the run wrote, and went out with the
+    // placeholder verbatim. Each round can only remove cleanups, so the loop
+    // shrinks and terminates.
     let outer = HashSet::new();
-    retain_cleanups(
-        &mut flow.nodes,
-        &outer,
-        entries,
-        helpers,
-        &mut |name, depends, visible| {
-            if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
-                return false;
-            }
-            let Some(entry) = resolve_qualified(entries, helpers, name) else {
-                return true;
-            };
-            // Only a name that *was* produced by a pruned step and is not
-            // produced by a surviving one in scope: anything else comes from the
-            // environment or from outside the region, and is none of pruning's
-            // business.
-            !crate::request::entry_referenced_keys(entry)
-                .iter()
-                .any(|r| dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str()))
-        },
-    );
+    loop {
+        let before = count_cleanups(&flow.nodes);
+        retain_cleanups(
+            &mut flow.nodes,
+            &outer,
+            entries,
+            helpers,
+            &mut |name, depends, using, visible| {
+                if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
+                    return false;
+                }
+                let Some(entry) = resolve_qualified(entries, helpers, name) else {
+                    return true;
+                };
+                // Ask about the request as it will actually be *sent*. An override
+                // can both introduce a reference and take one away — `USING(url =
+                // …)` replaces the URL wholesale — and reading the collection entry
+                // alone got it wrong in both directions: a teardown whose override
+                // had removed the reference was deleted and its resource leaked,
+                // while one whose override *added* a stranded reference was kept
+                // and dispatched with the placeholder on the wire. Applying them to
+                // a copy asks exactly the question the runner will ask, instead of
+                // a second model of it that can drift.
+                let mut effective = entry.clone();
+                for item in using {
+                    if let UsingItem::Override { target, value } = item {
+                        let _ = crate::report::run::apply_override(
+                            &mut effective,
+                            target,
+                            value.clone(),
+                        );
+                    }
+                }
+                // Only a name that *was* produced by a pruned step and is not
+                // produced by a surviving one in scope: anything else comes from the
+                // environment or from outside the region, and is none of pruning's
+                // business.
+                !crate::request::entry_referenced_keys(&effective)
+                    .iter()
+                    .any(|r| dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str()))
+            },
+        );
+        if count_cleanups(&flow.nodes) == before {
+            break;
+        }
+    }
 
     // Pruning removes steps, and what is left may still name one. A qualified
     // reference to a step that is no longer in the run cannot resolve: the
@@ -953,6 +1019,80 @@ mod tests {
         let targets: Vec<String> = targets.iter().map(|t| (*t).to_string()).collect();
         prune_to_targets(&mut flow, &targets, entries, &[], &Strings::english())?;
         Ok(flow.to_text())
+    }
+
+    #[test]
+    fn an_override_decides_whether_a_cleanup_is_stranded() {
+        // Direction one: the override replaces the URL that held the reference,
+        // so the request actually sent is clean and the teardown must survive —
+        // dropping it leaks the resource silently.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP purge USING(url = \"http://x/fixed\")\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP purge"), "{text}");
+
+        // Direction two: the entry is clean but the override introduces the
+        // stranded reference, so keeping it would put `{{sid}}` on the wire.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("purge", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP purge USING(url = \"http://x/{{sid}}\")\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP purge"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_cannot_be_vouched_for_by_one_that_is_itself_dropped() {
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("rotate", &["sid"], &[]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP rotate DEPENDS create\nCLEANUP purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(!text.contains("CLEANUP rotate"), "{text}");
+        assert!(
+            !text.contains("CLEANUP purge"),
+            "purge was kept on a name only the dropped rotate wrote: {text}"
+        );
+    }
+
+    #[test]
+    fn a_truth_template_naming_a_pruned_step_is_refused() {
+        let entries = [entry("create", &[], &[]), entry("target", &[], &[])];
+        let errs = pruned(
+            "GRAPH\n    REPORT REQUEST create SHOW(HttpStatus)\n    REQUEST target\nEND\n\
+             REPORT \"x\" AS C TRUTH \"{{create.HttpStatus}}\"\n",
+            &["target"],
+            &entries,
+        )
+        .expect_err("a stranded TRUTH must be refused");
+        assert!(
+            errs.iter().any(|e| e.contains("create.HttpStatus")),
+            "{errs:?}"
+        );
     }
 
     #[test]

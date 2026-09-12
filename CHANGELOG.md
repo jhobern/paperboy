@@ -179,6 +179,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A cycle among `CLEANUP`s is no longer *run*. Resolving the gate purely from
+  what had already happened meant neither member of a ring could see the other,
+  so nothing held either of them back and both were sent — a flat name falling
+  through to whatever older step last stood in the capture chain, which is a
+  destructive teardown aimed at somebody else's live resource. The report said
+  none of them ran the whole time.
+- `--targets` now reads a cleanup's `USING(…)` overrides when deciding whether
+  pruning has stranded it. The collection entry alone got it wrong both ways: an
+  override that replaced the text holding the reference had its teardown deleted
+  and its resource leaked, while one that *introduced* a stranded reference was
+  kept and dispatched with the placeholder on the wire.
+- A cleanup can no longer be kept on the strength of a capture written by a
+  sibling cleanup that the same pruning pass removes.
+- A `TRUTH` template naming a step that `--targets` pruned is refused instead of
+  scoring every row in the column `Untested` silently.
 - A `CLEANUP` that reads a name a *sibling* cleanup captures now waits for that
   sibling. Cleanups run after every ordinary step in their block, so a sibling
   that captures the name writes it last and its value is the one on the wire —

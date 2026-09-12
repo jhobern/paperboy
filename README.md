@@ -723,7 +723,12 @@ literal `{{create.sid}}`. Only qualified references are checked: a plain
 `{{sid}}` is answered by whatever is standing in the capture chain, and pruning
 can't know what else might answer it — the environment isn't even loaded at that
 point — so a selection that leaves a flat reference's producer out is allowed
-through. `--dry-run` lists the steps grouped by how deep in the graph they sit,
+through. A `TRUTH` template counts as a reference like any other: it is
+resolved against the row's cells, which are keyed by step, so pruning the step
+it names would leave every row in that column scoring `Untested` for no stated
+reason. A `USING(…)` override is read as part of the request too, since it
+decides what is actually sent — it can strand a teardown that looked clean, or
+clear one that didn't. `--dry-run` lists the steps grouped by how deep in the graph they sit,
 which is how you check the shape of a region without sending anything.
 
 `DEPENDS` states an ordering the data doesn't show. Inference only sees values
@@ -808,8 +813,8 @@ handed, not the last one that happened to succeed — otherwise a teardown could
 be authorised by one step and then sent with a different, failed step's
 identifier. Cleanups can depend on each other, by `DEPENDS` or by reading one
 another's captures, and are ordered accordingly; a cycle between them is
-refused, since every member of a ring waits on a member that has not run and
-the whole ring would silently skip. A cleanup can only depend on one in its own
+refused: every member of a ring waits on a member that has not run, so none of
+them is sent. A cleanup can only depend on one in its own
 block, and can only read one's captures there too: an enclosing block unwinds
 after this one, so a cleanup out there could never have run in time. For the
 same reason an ordinary step can never read a cleanup's capture — teardown runs
