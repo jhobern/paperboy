@@ -184,7 +184,22 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   scope, but the comparison re-derived it from the declared parameters alone, so
   it looked for the literal `{{setup.build}}` while the rows carried the real
   name and every comparison came back unmatched. The run's answer is carried out
-  to the collapse instead of being guessed at twice.
+  to the collapse instead of being guessed at twice. One written clause can name
+  more than one target: `BASELINE("prod-{{region}}")` inside a `FOR` resolves
+  afresh on every visit, so each text now carries the whole set of names it took
+  rather than only the last. Keeping just the last measured the earlier
+  iterations' rows against a stranger's baseline — and reported that comparison
+  confidently instead of admitting there was no baseline to compare against.
+- A `TRUTH` the header's `columns:` directive overrides is no longer checked by
+  `--targets`. The header wins at evaluation time, so refusing a run over a
+  template that will never be evaluated rejected a perfectly good report on the
+  strength of dead text.
+- A `CLEANUP` no longer counts as the producer of a name it captures twice. The
+  old rule counted producers and excused the one under test, which a request
+  capturing the same name in two places defeated — and which said nothing at all
+  about a pair of teardowns each vouching for the other. Both fall out of a
+  simpler rule: a request that has to be *told* a value is not the one that
+  supplies it.
 - `--targets` now checks a `TRUTH` template wherever it is attached — `REPORT
   "…" AS C`, `REPORT v AS C`, a `WITH` field, or the header's `columns:`
   directive. Only the first was checked, so the other three stranded in silence:

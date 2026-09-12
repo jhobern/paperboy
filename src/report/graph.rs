@@ -128,12 +128,38 @@ pub fn declared_deps(node: &FlowNode) -> &[String] {
     }
 }
 
+/// The request a step or cleanup will actually send: the collection entry with
+/// its `USING(…)` overrides applied.
+///
+/// An override can both introduce a reference and take one away — `USING(url =
+/// …)` replaces the URL wholesale — so reading the entry alone answers a
+/// different question from the one the runner will ask. Applying them to a copy
+/// asks exactly that question rather than keeping a second model of it that can
+/// drift; the runner's own `apply_override` is used for the same reason. Its
+/// errors are discarded because validation has already reported them, and on an
+/// error the entry is left untouched.
+fn effective_entry(
+    entries: &[HurlEntry],
+    helpers: &[HelperCollection],
+    name: &str,
+    using: &[UsingItem],
+) -> Option<HurlEntry> {
+    let mut entry = resolve_qualified(entries, helpers, name)?.clone();
+    for item in using {
+        if let UsingItem::Override { target, value } = item {
+            let _ = crate::report::run::apply_override(&mut entry, target, value.clone());
+        }
+    }
+    Some(entry)
+}
+
 /// The `USING(…)` values on a node — PaperTrail source text, so the only place
 /// a qualified reference can be written.
 fn using_values(node: &FlowNode) -> &[UsingItem] {
     match node {
         FlowNode::Request { using, .. } => using,
         FlowNode::Report(ReportStmt::Request { using, .. }) => using,
+        FlowNode::Cleanup { using, .. } => using,
         _ => &[],
     }
 }
@@ -428,18 +454,20 @@ pub fn explain(
 /// cleanup's capture is a real value that a sibling cleanup can read, and the
 /// runner orders the two on exactly that basis; leaving them out made pruning
 /// drop a teardown whose value was still being produced right beside it.
-/// Counted, not collected: knowing a name is produced here is not enough, since
-/// pruning also has to ask whether it is produced by anything *other* than the
-/// cleanup whose fate is being decided. A request cannot answer its own
-/// `{{sid}}` out of its own response, so a cleanup that both reads and captures
-/// the name was vouching for itself — and, because it survived, propping up
-/// every sibling that read the same name.
+/// A request that has to be *told* a value is not the one that supplies it. A
+/// capture is only counted here when the request making it does not also read
+/// the same name, because such a request is waiting on the very value it
+/// appears to offer: it would be answering `{{sid}}` out of its own response,
+/// which is not a thing a request can do. Without that rule a cleanup reading
+/// and capturing `sid` vouched for itself — and, by surviving, for every
+/// sibling that read the same name — while a pair doing it to each other
+/// vouched mutually and left the run reporting a teardown cycle nobody wrote.
 fn scope_captures(
     nodes: &[FlowNode],
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-) -> HashMap<String, usize> {
-    let mut out: HashMap<String, usize> = HashMap::new();
+) -> HashSet<String> {
+    let mut out = HashSet::new();
     let mut visit = |nodes: &[FlowNode]| {
         for n in nodes {
             let request = match n {
@@ -447,11 +475,16 @@ fn scope_captures(
                 _ => step_name(n).map(|(_, r)| r),
             };
             if let Some(request) = request
-                && let Some(e) = resolve_qualified(entries, helpers, request)
+                && let Some(e) = effective_entry(entries, helpers, request, using_values(n))
             {
-                for (c, _) in &e.captures {
-                    *out.entry(c.clone()).or_insert(0) += 1;
-                }
+                let reads = crate::request::entry_referenced_keys(&e);
+                out.extend(
+                    e.captures
+                        .iter()
+                        .map(|(c, _)| c)
+                        .filter(|c| !reads.contains(c.as_str()))
+                        .cloned(),
+                );
             }
         }
     };
@@ -482,14 +515,23 @@ fn scope_captures(
 /// the same question, and the header is added because it is the one site the
 /// node walk cannot reach.
 fn declared_truths(flow: &ReportFlow) -> Vec<String> {
-    let mut out: Vec<String> = flow.column_truths().into_values().collect();
+    let mut from_flow = flow.column_truths();
+    let mut out = Vec::new();
     if let Some(spec) = flow.header.columns() {
-        out.extend(
-            crate::report::model::parse_columns(spec)
-                .into_iter()
-                .filter_map(|c| c.truth),
-        );
+        for col in crate::report::model::parse_columns(spec) {
+            if let Some(t) = col.truth {
+                // An inline truth in the `columns:` directive is never
+                // overridden by the flow's own (`resolved_columns`), so the
+                // flow's is dead text for that column — and refusing a run over
+                // a template that will never be evaluated is the false-positive
+                // class two earlier checks had to be withdrawn for. Ask the
+                // resolved question, not the written one.
+                from_flow.remove(&col.header);
+                out.push(t);
+            }
+        }
     }
+    out.extend(from_flow.into_values());
     out
 }
 
@@ -516,32 +558,15 @@ fn retain_cleanups(
     helpers: &[HelperCollection],
     keep: &mut impl FnMut(&str, &[String], &[UsingItem], &HashSet<String>) -> bool,
 ) {
-    let mut counts = scope_captures(nodes, entries, helpers);
-    for name in visible {
-        // Something outside this scope writes it; who, exactly, is not this
-        // scope's business, and no cleanup here can be that producer.
-        *counts.entry(name.clone()).or_insert(0) += 1;
-    }
-    let here: HashSet<String> = counts.keys().cloned().collect();
+    let mut here = visible.clone();
+    here.extend(scope_captures(nodes, entries, helpers));
     nodes.retain(|n| match n {
         FlowNode::Cleanup {
             name,
             depends,
             using,
             ..
-        } => {
-            // The scope this cleanup gets to appeal to is the one it is not
-            // itself holding up.
-            let mut seen = here.clone();
-            if let Some(e) = resolve_qualified(entries, helpers, name) {
-                for (c, _) in &e.captures {
-                    if counts.get(c).copied().unwrap_or(0) <= 1 {
-                        seen.remove(c);
-                    }
-                }
-            }
-            keep(name, depends, using, &seen)
-        }
+        } => keep(name, depends, using, &here),
         _ => true,
     });
     for n in nodes {
@@ -690,11 +715,10 @@ pub fn prune_to_targets(
     // "Still produced" is scope-aware: a step outside a region is never pruned,
     // so its captures count — but only where they can actually be read, which
     // for a step inside a loop body is that body alone.
-    // Repeated to a fixed point. `scope_captures` counts a cleanup's own
-    // captures as produced — rightly, since the runner orders two cleanups
-    // against each other on them — but the scope is built before the retain
-    // runs, so a cleanup this very pass is about to drop could vouch for a
-    // sibling. The sibling survived on the strength of a name that, once the
+    // Repeated to a fixed point. `scope_captures` counts a cleanup's captures
+    // as produced — rightly, since the runner orders two cleanups against each
+    // other on them — but the scope is built before the retain runs, so a
+    // cleanup this very pass is about to drop could vouch for a sibling. The sibling survived on the strength of a name that, once the
     // pass finished, nothing in the run wrote, and went out with the
     // placeholder verbatim. Each round can only remove cleanups, so the loop
     // shrinks and terminates.
@@ -710,28 +734,9 @@ pub fn prune_to_targets(
                 if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
                     return false;
                 }
-                let Some(entry) = resolve_qualified(entries, helpers, name) else {
+                let Some(effective) = effective_entry(entries, helpers, name, using) else {
                     return true;
                 };
-                // Ask about the request as it will actually be *sent*. An override
-                // can both introduce a reference and take one away — `USING(url =
-                // …)` replaces the URL wholesale — and reading the collection entry
-                // alone got it wrong in both directions: a teardown whose override
-                // had removed the reference was deleted and its resource leaked,
-                // while one whose override *added* a stranded reference was kept
-                // and dispatched with the placeholder on the wire. Applying them to
-                // a copy asks exactly the question the runner will ask, instead of
-                // a second model of it that can drift.
-                let mut effective = entry.clone();
-                for item in using {
-                    if let UsingItem::Override { target, value } = item {
-                        let _ = crate::report::run::apply_override(
-                            &mut effective,
-                            target,
-                            value.clone(),
-                        );
-                    }
-                }
                 // Only a name that *was* produced by a pruned step and is not
                 // produced by a surviving one in scope: anything else comes from the
                 // environment or from outside the region, and is none of pruning's
@@ -1161,6 +1166,60 @@ mod tests {
             errs.iter().any(|e| e.contains("create.HttpStatus")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn a_request_that_reads_a_name_does_not_produce_it() {
+        // Counting captures asked the wrong question. An entry that captures
+        // `sid` twice contributed two producers by itself, and two cleanups
+        // that each read and captured it vouched for each other — neither of
+        // which can supply a value it is itself waiting for.
+        let mut twice = entry("rotate", &["sid"], &["sid"]);
+        twice
+            .captures
+            .push(("sid".into(), "jsonpath \"$.u\"".into()));
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            twice,
+            entry("swap", &["sid"], &["sid"]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let region = "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n";
+        for tail in [
+            "CLEANUP rotate\n",
+            "CLEANUP rotate\nCLEANUP swap\nCLEANUP purge\n",
+        ] {
+            let text = pruned(&format!("{region}{tail}"), &["target"], &entries).unwrap();
+            assert!(
+                !text.contains("CLEANUP"),
+                "nothing left in the run writes sid: {tail} => {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flow_truth_the_header_overrides_is_not_checked() {
+        // `resolved_columns` never lets the flow's truth override an inline one
+        // in the `columns:` directive, so the flow's is dead text — and
+        // refusing a run over a template that is never evaluated is exactly the
+        // false positive two withdrawn checks were built on.
+        let entries = [entry("create", &[], &[]), entry("target", &[], &[])];
+        let mut flow = crate::report::parser::parse_flow(
+            "# collection: c\n# columns: C TRUTH \"{{target.HttpStatus}}\"\n\n\
+             GRAPH\n    REPORT REQUEST create SHOW(HttpStatus)\n\
+             \x20   REPORT REQUEST target SHOW(HttpStatus)\nEND\n\
+             REPORT \"x\" AS C TRUTH \"{{create.HttpStatus}}\"\n",
+        )
+        .expect("parses");
+        prune_to_targets(
+            &mut flow,
+            &["target".to_string()],
+            &entries,
+            &[],
+            &Strings::english(),
+        )
+        .expect("the flow's truth is overridden and never evaluated");
     }
 
     #[test]

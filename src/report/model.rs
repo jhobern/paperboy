@@ -64,7 +64,16 @@ pub struct ReportResult {
     /// every comparison came back unmatched. Carrying the answer out is the only
     /// way the two can agree, since the second derivation cannot see what the
     /// first one saw.
-    pub role_targets: HashMap<String, String>,
+    ///
+    /// **All** of the answers, in first-seen order, because one written text is
+    /// not one target: a clause inside a `FOR` loop is resolved once per
+    /// iteration, and `BASELINE("prod-{{R}}")` really does name a different
+    /// environment each time. Keeping only the last left every earlier
+    /// iteration's rows measured against a stranger's baseline, or against none
+    /// at all. A role named through a variable now behaves exactly as if every
+    /// value it takes had been written out literally, which is the only story
+    /// that stays true as the scope changes.
+    pub role_targets: HashMap<String, Vec<String>>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
     /// Row indices whose result hasn't streamed in yet — the skeleton slots a

@@ -105,7 +105,7 @@ pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
 pub fn comparison_roles_with(
     flow: &ReportFlow,
     params: &HashMap<String, String>,
-    resolved: &HashMap<String, String>,
+    resolved: &HashMap<String, Vec<String>>,
 ) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
@@ -132,7 +132,7 @@ pub fn comparison_roles_with(
 fn collect_roles(
     nodes: &[FlowNode],
     params: &HashMap<String, String>,
-    resolved: &HashMap<String, String>,
+    resolved: &HashMap<String, Vec<String>>,
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
     baseline_show: &mut Vec<String>,
@@ -155,19 +155,22 @@ fn collect_roles(
                     // A role's comparison *target* is its name (a live env) or
                     // its snapshot path (a `FILE(…)`); either way the produced /
                     // injected rows carry that string as their target.
-                    let effective = |r: &RoleRef| -> String {
-                        resolved
-                            .get(r.target())
-                            .cloned()
-                            .unwrap_or_else(|| crate::environment::substitute(r.target(), params))
+                    // Every answer the run reached, not one: a clause inside a
+                    // loop is resolved per iteration and each value names a real
+                    // environment whose rows are waiting to be collapsed.
+                    let effective = |r: &RoleRef| -> Vec<String> {
+                        resolved.get(r.target()).cloned().unwrap_or_else(|| {
+                            vec![crate::environment::substitute(r.target(), params)]
+                        })
                     };
                     for r in b {
-                        baseline.insert(effective(r));
+                        baseline.extend(effective(r));
                     }
                     for r in c {
-                        let name = effective(r);
-                        if !comparisons.contains(&name) {
-                            comparisons.push(name);
+                        for name in effective(r) {
+                            if !comparisons.contains(&name) {
+                                comparisons.push(name);
+                            }
                         }
                     }
                     // Only the names travel here: any `STATISTICS(…)` a field

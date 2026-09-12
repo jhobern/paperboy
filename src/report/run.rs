@@ -262,6 +262,15 @@ pub fn resolve_title<'a>(entries: &'a [HurlEntry], name: &str) -> Option<&'a Hur
 /// or the declaration's own default. The map an `ENVS` clause's names are
 /// resolved through outside the run itself (see
 /// [`compare::comparison_roles_with`](super::compare::comparison_roles_with)).
+/// Record one `ENVS` role resolution, keeping first-seen order and never a
+/// duplicate — see [`ReportResult::role_targets`].
+fn note_role(out: &mut HashMap<String, Vec<String>>, written: String, got: String) {
+    let seen = out.entry(written).or_default();
+    if !seen.contains(&got) {
+        seen.push(got);
+    }
+}
+
 fn effective_params(flow: &ReportFlow, ctx: &RunContext) -> super::params::ParamValues {
     super::params::effective(&flow.params(), &ctx.params)
 }
@@ -593,7 +602,7 @@ struct Exec<'a> {
     /// What each `ENVS` role's written target resolved to — see
     /// [`ReportResult::role_targets`]. An output accumulator, not state: it
     /// travels back out of a fork, never into one.
-    role_targets: HashMap<String, String>,
+    role_targets: HashMap<String, Vec<String>>,
     /// Step names in the order they ran, so a teardown can be ordered against
     /// the setup it mirrors.
     step_order: Vec<String>,
@@ -654,7 +663,7 @@ struct IterOut {
     /// See [`ReportResult::role_targets`]: an `ENVS` loop nested in another
     /// loop resolves its roles on the fork, so the answer has to travel back
     /// with the rows it tagged.
-    role_targets: HashMap<String, String>,
+    role_targets: HashMap<String, Vec<String>>,
     columns: Vec<String>,
     timing_columns: Vec<String>,
     errors: Vec<String>,
@@ -2269,8 +2278,12 @@ impl<'a> Exec<'a> {
         // Hand the answers to the collapse, which cannot reach them: it derives
         // a role's identity from the declared parameters alone, and a role
         // named through anything else — a capture, a prelude assignment —
-        // resolves here and nowhere else.
-        self.role_targets.extend(resolved_roles);
+        // resolves here and nowhere else. Accumulated rather than replaced,
+        // since this clause is resolved again on every visit and each answer is
+        // a real environment some rows are tagged with.
+        for (written, got) in resolved_roles {
+            note_role(&mut self.role_targets, written, got);
+        }
         let mut seed = self.to_state();
         for (k, v) in inherited {
             seed.broadcast.insert(k.clone(), v.clone());
@@ -2391,7 +2404,11 @@ impl<'a> Exec<'a> {
             self.errors.extend(out.errors);
             self.skipped.extend(out.skipped);
             self.warnings.extend(out.warnings);
-            self.role_targets.extend(out.role_targets);
+            for (written, got) in out.role_targets {
+                for one in got {
+                    note_role(&mut self.role_targets, written.clone(), one);
+                }
+            }
             rows.extend(out.rows);
         }
         rows
@@ -3873,6 +3890,55 @@ mod tests {
     }
 
     #[test]
+    fn a_role_named_through_a_loop_variable_collapses_every_iteration() {
+        // One written text is not one target. The clause is resolved again on
+        // each visit, so `BASELINE("prod-{{R}}")` names a different environment
+        // every time — and keeping only the last left the earlier iterations'
+        // rows measured against a stranger's baseline, or against none at all.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "LIST REGIONS=[\"eu\",\"us\"]\n\
+             FOR R IN REGIONS\n\
+             \x20 FOR T IN ENVS BASELINE(\"prod-{{R}}\"), COMPARISON(\"staging-{{R}}\")\n\
+             \x20   REPORT REQUEST r SHOW(HttpStatus)\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("prod-eu", &[][..]),
+                ("staging-eu", &[][..]),
+                ("prod-us", &[][..]),
+                ("staging-us", &[][..]),
+            ],
+            &fake,
+        );
+        assert!(
+            res.errors.is_empty(),
+            "every environment was loaded: {:?}",
+            res.errors
+        );
+        assert_eq!(
+            res.rows.len(),
+            2,
+            "one collapsed row per region: {:?}",
+            res.rows
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>()
+        );
+        for row in &res.rows {
+            let verdict = &row.cells[crate::report::compare::RESULT_COLUMN];
+            assert!(
+                verdict.contains("matched"),
+                "{:?} was not collapsed: {verdict}",
+                row.target
+            );
+        }
+    }
+
+    #[test]
     fn a_role_named_through_a_capture_is_the_one_the_collapse_looks_for() {
         // The run resolves a role target against everything in scope; the
         // collapse used to re-derive it from the declared parameters alone. A
@@ -3895,8 +3961,8 @@ mod tests {
             &fake,
         );
         assert_eq!(
-            res.role_targets.get("{{setup.stack}}").map(String::as_str),
-            Some("prod"),
+            res.role_targets.get("{{setup.stack}}"),
+            Some(&vec!["prod".to_string()]),
             "the run must record what it resolved: {:?}",
             res.role_targets
         );
