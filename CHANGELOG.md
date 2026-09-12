@@ -185,6 +185,10 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   it looked for the literal `{{setup.build}}` while the rows carried the real
   name and every comparison came back unmatched. The run's answer is carried out
   to the collapse instead of being guessed at twice.
+- A `CLEANUP` that depends on a member of a cycle is now skipped rather than
+  sent with the reference still written `{{a.tok}}` in its URL. The cycle's
+  members are marked before any teardown is dispatched, so the verdict holds
+  whatever order the rest arrive in.
 - A cycle among `CLEANUP`s is no longer *run*. Resolving the gate purely from
   what had already happened meant neither member of a ring could see the other,
   so nothing held either of them back and both were sent — a flat name falling

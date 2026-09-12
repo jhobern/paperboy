@@ -1519,6 +1519,26 @@ impl<'a> Exec<'a> {
                 &[&cyclic.join(", ")],
             ));
         }
+        // Record the ring's verdict before anything is dispatched, not as the
+        // loop reaches each member. When Kahn stalls the leftovers come out in
+        // arrival order, which throws away the well-formed edges *out of* the
+        // ring — so a perfectly ordinary cleanup downstream of one can be
+        // dispatched first. Marking as we went left it asking about a ring
+        // member no verdict had been written for yet: the reference was
+        // silently dropped, nothing gated it, and the teardown went out with
+        // `{{a.tok}}` still literal in its URL while the run called it a
+        // success. A verdict written up front is true whatever order the
+        // leftovers arrive in.
+        for (_, _, node, step, _) in &planned {
+            if !cyclic.contains(step) {
+                continue;
+            }
+            let FlowNode::Cleanup { name, .. } = node else {
+                continue;
+            };
+            self.skipped.push(step.clone());
+            self.note_step(step, name, false);
+        }
 
         for (_, _, node, step, _) in planned {
             let FlowNode::Cleanup {
@@ -1547,12 +1567,9 @@ impl<'a> Exec<'a> {
             // Its members read one another, so whichever goes first is looking
             // for a value nothing has written yet — and a flat name in that
             // state falls through to whatever older step last stood in the
-            // chain, which is a live resource belonging to somebody else. The
-            // ring is already known by name here, and the error above has just
-            // told the user none of it ran, so make that true.
+            // chain, which is a live resource belonging to somebody else. Their
+            // verdict was written above, before any of this ran.
             if cyclic.contains(&step) {
-                self.skipped.push(step.clone());
-                self.note_step(&step, name, false);
                 continue;
             }
             let deps = self.cleanup_deps(name, depends, using, &step, &[]);
@@ -3894,6 +3911,38 @@ mod tests {
         assert!(
             verdict.contains("matched"),
             "the collapse looked for the literal role name: {verdict}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_downstream_of_a_ring_is_not_sent_with_an_unresolved_reference() {
+        // Kahn's leftovers come out in arrival order, so a well-formed cleanup
+        // that depends on a ring member can be dispatched before it. Writing
+        // the ring's verdict as the loop reached each member left this one
+        // asking about a step nothing had recorded yet, so the reference was
+        // dropped, nothing gated it, and it was sent with `{{a.tok}}` literal.
+        let mut a = graph_entry("a", &["tok"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["tok"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &["a.tok"]);
+        let entries = [a, b, c];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP c\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"c".to_string()),
+            "c depends on ring member 'a' and must be skipped, not sent",
+        );
+        assert!(
+            res.skipped.contains(&"c".to_string()),
+            "c must be reported as skipped: {:?}",
+            res.skipped
         );
     }
 
