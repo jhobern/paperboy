@@ -49,7 +49,7 @@ use super::flow::{
     Binder, Element, EnvClause, FlowNode, OverrideTarget, ParallelSpec, Pattern, Producer,
     ReportFlow, ReportStmt, ResponseFmt, RoleBinding, RoleRef, ShowField, UsingItem, WithItem,
 };
-use super::model::{ReportResult, ReportRow, Trend, Verdict};
+use super::model::{ReportResult, ReportRow, RowRole, Trend, Verdict};
 use super::producers::{self, ProducerItem};
 
 /// Engine defaults for the `PRELUDE_*` settings (overridable per flow/scope by a
@@ -578,6 +578,10 @@ struct Exec<'a> {
     path: Vec<(usize, usize)>,
     /// The current `ENVS` target (environment name), if inside an `ENVS` loop.
     target: Option<String>,
+    /// The role the current `ENVS` target was given, if its clause assigned
+    /// one. A role belongs to a position in one comparison, not to the
+    /// environment's name — see [`ReportRow::role`].
+    role: Option<RowRole>,
     /// The current `ENVS` target's variables, layered above pinned/global.
     target_env: Option<HashMap<String, String>>,
     /// Cells produced by REPORT statements in *enclosing* blocks (before this
@@ -654,6 +658,7 @@ struct ExecState {
     key_parts: Vec<String>,
     path: Vec<(usize, usize)>,
     target: Option<String>,
+    role: Option<RowRole>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
@@ -1129,6 +1134,7 @@ impl<'a> Exec<'a> {
             key_parts: Vec::new(),
             path: Vec::new(),
             target: None,
+            role: None,
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
@@ -1157,6 +1163,7 @@ impl<'a> Exec<'a> {
             key_parts: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
+            role: self.role,
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
             baseline_show: self.baseline_show.clone(),
@@ -1179,6 +1186,7 @@ impl<'a> Exec<'a> {
             key_parts: state.key_parts,
             path: state.path,
             target: state.target,
+            role: state.role,
             target_env: state.target_env,
             broadcast: state.broadcast,
             column_order: Vec::new(),
@@ -1766,6 +1774,7 @@ impl<'a> Exec<'a> {
             key: self.key_parts.clone(),
             path: self.path.clone(),
             target: self.target.clone(),
+            role: self.role,
         };
         if let Some(sink) = self.ctx.sink {
             sink(RowEvent::Completed(&row));
@@ -2286,6 +2295,12 @@ impl<'a> Exec<'a> {
         // all-live.
         let mut live: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
+        // The side each one is being run as. A role is a position in this
+        // comparison, not a property of the name: rolling pairs make the same
+        // environment the candidate here and the baseline next time round, so
+        // the collapse cannot recover it by looking the name up in a set.
+        let mut live_roles: Vec<Option<RowRole>> = Vec::new();
+        let mut file_roles: Vec<Option<RowRole>> = Vec::new();
         // An environment (or a snapshot path) may be named through a parameter
         // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
         // another pair of stacks without being edited. Resolved against the
@@ -2296,19 +2311,32 @@ impl<'a> Exec<'a> {
         let resolve = |s: &String| crate::environment::substitute(s, &vars);
         let mut resolved_roles: Vec<(String, String)> = Vec::new();
         match clause {
-            EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
+            EnvClause::Plain(names) => {
+                live = names.iter().map(resolve).collect();
+                live_roles = vec![None; live.len()];
+            }
             EnvClause::Roles {
                 baseline,
                 comparisons,
                 ..
             } => {
-                for r in baseline.iter().chain(comparisons) {
+                for (r, role) in baseline
+                    .iter()
+                    .map(|r| (r, RowRole::Baseline))
+                    .chain(comparisons.iter().map(|r| (r, RowRole::Candidate)))
+                {
                     let target = r.target().to_string();
                     let got = resolve(&target);
                     resolved_roles.push((target, got.clone()));
                     match r {
-                        RoleRef::Env(_) => live.push(got),
-                        RoleRef::File(_) => files.push(got),
+                        RoleRef::Env(_) => {
+                            live.push(got);
+                            live_roles.push(Some(role));
+                        }
+                        RoleRef::File(_) => {
+                            files.push(got);
+                            file_roles.push(Some(role));
+                        }
                     }
                 }
             }
@@ -2342,6 +2370,7 @@ impl<'a> Exec<'a> {
             }
             sub.scopes.push(HashMap::new());
             sub.set_var(var, name.clone());
+            sub.role = live_roles[i];
             if keyed {
                 sub.key_parts.push(name.clone());
             }
@@ -2370,6 +2399,7 @@ impl<'a> Exec<'a> {
                     for (ri, br) in snapshot.rows.iter().enumerate() {
                         let mut row = br.to_row();
                         row.target = Some(rel.clone());
+                        row.role = file_roles[fi];
                         // A deterministic structural path (identical between the
                         // dry skeleton pass and the live run) so a streaming
                         // front-end slots the row; file roles come after the live
@@ -3978,6 +4008,55 @@ mod tests {
                 verdict.contains("matched"),
                 "{:?} was not collapsed: {verdict}",
                 row.target
+            );
+        }
+    }
+
+    #[test]
+    fn an_environment_that_is_a_baseline_once_is_still_a_candidate_elsewhere() {
+        // A role is a position in one comparison, not a property of the name.
+        // Rolling pairs make the same environment the candidate in one
+        // iteration and the baseline in the next; classifying rows by global
+        // name membership tested "is a baseline" first, so the candidate row
+        // was filed as a baseline, its own pair lost its candidate, and the
+        // diff that was asked for came back as "no baseline".
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR (A, B) IN [(\"v1\", \"v2\"), (\"v2\", \"v3\")]\n\
+             \x20 FOR T IN ENVS BASELINE(\"{{A}}\"), COMPARISON(\"{{B}}\")\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{who}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                ("v1", &[("who", "V1")][..]),
+                ("v2", &[("who", "V2")][..]),
+                ("v3", &[("who", "V3")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(Option<String>, String)> = res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.target.clone(),
+                    r.cells
+                        .get(crate::report::compare::RESULT_COLUMN)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 2, "one row per pair: {verdicts:?}");
+        for (target, verdict) in &verdicts {
+            assert!(
+                verdict.contains("(baseline)"),
+                "{target:?} must be diffed against its own pair's baseline: {verdict}"
             );
         }
     }

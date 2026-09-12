@@ -25,7 +25,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::flow::{EnvClause, FlowNode, ReportFlow, RoleRef};
-use super::model::{ReportResult, ReportRow};
+use super::model::{ReportResult, ReportRow, RowRole};
 
 /// The reserved output column that carries the comparison outcome. Added to the
 /// default column order (at the front) only when the flow configures a
@@ -214,12 +214,25 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
 
     for row in rows {
         let target = row.target.clone();
-        let is_baseline = target
-            .as_deref()
-            .is_some_and(|t| roles.baseline.contains(t));
-        let is_candidate = target
-            .as_deref()
-            .is_some_and(|t| roles.comparisons.iter().any(|c| c == t));
+        // The row's own role wins. A name can hold both roles across a run —
+        // rolling pairs make one environment the candidate here and the
+        // baseline next time round — so asking a set whether a *name* is "a
+        // baseline" has no single answer, and asking it first filed the
+        // candidate as a baseline, losing its pair's diff to "no baseline".
+        // The set is the fallback for rows with no role recorded: those loaded
+        // from a stored snapshot, and any produced before roles were tracked.
+        let (is_baseline, is_candidate) = match row.role {
+            Some(RowRole::Baseline) => (true, false),
+            Some(RowRole::Candidate) => (false, true),
+            None => (
+                target
+                    .as_deref()
+                    .is_some_and(|t| roles.baseline.contains(t)),
+                target
+                    .as_deref()
+                    .is_some_and(|t| roles.comparisons.iter().any(|c| c == t)),
+            ),
+        };
 
         if (is_baseline || is_candidate) && seen_key.insert(row.key.clone()) {
             key_order.push(row.key.clone());
@@ -408,6 +421,7 @@ mod tests {
 
     fn row(key: &[&str], target: &str, cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            role: None,
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

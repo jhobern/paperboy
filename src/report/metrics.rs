@@ -401,6 +401,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            role: None,
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

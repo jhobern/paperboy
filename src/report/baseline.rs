@@ -60,6 +60,9 @@ impl BaselineRow {
             vars: self.vars.clone(),
             key: self.key.clone(),
             path: Vec::new(),
+            // A stored snapshot row has no role of its own: it takes the one
+            // the clause injecting it assigns.
+            role: None,
             target: self.target.clone(),
         }
     }
@@ -176,6 +179,7 @@ mod tests {
 
     fn row(key: &[&str], cells: &[(&str, &str)]) -> ReportRow {
         ReportRow {
+            role: None,
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

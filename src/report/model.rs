@@ -17,6 +17,13 @@ use super::flow::{Header, ImageSpec};
 /// comparison axis, not a row axis) but available as a column source.
 pub const TARGET_COLUMN: &str = "TARGET";
 
+/// Which side of an `ENVS` comparison a row was produced on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowRole {
+    Baseline,
+    Candidate,
+}
+
 /// One output row: one innermost-loop iteration (or the single row of a
 /// loop-free flow). A row is created at *plan* time (see the streaming/slot
 /// model) and its cells are filled as the run progresses.
@@ -44,6 +51,16 @@ pub struct ReportRow {
     /// The ENVS target (environment name) this row was produced under, if the
     /// flow loops over `ENVS`. `None` for a flow with no `ENVS` loop.
     pub target: Option<String>,
+    /// Which side of a comparison produced this row, when the `ENVS` clause
+    /// assigned it one.
+    ///
+    /// A role is a *position in one comparison*, not a property of the
+    /// environment's name. Rolling pairs — `[("v1","v2"), ("v2","v3")]` with
+    /// `BASELINE("{{A}}"), COMPARISON("{{B}}")` — make `v2` the candidate in
+    /// one iteration and the baseline in the next, so asking whether a name is
+    /// "a baseline" has no single answer. Recorded where the row is produced,
+    /// which is the only place that knows.
+    pub role: Option<RowRole>,
 }
 
 /// A whole run's output: the rows plus the first-seen order of produced column
@@ -1292,6 +1309,7 @@ mod tests {
 
     fn row(cells: &[(&str, &str)], vars: &[(&str, &str)], target: Option<&str>) -> ReportRow {
         ReportRow {
+            role: None,
             cells: cells
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

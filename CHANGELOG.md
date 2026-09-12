@@ -179,6 +179,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- An environment that is a baseline in one comparison is no longer mistaken for
+  one everywhere. A role is a position in a single comparison, not a property of
+  the name: rolling pairs — `[("v1","v2"), ("v2","v3")]` against
+  `BASELINE("{{A}}"), COMPARISON("{{B}}")` — make `v2` the candidate in one
+  iteration and the baseline in the next. The collapse asked a set of names
+  whether a row was a baseline, and asked that first, so the candidate row was
+  filed as a baseline, its own pair lost its candidate, and the diff that was
+  asked for came back as `no baseline`. Each row now carries the side it was
+  produced on.
 - Every `CLEANUP` the teardown sort cannot order is now refused, not just the
   members of the ring itself. Kahn's leftovers come out in arrival order, which
   throws away the well-formed edges *between* them, so a teardown two hops from
