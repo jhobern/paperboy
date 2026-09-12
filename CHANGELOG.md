@@ -179,6 +179,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- An `ENVS` role named through anything but a parameter — a capture, a prelude
+  assignment — now collapses. The run resolved the target against everything in
+  scope, but the comparison re-derived it from the declared parameters alone, so
+  it looked for the literal `{{setup.build}}` while the rows carried the real
+  name and every comparison came back unmatched. The run's answer is carried out
+  to the collapse instead of being guessed at twice.
 - A cycle among `CLEANUP`s is no longer *run*. Resolving the gate purely from
   what had already happened meant neither member of a ring could see the other,
   so nothing held either of them back and both were sent — a flat name falling

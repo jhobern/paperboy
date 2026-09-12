@@ -52,6 +52,19 @@ pub struct ReportRow {
 #[derive(Debug, Clone, Default)]
 pub struct ReportResult {
     pub rows: Vec<ReportRow>,
+    /// What each `ENVS` role's written target resolved to when the run actually
+    /// visited it, keyed by the text as written.
+    ///
+    /// The collapse has to look for the same string the rows carry, and it runs
+    /// outside the interpreter, where it can only re-derive a role's identity
+    /// from the declared parameters. The run resolves one against everything in
+    /// scope — captures included — so a role written
+    /// `BASELINE(FILE("snap/{{setup.build}}.baseline"))` diverged: the rows were
+    /// tagged with the real path while the collapse looked for the literal, and
+    /// every comparison came back unmatched. Carrying the answer out is the only
+    /// way the two can agree, since the second derivation cannot see what the
+    /// first one saw.
+    pub role_targets: HashMap<String, String>,
     /// Produced cell-column keys in first-seen order — the default column set.
     pub column_order: Vec<String>,
     /// Row indices whose result hasn't streamed in yet — the skeleton slots a

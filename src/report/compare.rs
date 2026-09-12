@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::flow::{EnvClause, FlowNode, ReportFlow};
+use super::flow::{EnvClause, FlowNode, ReportFlow, RoleRef};
 use super::model::{ReportResult, ReportRow};
 
 /// The reserved output column that carries the comparison outcome. Added to the
@@ -94,7 +94,7 @@ pub struct Roles {
 /// `ENVS` role clause with a baseline (a plain `ENVS` list, or no `ENVS` loop at
 /// all, produces per-env rows with no diff — unchanged behaviour).
 pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
-    comparison_roles_with(flow, &HashMap::new())
+    comparison_roles_with(flow, &HashMap::new(), &HashMap::new())
 }
 
 /// As [`comparison_roles`], with the run's parameter values in hand so a role
@@ -102,13 +102,18 @@ pub fn comparison_roles(flow: &ReportFlow) -> Option<Roles> {
 /// actually visited. Without this the collapse would look for a row whose
 /// target is the literal `{{TARGET}}` and find nothing — every comparison
 /// would come back unmatched.
-pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>) -> Option<Roles> {
+pub fn comparison_roles_with(
+    flow: &ReportFlow,
+    params: &HashMap<String, String>,
+    resolved: &HashMap<String, String>,
+) -> Option<Roles> {
     let mut baseline = HashSet::new();
     let mut comparisons = Vec::new();
     let mut baseline_show = Vec::new();
     collect_roles(
         &flow.nodes,
         params,
+        resolved,
         &mut baseline,
         &mut comparisons,
         &mut baseline_show,
@@ -127,10 +132,17 @@ pub fn comparison_roles_with(flow: &ReportFlow, params: &HashMap<String, String>
 fn collect_roles(
     nodes: &[FlowNode],
     params: &HashMap<String, String>,
+    resolved: &HashMap<String, String>,
     baseline: &mut HashSet<String>,
     comparisons: &mut Vec<String>,
     baseline_show: &mut Vec<String>,
 ) {
+    // What the run made of the target wins outright. Substituting again here
+    // can only see the declared parameters, so a role named through a capture
+    // or a prelude assignment would come back as the literal `{{…}}` and match
+    // no row at all — and the rows are tagged with the run's answer, not this
+    // one. The fallback is for callers with no run behind them (the pre-run
+    // skeleton, validation, the TUI's static look at a flow).
     for node in nodes {
         match node {
             FlowNode::ForEnvs { clause, body, .. } => {
@@ -143,11 +155,17 @@ fn collect_roles(
                     // A role's comparison *target* is its name (a live env) or
                     // its snapshot path (a `FILE(…)`); either way the produced /
                     // injected rows carry that string as their target.
+                    let effective = |r: &RoleRef| -> String {
+                        resolved
+                            .get(r.target())
+                            .cloned()
+                            .unwrap_or_else(|| crate::environment::substitute(r.target(), params))
+                    };
                     for r in b {
-                        baseline.insert(crate::environment::substitute(r.target(), params));
+                        baseline.insert(effective(r));
                     }
                     for r in c {
-                        let name = crate::environment::substitute(r.target(), params);
+                        let name = effective(r);
                         if !comparisons.contains(&name) {
                             comparisons.push(name);
                         }
@@ -161,10 +179,10 @@ fn collect_roles(
                         }
                     }
                 }
-                collect_roles(body, params, baseline, comparisons, baseline_show);
+                collect_roles(body, params, resolved, baseline, comparisons, baseline_show);
             }
             FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
-                collect_roles(body, params, baseline, comparisons, baseline_show)
+                collect_roles(body, params, resolved, baseline, comparisons, baseline_show)
             }
             _ => {}
         }

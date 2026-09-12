@@ -285,9 +285,13 @@ pub fn run_flow(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
 /// updates) and only collapse at the end.
 pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
     let mut ex = Exec::new(ctx);
-    ex.baseline_show = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx))
-        .map(|r| r.baseline_show)
-        .unwrap_or_default();
+    // Only `baseline_show` is wanted here, and it is a list of field names: no
+    // role target is read, so there is nothing for the run's answers to correct
+    // — and none exist yet, since this is the call that starts the run.
+    ex.baseline_show =
+        super::compare::comparison_roles_with(flow, &effective_params(flow, ctx), &HashMap::new())
+            .map(|r| r.baseline_show)
+            .unwrap_or_default();
     let rows = ex.exec_block(&flow.nodes);
     // The table-wide no-match marker is the effective top-level
     // `PRELUDE_NO_MATCH_MARKER` (scoped assigns are popped after the run, so the
@@ -300,6 +304,7 @@ pub fn run_flow_raw(flow: &ReportFlow, ctx: &RunContext) -> ReportResult {
         .unwrap_or_else(|| DEFAULT_NO_MATCH.to_string());
     ReportResult {
         rows,
+        role_targets: ex.role_targets,
         column_order: ex.column_order,
         no_match_marker,
         errors: ex.errors,
@@ -334,7 +339,11 @@ pub fn finalize(result: &mut ReportResult, flow: &ReportFlow, ctx: &RunContext) 
         .resolved_columns(&flow.header)
         .iter()
         .any(|c| c.truth.is_some());
-    if let Some(roles) = super::compare::comparison_roles_with(flow, &effective_params(flow, ctx)) {
+    if let Some(roles) = super::compare::comparison_roles_with(
+        flow,
+        &effective_params(flow, ctx),
+        &result.role_targets,
+    ) {
         super::compare::apply(result, &roles);
     } else if let Some(rel) = flow
         .header
@@ -581,6 +590,10 @@ struct Exec<'a> {
     /// Problems that must not change the verdict — see
     /// [`ReportResult::warnings`].
     warnings: Vec<String>,
+    /// What each `ENVS` role's written target resolved to — see
+    /// [`ReportResult::role_targets`]. An output accumulator, not state: it
+    /// travels back out of a fork, never into one.
+    role_targets: HashMap<String, String>,
     /// Step names in the order they ran, so a teardown can be ordered against
     /// the setup it mirrors.
     step_order: Vec<String>,
@@ -638,6 +651,10 @@ struct ExecState {
 /// iteration order after a (possibly parallel) loop.
 struct IterOut {
     rows: Vec<ReportRow>,
+    /// See [`ReportResult::role_targets`]: an `ENVS` loop nested in another
+    /// loop resolves its roles on the fork, so the answer has to travel back
+    /// with the rows it tagged.
+    role_targets: HashMap<String, String>,
     columns: Vec<String>,
     timing_columns: Vec<String>,
     errors: Vec<String>,
@@ -1096,6 +1113,7 @@ impl<'a> Exec<'a> {
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
+            role_targets: HashMap::new(),
             baseline_show: Vec::new(),
         }
     }
@@ -1145,6 +1163,7 @@ impl<'a> Exec<'a> {
             errors: Vec::new(),
             skipped: Vec::new(),
             warnings: Vec::new(),
+            role_targets: HashMap::new(),
             baseline_show: state.baseline_show,
         }
     }
@@ -2091,6 +2110,7 @@ impl<'a> Exec<'a> {
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
@@ -2205,14 +2225,12 @@ impl<'a> Exec<'a> {
         // An environment (or a snapshot path) may be named through a parameter
         // — `BASELINE("{{TARGET}}")` — so the same report can be pointed at
         // another pair of stacks without being edited. Resolved against the
-        // run's parameters only, and identically in `finalize`, so the rows
-        // this loop produces carry the targets the collapse then looks for.
-        // The parameters are bound in the prelude — validation refuses a
-        // `PARAM` written any later — so by the time a loop is reached they are
-        // ordinary variables, and `finalize` reaches the same names from the
-        // declarations themselves.
+        // run's whole scope, and the answer is recorded in `role_targets` so
+        // the collapse looks for the same string the rows are tagged with
+        // rather than deriving a second, poorer one of its own.
         let vars = self.vars_for_source();
         let resolve = |s: &String| crate::environment::substitute(s, &vars);
+        let mut resolved_roles: Vec<(String, String)> = Vec::new();
         match clause {
             EnvClause::Plain(names) => live = names.iter().map(resolve).collect(),
             EnvClause::Roles {
@@ -2221,13 +2239,21 @@ impl<'a> Exec<'a> {
                 ..
             } => {
                 for r in baseline.iter().chain(comparisons) {
+                    let target = r.target().to_string();
+                    let got = resolve(&target);
+                    resolved_roles.push((target, got.clone()));
                     match r {
-                        RoleRef::Env(n) => live.push(resolve(n)),
-                        RoleRef::File(p) => files.push(resolve(p)),
+                        RoleRef::Env(_) => live.push(got),
+                        RoleRef::File(_) => files.push(got),
                     }
                 }
             }
         }
+        // Hand the answers to the collapse, which cannot reach them: it derives
+        // a role's identity from the declared parameters alone, and a role
+        // named through anything else — a capture, a prelude assignment —
+        // resolves here and nowhere else.
+        self.role_targets.extend(resolved_roles);
         let mut seed = self.to_state();
         for (k, v) in inherited {
             seed.broadcast.insert(k.clone(), v.clone());
@@ -2248,6 +2274,7 @@ impl<'a> Exec<'a> {
             let rows = sub.exec_block(body);
             IterOut {
                 rows,
+                role_targets: sub.role_targets,
                 columns: sub.column_order,
                 timing_columns: sub.timing_columns,
                 errors: sub.errors,
@@ -2347,6 +2374,7 @@ impl<'a> Exec<'a> {
             self.errors.extend(out.errors);
             self.skipped.extend(out.skipped);
             self.warnings.extend(out.warnings);
+            self.role_targets.extend(out.role_targets);
             rows.extend(out.rows);
         }
         rows
@@ -3825,6 +3853,48 @@ mod tests {
             fake.call_vars("purge")
         );
         assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_role_named_through_a_capture_is_the_one_the_collapse_looks_for() {
+        // The run resolves a role target against everything in scope; the
+        // collapse used to re-derive it from the declared parameters alone. A
+        // role named through a capture therefore came back as the literal
+        // `{{setup.stack}}`, matched no row, and every comparison was unmatched
+        // — while a comment above the resolution claimed the two agreed.
+        let entries = [
+            graph_entry("setup", &["stack"], &[]),
+            graph_entry("r", &[], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("setup", &[("stack", "prod")])]);
+        let res = run(
+            "REQUEST setup AS setup\n\
+             FOR T IN ENVS BASELINE(\"{{setup.stack}}\"), COMPARISON(\"staging\")\n\
+             \x20 REPORT REQUEST r SHOW(HttpStatus)\n\
+             END\n",
+            &entries,
+            &[],
+            &[("prod", &[][..]), ("staging", &[][..])],
+            &fake,
+        );
+        assert_eq!(
+            res.role_targets.get("{{setup.stack}}").map(String::as_str),
+            Some("prod"),
+            "the run must record what it resolved: {:?}",
+            res.role_targets
+        );
+        assert!(
+            res.errors.is_empty(),
+            "both environments were loaded: {:?}",
+            res.errors
+        );
+        assert_eq!(res.rows.len(), 1, "the baseline row was not collapsed in");
+        assert_eq!(res.rows[0].target.as_deref(), Some("staging"));
+        let verdict = &res.rows[0].cells[crate::report::compare::RESULT_COLUMN];
+        assert!(
+            verdict.contains("matched"),
+            "the collapse looked for the literal role name: {verdict}"
+        );
     }
 
     #[test]
