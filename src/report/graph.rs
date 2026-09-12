@@ -428,12 +428,18 @@ pub fn explain(
 /// cleanup's capture is a real value that a sibling cleanup can read, and the
 /// runner orders the two on exactly that basis; leaving them out made pruning
 /// drop a teardown whose value was still being produced right beside it.
+/// Counted, not collected: knowing a name is produced here is not enough, since
+/// pruning also has to ask whether it is produced by anything *other* than the
+/// cleanup whose fate is being decided. A request cannot answer its own
+/// `{{sid}}` out of its own response, so a cleanup that both reads and captures
+/// the name was vouching for itself — and, because it survived, propping up
+/// every sibling that read the same name.
 fn scope_captures(
     nodes: &[FlowNode],
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-) -> HashSet<String> {
-    let mut out = HashSet::new();
+) -> HashMap<String, usize> {
+    let mut out: HashMap<String, usize> = HashMap::new();
     let mut visit = |nodes: &[FlowNode]| {
         for n in nodes {
             let request = match n {
@@ -443,7 +449,9 @@ fn scope_captures(
             if let Some(request) = request
                 && let Some(e) = resolve_qualified(entries, helpers, request)
             {
-                out.extend(e.captures.iter().map(|(c, _)| c.clone()));
+                for (c, _) in &e.captures {
+                    *out.entry(c.clone()).or_insert(0) += 1;
+                }
             }
         }
     };
@@ -454,6 +462,33 @@ fn scope_captures(
         if let FlowNode::Graph { body, .. } = n {
             visit(body);
         }
+    }
+    out
+}
+
+/// Collect every `TRUTH` template the flow declares, wherever it is attached.
+///
+/// A truth is a real consumer of a step: `resolve_truths` builds its scope from
+/// the row's cells first, and those are keyed `step.field`, so
+/// `TRUTH "{{create.HttpStatus}}"` resolves. Validation must therefore *not*
+/// refuse it — but pruning must not strand it either. Dropping the step removes
+/// the cell, the placeholder survives substitution, and every row in the column
+/// silently scores `Untested` with nothing said about why.
+///
+/// Asked of the flow rather than walked here, because a truth attaches at four
+/// places — `REPORT "…" AS C`, `REPORT v AS C`, a `WITH` field, and the header's
+/// `columns:` directive — and a walk that knew about three of them was exactly
+/// the bug. `column_truths` is what the runner scores against, so asking it is
+/// the same question, and the header is added because it is the one site the
+/// node walk cannot reach.
+fn declared_truths(flow: &ReportFlow) -> Vec<String> {
+    let mut out: Vec<String> = flow.column_truths().into_values().collect();
+    if let Some(spec) = flow.header.columns() {
+        out.extend(
+            crate::report::model::parse_columns(spec)
+                .into_iter()
+                .filter_map(|c| c.truth),
+        );
     }
     out
 }
@@ -481,15 +516,32 @@ fn retain_cleanups(
     helpers: &[HelperCollection],
     keep: &mut impl FnMut(&str, &[String], &[UsingItem], &HashSet<String>) -> bool,
 ) {
-    let mut here = visible.clone();
-    here.extend(scope_captures(nodes, entries, helpers));
+    let mut counts = scope_captures(nodes, entries, helpers);
+    for name in visible {
+        // Something outside this scope writes it; who, exactly, is not this
+        // scope's business, and no cleanup here can be that producer.
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    let here: HashSet<String> = counts.keys().cloned().collect();
     nodes.retain(|n| match n {
         FlowNode::Cleanup {
             name,
             depends,
             using,
             ..
-        } => keep(name, depends, using, &here),
+        } => {
+            // The scope this cleanup gets to appeal to is the one it is not
+            // itself holding up.
+            let mut seen = here.clone();
+            if let Some(e) = resolve_qualified(entries, helpers, name) {
+                for (c, _) in &e.captures {
+                    if counts.get(c).copied().unwrap_or(0) <= 1 {
+                        seen.remove(c);
+                    }
+                }
+            }
+            keep(name, depends, using, &seen)
+        }
         _ => true,
     });
     for n in nodes {
@@ -521,21 +573,7 @@ fn retain_cleanups(
 /// running the wrong thing when it is actually the wrong thing.
 fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
     for node in nodes {
-        // A `TRUTH` template is a real consumer of a step: `resolve_truths`
-        // builds its scope from the row's cells first, and those are keyed
-        // `step.field`, so `TRUTH "{{create.HttpStatus}}"` resolves. Validation
-        // must therefore *not* refuse it — but pruning must not strand it
-        // either. Dropping the step removes the cell, the placeholder survives
-        // substitution, and every row in the column silently scores `Untested`
-        // with nothing said about why.
-        let truth = match node {
-            FlowNode::Report(ReportStmt::Computed { truth, .. }) => truth.as_deref(),
-            _ => None,
-        };
-        for text in crate::report::validate::interpolated_source(node)
-            .into_iter()
-            .chain(truth)
-        {
+        for text in crate::report::validate::interpolated_source(node) {
             for key in crate::environment::referenced_keys(text) {
                 if let Some((step, _)) = key.split_once('.')
                     && dropped_names.contains(step)
@@ -717,6 +755,16 @@ pub fn prune_to_targets(
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
     scan_strands(&flow.nodes, &dropped_names, &mut stranded);
+    for text in declared_truths(flow) {
+        for key in crate::environment::referenced_keys(&text) {
+            if let Some((step, _)) = key.split_once('.')
+                && dropped_names.contains(step)
+                && !stranded.contains(&key)
+            {
+                stranded.push(key.clone());
+            }
+        }
+    }
     for key in stranded {
         let step = key.split_once('.').map(|(s, _)| s).unwrap_or(&key);
         errors.push(fill(strings.diag_graph_target_strands, &[&key, step]));
@@ -1076,6 +1124,70 @@ mod tests {
         assert!(
             !text.contains("CLEANUP purge"),
             "purge was kept on a name only the dropped rotate wrote: {text}"
+        );
+    }
+
+    #[test]
+    fn a_truth_is_checked_wherever_it_is_attached() {
+        let entries = [entry("create", &[], &[]), entry("target", &[], &[])];
+        let body = "GRAPH\n    REPORT REQUEST create SHOW(HttpStatus)\n    REQUEST target\nEND\n";
+        // A truth attaches at four places, and a walk that knew about one of
+        // them left the other three stranding silently.
+        for tail in [
+            "REPORT V AS C TRUTH \"{{create.HttpStatus}}\"\n",
+            "REPORT REQUEST target WITH\n    f: jsonpath \"$.x\" TRUTH \"{{create.HttpStatus}}\"\nEND\n",
+        ] {
+            let errs = pruned(&format!("{body}{tail}"), &["target"], &entries)
+                .expect_err("a stranded TRUTH must be refused");
+            assert!(
+                errs.iter().any(|e| e.contains("create.HttpStatus")),
+                "{tail} => {errs:?}"
+            );
+        }
+        // The header's `columns:` directive is the site no node walk reaches.
+        let mut flow = crate::report::parser::parse_flow(&format!(
+            "# collection: c\n# columns: C TRUTH \"{{{{create.HttpStatus}}}}\"\n\n{body}"
+        ))
+        .expect("parses");
+        let errs = prune_to_targets(
+            &mut flow,
+            &["target".to_string()],
+            &entries,
+            &[],
+            &Strings::english(),
+        )
+        .expect_err("a stranded header TRUTH must be refused");
+        assert!(
+            errs.iter().any(|e| e.contains("create.HttpStatus")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_cannot_vouch_for_a_name_only_it_writes() {
+        // A request cannot answer its own `{{sid}}` out of its own response, so
+        // a cleanup that both reads and captures the name was keeping itself —
+        // and propping up every sibling that read the same name.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("rotate", &["sid"], &["sid"]),
+            entry("purge", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP rotate\nCLEANUP purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP rotate"),
+            "rotate vouched for itself: {text}"
+        );
+        assert!(
+            !text.contains("CLEANUP purge"),
+            "purge was propped up by the self-vouching rotate: {text}"
         );
     }
 

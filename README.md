@@ -723,10 +723,11 @@ literal `{{create.sid}}`. Only qualified references are checked: a plain
 `{{sid}}` is answered by whatever is standing in the capture chain, and pruning
 can't know what else might answer it — the environment isn't even loaded at that
 point — so a selection that leaves a flat reference's producer out is allowed
-through. A `TRUTH` template counts as a reference like any other: it is
-resolved against the row's cells, which are keyed by step, so pruning the step
-it names would leave every row in that column scoring `Untested` for no stated
-reason. A `USING(…)` override is read as part of the request too, since it
+through. A `TRUTH` template counts as a reference like any other, wherever it is
+written — on a computed column, on a variable column, on a `WITH` field or in
+the `columns:` directive. It is resolved against the row's cells, which are
+keyed by step, so pruning the step it names would leave every row in that column
+scoring `Untested` for no stated reason. A `USING(…)` override is read as part of the request too, since it
 decides what is actually sent — it can strand a teardown that looked clean, or
 clear one that didn't. `--dry-run` lists the steps grouped by how deep in the graph they sit,
 which is how you check the shape of a region without sending anything.

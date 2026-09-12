@@ -185,6 +185,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   it looked for the literal `{{setup.build}}` while the rows carried the real
   name and every comparison came back unmatched. The run's answer is carried out
   to the collapse instead of being guessed at twice.
+- `--targets` now checks a `TRUTH` template wherever it is attached — `REPORT
+  "…" AS C`, `REPORT v AS C`, a `WITH` field, or the header's `columns:`
+  directive. Only the first was checked, so the other three stranded in silence:
+  the cell the truth names is gone, the placeholder survives substitution, and
+  every row in the column scores `Untested` with nothing said about why.
+- A `CLEANUP` whose request both reads and captures the same name no longer
+  vouches for itself through pruning — nor, by surviving, for every sibling that
+  reads that name. A request cannot answer its own `{{sid}}` out of its own
+  response.
 - A `CLEANUP` that depends on a member of a cycle is now skipped rather than
   sent with the reference still written `{{a.tok}}` in its URL. The cycle's
   members are marked before any teardown is dispatched, so the verdict holds
