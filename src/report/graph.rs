@@ -484,76 +484,38 @@ fn retain_cleanups(
     }
 }
 
-/// Collect every reference that pruning has left with nothing to resolve to,
-/// carrying the capture names visible at each level the way
-/// [`retain_cleanups`] does.
+/// Collect every reference that pruning has left with nothing to resolve to.
 ///
-/// A qualified reference names its step outright, so a dropped step is decisive
-/// wherever it is written. A flat one is answered by the capture chain, so it
-/// is only stranded when the name *was* produced by a pruned step and nothing
-/// still in scope produces it — the same test the cleanup retain uses, applied
-/// to the statements that are not cleanups. Without it a surviving request
-/// outside the region kept its `{{sid}}` and sent the placeholder verbatim.
+/// Only *qualified* references are checked, and deliberately so. A `step.var`
+/// names its producer outright, so a dropped step makes it unresolvable no
+/// matter where it is written or what else is in scope — the placeholder could
+/// only reach the run verbatim.
 ///
-/// A name the environment also supplies is still refused. In an unpruned run
-/// the capture shadows the environment, so letting the selection fall through
-/// to the environment value would quietly run the flow against a different
-/// value than the one the author wrote — which is the thing this check exists
-/// to prevent.
-fn scan_strands(
-    nodes: &[FlowNode],
-    visible: &HashSet<String>,
-    entries: &[HurlEntry],
-    helpers: &[HelperCollection],
-    dropped_names: &HashSet<String>,
-    dropped_captures: &HashSet<String>,
-    out: &mut Vec<String>,
-) {
-    let mut here = visible.clone();
-    here.extend(scope_captures(nodes, entries, helpers));
+/// A flat `{{sid}}` cannot be judged here at all. It is answered by whatever is
+/// standing in the capture chain, and pruning has no idea what else could
+/// answer it: the environment is not loaded at this point, and the chain is a
+/// run-time thing with an order this walk does not have. Trying it anyway
+/// refused working selections — a statement written *before* the region, which
+/// could never have read the region's capture in the first place; a step whose
+/// `USING(url = …)` had replaced the only text holding the reference; a name
+/// the environment supplied all along. Refusing to run is only better than
+/// running the wrong thing when it is actually the wrong thing.
+fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
     for node in nodes {
-        let own = match node {
-            FlowNode::Cleanup { name, .. } => Some(name.as_str()),
-            _ => step_name(node).map(|(_, r)| r),
-        };
-        // The flow's own text is only half of it: a flat `{{sid}}` is far more
-        // often written in the request's Hurl than in a `USING(…)` override.
-        // Dotted names there are refused outright by validation, so only the
-        // flat ones need checking.
-        let entry_refs: Vec<String> = own
-            .and_then(|r| resolve_qualified(entries, helpers, r))
-            .map(|e| {
-                crate::request::entry_referenced_keys(e)
-                    .into_iter()
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
-        let texts = crate::report::validate::interpolated_source(node);
-        let keys = texts
-            .iter()
-            .flat_map(|t| crate::environment::referenced_keys(t))
-            .chain(entry_refs);
-        for key in keys {
-            let stranded = match key.split_once('.') {
-                Some((step, _)) => dropped_names.contains(step),
-                None => dropped_captures.contains(key.as_str()) && !here.contains(key.as_str()),
-            };
-            if stranded && !out.contains(&key) {
-                out.push(key.clone());
+        for text in crate::report::validate::interpolated_source(node) {
+            for key in crate::environment::referenced_keys(text) {
+                if let Some((step, _)) = key.split_once('.')
+                    && dropped_names.contains(step)
+                    && !out.contains(&key)
+                {
+                    out.push(key.clone());
+                }
             }
         }
         match node {
             FlowNode::ForEach { body, .. }
             | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => scan_strands(
-                body,
-                &here,
-                entries,
-                helpers,
-                dropped_names,
-                dropped_captures,
-                out,
-            ),
+            | FlowNode::Graph { body, .. } => scan_strands(body, dropped_names, out),
             _ => {}
         }
     }
@@ -688,15 +650,7 @@ pub fn prune_to_targets(
     // here — and refused, because sending something other than what was asked
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
-    scan_strands(
-        &flow.nodes,
-        &HashSet::new(),
-        entries,
-        helpers,
-        &dropped_names,
-        &dropped_captures,
-        &mut stranded,
-    );
+    scan_strands(&flow.nodes, &dropped_names, &mut stranded);
     for key in stranded {
         let step = key.split_once('.').map(|(s, _)| s).unwrap_or(&key);
         errors.push(fill(strings.diag_graph_target_strands, &[&key, step]));
@@ -1158,26 +1112,6 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("CLEANUP teardown"), "{text}");
-    }
-
-    #[test]
-    fn pruning_refuses_to_strand_a_flat_reference_to_a_removed_step() {
-        // Outside a region a flat reference makes no edge, so nothing kept the
-        // producer — and nothing checked it either. The survivor was sent with
-        // the literal `{{sid}}` in its URL and said nothing about it.
-        let entries = [
-            entry("create", &["sid"], &[]),
-            entry("target", &[], &[]),
-            entry("consumer", &[], &["sid"]),
-        ];
-        let err = pruned(
-            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
-             REQUEST consumer\n",
-            &["target"],
-            &entries,
-        )
-        .unwrap_err();
-        assert!(err.iter().any(|e| e.contains("sid")), "{err:?}");
     }
 
     #[test]

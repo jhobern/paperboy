@@ -719,12 +719,12 @@ depend on, so a release check can ask for one answer without paying for the
 whole report. Naming a step that no region declares is an error rather than a
 silent empty run, and so is naming a set of targets that leaves out a step the
 rest of the report still refers to: the reference could only reach the run as a
-literal `{{create.sid}}`. That holds for a plain `{{sid}}` as much as for a
-qualified name — if the pruned step was what produced it and nothing left in
-scope does, the run is refused rather than quietly falling through to an
-environment value the unpruned run would have shadowed. `--dry-run` lists the steps grouped by how deep in the
-graph they sit, which is how you check the shape of a region without sending
-anything.
+literal `{{create.sid}}`. Only qualified references are checked: a plain
+`{{sid}}` is answered by whatever is standing in the capture chain, and pruning
+can't know what else might answer it — the environment isn't even loaded at that
+point — so a selection that leaves a flat reference's producer out is allowed
+through. `--dry-run` lists the steps grouped by how deep in the graph they sit,
+which is how you check the shape of a region without sending anything.
 
 `DEPENDS` states an ordering the data doesn't show. Inference only sees values
 flowing from a capture to a reference, and some dependencies leave no such
@@ -815,11 +815,13 @@ after this one, so a cleanup out there could never have run in time. For the
 same reason an ordinary step can never read a cleanup's capture — teardown runs
 after every step in its block.
 
-Where a cleanup and an ordinary step both produce a name, the cleanup wins: it
-writes the value last, so it is the one the teardown is handed and the one it
-is therefore gated on. That holds even when the environment supplies the name
-as well, because a capture shadows the environment here exactly as it does
-everywhere else.
+Which step a cleanup waits for and which one it is *gated* on are two different
+questions. The order has to be settled before anything has run, so it can only
+ask which steps declare a name; the gate is asked when the teardown is
+dispatched, by which point the step that actually wrote the value it is being
+handed is a fact. A sibling cleanup that was skipped, or that ran without
+capturing, therefore doesn't vouch for a value it never wrote — the step that
+did write it is the one that has to have succeeded.
 
 #### Carrying the requests in the report
 

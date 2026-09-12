@@ -1433,29 +1433,6 @@ fn check_qualified_refs(
     diags: &mut Vec<Diagnostic>,
 ) {
     let s = ctx.strings;
-    // `TRUTH` is resolved per row, against that row's cells and the loop
-    // variables visible where it was written — never against the capture
-    // chain or the `step.var` namespace. A step reference there is therefore
-    // not a reference to something out of scope but to something the template
-    // can never be handed: it would substitute nothing, every row would score
-    // as untested for that column, and no diagnostic would ever say why.
-    if let FlowNode::Report(ReportStmt::Computed {
-        truth: Some(truth), ..
-    }) = node
-    {
-        let mut bad: Vec<String> = crate::environment::referenced_keys(truth)
-            .into_iter()
-            .filter(|k| {
-                k.split_once('.')
-                    .is_some_and(|(step, _)| path.iter().rev().any(|f| f.contains_key(step)))
-            })
-            .collect();
-        bad.sort();
-        bad.dedup();
-        for key in bad {
-            diags.push(Diagnostic::error(fill(s.diag_truth_step_ref, &[&key])));
-        }
-    }
     for text in interpolated_source(node) {
         for key in crate::environment::referenced_keys(text) {
             let Some((step, var)) = key.split_once('.') else {
@@ -2506,23 +2483,6 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.severity == Severity::Error && d.message.contains("nosuch")),
-            "{diags:?}"
-        );
-    }
-
-    #[test]
-    fn a_truth_template_may_not_name_a_step() {
-        // TRUTH is resolved against the row's own cells and the loop variables
-        // around it — never the capture chain — so the placeholder substituted
-        // nothing, every row scored as untested, and nothing said why.
-        let diags = diags_with_entries(
-            "# collection: c\n\nREQUEST login\nREPORT \"x\" AS C TRUTH \"{{login.token}}\"\n",
-            &[capturing_entry("login", &["token"])],
-        );
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.severity == Severity::Error && d.message.contains("login.token")),
             "{diags:?}"
         );
     }

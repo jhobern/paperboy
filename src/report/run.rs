@@ -748,24 +748,35 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>,
         let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
             // A cycle: emit what is left in the order it arrived. The
             // leftovers are the ring *and* everything downstream of it, so
-            // trim back to the members themselves before naming them — a
-            // cleanup that merely depends on a ring member is well-formed,
-            // and telling its author to go break a cycle it is not part of
-            // sends them to the wrong line.
-            let mut ring: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
-            loop {
-                let before = ring.len();
-                let keep: Vec<usize> = ring
-                    .iter()
-                    .copied()
-                    .filter(|&i| succ[i].iter().any(|k| ring.contains(k)))
-                    .collect();
-                ring = keep;
-                if ring.len() == before {
-                    break;
+            // name only the members themselves — a cleanup that merely depends
+            // on a ring member is well-formed, and telling its author to go
+            // break a cycle it is not part of sends them to the wrong line.
+            //
+            // "In a ring" means the node can be reached from itself. Peeling
+            // off the leftovers that have no successor is not the same test: it
+            // keeps a node that sits *between* two rings, which has a successor
+            // throughout and is in neither.
+            let stuck: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+            let reaches_itself = |from: usize| {
+                let mut seen = vec![false; n];
+                let mut stack = succ[from].clone();
+                while let Some(k) = stack.pop() {
+                    if k == from {
+                        return true;
+                    }
+                    if !done[k] && !seen[k] {
+                        seen[k] = true;
+                        stack.extend(succ[k].iter().copied());
+                    }
                 }
-            }
-            cyclic.extend(ring.into_iter().map(|i| planned[i].3.clone()));
+                false
+            };
+            cyclic.extend(
+                stuck
+                    .iter()
+                    .filter(|&&i| reaches_itself(i))
+                    .map(|&i| planned[i].3.clone()),
+            );
             out_idx.extend((0..n).filter(|&i| !done[i]));
             break;
         };
@@ -1490,13 +1501,29 @@ impl<'a> Exec<'a> {
             ));
         }
 
-        for (_, _, node, step, deps) in planned {
+        for (_, _, node, step, _) in planned {
             let FlowNode::Cleanup {
-                name, alias, using, ..
+                name,
+                alias,
+                depends,
+                using,
             } = node
             else {
                 continue;
             };
+            // Gate on what wrote each value *now*, not on what was expected to
+            // write it when the order was worked out. The two are different
+            // questions: ordering has to be decided before anything has run, so
+            // it can only ask which steps *declare* a name, while the gate is
+            // about the value this teardown is actually being handed — and by
+            // the time it is dispatched that is a fact, not a forecast.
+            //
+            // Deciding both statically was wrong in both directions. A sibling
+            // that was skipped writes nothing, so gating on it abandoned a
+            // resource an earlier step had really made; a sibling that ran but
+            // captured nothing vouched for a value that belonged to a step that
+            // had failed.
+            let deps = self.cleanup_deps(name, depends, using, &step, &[]);
             if let Some(dep) = deps
                 .into_iter()
                 .find(|d| !self.step_ok.get(d).copied().unwrap_or(false))
@@ -3715,6 +3742,114 @@ mod tests {
             fake.call_vars("purge")
         );
         assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_skipped_sibling_does_not_strand_a_resource_that_was_really_made() {
+        // `rotate` declares `sid`, so it is ordered ahead of `purge` — but it is
+        // skipped and writes nothing, leaving `open`'s session standing in the
+        // chain. Gating on the sibling anyway abandoned a resource that
+        // demonstrably existed, and the run still read as green.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("flake", &[], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("open", &[("sid", "S1")]), failing("flake")]);
+        run(
+            "REQUEST open AS open\nREQUEST flake AS flake\n\
+             CLEANUP purge\nCLEANUP rotate DEPENDS flake\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            fake.call_order().contains(&"purge".to_string()),
+            "the session it tears down was really made: {:?}",
+            fake.call_order()
+        );
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("S1")
+        );
+    }
+
+    #[test]
+    fn a_sibling_that_declares_a_name_but_writes_nothing_does_not_vouch_for_it() {
+        // The other direction. `rotate` runs and succeeds but captures nothing,
+        // so the value `purge` is handed still belongs to `open` — which
+        // failed. Letting the sibling's success stand in for the writer's
+        // authorised the teardown against a dead session.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "open",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "S1".into())],
+                    ..Default::default()
+                },
+            ),
+            ("rotate", Canned::default()),
+        ]);
+        let res = run(
+            "REQUEST open AS open\nCLEANUP purge\nCLEANUP rotate\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have been sent the failed step's session: {:?}",
+            fake.call_vars("purge")
+        );
+        assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_cleanup_between_two_rings_is_named_in_neither() {
+        // Peeling off leftovers with no successor is not the same question as
+        // "is it in a ring": a cleanup downstream of one ring and upstream of
+        // another has a successor throughout, and was named as a member of a
+        // cycle it had nothing to do with.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let d = graph_entry("d", &["dkey"], &[]);
+        let mut e = graph_entry("e", &["tok2"], &["sid2", "dkey"]);
+        e.title = "e".into();
+        let mut f = graph_entry("f", &["sid2"], &["tok2"]);
+        f.title = "f".into();
+        let entries = [a, b, d, e, f];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP d DEPENDS a\nCLEANUP e\nCLEANUP f\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let ring = res
+            .errors
+            .iter()
+            .find(|e| e.contains("cycle"))
+            .expect("the rings are reported");
+        for m in ["a", "b", "e", "f"] {
+            assert!(ring.contains(m), "{m} is in a ring: {ring}");
+        }
+        assert!(
+            !ring.contains(", d") && !ring.contains("d,"),
+            "'d' sits between the two rings and is in neither: {ring}"
+        );
     }
 
     #[test]
