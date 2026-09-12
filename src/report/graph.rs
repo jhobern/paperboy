@@ -414,26 +414,6 @@ pub fn explain(
     out
 }
 
-/// Prune every region in `flow` to the transitive closure of `targets`.
-///
-/// Pruning needs exactly the promise the region makes and nothing weaker: that
-/// the declared graph is complete. Outside a region there is no such promise,
-/// so a target naming a step out there is an error rather than a no-op — the
-/// closure would be meaningless, and silently running the whole flow instead
-/// would be the worst of the available answers.
-/// Visit every node in `nodes`, descending into loop bodies and regions.
-fn for_each_node(nodes: &[FlowNode], f: &mut impl FnMut(&FlowNode)) {
-    for n in nodes {
-        f(n);
-        match n {
-            FlowNode::ForEach { body, .. }
-            | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => for_each_node(body, f),
-            _ => {}
-        }
-    }
-}
-
 /// The capture names produced *in this scope*: the steps written here and in
 /// any region here, but not those inside a loop body.
 ///
@@ -442,6 +422,12 @@ fn for_each_node(nodes: &[FlowNode], f: &mut impl FnMut(&FlowNode)) {
 /// loop is not available to anything after it. Counting one as still-produced
 /// would keep a teardown that then reads a variable nobody in this run ever
 /// set, which is the exact outcome pruning a stranded cleanup exists to avoid.
+///
+/// Cleanups count as producers here, even though [`step_name`] excludes them
+/// (it answers a different question — which nodes are graph vertices). A
+/// cleanup's capture is a real value that a sibling cleanup can read, and the
+/// runner orders the two on exactly that basis; leaving them out made pruning
+/// drop a teardown whose value was still being produced right beside it.
 fn scope_captures(
     nodes: &[FlowNode],
     entries: &[HurlEntry],
@@ -450,7 +436,11 @@ fn scope_captures(
     let mut out = HashSet::new();
     let mut visit = |nodes: &[FlowNode]| {
         for n in nodes {
-            if let Some((_, request)) = step_name(n)
+            let request = match n {
+                FlowNode::Cleanup { name, .. } => Some(name.as_str()),
+                _ => step_name(n).map(|(_, r)| r),
+            };
+            if let Some(request) = request
                 && let Some(e) = resolve_qualified(entries, helpers, request)
             {
                 out.extend(e.captures.iter().map(|(c, _)| c.clone()));
@@ -488,12 +478,94 @@ fn retain_cleanups(
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 retain_cleanups(body, &here, entries, helpers, keep)
             }
-            FlowNode::Graph { body, .. } => retain_cleanups(body, visible, entries, helpers, keep),
+            FlowNode::Graph { body, .. } => retain_cleanups(body, &here, entries, helpers, keep),
             _ => {}
         }
     }
 }
 
+/// Collect every reference that pruning has left with nothing to resolve to,
+/// carrying the capture names visible at each level the way
+/// [`retain_cleanups`] does.
+///
+/// A qualified reference names its step outright, so a dropped step is decisive
+/// wherever it is written. A flat one is answered by the capture chain, so it
+/// is only stranded when the name *was* produced by a pruned step and nothing
+/// still in scope produces it — the same test the cleanup retain uses, applied
+/// to the statements that are not cleanups. Without it a surviving request
+/// outside the region kept its `{{sid}}` and sent the placeholder verbatim.
+///
+/// A name the environment also supplies is still refused. In an unpruned run
+/// the capture shadows the environment, so letting the selection fall through
+/// to the environment value would quietly run the flow against a different
+/// value than the one the author wrote — which is the thing this check exists
+/// to prevent.
+fn scan_strands(
+    nodes: &[FlowNode],
+    visible: &HashSet<String>,
+    entries: &[HurlEntry],
+    helpers: &[HelperCollection],
+    dropped_names: &HashSet<String>,
+    dropped_captures: &HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    let mut here = visible.clone();
+    here.extend(scope_captures(nodes, entries, helpers));
+    for node in nodes {
+        let own = match node {
+            FlowNode::Cleanup { name, .. } => Some(name.as_str()),
+            _ => step_name(node).map(|(_, r)| r),
+        };
+        // The flow's own text is only half of it: a flat `{{sid}}` is far more
+        // often written in the request's Hurl than in a `USING(…)` override.
+        // Dotted names there are refused outright by validation, so only the
+        // flat ones need checking.
+        let entry_refs: Vec<String> = own
+            .and_then(|r| resolve_qualified(entries, helpers, r))
+            .map(|e| {
+                crate::request::entry_referenced_keys(e)
+                    .into_iter()
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        let texts = crate::report::validate::interpolated_source(node);
+        let keys = texts
+            .iter()
+            .flat_map(|t| crate::environment::referenced_keys(t))
+            .chain(entry_refs);
+        for key in keys {
+            let stranded = match key.split_once('.') {
+                Some((step, _)) => dropped_names.contains(step),
+                None => dropped_captures.contains(key.as_str()) && !here.contains(key.as_str()),
+            };
+            if stranded && !out.contains(&key) {
+                out.push(key.clone());
+            }
+        }
+        match node {
+            FlowNode::ForEach { body, .. }
+            | FlowNode::ForEnvs { body, .. }
+            | FlowNode::Graph { body, .. } => scan_strands(
+                body,
+                &here,
+                entries,
+                helpers,
+                dropped_names,
+                dropped_captures,
+                out,
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// Prune every region in `flow` to the transitive closure of `targets`.
+///
+/// Pruning needs exactly the promise the region makes and nothing weaker: that
+/// the declared graph is complete. Outside a region there is no such promise,
+/// so a target naming a step out there is an error rather than a no-op — the
+/// closure would be meaningless, and silently running the whole flow instead
+/// would be the worst of the available answers.
 pub fn prune_to_targets(
     flow: &mut ReportFlow,
     targets: &[String],
@@ -616,18 +688,15 @@ pub fn prune_to_targets(
     // here — and refused, because sending something other than what was asked
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
-    for_each_node(&flow.nodes, &mut |node| {
-        for text in crate::report::validate::interpolated_source(node) {
-            for key in crate::environment::referenced_keys(text) {
-                if let Some((step, _)) = key.split_once('.')
-                    && dropped_names.contains(step)
-                    && !stranded.contains(&key)
-                {
-                    stranded.push(key.clone());
-                }
-            }
-        }
-    });
+    scan_strands(
+        &flow.nodes,
+        &HashSet::new(),
+        entries,
+        helpers,
+        &dropped_names,
+        &dropped_captures,
+        &mut stranded,
+    );
     for key in stranded {
         let step = key.split_once('.').map(|(s, _)| s).unwrap_or(&key);
         errors.push(fill(strings.diag_graph_target_strands, &[&key, step]));
@@ -1044,6 +1113,71 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_keeps_a_capture_another_cleanup_still_makes() {
+        // A cleanup is a producer too — a sibling reads its capture and the
+        // runner orders the two on exactly that basis. Counting only ordinary
+        // steps dropped the second teardown although the value it needed was
+        // being minted right beside it.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("make", &["sid"], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP make\nCLEANUP teardown\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_in_a_region_sees_what_is_written_beside_the_region() {
+        // The recursion handed a region body the *incoming* set, throwing away
+        // everything written at the enclosing level, so a teardown inside one
+        // could not see a producer standing right next to it.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("make", &["sid"], &[]),
+            entry("target2", &[], &[]),
+            entry("teardown", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             REQUEST make\n\
+             GRAPH\n    REQUEST target2\n    CLEANUP teardown\nEND\n",
+            &["target", "target2"],
+            &entries,
+        )
+        .unwrap();
+        assert!(text.contains("CLEANUP teardown"), "{text}");
+    }
+
+    #[test]
+    fn pruning_refuses_to_strand_a_flat_reference_to_a_removed_step() {
+        // Outside a region a flat reference makes no edge, so nothing kept the
+        // producer — and nothing checked it either. The survivor was sent with
+        // the literal `{{sid}}` in its URL and said nothing about it.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("consumer", &[], &["sid"]),
+        ];
+        let err = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             REQUEST consumer\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap_err();
+        assert!(err.iter().any(|e| e.contains("sid")), "{err:?}");
     }
 
     #[test]

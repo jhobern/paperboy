@@ -746,8 +746,26 @@ fn order_cleanups(planned: Vec<PlannedCleanup<'_>>) -> (Vec<PlannedCleanup<'_>>,
     let mut cyclic: Vec<String> = Vec::new();
     while out_idx.len() < n {
         let Some(next) = (0..n).find(|&i| !done[i] && waiting[i] == 0) else {
-            // A cycle: emit what is left in the order it arrived.
-            cyclic.extend((0..n).filter(|&i| !done[i]).map(|i| planned[i].3.clone()));
+            // A cycle: emit what is left in the order it arrived. The
+            // leftovers are the ring *and* everything downstream of it, so
+            // trim back to the members themselves before naming them — a
+            // cleanup that merely depends on a ring member is well-formed,
+            // and telling its author to go break a cycle it is not part of
+            // sends them to the wrong line.
+            let mut ring: Vec<usize> = (0..n).filter(|&i| !done[i]).collect();
+            loop {
+                let before = ring.len();
+                let keep: Vec<usize> = ring
+                    .iter()
+                    .copied()
+                    .filter(|&i| succ[i].iter().any(|k| ring.contains(k)))
+                    .collect();
+                ring = keep;
+                if ring.len() == before {
+                    break;
+                }
+            }
+            cyclic.extend(ring.into_iter().map(|i| planned[i].3.clone()));
             out_idx.extend((0..n).filter(|&i| !done[i]));
             break;
         };
@@ -1467,7 +1485,7 @@ impl<'a> Exec<'a> {
         (planned, cyclic) = order_cleanups(planned);
         if !cyclic.is_empty() {
             self.errors.push(crate::i18n::fill(
-                self.ctx.strings.diag_graph_cycle,
+                self.ctx.strings.run_cleanup_cycle,
                 &[&cyclic.join(", ")],
             ));
         }
@@ -1536,9 +1554,6 @@ impl<'a> Exec<'a> {
             resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
                 .is_some_and(|e| e.captures.iter().any(|(c, _)| c == var))
         };
-        // Everything the cleanup could already read: environment, assignments,
-        // loop binds and the capture chain.
-        let have = self.vars_for();
         let mut refs: Vec<String> = Vec::new();
         if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
             refs.extend(crate::request::entry_referenced_keys(entry));
@@ -1560,12 +1575,36 @@ impl<'a> Exec<'a> {
                 }
                 Some(_) => {}
                 None => {
-                    // A flat reference is answered by whatever is standing in
-                    // the flat chain, so the step it depends on is the step
-                    // that *wrote* that value — recorded at the time, because a
-                    // request that failed a status or an assertion can still
-                    // have captured, and the winner is therefore not always the
-                    // latest successful one.
+                    // A sibling cleanup that captures this name writes it
+                    // *after* every ordinary step in the block has run, so by
+                    // the time this teardown is dispatched the sibling is the
+                    // last writer and its value is the one on the wire. The
+                    // dependency has to be the step whose value actually
+                    // arrives; gating on the earlier owner instead would
+                    // authorise the teardown by one step and then point it at
+                    // another one's resource.
+                    //
+                    // That is true whether or not anything else can answer the
+                    // name. An environment value looks like a second source,
+                    // but a capture shadows the environment everywhere else in
+                    // the language and does so here too — declining the edge
+                    // to protect it only meant the ordering disagreed with the
+                    // value while the wrong resource was torn down anyway.
+                    let sibs: Vec<String> = siblings
+                        .iter()
+                        .filter(|(s, req)| s != self_step && declares(req, &r))
+                        .map(|(s, _)| s.clone())
+                        .collect();
+                    if !sibs.is_empty() {
+                        out.extend(sibs);
+                        continue;
+                    }
+                    // A flat reference is otherwise answered by whatever is
+                    // standing in the flat chain, so the step it depends on is
+                    // the step that *wrote* that value — recorded at the time,
+                    // because a request that failed a status or an assertion
+                    // can still have captured, and the winner is therefore not
+                    // always the latest successful one.
                     if let Some(owner) = self.capture_owner.get(&r) {
                         out.push(owner.clone());
                         continue;
@@ -1585,22 +1624,6 @@ impl<'a> Exec<'a> {
                             })
                             .cloned(),
                     );
-                    // A sibling cleanup is different: none of them has run, so
-                    // "no step wrote this name" is not evidence about any of
-                    // them, and gating on one unconditionally would skip a
-                    // teardown whose value was in the environment all along —
-                    // leaking the resource over a name collision. It counts
-                    // only when nothing else can answer the reference, which is
-                    // the one case where the sibling's capture must be what was
-                    // meant.
-                    if !have.contains_key(&r) {
-                        out.extend(
-                            siblings
-                                .iter()
-                                .filter(|(s, req)| s != self_step && declares(req, &r))
-                                .map(|(s, _)| s.clone()),
-                        );
-                    }
                 }
             }
         }
@@ -3656,18 +3679,117 @@ mod tests {
     }
 
     #[test]
-    fn a_sibling_cleanup_does_not_claim_a_name_the_environment_already_answers() {
-        // No cleanup has run when the order is worked out, so "nothing wrote
-        // this name" is not evidence about any of them. Gating on a sibling
-        // unconditionally skipped a teardown whose value was in the environment
-        // all along — leaking the resource over nothing but a name collision,
-        // and reporting it as a warning so the run still read as green.
+    fn a_teardown_is_gated_on_the_sibling_that_writes_the_name_last() {
+        // `open` owned `sid` when the order was worked out, so the teardown was
+        // authorised by a step that succeeded — and then `rotate` ran first and
+        // overwrote `sid` with the session it had failed to make. The value on
+        // the wire was the dead one, the gate had vouched for a different
+        // resource entirely, and the run still read as green.
+        let entries = [
+            graph_entry("open", &["sid"], &[]),
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[
+            ok_capturing("open", &[("sid", "S1")]),
+            (
+                "rotate",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    captures: vec![("sid".into(), "S2".into())],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let res = run(
+            "REQUEST open AS open\nCLEANUP purge\nCLEANUP rotate DEPENDS open\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        assert!(
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have been sent the failed session: {:?}",
+            fake.call_vars("purge")
+        );
+        assert!(res.skipped.contains(&"purge".to_string()));
+    }
+
+    #[test]
+    fn a_cycle_among_cleanups_names_only_the_ones_in_it() {
+        // Kahn leaves the ring *and* everything downstream of it. Naming the
+        // lot told the author of a perfectly well-formed teardown to go break a
+        // cycle it was not part of.
+        let mut a = graph_entry("a", &["token"], &["sid"]);
+        a.title = "a".into();
+        let mut b = graph_entry("b", &["sid"], &["token"]);
+        b.title = "b".into();
+        let c = graph_entry("c", &[], &[]);
+        let entries = [a, b, c];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "CLEANUP a\nCLEANUP b\nCLEANUP c DEPENDS a\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let ring = res
+            .errors
+            .iter()
+            .find(|e| e.contains("cycle"))
+            .expect("the ring is reported");
+        assert!(ring.contains('a') && ring.contains('b'), "{ring}");
+        assert!(
+            !ring.contains(", c") && !ring.contains("c,"),
+            "'c' only depends on the ring, it is not in it: {ring}"
+        );
+    }
+
+    #[test]
+    fn a_sibling_cleanup_that_writes_the_name_is_what_the_teardown_waits_for() {
+        // The environment answers `sid` too, which once looked like reason
+        // enough not to order the two — but a capture shadows the environment
+        // here as it does everywhere else, so the sibling's value is the one on
+        // the wire regardless. Declining the edge only made the ordering
+        // disagree with the value: the teardown was authorised against the
+        // environment and then sent against the sibling's resource.
+        let entries = [
+            graph_entry("purge", &[], &["sid"]),
+            graph_entry("rotate", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok_capturing("rotate", &[("sid", "FRESH")])]);
+        // Written rotate-first, so reverse-written order alone would send the
+        // teardown before the sibling that mints what it tears down.
+        run(
+            "CLEANUP rotate\nCLEANUP purge\n",
+            &entries,
+            &[("sid", "from-env")],
+            &[],
+            &fake,
+        );
+        let order = fake.call_order();
+        assert_eq!(order, vec!["rotate".to_string(), "purge".to_string()]);
+        assert_eq!(
+            fake.call_vars("purge").get("sid").map(String::as_str),
+            Some("FRESH"),
+            "the teardown is sent the value it was ordered against"
+        );
+    }
+
+    #[test]
+    fn a_teardown_is_not_sent_against_a_sibling_that_failed_to_write() {
+        // The other half of the same rule. `sid` is in the environment, so
+        // before the edge existed `purge` ran happily — against the *old*
+        // session, while the one `rotate` was meant to mint was never made.
         let entries = [
             graph_entry("purge", &[], &["sid"]),
             graph_entry("rotate", &["sid"], &[]),
         ];
         let fake = Fake::new(&[failing("rotate")]);
-        run(
+        let res = run(
             "CLEANUP purge\nCLEANUP rotate\n",
             &entries,
             &[("sid", "from-env")],
@@ -3675,10 +3797,11 @@ mod tests {
             &fake,
         );
         assert!(
-            fake.call_order().contains(&"purge".to_string()),
-            "the teardown had its value all along: {:?}",
+            !fake.call_order().contains(&"purge".to_string()),
+            "it would have torn down whatever the environment happened to name: {:?}",
             fake.call_order()
         );
+        assert!(res.skipped.contains(&"purge".to_string()));
     }
 
     #[test]

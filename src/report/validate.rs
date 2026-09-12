@@ -1358,6 +1358,24 @@ pub(super) fn interpolated_source(node: &FlowNode) -> Vec<&str> {
         FlowNode::Cleanup { using: u, .. } => using(u),
         FlowNode::Report(ReportStmt::Request { using: u, .. }) => using(u),
         FlowNode::Report(ReportStmt::Computed { template, .. }) => vec![template.as_str()],
+        // A `FILE(…)` snapshot path is resolved like a producer path, against
+        // the same dotted-capable map, so it is an interpolation site like any
+        // other. The role *names* beside it are checked by `check_env_refs`.
+        FlowNode::ForEnvs { clause, .. } => match clause {
+            EnvClause::Plain(_) => vec![],
+            EnvClause::Roles {
+                baseline,
+                comparisons,
+                ..
+            } => baseline
+                .iter()
+                .chain(comparisons)
+                .filter_map(|r| match r {
+                    RoleRef::File(p) => Some(p.as_str()),
+                    RoleRef::Env(_) => None,
+                })
+                .collect(),
+        },
         _ => vec![],
     }
 }
@@ -1415,6 +1433,29 @@ fn check_qualified_refs(
     diags: &mut Vec<Diagnostic>,
 ) {
     let s = ctx.strings;
+    // `TRUTH` is resolved per row, against that row's cells and the loop
+    // variables visible where it was written — never against the capture
+    // chain or the `step.var` namespace. A step reference there is therefore
+    // not a reference to something out of scope but to something the template
+    // can never be handed: it would substitute nothing, every row would score
+    // as untested for that column, and no diagnostic would ever say why.
+    if let FlowNode::Report(ReportStmt::Computed {
+        truth: Some(truth), ..
+    }) = node
+    {
+        let mut bad: Vec<String> = crate::environment::referenced_keys(truth)
+            .into_iter()
+            .filter(|k| {
+                k.split_once('.')
+                    .is_some_and(|(step, _)| path.iter().rev().any(|f| f.contains_key(step)))
+            })
+            .collect();
+        bad.sort();
+        bad.dedup();
+        for key in bad {
+            diags.push(Diagnostic::error(fill(s.diag_truth_step_ref, &[&key])));
+        }
+    }
     for text in interpolated_source(node) {
         for key in crate::environment::referenced_keys(text) {
             let Some((step, var)) = key.split_once('.') else {
@@ -1430,13 +1471,42 @@ fn check_qualified_refs(
                 )));
                 continue;
             }
-            let Some(info) = path.iter().rev().find_map(|f| f.get(step)) else {
+            let Some((depth, info)) = path
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, f)| f.get(step).map(|info| (i, info)))
+            else {
                 diags.push(Diagnostic::error(fill(
                     s.diag_step_ref_unknown,
                     &[&key, step],
                 )));
                 continue;
             };
+            // Reading a capture is a dependency as surely as naming one, so
+            // the rules that govern `DEPENDS` on a cleanup govern this too —
+            // otherwise the same mistake written as a value slips through,
+            // makes no edge at run time, and puts the literal `{{…}}` on the
+            // wire without a word said.
+            if info.is_cleanup {
+                if !matches!(node, FlowNode::Cleanup { .. }) {
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_step_ref_cleanup,
+                        &[&key, step],
+                    )));
+                    continue;
+                }
+                // An enclosing block unwinds after this one, so a cleanup out
+                // there cannot have run by the time this value is needed.
+                if depth + 1 < path.len() {
+                    let here = own.unwrap_or(step);
+                    diags.push(Diagnostic::error(fill(
+                        s.diag_cleanup_depends_outer,
+                        &[here, step, step],
+                    )));
+                    continue;
+                }
+            }
             // Unbound collection: the request's captures aren't knowable, so
             // the second half of the check is skipped rather than guessed at.
             if ctx.request_entries.is_none() {
@@ -2358,6 +2428,101 @@ mod tests {
             diags.iter().any(|d| d.severity == Severity::Error
                 && d.message.contains("inner")
                 && d.message.contains("outer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_not_read_a_capture_from_one_in_an_enclosing_block() {
+        // The same mistake written as a value instead of a clause. It made no
+        // edge at run time, was not skipped, and put the literal
+        // `{{outer.token}}` on the wire without a word said.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP outer\n\
+             FOR X IN [\"a\"]\n    REQUEST create\n    CLEANUP inner USING(query.t = \"{{outer.token}}\")\nEND\n",
+            &[
+                capturing_entry("outer", &["token"]),
+                capturing_entry("create", &[]),
+                capturing_entry("inner", &[]),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.severity == Severity::Error
+                && d.message.contains("inner")
+                && d.message.contains("outer")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_step_may_not_read_a_cleanups_capture() {
+        // Teardown runs after every step in its block, so the value does not
+        // exist yet when the step is sent — there is no ordering that would
+        // make this work, whichever way round the two are written.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP purge\nREQUEST use USING(query.t = \"{{purge.token}}\")\n",
+            &[
+                capturing_entry("purge", &["token"]),
+                capturing_entry("use", &[]),
+            ],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("purge.token")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_may_read_a_sibling_cleanups_capture() {
+        // The boundary of the rule above: same block, and the runner orders the
+        // two on exactly this reference.
+        let diags = diags_with_entries(
+            "# collection: c\n\nCLEANUP make\nCLEANUP purge USING(query.t = \"{{make.token}}\")\n",
+            &[
+                capturing_entry("make", &["token"]),
+                capturing_entry("purge", &[]),
+            ],
+        );
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("make")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_path_is_checked_for_step_references_like_any_other() {
+        // A FILE(…) role is resolved like a producer path, against the same
+        // dotted-capable map — so it is an interpolation site, and a reference
+        // to a step that does not exist has to be caught before the run.
+        let diags = diags_with_entries(
+            "# collection: c\n\nFOR T IN ENVS BASELINE(FILE(\"{{nosuch.sid}}.baseline\")), COMPARISON(\"eu\")\n    REPORT T AS S\nEND\n",
+            &[capturing_entry("create", &["sid"])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("nosuch")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_truth_template_may_not_name_a_step() {
+        // TRUTH is resolved against the row's own cells and the loop variables
+        // around it — never the capture chain — so the placeholder substituted
+        // nothing, every row scored as untested, and nothing said why.
+        let diags = diags_with_entries(
+            "# collection: c\n\nREQUEST login\nREPORT \"x\" AS C TRUTH \"{{login.token}}\"\n",
+            &[capturing_entry("login", &["token"])],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Severity::Error && d.message.contains("login.token")),
             "{diags:?}"
         );
     }

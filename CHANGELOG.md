@@ -179,6 +179,52 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A `CLEANUP` that reads a name a *sibling* cleanup captures now waits for that
+  sibling, and is gated on it. Cleanups run after every ordinary step in their
+  block, so a sibling that captures the name writes it last and its value is the
+  one on the wire — but the teardown was being ordered and gated against an
+  earlier producer, or against an environment value, and then sent against the
+  sibling's resource. It now holds whether or not anything else supplies the
+  name, because a capture shadows the environment here exactly as it does
+  everywhere else.
+
+- A cycle between cleanups reported at run time now names only the cleanups in
+  the ring. Everything downstream of a cycle also fails to sort, so a
+  well-formed teardown that merely depended on a ring member was named as one of
+  its members and its author sent to break a cycle it was not part of. The
+  message now also says plainly that none of them ran and that what they cover
+  has been left behind.
+
+- A `CLEANUP` can no longer *read* a capture from a cleanup in an enclosing
+  block, and an ordinary step can no longer read one at all. `DEPENDS` already
+  refused the first of these; written as a value reference instead, the same
+  impossible ordering passed validation, produced no edge, and put the literal
+  `{{outer.token}}` on the wire without a word said.
+
+- `--targets` no longer drops a teardown whose value another cleanup still
+  produces. Only ordinary steps counted as producers when pruning, so a cleanup
+  reading a sibling cleanup's capture was pruned as stranded even though the
+  runner orders the two on exactly that reference — and the resource it covered
+  was leaked. A cleanup written inside a region now also sees what is written
+  beside the region.
+
+- `--targets` now refuses a *flat* reference to a capture it pruned away, as it
+  already refused a qualified one. Outside a region a plain `{{sid}}` makes no
+  dependency edge, so nothing kept its producer and nothing checked it either:
+  the surviving request was sent with the placeholder verbatim. Falling through
+  to an environment value of the same name is refused too — the unpruned run
+  would have shadowed it, so it is a different run, not a lucky one.
+
+- An `ENVS BASELINE(FILE("…"))` snapshot path is now checked for step
+  references. It is resolved like a producer path, against the same map, but no
+  check ever read it: a reference to a step that does not exist was accepted at
+  open time, and one that `--targets` removed was not reported as stranded.
+
+- A `TRUTH` template naming a step is now refused. `TRUTH` is resolved against
+  the row's own cells and the loop variables around it, never the capture chain,
+  so `{{login.token}}` substituted nothing, every row scored as untested for that
+  column, and nothing said why.
+
 - A `CLEANUP` is now gated on the step that actually produced each value it
   reads, rather than on the last step that succeeded. Captures are recorded
   whether or not the request passed — a status or assertion can fail on a

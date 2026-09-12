@@ -719,7 +719,10 @@ depend on, so a release check can ask for one answer without paying for the
 whole report. Naming a step that no region declares is an error rather than a
 silent empty run, and so is naming a set of targets that leaves out a step the
 rest of the report still refers to: the reference could only reach the run as a
-literal `{{create.sid}}`. `--dry-run` lists the steps grouped by how deep in the
+literal `{{create.sid}}`. That holds for a plain `{{sid}}` as much as for a
+qualified name — if the pruned step was what produced it and nothing left in
+scope does, the run is refused rather than quietly falling through to an
+environment value the unpruned run would have shadowed. `--dry-run` lists the steps grouped by how deep in the
 graph they sit, which is how you check the shape of a region without sending
 anything.
 
@@ -807,8 +810,16 @@ identifier. Cleanups can depend on each other, by `DEPENDS` or by reading one
 another's captures, and are ordered accordingly; a cycle between them is
 refused, since every member of a ring waits on a member that has not run and
 the whole ring would silently skip. A cleanup can only depend on one in its own
-block: an enclosing block unwinds after this one, so a cleanup out there could
-never have run in time.
+block, and can only read one's captures there too: an enclosing block unwinds
+after this one, so a cleanup out there could never have run in time. For the
+same reason an ordinary step can never read a cleanup's capture — teardown runs
+after every step in its block.
+
+Where a cleanup and an ordinary step both produce a name, the cleanup wins: it
+writes the value last, so it is the one the teardown is handed and the one it
+is therefore gated on. That holds even when the environment supplies the name
+as well, because a capture shadows the environment here exactly as it does
+everywhere else.
 
 #### Carrying the requests in the report
 
