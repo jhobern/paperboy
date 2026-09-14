@@ -1937,6 +1937,7 @@ mod tests {
             vars: HashMap::new(),
             key: vec![],
             path: Vec::new(),
+            comparison: None,
             target: None,
         }
     }

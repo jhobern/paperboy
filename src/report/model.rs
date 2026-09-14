@@ -76,6 +76,22 @@ pub struct ReportRow {
     /// "a baseline" has no single answer. Recorded where the row is produced,
     /// which is the only place that knows.
     pub role: RowRole,
+    /// *Which* comparison that role is a position in: an identity for the
+    /// `ENVS` clause the row was produced under, stable across its visits.
+    ///
+    /// A side is meaningless without the comparison it belongs to. Two
+    /// independent clauses in one flow both drop their own environment axis
+    /// from the row key — that is what lets a baseline and its candidate meet
+    /// — so their rows land on the *same* key, and a collapse that indexed
+    /// baselines by key alone kept whichever arrived first and measured the
+    /// other comparison's candidates against it. Rolling pairs share one
+    /// identity on purpose: they are the same clause, told apart by the
+    /// enclosing loop's key part.
+    ///
+    /// `None` for a row with no comparison — and for one restored from a
+    /// snapshot, which is matched leniently so a saved baseline still stands in
+    /// for a live run.
+    pub comparison: Option<String>,
 }
 
 /// A whole run's output: the rows plus the first-seen order of produced column
@@ -1335,6 +1351,7 @@ mod tests {
                 .collect(),
             key: vec![],
             path: Vec::new(),
+            comparison: None,
             target: target.map(str::to_string),
         }
     }

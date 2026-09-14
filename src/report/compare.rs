@@ -206,10 +206,16 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     let excluded = excluded_keys(result);
     let rows = std::mem::take(&mut result.rows);
 
-    let mut baseline_by_key: HashMap<Vec<String>, ReportRow> = HashMap::new();
-    let mut candidate_by_key_target: HashMap<(Vec<String>, String), ReportRow> = HashMap::new();
-    let mut key_order: Vec<Vec<String>> = Vec::new();
-    let mut seen_key: HashSet<Vec<String>> = HashSet::new();
+    // Keyed by comparison as well as by row key. Two independent clauses both
+    // drop their own environment axis from the key — that is what lets a
+    // baseline and its candidate meet — so their rows collide, and indexing
+    // baselines by key alone kept whichever arrived first and measured the
+    // other comparison's candidates against a stranger.
+    type CmpKey = (Vec<String>, Option<String>);
+    let mut baseline_by_key: HashMap<CmpKey, ReportRow> = HashMap::new();
+    let mut candidate_by_key_target: HashMap<(CmpKey, String), ReportRow> = HashMap::new();
+    let mut key_order: Vec<CmpKey> = Vec::new();
+    let mut seen_key: HashSet<CmpKey> = HashSet::new();
     let mut passthrough: Vec<ReportRow> = Vec::new();
 
     for row in rows {
@@ -238,17 +244,16 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
             ),
         };
 
-        if (is_baseline || is_candidate) && seen_key.insert(row.key.clone()) {
-            key_order.push(row.key.clone());
+        let ck = (row.key.clone(), row.comparison.clone());
+        if (is_baseline || is_candidate) && seen_key.insert(ck.clone()) {
+            key_order.push(ck.clone());
         }
 
         if is_baseline {
-            baseline_by_key.entry(row.key.clone()).or_insert(row);
+            baseline_by_key.entry(ck).or_insert(row);
         } else if is_candidate {
             let t = target.unwrap_or_default();
-            candidate_by_key_target
-                .entry((row.key.clone(), t))
-                .or_insert(row);
+            candidate_by_key_target.entry((ck, t)).or_insert(row);
         } else {
             passthrough.push(row);
         }
@@ -258,7 +263,13 @@ pub fn apply(result: &mut ReportResult, roles: &Roles) {
     out.append(&mut passthrough);
 
     for key in &key_order {
-        let baseline = baseline_by_key.get(key);
+        // A row restored from a snapshot carries no comparison — it was saved
+        // long before this flow was written — so a comparison with no baseline
+        // of its own falls back to one that belongs to no comparison. That is
+        // the whole point of `BASELINE(FILE(…))`.
+        let baseline = baseline_by_key
+            .get(key)
+            .or_else(|| baseline_by_key.get(&(key.0.clone(), None)));
         let mut emitted = false;
         for comp in &roles.comparisons {
             if let Some(mut cand) = candidate_by_key_target.remove(&(key.clone(), comp.clone())) {
@@ -433,6 +444,7 @@ mod tests {
             vars: HashMap::new(),
             key: key.iter().map(|k| k.to_string()).collect(),
             path: Vec::new(),
+            comparison: None,
             target: Some(target.to_string()),
         }
     }

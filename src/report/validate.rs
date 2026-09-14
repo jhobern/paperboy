@@ -373,26 +373,24 @@ fn nested_params<'a>(nodes: &'a [FlowNode]) -> Vec<&'a super::flow::ParamDecl> {
 }
 
 /// Judge the `ENVS` names that are written as `{{PARAM}}` rather than spelled
-/// out. Two things can be said about them without running anything: whether
-/// they name a parameter at all (nothing else is resolvable this early — an
-/// `ENVS` clause is read before the first request has run, so a capture or an
-/// assignment would be a name whose meaning depends on where the run had got
-/// to), and, once the parameters' defaults are filled in, whether what they
-/// currently mean is loaded. The second is only a warning: changing it per run
-/// is the entire point.
+/// out: once the parameters' defaults are filled in, is what the name
+/// currently means actually loaded? Only a warning — changing it per run is
+/// the entire point — and only answerable at all when every reference in the
+/// name is a parameter, since nothing else has a value to substitute here.
+///
+/// Whether the reference resolves to *anything* is a separate question, asked
+/// by `check_var_availability` where the scope at the clause is known. It used
+/// to be asked here, and answered "only a parameter will do", on the grounds
+/// that an `ENVS` clause is read before the first request has run. That was
+/// never true of the interpreter: `run_for_envs` resolves the clause when it
+/// reaches it, against everything then in scope, so a loop variable — the way
+/// `BASELINE("prod-{{region}}")` inside a `FOR` is written, and the reason
+/// role targets are resolved per visit — is perfectly resolvable.
 fn check_env_refs(flow: &ReportFlow, ctx: &Context, diags: &mut Vec<Diagnostic>) {
     let s = ctx.strings;
     let declared = flow.params();
     let defaults = super::params::effective(&declared, &Default::default());
     for name in env_ref_names(&flow.nodes) {
-        for key in crate::environment::referenced_keys(name) {
-            if !declared.iter().any(|p| p.name == key) {
-                diags.push(Diagnostic::error(fill(
-                    s.diag_env_ref_not_a_param,
-                    &[&key, name],
-                )));
-            }
-        }
         let resolved = crate::environment::substitute(name, &defaults);
         if resolved.contains("{{") {
             // Still unresolved: a required parameter with no default. What it
@@ -2058,7 +2056,15 @@ fn check_var_availability(
             // inside the body regardless of which env is active. If the loaded
             // env variable names are unknown (`all_env_var_names` is None) we
             // skip the body entirely to stay conservative.
-            FlowNode::ForEnvs { var, body, .. } => {
+            FlowNode::ForEnvs {
+                var, body, clause, ..
+            } => {
+                // The clause itself is read in *this* scope, not the body's:
+                // `BASELINE("prod-{{region}}")` is resolved afresh on every
+                // visit against whatever is bound where the loop is written.
+                // Anything in scope will do — a parameter, a loop variable, an
+                // assignment, a capture from a step above.
+                warn_if_env_names_undefined(clause, ctx, defined, diags);
                 let mut inner = defined.clone();
                 inner.insert(var.clone());
                 if let Some(env_vars) = ctx.all_env_var_names {
@@ -2085,6 +2091,56 @@ fn check_var_availability(
                     }
                 }
                 check_var_availability(body, ctx, defined, diags);
+            }
+        }
+    }
+}
+
+/// Warn for every `{{VAR}}` in an `ENVS` clause's environment names that
+/// nothing in scope at the clause can answer.
+///
+/// Conservative in the same way as `warn_if_vars_undefined`: when the loaded
+/// environments' variable names are unknown the check is skipped entirely,
+/// because an environment may itself supply the name and a false warning about
+/// a working report is worse than a missed one. A `FILE(…)` role is a path
+/// rather than an environment and is left to the snapshot checks.
+fn warn_if_env_names_undefined(
+    clause: &EnvClause,
+    ctx: &Context,
+    defined: &HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(env_vars) = ctx.all_env_var_names else {
+        return;
+    };
+    let names: Vec<&String> = match clause {
+        EnvClause::Plain(names) => names.iter().collect(),
+        EnvClause::Roles {
+            baseline,
+            comparisons,
+            ..
+        } => baseline
+            .iter()
+            .chain(comparisons.iter())
+            .filter_map(|r| match r {
+                RoleRef::Env(n) => Some(n),
+                RoleRef::File(_) => None,
+            })
+            .collect(),
+    };
+    for name in names {
+        let mut keys: Vec<String> = crate::environment::referenced_keys(name)
+            .into_iter()
+            .collect();
+        // Sorted for the same reason `warn_if_vars_undefined` sorts: the panel
+        // is rebuilt often and a set's order is not stable between builds.
+        keys.sort();
+        for key in keys {
+            if !defined.contains(&key) && !env_vars.iter().any(|v| *v == key) {
+                diags.push(Diagnostic::warning(fill(
+                    ctx.strings.diag_env_ref_not_in_scope,
+                    &[&key, name],
+                )));
             }
         }
     }
@@ -2719,18 +2775,58 @@ mod tests {
         );
     }
 
-    /// An `ENVS` clause is read before anything has run, so a name it reaches
-    /// for has to be a parameter — a capture or an assignment would mean
-    /// something different depending on where the run had got to.
+    /// An `ENVS` clause is resolved when the run reaches it, against everything
+    /// then in scope — so an assignment above it names an environment perfectly
+    /// well. Refusing anything but a parameter put every role target written
+    /// through a loop variable out of reach, which is most of what roles are
+    /// for.
     #[test]
-    fn an_environment_reference_that_isnt_a_parameter_is_refused() {
+    fn an_environment_named_by_something_in_scope_is_accepted() {
         let errs = errors_for(
             "# collection: c\nTARGET_ENV = \"staging\"\n\
              FOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n",
         );
         assert!(
-            errs.iter().any(|e| e.contains("TARGET_ENV")),
-            "says which name and that it needs declaring: {errs:?}"
+            !errs.iter().any(|e| e.contains("TARGET_ENV")),
+            "an assignment binds it: {errs:?}"
+        );
+
+        let errs = errors_for(
+            "# collection: c\nFOR R IN [\"eu\", \"us\"]\n    \
+             FOR T IN ENVS BASELINE(\"prod-{{R}}\"), COMPARISON(\"stg-{{R}}\")\n        \
+             REPORT REQUEST r\n    END\nEND\n",
+        );
+        assert!(errs.is_empty(), "a loop variable binds it too: {errs:?}");
+    }
+
+    /// It is still worth saying when nothing at all could answer the reference
+    /// — but as a warning, and only where the scope is fully known, because an
+    /// environment may supply the name itself.
+    #[test]
+    fn an_environment_named_by_nothing_in_scope_is_a_warning() {
+        let entries = [test_entry("r", &[], &[])];
+        let warns: Vec<String> = {
+            let flow = parse_flow(
+                "# collection: c\nFOR T IN ENVS \"{{TARGET_ENV}}\"\n    REPORT REQUEST r\nEND\n",
+            )
+            .expect("test source should parse");
+            let titles = ["r".to_string()];
+            let ctx = Context {
+                request_titles: Some(&titles),
+                base_var_names: Some(&[]),
+                all_env_var_names: Some(&[]),
+                request_entries: Some(&entries),
+                ..Default::default()
+            };
+            validate(&flow, &ctx)
+                .into_iter()
+                .filter(|d| d.severity == Severity::Warning)
+                .map(|d| d.message)
+                .collect()
+        };
+        assert!(
+            warns.iter().any(|w| w.contains("TARGET_ENV")),
+            "says which name: {warns:?}"
         );
     }
 

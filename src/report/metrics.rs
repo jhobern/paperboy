@@ -409,6 +409,7 @@ mod tests {
             vars: HashMap::new(),
             key: Vec::new(),
             path: Vec::new(),
+            comparison: None,
             target: None,
         }
     }

@@ -582,6 +582,9 @@ struct Exec<'a> {
     /// one. A role belongs to a position in one comparison, not to the
     /// environment's name — see [`ReportRow::role`].
     role: RowRole,
+    /// Which comparison that role is a position in — see
+    /// [`ReportRow::comparison`].
+    comparison: Option<String>,
     /// The current `ENVS` target's variables, layered above pinned/global.
     target_env: Option<HashMap<String, String>>,
     /// Cells produced by REPORT statements in *enclosing* blocks (before this
@@ -659,6 +662,7 @@ struct ExecState {
     path: Vec<(usize, usize)>,
     target: Option<String>,
     role: RowRole,
+    comparison: Option<String>,
     target_env: Option<HashMap<String, String>>,
     broadcast: HashMap<String, String>,
     baseline_show: Vec<String>,
@@ -1135,6 +1139,7 @@ impl<'a> Exec<'a> {
             path: Vec::new(),
             target: None,
             role: RowRole::Unknown,
+            comparison: None,
             target_env: None,
             broadcast: HashMap::new(),
             column_order: Vec::new(),
@@ -1164,6 +1169,7 @@ impl<'a> Exec<'a> {
             path: self.path.clone(),
             target: self.target.clone(),
             role: self.role,
+            comparison: self.comparison.clone(),
             target_env: self.target_env.clone(),
             broadcast: self.broadcast.clone(),
             baseline_show: self.baseline_show.clone(),
@@ -1187,6 +1193,7 @@ impl<'a> Exec<'a> {
             path: state.path,
             target: state.target,
             role: state.role,
+            comparison: state.comparison,
             target_env: state.target_env,
             broadcast: state.broadcast,
             column_order: Vec::new(),
@@ -1775,6 +1782,7 @@ impl<'a> Exec<'a> {
             path: self.path.clone(),
             target: self.target.clone(),
             role: self.role,
+            comparison: self.comparison.clone(),
         };
         if let Some(sink) = self.ctx.sink {
             sink(RowEvent::Completed(&row));
@@ -2358,19 +2366,38 @@ impl<'a> Exec<'a> {
         // A plain list assigns no roles, so nothing pairs across it and its
         // value belongs in the key like any other loop's.
         let keyed = matches!(clause, EnvClause::Plain(_));
+        // ...and, for the same reason, it must not displace a comparison it is
+        // written *inside*. A plain `ENVS` nested in a role-bearing one still
+        // produces rows belonging to the enclosing baseline or candidate side;
+        // overwriting the side and the target with the inner environment's name
+        // left every row `Unassigned`, and the whole comparison the report was
+        // written for simply vanished from the output.
+        let inherit = keyed && matches!(self.role, RowRole::Baseline | RowRole::Candidate);
+        // Which comparison a side belongs to. The clause's position in the
+        // tree: constant across its visits, so rolling pairs stay one
+        // comparison, and distinct from any sibling clause, whose rows would
+        // otherwise land on the same key with nothing to tell them apart.
+        let comparison = (!keyed).then(|| {
+            let mut id: Vec<String> = self.path.iter().map(|(n, _)| n.to_string()).collect();
+            id.push(node_index.to_string());
+            id.join("/")
+        });
         let run_one = |i: usize| -> IterOut {
             let name = &live[i];
             let mut sub = Exec::from_state(ctx, seed.clone());
             sub.path.push((node_index, i));
-            sub.target = Some(name.clone());
             sub.target_env = ctx.named_envs.get(name).cloned();
+            if !inherit {
+                sub.target = Some(name.clone());
+                sub.role = live_roles[i];
+                sub.comparison = comparison.clone();
+            }
             if sub.target_env.is_none() {
                 sub.errors
                     .push(format!("environment '{name}' is not loaded"));
             }
             sub.scopes.push(HashMap::new());
             sub.set_var(var, name.clone());
-            sub.role = live_roles[i];
             if keyed {
                 sub.key_parts.push(name.clone());
             }
@@ -2400,6 +2427,9 @@ impl<'a> Exec<'a> {
                         let mut row = br.to_row();
                         row.target = Some(rel.clone());
                         row.role = file_roles[fi];
+                        // It stands in for a live run of this role, so it
+                        // belongs to this comparison like any other side.
+                        row.comparison = comparison.clone();
                         // A deterministic structural path (identical between the
                         // dry skeleton pass and the live run) so a streaming
                         // front-end slots the row; file roles come after the live
@@ -4160,6 +4190,107 @@ mod tests {
             assert!(
                 verdict.contains(&own),
                 "{env} must be measured against {own}: {verdict}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_envs_loop_inside_a_comparison_does_not_erase_it() {
+        // A plain list compares nothing, so it cannot be a *side* of anything —
+        // but it was overwriting the side and the target it had inherited with
+        // its own environment's name, leaving every row `Unassigned`. The
+        // collapse then passed the lot through and the comparison the report
+        // was written for vanished: no `Result` cell anywhere.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR T IN ENVS BASELINE(\"prod\"), COMPARISON(\"stg\")\n\
+             \x20 FOR E IN ENVS \"au\", \"eu\"\n\
+             \x20   REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20   REPORT \"{{T}}-{{E}}\" AS \"proc.v\"\n\
+             \x20 END\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                // The sides have to differ for the verdict to name the
+                // baseline it measured against, so the cell carries the outer
+                // loop variable — which is the side.
+                ("prod", &[][..]),
+                ("stg", &[][..]),
+                ("au", &[][..]),
+                ("eu", &[][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<String> = res
+            .rows
+            .iter()
+            .filter_map(|r| r.cells.get(crate::report::compare::RESULT_COLUMN).cloned())
+            .collect();
+        assert_eq!(
+            verdicts.len(),
+            2,
+            "one collapsed row per inner environment: {:?}",
+            res.rows
+        );
+        for v in &verdicts {
+            assert!(
+                v.contains("prod (baseline)"),
+                "the enclosing comparison still happened: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_comparisons_in_one_flow_do_not_share_a_baseline() {
+        // Both clauses leave their own `ENVS` axis out of the row key — that is
+        // what lets a baseline and its candidate meet — so all four rows land
+        // on key `[]`. Indexed by key alone, the first baseline to arrive won
+        // and the *other* comparison's candidate was measured against it: a
+        // confident verdict about a pair that was never written down, and the
+        // real baseline gone from the report.
+        let entries = [graph_entry("r", &[], &[])];
+        let fake = Fake::new(&[]);
+        let res = run(
+            "FOR T IN ENVS BASELINE(\"prod-a\"), COMPARISON(\"stg-a\")\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n\
+             FOR T IN ENVS BASELINE(\"prod-b\"), COMPARISON(\"stg-b\")\n\
+             \x20 REPORT REQUEST r AS proc SHOW(HttpStatus)\n\
+             \x20 REPORT \"{{who}}\" AS \"proc.v\"\n\
+             END\n",
+            &entries,
+            &[],
+            &[
+                // Each side differs from its own baseline, so the verdict has
+                // to name the baseline it was actually measured against.
+                ("prod-a", &[("who", "A1")][..]),
+                ("stg-a", &[("who", "A2")][..]),
+                ("prod-b", &[("who", "B1")][..]),
+                ("stg-b", &[("who", "B2")][..]),
+            ],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let verdicts: Vec<(String, String)> = res
+            .rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.target.clone()?,
+                    r.cells.get(crate::report::compare::RESULT_COLUMN)?.clone(),
+                ))
+            })
+            .collect();
+        assert_eq!(verdicts.len(), 2, "one per comparison: {verdicts:?}");
+        for (target, verdict) in &verdicts {
+            let own = format!("prod-{} (baseline)", &target[target.len() - 1..]);
+            assert!(
+                verdict.contains(&own),
+                "{target} must be measured against {own}: {verdict}"
             );
         }
     }

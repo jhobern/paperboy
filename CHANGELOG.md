@@ -179,6 +179,32 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- An `ENVS` clause may name its environment through **anything in scope where
+  it is written** — a parameter, a loop variable, an assignment, a capture —
+  not only a parameter. The clause is resolved when the run *reaches* it,
+  against everything then bound, so `BASELINE("prod-{{region}}")` inside a
+  `FOR` has always worked; validation refused it anyway, on a rationale that
+  was never true of the interpreter, and that error blocked the run in all
+  three front ends. Every comparison whose sides are chosen per visit —
+  region-by-region baselines, rolling pairs — was unreachable in practice.
+  A reference nothing in scope can answer is now a warning, and only where the
+  loaded environments' variable names are known, since an environment may
+  supply the name itself.
+- A plain `ENVS` loop written *inside* a comparison no longer erases it. A
+  plain list compares nothing, so it cannot be a side of anything — but it was
+  overwriting the side and the target it had inherited with its own
+  environment's name, leaving every row unassigned. The comparison the report
+  was written for then vanished from the output entirely: not a wrong verdict,
+  no verdict at all.
+- Two comparisons in one flow no longer share a baseline. Both clauses leave
+  their own `ENVS` axis out of the row key — that is what lets a baseline and
+  its candidate meet — so their rows land on the same key, and a collapse that
+  indexed baselines by key alone kept whichever arrived first and measured the
+  other comparison's candidates against a stranger, under a confident verdict,
+  with the real baseline gone from the report. A row now records *which*
+  comparison its side belongs to. Rolling pairs still share one identity, as
+  they must: they are the same clause, told apart by the enclosing loop's key.
+
 - A baseline snapshot taken before the row key changed is now refused outright
   rather than loaded and matched against nothing. Matching is exact key
   equality, so a stale file read cleanly, contributed no baseline to any row,

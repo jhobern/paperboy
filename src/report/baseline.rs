@@ -70,6 +70,9 @@ impl BaselineRow {
             // A stored snapshot row has no role of its own: it takes the one
             // the clause injecting it assigns.
             role: RowRole::Unknown,
+            // A saved row belongs to no comparison: it predates the flow it is
+            // about to stand in for, and is matched leniently for that reason.
+            comparison: None,
             target: self.target.clone(),
         }
     }
@@ -194,6 +197,7 @@ mod tests {
             vars: HashMap::new(),
             key: key.iter().map(|k| k.to_string()).collect(),
             path: Vec::new(),
+            comparison: None,
             target: None,
         }
     }
