@@ -2702,6 +2702,48 @@ REPORT Thumb AS Small IMAGE(FIT)
         );
     }
 
+    /// The four kinds of column metadata are gathered by one walk, but the
+    /// walk is not symmetric across them, and flattening it would be a silent
+    /// behaviour change. A `SHOW` field carries statistics and nothing else —
+    /// there is no `SHOW(f IMAGE)` — and a `BASELINE(…) SHOW(…)` contributes a
+    /// suffix-matched `baseline.*.f` key that only statistics have.
+    #[test]
+    fn column_metadata_is_gathered_from_the_places_each_clause_may_be_written() {
+        let src = concat!(
+            "# collection: c\n\n",
+            "REPORT REQUEST api AS a SHOW(dur STATISTICS(MEAN)) WITH\n",
+            "    code: jsonpath \"$.c\" IMAGE DETAIL TRUTH \"{{ e }}\" STATISTICS(COUNT)\n",
+            "END\n",
+            "FOR T IN ENVS BASELINE(\"p\") SHOW(lat STATISTICS(MEAN)), COMPARISON(\"s\")\n",
+            "    REPORT \"x\" AS C\n",
+            "END\n",
+        );
+        let flow = parse_flow(src).expect("parse");
+
+        // A `SHOW` field reaches the stats and only the stats.
+        assert!(flow.column_stats().contains_key("a.dur"), "SHOW summarises");
+        assert!(!flow.column_images().contains_key("a.dur"));
+        assert!(!flow.column_truths().contains_key("a.dur"));
+        assert!(!flow.column_details().contains("a.dur"));
+
+        // A `WITH` field reaches all four.
+        assert!(flow.column_stats().contains_key("a.code"));
+        assert!(flow.column_images().contains_key("a.code"));
+        assert_eq!(
+            flow.column_truths().get("a.code").map(String::as_str),
+            Some("{{ e }}")
+        );
+        assert!(flow.column_details().contains("a.code"));
+
+        // And the baseline key, which is statistics-only and matched by suffix
+        // at render time because its aliases aren't known until the run.
+        assert!(
+            flow.column_stats().contains_key("baseline.*.lat"),
+            "{:?}",
+            flow.column_stats()
+        );
+    }
+
     /// The template is arbitrary text, so words that happen to be clause
     /// keywords inside it must stay part of the value, and an escaped quote
     /// must not end it early.

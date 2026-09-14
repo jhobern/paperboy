@@ -177,6 +177,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   is a warning — dead text in the one file that was supposed to be
   self-contained.
 
+### Changed
+
+- Column metadata (`STATISTICS`, `IMAGE`, `TRUTH`, `DETAIL`) is gathered by a
+  single walk of the flow rather than four near-identical ones, and merged into
+  the resolved columns by a single rule rather than two copies of it. The four
+  walks had already drifted apart once: `SHOW(…)` contributes statistics only
+  (a `SHOW` field has nowhere to write the other three), and a role clause's
+  `BASELINE(…) SHOW(…)` likewise. Both asymmetries are now stated once, and
+  pinned by a test, instead of being implicit in which of four functions
+  happened to have the arm.
+
 ### Fixed
 
 - `--targets` no longer drops a teardown, or refuses a run, over a name that was

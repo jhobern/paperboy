@@ -1007,9 +1007,7 @@ impl ReportFlow {
     /// for the same header win. Used to attach statistics to the resolved
     /// columns at render time.
     pub fn column_stats(&self) -> std::collections::HashMap<String, Vec<StatKind>> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_stats(&self.nodes, &mut out);
-        out
+        self.column_meta().stats
     }
 
     /// Collect the per-column `IMAGE[(…)]` render hints requested anywhere in
@@ -1017,9 +1015,7 @@ impl ReportFlow {
     /// [`column_stats`](Self::column_stats) does for statistics — the two
     /// clauses attach at the same three places and are resolved the same way.
     pub fn column_images(&self) -> std::collections::HashMap<String, ImageSpec> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_images(&self.nodes, &mut out);
-        out
+        self.column_meta().images
     }
 
     /// Collect the per-column `TRUTH "<template>"` clauses declared anywhere in
@@ -1033,9 +1029,7 @@ impl ReportFlow {
     /// from the loop that chose the input (a labels manifest, a folder name),
     /// never from the response it is judging.
     pub fn column_truths(&self) -> std::collections::HashMap<String, String> {
-        let mut out = std::collections::HashMap::new();
-        collect_column_truths(&self.nodes, &mut out);
-        out
+        self.column_meta().truths
     }
 
     /// The columns flagged `DETAIL` — shown in a row's drill-down rather than
@@ -1047,139 +1041,86 @@ impl ReportFlow {
     /// have somewhere else to put it treat it differently, which is what lets
     /// every other format ignore the flag without losing data.
     pub fn column_details(&self) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        collect_column_details(&self.nodes, &mut out);
+        self.column_meta().details
+    }
+
+    /// All four kinds of column metadata in one walk, for the callers that
+    /// want more than one of them — which is every caller that resolves a
+    /// column, since the precedence rule reads all four together.
+    pub fn column_meta(&self) -> FlowColumnMeta {
+        let mut out = FlowColumnMeta::default();
+        collect_column_meta(&self.nodes, &mut out);
         out
     }
 }
 
-fn collect_column_images(
-    nodes: &[FlowNode],
-    out: &mut std::collections::HashMap<String, ImageSpec>,
-) {
+/// Everything the flow says about its output columns, gathered in one walk.
+///
+/// The four kinds of column metadata — statistics, image hints, ground truths
+/// and the `DETAIL` flag — attach at the same places and are keyed the same
+/// way, so they are collected together. They were four near-identical walkers
+/// once, and the cost of that was paid twice: each had to learn about every new
+/// node kind separately, and when `GRAPH` arrived three of them were taught to
+/// recurse into it and the fourth was not, making metadata written inside a
+/// region dead text with nothing to say so.
+#[derive(Default)]
+pub struct FlowColumnMeta {
+    /// `STATISTICS(…)`, keyed by output-column header. Later statements for the
+    /// same header win.
+    pub stats: std::collections::HashMap<String, Vec<StatKind>>,
+    /// `IMAGE[(…)]` render hints, keyed the same way.
+    pub images: std::collections::HashMap<String, ImageSpec>,
+    /// `TRUTH "<template>"` clauses, **unevaluated**: a truth is interpolated
+    /// per row after the run, against that row's variable snapshot.
+    pub truths: std::collections::HashMap<String, String>,
+    /// The columns flagged `DETAIL`.
+    pub details: std::collections::HashSet<String>,
+}
+
+/// The output-column header a `WITH`/`SHOW` field lands in: the statement's
+/// alias, defaulting to the request's leaf name, then the field name.
+fn field_header(name: &str, alias: &Option<String>, field: &str) -> String {
+    let a = alias
+        .clone()
+        .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
+    format!("{a}.{field}")
+}
+
+fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
     for node in nodes {
         match node {
-            FlowNode::Report(ReportStmt::VarAs { name, image, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, image, .. }) => {
+            FlowNode::Report(ReportStmt::VarAs {
+                name,
+                image,
+                truth,
+                detail,
+                stats,
+                ..
+            })
+            | FlowNode::Report(ReportStmt::Computed {
+                name,
+                image,
+                truth,
+                detail,
+                stats,
+                ..
+            }) => {
                 if let Some(img) = image {
-                    out.insert(name.clone(), *img);
+                    out.images.insert(name.clone(), *img);
                 }
-            }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        image: Some(img),
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"), *img);
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. }
-            | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => {
-                collect_column_images(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_details(nodes: &[FlowNode], out: &mut std::collections::HashSet<String>) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, detail, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, detail, .. }) => {
-                if *detail {
-                    out.insert(name.clone());
-                }
-            }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        detail: true,
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"));
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. }
-            | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => {
-                collect_column_details(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_truths(nodes: &[FlowNode], out: &mut std::collections::HashMap<String, String>) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, truth, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, truth, .. }) => {
                 if let Some(t) = truth {
-                    out.insert(name.clone(), t.clone());
+                    out.truths.insert(name.clone(), t.clone());
+                }
+                if *detail {
+                    out.details.insert(name.clone());
+                }
+                if !stats.is_empty() {
+                    out.stats.insert(name.clone(), stats.clone());
                 }
             }
-            FlowNode::Report(ReportStmt::Request {
-                name, alias, with, ..
-            }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                for item in with {
-                    if let WithItem::Field {
-                        name: fname,
-                        truth: Some(t),
-                        ..
-                    } = item
-                    {
-                        out.insert(format!("{a}.{fname}"), t.clone());
-                    }
-                }
-            }
-            FlowNode::ForEach { body, .. }
-            | FlowNode::ForEnvs { body, .. }
-            | FlowNode::Graph { body, .. } => {
-                collect_column_truths(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_column_stats(
-    nodes: &[FlowNode],
-    out: &mut std::collections::HashMap<String, Vec<StatKind>>,
-) {
-    for node in nodes {
-        match node {
-            FlowNode::Report(ReportStmt::VarAs { name, stats, .. })
-            | FlowNode::Report(ReportStmt::Computed { name, stats, .. })
-                if !stats.is_empty() =>
-            {
-                out.insert(name.clone(), stats.clone());
-            }
-            // `WITH` fields carry their own optional `STATISTICS(…)`; their
-            // output column is `alias.field`, where `alias` defaults to the
-            // request's leaf name. Compute that key statically so the stats
-            // attach at render time just like a `REPORT … STATISTICS(…)`.
+            // `WITH` fields carry their own clauses; their output column is
+            // `alias.field`, computed statically here so the metadata attaches
+            // at render time just like a `REPORT … AS <header>` clause.
             FlowNode::Report(ReportStmt::Request {
                 name,
                 alias,
@@ -1187,23 +1128,40 @@ fn collect_column_stats(
                 show,
                 ..
             }) => {
-                let a = alias
-                    .clone()
-                    .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name).to_string());
-                // A `SHOW(field STATISTICS(…))` names the same `alias.field`
-                // column a `WITH` field would.
+                // Asymmetric on purpose: a `SHOW(field STATISTICS(…))` names
+                // the same `alias.field` column a `WITH` field would, but a
+                // `ShowField` carries *only* statistics — there is no
+                // `SHOW(field IMAGE)` or `SHOW(field TRUTH …)` to collect.
                 for f in show {
                     if !f.stats.is_empty() {
-                        out.insert(format!("{a}.{}", f.field), f.stats.clone());
+                        out.stats
+                            .insert(field_header(name, alias, &f.field), f.stats.clone());
                     }
                 }
                 for item in with {
-                    if let WithItem::Field {
-                        name: fname, stats, ..
+                    let WithItem::Field {
+                        name: fname,
+                        image,
+                        truth,
+                        detail,
+                        stats,
+                        ..
                     } = item
-                        && !stats.is_empty()
-                    {
-                        out.insert(format!("{a}.{fname}"), stats.clone());
+                    else {
+                        continue;
+                    };
+                    let header = field_header(name, alias, fname);
+                    if let Some(img) = image {
+                        out.images.insert(header.clone(), *img);
+                    }
+                    if let Some(t) = truth {
+                        out.truths.insert(header.clone(), t.clone());
+                    }
+                    if *detail {
+                        out.details.insert(header.clone());
+                    }
+                    if !stats.is_empty() {
+                        out.stats.insert(header.clone(), stats.clone());
                     }
                 }
             }
@@ -1213,19 +1171,23 @@ fn collect_column_stats(
             // and those aliases aren't known until the run produces them. The
             // key is therefore matched by suffix at render time (see
             // `ReportResult::resolved_columns`), recorded here under the bare
-            // field with a `baseline.` marker prefix.
+            // field with a `baseline.` marker prefix. Statistics only: the
+            // other three clauses have no baseline form.
             FlowNode::ForEnvs { body, clause, .. } => {
                 if let EnvClause::Roles { baseline_show, .. } = clause {
                     for f in baseline_show {
                         if !f.stats.is_empty() {
-                            out.insert(format!("baseline.*.{}", f.field), f.stats.clone());
+                            out.stats
+                                .insert(format!("baseline.*.{}", f.field), f.stats.clone());
                         }
                     }
                 }
-                collect_column_stats(body, out);
+                collect_column_meta(body, out);
             }
+            // A region is a scheduling device, not a scope: metadata written
+            // inside one belongs to the enclosing block's row like any other.
             FlowNode::ForEach { body, .. } | FlowNode::Graph { body, .. } => {
-                collect_column_stats(body, out);
+                collect_column_meta(body, out);
             }
             _ => {}
         }

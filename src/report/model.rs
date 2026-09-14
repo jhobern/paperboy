@@ -376,59 +376,13 @@ impl ReportResult {
                 })
                 .collect(),
         };
-        // Merge in per-header statistics requested by `REPORT … STATISTICS(…)`
-        // statements — but never override stats a `columns:` spec set inline.
-        if !self.column_stats.is_empty() {
-            for col in &mut columns {
-                if col.stats.is_empty()
-                    && let Some(stats) = self.column_stats.get(&col.header)
-                {
-                    col.stats = stats.clone();
-                }
-                // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
-                // statically: the comparison produces one `baseline.<alias>.f`
-                // per alias that emits `f`, and the aliases are only known once
-                // the run has produced rows. It is recorded as `baseline.*.f`
-                // and matched here by prefix and suffix.
-                if col.stats.is_empty()
-                    && let Some(rest) = col.header.strip_prefix("baseline.")
-                    && let Some((_, field)) = rest.rsplit_once('.')
-                    && let Some(stats) = self.column_stats.get(&format!("baseline.*.{field}"))
-                {
-                    col.stats = stats.clone();
-                }
-            }
-        }
-        // Likewise for `IMAGE(…)` hints, and on the same precedence rule: an
-        // inline hint in the `columns:` directive is the more specific
-        // statement of intent, so it is never overridden.
-        if !self.column_images.is_empty() {
-            for col in &mut columns {
-                if col.image.is_none()
-                    && let Some(img) = self.column_images.get(&col.header)
-                {
-                    col.image = Some(*img);
-                }
-            }
-        }
-        // And for `TRUTH "…"`, on the same precedence rule.
-        if !self.column_truths.is_empty() {
-            for col in &mut columns {
-                if col.truth.is_none()
-                    && let Some(t) = self.column_truths.get(&col.header)
-                {
-                    col.truth = Some(t.clone());
-                }
-            }
-        }
-        // `DETAIL` is a flag rather than a value, so "the directive already said
-        // so" is the whole precedence rule: a `columns:` spec can add the flag,
-        // never take it away.
-        if !self.column_details.is_empty() {
-            for col in &mut columns {
-                col.detail = col.detail || self.column_details.contains(&col.header);
-            }
-        }
+        apply_column_meta(
+            &mut columns,
+            &self.column_stats,
+            &self.column_images,
+            &self.column_truths,
+            &self.column_details,
+        );
         columns
     }
 
@@ -871,6 +825,60 @@ impl OutputColumn {
 /// `columns := column-spec (',' column-spec)*`,
 /// `column-spec := source ('|' source)* ['AS' name]`. A quoted `AS` name may
 /// contain spaces/commas; sources are bare `IDENT('.'IDENT)?` tokens.
+/// Merge what the flow said about each column into the resolved column set.
+///
+/// One rule, stated once, for all four kinds of metadata: **a `columns:`
+/// directive is never overridden.** An inline clause in the directive is the
+/// more specific statement of intent — the author naming that column
+/// deliberately — so the flow's value fills a gap and never replaces an answer.
+/// `DETAIL` is a flag rather than a value, which makes "the directive already
+/// said so" the whole rule there: either source can add it, neither can take it
+/// away.
+///
+/// Shared because it was written twice and the two copies had already drifted:
+/// one consumed each truth as it matched and the other did not, so two columns
+/// resolving to the same header — which `parse_columns` permits, as
+/// `columns: x AS T, y AS T` — disagreed about whether the second one had a
+/// truth. Scoring used the copy that kept it.
+pub fn apply_column_meta(
+    columns: &mut [OutputColumn],
+    stats: &std::collections::HashMap<String, Vec<StatKind>>,
+    images: &std::collections::HashMap<String, ImageSpec>,
+    truths: &std::collections::HashMap<String, String>,
+    details: &std::collections::HashSet<String>,
+) {
+    for col in columns.iter_mut() {
+        if col.stats.is_empty()
+            && let Some(s) = stats.get(&col.header)
+        {
+            col.stats = s.clone();
+        }
+        // A `BASELINE(…) SHOW(f STATISTICS(…))` can't name its column
+        // statically: the comparison produces one `baseline.<alias>.f` per
+        // alias that emits `f`, and the aliases are only known once the run has
+        // produced rows. It is recorded as `baseline.*.f` and matched here by
+        // prefix and suffix.
+        if col.stats.is_empty()
+            && let Some(rest) = col.header.strip_prefix("baseline.")
+            && let Some((_, field)) = rest.rsplit_once('.')
+            && let Some(s) = stats.get(&format!("baseline.*.{field}"))
+        {
+            col.stats = s.clone();
+        }
+        if col.image.is_none()
+            && let Some(img) = images.get(&col.header)
+        {
+            col.image = Some(*img);
+        }
+        if col.truth.is_none()
+            && let Some(t) = truths.get(&col.header)
+        {
+            col.truth = Some(t.clone());
+        }
+        col.detail = col.detail || details.contains(&col.header);
+    }
+}
+
 pub fn parse_columns(spec: &str) -> Vec<OutputColumn> {
     split_top_level(spec, ',')
         .into_iter()

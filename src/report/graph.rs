@@ -553,20 +553,24 @@ fn scope_captures(
 /// checks had to be withdrawn for, so the resolved question is asked here too
 /// rather than half of it re-derived.
 fn declared_truths(flow: &ReportFlow) -> Vec<String> {
-    let mut from_flow = flow.column_truths();
-    let mut out = Vec::new();
+    let from_flow = flow.column_truths();
     if let Some(spec) = flow.header.columns() {
-        for col in crate::report::model::parse_columns(spec) {
-            if let Some(t) = col.truth.or_else(|| from_flow.remove(&col.header)) {
-                out.push(t);
-            }
-        }
-        return out;
+        // The same merge the renderer will do, so this walk asks about exactly
+        // the truths that will actually be evaluated. Stated once in `model`:
+        // reproducing the precedence here is how the two drifted apart before.
+        let mut columns = crate::report::model::parse_columns(spec);
+        crate::report::model::apply_column_meta(
+            &mut columns,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &from_flow,
+            &std::collections::HashSet::new(),
+        );
+        return columns.into_iter().filter_map(|c| c.truth).collect();
     }
     // With no directive the columns are whatever the run produces, in
     // first-seen order — not knowable here, so every flow truth is a candidate.
-    out.extend(from_flow.into_values());
-    out
+    from_flow.into_values().collect()
 }
 
 /// How many `CLEANUP`s the flow holds, at every depth.
