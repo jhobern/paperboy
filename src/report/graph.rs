@@ -602,6 +602,7 @@ fn retain_cleanups(
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
     dropped: &HashSet<String>,
+    dropped_at: &HashMap<String, usize>,
     keep: &mut impl FnMut(
         &str,
         &str,
@@ -614,24 +615,40 @@ fn retain_cleanups(
     let mut here = visible.clone();
     here.extend(scope_captures(nodes, entries, helpers, true));
     let mut here_dropped = dropped.clone();
-    nodes.retain(|n| match n {
-        FlowNode::Cleanup {
-            name,
-            alias,
-            depends,
-            using,
-        } => {
-            let step = alias
-                .clone()
-                .unwrap_or_else(|| crate::report::run::leaf(name).to_string());
-            let k = keep(name, &step, depends, using, &here, &here_dropped);
-            if !k {
-                here_dropped.insert(step);
+    // Repeated until this block stops shrinking, because cleanups in one block
+    // are order-independent: they all run when the block unwinds, so one may
+    // name another written below it. A single forward pass judged
+    // `CLEANUP close DEPENDS purge` before `purge` had been dropped and kept it
+    // forever — the enclosing fixed point could not save it either, since that
+    // rebuilds this set from the seed each round and the seed never holds a
+    // cleanup's name. `here_dropped` therefore has to survive the passes.
+    //
+    // Terminates: a pass only ever removes cleanups, so the block shrinks
+    // monotonically and the loop ends when one pass removes none.
+    loop {
+        let before = nodes.len();
+        nodes.retain(|n| match n {
+            FlowNode::Cleanup {
+                name,
+                alias,
+                depends,
+                using,
+            } => {
+                let step = alias
+                    .clone()
+                    .unwrap_or_else(|| crate::report::run::leaf(name).to_string());
+                let k = keep(name, &step, depends, using, &here, &here_dropped);
+                if !k {
+                    here_dropped.insert(step);
+                }
+                k
             }
-            k
+            _ => true,
+        });
+        if nodes.len() == before {
+            break;
         }
-        _ => true,
-    });
+    }
     // A loop body is its own block: its cleanups run at the end of *every
     // iteration*, while this block's run once, after the whole loop is over. So
     // a teardown out here has not written anything yet when one in there is
@@ -649,11 +666,44 @@ fn retain_cleanups(
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 let mut body_visible = visible.clone();
                 body_visible.extend(scope_captures(above, entries, helpers, false));
-                retain_cleanups(body, &body_visible, entries, helpers, &here_dropped, keep)
+                // The same positional rule the captures get, for the same
+                // reason. A pruned region's step names are bound where the
+                // region is written, so a loop written *above* it never saw
+                // them: filtering by position is what keeps a pruned `gate` in
+                // some later region from removing this body's
+                // `CLEANUP release DEPENDS gate`, whose own `gate` is alive.
+                //
+                // Only the seed is positional. Names this block dropped itself
+                // are cleanups, and a nested block may not depend on an
+                // enclosing block's cleanup at all, so carrying those down
+                // unfiltered is inert.
+                let body_dropped: HashSet<String> = here_dropped
+                    .iter()
+                    .filter(|n| dropped_at.get(*n).is_none_or(|&at| at < i))
+                    .cloned()
+                    .collect();
+                retain_cleanups(
+                    body,
+                    &body_visible,
+                    entries,
+                    helpers,
+                    &body_dropped,
+                    &HashMap::new(),
+                    keep,
+                )
             }
-            FlowNode::Graph { body, .. } => {
-                retain_cleanups(body, &here, entries, helpers, &here_dropped, keep)
-            }
+            // A region is not a scope, so its body reads this block's names
+            // whole. (It may hold neither a cleanup nor a loop, so this
+            // recursion is defensive.)
+            FlowNode::Graph { body, .. } => retain_cleanups(
+                body,
+                &here,
+                entries,
+                helpers,
+                &here_dropped,
+                &HashMap::new(),
+                keep,
+            ),
             _ => {}
         }
     }
@@ -675,6 +725,38 @@ fn retain_cleanups(
 /// `USING(url = …)` had replaced the only text holding the reference; a name
 /// the environment supplied all along. Refusing to run is only better than
 /// running the wrong thing when it is actually the wrong thing.
+/// The top-level pass, which is where position still means something.
+///
+/// A dropped name is bound at the region that held it, so only what is written
+/// from that point on could ever have read it. Judging every reference against
+/// one flat set refused working selections: a loop with its own `gate`, written
+/// above a region whose `gate` was pruned, had its perfectly resolvable
+/// `{{gate.v}}` reported as stranded and the whole run refused.
+///
+/// A `CLEANUP` is the exception, and gets the unfiltered set. Cleanups run when
+/// their block unwinds, not where they are written, so one at the top of the
+/// file may legitimately name a step in a region at the bottom — and if that
+/// step is gone the reference really is stranded.
+fn scan_strands_top(
+    nodes: &[FlowNode],
+    dropped_names: &HashSet<String>,
+    dropped_at: &HashMap<String, usize>,
+    out: &mut Vec<String>,
+) {
+    for (i, node) in nodes.iter().enumerate() {
+        let visible: HashSet<String> = if matches!(node, FlowNode::Cleanup { .. }) {
+            dropped_names.clone()
+        } else {
+            dropped_names
+                .iter()
+                .filter(|n| dropped_at.get(*n).is_none_or(|&at| at <= i))
+                .cloned()
+                .collect()
+        };
+        scan_strands(std::slice::from_ref(node), &visible, out);
+    }
+}
+
 fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
     for node in nodes {
         for text in crate::report::validate::interpolated_source(node) {
@@ -714,8 +796,20 @@ pub fn prune_to_targets(
     let mut matched: HashSet<String> = HashSet::new();
     // What pruning took away, so the cleanups can be pruned with it below.
     let mut dropped_names: HashSet<String> = HashSet::new();
+    // *Where* each of those names was bound — the index of the top-level region
+    // that held it. A name alone cannot say who is entitled to be affected by
+    // its removal: only regions at the top level are pruned, so every dropped
+    // name is bound in the root block at a definite position, and a loop
+    // written above that position never had it in scope. Two loops may each
+    // hold their own `gate`, which is legal precisely because neither can see
+    // the other or the region's.
+    //
+    // Recorded here because it cannot be recovered later: by the time cleanups
+    // are pruned the steps have already been retained out of their region
+    // bodies, and nothing in the surviving tree says where they used to be.
+    let mut dropped_at: HashMap<String, usize> = HashMap::new();
     let mut dropped_captures: HashSet<String> = HashSet::new();
-    for node in &mut flow.nodes {
+    for (node_index, node) in flow.nodes.iter_mut().enumerate() {
         let FlowNode::Graph { body, .. } = node else {
             continue;
         };
@@ -769,6 +863,7 @@ pub fn prune_to_targets(
             // actually be read.
             if !keep_written.contains(&step.written) {
                 dropped_names.insert(step.name.clone());
+                dropped_at.insert(step.name.clone(), node_index);
                 dropped_captures.extend(caps);
             }
         }
@@ -810,6 +905,7 @@ pub fn prune_to_targets(
             entries,
             helpers,
             &dropped_names,
+            &dropped_at,
             &mut |name, _step, depends, using, visible, dropped| {
                 // A cleanup dropped here is as gone as a pruned step, so a
                 // teardown that depends on it goes too — `dropped` carries
@@ -845,7 +941,7 @@ pub fn prune_to_targets(
     // here — and refused, because sending something other than what was asked
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
-    scan_strands(&flow.nodes, &dropped_names, &mut stranded);
+    scan_strands_top(&flow.nodes, &dropped_names, &dropped_at, &mut stranded);
     for text in declared_truths(flow) {
         for key in crate::environment::referenced_keys(&text) {
             if let Some((step, _)) = key.split_once('.')
@@ -1428,6 +1524,95 @@ mod tests {
             text.contains("CLEANUP release"),
             "and so is what depends on it: {text}"
         );
+    }
+
+    #[test]
+    fn a_cleanup_written_above_the_one_it_depends_on_is_dropped_with_it() {
+        // Cleanups in one block all run when that block unwinds, so they are
+        // order-independent: `close DEPENDS purge` means the same thing written
+        // above `purge` as below it. A single forward pass judged `close`
+        // before `purge` had been dropped and kept it forever — and the
+        // enclosing fixed point could not recover, since it rebuilds the
+        // dropped set from the seed each round and the seed never holds a
+        // cleanup's name. `close` survived naming a teardown that appears
+        // nowhere in the flow, to be skipped at run time with a warning
+        // pointing at it, its own resource left standing.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("shut", &[], &[]),
+            entry("doomed", &[], &["sid"]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             CLEANUP shut AS close DEPENDS purge\n\
+             CLEANUP doomed AS purge\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP doomed"),
+            "purge reads a capture nothing produces now: {text}"
+        );
+        assert!(
+            !text.contains("CLEANUP shut"),
+            "and close depends on purge, wherever it is written: {text}"
+        );
+    }
+
+    #[test]
+    fn a_pruned_step_does_not_drop_a_teardown_in_a_loop_written_above_it() {
+        // Only top-level regions are pruned, so every dropped name is bound
+        // where its region is written — and a loop above that point never had
+        // it in scope. Its own `gate` is a different `gate`, which is why step
+        // validation allows both. Handing the pruned name to every block alike
+        // removed a teardown whose dependency was alive and well.
+        let entries = [
+            entry("prepare", &[], &[]),
+            entry("release", &[], &[]),
+            entry("gated", &[], &[]),
+            entry("target", &[], &[]),
+        ];
+        let text = pruned(
+            "FOR y IN [\"b\"]\n    CLEANUP prepare AS gate\n    \
+             CLEANUP release DEPENDS gate\nEND\n\
+             GRAPH\n    REQUEST gated AS gate\n    REQUEST target\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            text.contains("CLEANUP prepare"),
+            "the loop's own gate is untouched by pruning: {text}"
+        );
+        assert!(
+            text.contains("CLEANUP release"),
+            "so nothing licenses dropping what depends on it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_pruned_step_does_not_strand_a_reference_in_a_loop_written_above_it() {
+        // The same rule, asked of references rather than teardowns. A
+        // `{{gate.v}}` inside the loop names the loop's own `gate`, which
+        // pruning never touched. Testing every qualified reference against one
+        // flat set reported it as stranded and refused the whole run — the
+        // worst outcome available, since nothing was actually wrong.
+        let entries = [
+            entry("mint", &["v"], &[]),
+            entry("gated", &[], &[]),
+            entry("target", &[], &[]),
+        ];
+        let text = pruned(
+            "FOR y IN [\"b\"]\n    REQUEST mint AS gate\n    \
+             REPORT \"{{gate.v}}\" AS Seen\nEND\n\
+             GRAPH\n    REQUEST gated AS gate\n    REQUEST target\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .expect("the loop's own gate resolves, so nothing is stranded");
+        assert!(text.contains("{{gate.v}}"), "{text}");
     }
 
     #[test]

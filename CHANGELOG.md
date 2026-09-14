@@ -179,6 +179,20 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- `--targets` no longer drops a teardown, or refuses a run, over a name that was
+  never in scope. Only top-level regions are pruned, so a pruned step's name is
+  bound where its region is written — and a loop written *above* that region has
+  its own, unrelated `gate`, which is exactly why step validation allows both.
+  Handing the pruned name to every block alike removed a `CLEANUP release
+  DEPENDS gate` whose own `gate` was alive, and reported a perfectly resolvable
+  `{{gate.v}}` inside that loop as stranded, refusing the whole run.
+- A `CLEANUP` written *above* the one it depends on is now dropped with it.
+  Cleanups in one block all run when that block unwinds, so they are
+  order-independent — but they were judged in one forward pass, which asked
+  about `close DEPENDS purge` before `purge` had been dropped and then never
+  asked again. `close` survived naming a teardown that appeared nowhere in the
+  flow, to be skipped at run time with a warning pointing at it and its own
+  resource left standing.
 - A request's `# [Gen]` values are now threaded forward like its captures, and
   count as the step's outputs. They were computed, used for the send, and then
   dropped on the floor — so `{{sid}}` downstream kept resolving to whatever the
