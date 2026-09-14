@@ -1086,7 +1086,7 @@ fn field_header(name: &str, alias: &Option<String>, field: &str) -> String {
     format!("{a}.{field}")
 }
 
-fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
+pub fn collect_column_meta(nodes: &[FlowNode], out: &mut FlowColumnMeta) {
     for node in nodes {
         match node {
             FlowNode::Report(ReportStmt::VarAs {

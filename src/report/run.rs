@@ -565,6 +565,16 @@ struct Exec<'a> {
     /// the latest *successful* capturer instead let a teardown be authorised by
     /// one step and then sent with a different, failed step's identifier.
     capture_owner: HashMap<String, String>,
+    /// Per step, the names whose live value in `step_captures` came from a
+    /// `[Gen]` row rather than from a capture that fired.
+    ///
+    /// Provenance cannot be re-derived from the values afterwards: a request
+    /// may declare both clauses for one name, and only the run knows which one
+    /// answered. [`DepGate`] needs that distinction, because a generated value
+    /// is a fact about what was *sent* and gates on having been produced, while
+    /// a captured one is a fact about what came *back* and gates on the step
+    /// having succeeded.
+    generated_only: HashMap<String, std::collections::HashSet<String>>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
     /// key. A role-bearing `ENVS` axis is deliberately excluded: it is the
     /// comparison axis, and baseline and candidate have to agree on the key to
@@ -656,6 +666,7 @@ struct ExecState {
     captures: HashMap<String, String>,
     step_captures: HashMap<String, HashMap<String, String>>,
     capture_owner: HashMap<String, String>,
+    generated_only: HashMap<String, std::collections::HashSet<String>>,
     step_ok: HashMap<String, bool>,
     step_order: Vec<String>,
     step_request: HashMap<String, String>,
@@ -691,6 +702,12 @@ struct StepOut {
     /// The step's own captures, kept out of the shared chain so the next step
     /// can be handed a chain assembled from its ancestors alone.
     produced: HashMap<String, String>,
+    /// Which of `produced` came from a `[Gen]` row rather than a capture that
+    /// fired. A region step runs on a fork, so its provenance would be thrown
+    /// away with the fork unless it travels back out here beside the values it
+    /// describes — and a `CLEANUP` for a region step is written in the
+    /// *enclosing* block, which is where it would be missing it.
+    generated_only: std::collections::HashSet<String>,
     ok: bool,
     /// Set when the step was never sent because something it depends on didn't
     /// succeed, as opposed to sent and failed. Both are `ok: false`; only this
@@ -1070,6 +1087,8 @@ fn view_for(plan: &super::graph::Plan, base: &ExecState, s: &Sched, idx: usize) 
         let Some(out) = &s.out[anc] else { continue };
         st.step_captures
             .insert(plan.steps[anc].name.clone(), out.produced.clone());
+        st.generated_only
+            .insert(plan.steps[anc].name.clone(), out.generated_only.clone());
         for (k, v) in &out.produced {
             st.captures.insert(k.clone(), v.clone());
             st.capture_owner
@@ -1090,6 +1109,7 @@ fn skip_out(
     let step = &plan.steps[idx];
     let mut out = StepOut {
         produced: HashMap::new(),
+        generated_only: std::collections::HashSet::new(),
         ok: false,
         was_skipped: true,
         request: step.request.clone(),
@@ -1150,6 +1170,11 @@ fn run_step(
             .get(&step.name)
             .cloned()
             .unwrap_or_default(),
+        generated_only: ex
+            .generated_only
+            .get(&step.name)
+            .cloned()
+            .unwrap_or_default(),
         // A node that ran nothing (the arm above) never records a verdict. It
         // counts as succeeded: it cannot have failed, and treating it as a
         // failure would skip everything written after it.
@@ -1173,6 +1198,7 @@ impl<'a> Exec<'a> {
             captures: HashMap::new(),
             step_captures: HashMap::new(),
             capture_owner: HashMap::new(),
+            generated_only: HashMap::new(),
             step_ok: HashMap::new(),
             step_order: Vec::new(),
             step_request: HashMap::new(),
@@ -1203,6 +1229,7 @@ impl<'a> Exec<'a> {
             captures: self.captures.clone(),
             step_captures: self.step_captures.clone(),
             capture_owner: self.capture_owner.clone(),
+            generated_only: self.generated_only.clone(),
             step_ok: self.step_ok.clone(),
             step_order: self.step_order.clone(),
             step_request: self.step_request.clone(),
@@ -1227,6 +1254,7 @@ impl<'a> Exec<'a> {
             captures: state.captures,
             step_captures: state.step_captures,
             capture_owner: state.capture_owner,
+            generated_only: state.generated_only,
             step_ok: state.step_ok,
             step_order: state.step_order,
             step_request: state.step_request,
@@ -1317,6 +1345,18 @@ impl<'a> Exec<'a> {
     /// Thread one request's captures forward: into the flat chain, and under
     /// the step's own name so a later reference can disambiguate.
     fn record_captures(&mut self, step: &str, captures: &[(String, String)]) {
+        self.record_values(step, captures);
+        // A capture that actually fired is the answer now, so the name stops
+        // being a generated one. This is why the recording body is factored
+        // out: `record_generated` delegating here would undo its own note.
+        if let Some(minted) = self.generated_only.get_mut(step) {
+            for (k, _) in captures {
+                minted.remove(k);
+            }
+        }
+    }
+
+    fn record_values(&mut self, step: &str, captures: &[(String, String)]) {
         let own = self.step_captures.entry(step.to_string()).or_default();
         for (k, v) in captures {
             own.insert(k.clone(), v.clone());
@@ -1354,7 +1394,19 @@ impl<'a> Exec<'a> {
         // sorting keeps the recorded sequence reproducible for anything that
         // replays it.
         pairs.sort();
-        self.record_captures(step, &pairs);
+        self.record_values(step, &pairs);
+        // Which value answered, not which clause was written. A request may
+        // declare a `[Gen]` row *and* a capture for the same name — mint an id
+        // client-side, then read the server's canonical one back — and when the
+        // send fails the capture never fires, leaving the generated value
+        // standing as the live one. Reading the gate off the declared clauses
+        // called that a capture, required the step to have succeeded, and
+        // skipped the teardown for a resource the request may well have
+        // created.
+        let own = self.generated_only.entry(step.to_string()).or_default();
+        for (k, _) in &pairs {
+            own.insert(k.clone());
+        }
     }
 
     /// Record whether a step succeeded.
@@ -1787,12 +1839,26 @@ impl<'a> Exec<'a> {
         // either is legal — but they are worth different things to a teardown,
         // so the kind travels with the dependency rather than being flattened
         // away here.
-        let gate_for = |request: &str, var: &str| -> Option<DepGate> {
+        let gate_for = |step: &str, request: &str, var: &str| -> Option<DepGate> {
             let e = resolve_qualified(self.ctx.entries, self.ctx.helpers, request)?;
+            // What the run observed outranks what the source declares, because
+            // only the run knows which clause answered. A step that has not run
+            // has nothing recorded and falls through to the declarations, which
+            // is the conservative reading: the strong gate, and a teardown that
+            // is skipped rather than pointed at a resource nobody made.
+            if self
+                .generated_only
+                .get(step)
+                .is_some_and(|g| g.contains(var))
+            {
+                return Some(DepGate::Produced(var.to_string()));
+            }
             if e.captures.iter().any(|(c, _)| c == var) {
                 // A request that generates a name and then captures it too is
-                // answered by the response: the capture is written second and
-                // wins everywhere, so the gate has to be the capture's.
+                // answered by the response *when the capture fires* — it is
+                // written second and wins everywhere. When it does not fire the
+                // generated value is still standing, and the check above has
+                // already said so.
                 return Some(DepGate::Succeeded);
             }
             if e.generators.iter().any(|(g, _)| g == var) {
@@ -1832,7 +1898,7 @@ impl<'a> Exec<'a> {
                     // value. A step whose request cannot be resolved promised
                     // nothing legible, and the strong gate is the safe reading.
                     let gate = request_of(step)
-                        .and_then(|req| gate_for(&req, var))
+                        .and_then(|req| gate_for(step, &req, var))
                         .unwrap_or(DepGate::Succeeded);
                     out.push(CleanupDep {
                         step: step.to_string(),
@@ -1860,7 +1926,7 @@ impl<'a> Exec<'a> {
                         .iter()
                         .filter(|(s, _)| s != self_step)
                         .filter_map(|(s, req)| {
-                            gate_for(req, &r).map(|gate| CleanupDep {
+                            gate_for(s, req, &r).map(|gate| CleanupDep {
                                 step: s.clone(),
                                 gate,
                             })
@@ -1881,7 +1947,7 @@ impl<'a> Exec<'a> {
                         // captured ones — both are things a step wrote — so
                         // ask the owner's request which kind this was.
                         let gate = request_of(owner)
-                            .and_then(|req| gate_for(&req, &r))
+                            .and_then(|req| gate_for(owner, &req, &r))
                             .unwrap_or(DepGate::Succeeded);
                         out.push(CleanupDep {
                             step: owner.clone(),
@@ -1896,7 +1962,7 @@ impl<'a> Exec<'a> {
                     // leave is missing.
                     out.extend(self.step_order.iter().filter_map(|step| {
                         let req = self.step_request.get(step)?;
-                        gate_for(req, &r).map(|gate| CleanupDep {
+                        gate_for(step, req, &r).map(|gate| CleanupDep {
                             step: step.clone(),
                             gate,
                         })
@@ -2417,6 +2483,8 @@ impl<'a> Exec<'a> {
             let Some(out) = &outs[idx] else { continue };
             self.step_captures
                 .insert(plan.steps[idx].name.clone(), out.produced.clone());
+            self.generated_only
+                .insert(plan.steps[idx].name.clone(), out.generated_only.clone());
             for (k, v) in &out.produced {
                 self.captures.insert(k.clone(), v.clone());
                 self.capture_owner
@@ -5446,6 +5514,118 @@ mod tests {
             &fake,
         );
         assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    /// An entry that mints a name client-side *and* declares a capture for the
+    /// same name: the id is guessed before the send and confirmed from the
+    /// response, which is the ordinary shape of a create.
+    fn gen_and_capture_entry(title: &str, name: &str, url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            generators: vec![(name.to_string(), "uuid()".to_string())],
+            ..graph_entry(title, &[name], url_vars)
+        }
+    }
+
+    #[test]
+    fn a_minted_value_gates_its_cleanup_even_where_a_capture_was_also_declared() {
+        // The gate asks which value answered, not which clause was written. A
+        // create that mints an id and also reads the server's canonical one
+        // back declares both, and when the send fails the capture never fires:
+        // the minted value is the live one, so the teardown is owed. Reading
+        // the gate off the declarations called it a capture, demanded the step
+        // have succeeded, and left the resource standing.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW"),
+            "and with the id it actually minted"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_fired_still_gates_its_cleanup_on_the_step_succeeding() {
+        // The other side of the same question, and why provenance has to be
+        // recorded rather than the declaration simply ignored. Here the capture
+        // *did* fire, so the live value came back from the server — and a
+        // teardown on a captured value waits for the step to have succeeded.
+        // Treating every declared `[Gen]` row as a free pass would have run it.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 500,
+                    error: Some("boom".into()),
+                    generated: [("sid".to_string(), "NEW".to_string())]
+                        .into_iter()
+                        .collect(),
+                    captures: vec![("sid".into(), "SERVER".into())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(
+            res.skipped,
+            ["delete"],
+            "the capture answered, and it failed"
+        );
+        assert_eq!(fake.call_order(), ["create"]);
+    }
+
+    #[test]
+    fn a_minted_value_from_inside_a_region_still_gates_the_cleanup_outside_it() {
+        // A region step runs on a fork, and a `CLEANUP` for it is written in
+        // the enclosing block. The values came back through the closing
+        // barrier; without their provenance coming with them the enclosing
+        // block saw a live minted id it believed to be a capture, and skipped
+        // the teardown for exactly the resource the region may have created.
+        let entries = [
+            gen_and_capture_entry("create", "sid", &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "GRAPH\n    REQUEST create AS setup\nEND\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
         assert!(res.skipped.is_empty(), "{:?}", res.skipped);
         assert_eq!(
             fake.call_vars("delete").get("sid").map(String::as_str),

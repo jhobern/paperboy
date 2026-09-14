@@ -190,6 +190,30 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- `--targets` no longer misjudges where a pruned name was written when a
+  `CLEANUP` above it has been removed. Position was counted as an index into
+  `flow.nodes`, but removing a teardown shifts everything below it up a place,
+  so a region recorded at index 2 was compared against a loop that had slid
+  from 3 to 1 and "below" read as "above". A reference to a step no longer in
+  the run went unreported and was handed back to be sent verbatim, and a
+  teardown for a pruned step survived to be skipped at run time with an exit
+  code claiming the run was incomplete. Position is now counted among the nodes
+  pruning cannot remove, which nothing shifts.
+- A `TRUTH` template is now read where it is written, like every other
+  reference. Judging all of them against one flat set refused a run whose loop
+  had its own live `gate`, over a name some region further down the file had
+  dropped. Only the template that will actually be scored is checked — a truth
+  a later statement overwrites for the same column is dead text, and refusing a
+  run over one strands nothing.
+- A `CLEANUP` whose value was minted by a `[Gen]` row now runs even when the
+  same request also declared a capture for that name. The gate was read off the
+  declared clauses, so the natural "mint an id, then read the server's
+  canonical one back" create was treated as capture-gated: when the send failed
+  the capture never fired, the minted id was the live value, and the teardown
+  was skipped for a resource the request may well have created. The gate now
+  asks which value actually answered — including for a step inside a `GRAPH`
+  region, whose provenance now travels out of the fork beside the values it
+  describes. A capture that *did* fire still gates on the step succeeding.
 - `--targets` no longer drops a teardown, or refuses a run, over a name that was
   never in scope. Only top-level regions are pruned, so a pruned step's name is
   bound where its region is written — and a loop written *above* that region has

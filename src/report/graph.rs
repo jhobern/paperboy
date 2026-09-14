@@ -552,13 +552,38 @@ fn scope_captures(
 /// template that is never evaluated is the false-positive class two earlier
 /// checks had to be withdrawn for, so the resolved question is asked here too
 /// rather than half of it re-derived.
-fn declared_truths(flow: &ReportFlow) -> Vec<String> {
+fn declared_truths(flow: &ReportFlow) -> Vec<(String, Option<usize>)> {
     let from_flow = flow.column_truths();
+    // Which top-level node wrote the template that *won* each header. Truths
+    // overwrite by header, so walking node by node in order and overwriting the
+    // origin leaves exactly the winner's — the same entry `column_truths` ends
+    // up with. Collecting a per-node *union* instead would have judged the
+    // losers too, and a shadowed template is dead text: refusing a run over one
+    // is the false-positive class this check has already been trimmed for
+    // twice.
+    let mut origin: HashMap<String, usize> = HashMap::new();
+    let mut ord = 0usize;
+    for node in &flow.nodes {
+        if matches!(node, FlowNode::Cleanup { .. }) {
+            continue;
+        }
+        let mut here = crate::report::flow::FlowColumnMeta::default();
+        crate::report::flow::collect_column_meta(std::slice::from_ref(node), &mut here);
+        for header in here.truths.into_keys() {
+            origin.insert(header, ord);
+        }
+        ord += 1;
+    }
     if let Some(spec) = flow.header.columns() {
         // The same merge the renderer will do, so this walk asks about exactly
         // the truths that will actually be evaluated. Stated once in `model`:
         // reproducing the precedence here is how the two drifted apart before.
         let mut columns = crate::report::model::parse_columns(spec);
+        // A truth the directive already carries is written in the header, which
+        // stands outside the flow entirely: no node holds it, so no position
+        // can excuse a dropped name in it. Noted before the merge, because
+        // afterwards the two sources are indistinguishable.
+        let inline: Vec<bool> = columns.iter().map(|c| c.truth.is_some()).collect();
         crate::report::model::apply_column_meta(
             &mut columns,
             &std::collections::HashMap::new(),
@@ -566,11 +591,26 @@ fn declared_truths(flow: &ReportFlow) -> Vec<String> {
             &from_flow,
             &std::collections::HashSet::new(),
         );
-        return columns.into_iter().filter_map(|c| c.truth).collect();
+        return columns
+            .into_iter()
+            .zip(inline)
+            .filter_map(|(c, was_inline)| {
+                let t = c.truth?;
+                let at = if was_inline {
+                    None
+                } else {
+                    origin.get(&c.header).copied()
+                };
+                Some((t, at))
+            })
+            .collect();
     }
     // With no directive the columns are whatever the run produces, in
     // first-seen order — not knowable here, so every flow truth is a candidate.
-    from_flow.into_values().collect()
+    from_flow
+        .into_iter()
+        .map(|(header, t)| (t, origin.get(&header).copied()))
+        .collect()
 }
 
 /// How many `CLEANUP`s the flow holds, at every depth.
@@ -664,8 +704,16 @@ fn retain_cleanups(
     // yet on any iteration: counting it kept a teardown that then went out with
     // `{{sid}}` verbatim, once per item, with the run still reading as green.
     // A region is not a scope and keeps the lot.
+    // `ord` is *not* `i`. `i` indexes the vector, which this function has just
+    // shrunk; `ord` counts only the nodes it cannot remove, which is the
+    // numbering `dropped_at` speaks. See `top_ordinal`.
+    let mut ord = 0usize;
     for i in 0..nodes.len() {
         let (above, rest) = nodes.split_at_mut(i);
+        let here_ord = ord;
+        if !matches!(rest[0], FlowNode::Cleanup { .. }) {
+            ord += 1;
+        }
         match &mut rest[0] {
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 let mut body_visible = visible.clone();
@@ -683,7 +731,7 @@ fn retain_cleanups(
                 // unfiltered is inert.
                 let body_dropped: HashSet<String> = here_dropped
                     .iter()
-                    .filter(|n| dropped_at.get(*n).is_none_or(|&at| at < i))
+                    .filter(|n| dropped_at.get(*n).is_none_or(|&at| at < here_ord))
                     .cloned()
                     .collect();
                 retain_cleanups(
@@ -747,18 +795,44 @@ fn scan_strands_top(
     dropped_at: &HashMap<String, usize>,
     out: &mut Vec<String>,
 ) {
-    for (i, node) in nodes.iter().enumerate() {
+    let mut ord = 0usize;
+    for node in nodes {
         let visible: HashSet<String> = if matches!(node, FlowNode::Cleanup { .. }) {
             dropped_names.clone()
         } else {
+            let here = ord;
+            ord += 1;
             dropped_names
                 .iter()
-                .filter(|n| dropped_at.get(*n).is_none_or(|&at| at <= i))
+                .filter(|n| dropped_at.get(*n).is_none_or(|&at| at <= here))
                 .cloned()
                 .collect()
         };
         scan_strands(std::slice::from_ref(node), &visible, out);
     }
+}
+
+/// Where a top-level node stands in the only numbering that survives pruning.
+///
+/// `dropped_at` says which region a name was written in, and every consumer
+/// asks whether some other node is written above or below it. The obvious
+/// answer — the node's index — is wrong, because `retain_cleanups` *removes*
+/// top-level `CLEANUP` nodes and every removal shifts what follows down a
+/// place. A name recorded at index 2 was then judged against a loop that had
+/// slid from 3 to 1, and "below the region" read as "above" it: the stranded
+/// reference went unreported and the orphaned teardown survived, both silently.
+///
+/// So position is counted among the nodes pruning *cannot* remove. Nothing but
+/// a `CLEANUP` is ever dropped from `flow.nodes` and nothing is ever reordered,
+/// which makes this ordinal invariant across every pass — including the
+/// enclosing fixed point, which hands the same `dropped_at` to a vector that
+/// has shrunk since it was built. It is a stable identity that costs nothing to
+/// store.
+fn top_ordinal(nodes: &[FlowNode], upto: usize) -> usize {
+    nodes[..upto]
+        .iter()
+        .filter(|n| !matches!(n, FlowNode::Cleanup { .. }))
+        .count()
 }
 
 fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
@@ -813,6 +887,11 @@ pub fn prune_to_targets(
     // bodies, and nothing in the surviving tree says where they used to be.
     let mut dropped_at: HashMap<String, usize> = HashMap::new();
     let mut dropped_captures: HashSet<String> = HashSet::new();
+    // Taken before the walk, because `iter_mut` holds the vector and
+    // `top_ordinal` needs to read it.
+    let ordinals: Vec<usize> = (0..flow.nodes.len())
+        .map(|i| top_ordinal(&flow.nodes, i))
+        .collect();
     for (node_index, node) in flow.nodes.iter_mut().enumerate() {
         let FlowNode::Graph { body, .. } = node else {
             continue;
@@ -867,7 +946,7 @@ pub fn prune_to_targets(
             // actually be read.
             if !keep_written.contains(&step.written) {
                 dropped_names.insert(step.name.clone());
-                dropped_at.insert(step.name.clone(), node_index);
+                dropped_at.insert(step.name.clone(), ordinals[node_index]);
                 dropped_captures.extend(caps);
             }
         }
@@ -946,10 +1025,14 @@ pub fn prune_to_targets(
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
     scan_strands_top(&flow.nodes, &dropped_names, &dropped_at, &mut stranded);
-    for text in declared_truths(flow) {
+    // A truth is read where it is written, like every other reference. Judging
+    // all of them against the flat set refused a loop whose own `gate` was
+    // alive, over a name a region at the bottom of the file had dropped.
+    for (text, at) in declared_truths(flow) {
         for key in crate::environment::referenced_keys(&text) {
             if let Some((step, _)) = key.split_once('.')
                 && dropped_names.contains(step)
+                && at.is_none_or(|here| dropped_at.get(step).is_none_or(|&d| d <= here))
                 && !stranded.contains(&key)
             {
                 stranded.push(key.clone());
@@ -1617,6 +1700,115 @@ mod tests {
         )
         .expect("the loop's own gate resolves, so nothing is stranded");
         assert!(text.contains("{{gate.v}}"), "{text}");
+    }
+
+    #[test]
+    fn a_cleanup_removed_from_above_a_region_does_not_move_it() {
+        // Position is counted among the nodes pruning cannot remove, because
+        // the ones it can remove *go*. Two dropped cleanups written above the
+        // region slid it two places up the vector while `dropped_at` went on
+        // naming the place it used to be, and the loop below it read as though
+        // it were above: the reference to a step that is no longer in the run
+        // went unreported and the flow was handed back to be sent verbatim.
+        let entries = [
+            entry("p1", &[], &[]),
+            entry("p2", &[], &[]),
+            entry("gated", &["v"], &[]),
+            entry("target", &[], &[]),
+        ];
+        let errs = pruned(
+            "CLEANUP p1 DEPENDS gate
+CLEANUP p2 DEPENDS gate
+             GRAPH
+    REQUEST gated AS gate
+    REQUEST target
+END
+             FOR y IN [\"b\"]\n    REPORT \"{{gate.v}}\" AS Seen\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .expect_err("the loop is below the region, so its {{gate.v}} is stranded");
+        assert!(
+            errs.iter().any(|e| e.contains("gate.v")),
+            "expected the strand to be reported: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_removed_from_above_a_loop_does_not_move_it() {
+        // The same shift, one consumer over. `purge` reads a capture the
+        // pruning dropped and goes in the first pass, which moved the loop up
+        // to exactly the index the region had been recorded at — so `create`
+        // failed the strictly-above test and the teardown for a step that is
+        // no longer in the run survived, to be skipped at run time with an exit
+        // code claiming the run was incomplete.
+        let entries = [
+            entry("purge", &[], &["sid"]),
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("release", &[], &[]),
+        ];
+        let text = pruned(
+            "CLEANUP purge
+             GRAPH
+    REQUEST create
+    REQUEST target
+END
+             FOR y IN [\"b\"]\n    CLEANUP release DEPENDS create\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP release"),
+            "create was pruned, so its teardown goes with it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_truth_in_a_loop_above_a_region_reads_the_loops_own_step() {
+        // The positional rule the strand scan already had, now asked of truths
+        // too. The loop's `gate` is alive; the region's separate `gate` is
+        // pruned; judging the truth against the flat set refused a selection
+        // with nothing wrong with it.
+        let entries = [
+            entry("mint", &["v"], &[]),
+            entry("gated", &[], &[]),
+            entry("target", &[], &[]),
+        ];
+        let text = pruned(
+            "FOR y IN [\"b\"]\n    REQUEST mint AS gate\n    \
+             REPORT \"x\" AS C TRUTH \"{{gate.v}}\"\nEND\n\
+             GRAPH\n    REQUEST gated AS gate\n    REQUEST target\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .expect("the loop's own gate answers its truth");
+        assert!(text.contains("TRUTH"), "{text}");
+    }
+
+    #[test]
+    fn a_truth_a_later_statement_overwrites_is_not_checked() {
+        // Truths overwrite by column header, so only the last one written for a
+        // header is ever scored. Attributing truths per node without keeping
+        // that rule judged the losers as well, and refused a run over a
+        // template the report will never evaluate.
+        let entries = [
+            entry("dead", &["v"], &[]),
+            entry("gated", &[], &[]),
+            entry("target", &[], &[]),
+        ];
+        // The loser is written *below* the region, so position does not excuse
+        // it — only the fact that nothing will ever score it does.
+        let text = pruned(
+            "GRAPH\n    REQUEST dead\n    REQUEST target\nEND\n\
+             FOR y IN [\"b\"]\n    REPORT \"x\" AS C TRUTH \"{{dead.v}}\"\nEND\n\
+             REPORT \"ok\" AS C TRUTH \"static\"\n",
+            &["target"],
+            &entries,
+        )
+        .expect("the surviving truth for C is the static one");
+        assert!(text.contains("static"), "{text}");
     }
 
     #[test]
