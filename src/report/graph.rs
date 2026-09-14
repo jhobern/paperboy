@@ -584,16 +584,36 @@ fn count_cleanups(nodes: &[FlowNode]) -> usize {
 }
 
 /// Drop the cleanups `keep` rejects, at every depth, telling it which capture
-/// names are visible where each one is written.
+/// names are visible where each one is written and which step names have
+/// already been dropped *where this block can see them*.
+///
+/// The dropped set is scoped, not global. A step name means whatever it means
+/// in the block it is written in — two sibling loops may each hold a `CLEANUP
+/// … AS gate`, and validation allows it precisely because neither can see the
+/// other. A flat set of names could not tell them apart, so dropping one loop's
+/// `gate` dropped the *other* loop's `release DEPENDS gate` as well, whose own
+/// `gate` was alive and well: a teardown silently removed and its resource
+/// left standing, with the run still green. An inner block inherits the
+/// enclosing one's dropped names, since a body may legitimately depend on a
+/// step written above it.
 fn retain_cleanups(
     nodes: &mut Vec<FlowNode>,
     visible: &HashSet<String>,
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-    keep: &mut impl FnMut(&str, &str, &[String], &[UsingItem], &HashSet<String>) -> bool,
+    dropped: &HashSet<String>,
+    keep: &mut impl FnMut(
+        &str,
+        &str,
+        &[String],
+        &[UsingItem],
+        &HashSet<String>,
+        &HashSet<String>,
+    ) -> bool,
 ) {
     let mut here = visible.clone();
     here.extend(scope_captures(nodes, entries, helpers, true));
+    let mut here_dropped = dropped.clone();
     nodes.retain(|n| match n {
         FlowNode::Cleanup {
             name,
@@ -604,7 +624,11 @@ fn retain_cleanups(
             let step = alias
                 .clone()
                 .unwrap_or_else(|| crate::report::run::leaf(name).to_string());
-            keep(name, &step, depends, using, &here)
+            let k = keep(name, &step, depends, using, &here, &here_dropped);
+            if !k {
+                here_dropped.insert(step);
+            }
+            k
         }
         _ => true,
     });
@@ -625,9 +649,11 @@ fn retain_cleanups(
             FlowNode::ForEach { body, .. } | FlowNode::ForEnvs { body, .. } => {
                 let mut body_visible = visible.clone();
                 body_visible.extend(scope_captures(above, entries, helpers, false));
-                retain_cleanups(body, &body_visible, entries, helpers, keep)
+                retain_cleanups(body, &body_visible, entries, helpers, &here_dropped, keep)
             }
-            FlowNode::Graph { body, .. } => retain_cleanups(body, &here, entries, helpers, keep),
+            FlowNode::Graph { body, .. } => {
+                retain_cleanups(body, &here, entries, helpers, &here_dropped, keep)
+            }
             _ => {}
         }
     }
@@ -783,35 +809,27 @@ pub fn prune_to_targets(
             &outer,
             entries,
             helpers,
-            &mut |name, step, depends, using, visible| {
-                // A cleanup dropped here is as gone as a pruned step, so it
-                // joins them: the fixed-point loop then applies the same
-                // doctrine transitively. Without it a teardown could survive
-                // naming a sibling that no longer appears anywhere in the flow,
-                // to be skipped at run time with a warning pointing at it — and
-                // its own resource left standing.
-                let decide = || -> bool {
-                    if depends.iter().any(|d| dropped_names.contains(d.as_str())) {
-                        return false;
-                    }
-                    let Some(effective) = effective_entry(entries, helpers, name, using) else {
-                        return true;
-                    };
-                    // Only a name that *was* produced by a pruned step and is not
-                    // produced by a surviving one in scope: anything else comes from the
-                    // environment or from outside the region, and is none of pruning's
-                    // business.
-                    !crate::request::entry_referenced_keys(&effective)
-                        .iter()
-                        .any(|r| {
-                            dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str())
-                        })
-                };
-                let keep = decide();
-                if !keep {
-                    dropped_names.insert(step.to_string());
+            &dropped_names,
+            &mut |name, _step, depends, using, visible, dropped| {
+                // A cleanup dropped here is as gone as a pruned step, so a
+                // teardown that depends on it goes too — `dropped` carries
+                // both, scoped to where those names are legible. Without it a
+                // teardown survived naming a sibling that no longer appeared
+                // anywhere in the flow, to be skipped at run time with a
+                // warning pointing at it, and its own resource left standing.
+                if depends.iter().any(|d| dropped.contains(d.as_str())) {
+                    return false;
                 }
-                keep
+                let Some(effective) = effective_entry(entries, helpers, name, using) else {
+                    return true;
+                };
+                // Only a name that *was* produced by a pruned step and is not
+                // produced by a surviving one in scope: anything else comes from the
+                // environment or from outside the region, and is none of pruning's
+                // business.
+                !crate::request::entry_referenced_keys(&effective)
+                    .iter()
+                    .any(|r| dropped_captures.contains(r.as_str()) && !visible.contains(r.as_str()))
             },
         );
         if count_cleanups(&flow.nodes) == before {
@@ -1370,6 +1388,45 @@ mod tests {
         assert!(
             !text.contains("CLEANUP"),
             "close depends on purge, which is gone: {text}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_cleanup_does_not_drop_a_same_named_one_in_a_sibling_scope() {
+        // A step name means whatever it means in the block it is written in,
+        // and two sibling loops may each hold a `CLEANUP … AS gate` — step
+        // validation allows it precisely because neither can see the other.
+        // Recording dropped names in one flat set could not tell them apart, so
+        // dropping the first loop's `gate` dropped the second loop's
+        // `release DEPENDS gate` too, whose own `gate` was alive and well: a
+        // teardown silently removed and its resource left standing.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("doomed", &[], &["sid"]),
+            entry("prepare", &[], &[]),
+            entry("release", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             FOR x IN [\"a\"]\n    CLEANUP doomed AS gate\nEND\n\
+             FOR y IN [\"b\"]\n    CLEANUP prepare AS gate\n    \
+             CLEANUP release DEPENDS gate\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP doomed"),
+            "the first loop's gate reads a capture nothing produces now: {text}"
+        );
+        assert!(
+            text.contains("CLEANUP prepare"),
+            "the second loop's gate is untouched: {text}"
+        );
+        assert!(
+            text.contains("CLEANUP release"),
+            "and so is what depends on it: {text}"
         );
     }
 

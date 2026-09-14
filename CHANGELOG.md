@@ -179,6 +179,15 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A dropped `CLEANUP` no longer drops a same-named one in a sibling scope. A
+  step name means whatever it means in the block it is written in, and two
+  sibling loops may each hold a `CLEANUP … AS gate` — step validation allows it
+  precisely because neither can see the other. Recording dropped names in one
+  flat set could not tell them apart, so pruning one loop's `gate` also removed
+  the other loop's `release DEPENDS gate`, whose own `gate` was alive and well:
+  a teardown silently dropped and its resource left standing, with the run
+  still reading as green.
+
 - An `ENVS` clause may name its environment through **anything in scope where
   it is written** — a parameter, a loop variable, an assignment, a capture —
   not only a parameter. The clause is resolved when the run *reaches* it,
