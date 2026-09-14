@@ -179,6 +179,18 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- A request's `# [Gen]` values are now threaded forward like its captures, and
+  count as the step's outputs. They were computed, used for the send, and then
+  dropped on the floor — so `{{sid}}` downstream kept resolving to whatever the
+  environment was carrying, and `{{step.sid}}`, which validation explicitly
+  permits, resolved to nothing at all. A `CLEANUP` reading a generated id also
+  inferred no dependency on the step that minted it, because only captures were
+  searched: with a stale `sid` in the environment the teardown deleted somebody
+  else's live resource and reported success, while the qualified spelling of the
+  same reference correctly skipped. A generated value now gates a teardown on
+  having been *produced* rather than on the send having succeeded — it is known
+  before the request leaves, so a create that failed after minting its id still
+  lets the teardown run, which is exactly when the resource may need reclaiming.
 - A dropped `CLEANUP` no longer drops a same-named one in a sibling scope. A
   step name means whatever it means in the block it is written in, and two
   sibling loops may each hold a `CLEANUP … AS gate` — step validation allows it

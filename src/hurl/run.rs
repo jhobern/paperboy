@@ -133,6 +133,16 @@ pub struct RunOutput {
     /// A concise message for the status bar: a parse error, transport failure,
     /// or the first failed assertion. `None` when everything succeeded.
     pub error: Option<String>,
+    /// What the request's `# [Gen]` block computed for *this* send.
+    ///
+    /// A generated value is an output of the send just as a capture is — the
+    /// difference is only that it was computed before the request left rather
+    /// than read out of the response. It has to travel with the result for the
+    /// same reason a capture does: something downstream may name it, and the
+    /// alternative is that `{{step.sid}}` resolves to whatever older value of
+    /// that name happens to be lying around. Empty for every runner that does
+    /// not evaluate a `[Gen]` block, which is all of them but the live one.
+    pub generated: std::collections::HashMap<String, String>,
 }
 
 /// Builds the [`ContextDir`] that gates local file access for `[Form]`/
@@ -182,6 +192,7 @@ pub fn run_hurl_watching(
             return RunOutput {
                 entries: vec![],
                 error: Some(format!("Parse error (line {}): {:?}", e.pos.line, e.kind)),
+                generated: Default::default(),
             };
         }
     };
@@ -243,7 +254,11 @@ pub fn run_hurl_watching(
         .zip(&errors)
         .find_map(|(e, err)| (!e.superseded).then_some(err.clone()).flatten());
 
-    RunOutput { entries, error }
+    RunOutput {
+        entries,
+        error,
+        generated: Default::default(),
+    }
 }
 
 /// How many attempts a request allows -- the denominator in "retry 2 of 5",
@@ -437,6 +452,7 @@ pub fn run_hurl_streaming_with(
             return RunOutput {
                 entries: vec![],
                 error: Some(format!("Parse error (line {}): {:?}", e.pos.line, e.kind)),
+                generated: Default::default(),
             };
         }
     };
@@ -552,7 +568,11 @@ pub fn run_hurl_streaming_with(
         }
     }
 
-    RunOutput { entries, error }
+    RunOutput {
+        entries,
+        error,
+        generated: Default::default(),
+    }
 }
 
 /// Map one runner [`EntryResult`] to the app's [`EntryOutcome`], returning it

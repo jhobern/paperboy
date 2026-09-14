@@ -128,6 +128,7 @@ impl<R: EntryRunner> EntryRunner for CancellableRunner<R> {
     ) -> crate::hurl::RunOutput {
         if self.cancel.load(Ordering::Relaxed) {
             return crate::hurl::RunOutput {
+                generated: Default::default(),
                 entries: Vec::new(),
                 error: Some("cancelled".to_string()),
             };

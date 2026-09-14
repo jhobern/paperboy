@@ -109,6 +109,7 @@ impl EntryRunner for DryRunner {
 
     fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
         RunOutput {
+            generated: Default::default(),
             entries: vec![EntryOutcome {
                 entry_index: 0,
                 superseded: false,
@@ -758,8 +759,48 @@ struct Sched {
 /// the ring has to be caught here too. It is left in the order it arrived and
 /// reported, because a ring that quietly skips itself leaks every resource it
 /// covers while the run still reads as green.
-type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
+/// Why a cleanup waits on a step, and therefore what counts as that step
+/// having delivered.
+///
+/// The distinction exists because a step has two kinds of output and they are
+/// worth different things to a teardown. It is not a refinement of the
+/// ordering — the two gate the same edge — only of the question asked at
+/// dispatch.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum DepGate {
+    /// The value came off the wire, so it is only worth anything if the step
+    /// succeeded. A request that failed its status or an assertion captured
+    /// nothing, and the name then falls through to whatever older value was
+    /// standing in the chain — which is somebody else's live resource.
+    Succeeded,
+    /// The named value was computed by the step's `# [Gen]` block, *before* the
+    /// request left, so it is known whatever the server went on to say. The
+    /// gate therefore asks the weaker and truer question: did this step
+    /// actually produce this value?
+    ///
+    /// Weaker on purpose. A client-minted id is the id the teardown wants
+    /// whether or not the create came back 500 — the server may well have made
+    /// the resource before erroring — and deleting an id we minted ourselves
+    /// is either a delete of our own resource or a harmless 404. Inheriting the
+    /// capture rule here would skip the teardown over a value that was never in
+    /// doubt, leaking exactly the resource it exists to reclaim.
+    ///
+    /// Still a gate, not a free pass. A step that never ran, or whose `[Gen]`
+    /// block failed to evaluate (in which case the send is refused outright and
+    /// nothing is generated), produced no value — and a teardown dispatched
+    /// then would carry a stale environment value of the same name, which is
+    /// the one outcome worth refusing.
+    Produced(String),
+}
 
+/// One step a cleanup waits on, and the gate that step has to pass.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct CleanupDep {
+    step: String,
+    gate: DepGate,
+}
+
+type PlannedCleanup<'a> = (usize, Option<usize>, &'a FlowNode, String, Vec<String>);
 fn order_cleanups(
     planned: Vec<PlannedCleanup<'_>>,
 ) -> (Vec<PlannedCleanup<'_>>, Vec<String>, Vec<String>) {
@@ -1286,6 +1327,36 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Thread one request's `[Gen]` values forward, exactly where its captures
+    /// go.
+    ///
+    /// Called *before* [`record_captures`](Self::record_captures) at every
+    /// dispatch, so a request that generates a name and then captures the same
+    /// name resolves downstream to what the response said. The generated value
+    /// is the guess the request went out with; the captured one is what came
+    /// back, and the later writer has to be the one that wins — the other order
+    /// would clobber the server's canonical id with the client's placeholder.
+    ///
+    /// Recorded whether or not the send succeeded, because a `[Gen]` row is
+    /// evaluated before the request leaves: the value is a fact about what was
+    /// sent, and a teardown holding it is holding the right one even when the
+    /// send came back 500. What the failure changes is whether the *resource*
+    /// exists, which is a question about gating — see [`DepGate`].
+    fn record_generated(&mut self, step: &str, generated: &HashMap<String, String>) {
+        if generated.is_empty() {
+            return;
+        }
+        let mut pairs: Vec<(String, String)> = generated
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // A map has no order and two names never collide within one block, but
+        // sorting keeps the recorded sequence reproducible for anything that
+        // replays it.
+        pairs.sort();
+        self.record_captures(step, &pairs);
+    }
+
     /// Record whether a step succeeded.
     ///
     /// "Succeeded" is the runner's own verdict for the entry — status, asserts
@@ -1528,7 +1599,15 @@ impl<'a> Exec<'a> {
                 continue;
             };
             let step = alias.clone().unwrap_or_else(|| leaf(name).to_string());
-            let deps = self.cleanup_deps(name, depends, using, &step, &siblings);
+            // Ordering cares only about *which* steps a cleanup waits on. Which
+            // gate each one has to pass is a dispatch-time question about the
+            // value that actually arrived, and asking it here — before anything
+            // has run — could only guess.
+            let deps: Vec<String> = self
+                .cleanup_deps(name, depends, using, &step, &siblings)
+                .into_iter()
+                .map(|d| d.step)
+                .collect();
             // How late the cleanup's latest dependency ran. `None` — it depends
             // on nothing — sorts first here, and therefore last once reversed.
             let depth = deps
@@ -1628,10 +1707,17 @@ impl<'a> Exec<'a> {
                 continue;
             }
             let deps = self.cleanup_deps(name, depends, using, &step, &[]);
-            if let Some(dep) = deps
-                .into_iter()
-                .find(|d| !self.step_ok.get(d).copied().unwrap_or(false))
-            {
+            if let Some(dep) = deps.into_iter().find(|d| match &d.gate {
+                DepGate::Succeeded => !self.step_ok.get(&d.step).copied().unwrap_or(false),
+                // "Produced" is asked of the recorded value rather than of the
+                // verdict, so a failed send whose `[Gen]` block ran still
+                // satisfies it — and a step that never ran, or that generated
+                // nothing, still does not.
+                DepGate::Produced(var) => !self
+                    .step_captures
+                    .get(&d.step)
+                    .is_some_and(|c| c.contains_key(var)),
+            }) {
                 // Not an error. A cleanup whose subject was never created has
                 // nothing to do, and saying "failed" about it would bury the
                 // real failure under a second one caused entirely by the first.
@@ -1639,7 +1725,7 @@ impl<'a> Exec<'a> {
                 self.note_step(&step, name, false);
                 self.warnings.push(crate::i18n::fill(
                     self.ctx.strings.run_cleanup_skipped,
-                    &[&step, &dep],
+                    &[&step, &dep.step],
                 ));
                 continue;
             }
@@ -1669,6 +1755,11 @@ impl<'a> Exec<'a> {
     /// variable says nothing about ordering, and treating one as a dependency
     /// would skip the teardown over a name that was never going to "succeed".
     ///
+    /// A step's outputs are its response captures *and* its `# [Gen]` values —
+    /// the language lets a reference name either, so the ordering has to see
+    /// both or the two spellings of the same dependency disagree. Each returned
+    /// dependency carries the [`DepGate`] its kind earns.
+    ///
     /// `siblings` is every cleanup in this block as `(step name, request)`,
     /// including this one: cleanups are ordered against each other too, and
     /// none of them has run yet, so they cannot be recognised from `step_ok`.
@@ -1679,11 +1770,45 @@ impl<'a> Exec<'a> {
         using: &[UsingItem],
         self_step: &str,
         siblings: &[(String, String)],
-    ) -> Vec<String> {
-        let mut out: Vec<String> = depends.to_vec();
-        let declares = |request: &str, var: &str| {
-            resolve_qualified(self.ctx.entries, self.ctx.helpers, request)
-                .is_some_and(|e| e.captures.iter().any(|(c, _)| c == var))
+    ) -> Vec<CleanupDep> {
+        // An explicit `DEPENDS` is the author asking for the strong gate by
+        // hand: they named a step, not a value, and what they meant by naming
+        // it is "only if that worked".
+        let mut out: Vec<CleanupDep> = depends
+            .iter()
+            .map(|d| CleanupDep {
+                step: d.clone(),
+                gate: DepGate::Succeeded,
+            })
+            .collect();
+        // What a request declaring `var` promises about it, or `None` if it
+        // does not declare it at all. A response capture and a `[Gen]` row are
+        // both outputs of the step — validation says so, and a reference to
+        // either is legal — but they are worth different things to a teardown,
+        // so the kind travels with the dependency rather than being flattened
+        // away here.
+        let gate_for = |request: &str, var: &str| -> Option<DepGate> {
+            let e = resolve_qualified(self.ctx.entries, self.ctx.helpers, request)?;
+            if e.captures.iter().any(|(c, _)| c == var) {
+                // A request that generates a name and then captures it too is
+                // answered by the response: the capture is written second and
+                // wins everywhere, so the gate has to be the capture's.
+                return Some(DepGate::Succeeded);
+            }
+            if e.generators.iter().any(|(g, _)| g == var) {
+                return Some(DepGate::Produced(var.to_string()));
+            }
+            None
+        };
+        // The request a step runs, whether it has already run or is a cleanup
+        // still waiting its turn.
+        let request_of = |step: &str| -> Option<String> {
+            self.step_request.get(step).cloned().or_else(|| {
+                siblings
+                    .iter()
+                    .find(|(s, _)| s == step)
+                    .map(|(_, r)| r.clone())
+            })
         };
         let mut refs: Vec<String> = Vec::new();
         if let Some(entry) = resolve_qualified(self.ctx.entries, self.ctx.helpers, name) {
@@ -1698,11 +1823,21 @@ impl<'a> Exec<'a> {
             // A qualified reference names its step outright; a flat one is
             // matched against the steps that captured it.
             match r.split_once('.') {
-                Some((step, _))
+                Some((step, var))
                     if self.step_ok.contains_key(step)
                         || siblings.iter().any(|(s, _)| s == step && s != self_step) =>
                 {
-                    out.push(step.to_string())
+                    // The reference names the step outright, so the only
+                    // question left is what that step promised about the
+                    // value. A step whose request cannot be resolved promised
+                    // nothing legible, and the strong gate is the safe reading.
+                    let gate = request_of(step)
+                        .and_then(|req| gate_for(&req, var))
+                        .unwrap_or(DepGate::Succeeded);
+                    out.push(CleanupDep {
+                        step: step.to_string(),
+                        gate,
+                    })
                 }
                 Some(_) => {}
                 None => {
@@ -1721,10 +1856,15 @@ impl<'a> Exec<'a> {
                     // the language and does so here too — declining the edge
                     // to protect it only meant the ordering disagreed with the
                     // value while the wrong resource was torn down anyway.
-                    let sibs: Vec<String> = siblings
+                    let sibs: Vec<CleanupDep> = siblings
                         .iter()
-                        .filter(|(s, req)| s != self_step && declares(req, &r))
-                        .map(|(s, _)| s.clone())
+                        .filter(|(s, _)| s != self_step)
+                        .filter_map(|(s, req)| {
+                            gate_for(req, &r).map(|gate| CleanupDep {
+                                step: s.clone(),
+                                gate,
+                            })
+                        })
                         .collect();
                     if !sibs.is_empty() {
                         out.extend(sibs);
@@ -1737,7 +1877,16 @@ impl<'a> Exec<'a> {
                     // can still have captured, and the winner is therefore not
                     // always the latest successful one.
                     if let Some(owner) = self.capture_owner.get(&r) {
-                        out.push(owner.clone());
+                        // `capture_owner` records generated values alongside
+                        // captured ones — both are things a step wrote — so
+                        // ask the owner's request which kind this was.
+                        let gate = request_of(owner)
+                            .and_then(|req| gate_for(&req, &r))
+                            .unwrap_or(DepGate::Succeeded);
+                        out.push(CleanupDep {
+                            step: owner.clone(),
+                            gate,
+                        });
                         continue;
                     }
                     // Nothing has written the name yet. Every step that
@@ -1745,16 +1894,13 @@ impl<'a> Exec<'a> {
                     // a single producer that failed before capturing still skip
                     // the cleanup: it ran, and the value it was supposed to
                     // leave is missing.
-                    out.extend(
-                        self.step_order
-                            .iter()
-                            .filter(|step| {
-                                self.step_request
-                                    .get(*step)
-                                    .is_some_and(|req| declares(req, &r))
-                            })
-                            .cloned(),
-                    );
+                    out.extend(self.step_order.iter().filter_map(|step| {
+                        let req = self.step_request.get(step)?;
+                        gate_for(req, &r).map(|gate| CleanupDep {
+                            step: step.clone(),
+                            gate,
+                        })
+                    }));
                 }
             }
         }
@@ -1820,6 +1966,7 @@ impl<'a> Exec<'a> {
             }
         };
         let out = self.ctx.runner.run(&base, &self.vars_for());
+        self.record_generated(&step, &out.generated);
         if let Some(err) = &out.error {
             self.errors.push(format!("{name}: {err}"));
         }
@@ -1994,6 +2141,7 @@ impl<'a> Exec<'a> {
             }
         };
         let out = self.ctx.runner.run(&base, &self.vars_for());
+        self.record_generated(&alias, &out.generated);
         let eo = match out.entries.into_iter().next() {
             Some(eo) => eo,
             None => {
@@ -3016,6 +3164,11 @@ mod tests {
         raw_body: String,
         pretty_body: String,
         captures: Vec<(String, String)>,
+        /// What the request's `[Gen]` block computed for this send. Separate
+        /// from `captures` because the two are produced at different moments —
+        /// before the request leaves and after the answer arrives — and a
+        /// teardown is allowed to trust them differently.
+        generated: Vec<(String, String)>,
         headers: Vec<(String, String)>,
         asserts: Vec<(bool,)>,
         duration_ms: u64,
@@ -3155,6 +3308,7 @@ mod tests {
             };
             self.active.fetch_sub(1, Ordering::SeqCst);
             RunOutput {
+                generated: c.generated.into_iter().collect(),
                 entries: vec![eo],
                 error: c.error,
             }
@@ -5147,6 +5301,259 @@ mod tests {
         )
     }
 
+    /// An entry whose `# [Gen]` block declares `generators`, reading `url_vars`
+    /// out of its URL — the shape of a request that mints an id client-side and
+    /// then creates it.
+    fn gen_entry(title: &str, generators: &[&str], url_vars: &[&str]) -> HurlEntry {
+        HurlEntry {
+            generators: generators
+                .iter()
+                .map(|g| ((*g).to_string(), "uuid()".to_string()))
+                .collect(),
+            ..graph_entry(title, &[], url_vars)
+        }
+    }
+
+    /// A send that computed its `[Gen]` values and then succeeded.
+    fn ok_generating<'a>(title: &'a str, gens: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 200,
+                generated: gens
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// A send that computed its `[Gen]` values and *then* failed — the case the
+    /// whole `Produced` gate exists for. The value is a fact about what went
+    /// out; only the resource's existence is in doubt.
+    fn failing_generating<'a>(title: &'a str, gens: &[(&str, &str)]) -> (&'a str, Canned) {
+        (
+            title,
+            Canned {
+                status: 500,
+                error: Some("boom".into()),
+                generated: gens
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_generated_value_reaches_the_steps_that_read_it() {
+        // The bug this replaces: generated values were dropped on the floor at
+        // the end of the send, so `{{sid}}` downstream kept resolving to the
+        // environment's stale value and `{{setup.sid}}` — which validation
+        // explicitly permits — resolved to nothing at all and went out as
+        // literal text.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("fetch", &[], &["sid"]),
+            graph_entry("show", &[], &[]),
+        ];
+        let fake = Fake::new(&[
+            ok_generating("create", &[("sid", "NEW")]),
+            ok("fetch"),
+            ok("show"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\n\
+             REQUEST fetch\n\
+             REQUEST show USING(query.sid = \"{{setup.sid}}\")\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        // The flat name is answered by the step that generated it, exactly as
+        // it would be by a step that captured it.
+        assert_eq!(
+            fake.call_vars("fetch").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+        // And the qualified spelling names the same value. It is asked for in
+        // PaperTrail's own text, which is the only place a dotted name is
+        // legible — Hurl's grammar has no such path, so request text never
+        // carries one.
+        let sent = fake.sent_entry("show").expect("show was sent");
+        assert_eq!(
+            sent.queries
+                .iter()
+                .find(|q| q.key == "sid")
+                .map(|q| q.value.as_str()),
+            Some("NEW"),
+            "qualified generated value did not reach the send: {:?}",
+            sent.queries
+        );
+    }
+
+    #[test]
+    fn a_cleanup_reading_a_generated_value_waits_for_the_step_that_generated_it() {
+        // Ordering has to see `[Gen]` values as outputs, or the teardown is
+        // free to run before the thing it tears down exists.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[ok_generating("create", &[("sid", "NEW")]), ok("delete")]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        // The point of the edge: the teardown carries the id that was minted,
+        // not the one the environment was carrying around beforehand.
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    #[test]
+    fn a_cleanup_still_runs_when_the_step_that_generated_its_value_failed() {
+        // A `[Gen]` value is computed before the request leaves, so a 500 says
+        // nothing about whether the id is right — only about whether the
+        // server managed to store it, which is exactly what a teardown is for.
+        // Skipping here would leak the resource a half-completed create left
+        // behind. Deleting an id we minted ourselves is either our own
+        // resource or a harmless 404.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            failing_generating("create", &[("sid", "NEW")]),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create", "delete"]);
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("NEW")
+        );
+    }
+
+    #[test]
+    fn a_cleanup_is_skipped_when_the_generated_value_it_reads_was_never_produced() {
+        // The other half of the rule, and the reason `Produced` is a gate at
+        // all rather than a free pass. A step whose `[Gen]` block failed is
+        // refused before the send and generates nothing, so the name falls
+        // through to the environment — and a teardown dispatched on a stale
+        // id destroys somebody else's live resource and reports success.
+        let entries = [
+            gen_entry("create", &["sid"], &[]),
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[failing("create"), ok("delete")]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert_eq!(fake.call_order(), ["create"]);
+        assert_eq!(res.skipped, ["delete"]);
+    }
+
+    #[test]
+    fn a_reporting_request_threads_its_generated_values_forward_too() {
+        // `REPORT REQUEST` dispatches down its own path, and a fix applied to
+        // only one of the two sends is the kind of half-fix that reads as
+        // working until the one flow nobody tested runs a teardown.
+        let entries = [
+            HurlEntry {
+                generators: vec![("sid".to_string(), "uuid()".to_string())],
+                ..graph_entry("create", &["sid"], &[])
+            },
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 200,
+                    captures: vec![("sid".to_string(), "SERVER".to_string())],
+                    generated: vec![("sid".to_string(), "MINTED".to_string())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        run(
+            "REPORT REQUEST create AS setup SHOW(HttpStatus)\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        // Same precedence as the ordinary send: the response is written last
+        // and wins over the value the request went out with.
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("SERVER")
+        );
+    }
+
+    #[test]
+    fn a_captured_name_outranks_the_generated_one_of_the_same_name() {
+        // A request may mint a placeholder id and then read the server's
+        // canonical one out of the answer. The response is written second and
+        // has to win — and the gate that comes with it is the capture's, since
+        // the value downstream is now the one that came off the wire.
+        let entries = [
+            HurlEntry {
+                generators: vec![("sid".to_string(), "uuid()".to_string())],
+                ..graph_entry("create", &["sid"], &[])
+            },
+            graph_entry("delete", &[], &["sid"]),
+        ];
+        let fake = Fake::new(&[
+            (
+                "create",
+                Canned {
+                    status: 200,
+                    captures: vec![("sid".to_string(), "SERVER".to_string())],
+                    generated: vec![("sid".to_string(), "MINTED".to_string())],
+                    ..Default::default()
+                },
+            ),
+            ok("delete"),
+        ]);
+        let res = run(
+            "REQUEST create AS setup\nCLEANUP delete\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            fake.call_vars("delete").get("sid").map(String::as_str),
+            Some("SERVER")
+        );
+    }
+
     #[test]
     fn depends_orders_two_steps_that_share_no_data() {
         // The case inference cannot reach: an upload whose result is fetched
@@ -6263,6 +6670,7 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
                         superseded: false,
@@ -6358,6 +6766,7 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
                         superseded: false,
@@ -6465,6 +6874,7 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
                         superseded: false,
@@ -7505,6 +7915,7 @@ mod tests {
                 let v = vars.get("VERDICT").cloned().unwrap_or_default();
                 let body = format!("{{\"overall\":\"{v}\"}}");
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
                         superseded: false,
@@ -8055,6 +8466,7 @@ mod helper_collection_tests {
             fn run(&self, base: &HurlEntry, _vars: &HashMap<String, String>) -> RunOutput {
                 self.0.lock().unwrap().push(base.title.clone());
                 RunOutput {
+                    generated: Default::default(),
                     entries: vec![EntryOutcome {
                         entry_index: 0,
                         superseded: false,
@@ -8140,6 +8552,7 @@ mod timing_column_tests {
             let ms = 100 + n.len() as u64;
             n.push(ms);
             RunOutput {
+                generated: Default::default(),
                 entries: vec![EntryOutcome {
                     entry_index: 0,
                     superseded: false,

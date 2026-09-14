@@ -854,6 +854,7 @@ pub fn run_resolved_entry_watching(
             RunOutput {
                 entries: vec![],
                 error: Some(UNREADABLE_REQUEST_ERROR.to_string()),
+                generated: HashMap::new(),
             },
             HashMap::new(),
             Vec::new(),
@@ -874,6 +875,7 @@ pub fn run_resolved_entry_watching(
             RunOutput {
                 entries: vec![],
                 error: Some(crate::i18n::summarise_gen_errors(&english, &gen_errors).join("; ")),
+                generated: HashMap::new(),
             },
             HashMap::new(),
             gen_errors,
@@ -898,6 +900,7 @@ pub fn run_resolved_entry_watching(
             RunOutput {
                 entries: vec![],
                 error: Some(format!("Base64 file error: {e}")),
+                generated: generated.clone(),
             },
             generated,
             Vec::new(),
@@ -909,10 +912,16 @@ pub fn run_resolved_entry_watching(
     let run_root = staged_dir.as_deref().or(file_root);
 
     let content = run_entry.to_hurl();
-    let out = crate::hurl::run::run_hurl_watching(&content, &vars, run_root, on_attempt);
+    let mut out = crate::hurl::run::run_hurl_watching(&content, &vars, run_root, on_attempt);
     if let Some(dir) = &staged_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
+    // The block's results travel with the result as well as beside it. The
+    // tuple is read by the front-ends, which want the generated values to show
+    // the user; the field is read by anything holding only a `RunOutput` —
+    // notably the report interpreter, which threads them forward exactly as it
+    // threads captures, so `{{step.sid}}` names the value this send used.
+    out.generated = generated.clone();
     (out, generated, Vec::new())
 }
 

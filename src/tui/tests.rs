@@ -20990,6 +20990,7 @@ impl crate::report::run::EntryRunner for FakeReportRunner {
         _vars: &std::collections::HashMap<String, String>,
     ) -> crate::hurl::RunOutput {
         crate::hurl::RunOutput {
+            generated: Default::default(),
             entries: vec![crate::hurl::EntryOutcome {
                 entry_index: 0,
                 superseded: false,

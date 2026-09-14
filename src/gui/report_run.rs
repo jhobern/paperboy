@@ -218,6 +218,7 @@ impl<R: EntryRunner> EntryRunner for CancellableRunner<R> {
     fn run(&self, base: &HurlEntry, vars: &HashMap<String, String>) -> RunOutput {
         if self.cancel.load(Ordering::Relaxed) {
             return RunOutput {
+                generated: Default::default(),
                 entries: Vec::new(),
                 error: Some("cancelled".to_string()),
             };

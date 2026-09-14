@@ -277,6 +277,7 @@ pub fn run(collection_path: String, env_path: Option<String>, batch: bool) -> i3
                 .flat_map(|(_, errs)| errs.iter().cloned())
                 .collect();
             RunOutput {
+                generated: Default::default(),
                 entries: vec![],
                 error: Some(crate::i18n::summarise_gen_errors(&strings, &flat).join("; ")),
             }
