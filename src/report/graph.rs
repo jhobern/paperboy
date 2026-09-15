@@ -645,16 +645,8 @@ fn retain_cleanups(
     visible: &HashSet<String>,
     entries: &[HurlEntry],
     helpers: &[HelperCollection],
-    dropped: &HashSet<String>,
-    dropped_at: &HashMap<String, usize>,
-    keep: &mut impl FnMut(
-        &str,
-        &str,
-        &[String],
-        &[UsingItem],
-        &HashSet<String>,
-        &HashSet<String>,
-    ) -> bool,
+    dropped: &DroppedNames,
+    keep: &mut impl FnMut(&str, &str, &[String], &[UsingItem], &HashSet<String>, &DroppedNames) -> bool,
 ) {
     let mut here = visible.clone();
     here.extend(scope_captures(nodes, entries, helpers, true));
@@ -683,7 +675,7 @@ fn retain_cleanups(
                     .unwrap_or_else(|| crate::report::run::leaf(name).to_string());
                 let k = keep(name, &step, depends, using, &here, &here_dropped);
                 if !k {
-                    here_dropped.insert(step);
+                    here_dropped.insert_anywhere(step);
                 }
                 k
             }
@@ -725,24 +717,14 @@ fn retain_cleanups(
                 // some later region from removing this body's
                 // `CLEANUP release DEPENDS gate`, whose own `gate` is alive.
                 //
-                // Only the seed is positional. Names this block dropped itself
-                // are cleanups, and a nested block may not depend on an
-                // enclosing block's cleanup at all, so carrying those down
-                // unfiltered is inert.
-                let body_dropped: HashSet<String> = here_dropped
-                    .iter()
-                    .filter(|n| dropped_at.get(*n).is_none_or(|&at| at < here_ord))
-                    .cloned()
-                    .collect();
-                retain_cleanups(
-                    body,
-                    &body_visible,
-                    entries,
-                    helpers,
-                    &body_dropped,
-                    &HashMap::new(),
-                    keep,
-                )
+                // The body numbers its own nodes, so what survives the filter
+                // goes down without a position: it was bound above the whole
+                // loop, which is what having none means. See
+                // `DroppedNames::positionless`.
+                let body_dropped = here_dropped
+                    .visible_strictly_before(here_ord)
+                    .positionless();
+                retain_cleanups(body, &body_visible, entries, helpers, &body_dropped, keep)
             }
             // A region is not a scope, so its body reads this block's names
             // whole. (It may hold neither a cleanup nor a loop, so this
@@ -752,8 +734,7 @@ fn retain_cleanups(
                 &here,
                 entries,
                 helpers,
-                &here_dropped,
-                &HashMap::new(),
+                &here_dropped.positionless(),
                 keep,
             ),
             _ => {}
@@ -789,24 +770,15 @@ fn retain_cleanups(
 /// their block unwinds, not where they are written, so one at the top of the
 /// file may legitimately name a step in a region at the bottom — and if that
 /// step is gone the reference really is stranded.
-fn scan_strands_top(
-    nodes: &[FlowNode],
-    dropped_names: &HashSet<String>,
-    dropped_at: &HashMap<String, usize>,
-    out: &mut Vec<String>,
-) {
+fn scan_strands_top(nodes: &[FlowNode], dropped: &DroppedNames, out: &mut Vec<String>) {
     let mut ord = 0usize;
     for node in nodes {
-        let visible: HashSet<String> = if matches!(node, FlowNode::Cleanup { .. }) {
-            dropped_names.clone()
+        let visible = if matches!(node, FlowNode::Cleanup { .. }) {
+            dropped.clone()
         } else {
             let here = ord;
             ord += 1;
-            dropped_names
-                .iter()
-                .filter(|n| dropped_at.get(*n).is_none_or(|&at| at <= here))
-                .cloned()
-                .collect()
+            dropped.visible_at(here)
         };
         scan_strands(std::slice::from_ref(node), &visible, out);
     }
@@ -835,7 +807,99 @@ fn top_ordinal(nodes: &[FlowNode], upto: usize) -> usize {
         .count()
 }
 
-fn scan_strands(nodes: &[FlowNode], dropped_names: &HashSet<String>, out: &mut Vec<String>) {
+/// The names pruning removed, each carrying where it was legible.
+///
+/// This used to be two structures — a flat set of names and a separate map of
+/// positions — which every reader had to remember to combine. Three readers
+/// had to; one of them forgot entirely and refused working runs for a release,
+/// and two more combined them against a stale numbering. The position is not
+/// an annotation on a name here, it is part of what the name *is*, so there is
+/// no half of this to consume by accident.
+///
+/// A position of `None` is not "unknown", it is a name legible anywhere in the
+/// block that holds it. That is what a dropped `CLEANUP` is: a teardown runs
+/// where its block unwinds, not where it is written, so nothing above or below
+/// it means anything.
+#[derive(Clone, Default)]
+struct DroppedNames {
+    at: HashMap<String, Option<usize>>,
+}
+
+impl DroppedNames {
+    /// A pruned step, bound at the top-level ordinal of the region that held
+    /// it.
+    fn insert_at(&mut self, name: String, ord: usize) {
+        self.at.insert(name, Some(ord));
+    }
+
+    /// A name with no position to speak of — see the type's note on `None`.
+    fn insert_anywhere(&mut self, name: String) {
+        self.at.insert(name, None);
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.at.contains_key(name)
+    }
+
+    /// Whether `name` is a dropped name that something written at `at` could
+    /// have read.
+    ///
+    /// `at: None` asks on behalf of text that stands outside the flow's node
+    /// order — the header's `columns:` directive — which no position excuses.
+    fn legible_to(&self, name: &str, at: Option<usize>) -> bool {
+        match self.at.get(name) {
+            None => false,
+            Some(None) => true,
+            Some(&Some(bound)) => at.is_none_or(|here| bound <= here),
+        }
+    }
+
+    /// The names a node at `ord` could have read: bound at or above it.
+    fn visible_at(&self, ord: usize) -> Self {
+        self.filtered(|bound| bound <= ord)
+    }
+
+    /// The names bound *strictly* above `ord`.
+    ///
+    /// A loop body runs before anything written beside the loop, so a name
+    /// bound at the loop's own position is not bound yet on any iteration.
+    /// Kept distinct from [`visible_at`](Self::visible_at) deliberately: the
+    /// two happen to agree today, because every position recorded is a
+    /// region's and this is only ever asked at a loop, so no input can reach
+    /// the boundary where they differ. That makes merging them a change no
+    /// test could ever catch — and the distinction is real enough that the next
+    /// person to record a position somewhere new would need it back.
+    fn visible_strictly_before(&self, ord: usize) -> Self {
+        self.filtered(|bound| bound < ord)
+    }
+
+    fn filtered(&self, keep: impl Fn(usize) -> bool) -> Self {
+        Self {
+            at: self
+                .at
+                .iter()
+                .filter(|(_, pos)| pos.is_none_or(|bound| keep(bound)))
+                .map(|(n, pos)| (n.clone(), *pos))
+                .collect(),
+        }
+    }
+
+    /// The same names, with their positions forgotten.
+    ///
+    /// Every block numbers its own nodes, so an enclosing block's ordinals mean
+    /// nothing inside a nested one — "the region at 0" and "the nested loop at
+    /// 0" are different nodes. A name handed down was bound above the whole
+    /// block anyway, which is exactly what no position means. Descending
+    /// without this compares across two numberings and keeps the teardown of a
+    /// pruned step.
+    fn positionless(&self) -> Self {
+        Self {
+            at: self.at.keys().map(|n| (n.clone(), None)).collect(),
+        }
+    }
+}
+
+fn scan_strands(nodes: &[FlowNode], dropped_names: &DroppedNames, out: &mut Vec<String>) {
     for node in nodes {
         for text in crate::report::validate::interpolated_source(node) {
             for key in crate::environment::referenced_keys(text) {
@@ -873,7 +937,7 @@ pub fn prune_to_targets(
     let mut errors = Vec::new();
     let mut matched: HashSet<String> = HashSet::new();
     // What pruning took away, so the cleanups can be pruned with it below.
-    let mut dropped_names: HashSet<String> = HashSet::new();
+    let mut dropped: DroppedNames = DroppedNames::default();
     // *Where* each of those names was bound — the index of the top-level region
     // that held it. A name alone cannot say who is entitled to be affected by
     // its removal: only regions at the top level are pruned, so every dropped
@@ -885,7 +949,6 @@ pub fn prune_to_targets(
     // Recorded here because it cannot be recovered later: by the time cleanups
     // are pruned the steps have already been retained out of their region
     // bodies, and nothing in the surviving tree says where they used to be.
-    let mut dropped_at: HashMap<String, usize> = HashMap::new();
     let mut dropped_captures: HashSet<String> = HashSet::new();
     // Taken before the walk, because `iter_mut` holds the vector and
     // `top_ordinal` needs to read it.
@@ -945,8 +1008,7 @@ pub fn prune_to_targets(
             // pruned, which is the only place that knows where a name can
             // actually be read.
             if !keep_written.contains(&step.written) {
-                dropped_names.insert(step.name.clone());
-                dropped_at.insert(step.name.clone(), ordinals[node_index]);
+                dropped.insert_at(step.name.clone(), ordinals[node_index]);
                 dropped_captures.extend(caps);
             }
         }
@@ -987,8 +1049,7 @@ pub fn prune_to_targets(
             &outer,
             entries,
             helpers,
-            &dropped_names,
-            &dropped_at,
+            &dropped,
             &mut |name, _step, depends, using, visible, dropped| {
                 // A cleanup dropped here is as gone as a pruned step, so a
                 // teardown that depends on it goes too — `dropped` carries
@@ -1024,15 +1085,14 @@ pub fn prune_to_targets(
     // here — and refused, because sending something other than what was asked
     // for is worse than not running.
     let mut stranded: Vec<String> = Vec::new();
-    scan_strands_top(&flow.nodes, &dropped_names, &dropped_at, &mut stranded);
+    scan_strands_top(&flow.nodes, &dropped, &mut stranded);
     // A truth is read where it is written, like every other reference. Judging
     // all of them against the flat set refused a loop whose own `gate` was
     // alive, over a name a region at the bottom of the file had dropped.
     for (text, at) in declared_truths(flow) {
         for key in crate::environment::referenced_keys(&text) {
             if let Some((step, _)) = key.split_once('.')
-                && dropped_names.contains(step)
-                && at.is_none_or(|here| dropped_at.get(step).is_none_or(|&d| d <= here))
+                && dropped.legible_to(step, at)
                 && !stranded.contains(&key)
             {
                 stranded.push(key.clone());
@@ -1762,6 +1822,34 @@ END
         assert!(
             !text.contains("CLEANUP release"),
             "create was pruned, so its teardown goes with it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_name_inherited_into_a_loop_body_is_legible_throughout_it() {
+        // A block's ordinals are its own. A name handed down from the enclosing
+        // block was bound above the whole loop, so it is legible everywhere
+        // inside it — including in a nested loop written at the body's first
+        // position. Carrying the enclosing block's numbering down instead would
+        // compare it against the child's, where "region 0" and "nested loop 0"
+        // are different nodes entirely, and the teardown for a pruned step
+        // would survive.
+        let entries = [
+            entry("create", &["sid"], &[]),
+            entry("target", &[], &[]),
+            entry("release", &[], &[]),
+        ];
+        let text = pruned(
+            "GRAPH\n    REQUEST create\n    REQUEST target\nEND\n\
+             FOR y IN [\"b\"]\n    FOR z IN [\"c\"]\n        \
+             CLEANUP release DEPENDS create\n    END\nEND\n",
+            &["target"],
+            &entries,
+        )
+        .unwrap();
+        assert!(
+            !text.contains("CLEANUP release"),
+            "create was pruned above the loop, so its teardown goes: {text}"
         );
     }
 

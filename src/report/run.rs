@@ -555,7 +555,7 @@ struct Exec<'a> {
     /// Qualified names never reach Hurl — `{{a.b}}` is not valid Hurl syntax —
     /// so this feeds [`Exec::vars_for_source`] only, which substitutes
     /// PaperTrail's own text.
-    step_captures: HashMap<String, HashMap<String, String>>,
+    step_captures: HashMap<String, crate::report::produced::Produced>,
     /// Which step wrote the value currently standing in `captures` under each
     /// name. The flat chain is last-*writer*-wins, and a request that failed
     /// its status or an assertion can still have captured — Hurl reports both —
@@ -565,16 +565,6 @@ struct Exec<'a> {
     /// the latest *successful* capturer instead let a teardown be authorised by
     /// one step and then sent with a different, failed step's identifier.
     capture_owner: HashMap<String, String>,
-    /// Per step, the names whose live value in `step_captures` came from a
-    /// `[Gen]` row rather than from a capture that fired.
-    ///
-    /// Provenance cannot be re-derived from the values afterwards: a request
-    /// may declare both clauses for one name, and only the run knows which one
-    /// answered. [`DepGate`] needs that distinction, because a generated value
-    /// is a fact about what was *sent* and gates on having been produced, while
-    /// a captured one is a fact about what came *back* and gates on the step
-    /// having succeeded.
-    generated_only: HashMap<String, std::collections::HashSet<String>>,
     /// In-scope `FILES`/list loop-variable *values* in binding order — the row
     /// key. A role-bearing `ENVS` axis is deliberately excluded: it is the
     /// comparison axis, and baseline and candidate have to agree on the key to
@@ -664,9 +654,8 @@ struct ExecState {
     scopes: Vec<HashMap<String, String>>,
     lists: HashMap<String, Producer>,
     captures: HashMap<String, String>,
-    step_captures: HashMap<String, HashMap<String, String>>,
+    step_captures: HashMap<String, crate::report::produced::Produced>,
     capture_owner: HashMap<String, String>,
-    generated_only: HashMap<String, std::collections::HashSet<String>>,
     step_ok: HashMap<String, bool>,
     step_order: Vec<String>,
     step_request: HashMap<String, String>,
@@ -701,13 +690,12 @@ struct IterOut {
 struct StepOut {
     /// The step's own captures, kept out of the shared chain so the next step
     /// can be handed a chain assembled from its ancestors alone.
-    produced: HashMap<String, String>,
-    /// Which of `produced` came from a `[Gen]` row rather than a capture that
-    /// fired. A region step runs on a fork, so its provenance would be thrown
-    /// away with the fork unless it travels back out here beside the values it
-    /// describes — and a `CLEANUP` for a region step is written in the
-    /// *enclosing* block, which is where it would be missing it.
-    generated_only: std::collections::HashSet<String>,
+    /// A region step runs on a fork, so whatever does not travel back out
+    /// here is thrown away with it — and a `CLEANUP` for a region step is
+    /// written in the *enclosing* block, which is where it would be missed.
+    /// Provenance rode in a second field for one release and was dropped on
+    /// exactly this path; carried inside the values, it cannot be.
+    produced: crate::report::produced::Produced,
     ok: bool,
     /// Set when the step was never sent because something it depends on didn't
     /// succeed, as opposed to sent and failed. Both are `ok: false`; only this
@@ -1087,9 +1075,7 @@ fn view_for(plan: &super::graph::Plan, base: &ExecState, s: &Sched, idx: usize) 
         let Some(out) = &s.out[anc] else { continue };
         st.step_captures
             .insert(plan.steps[anc].name.clone(), out.produced.clone());
-        st.generated_only
-            .insert(plan.steps[anc].name.clone(), out.generated_only.clone());
-        for (k, v) in &out.produced {
+        for (k, v) in out.produced.iter() {
             st.captures.insert(k.clone(), v.clone());
             st.capture_owner
                 .insert(k.clone(), plan.steps[anc].name.clone());
@@ -1108,8 +1094,7 @@ fn skip_out(
 ) -> StepOut {
     let step = &plan.steps[idx];
     let mut out = StepOut {
-        produced: HashMap::new(),
-        generated_only: std::collections::HashSet::new(),
+        produced: crate::report::produced::Produced::default(),
         ok: false,
         was_skipped: true,
         request: step.request.clone(),
@@ -1170,11 +1155,6 @@ fn run_step(
             .get(&step.name)
             .cloned()
             .unwrap_or_default(),
-        generated_only: ex
-            .generated_only
-            .get(&step.name)
-            .cloned()
-            .unwrap_or_default(),
         // A node that ran nothing (the arm above) never records a verdict. It
         // counts as succeeded: it cannot have failed, and treating it as a
         // failure would skip everything written after it.
@@ -1198,7 +1178,6 @@ impl<'a> Exec<'a> {
             captures: HashMap::new(),
             step_captures: HashMap::new(),
             capture_owner: HashMap::new(),
-            generated_only: HashMap::new(),
             step_ok: HashMap::new(),
             step_order: Vec::new(),
             step_request: HashMap::new(),
@@ -1229,7 +1208,6 @@ impl<'a> Exec<'a> {
             captures: self.captures.clone(),
             step_captures: self.step_captures.clone(),
             capture_owner: self.capture_owner.clone(),
-            generated_only: self.generated_only.clone(),
             step_ok: self.step_ok.clone(),
             step_order: self.step_order.clone(),
             step_request: self.step_request.clone(),
@@ -1254,7 +1232,6 @@ impl<'a> Exec<'a> {
             captures: state.captures,
             step_captures: state.step_captures,
             capture_owner: state.capture_owner,
-            generated_only: state.generated_only,
             step_ok: state.step_ok,
             step_order: state.step_order,
             step_request: state.step_request,
@@ -1335,7 +1312,7 @@ impl<'a> Exec<'a> {
         // so the qualified namespace is kept to itself.
         m.retain(|k, _| !k.contains('.'));
         for (step, caps) in &self.step_captures {
-            for (k, v) in caps {
+            for (k, v) in caps.iter() {
                 m.insert(format!("{step}.{k}"), v.clone());
             }
         }
@@ -1345,21 +1322,25 @@ impl<'a> Exec<'a> {
     /// Thread one request's captures forward: into the flat chain, and under
     /// the step's own name so a later reference can disambiguate.
     fn record_captures(&mut self, step: &str, captures: &[(String, String)]) {
-        self.record_values(step, captures);
-        // A capture that actually fired is the answer now, so the name stops
-        // being a generated one. This is why the recording body is factored
-        // out: `record_generated` delegating here would undo its own note.
-        if let Some(minted) = self.generated_only.get_mut(step) {
-            for (k, _) in captures {
-                minted.remove(k);
-            }
-        }
+        self.record_values(
+            step,
+            captures,
+            crate::report::produced::Provenance::Captured,
+        );
     }
 
-    fn record_values(&mut self, step: &str, captures: &[(String, String)]) {
+    fn record_values(
+        &mut self,
+        step: &str,
+        captures: &[(String, String)],
+        how: crate::report::produced::Provenance,
+    ) {
         let own = self.step_captures.entry(step.to_string()).or_default();
         for (k, v) in captures {
-            own.insert(k.clone(), v.clone());
+            match how {
+                crate::report::produced::Provenance::Captured => own.record_captured(k, v),
+                crate::report::produced::Provenance::Generated => own.record_generated(k, v),
+            }
         }
         for (k, v) in captures {
             self.captures.insert(k.clone(), v.clone());
@@ -1394,7 +1375,7 @@ impl<'a> Exec<'a> {
         // sorting keeps the recorded sequence reproducible for anything that
         // replays it.
         pairs.sort();
-        self.record_values(step, &pairs);
+        self.record_values(step, &pairs, crate::report::produced::Provenance::Generated);
         // Which value answered, not which clause was written. A request may
         // declare a `[Gen]` row *and* a capture for the same name — mint an id
         // client-side, then read the server's canonical one back — and when the
@@ -1403,10 +1384,6 @@ impl<'a> Exec<'a> {
         // called that a capture, required the step to have succeeded, and
         // skipped the teardown for a resource the request may well have
         // created.
-        let own = self.generated_only.entry(step.to_string()).or_default();
-        for (k, _) in &pairs {
-            own.insert(k.clone());
-        }
     }
 
     /// Record whether a step succeeded.
@@ -1768,7 +1745,7 @@ impl<'a> Exec<'a> {
                 DepGate::Produced(var) => !self
                     .step_captures
                     .get(&d.step)
-                    .is_some_and(|c| c.contains_key(var)),
+                    .is_some_and(|c| c.contains(var)),
             }) {
                 // Not an error. A cleanup whose subject was never created has
                 // nothing to do, and saying "failed" about it would bury the
@@ -1847,9 +1824,9 @@ impl<'a> Exec<'a> {
             // is the conservative reading: the strong gate, and a teardown that
             // is skipped rather than pointed at a resource nobody made.
             if self
-                .generated_only
+                .step_captures
                 .get(step)
-                .is_some_and(|g| g.contains(var))
+                .is_some_and(|p| p.is_generated(var))
             {
                 return Some(DepGate::Produced(var.to_string()));
             }
@@ -2483,9 +2460,7 @@ impl<'a> Exec<'a> {
             let Some(out) = &outs[idx] else { continue };
             self.step_captures
                 .insert(plan.steps[idx].name.clone(), out.produced.clone());
-            self.generated_only
-                .insert(plan.steps[idx].name.clone(), out.generated_only.clone());
-            for (k, v) in &out.produced {
+            for (k, v) in out.produced.iter() {
                 self.captures.insert(k.clone(), v.clone());
                 self.capture_owner
                     .insert(k.clone(), plan.steps[idx].name.clone());

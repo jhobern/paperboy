@@ -179,6 +179,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Changed
 
+- A dropped step name and where it was legible are one type rather than two
+  structures every reader had to remember to combine, and a step's values now
+  carry how each came to be rather than travelling beside a second map that
+  said so. Both pairs had already failed in the same way — a reader that took
+  one half and not the other — so the halves no longer exist to be taken
+  separately. `Produced` lives in its own module precisely so that its fields
+  can be private: within one file, "these are always written together" is a
+  habit, and a habit is what went wrong.
 - Column metadata (`STATISTICS`, `IMAGE`, `TRUTH`, `DETAIL`) is gathered by a
   single walk of the flow rather than four near-identical ones, and merged into
   the resolved columns by a single rule rather than two copies of it. The four
