@@ -196,7 +196,43 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   pinned by a test, instead of being implicit in which of four functions
   happened to have the arm.
 
+### Removed
+
+- **The `p` "link environment to collection" picker, and the linked/active
+  distinction it existed to set up.** With one environment per tab there is
+  nothing to link: `a` is the whole gesture. The GUI's "Linked" button and its
+  link/unlink context-menu items are gone for the same reason.
+
+- **The shadow-warning icon (`!`) beside a substituted value.** It marked a
+  value the linked environment had overridden. With a single environment per
+  tab a key is defined once or not at all, so there is nothing to shadow and
+  nothing to warn about.
+
 ### Fixed
+
+- **The build no longer refuses to start on Windows.** `build.rs`'s pre-flight
+  check looked for bare `perl`, `make` and `cc`/`gcc`/`clang` filenames on
+  `PATH`, which on Windows are `perl.exe` and friends — so every machine, however
+  well provisioned, was reported as missing everything and the build was stopped
+  before it began. The `PATH` walk now honours `PATHEXT`, and the checks that
+  cannot be answered on an MSVC target are skipped rather than guessed: libxml2
+  comes from vcpkg, `cl.exe` is found by cc-rs through the registry, and OpenSSL
+  is built with `nmake`, which `openssl-src` finds the same way — none of the
+  three has to be on `PATH`. `nasm`, which OpenSSL's MSVC build does expect
+  there, is now advised about (a warning, never fatal), the libclang search
+  knows about `libclang.dll` and LLVM's `bin` directory, and the install hint
+  offers the vcpkg/winget/choco commands rather than an apt line.
+
+- **The Windows build now gets told how to install libxml2.** On an MSVC target
+  `libxml` consults vcpkg and nothing else, so the check is made against vcpkg's
+  own tree: `build.rs` finds it the way vcpkg-rs does (`VCPKG_ROOT`, then
+  `vcpkg integrate install` — never `vcpkg.exe` on `PATH`), works out the triplet
+  vcpkg-rs will ask for (`x64-windows-static-md` by default, honouring
+  `VCPKGRS_TRIPLET`, `VCPKGRS_DYNAMIC` and `crt-static`), and says which of the
+  two is wrong: no vcpkg tree at all, or a tree without the port. The advice
+  follows suit — bootstrap commands when there is no tree, and a
+  `vcpkg install libxml2:<triplet>` naming the triplet actually wanted. The
+  README gained a Windows section covering the same ground.
 
 - `--targets` no longer misjudges where a pruned name was written when a
   `CLEANUP` above it has been removed. Position was counted as an index into

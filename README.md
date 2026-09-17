@@ -62,7 +62,7 @@ Five things Cargo can't fetch for you:
 | Fedora/RHEL | `sudo dnf install pkgconf-pkg-config gcc make perl libxml2-devel clang-devel` |
 | Arch | `sudo pacman -S pkgconf base-devel perl libxml2 clang` |
 | Alpine | `sudo apk add build-base pkgconfig perl libxml2-dev clang-dev` |
-| Windows (MSVC) | `vcpkg install libxml2:x64-windows-static-md` |
+| Windows (MSVC) | see [Windows](#windows) below |
 
 **libxml2 + `pkg-config`** because `hurl`/`hurl_core` depend unconditionally on
 the `libxml` crate (Hurl's XPath asserts *are* libxml2's XPath engine), and that
@@ -81,6 +81,53 @@ SDK:
 ```sh
 export PKG_CONFIG_PATH="$(brew --prefix libxml2)/lib/pkgconfig:$PKG_CONFIG_PATH"
 ```
+
+#### Windows
+
+Nothing here is unusual, but almost every piece arrives from a different place
+than it does on Unix, so in order:
+
+1. **Visual Studio Build Tools**, workload *Desktop development with C++* —
+   this is `cl.exe`, `nmake` and the Windows SDK. `cargo` finds them through
+   the registry, so they don't have to be on `PATH`; building from an **x64
+   Native Tools Command Prompt for VS** is still the least surprising way.
+
+2. **libxml2, from vcpkg.** On MSVC the `libxml` crate asks vcpkg and nothing
+   else — there is no pkg-config fallback — and it finds vcpkg through
+   `VCPKG_ROOT` (or a previous `vcpkg integrate install`), *not* by looking for
+   `vcpkg.exe` on `PATH`:
+
+   ```bat
+   git clone https://github.com/microsoft/vcpkg C:\vcpkg
+   C:\vcpkg\bootstrap-vcpkg.bat
+   setx VCPKG_ROOT C:\vcpkg
+   vcpkg install libxml2:x64-windows-static-md
+   ```
+
+   The triplet is the part worth reading twice. `x64-windows-static-md` is a
+   static libxml2 built against the *dynamic* CRT, which is what Rust's MSVC
+   targets link — it is what vcpkg-rs asks for by default, and installing the
+   plain `x64-windows` port instead is the usual first wrong turn. Use
+   `arm64-windows-static-md` on ARM64. (`VCPKGRS_DYNAMIC=1` switches to the DLL
+   ports, and `VCPKGRS_TRIPLET` overrides the choice outright — `build.rs`
+   honours both when it tells you which triplet is missing.)
+
+3. **LLVM, Strawberry Perl and NASM:**
+
+   ```bat
+   winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM
+   ```
+
+   or `choco install llvm strawberryperl nasm`. LLVM supplies `libclang.dll`
+   for bindgen — if it isn't found, point at it with
+   `setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"`. Perl and NASM are for the
+   vendored OpenSSL build (`perl Configure`, then NASM for the crypto
+   assembly), and **NASM's installer does not add itself to `PATH`**, which
+   OpenSSL needs it to be — so add `C:\Program Files\NASM` yourself.
+
+`build.rs` checks all of this before the build starts and names the triplet and
+the tree it actually looked in, so a wrong `VCPKG_ROOT` reads as one line rather
+than as a link error several minutes later.
 
 PaperBoy's `build.rs` checks for all five before the build gets going and fails
 with the package-manager command your machine actually wants (it detects

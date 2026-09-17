@@ -20,6 +20,14 @@
 //!   `runtime` feature `dlopen`s libclang during the build. Fails as
 //!   `Unable to find libclang`.
 //!
+//! On an MSVC target the same needs are met by different tools, and most of them
+//! are not on `PATH` to be looked for: libxml2 comes from vcpkg (checked against
+//! vcpkg's own tree instead, since `libxml` has no pkg-config branch there), the
+//! compiler is `cl.exe` and the OpenSSL build uses `nmake`, both of which cc-rs
+//! and `openssl-src` locate through the registry. Those two are therefore
+//! skipped rather than guessed at — only `perl` and `nasm` are expected on
+//! `PATH`.
+//!
 //! Audited rather than assumed: the rest of the tree either vendors its C or
 //! loads it lazily. `libz-sys` falls back to compiling its bundled zlib when
 //! pkg-config finds nothing, and the `gui` feature adds no *build*-time system
@@ -93,6 +101,13 @@ fn main() {
         "PERL",
         "OPENSSL_SRC_PERL",
         "MAKE",
+        // The MSVC route to libxml2: which vcpkg tree is consulted, and which
+        // triplet is asked of it.
+        "VCPKG_ROOT",
+        "VCPKGRS_TRIPLET",
+        "VCPKGRS_DYNAMIC",
+        "VCPKGRS_DISABLE",
+        "VCPKGRS_NO_LIBXML2",
     ] {
         println!("cargo::rerun-if-env-changed={var}");
     }
@@ -113,9 +128,13 @@ fn main() {
     .flatten()
     .collect();
 
-    // A guess: replicating clang-sys's search well enough to *block* a build
-    // isn't realistic, so a negative here only ever advises.
-    let uncertain: Vec<Missing> = check_libclang().into_iter().collect();
+    // Guesses: replicating clang-sys's search well enough to *block* a build
+    // isn't realistic, and nasm has no install location to confirm — so a
+    // negative in either only ever advises.
+    let uncertain: Vec<Missing> = [check_libclang(), check_nasm()]
+        .into_iter()
+        .flatten()
+        .collect();
 
     if certain.is_empty() && uncertain.is_empty() {
         return;
@@ -153,15 +172,11 @@ fn check_libxml2() -> Option<Missing> {
         return None;
     }
 
-    // On windows-msvc `libxml` asks vcpkg rather than pkg-config, and vcpkg's
-    // layout is involved enough that a bad guess here would be worse than
-    // silence. Leave that path to the README. Note this reads the *target*
-    // triple's configuration, not the host's: it is the target's build of
-    // `libxml` that decides which probe runs.
-    if target_cfg("CARGO_CFG_TARGET_FAMILY").contains("windows")
-        && target_cfg("CARGO_CFG_TARGET_ENV") == "msvc"
-    {
-        return None;
+    // On an MSVC target `libxml` asks vcpkg and nothing else — there is no
+    // pkg-config branch in its build script — so the question becomes a
+    // different one, answered against vcpkg's own tree.
+    if is_msvc_target() {
+        return check_libxml2_vcpkg();
     }
 
     // Honour the same override pkg-config-rs does, so a user who has pointed
@@ -188,8 +203,138 @@ fn check_libxml2() -> Option<Missing> {
     }
 }
 
+/// libxml2 on an MSVC target, where `libxml` reaches it through vcpkg-rs.
+///
+/// Two ways this can be missing, and they want different advice: no vcpkg tree
+/// at all (vcpkg-rs looks at `VCPKG_ROOT`, then at what `vcpkg integrate
+/// install` recorded — *not* at `vcpkg.exe` on PATH, so "I have vcpkg" is not
+/// the same as "vcpkg-rs can find it"), or a tree that simply doesn't carry the
+/// port for the triplet this build will ask for.
+///
+/// Both are filesystem answers about the exact tree the real probe will read,
+/// which is why this is allowed to be as fatal as the pkg-config branch.
+fn check_libxml2_vcpkg() -> Option<Missing> {
+    const NEEDED_BY: &str = "`hurl`, which PaperBoy uses to run requests. Hurl's XPath \
+        asserts and captures are libxml2, and on MSVC the `libxml` crate looks for \
+        it through vcpkg alone — there is no pkg-config fallback on this platform.";
+
+    // Both of these tell vcpkg-rs to give up before it looks anywhere, so the
+    // user has already been told what is wrong by something closer to it.
+    if std::env::var_os("VCPKGRS_DISABLE").is_some()
+        || std::env::var_os("VCPKGRS_NO_LIBXML2").is_some()
+    {
+        return None;
+    }
+
+    let triplet = vcpkg_triplet();
+
+    let Some(root) = vcpkg_root() else {
+        return Some(Missing {
+            name: "libxml2 (via vcpkg)",
+            evidence: "no vcpkg installation found: VCPKG_ROOT is unset and no \
+                `vcpkg integrate install` has been run"
+                .to_string(),
+            needed_by: NEEDED_BY,
+        });
+    };
+
+    // vcpkg's classic-mode layout. The library is matched by prefix rather than
+    // by an exact `libxml2.lib`, because the port's name for it has moved
+    // between releases and a rename here should read as "installed" rather than
+    // as "missing".
+    let lib_dir = root.join("installed").join(&triplet).join("lib");
+    let installed = std::fs::read_dir(&lib_dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                name.starts_with("libxml2") && name.ends_with(".lib")
+            })
+        })
+        .unwrap_or(false);
+    if installed {
+        return None;
+    }
+
+    Some(Missing {
+        name: "libxml2 (via vcpkg)",
+        evidence: format!(
+            "the vcpkg tree at {} has no libxml2 for the `{triplet}` triplet",
+            root.display()
+        ),
+        needed_by: NEEDED_BY,
+    })
+}
+
+/// The vcpkg tree vcpkg-rs will use, found the way vcpkg-rs finds it.
+///
+/// Note what is *not* here: `vcpkg.exe` being on PATH. vcpkg-rs never looks at
+/// PATH, so a user with a perfectly working `vcpkg` command can still have
+/// nothing this build can use — which is exactly the confusion the advice above
+/// exists to pre-empt.
+fn vcpkg_root() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("VCPKG_ROOT") {
+        return Some(PathBuf::from(root));
+    }
+
+    // `vcpkg integrate install` writes a per-user MSBuild file pointing at the
+    // tree: `…\scripts\buildsystems\msbuild\vcpkg.targets`, four components
+    // below the root.
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    let targets = PathBuf::from(local_app_data)
+        .join("vcpkg")
+        .join("vcpkg.user.targets");
+    let contents = std::fs::read_to_string(targets).ok()?;
+    let project = contents
+        .lines()
+        .filter_map(|line| line.split("Project=\"").nth(1))
+        // `"` can't appear in a Windows path, so the next one ends the value.
+        .filter_map(|rest| rest.split('"').next())
+        .next()?;
+    let mut root = PathBuf::from(project);
+    for _ in 0..4 {
+        if !root.pop() {
+            return None;
+        }
+    }
+    Some(root)
+}
+
+/// The vcpkg triplet this build will ask for, mirroring vcpkg-rs's own choice.
+///
+/// The default is a `-static-md` triplet: a statically linked port against the
+/// *dynamic* CRT, which is the combination Rust's MSVC targets use. Getting
+/// this right matters more than it looks — installing the plain `x64-windows`
+/// port and being told libxml2 is still missing is the usual first wrong turn.
+fn vcpkg_triplet() -> String {
+    if let Ok(triplet) = std::env::var("VCPKGRS_TRIPLET") {
+        return triplet;
+    }
+    let arch = match target_cfg("CARGO_CFG_TARGET_ARCH").as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        // vcpkg-rs treats everything it doesn't recognise as x86.
+        _ => "x86",
+    };
+    if target_cfg("CARGO_CFG_TARGET_FEATURE").contains("crt-static") {
+        format!("{arch}-windows-static")
+    } else if std::env::var_os("VCPKGRS_DYNAMIC").is_some() {
+        format!("{arch}-windows")
+    } else {
+        format!("{arch}-windows-static-md")
+    }
+}
+
 fn check_compiler() -> Option<Missing> {
     if std::env::var_os("CC").is_some() {
+        return None;
+    }
+
+    // MSVC's compiler is `cl.exe`, which cc-rs locates through the registry and
+    // vswhere rather than PATH — outside a Developer Command Prompt a perfectly
+    // good Visual Studio install puts nothing on PATH at all. A PATH probe
+    // can't answer the question here, and answering "missing" would stop a
+    // build that was going to work.
+    if is_msvc_target() {
         return None;
     }
     // cc-rs picks a platform default; any of these being present means the
@@ -226,6 +371,14 @@ fn check_make() -> Option<Missing> {
     if std::env::var_os("MAKE").is_some() {
         return None;
     }
+    // OpenSSL's MSVC build is driven by `nmake`, not `make`, and openssl-src
+    // finds it the way cc-rs finds `cl.exe` — through the registry rather than
+    // PATH. So there is nothing to probe: looking for `make` on a Windows box
+    // would report every correctly set up machine as broken. The one Windows
+    // tool that really is expected on PATH is nasm; see `check_nasm`.
+    if is_msvc_target() {
+        return None;
+    }
     if has("make") || has("gmake") {
         return None;
     }
@@ -233,6 +386,25 @@ fn check_make() -> Option<Missing> {
         name: "make",
         evidence: "neither `make` nor `gmake` is on PATH".to_string(),
         needed_by: "the vendored OpenSSL build, which drives OpenSSL's own makefile.",
+    })
+}
+
+/// NASM, which OpenSSL's MSVC build assembles its crypto primitives with.
+///
+/// Advice only, never fatal: unlike the tools above, nasm has no canonical
+/// install location for this script to fall back on, and its installer does not
+/// reliably add itself to PATH — so a negative here is as likely to be this
+/// script's blind spot as a real gap.
+fn check_nasm() -> Option<Missing> {
+    if !is_msvc_target() || has("nasm") {
+        return None;
+    }
+    Some(Missing {
+        name: "nasm",
+        evidence: "`nasm` is not on PATH".to_string(),
+        needed_by: "the vendored OpenSSL build: on MSVC targets OpenSSL assembles \
+            its crypto primitives with NASM, and openssl-src expects to find it \
+            on PATH.",
     })
 }
 
@@ -271,6 +443,22 @@ fn check_libclang() -> Option<Missing> {
         }
     }
 
+    // Windows keeps `libclang.dll` in LLVM's `bin` next to `clang.exe` rather
+    // than in any lib directory, so look where the LLVM installer puts it — and
+    // then at PATH itself, since that `bin` is normally on it. PATH is only
+    // worth walking on Windows: elsewhere the directories above already cover
+    // it, and every entry costs a `read_dir`.
+    if cfg!(windows) {
+        for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(program_files) = std::env::var_os(var) {
+                dirs.push(PathBuf::from(program_files).join("LLVM").join("bin"));
+            }
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+    }
+
     // Whatever the installed LLVM says about itself, if it can be asked.
     if let Ok(out) = Command::new("llvm-config").arg("--libdir").output() {
         if out.status.success() {
@@ -300,8 +488,18 @@ fn contains_libclang(dir: &Path) -> bool {
     entries.flatten().any(|entry| {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        name.starts_with("libclang") && (name.contains(".so") || name.contains(".dylib"))
+        name.starts_with("libclang")
+            && (name.contains(".so") || name.contains(".dylib") || name.contains(".dll"))
     })
+}
+
+/// Is the build targeting the MSVC toolchain? Several of the checks can't be
+/// asked of it through PATH — see their comments. This reads the *target*
+/// triple's configuration, not the host's: it is the target's build of
+/// `libxml`, `cc` and `openssl-src` that decides which tools get used.
+fn is_msvc_target() -> bool {
+    target_cfg("CARGO_CFG_TARGET_FAMILY").contains("windows")
+        && target_cfg("CARGO_CFG_TARGET_ENV") == "msvc"
 }
 
 /// May a failed check be trusted enough to stop the build?
@@ -482,6 +680,50 @@ fn install_hint() -> Vec<String> {
         return hint;
     }
 
+    // Windows: vcpkg leads because it is the only source `libxml`'s MSVC build
+    // script knows how to consult — it asks vcpkg directly and never looks at
+    // pkg-config. The rest are ordinary installers, offered through whichever
+    // package manager this machine has.
+    if target_cfg("CARGO_CFG_TARGET_OS") == "windows" {
+        let mut hint = Vec::new();
+
+        // Bootstrapping comes first when there is no tree, because `vcpkg
+        // install` is not a command this machine has yet — and the `VCPKG_ROOT`
+        // line is not optional decoration: vcpkg-rs finds the tree by that
+        // variable (or by `vcpkg integrate install`), never by PATH.
+        if vcpkg_root().is_none() {
+            hint.push("git clone https://github.com/microsoft/vcpkg C:\\vcpkg".to_string());
+            hint.push("C:\\vcpkg\\bootstrap-vcpkg.bat".to_string());
+            hint.push("setx VCPKG_ROOT C:\\vcpkg   # then reopen the shell".to_string());
+        }
+        hint.push(format!("vcpkg install libxml2:{}", vcpkg_triplet()));
+
+        if has("winget") {
+            hint.push(
+                "winget install LLVM.LLVM StrawberryPerl.StrawberryPerl NASM.NASM".to_string(),
+            );
+        } else if has("choco") {
+            hint.push("choco install llvm strawberryperl nasm".to_string());
+        } else {
+            hint.push(
+                "install LLVM (for libclang), Strawberry Perl and NASM (https://nasm.us)"
+                    .to_string(),
+            );
+        }
+        // NASM's installer doesn't put itself on PATH, and OpenSSL's build
+        // looks for it there — the one manual step in the list.
+        hint.push("add NASM's folder to PATH (the installer doesn't)".to_string());
+        hint.push(
+            "setx LIBCLANG_PATH \"C:\\Program Files\\LLVM\\bin\"   # if bindgen can't find it"
+                .to_string(),
+        );
+        hint.push(
+            "…plus \"Desktop development with C++\" in the Visual Studio Installer".to_string(),
+        );
+        hint.push("then build from an \"x64 Native Tools Command Prompt for VS\"".to_string());
+        return hint;
+    }
+
     // Ordered so that a distro's native manager is found before anything that
     // might merely be present alongside it.
     let candidates: &[(&str, &str)] = &[
@@ -524,12 +766,32 @@ fn install_hint() -> Vec<String> {
 
 /// Is `bin` an executable on `PATH`? Spawning `which` would itself be a
 /// dependency on something that may not be installed, so walk `PATH` directly.
+///
+/// On Windows the name on PATH is `perl.exe`, not `perl`, so the bare name has
+/// to be tried against each `PATHEXT` suffix as well. Without that every check
+/// here reported every Windows machine as missing everything, and the script
+/// stopped builds that would have succeeded.
 fn has(bin: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
+    // The default is what `cmd` uses when PATHEXT is unset; the empty entry is
+    // the bare name, which is right on Unix and harmless on Windows.
+    let extensions: Vec<String> = if cfg!(windows) {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        std::iter::once(String::new())
+            .chain(pathext.split(';').map(str::to_string))
+            .filter(|ext| ext.is_empty() || ext.starts_with('.'))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
     std::env::split_paths(&path).any(|dir| {
-        let candidate: PathBuf = dir.join(bin);
-        candidate.is_file()
+        extensions.iter().any(|ext| {
+            let candidate: PathBuf = dir.join(format!("{bin}{ext}"));
+            candidate.is_file()
+        })
     })
 }
