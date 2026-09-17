@@ -2751,7 +2751,7 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
         // Activating a file that isn't open yet has to open it first. An
         // already-open one is reused rather than loaded again, so activating
         // twice can't leave two copies of the same file in the panel — and
-        // `set_active_env` is a toggle, so re-activating the active one turns
+        // `set_tab_env` is a toggle, so re-activating the active one turns
         // substitution off, exactly as the Environments panel's button does.
         WsAction::ActivateEnv(path) => {
             let existing = app
@@ -2765,11 +2765,12 @@ fn apply_ws_action(app: &mut GuiApp, ci: usize, action: WsAction) {
                 None => app.session.open_workspace_environment(&path),
             };
             if id.is_some() {
-                // `set_active_env` is a toggle, so an already-active
-                // environment would be *deactivated* by it — not what "Set as
+                // `set_tab_env` is a toggle, so an environment already active
+                // on this tab would be *deactivated* by it — not what "Set as
                 // active" asks for.
-                if app.session.active_env_id != id {
-                    app.session.set_active_env(id);
+                let ci = app.active_ci();
+                if app.session.collections[ci].env_id != id {
+                    app.session.set_tab_env(ci, id);
                 }
                 app.reveal_env = id;
             }
@@ -2801,13 +2802,13 @@ pub(crate) mod tests {
 
         assert_eq!(app.session.global_envs.len(), 1, "the file was loaded");
         let id = app.session.global_envs[0].id;
-        assert_eq!(app.session.active_env_id, Some(id));
+        assert_eq!(app.session.collections[ci].env_id, Some(id));
         assert_eq!(app.reveal_env, Some(id), "and it is shown in the panel");
 
         // Again: neither a second copy nor a deactivation.
         apply_ws_action(&mut app, ci, WsAction::ActivateEnv(env));
         assert_eq!(app.session.global_envs.len(), 1);
-        assert_eq!(app.session.active_env_id, Some(id));
+        assert_eq!(app.session.collections[ci].env_id, Some(id));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

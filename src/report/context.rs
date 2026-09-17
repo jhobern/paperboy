@@ -290,13 +290,12 @@ pub fn load_helpers(
 }
 
 /// The base variable *names* in scope for a report: a `# environment:` directive
-/// names a single loaded env; otherwise the bound collection's effective
-/// (active global + pinned) merge. `None` when the collection is unbound and no
+/// names a single loaded env; otherwise the environment active on the bound
+/// collection's tab. `None` when the collection is unbound and no
 /// `# environment:` is set, so the variable-availability check is skipped.
 fn base_var_names(
     collections: &[Collection],
     global_envs: &[Environment],
-    active_env_id: Option<u64>,
     flow: &ReportFlow,
     bound: Option<usize>,
 ) -> Option<Vec<String>> {
@@ -309,7 +308,7 @@ fn base_var_names(
                 .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
         }
         (Some(ci), None) => Some(
-            effective_env(collections, global_envs, ci, active_env_id)
+            effective_env(collections, global_envs, ci)
                 .map(|env| env.vars.iter().map(|v| v.key.clone()).collect())
                 .unwrap_or_default(),
         ),
@@ -323,7 +322,6 @@ fn base_var_names(
 pub fn report_diagnostics(
     collections: &[Collection],
     global_envs: &[Environment],
-    active_env_id: Option<u64>,
     flow: &ReportFlow,
     report_path: Option<&Path>,
     strings: &crate::i18n::Strings,
@@ -349,7 +347,7 @@ pub fn report_diagnostics(
     });
     let env_names: Vec<String> = global_envs.iter().map(|e| e.name.clone()).collect();
     let (base_dir, anchored) = report_base_dir(flow, report_path);
-    let base_var_names = base_var_names(collections, global_envs, active_env_id, flow, bound);
+    let base_var_names = base_var_names(collections, global_envs, flow, bound);
     // Union of ALL loaded env variable names — used conservatively inside
     // `FOR … IN ENVS` bodies so we don't false-warn when any of the named envs
     // might supply a var.
@@ -417,7 +415,6 @@ pub fn report_diagnostics(
 pub fn diagnostics_fingerprint(
     collections: &[Collection],
     global_envs: &[Environment],
-    active_env_id: Option<u64>,
     flow: &ReportFlow,
     report_path: Option<&Path>,
     strings: &crate::i18n::Strings,
@@ -426,14 +423,13 @@ pub fn diagnostics_fingerprint(
     let mut h = std::collections::hash_map::DefaultHasher::new();
     flow.to_text().hash(&mut h);
     report_path.hash(&mut h);
-    active_env_id.hash(&mut h);
     // The language decides the wording of every message, so a diagnostic set
     // computed under one is not reusable under another.
     (strings.diag_var_maybe_undefined.as_ptr() as usize).hash(&mut h);
     for c in collections {
         c.name.hash(&mut h);
         c.path.hash(&mut h);
-        c.linked_env_id.hash(&mut h);
+        c.env_id.hash(&mut h);
         c.entries.len().hash(&mut h);
         for e in &c.entries {
             e.title.hash(&mut h);
@@ -480,7 +476,6 @@ pub fn diagnostics_fingerprint(
 pub fn report_run_inputs(
     collections: &[Collection],
     global_envs: &[Environment],
-    active_env_id: Option<u64>,
     flow: &ReportFlow,
     report_path: Option<&Path>,
 ) -> Result<ReportRunInputs, RunInputError> {
@@ -492,7 +487,13 @@ pub fn report_run_inputs(
 
     // Base variable layer. A `# environment:` directive names a single loaded
     // environment for a plain, no-comparison run; otherwise fall back to the
-    // bound collection's effective (active + pinned) environment.
+    // environment active on the bound collection's tab.
+    //
+    // A collection the workspace holds but no tab has open therefore has no
+    // base layer of its own: environments are per-tab, and a collection with
+    // no tab has no environment to inherit. Such a report needs an explicit
+    // `# environment:` line, which is the only way to say which one it meant
+    // that doesn't depend on what happens to be open at the time.
     let base_vars = match flow
         .header
         .environment()
@@ -505,7 +506,7 @@ pub fn report_run_inputs(
             .map(flatten_env)
             .unwrap_or_default(),
         None => ci
-            .and_then(|ci| effective_env(collections, global_envs, ci, active_env_id))
+            .and_then(|ci| effective_env(collections, global_envs, ci))
             .map(|env| flatten_env(&env))
             .unwrap_or_default(),
     };
@@ -585,7 +586,7 @@ mod tests {
     }
 
     fn fingerprint(cols: &[Collection], envs: &[Environment], flow: &ReportFlow) -> u64 {
-        diagnostics_fingerprint(cols, envs, None, flow, None, &strings())
+        diagnostics_fingerprint(cols, envs, flow, None, &strings())
     }
 
     /// The cache is only sound if the fingerprint moves whenever anything
@@ -746,7 +747,6 @@ mod helper_loading_tests {
         let diags = report_diagnostics(
             &[],
             &[],
-            None,
             &flow,
             Some(report.as_path()),
             crate::i18n::Strings::english(),
@@ -764,7 +764,7 @@ mod helper_loading_tests {
         );
 
         // And it runs: the entries come from disk rather than from a tab.
-        let inputs = report_run_inputs(&[], &[], None, &flow, Some(report.as_path()))
+        let inputs = report_run_inputs(&[], &[], &flow, Some(report.as_path()))
             .expect("bound to the file on disk");
         assert_eq!(inputs.entries.len(), 1);
         assert_eq!(inputs.file_root.as_deref(), Some(dir.as_path()));
@@ -788,7 +788,7 @@ mod helper_loading_tests {
         assert_eq!(entries[0].title, "Oauth");
 
         let s = crate::i18n::Strings::english();
-        let diags = report_diagnostics(&[], &[], None, &flow, Some(report.as_path()), s);
+        let diags = report_diagnostics(&[], &[], &flow, Some(report.as_path()), s);
         assert!(
             !diags
                 .iter()

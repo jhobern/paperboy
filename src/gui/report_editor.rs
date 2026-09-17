@@ -679,7 +679,6 @@ impl ReportEditor {
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
-            app.session.active_env_id,
             &flow,
             self.report.path.as_deref(),
         ) {
@@ -756,7 +755,6 @@ impl ReportEditor {
         match context::report_run_inputs(
             &app.session.collections,
             &app.session.global_envs,
-            app.session.active_env_id,
             &flow,
             self.report.path.as_deref(),
         ) {
@@ -2073,7 +2071,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             let key = context::diagnostics_fingerprint(
                 &app.session.collections,
                 &app.session.global_envs,
-                app.session.active_env_id,
                 flow,
                 ed.report.path.as_deref(),
                 &app.strings,
@@ -2082,7 +2079,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                 ed.diagnostics = context::report_diagnostics(
                     &app.session.collections,
                     &app.session.global_envs,
-                    app.session.active_env_id,
                     flow,
                     ed.report.path.as_deref(),
                     &app.strings,

@@ -74,6 +74,9 @@ sources — which is why there is no `libcurl-dev` row above. The `gui` feature
 adds no build-time requirement; its X11/Wayland libraries are `dlopen`ed at
 runtime.
 
+On Windows (MSVC) the same needs are met by different tools, so it gets its own
+section below.
+
 On macOS the Command Line Tools cover everything except `pkg-config`, which is
 the failure most people hit. If your libxml2 came from Homebrew rather than the
 SDK:
@@ -256,6 +259,23 @@ Worth knowing:
 - **The request preview substitutes `{{ VAR }}`** and colours each by status —
   green loaded, cyan literal, orange loading, red missing — while the editor
   keeps the original text. Secrets are masked as eight dots.
+- **A JSON body can be laid out again** — `p` in the main view, `Alt+P` in the
+  request editor, **Format** in the GUI. The body is re-indented in place
+  rather than round-tripped through a JSON parser, so comments, a bare
+  `{{ TEMPLATE }}` standing where a value goes, number spelling (`1.50`, `1e3`,
+  a 19-digit id) and duplicate keys all survive; a body that isn't JSON is
+  refused rather than mangled.
+- **Captures are visible in two places, because there are two questions.** The
+  Response pane's **Captures** tab lists what *that* request captured when it
+  last ran, marking a value a later run has since replaced as *superseded*. The
+  live pool — what `{{ VAR }}` is worth *right now* — is in the terminal UI's
+  `v` **Variables** popup and the GUI's Environments panel ▸ **Variables** tab.
+  Both list the bound environment's variables and the capture pool together, in
+  the precedence substitution applies: the environment *overridden by* the pool,
+  so an environment row a capture is shadowing is marked as such rather than
+  quietly showing a value that isn't the one being sent. Values are masked by
+  default (`m` / **Reveal**) since a capture is usually a token; copying still
+  yields the real value, and `# [Gen]` computed values are never listed.
 - **Sections start empty** and dropdowns only auto-open on an empty cell, so
   arrowing through a populated table doesn't keep reopening them.
 - **Settings ▸ Preferences** persists: confirm on exit/clear, confirm before
@@ -360,16 +380,15 @@ a value into something that looks like a reference triggers a load attempt, and
 a "still secret?" checkbox decides whether the new value stays masked.
 
 **Loading a `.vars` file substitutes nothing on its own.** It only joins the
-Global Environments list. It has to be either:
+Global Environments list. It then has to be *activated on a tab*: `a` in the
+Global Environments panel (GUI: the **Active** button, a double-click, or
+right-click → Activate).
 
-- **active** — `a` in the Global Environments panel (GUI: the **Active**
-  button). One at a time, shared by every tab; or
-- **linked** — `p` in the Requests list pins one to the active collection (GUI:
-  **Linked**).
-
-Both at once merge, with the linked value winning. A collection still showing
-raw `{{ VAR }}`, or a red "variables in this request are undefined" band, nearly
-always means this step was missed.
+The environment belongs to the tab, not to the app: one per tab, and activating
+one leaves every other tab alone. Open the same collection in two tabs to run it
+against staging and prod side by side. A collection still showing raw
+`{{ VAR }}`, or a red "variables in this request are undefined" band, nearly
+always means this step was missed on *that* tab.
 
 A variable that is *defined but empty* is not undefined and warns about nothing
 — it substitutes as an empty string. With Basic Auth that produces a

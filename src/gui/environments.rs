@@ -9,7 +9,7 @@ use eframe::egui::{self, RichText};
 use crate::environment::{EnvVar, PendingSecret, ValueSource, spawn_resolution};
 use crate::i18n::Strings;
 
-use super::app::{Dialog, GuiApp, OpenKind, PromptKind, SaveKind};
+use super::app::{Dialog, EnvPanelTab, GuiApp, OpenKind, PromptKind, SaveKind};
 
 fn source_label(source: ValueSource) -> Option<&'static str> {
     match source {
@@ -113,8 +113,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         lbl_no_envs,
         lbl_active,
         tip_active,
-        lbl_linked,
-        tip_linked,
         lbl_delete,
         lbl_save,
     ) = {
@@ -127,8 +125,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             s.gui_no_environments,
             s.gui_active,
             s.gui_active_tooltip,
-            s.gui_linked,
-            s.gui_linked_tooltip,
             s.gui_delete,
             s.gui_save_ellipsis,
         )
@@ -136,14 +132,9 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     // The header right-click menu's labels, which say what the click will *do*
     // rather than what the row currently *is* (the body's buttons are toggles
     // showing state, so "Active" reads correctly there and wouldn't here).
-    let (lbl_activate, lbl_deactivate, lbl_link, lbl_unlink) = {
+    let (lbl_activate, lbl_deactivate) = {
         let s = &app.strings;
-        (
-            s.gui_env_menu_activate,
-            s.gui_env_menu_deactivate,
-            s.gui_env_menu_link,
-            s.gui_env_menu_unlink,
-        )
+        (s.gui_env_menu_activate, s.gui_env_menu_deactivate)
     };
 
     super::widgets::panel_header(ui, &theme, lbl_environments, |ui| {
@@ -151,7 +142,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         // environments buries it, and the row people most often want is the one
         // currently in effect. Shown only when something is active, so the
         // button never sits there with nowhere to go.
-        if let Some(id) = app.session.active_env_id {
+        if let Some(id) = app.session.collections[ci].env_id {
             if ui
                 .button(super::icons::GOTO_ACTIVE)
                 .on_hover_text(app.strings.gui_env_goto_active_tooltip)
@@ -174,6 +165,33 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
             });
         }
     });
+
+    // Two questions, two tabs: which environments there are, and what a request
+    // will actually substitute. The second used to be a strip docked along the
+    // bottom of the first, which spent panel height the list could not spare
+    // and showed a short window on to a list that is often longer than it.
+    ui.horizontal(|ui| {
+        for tab in [EnvPanelTab::Environments, EnvPanelTab::Variables] {
+            let (label, hint) = match tab {
+                EnvPanelTab::Environments => (lbl_environments, app.strings.gui_env_tab_envs_hint),
+                EnvPanelTab::Variables => {
+                    (app.strings.vars_heading, app.strings.gui_env_tab_vars_hint)
+                }
+            };
+            if super::widgets::selectable(ui, app.env_panel_tab == tab, label)
+                .on_hover_text(hint)
+                .clicked()
+            {
+                app.env_panel_tab = tab;
+            }
+        }
+    });
+    ui.separator();
+
+    if app.env_panel_tab == EnvPanelTab::Variables {
+        variables_tab(app, ui);
+        return;
+    }
 
     // Filter box. Always shown rather than hidden behind a toggle: a workspace
     // of a few hundred environments is unusable without it, and an empty box is
@@ -213,14 +231,27 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
     let rows = env_rows_from(app, &files);
     let rows_for_source =
         crate::env_panel::rows(&app.session.global_envs, &files, "", effective_source(app));
-    let active = app.session.active_env_id;
-    let linked = app.session.collections[ci].linked_env_id;
+    // The environment active on *this tab* — the only one its requests
+    // substitute from.
+    let active = app.session.collections[ci].env_id;
+
+    // Which of the listed variables a capture is currently shadowing. Computed
+    // once, up here, because the editor below borrows `global_envs` mutably and
+    // could not reach `collections` to ask.
+    let overridden: std::collections::HashSet<String> = {
+        let col = &app.session.collections[ci];
+        app.session
+            .global_envs
+            .iter()
+            .flat_map(|e| e.vars.iter().map(|v| v.key.clone()))
+            .filter(|k| crate::vars_view::env_var_overridden(col, k))
+            .collect()
+    };
 
     // One-shot: consumed on the frame that shows the row, so a later manual
     // collapse isn't fought by a request that never expires.
     let reveal_target = app.reveal_env;
     let mut activate: Option<u64> = None;
-    let mut link: Option<u64> = None;
     let mut delete: Option<u64> = None;
     let mut save: Option<u64> = None;
     let mut resolve: Option<(u64, Vec<PendingSecret>)> = None;
@@ -294,7 +325,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     None => continue,
                 };
                 let is_active = active == Some(id);
-                let is_linked = linked == Some(id);
                 let name = app.session.global_envs[idx].name.clone();
                 let from_git = app.session.global_envs[idx].git_origin.is_some();
                 // The active environment is marked the way the terminal UI
@@ -356,12 +386,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             {
                                 activate = Some(id);
                             }
-                            if super::widgets::selectable(ui, is_linked, lbl_linked)
-                                .on_hover_text(tip_linked)
-                                .clicked()
-                            {
-                                link = Some(id);
-                            }
                             if ui.button(lbl_save).clicked() {
                                 save = Some(id);
                             }
@@ -378,6 +402,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                             &theme,
                             &app.strings,
                             &mut app.session.global_envs[idx].vars,
+                            &overridden,
                         );
                         if edited {
                             changed = true;
@@ -412,11 +437,6 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
                     };
                     if ui.button(toggle).clicked() {
                         activate = Some(id);
-                        ui.close();
-                    }
-                    let link_lbl = if is_linked { lbl_unlink } else { lbl_link };
-                    if ui.button(link_lbl).on_hover_text(tip_linked).clicked() {
-                        link = Some(id);
                         ui.close();
                     }
                     ui.separator();
@@ -455,10 +475,7 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         app.session.save();
     }
     if let Some(id) = activate {
-        app.session.set_active_env(Some(id));
-    }
-    if let Some(id) = link {
-        app.session.set_linked_env(ci, Some(id));
+        app.session.set_tab_env(ci, Some(id));
     }
     if let Some(id) = delete {
         app.session.delete_environment(id);
@@ -473,6 +490,236 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         for col in &mut app.session.collections {
             col.invalidate_request_json();
         }
+    }
+}
+
+/// A group heading inside the Variables tab, with a rule running out to the
+/// right of the label so the two groups read as sections rather than as two
+/// bold rows adrift in a list of variables. The terminal UI's popup centres its
+/// labels between two rules for the same reason; a rule on one side is enough
+/// here, where the rows are a grid rather than full-width highlighted lines.
+fn vars_group_header(ui: &mut egui::Ui, theme: &super::theme::GuiTheme, label: &str, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).color(theme.text).strong())
+            .on_hover_text(hint);
+        // Claimed rather than painted over the free space, so the rule is part
+        // of the layout and nothing can land on top of it later.
+        let rest = ui.available_size_before_wrap().x;
+        if rest > 0.0 {
+            let (_, rect) = ui.allocate_space(egui::vec2(rest, 1.0));
+            ui.painter().hline(
+                rect.x_range(),
+                rect.center().y,
+                egui::Stroke::new(1.0, theme.line),
+            );
+        }
+    });
+}
+
+/// One environment variable as the Variables tab shows it: flattened out of
+/// [`EnvVar`] so the borrow of `app.session` can end before the tab's Reveal
+/// toggle needs `app` mutably.
+struct VarRow {
+    key: String,
+    dot: egui::Color32,
+    value: String,
+    value_color: egui::Color32,
+    copy: String,
+    overridden: bool,
+}
+
+/// Everything a request on the active tab will substitute, in the precedence
+/// the runner applies (see `request::collection_vars`): the bound environment's
+/// variables, **overridden by** the live capture pool.
+///
+/// The same question the terminal UI answers with `v`, laid out the same way —
+/// keep the two in step. It is a tab rather than a strip along the bottom of
+/// the environments list because both halves are lists that want the panel's
+/// full height, and because the answer is about *this tab*, not about whichever
+/// environment happens to be selected above it.
+///
+/// Read-only. Environment values are edited one tab across, where the
+/// environment owning them is on screen; captures are not editable anywhere,
+/// being whatever the last response yielded.
+fn variables_tab(app: &mut GuiApp, ui: &mut egui::Ui) {
+    let theme = app.theme;
+    let ci = app.active_ci();
+    let env = app.session.collections[ci]
+        .env_id
+        .and_then(|id| app.session.global_envs.iter().find(|e| e.id == id));
+    let captures = crate::vars_view::capture_rows(&app.session.collections[ci], env);
+    // Copied out rather than borrowed, so the borrow of `app.session` ends
+    // before the Reveal toggle below needs `app` mutably.
+    let vars: Vec<VarRow> = env
+        .map(|e| {
+            e.vars
+                .iter()
+                .map(|v| VarRow {
+                    key: v.key.clone(),
+                    // Status dot colour-matched to the request substitution
+                    // scheme, as the terminal UI's popup does it: orange =
+                    // loading, cyan = literal, green = loaded from a provider,
+                    // red = failed to resolve.
+                    dot: if v.loading {
+                        theme.pending
+                    } else if !v.resolved {
+                        theme.err
+                    } else if v.source == ValueSource::Literal {
+                        theme.subst
+                    } else {
+                        theme.ok
+                    },
+                    value: if v.loading {
+                        app.strings.env_loading.to_string()
+                    } else {
+                        v.display_value()
+                    },
+                    value_color: if v.resolved {
+                        theme.text
+                    } else {
+                        theme.pending
+                    },
+                    // A masked secret is masked in `display_value`, so what is
+                    // on screen is already safe to copy verbatim.
+                    copy: v.display_value(),
+                    overridden: crate::vars_view::env_var_overridden(
+                        &app.session.collections[ci],
+                        &v.key,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let s = &app.strings;
+    let (
+        lbl_env_group,
+        hint_env_group,
+        lbl_capture_group,
+        hint_capture_group,
+        lbl_none,
+        lbl_no_captures,
+        lbl_overridden,
+        tip_overridden,
+        lbl_shadows,
+        lbl_copy,
+        lbl_reveal,
+        tip_reveal,
+    ) = (
+        s.vars_group_env,
+        s.gui_env_group_hint,
+        s.gui_captures_heading,
+        s.gui_captures_heading_hint,
+        s.vars_none,
+        s.gui_no_captures_yet,
+        s.vars_overridden,
+        s.gui_overridden_tooltip,
+        s.vars_shadows_env,
+        s.gui_probe_copy_this,
+        s.gui_reveal,
+        s.gui_reveal_hint,
+    );
+
+    // The Reveal toggle sits above both groups rather than beside the Captures
+    // heading: it is the tab's one control, and putting it on a heading that
+    // scrolls away would take it off screen just as a long list needs it.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if super::widgets::selectable(ui, app.vars_reveal, lbl_reveal)
+                .on_hover_text(tip_reveal)
+                .clicked()
+            {
+                app.vars_reveal = !app.vars_reveal;
+            }
+        });
+    });
+    let reveal = app.vars_reveal;
+    let mut to_copy: Option<String> = None;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            vars_group_header(ui, &theme, lbl_env_group, hint_env_group);
+            if vars.is_empty() {
+                ui.colored_label(theme.dim, lbl_none);
+            } else {
+                egui::Grid::new("env-vars-grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for row in &vars {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(row.dot, "\u{25cf}");
+                                ui.label(RichText::new(&row.key).color(theme.text));
+                            });
+                            ui.horizontal(|ui| {
+                                let label =
+                                    ui.label(RichText::new(&row.value).color(row.value_color));
+                                // A capture of this name wins, so the value
+                                // beside it is not the one that gets sent.
+                                // Saying so is the whole point of listing both
+                                // groups together: without the note the row is
+                                // not merely incomplete, it is wrong.
+                                if row.overridden {
+                                    ui.label(RichText::new(lbl_overridden).color(theme.pending))
+                                        .on_hover_text(tip_overridden);
+                                }
+                                label.context_menu(|ui| {
+                                    if ui.button(lbl_copy).clicked() {
+                                        to_copy = Some(row.copy.clone());
+                                        ui.close();
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            ui.add_space(6.0);
+            vars_group_header(ui, &theme, lbl_capture_group, hint_capture_group);
+            if captures.is_empty() {
+                // Said rather than left out: "nothing has been captured" is an
+                // answer, where a missing group reads as a missing feature.
+                ui.colored_label(theme.dim, lbl_no_captures);
+                return;
+            }
+            egui::Grid::new("env-captures-grid")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    for row in &captures {
+                        ui.horizontal(|ui| {
+                            // Green, matching `SubstKind::Loaded`: a capture is
+                            // a value resolved from a live response.
+                            ui.colored_label(theme.ok, "\u{25cf}");
+                            ui.label(RichText::new(&row.key).color(theme.text));
+                        });
+                        ui.horizontal(|ui| {
+                            let label = ui.label(
+                                RichText::new(crate::vars_view::shown_value(&row.value, reveal))
+                                    .color(theme.ok),
+                            );
+                            if row.shadows_env {
+                                ui.label(RichText::new(lbl_shadows).color(theme.pending));
+                            }
+                            // Copying yields the real value even while masked,
+                            // the way the Response pane's Captures tab does: a
+                            // value nobody can retrieve would defeat the point
+                            // of listing it.
+                            label.context_menu(|ui| {
+                                if ui.button(lbl_copy).clicked() {
+                                    to_copy = Some(row.value.clone());
+                                    ui.close();
+                                }
+                            });
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+    if let Some(v) = to_copy {
+        ui.ctx().copy_text(v);
     }
 }
 
@@ -494,6 +741,7 @@ fn var_editor(
     theme: &super::theme::GuiTheme,
     s: &Strings,
     vars: &mut Vec<EnvVar>,
+    overridden: &std::collections::HashSet<String>,
 ) -> (bool, Vec<PendingSecret>) {
     let mut changed = false;
     let mut pending: Vec<PendingSecret> = Vec::new();
@@ -590,6 +838,15 @@ fn var_editor(
                             },
                         );
                     }
+                }
+                // A capture of the same name wins over this row (see
+                // `request::collection_vars`), so the value shown beside it is
+                // not the value that gets sent. Without the note the row is not
+                // merely incomplete, it is wrong — which is what it was before
+                // the Captures section below existed to be pointed at.
+                if overridden.contains(&vars[i].key) {
+                    ui.colored_label(theme.pending, s.vars_overridden)
+                        .on_hover_text(s.gui_overridden_tooltip);
                 }
                 if super::widgets::flat_buttons(ui, |ui| {
                     ui.add_sized(
@@ -693,6 +950,204 @@ mod tests {
         (GuiApp::for_test(session), dir)
     }
 
+    fn app_with_captures(captures: &[(&str, &str)], vars: &str) -> GuiApp {
+        let mut session = crate::session::Session::default();
+        session.collections.clear();
+        session.collections.push(crate::collection::Collection::new(
+            "api".to_string(),
+            vec![],
+        ));
+        session.active_tab = 0;
+        if !vars.is_empty() {
+            let id = session.load_environment_text("dev".into(), vars, None, None);
+            session.collections[0].env_id = id;
+        }
+        for (k, v) in captures {
+            session.collections[0]
+                .captures
+                .insert((*k).to_string(), (*v).to_string());
+        }
+        GuiApp::for_test(session)
+    }
+
+    /// The panel listed the environment's rows while substitution reads the
+    /// environment **overridden by** the capture pool, so a captured value was
+    /// not merely unlisted — it left the environment row showing a value that
+    /// is not the one sent.
+    #[test]
+    fn the_panel_lists_the_live_capture_pool() {
+        let mut app = app_with_captures(&[("session", "abc123")], "");
+        app.env_panel_tab = EnvPanelTab::Variables;
+        let painted = draw(&mut app);
+        assert!(
+            painted.iter().any(|t| t == "session"),
+            "the capture is listed: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == crate::environment::SECRET_MASK),
+            "masked until asked for: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t.contains("abc123")),
+            "the value must not be on screen unasked: {painted:?}"
+        );
+
+        app.vars_reveal = true;
+        let painted = draw(&mut app);
+        assert!(
+            painted.iter().any(|t| t == "abc123"),
+            "Reveal shows it: {painted:?}"
+        );
+    }
+
+    /// The section is always there, so "nothing has been captured" is a visible
+    /// answer rather than a missing section that reads as a missing feature.
+    #[test]
+    fn the_captures_section_is_there_even_with_nothing_in_it() {
+        let mut app = app_with_captures(&[], "");
+        app.env_panel_tab = EnvPanelTab::Variables;
+        let empty = app.strings.gui_no_captures_yet.to_string();
+        let painted = draw(&mut app);
+        assert!(
+            painted
+                .iter()
+                .any(|t| t.starts_with(app.strings.gui_captures_heading)),
+            "the heading is always shown: {painted:?}"
+        );
+        assert!(
+            painted.contains(&empty),
+            "and says it is empty: {painted:?}"
+        );
+    }
+
+    /// The environment row a capture shadows is the one the panel was actively
+    /// misleading about.
+    #[test]
+    fn an_environment_row_a_capture_shadows_is_marked() {
+        let mut app = app_with_captures(
+            &[],
+            "TOKEN=from-env
+",
+        );
+        let marker = app.strings.vars_overridden.to_string();
+        app.reveal_env = app.session.global_envs.first().map(|e| e.id);
+        let painted = draw(&mut app);
+        assert!(
+            !painted.contains(&marker),
+            "nothing is shadowing it yet: {painted:?}"
+        );
+
+        app.session.collections[0]
+            .captures
+            .insert("TOKEN".to_string(), "from-capture".to_string());
+        app.reveal_env = app.session.global_envs.first().map(|e| e.id);
+        let painted = draw(&mut app);
+        assert!(
+            painted.contains(&marker),
+            "the row whose value is no longer the one sent must say so: {painted:?}"
+        );
+    }
+
+    /// The two halves of "what will this request substitute?" are both on the
+    /// Variables tab and in precedence order, the way the terminal UI's `v`
+    /// popup shows them: an environment row is only half an answer once a
+    /// capture of that name exists.
+    #[test]
+    fn the_variables_tab_shows_both_groups_in_precedence_order() {
+        let mut app = app_with_captures(&[("TOKEN", "from-capture")], "TOKEN=from-env\n");
+        app.env_panel_tab = EnvPanelTab::Variables;
+        app.vars_reveal = true;
+        let (env_group, capture_group, overridden, shadows) = {
+            let s = &app.strings;
+            (
+                s.vars_group_env.to_string(),
+                s.gui_captures_heading.to_string(),
+                s.vars_overridden.to_string(),
+                s.vars_shadows_env.to_string(),
+            )
+        };
+        let painted = draw(&mut app);
+        let at = |needle: &str| painted.iter().position(|t| t == needle);
+
+        let env_at = at(&env_group).unwrap_or_else(|| panic!("no env heading: {painted:?}"));
+        let cap_at =
+            at(&capture_group).unwrap_or_else(|| panic!("no captures heading: {painted:?}"));
+        assert!(
+            env_at < cap_at,
+            "the environment comes first and the captures override it: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == "from-env"),
+            "the environment's own value is listed: {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == "from-capture"),
+            "and the value that actually gets sent: {painted:?}"
+        );
+        // Both sides of the clash are marked, or the reader has two rows of the
+        // same name and no way to tell which one wins.
+        assert!(painted.contains(&overridden), "env row marked: {painted:?}");
+        assert!(
+            painted.contains(&shadows),
+            "capture row marked: {painted:?}"
+        );
+    }
+
+    /// The panel opens on the environments, which is what it is for; the
+    /// variables are a tab across. Guards against a stray `Default` on the tab
+    /// enum silently reversing that.
+    #[test]
+    fn the_panel_opens_on_the_environments_tab() {
+        let mut app = app_with_captures(&[("session", "abc123")], "");
+        assert_eq!(app.env_panel_tab, EnvPanelTab::Environments);
+        let (envs_tab, vars_tab, captures_heading) = {
+            let s = &app.strings;
+            (
+                s.gui_environments.to_string(),
+                s.vars_heading.to_string(),
+                s.gui_captures_heading.to_string(),
+            )
+        };
+        let painted = draw(&mut app);
+        // Both tab labels are on screen, so the variables are reachable...
+        assert!(
+            painted.iter().filter(|t| **t == envs_tab).count() >= 2,
+            "panel header and its own tab: {painted:?}"
+        );
+        assert!(
+            painted.contains(&vars_tab),
+            "the Variables tab is offered: {painted:?}"
+        );
+        // ...but their contents are not stealing height from the list, which is
+        // the whole reason the captures moved off the bottom of this tab.
+        assert!(
+            !painted.contains(&captures_heading),
+            "the captures are not on this tab: {painted:?}"
+        );
+    }
+
+    /// A `# [Gen]` value reaches the pool the way a capture does but must never
+    /// be displayed — it may be an HMAC of a secret, and the figure on hand is
+    /// the previous send's.
+    #[test]
+    fn a_computed_value_is_not_listed_among_the_captures() {
+        let mut app = app_with_captures(&[("nonce", "deadbeef")], "");
+        app.env_panel_tab = EnvPanelTab::Variables;
+        app.session.collections[0]
+            .entries
+            .push(crate::hurl::HurlEntry {
+                title: "gen".to_string(),
+                generators: vec![("nonce".to_string(), "uuid".to_string())],
+                ..Default::default()
+            });
+        app.vars_reveal = true;
+        let painted = draw(&mut app);
+        assert!(
+            !painted.iter().any(|t| t.contains("deadbeef")),
+            "a computed value must never be shown: {painted:?}"
+        );
+    }
+
     /// The panel shows the open workspace's environment files alongside the
     /// global ones, whether or not they have been opened yet.
     #[test]
@@ -772,7 +1227,8 @@ mod tests {
         app.session
             .load_environment_text("hand-made".into(), "A=1\n", None, None);
         let id = app.session.global_envs.last().unwrap().id;
-        app.session.active_env_id = Some(id);
+        let ci = app.active_ci();
+        app.session.collections[ci].env_id = Some(id);
 
         // Hidden twice over: by the text filter and by a workspace-only source.
         app.env_query = "PROD".into();
@@ -798,7 +1254,8 @@ mod tests {
         app.session
             .load_environment_text("hand-made".into(), "A=1\n", None, None);
         let id = app.session.global_envs.last().unwrap().id;
-        app.session.active_env_id = Some(id);
+        let ci = app.active_ci();
+        app.session.collections[ci].env_id = Some(id);
         app.env_query = "hand".into();
 
         goto_active(&mut app, id);
@@ -1034,8 +1491,9 @@ mod tests {
         let (mut app, dir) = app_with_workspace("dblclick");
         app.session
             .load_environment_text("hand-made".into(), "A=1\n", None, None);
+        let ci = app.active_ci();
         assert_eq!(
-            app.session.active_env_id, None,
+            app.session.collections[ci].env_id, None,
             "nothing active to begin with"
         );
 
@@ -1053,7 +1511,7 @@ mod tests {
             .find(|e| e.name == "hand-made")
             .map(|e| e.id);
         assert_eq!(
-            app.session.active_env_id, id,
+            app.session.collections[ci].env_id, id,
             "the row the user double-clicked is the one that became active"
         );
 
@@ -1063,7 +1521,74 @@ mod tests {
             &mut app,
             &[vec![], click_at(pos, egui::PointerButton::Primary, 2)],
         );
-        assert_eq!(app.session.active_env_id, None, "double-click toggles");
+        assert_eq!(
+            app.session.collections[ci].env_id, None,
+            "double-click toggles"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An environment belongs to a tab, so the panel has to answer for the tab
+    /// you are *looking at*. Switching tabs must re-read it: the row marked
+    /// active, and the action the menu offers, both follow the new tab rather
+    /// than staying on whatever the last tab had.
+    #[test]
+    fn the_panel_follows_the_active_tab() {
+        let (mut app, dir) = app_with_workspace("tabswitch");
+        app.session
+            .load_environment_text("hand-made".into(), "A=1\n", None, None);
+        let id = app.session.global_envs.last().unwrap().id;
+        let first = app.active_ci();
+        app.session.set_tab_env(first, Some(id));
+
+        let (_, shapes) = drive(&mut app, &[vec![]]);
+        let pos = text_pos(&shapes, "hand-made").expect("the row is painted");
+        let (painted, _) = drive(
+            &mut app,
+            &[
+                vec![],
+                click_at(pos, egui::PointerButton::Secondary, 1),
+                vec![],
+            ],
+        );
+        assert!(
+            painted.iter().any(|t| t == "Deactivate"),
+            "on the tab that activated it, the row is active: {painted:?}"
+        );
+
+        // A second tab, which activated nothing. It has no workspace, so the
+        // panel drops the source selector and the row moves — find it again.
+        let second = app.session.add_collection("other");
+        app.session.active_tab = second;
+        let (_, shapes) = drive(&mut app, &[vec![]]);
+        let pos = text_pos(&shapes, "hand-made").expect("the row is still painted");
+        let (painted, _) = drive(
+            &mut app,
+            &[
+                vec![],
+                click_at(pos, egui::PointerButton::Secondary, 1),
+                vec![],
+            ],
+        );
+        assert!(
+            painted.iter().any(|t| t == "Activate"),
+            "the new tab has no environment, so the row offers to activate: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t == "Deactivate"),
+            "the other tab's choice must not show here: {painted:?}"
+        );
+
+        // Activating it here leaves the first tab exactly as it was.
+        app.session.set_tab_env(second, Some(id));
+        assert_eq!(app.session.collections[first].env_id, Some(id));
+        assert_eq!(app.session.collections[second].env_id, Some(id));
+        app.session.set_tab_env(second, None);
+        assert_eq!(
+            app.session.collections[first].env_id,
+            Some(id),
+            "turning it off on one tab must not turn it off on the other"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1087,7 +1612,7 @@ mod tests {
                 vec![],
             ],
         );
-        for label in ["Activate", "Link to this collection", "Save…", "Delete"] {
+        for label in ["Activate", "Save…", "Delete"] {
             assert!(
                 painted.iter().any(|t| t == label),
                 "the menu should offer {label:?}, painted: {painted:?}"
@@ -1105,7 +1630,8 @@ mod tests {
             .iter()
             .find(|e| e.name == "hand-made")
             .map(|e| e.id);
-        app.session.set_active_env(id);
+        let ci = app.active_ci();
+        app.session.set_tab_env(ci, id);
         let (painted, _) = drive(
             &mut app,
             &[

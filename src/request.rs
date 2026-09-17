@@ -1013,6 +1013,11 @@ pub fn run_collection(
                 r.duration_ms = Some(eo.duration_ms);
                 // Surface a transport failure / failed assert on the status bar.
                 r.error = eo.error.or(out.error).unwrap_or_default();
+                // The `[Captures]` rows alone, kept on the response so the
+                // Captures tab can say what *this* request took. Cloned before
+                // the merge below, which folds the computed values in and so
+                // produces a set that must never be shown.
+                r.captures = eo.captures.clone();
                 // The block's values go back with the captures, so the next
                 // request sees a `nonce` this one computed exactly the way it
                 // sees a token this one captured. A `[Captures]` row of the
@@ -1064,6 +1069,7 @@ fn entry_response(eo: &EntryOutcome) -> ApiResponse {
         error: eo.error.clone().unwrap_or_default(),
         headers: eo.headers.clone(),
         assert_results: eo.asserts.clone(),
+        captures: eo.captures.clone(),
         duration_ms: Some(eo.duration_ms),
         // A "Run All" entry that ran has no generator failure to carry: the
         // whole-file block is expanded once, up front, and its failures are
@@ -2271,7 +2277,7 @@ fn request_label(e: &crate::hurl::HurlEntry) -> String {
 
 /// Drain background secret-resolution results, applying each to the matching
 /// Global Environment and invalidating every collection's cached preview (any
-/// of them might reference it, linked or active-global). Disconnected
+/// of them might reference it). Disconnected
 /// channels are dropped. Returns `true` while any resolution is still in
 /// flight. Shared by both front-ends' per-frame/per-tick update loop.
 pub fn drain_env_updates(

@@ -964,7 +964,20 @@ fn schedule_graph<'a>(
                         let idx = s.ready.remove(pos);
                         if let Some(dep) = blocker(&s, plan, idx) {
                             s.out[idx] = Some(skip_out(ctx, plan, body, idx, &dep));
-                            finish(&mut s, &succ, idx, false);
+                            // A skip is decided without ever dropping the lock,
+                            // so this is the one path that can grow the ready
+                            // set with no matching wake-up: the worker simply
+                            // goes back round and claims one itself. Today that
+                            // strands nothing, because a skip always propagates
+                            // — every step it releases has this one as a
+                            // predecessor, so each is skipped in turn by the
+                            // same loop and none of them would have made a
+                            // request. Waking here anyway keeps the scheduler's
+                            // invariant local: work reaching the ready set
+                            // always wakes the sleepers, whoever put it there.
+                            if finish(&mut s, &succ, idx, false) {
+                                idle.notify_all();
+                            }
                             continue;
                         }
                         let state = view_for(plan, base, &s, idx);
@@ -1051,9 +1064,12 @@ fn blocker(s: &Sched, plan: &super::graph::Plan, idx: usize) -> Option<String> {
         .map(|e| plan.steps[e.from].name.clone())
 }
 
-/// Record a decision and release whatever was waiting on it.
-fn finish(s: &mut Sched, succ: &[Vec<usize>], idx: usize, ok: bool) {
+/// Record a decision and release whatever was waiting on it. Reports whether
+/// anything reached the ready set, so a caller holding the lock knows if there
+/// is now work a sleeping worker should be woken for.
+fn finish(s: &mut Sched, succ: &[Vec<usize>], idx: usize, ok: bool) -> bool {
     s.ok[idx] = Some(ok);
+    let mut released = false;
     for &to in &succ[idx] {
         s.waiting[to] -= 1;
         if s.waiting[to] == 0 {
@@ -1061,8 +1077,10 @@ fn finish(s: &mut Sched, succ: &[Vec<usize>], idx: usize, ok: bool) {
             // and so the ready set itself doesn't depend on completion order.
             let at = s.ready.partition_point(|&i| i < to);
             s.ready.insert(at, to);
+            released = true;
         }
     }
+    released
 }
 
 /// The execution state one step sees: the region's entry state plus exactly
@@ -5391,6 +5409,37 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_value_orders_a_region_and_reaches_the_step_that_reads_it() {
+        // The region's no-op promise, end to end: this same flow written as a
+        // plain block already worked, because written order supplied what the
+        // graph had forgotten. The graph did not treat a `# [Gen]` value as an
+        // output, so `fetch` got no edge to `create`, was ordered first by its
+        // written position, and — since a step inside a region is handed only
+        // its ancestors' values — could not have seen `sid` even if it had run
+        // second. Written the "wrong" way round on purpose: that is exactly
+        // what a region is for.
+        let entries = [
+            graph_entry("fetch", &[], &["sid"]),
+            gen_entry("create", &["sid"], &[]),
+        ];
+        let fake = Fake::new(&[ok("fetch"), ok_generating("create", &[("sid", "NEW")])]);
+        let res = run(
+            "GRAPH\n    REQUEST fetch\n    REQUEST create\nEND\n",
+            &entries,
+            &[("sid", "OLD")],
+            &[],
+            &fake,
+        );
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(
+            fake.call_vars("fetch").get("sid").map(String::as_str),
+            Some("NEW"),
+            "the generated value has to reach the step that reads it, not the \
+             environment's stale one"
+        );
+    }
+
+    #[test]
     fn a_generated_value_reaches_the_steps_that_read_it() {
         // The bug this replaces: generated values were dropped on the floor at
         // the end of the send, so `{{sid}}` downstream kept resolving to the
@@ -5726,6 +5775,40 @@ mod tests {
         );
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         assert_eq!(fake.call_order(), ["put", "fetch"]);
+    }
+
+    #[test]
+    fn a_skip_propagates_through_a_step_whose_other_dependency_succeeded() {
+        // The join is the shape that decides whether a skip can ever release a
+        // step that is ready to *run*: `join` waits on both `mid` and `good`,
+        // and `good` succeeds, so it is `mid` being skipped that finally frees
+        // it. It must still be skipped rather than sent — a half-satisfied step
+        // has no value for the dependency it never got. The scheduler leans on
+        // this: because a skip only ever frees more skips, resolving a cascade
+        // holds no request back.
+        let entries = [
+            graph_entry("boom", &["b"], &[]),
+            graph_entry("good", &["g"], &[]),
+            graph_entry("mid", &["m"], &["b"]),
+            graph_entry("join", &[], &["m", "g"]),
+        ];
+        let fake = Fake::new(&[
+            failing("boom"),
+            ok_capturing("good", &[("g", "G")]),
+            ok_capturing("mid", &[("m", "M")]),
+            ok("join"),
+        ]);
+        let res = run(
+            "PARALLEL(4) GRAPH\n    REQUEST boom\n    REQUEST good\n    REQUEST mid\n    REQUEST join\nEND\n",
+            &entries,
+            &[],
+            &[],
+            &fake,
+        );
+        let mut sent = fake.call_order();
+        sent.sort();
+        assert_eq!(sent, ["boom", "good"], "the join was sent anyway");
+        assert_eq!(res.skipped, ["mid", "join"]);
     }
 
     #[test]

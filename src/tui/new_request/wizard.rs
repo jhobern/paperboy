@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::hurl::{FormFieldKind, KvRow, METHODS};
-use crate::i18n::{Strings, fill};
+use crate::i18n::{Status, Strings, fill};
 use crate::shared_utils::truncate_to_width;
 
 use super::super::app::{
@@ -672,6 +672,46 @@ impl NewReq {
 
     /// Open the prompt on the focused cell, pre-filled with a suggested name.
     /// Returns whether there was anything to extract.
+    /// Lay the Body out again, returning what to tell the user.
+    ///
+    /// The cursor is carried across rather than reset: prettifying is most
+    /// useful on a long pasted body, which is exactly the case where being
+    /// dumped back at line one costs the most. Nothing needs confirming —
+    /// [`Editor::replace_text`] takes an undo checkpoint, so Ctrl+Z puts the
+    /// old layout back.
+    pub(crate) fn prettify_body(&mut self) -> Status {
+        let src = self.body.text();
+        match crate::hurl::json_format::prettify_json(&src) {
+            crate::hurl::json_format::Prettified::Changed(out) => {
+                let at = self.body_cursor_offset(&src);
+                let mapped = crate::hurl::json_format::map_cursor(&src, &out, at);
+                let before = &out[..mapped];
+                let row = before.matches('\n').count();
+                let col = before
+                    .rsplit('\n')
+                    .next()
+                    .map(|l| l.chars().count())
+                    .unwrap_or(0);
+                self.body.replace_text(&out, row, col);
+                Status::BodyPrettified
+            }
+            crate::hurl::json_format::Prettified::Unchanged => Status::BodyAlreadyTidy,
+            crate::hurl::json_format::Prettified::NotJson => Status::BodyNotJson,
+        }
+    }
+
+    /// The Body cursor's byte offset into `src`, which is `self.body.text()`.
+    fn body_cursor_offset(&self, src: &str) -> usize {
+        let mut at = 0usize;
+        for (i, line) in src.split('\n').enumerate() {
+            if i == self.body.row {
+                return at + Editor::byte_idx(line, self.body.col);
+            }
+            at += line.len() + 1;
+        }
+        src.len()
+    }
+
     pub(crate) fn begin_extract(&mut self) -> bool {
         let Some(value) = self.extractable() else {
             return false;
@@ -2591,6 +2631,13 @@ pub(crate) fn draw_new_request_with_hits(
     // findable from the field it applies to rather than only in the docs.
     if form.extractable_hint() {
         parts.push(s.hint_extract_parameter.to_string());
+    }
+    // Contextual addition: only on the Body, which is the only thing Alt+P
+    // formats. Offered whatever the body holds — a body that isn't JSON says
+    // so when the key is pressed, which is a better way to learn the rule than
+    // a hint that appears and disappears as you type.
+    if form.focus == NewField::Body {
+        parts.push(s.hint_prettify_body.to_string());
     }
     // Contextual addition: only in the Options section, where the way to
     // declare a report-steerable parameter is a `variable:` row and there is

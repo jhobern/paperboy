@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [Unreleased]
+## [0.6.0] - 2026-09-18
 
 ### Added
 
@@ -71,10 +71,12 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 - **`GRAPH … END` regions: order from dependencies, not from written order.**
   Inside a region PaperTrail reads what each request needs — the variables its
-  Hurl entry interpolates, and the values given to it in `USING(…)` — and what
-  each produces, its captures, and runs the ordering those imply. Writing the
-  login after the request that needs its token now works, because the region
-  says the graph is what is meant and the text is just where it was typed.
+  Hurl entry interpolates *after* its `USING(…)` overrides are applied, so an
+  override that replaces a URL or body takes the references it held with it —
+  and what each produces: its captures, and the values its `# [Gen]` rows
+  compute. It runs the ordering those imply. Writing the login after the
+  request that needs its token now works, because the region says the graph is
+  what is meant and the text is just where it was typed.
 
   A region can be named (`GRAPH release`) so that a run can be asked for part
   of it. It is otherwise transparent: wrapping an existing block in `GRAPH …
@@ -200,7 +202,89 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   is a warning — dead text in the one file that was supposed to be
   self-contained.
 
+- **A JSON request body can now be laid out again: `p` in the main view,
+  `Alt+P` in the request editor, and a **Format** button in the GUI's Body
+  section.** A body pasted from a log or a browser's network tab arrives as one
+  long line, and until now the only way to read it was to re-indent it by hand.
+
+  The body is *not* round-tripped through a JSON parser, because four things a
+  PaperBoy body is allowed to contain would not survive that: `//` and `/* */`
+  comments (stripped), a bare `{{ TEMPLATE }}` standing where a value goes
+  (`{"n": {{ COUNT }}}` isn't valid JSON, but it is a valid request), number
+  spelling (`1.50` and `1e3` would come back `1.5` and `1000.0`, and a 19-digit
+  id would lose its last digits to a float), and duplicate keys (a map keeps
+  one). Instead the text is re-indented in place: every token is copied byte for
+  byte and only the whitespace between tokens is rewritten, so key order,
+  comments, templates and number spelling all come back exactly as written.
+
+  The result is checked against the original before it replaces anything — same
+  wire body, same comments — and a body that isn't JSON is refused with a
+  message rather than mangled, so a GraphQL query or a form-encoded string is
+  safe to press the key on. In the editor the cursor stays on the character it
+  was on, and one Ctrl+Z puts the old layout back.
+
+- **Captures are now visible — twice, because there are two questions about
+  them.** `[Captures]` pulled values out of a response and fed them to the next
+  request, and nothing ever showed what they were. Two views now answer the two
+  different questions:
+
+  - **"What did *this* request capture?"** — a **Captures** tab in the Response
+    pane (both front-ends), listing the snapshot that request took when it last
+    ran. A capture that has since been overwritten by a later run is marked
+    *superseded*, so a stale figure can't sit there looking current.
+  - **"What is `{{ VAR }}` worth *right now*?"** — the terminal UI's `v` popup,
+    retitled **Variables**, and a matching **Variables** tab in the GUI's
+    Environments panel. Both list the bound environment's variables and the live
+    capture pool for the active tab, one after the other, in the order
+    substitution applies them.
+
+  This also fixes a view that was giving a wrong answer. Substitution reads the
+  environment's variables *overridden by* the capture pool, but both front-ends
+  listed the environment's rows and nothing else — so a captured `access_token`
+  left the environment's row displaying a value that was **not** the one being
+  sent. Such a row is now marked as overridden, with the winning value listed
+  beside it.
+
+  Captured values are masked by default (`m` in the terminal UI, a **Reveal**
+  toggle in the GUI): a capture is very often a bearer token and, unlike an
+  environment variable, carries no "secret" marking to go by. Copying still
+  yields the real value. Values computed by `# [Gen]` are never listed, for the
+  same reason the request preview refuses to substitute them into view.
+
+  `v` now also opens on a tab with no environment loaded — previously the one
+  case it refused, and the case where captures are the only variables there are.
+
 ### Changed
+
+- **An environment now belongs to a tab.** PaperBoy used to have two layers: one
+  environment activated app-wide, and optionally a second one *linked* to a
+  collection, whose values won on a key collision. Both applied to a run, which
+  meant reading a substituted value required knowing which of two environments
+  had supplied it, and there was no way to have two tabs on two different
+  environments at once — the thing people actually wanted the two layers for.
+
+  There is now exactly one environment per tab. `a` in the Environments panel
+  (and double-click, or right-click → Activate, in the GUI) sets the active
+  tab's environment and nothing else's; every other tab keeps what it had. Open
+  the same collection in two tabs and you can run it against staging and prod
+  side by side.
+
+  The 🔗 that joined a tab's title to its environment is gone with the layer it
+  named — there is nothing to link when a tab simply *has* an environment — and
+  the title now uses the same dim middot the Environments panel's own title
+  does. The Glossary drops the icon with it.
+
+  **Migration is automatic and nothing is lost.** A session saved by an earlier
+  build hands its app-wide environment to exactly the tabs that had no linked
+  environment of their own — which is precisely the set that was substituting
+  from it — so a restored session substitutes what it did before. The state file
+  stays readable by older builds.
+
+- **A report bound to a collection no tab has open no longer inherits an
+  environment.** Its base environment is the one on the tab holding that
+  collection, and with no such tab there is none. Name it explicitly with an
+  `# environment:` directive (or a `FOR … IN ENVS` loop, which already named its
+  environments) to pin it down regardless of what is open.
 
 - A dropped step name and where it was legible are one type rather than two
   structures every reader had to remember to combine, and a step's values now
@@ -232,6 +316,13 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   nothing to warn about.
 
 ### Fixed
+
+- **The GUI's **Compact** and **Reveal** toggles look like buttons when they are
+  off.** Both were drawn with a control that frames itself only while selected,
+  so an unselected toggle sat as bare text beside the framed **Copy** and
+  **Probe** buttons next to it — reading as a label rather than as something
+  clickable, and leaving the row looking half-rendered. They are now framed in
+  both states, like every other toolbar toggle.
 
 - **The build no longer refuses to start on Windows.** `build.rs`'s pre-flight
   check looked for bare `perl`, `make` and `cc`/`gcc`/`clang` filenames on

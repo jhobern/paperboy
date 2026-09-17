@@ -59,6 +59,7 @@ mod theme;
 mod tree;
 #[cfg(feature = "tui")]
 mod tui;
+mod vars_view;
 mod workspace;
 
 use clap::Parser;

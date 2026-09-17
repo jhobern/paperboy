@@ -86,6 +86,29 @@ pub struct ApiResponse {
     pub headers: Vec<(String, String)>,
     /// Results of evaluating the run entry's `[Asserts]` against this response.
     pub assert_results: Vec<AssertOutcome>,
+    /// What this entry's `[Captures]` took from this response, in the order the
+    /// rows are written.
+    ///
+    /// Deliberately *not* the same thing as [`Collection::captures`], which is
+    /// the collection-wide pool every later request substitutes from: that pool
+    /// is flat, last-writer-wins and keeps no record of which request filled
+    /// which name, so it cannot answer "what did *this* request capture". A
+    /// response carries its own answer, and — like `body` and `headers` beside
+    /// it — keeps it on `HurlEntry::last_response` so re-selecting the request
+    /// still shows it.
+    ///
+    /// A snapshot, therefore, and one that a later run of another request can
+    /// make stale: a front-end showing these should compare against the live
+    /// pool rather than imply the value is still in force.
+    ///
+    /// Holds `[Captures]` rows *only*. The values a `# [Gen]` block computes
+    /// travel with the captures everywhere else (see `CaptureUpdate::values`)
+    /// because the next request has to substitute them, but they must never be
+    /// displayed — a computed value may be an HMAC of a secret, and showing the
+    /// last send's nonce while the next send computes a fresh one would be a
+    /// lie regardless (`request.rs::subst_map` refuses them for the same
+    /// reason).
+    pub captures: Vec<(String, String)>,
     /// Wall-clock duration of the HTTP transfer for this request, in
     /// milliseconds, as reported by the Hurl runner (the same figure reports
     /// surface as the per-request "Time" column). `None` when unknown — e.g. a
@@ -112,6 +135,7 @@ impl ApiResponse {
         self.error.clear();
         self.headers.clear();
         self.assert_results.clear();
+        self.captures.clear();
         self.duration_ms = None;
         self.gen_errors.clear();
     }

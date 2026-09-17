@@ -2,6 +2,8 @@
 //! - [`entry`]: the `HurlEntry` request model + Hurl-text serializer.
 //! - [`json_comments`]: strip `//` and `/* */` comments from a JSON body, so a
 //!   body can be authored with notes but written out as strict JSON.
+//! - [`json_format`]: re-indent a JSON body without parsing it, so comments,
+//!   templates, numbers and key order survive being prettified.
 //! - [`parser`]: parse Hurl text into `HurlEntry` values.
 //! - [`run`]: execute + evaluate via the `hurl` runner (`[Captures]`/`[Asserts]`).
 //! - [`stage`]: copy out-of-scope `[Form]`/`[Multipart]` files next to the
@@ -9,6 +11,7 @@
 
 mod entry;
 pub mod json_comments;
+pub mod json_format;
 mod parser;
 pub mod run;
 mod stage;

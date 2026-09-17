@@ -982,7 +982,6 @@ impl TuiApp {
                     let diags = crate::report::context::report_diagnostics(
                         &self.collections,
                         &self.global_envs,
-                        self.active_env_id,
                         &flow,
                         rt.report.path.as_deref(),
                         &crate::i18n::Strings::for_language(&self.language),
@@ -1100,7 +1099,6 @@ impl TuiApp {
         crate::report::context::report_run_inputs(
             &self.collections,
             &self.global_envs,
-            self.active_env_id,
             &flow,
             rt.report.path.as_deref(),
         )

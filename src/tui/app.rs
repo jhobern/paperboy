@@ -291,9 +291,17 @@ impl EnvVarForm {
 /// collection's linked environment from the Tabs pane ('v'). Same format and
 /// shortcuts as the old inline Environment panel.
 pub(crate) struct EnvPopupState {
-    pub(crate) env_id: u64,
+    /// The environment whose variables are listed, if the tab has one. `None`
+    /// is a first-class state, not an error: the popup also lists the live
+    /// capture pool, which exists whether or not an environment is loaded, and
+    /// a tab with captures but no environment is precisely the case where the
+    /// old "no environment, nothing to show" refusal hid the most.
+    pub(crate) env_id: Option<u64>,
     pub(crate) idx: usize,
     pub(crate) hscroll: u16,
+    /// Capture values are masked until this is set (`m`), for the reason given
+    /// on [`crate::vars_view::shown_value`].
+    pub(crate) reveal: bool,
     /// Content width of the selected row's `key = value` text, recorded
     /// during draw (see `env_scroll_w`/`list_scroll_w`) so `hscroll` can be
     /// clamped to stop at the text's end.
@@ -303,20 +311,24 @@ pub(crate) struct EnvPopupState {
 impl EnvPopupState {
     pub(crate) fn new(env_id: u64) -> Self {
         Self {
-            env_id,
+            env_id: Some(env_id),
             idx: 0,
             hscroll: 0,
+            reveal: false,
             scroll_w: std::cell::Cell::new(0),
         }
     }
-}
 
-/// A picker (opened with 'p' in the Requests/List pane) of which Global
-/// Environment to link/unlink to a collection. `sel == 0` means "None"
-/// (unlink); `sel == i + 1` means `global_envs[i]`.
-pub(crate) struct EnvLinkPicker {
-    pub(crate) ci: usize,
-    pub(crate) sel: usize,
+    /// The popup for a tab with no environment loaded — captures only.
+    pub(crate) fn unlinked() -> Self {
+        Self {
+            env_id: None,
+            idx: 0,
+            hscroll: 0,
+            reveal: false,
+            scroll_w: std::cell::Cell::new(0),
+        }
+    }
 }
 
 /// A newly loaded environment whose name collides with one already in the
@@ -653,9 +665,6 @@ pub(crate) enum Overlay {
     ReportNodeComputed(Box<crate::tui::report_nodes::ComputedForm>),
     /// Viewing one Global Environment's vars (see [`EnvPopupState`]).
     EnvPopup(EnvPopupState),
-    /// Linking/unlinking a Global Environment to a collection (see
-    /// [`EnvLinkPicker`]).
-    EnvLinkPicker(EnvLinkPicker),
     /// Resolving a name collision on environment load (see [`EnvCollision`]).
     EnvCollision(Box<EnvCollision>),
     /// The Workspace file-tree popup (see [`WorkspacePickerState`]).
@@ -796,11 +805,11 @@ pub(crate) enum Pane {
 /// mirroring the GUI's `ResponseSection` so the two front-ends agree on what a
 /// response is made of.
 ///
-/// Deliberately modelled as a *ring* rather than a boolean toggle even though
-/// there are only two members today: the runner already captures more than
-/// this (per-phase timings, captured `[Captures]` values, the redirect chain)
-/// and none of it is drawn yet. Adding one of those later should be a new
-/// variant and a new draw arm, not a re-negotiation of the key map.
+/// Deliberately modelled as a *ring* rather than a boolean toggle: the runner
+/// already captures more than this (per-phase timings, the redirect chain) and
+/// none of it is drawn yet. Adding one of those later should be a new variant
+/// and a new draw arm, not a re-negotiation of the key map — which is exactly
+/// how `Captures` arrived.
 ///
 /// Cycled with `i` / `Shift+I` while the Response pane holds focus. Not `[`/`]`
 /// — those mean "previous/next collection tab" from *every* pane, and quietly
@@ -810,16 +819,22 @@ pub(crate) enum Pane {
 pub(crate) enum ResponseSection {
     Body,
     Headers,
+    Captures,
 }
 
 impl ResponseSection {
     /// The ring, in tab-bar order. Also the order `i` steps through.
-    pub(crate) const ALL: [ResponseSection; 2] = [ResponseSection::Body, ResponseSection::Headers];
+    pub(crate) const ALL: [ResponseSection; 3] = [
+        ResponseSection::Body,
+        ResponseSection::Headers,
+        ResponseSection::Captures,
+    ];
 
     pub(crate) fn label(self, s: &Strings) -> &'static str {
         match self {
             ResponseSection::Body => s.resp_section_body,
             ResponseSection::Headers => s.resp_section_headers,
+            ResponseSection::Captures => s.resp_section_captures,
         }
     }
 }
@@ -1249,15 +1264,6 @@ pub struct TuiApp {
     /// mouse coordinates to text, and extracting a selection, so all three
     /// always agree on exactly the same content.
     pub(crate) main_panel: MultiSelectPanel,
-    /// Character positions (within `main_panel`'s logical text) of every
-    /// shadow-warning icon (see `draw::SHADOW_ICON`) rendered into the
-    /// Request JSON/Hurl body this frame — recomputed each frame the panel's
-    /// content is rebuilt. A purely visual annotation, so it's excluded from
-    /// copied/selected text (see `whole_panel_text`,
-    /// `concatenated_selection_text`) rather than corrupting a pasted
-    /// request with a stray "!" the recipient would have to notice and
-    /// remove by hand.
-    pub(crate) main_shadow_icon_positions: std::collections::HashSet<TextPos>,
     /// The exact screen Rect the Response body was rendered into last frame,
     /// used to hit-test mouse clicks/drags against this panel.
     pub(crate) resp_text_area: Rect,
@@ -1280,9 +1286,22 @@ pub struct TuiApp {
     /// the Response pane is focused. Display-only: `resp_full_body` keeps the
     /// untruncated text so a whole-panel `y`-copy still yields the full body.
     pub(crate) response_compact: bool,
-    /// Which section of the response the pane is showing (Body / Headers).
-    /// Purely a view choice — it changes what `resp_panel` is fed, never the
-    /// response itself — so it isn't persisted and resets to `Body` on start.
+    /// When true, the Captures section prints its values in the clear instead
+    /// of masking them. Toggled with `m` while the Response pane is focused.
+    ///
+    /// Masked by default: unlike an environment variable, which is marked
+    /// secret at its source, a capture carries no such marking and is very
+    /// often a bearer token — which is what `[Captures]` is largely *for*.
+    /// Display-only, so a `y`-copy still yields the real values; a masked value
+    /// nobody could retrieve would defeat the point of listing it.
+    ///
+    /// Not persisted, and deliberately so: "show me the tokens" should not be a
+    /// setting that survives a restart and greets the next screen-share.
+    pub(crate) response_reveal: bool,
+    /// Which section of the response the pane is showing (Body / Headers /
+    /// Captures). Purely a view choice — it changes what `resp_panel` is fed,
+    /// never the response itself — so it isn't persisted and resets to `Body`
+    /// on start.
     pub(crate) response_section: ResponseSection,
     /// The full (untruncated) Response body cached each frame the normal body is
     /// drawn, so the whole-panel copy fallback can return it even while the
@@ -1577,11 +1596,11 @@ impl Default for TuiApp {
             global_env_hscroll: 0,
             main_text_area: Rect::default(),
             main_panel: MultiSelectPanel::new(),
-            main_shadow_icon_positions: std::collections::HashSet::new(),
             resp_text_area: Rect::default(),
             resp_probe_anchor: None,
             resp_panel: MultiSelectPanel::new(),
             response_compact: false,
+            response_reveal: false,
             response_section: ResponseSection::Body,
             resp_full_body: Arc::from(""),
             resp_compact_line_maps: Vec::new(),
@@ -3736,7 +3755,7 @@ impl TuiApp {
 
     /// Load `.vars`-style `content` into the Global Environments list,
     /// resolving any secrets in the background. Never attached directly to a
-    /// collection — see `set_linked_env` for that (linking is a separate,
+    /// tab — see `toggle_activate_env` for that (activating is a separate,
     /// explicit action). `path`/`git_origin` record where the environment
     /// came from, so "Save Environment" and future reloads target the right
     /// place. If an environment with the same name already exists, an
@@ -3874,7 +3893,7 @@ impl TuiApp {
     /// list, or (if open) the environment shown in the entries popup.
     pub(crate) fn current_env_id(&self) -> Option<u64> {
         if let Some(Overlay::EnvPopup(p)) = &self.overlay {
-            return Some(p.env_id);
+            return p.env_id;
         }
         self.selected_env_id()
     }
@@ -3946,7 +3965,7 @@ impl TuiApp {
         let (env_id, vi) = (popup.env_id, popup.idx);
         let mut pending_secret = None;
         let mut key = None;
-        if let Some(env) = self.global_envs.iter_mut().find(|e| e.id == env_id)
+        if let Some(env) = self.global_envs.iter_mut().find(|e| Some(e.id) == env_id)
             && let Some(var) = env.vars.get_mut(vi)
             && var.is_failed()
         {
@@ -3957,29 +3976,37 @@ impl TuiApp {
         for col in &mut self.collections {
             col.invalidate_request_json();
         }
-        if let Some(secret) = pending_secret {
+        if let Some(secret) = pending_secret
+            && let Some(env_id) = env_id
+        {
             self.pending_env
                 .push(spawn_resolution(env_id, vec![secret]));
         }
         self.status = Some(Status::EnvVarReloading(key));
     }
 
-    /// Toggle activation of the Global Environment at `idx` in `global_envs`:
-    /// activating it deactivates whatever else was active (at most one may
-    /// be active at a time); activating shows a status-bar notification.
-    /// Deactivating the currently-active one leaves no active Global
-    /// Environment.
+    /// Toggle the Global Environment at `idx` on the active tab: activating it
+    /// replaces whatever that tab had active (a tab substitutes from exactly
+    /// one environment); activating shows a status-bar notification.
+    /// Activating the tab's current one again leaves the tab with none.
+    ///
+    /// Only the active tab is touched — every other tab keeps the environment
+    /// it was already on, which is the point of the whole arrangement.
     pub(crate) fn toggle_activate_env(&mut self, idx: usize) {
         let Some(env) = self.global_envs.get(idx) else {
             return;
         };
         let id = env.id;
         let name = env.name.clone();
-        if self.active_env_id == Some(id) {
-            self.active_env_id = None;
+        let ci = self.active_tab;
+        let Some(col) = self.collections.get_mut(ci) else {
+            return;
+        };
+        if col.env_id == Some(id) {
+            col.env_id = None;
             self.status = Some(Status::EnvDeactivated(name));
         } else {
-            self.active_env_id = Some(id);
+            col.env_id = Some(id);
             self.status = Some(Status::EnvActivated(name));
         }
         for col in &mut self.collections {
@@ -3988,10 +4015,10 @@ impl TuiApp {
         self.save_state();
     }
 
-    /// Delete the Global Environment at `idx`: any collection linked to it
-    /// becomes unlinked, and it's deactivated if it was active. The removed
-    /// environment is pushed onto `deleted_envs` so `u` can reopen it, and a
-    /// status naming it (with the undo hint) is shown.
+    /// Delete the Global Environment at `idx`: it's deactivated on every tab
+    /// that had it active. The removed environment is pushed onto
+    /// `deleted_envs` so `u` can reopen it, and a status naming it (with the
+    /// undo hint) is shown.
     pub(crate) fn delete_global_env(&mut self, idx: usize) {
         if idx >= self.global_envs.len() {
             return;
@@ -3999,12 +4026,9 @@ impl TuiApp {
         let removed = self.global_envs.remove(idx);
         let id = removed.id;
         let name = removed.name.clone();
-        if self.active_env_id == Some(id) {
-            self.active_env_id = None;
-        }
         for col in &mut self.collections {
-            if col.linked_env_id == Some(id) {
-                col.linked_env_id = None;
+            if col.env_id == Some(id) {
+                col.env_id = None;
             }
         }
         self.deleted_envs.push((idx, removed));
@@ -4067,38 +4091,10 @@ impl TuiApp {
         }
         self.active_theme_spec().to_theme()
     }
-    pub(crate) fn set_linked_env(&mut self, ci: usize, env_id: Option<u64>) {
-        if let Some(col) = self.collections.get_mut(ci) {
-            col.linked_env_id = if col.linked_env_id == env_id {
-                None
-            } else {
-                env_id
-            };
-            col.invalidate_request_json();
-        }
-        self.save_state();
-    }
-
-    /// Build the effective, merged [`Environment`] used for substitution in
-    /// collection `ci`: the active Global Environment's vars, overridden by
-    /// the collection's own Linked Environment's vars on any name collision
-    /// (Linked wins). `None` when neither is set.
+    /// The [`Environment`] used for substitution in collection `ci`: the one
+    /// active on that tab, or `None` when it has none.
     pub(crate) fn effective_env(&self, ci: usize) -> Option<Environment> {
-        crate::session::effective_env(&self.collections, &self.global_envs, ci, self.active_env_id)
-    }
-
-    /// Keys defined in *both* the active collection's linked Environment and
-    /// the active Global Environment — per `effective_env`'s merge rule the
-    /// linked value always wins, so these keys' Global Environment value is
-    /// silently shadowed. Used to flag such substitutions in the Request
-    /// viewer with a warning icon so the collision isn't invisible.
-    pub(crate) fn shadowed_env_keys(&self, ci: usize) -> std::collections::HashSet<String> {
-        crate::session::shadowed_env_keys(
-            &self.collections,
-            &self.global_envs,
-            ci,
-            self.active_env_id,
-        )
+        crate::session::effective_env(&self.collections, &self.global_envs, ci)
     }
 
     /// Apply the user's choice on an [`Overlay::EnvCollision`] popup,

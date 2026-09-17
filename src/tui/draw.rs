@@ -30,19 +30,10 @@ use tui_panel_select::wrapcache::TextPos;
 pub(crate) const GIT_ICON: &str = "\u{2387}";
 /// Marks an Environments panel row as coming from the open Workspace folder,
 /// as opposed to an environment loaded from anywhere else. Deliberately a
-/// single-cell BMP glyph (⌂) rather than a folder emoji — see the note on
-/// [`SHADOW_ICON`] about terminals giving emoji double-cell width.
+/// single-cell BMP glyph (⌂) rather than a folder emoji: several terminals
+/// render emoji with double-cell width even without a variation selector,
+/// which visually overlaps the very next character.
 pub(crate) const WORKSPACE_ICON: &str = "\u{2302}";
-/// Joins a collection tab to its linked Global Environment's sub-tab in the
-/// tab bar (see `draw_tabs`).
-pub(crate) const LINK_ICON: &str = "\u{1F517}";
-/// Flags a substituted `{{ VAR }}` in the Request viewer whose Global
-/// Environment value is being shadowed by the collection's linked
-/// Environment (see `TuiApp::shadowed_env_keys`). Deliberately a plain ASCII
-/// glyph rather than a Unicode symbol like ⚠ — several terminals render
-/// that one with emoji-style double-cell width even without a variation
-/// selector, which visually overlaps the very next character.
-pub(crate) const SHADOW_ICON: &str = "!";
 /// The end-of-row marker painted in a reserved rightmost column whenever a
 /// logical line is soft-wrapped by a body panel (Request/Response), so a
 /// wrapped line reads unambiguously as one line rather than several separate
@@ -2551,7 +2542,7 @@ pub(crate) fn draw_collection_left(
                 } else {
                     // The URL, with `{{ VAR }}` substituted + colour-coded by status.
                     let mut seen = SubstSeen::default();
-                    let url_spans = highlight_spans(&e.url, &smap, th, &mut seen, None, None);
+                    let url_spans = highlight_spans(&e.url, &smap, th, &mut seen);
                     // Horizontally scroll only the selected row so its full (possibly
                     // long) URL can be read with ← / →; other rows show from the start.
                     // Arrow hints appear on whichever side still has hidden text so
@@ -2627,22 +2618,28 @@ pub(crate) fn draw_collection_left(
     // No breadcrumb on either kind of tab: both draw a real expand/collapse
     // tree, so there is no single "current folder" to name — the open folders
     // are on the screen, indented, saying it better than a title could.
-    // A collection linked to a Global Environment shows that environment's
-    // name (green, joined by a link icon) in this panel's title bar, so
-    // it's visible at a glance which environment its requests will
-    // substitute from — the trailing "(v)" hints at the key that opens its
-    // full entries popup (works from any pane).
+    // A tab with an environment shows that environment's name (green) in this
+    // panel's title bar, so it's visible at a glance which environment its
+    // requests will substitute from — the trailing "(v)" hints at the key that
+    // opens the tab's full variables popup (works from any pane).
+    //
+    // Joined by a dim middot, the separator the Environment panel's own title
+    // uses. It was a 🔗 back when an environment was *linked* to a collection as
+    // a second layer over an app-wide active one, and the icon carried that
+    // relationship. There is now exactly one environment per tab and nothing to
+    // link, so the icon was naming a feature that no longer exists — and it
+    // cost two columns of a title bar that is the first thing to run out of
+    // room.
     let mut title_spans = vec![Span::styled(
         title.clone(),
         Style::default().fg(th.text).add_modifier(Modifier::BOLD),
     )];
     if let Some(env) = col
-        .linked_env_id
+        .env_id
         .and_then(|id| app.global_envs.iter().find(|e| e.id == id))
     {
-        let link_part = format!(" {LINK_ICON} ");
         let env_suffix = " (v)";
-        title_spans.push(Span::styled(link_part, Style::default().fg(th.dim)));
+        title_spans.push(Span::styled(" \u{00b7} ", Style::default().fg(th.dim)));
         title_spans.push(Span::styled(
             env.name.clone(),
             Style::default().fg(th.ok).add_modifier(Modifier::BOLD),
@@ -2652,7 +2649,7 @@ pub(crate) fn draw_collection_left(
     // The "w to browse" reminder used to be repeated here in the title bar as
     // well, on the theory that new users would notice it sooner next to the
     // folder icon. But the title already carries the collection name, the
-    // folder breadcrumb and any linked environment, so the hint was the first
+    // folder breadcrumb and the tab's environment, so the hint was the first
     // thing squeezed out — present for a short name, silently absent for a long
     // one, which is worse than consistently living in one place. It now appears
     // only on the bottom border below, where it competes with hints instead of
@@ -2671,7 +2668,6 @@ pub(crate) fn draw_collection_left(
     let hint_parts = [
         run_primary_hint.clone(),
         format!("Alt+F5 {}", s.foot_run_all),
-        format!("p {}", s.foot_env_link),
     ];
     let run_hint = fit_border_hint(&hint_parts, " \u{00b7} ", list_area.width);
     // The "F5 run" words are clickable (see `MouseHitTarget::RunRequest`), so
@@ -2799,7 +2795,9 @@ pub(crate) fn draw_collection_left(
 /// goes would shift the list under the cursor.
 fn active_env_line(app: &TuiApp, s: &Strings, th: &Theme, width: u16) -> Line<'static> {
     let active = app
-        .active_env_id
+        .collections
+        .get(app.active_tab)
+        .and_then(|c| c.env_id)
         .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
     let mut spans = vec![Span::styled(
         s.env_active_label,
@@ -2861,7 +2859,7 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // With hundreds of rows the active environment is rarely on screen, and it
     // is the one people want back most often. Announced only when something is
     // active, so the key is never advertised with nowhere to go.
-    if app.active_env_id.is_some() {
+    if app.collections[app.active_tab].env_id.is_some() {
         hint_parts.push(format!("g {}", s.foot_env_goto_active));
     }
     let title = if app.has_workspace_env_source() {
@@ -2959,7 +2957,8 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
             let env = row
                 .env_id()
                 .and_then(|id| app.global_envs.iter().find(|e| e.id == id));
-            let is_active = row.env_id().is_some() && app.active_env_id == row.env_id();
+            let tab_env = app.collections[app.active_tab].env_id;
+            let is_active = row.env_id().is_some() && tab_env == row.env_id();
             // Active: green name + a checkmark marker; git origin shows the
             // same ⎇ icon convention used elsewhere.
             let (marker, marker_fg) = if is_active {
@@ -3093,9 +3092,9 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     // Clicking the pinned line goes to the active environment's row — the
     // reason to look at it is usually to get back to it.
     if let Some(pin) = pin_area
-        && let Some(row) = rows
-            .iter()
-            .position(|r| r.env_id().is_some() && r.env_id() == app.active_env_id)
+        && let Some(row) = rows.iter().position(|r| {
+            r.env_id().is_some() && r.env_id() == app.collections[app.active_tab].env_id
+        })
     {
         app.push_mouse_hit(
             MouseLayer::Base,
@@ -3119,13 +3118,51 @@ pub(crate) fn draw_env_panel(f: &mut Frame, area: Rect, app: &TuiApp, s: &String
     }
 }
 
-/// The popup listing one [`crate::environment::Environment`]'s vars (opened
-/// via Enter on a Global Environments list row, or 'v' on a linked
-/// collection's Tabs entry) — same rendering as the old inline Environment
-/// panel: a status dot per variable (orange=loading, cyan=literal,
-/// green=loaded, red=failed), a marker column (➕ user-added, ✎ modified),
-/// and horizontal-scrolling of the selected row's `key = value` text with
-/// ‹/› arrow hints when there's more text in that direction.
+/// The popup answering "what is `{{ VAR }}` worth right now?" for the active
+/// tab (opened via Enter on a Global Environments list row, or `v` anywhere).
+///
+/// Two groups, because substitution reads two sources:
+/// [`crate::request::collection_vars`] is the environment's variables
+/// **overridden by** the tab's capture pool. The environment's rows come first
+/// and keep the Environment panel's rendering — a status dot per variable
+/// (orange=loading, cyan=literal, green=loaded, red=failed), a marker column
+/// (➕ user-added, ✎ modified), and horizontal scrolling of the selected row's
+/// `key = value` text with ‹/› arrow hints. The capture group follows, masked
+/// until `m` and not selectable: there is nothing about a capture to edit,
+/// reload or revert.
+///
+/// An environment row that a capture shadows is marked, since the value printed
+/// beside it is then *not* the one that gets sent — the popup listed exactly
+/// that misleading row, and only that row, before the capture group existed.
+/// The popup also opens with no environment at all, which the `v` key used to
+/// refuse; a tab can have captures without one.
+/// A group heading inside the Variables popup: the label centred in a hairline
+/// spanning the row.
+///
+/// Centred rather than left-aligned because the variable rows are themselves
+/// left-aligned — a label starting at the same column as the content reads as
+/// one more row of it, which is how the first version of this got lost among
+/// the variables it was introducing.
+///
+/// The rule is drawn *through* the row rather than under the label.
+/// A `ListItem`'s style is painted across the whole width of its row, so
+/// `Modifier::UNDERLINED` drew a line the full width of the popup along the
+/// bottom of the heading — a divider adrift between the heading and the values
+/// it introduces, rather than part of the heading itself.
+fn vars_group_header<'a>(label: &str, width: u16, th: &Theme) -> ListItem<'a> {
+    let rule_w = (width as usize).saturating_sub(label.chars().count() + 2);
+    let left = rule_w / 2;
+    let line = Style::default().fg(th.line);
+    ListItem::new(Line::from(vec![
+        Span::styled("\u{2500}".repeat(left), line),
+        Span::styled(
+            format!(" {label} "),
+            Style::default().fg(th.dim).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("\u{2500}".repeat(rule_w - left), line),
+    ]))
+}
+
 pub(crate) fn draw_env_popup(
     f: &mut Frame,
     app: &TuiApp,
@@ -3133,20 +3170,31 @@ pub(crate) fn draw_env_popup(
     s: &Strings,
     th: &Theme,
 ) {
-    let Some(env) = app.global_envs.iter().find(|e| e.id == popup.env_id) else {
-        return;
-    };
+    let env = app.global_envs.iter().find(|e| Some(e.id) == popup.env_id);
+    // Captures belong to a collection, and the popup is always about one tab's
+    // variables, so the pool comes from the active tab rather than from
+    // whichever environment happens to be shown.
+    let captures = app
+        .collections
+        .get(app.active_tab)
+        .map(|c| crate::vars_view::capture_rows(c, env))
+        .unwrap_or_default();
+    let vars: &[crate::environment::EnvVar] = env.map(|e| e.vars.as_slice()).unwrap_or(&[]);
     let area = centered_rect(78, 20.min(f.area().height.saturating_sub(2)), f.area());
     f.render_widget(Clear, area);
-    let title = if env.git_origin.is_some() {
-        format!("{} — {GIT_ICON} {}", s.env_heading, env.name)
-    } else {
-        format!("{} — {}", s.env_heading, env.name)
+    let title = match env {
+        Some(e) if e.git_origin.is_some() => format!("{} — {GIT_ICON} {}", s.vars_heading, e.name),
+        Some(e) => format!("{} — {}", s.vars_heading, e.name),
+        None => s.vars_heading.to_string(),
     };
-    if env.vars.is_empty() {
+    if vars.is_empty() && captures.is_empty() {
         let block = panel(title, true, th);
         let p = Paragraph::new(Line::styled(
-            s.env_no_env.to_string(),
+            if env.is_some() {
+                s.env_no_env.to_string()
+            } else {
+                s.vars_none.to_string()
+            },
             Style::default().fg(th.dim),
         ))
         .block(block)
@@ -3154,20 +3202,18 @@ pub(crate) fn draw_env_popup(
         f.render_widget(p, area);
         return;
     }
-    let sel = popup.idx.min(env.vars.len().saturating_sub(1));
+    let sel = popup.idx.min(vars.len().saturating_sub(1));
     // Columns available for the `key = value` text (after the border,
     // highlight symbol, marker and status dot); used to clamp scrolling.
     let text_w = area.width.saturating_sub(2 + 2 + 2 + 2);
     popup.scroll_w.set(text_w);
-    let sel_len = env
-        .vars
+    let sel_len = vars
         .get(sel)
         .map(|v| v.key.chars().count() + 3 + v.display_value().chars().count())
         .unwrap_or(0);
     let max_scroll = sel_len.saturating_sub((text_w as usize).saturating_sub(1));
     let hscroll = (popup.hscroll as usize).min(max_scroll);
-    let items: Vec<ListItem> = env
-        .vars
+    let mut items: Vec<ListItem> = vars
         .iter()
         .enumerate()
         .map(|(i, v)| {
@@ -3237,9 +3283,53 @@ pub(crate) fn draw_env_popup(
                 spans.push(Span::styled(" = ", Style::default().fg(th.dim)));
                 spans.push(Span::styled(shown, Style::default().fg(val_color)));
             }
+            // A capture of the same name wins over this row (see
+            // `request::collection_vars`), so the value beside it is not the one
+            // that gets sent. Saying so is the whole point of listing captures
+            // here: without the note the row is not merely incomplete, it is
+            // wrong, and it was wrong before this view existed.
+            if captures.iter().any(|c| c.shadows_env && c.key == v.key) {
+                spans.push(Span::styled(
+                    format!(" {}", s.vars_overridden),
+                    Style::default().fg(if selected { th.bg } else { th.pending }),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
+    // Width available to a group heading: the popup less its borders, the
+    // column `highlight_symbol` reserves on every row, and a matching gap on
+    // the right so the rule is inset by the same amount at both ends.
+    let group_w = area.width.saturating_sub(6);
+    // Rows above the first variable, which the selection and the mouse map both
+    // have to step over to reach it.
+    let header_rows = usize::from(!vars.is_empty());
+    if header_rows > 0 {
+        items.insert(0, vars_group_header(s.vars_group_env, group_w, th));
+    }
+    if !captures.is_empty() {
+        items.push(vars_group_header(s.vars_group_captures, group_w, th));
+        for c in &captures {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ", Style::default().fg(th.dim)),
+                // Green: a capture is a value that was resolved from a live
+                // response, which is what `SubstKind::Loaded` colours.
+                Span::styled("● ", Style::default().fg(th.ok)),
+                Span::styled(c.key.clone(), Style::default().fg(th.text)),
+                Span::styled(" = ", Style::default().fg(th.dim)),
+                Span::styled(
+                    crate::vars_view::shown_value(&c.value, popup.reveal),
+                    Style::default().fg(th.ok),
+                ),
+            ])));
+        }
+    } else if !vars.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            format!("  {}", s.vars_no_captures),
+            Style::default().fg(th.dim),
+        )));
+    }
+    let items_len = items.len();
     let list = List::new(items)
         .block(panel(title, true, th))
         // Background + bold only (no fg): patching fg would overwrite the
@@ -3248,9 +3338,14 @@ pub(crate) fn draw_env_popup(
         .highlight_symbol("› ");
     // Tagged with the environment: opening a different one shows it from the
     // top rather than wherever the last one happened to be scrolled to.
-    let var_offset =
-        app.env_var_scroll
-            .render_ctx(f, area, list, Some(sel), env.vars.len(), popup.env_id);
+    let var_offset = app.env_var_scroll.render_ctx(
+        f,
+        area,
+        list,
+        (!vars.is_empty()).then_some(sel + header_rows),
+        items_len,
+        popup.env_id.unwrap_or(0),
+    );
     app.set_mouse_layer(MouseLayer::Overlay);
     let inner = Rect {
         x: area.x.saturating_add(1),
@@ -3265,11 +3360,17 @@ pub(crate) fn draw_env_popup(
     );
     let first = var_offset;
     let visible = inner.height as usize;
-    for row in first..env.vars.len().min(first + visible) {
+    // Only the environment rows are clickable — see `on_key_env_popup`, where
+    // the selection deliberately stops at the end of them. `first` counts list
+    // items, so the group heading has to be skipped to get back to a variable.
+    for item in first..(vars.len() + header_rows).min(first + visible) {
+        let Some(var) = item.checked_sub(header_rows) else {
+            continue;
+        };
         app.push_mouse_hit(
             MouseLayer::Overlay,
-            Rect::new(inner.x, inner.y + (row - first) as u16, inner.width, 1),
-            MouseHitTarget::OverlayRow(row),
+            Rect::new(inner.x, inner.y + (item - first) as u16, inner.width, 1),
+            MouseHitTarget::OverlayRow(var),
         );
     }
 }
@@ -3300,9 +3401,6 @@ struct SubstSeen {
     undefined: bool,
     /// At least one `{{ VAR }}` is computed by the request's `# [Gen]` block.
     computed: bool,
-    /// At least one rendered substitution's Global Environment value is
-    /// being shadowed by the collection's linked Environment.
-    shadowed: bool,
 }
 
 impl SubstSeen {
@@ -3334,16 +3432,7 @@ impl SubstSeen {
 /// `{{ VAR }}` placeholder (orange = loading, red = failed / not initialised).
 /// A placeholder nothing defines keeps its braces too and is painted red.
 /// Marks `seen` with the
-/// status of every known variable that was rendered. `shadowed`, when given,
-/// flags variable names whose value from the active Global Environment is
-/// being overridden by the collection's linked Environment (see
-/// `TuiApp::shadowed_env_keys`) — such substitutions get a trailing warning
-/// icon so the collision isn't silently invisible to the user. When
-/// `icon_cols` is given, the character offset (within this call's returned
-/// spans, i.e. relative to the start of `text`) of every such warning icon
-/// is appended to it — used to strip the icon back out of copied/selected
-/// text later (see `TuiApp::main_shadow_icon_positions`), since it's a
-/// purely visual annotation that would otherwise corrupt a pasted request.
+/// status of every known variable that was rendered.
 /// Repaint a line's ordinary text without touching what `highlight_spans`
 /// deliberately coloured: a substituted `{{ var }}` keeps its status colour
 /// (that is the whole point of the legend), everything else takes `to`.
@@ -3372,11 +3461,8 @@ fn highlight_spans(
     vars: &std::collections::HashMap<String, crate::request::SubstInfo>,
     th: &Theme,
     seen: &mut SubstSeen,
-    shadowed: Option<&std::collections::HashSet<String>>,
-    mut icon_cols: Option<&mut Vec<usize>>,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut cur_len: usize = 0;
     let mut rest = text;
     while let Some(open) = rest.find("{{") {
         let Some(close_rel) = rest[open + 2..].find("}}") else {
@@ -3386,37 +3472,26 @@ fn highlight_spans(
         let end = close + 2; // just past "}}"
         let inner = rest[open + 2..close].trim();
         if open > 0 {
-            let piece = rest[..open].to_string();
-            cur_len += piece.chars().count();
-            spans.push(Span::styled(piece, Style::default().fg(th.text)));
+            spans.push(Span::styled(
+                rest[..open].to_string(),
+                Style::default().fg(th.text),
+            ));
         }
         match vars.get(inner) {
             Some(info) => {
                 seen.mark(info.kind);
                 let color = subst_color(info.kind, th);
                 match &info.shown {
-                    // Resolved: show the value in its status colour, with a
-                    // warning icon immediately before it (no gap) when this
-                    // key is shadowing/shadowed — placed on the left so it
-                    // never gets crowded out by whatever character follows
-                    // the substitution (e.g. a URL path separator).
+                    // Resolved: show the value in its status colour.
                     Some(val) => {
-                        if shadowed.is_some_and(|s| s.contains(inner)) {
-                            if let Some(cols) = icon_cols.as_deref_mut() {
-                                cols.push(cur_len);
-                            }
-                            cur_len += SHADOW_ICON.chars().count();
-                            spans.push(Span::styled(SHADOW_ICON, Style::default().fg(th.pending)));
-                            seen.shadowed = true;
-                        }
-                        cur_len += val.chars().count();
                         spans.push(Span::styled(val.clone(), Style::default().fg(color)));
                     }
                     // Unavailable: keep `{{ VAR }}` in its status colour.
                     None => {
-                        let piece = rest[open..end].to_string();
-                        cur_len += piece.chars().count();
-                        spans.push(Span::styled(piece, Style::default().fg(color)));
+                        spans.push(Span::styled(
+                            rest[open..end].to_string(),
+                            Style::default().fg(color),
+                        ));
                     }
                 }
             }
@@ -3425,10 +3500,8 @@ fn highlight_spans(
             // variable the one broken thing on screen that looked fine.
             None => {
                 seen.mark(crate::request::SubstKind::Undefined);
-                let piece = rest[open..end].to_string();
-                cur_len += piece.chars().count();
                 spans.push(Span::styled(
-                    piece,
+                    rest[open..end].to_string(),
                     Style::default().fg(subst_color(crate::request::SubstKind::Undefined, th)),
                 ));
             }
@@ -3666,7 +3739,6 @@ pub(crate) fn draw_collection_main(
         app.main_panel.clear();
         app.main_panel.set_scroll(0);
         app.main_text_area = Rect::default();
-        app.main_shadow_icon_positions.clear();
         app.main_scrollbar_area = Rect::default();
         app.push_mouse_hit(
             MouseLayer::Base,
@@ -3718,9 +3790,6 @@ pub(crate) fn draw_collection_main(
     // How each `{{ VAR }}` should be shown/coloured in the preview (secrets masked).
     let env = app.effective_env(ci);
     let dvars = crate::request::subst_map(&app.collections[ci], env.as_ref());
-    // Keys where the linked Environment's value shadows the active Global
-    // Environment's — flagged with a warning icon below.
-    let shadowed = app.shadowed_env_keys(ci);
     // `col`/`entry` borrows end here — everything needed is cloned above.
 
     let mut seen = SubstSeen::default();
@@ -3732,14 +3801,7 @@ pub(crate) fn draw_collection_main(
             .fg(method_color(&method))
             .add_modifier(Modifier::BOLD),
     )];
-    first.extend(highlight_spans(
-        &url,
-        &dvars,
-        th,
-        &mut seen,
-        Some(&shadowed),
-        None,
-    ));
+    first.extend(highlight_spans(&url, &dvars, th, &mut seen));
     first.push(Span::styled(
         format!(
             "   [ {} — {} ]",
@@ -3754,13 +3816,7 @@ pub(crate) fn draw_collection_main(
     ));
     top_lines.push(Line::from(first));
     // Build the (highlighted) JSON body; this also flags whether anything was
-    // substituted so we can show the legend. Also records, per body line,
-    // the character offset of every shadow-warning icon inserted into it
-    // (`shadow_positions`) — purely a visual annotation, so it's stripped
-    // back out of copied/selected text later (see
-    // `TuiApp::main_shadow_icon_positions`) rather than corrupting a pasted
-    // request with a stray "!".
-    let mut shadow_positions: std::collections::HashSet<TextPos> = std::collections::HashSet::new();
+    // substituted so we can show the legend.
     // A `# [Gen]` block is a section of the request that happens to be spelled
     // as comments (that is the only way the file stays runnable by `hurl`
     // itself). Colouring it like one keeps the `#` — copy this pane and you
@@ -3770,13 +3826,8 @@ pub(crate) fn draw_collection_main(
     let mut gen_rows_left = 0usize;
     let mut body_lines: Vec<Line> = buf
         .lines()
-        .enumerate()
-        .map(|(li, l)| {
-            let mut cols = Vec::new();
-            let spans = highlight_spans(l, &dvars, th, &mut seen, Some(&shadowed), Some(&mut cols));
-            for c in cols {
-                shadow_positions.insert(TextPos::new(li, c));
-            }
+        .map(|l| {
+            let spans = highlight_spans(l, &dvars, th, &mut seen);
             let marker = crate::hurl::parse_gen_marker(l).filter(|n| *n > 0);
             let row = gen_rows_left > 0 && crate::hurl::parse_gen_row(l).is_some();
             if row {
@@ -3855,18 +3906,6 @@ pub(crate) fn draw_collection_main(
             spans.push(Span::styled(
                 format!("\u{25cf} {word}"),
                 Style::default().fg(color),
-            ));
-        }
-        // Rendered with the same "!" icon used inline (not the "●" dot) so
-        // the legend visually matches the marker the user actually sees
-        // next to shadowed substitutions.
-        if seen.shadowed {
-            if !spans.is_empty() {
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(
-                format!("{SHADOW_ICON} {}", s.subst_hint_shadowed),
-                Style::default().fg(th.pending),
             ));
         }
         top_lines.push(Line::from(spans));
@@ -4079,10 +4118,9 @@ pub(crate) fn draw_collection_main(
         app.main_scrollbar_area = Rect::default();
     }
 
-    // Record the panel's Rect and shadow-icon positions so mouse selection can
-    // map coordinates back to real, copyable text — scoped to this panel only.
+    // Record the panel's Rect so mouse selection can map coordinates back to
+    // real, copyable text — scoped to this panel only.
     app.main_text_area = text_area;
-    app.main_shadow_icon_positions = shadow_positions;
     app.push_mouse_hit(
         MouseLayer::Base,
         text_area,
@@ -4188,7 +4226,7 @@ pub(crate) fn draw_response(
     // Copied out here, not read in the loading branch below: `entry` borrows
     // `app`, which that branch writes to.
     let entry_retry = entry.and_then(|e| e.retry_attempt);
-    let (status, status_text, body, error, asserts, duration, headers) =
+    let (status, status_text, body, error, asserts, duration, headers, captures) =
         match entry.and_then(|e| e.last_response.as_ref()) {
             Some(r) => (
                 r.status,
@@ -4201,6 +4239,7 @@ pub(crate) fn draw_response(
                 r.assert_results.clone(),
                 r.duration_ms,
                 r.headers.clone(),
+                r.captures.clone(),
             ),
             None => (
                 0,
@@ -4209,6 +4248,7 @@ pub(crate) fn draw_response(
                 String::new(),
                 Vec::new(),
                 None,
+                Vec::new(),
                 Vec::new(),
             ),
         };
@@ -4422,9 +4462,19 @@ pub(crate) fn draw_response(
             .collect::<Vec<_>>()
             .join("\n"),
     );
+    // What *this* request captured, last time it ran. A snapshot, not the live
+    // pool: the response keeps it for as long as the entry keeps its
+    // `last_response`, so running some other request that captures the same
+    // name leaves this figure on screen looking current. `is_superseded` is
+    // what stops it lying — the row says so rather than quietly aging. The
+    // whole pool, and what each name is worth *now*, is the `v` popup's job.
+    let (captures_shown, captures_full, captures_maps) =
+        captures_view(&captures, app.collections.get(ci), app.response_reveal, s);
+    let captures_text: Arc<str> = Arc::from(captures_shown);
     let (content, empty_note) = match app.response_section {
         ResponseSection::Body => (body.clone(), s.resp_empty_body),
         ResponseSection::Headers => (headers_text, s.resp_no_headers),
+        ResponseSection::Captures => (captures_text, s.resp_no_captures),
     };
 
     // Wrap long lines to the body width and clamp scrolling so the user can't
@@ -4451,6 +4501,16 @@ pub(crate) fn draw_response(
         app.resp_compact_line_maps = line_maps;
         app.resp_panel.set_content(Arc::from(compacted), width);
     } else {
+        // A masked Captures section is the same shape of problem as the compact
+        // body — what is on screen is not what a copy should produce — so it
+        // reuses the same two caches rather than growing a second mechanism.
+        // `captures_view` has already built both texts and the column map
+        // between them; `content` is the masked one, so only the full text and
+        // the map need publishing.
+        if app.response_section == ResponseSection::Captures && !app.response_reveal {
+            app.resp_full_body = Arc::from(captures_full);
+            app.resp_compact_line_maps = captures_maps;
+        }
         app.resp_panel.set_content(content.clone(), width);
     }
     let total_lines = app.resp_panel.total_rows().min(u16::MAX as u32) as u16;
@@ -4558,6 +4618,92 @@ pub(crate) fn draw_response(
 /// at). While the pane is unfocused the active tab is shown in plain accent
 /// rather than reverse video, so it still says which section is on view without
 /// implying the keys will reach it from wherever the cursor actually is.
+/// The Captures section's text, in both the masked form shown on screen and the
+/// unmasked form the copy paths must yield, plus the per-line column map that
+/// translates a selection made in the first into a range of the second.
+///
+/// Three returns rather than one because masking a value changes its *width*:
+/// a token of forty characters becomes eight bullets, so a selection's columns
+/// mean different things in the two texts. The map has the shape
+/// `compact_long_strings_mapped` produces — `maps[line][shown_col] = full_col`,
+/// with a past-the-end sentinel closing each line — precisely so the existing
+/// expansion path (`resp_full_selected_parts`) can consume it unchanged.
+///
+/// Mask columns are clamped to the real value's length (`min(j, len)`) rather
+/// than mapped straight through. Without the clamp a value shorter than the
+/// mask would map its later bullets past its own end, and the map would stop
+/// being non-decreasing — which is the one property a range translation needs.
+fn captures_view(
+    captures: &[(String, String)],
+    col: Option<&Collection>,
+    reveal: bool,
+    s: &Strings,
+) -> (String, String, Vec<Vec<usize>>) {
+    let mut shown = String::new();
+    let mut full = String::new();
+    let mut maps: Vec<Vec<usize>> = Vec::new();
+
+    for (i, (key, value)) in captures.iter().enumerate() {
+        if i > 0 {
+            shown.push('\n');
+            full.push('\n');
+        }
+        let mut map: Vec<usize> = Vec::new();
+        let mut full_col = 0usize;
+
+        let plain = |text: &str,
+                     shown: &mut String,
+                     full: &mut String,
+                     map: &mut Vec<usize>,
+                     full_col: &mut usize| {
+            for c in text.chars() {
+                map.push(*full_col);
+                shown.push(c);
+                full.push(c);
+                *full_col += 1;
+            }
+        };
+
+        plain(
+            &format!("{key}: "),
+            &mut shown,
+            &mut full,
+            &mut map,
+            &mut full_col,
+        );
+
+        let value_start = full_col;
+        let value_len = value.chars().count();
+        if reveal {
+            plain(value, &mut shown, &mut full, &mut map, &mut full_col);
+        } else {
+            for (j, c) in crate::environment::SECRET_MASK.chars().enumerate() {
+                map.push(value_start + j.min(value_len));
+                shown.push(c);
+            }
+            full.push_str(value);
+            full_col = value_start + value_len;
+        }
+
+        // Superseded against the *live* pool, not against anything on the
+        // response: the response's own copy is by definition what it captured.
+        if col.is_some_and(|c| crate::vars_view::is_superseded(c, key, value)) {
+            plain(
+                &format!("  ({})", s.resp_capture_superseded),
+                &mut shown,
+                &mut full,
+                &mut map,
+                &mut full_col,
+            );
+        }
+
+        map.push(full_col);
+        maps.push(map);
+    }
+
+    (shown, full, maps)
+}
+
 fn response_panel_block(app: &TuiApp, focused: bool, s: &Strings, th: &Theme) -> Block<'static> {
     let border = if focused { th.accent } else { th.line };
     let mut spans = vec![
@@ -4644,6 +4790,17 @@ pub(crate) fn draw_footer(f: &mut Frame, area: Rect, app: &TuiApp, s: &Strings, 
     // only shown) while the Response pane holds focus, on the Body section.
     if app.focus == Pane::Response && app.response_section == ResponseSection::Body {
         hint.push(format!("c {}", s.foot_compact));
+    }
+    // `m` shows or hides the captured values. Worded for the direction it is
+    // about to go, since a toggle that always reads the same says nothing about
+    // its own state.
+    if app.focus == Pane::Response && app.response_section == ResponseSection::Captures {
+        let verb = if app.response_reveal {
+            s.foot_hide
+        } else {
+            s.foot_reveal
+        };
+        hint.push(format!("m {verb}"));
     }
     // `a` builds an assert or a capture out of the reply under the cursor. It
     // is the only entry point to that palette, and a key nothing advertises is
@@ -5199,6 +5356,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("z", s.help_fold_meta),
                             ("u (List pane)", s.help_restore_request),
                             ("^r (List pane)", s.help_revert_request),
+                            ("p", s.help_prettify_body),
                             ("m (workspace, List pane)", s.help_move_request),
                             ("c (workspace, List pane)", s.help_copy_request),
                             ("c (List pane)", s.help_duplicate_request),
@@ -5238,8 +5396,8 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("g", s.help_env_goto_active),
                             ("x", s.help_env_delete),
                             ("u (Env panel)", s.help_env_reopen),
-                            ("p (List pane)", s.help_env_link),
-                            ("v", s.help_env_view_linked),
+                            ("v", s.help_env_view_vars),
+                            ("m (v popup)", s.help_reveal_captures),
                         ],
                     ),
                     (
@@ -5251,9 +5409,11 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                             ("Ctrl+C", s.help_ctrl_c),
                             ("a (Response pane)", s.help_text_probe),
                             ("c (Response pane)", s.help_compact),
+                            ("m (Captures tab)", s.help_reveal_values),
                             ("\u{2192} / i (Response pane)", s.help_response_section),
                             ("Alt+Click+Drag", s.help_multi_select),
                             ("F2", s.help_save_editor),
+                            ("Alt+P", s.help_prettify_body_wizard),
                         ],
                     ),
                     (
@@ -5333,7 +5493,7 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                     };
 
                 let mut body: Vec<Line<'static>> = Vec::new();
-                let entries: [(&str, Color, &str, &str); 5] = [
+                let entries: [(&str, Color, &str, &str); 4] = [
                     (
                         "\u{25cf}",
                         th.subst,
@@ -5358,18 +5518,12 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_label_failed,
                         s.glossary_desc_failed,
                     ),
-                    (
-                        SHADOW_ICON,
-                        th.pending,
-                        s.glossary_label_shadowed,
-                        s.glossary_desc_shadowed,
-                    ),
                 ];
                 render_group(&mut body, s.glossary_heading, &entries);
                 // A second group covers every other icon shown around the
                 // app (list rows, tab bar, form editor) so this one tab is
                 // a complete legend rather than just the substitution dots.
-                let icon_entries: [(&str, Color, &str, &str); 9] = [
+                let icon_entries: [(&str, Color, &str, &str); 8] = [
                     (
                         "\u{270e}",
                         th.accent,
@@ -5401,12 +5555,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
                         s.glossary_desc_running,
                     ),
                     (GIT_ICON, th.text, s.glossary_label_git, s.glossary_desc_git),
-                    (
-                        LINK_ICON,
-                        th.dim,
-                        s.glossary_label_linked,
-                        s.glossary_desc_linked,
-                    ),
                     (
                         FOLDER_ICON,
                         th.accent,
@@ -5926,7 +6074,6 @@ pub(crate) fn draw_overlay(f: &mut Frame, app: &mut TuiApp, s: &Strings, th: &Th
         Overlay::PostmanImport(w) => draw_postman_wizard(f, w, s, th),
         Overlay::GitSave(w) => draw_git_save_wizard_with_hits(f, w, s, th, Some(app)),
         Overlay::EnvPopup(popup) => draw_env_popup(f, app, popup, s, th),
-        Overlay::EnvLinkPicker(picker) => draw_env_link_picker(f, app, picker, s, th),
         Overlay::EnvCollision(collision) => draw_env_collision(f, collision, s, th, Some(app)),
         Overlay::WorkspacePicker(picker) => draw_workspace_picker(f, picker, s, th, Some(app)),
         Overlay::CloseGitWorkspace { path, sel, .. } => {
@@ -6116,36 +6263,6 @@ pub(crate) fn draw_env_var_form(
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(th.dim))),
         rows[3],
-    );
-}
-
-/// Picker (opened with 'p' in the Requests/List pane) to link/unlink a Global
-/// Environment to the current collection: "(none)" plus every Global
-/// Environment name, with the currently-linked one marked.
-pub(crate) fn draw_env_link_picker(
-    f: &mut Frame,
-    app: &TuiApp,
-    picker: &EnvLinkPicker,
-    s: &Strings,
-    th: &Theme,
-) {
-    let linked = app.collections.get(picker.ci).and_then(|c| c.linked_env_id);
-    let mut labels: Vec<String> = vec![s.env_link_none.to_string()];
-    labels.extend(app.global_envs.iter().map(|e| {
-        if Some(e.id) == linked {
-            format!("\u{2713} {}", e.name)
-        } else {
-            e.name.clone()
-        }
-    }));
-    let items: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    draw_menu_popup(
-        f,
-        s.env_link_picker_title,
-        &items,
-        picker.sel,
-        th,
-        Some(app),
     );
 }
 

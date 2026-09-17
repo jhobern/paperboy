@@ -153,6 +153,26 @@ fn effective_entry(
     Some(entry)
 }
 
+/// Every name a request binds for the steps after it: its `[Captures]`, and the
+/// values its `# [Gen]` rows compute.
+///
+/// One function because the two are one question, asked in four places that had
+/// drifted apart. Sorted so that a region's edge list, its dry-run listing and
+/// its diagnostics read the same from one run to the next — `captures` and
+/// `generators` are ordered, but joining two ordered lists is not a property
+/// anyone should have to re-derive at each call site.
+fn produced_names(entry: &HurlEntry) -> Vec<String> {
+    let mut out: Vec<String> = entry
+        .captures
+        .iter()
+        .map(|(c, _)| c.clone())
+        .chain(entry.generators.iter().map(|(g, _)| g.clone()))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The `USING(…)` values on a node — PaperTrail source text, so the only place
 /// a qualified reference can be written.
 fn using_values(node: &FlowNode) -> &[UsingItem] {
@@ -191,16 +211,37 @@ pub fn build(
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
 
-    // Which steps capture which names. A request's own `[Options] variable:`
-    // defaults and `# [Gen]` rows are *not* captures: they exist before it
-    // sends, so reading one implies nothing about ordering.
+    // Which steps produce which names: their captures, and the values their
+    // `# [Gen]` rows compute.
+    //
+    // A generated value is an output of the step that generated it, the same
+    // way a capture is — `validate::add_entry_captures` binds one "for its own
+    // request onwards, the same way a capture is", `run::record_generated`
+    // writes it into the flat capture chain, and `run::gate_for` gates a
+    // teardown on it. Leaving them out here was the one place that disagreed,
+    // and the disagreement was silent: a step reading `{{sid}}` from another's
+    // `# [Gen]` got no edge, so it could be ordered first and was handed only
+    // its ancestors' values — which do not include one. Outside a region the
+    // same flow works, because written order supplies what the graph forgot, so
+    // this broke the one promise the feature makes about adoption: that
+    // wrapping an existing block in `GRAPH … END` reorders sends and changes
+    // nothing else.
+    //
+    // `[Options] variable:` defaults are still not outputs: they exist before
+    // the step sends, so reading one implies nothing about ordering. A `# [Gen]`
+    // row is different — it is computed as part of *this* step's dispatch, and
+    // the value another step reads is the one this step computed.
+    //
+    // Overrides are not applied: `USING(…)` can replace what a request sends
+    // (see `effective_entry`) but there is no override target for `[Captures]`
+    // or `# [Gen]`, so what a step produces is whatever its entry says.
     let mut producers: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, step) in steps.iter().enumerate() {
         let Some(entry) = resolve_qualified(entries, helpers, &step.request) else {
             continue; // unresolvable — reported elsewhere
         };
-        for (cap, _) in &entry.captures {
-            producers.entry(cap.clone()).or_default().push(i);
+        for name in produced_names(entry) {
+            producers.entry(name).or_default().push(i);
         }
     }
 
@@ -236,8 +277,17 @@ pub fn build(
         // flow's `USING(…)` values, which are substituted before the request is
         // built and so can carry a qualified name the request itself cannot.
         let mut refs: Vec<String> = Vec::new();
-        if let Some(entry) = resolve_qualified(entries, helpers, &step.request) {
-            let mut own: Vec<String> = crate::request::entry_referenced_keys(entry)
+        // The *effective* entry, not the raw one: `USING(url = …)` and
+        // `USING(body = …)` replace their field wholesale, so a `{{VAR}}` the
+        // original held may be text this step never sends. Reading the raw entry
+        // counted it anyway, and an invented edge is not a safe
+        // over-approximation in the ordering direction — it can close a cycle,
+        // which stops the region before anything is sent, and it can make a
+        // flat name look ambiguous or drag a producer into a `--targets` run.
+        // `scope_captures` and `retain_cleanups` already ask the question this
+        // way; this was the odd one out.
+        if let Some(entry) = effective_entry(entries, helpers, &step.request, using_values(node)) {
+            let mut own: Vec<String> = crate::request::entry_referenced_keys(&entry)
                 .into_iter()
                 .collect();
             // `entry_referenced_keys` hands back a `HashSet`; sort so a
@@ -508,11 +558,9 @@ fn scope_captures(
             {
                 let reads = crate::request::entry_referenced_keys(&e);
                 out.extend(
-                    e.captures
-                        .iter()
-                        .map(|(c, _)| c)
-                        .filter(|c| !self_read_only || !reads.contains(c.as_str()))
-                        .cloned(),
+                    produced_names(&e)
+                        .into_iter()
+                        .filter(|c| !self_read_only || !reads.contains(c.as_str())),
                 );
             }
         }
@@ -607,6 +655,14 @@ fn declared_truths(flow: &ReportFlow) -> Vec<(String, Option<usize>)> {
     }
     // With no directive the columns are whatever the run produces, in
     // first-seen order — not knowable here, so every flow truth is a candidate.
+    //
+    // Sorted by header because `column_truths` hands back a `HashMap`, whose
+    // iteration order differs between iterations. `prune_to_targets` walks this
+    // list to report stranded references, so leaving it raw made a
+    // `--targets` failure print its error lines in a different order run to run
+    // — undiffable, and unsnapshottable.
+    let mut from_flow: Vec<(String, String)> = from_flow.into_iter().collect();
+    from_flow.sort();
     from_flow
         .into_iter()
         .map(|(header, t)| (t, origin.get(&header).copied()))
@@ -995,13 +1051,11 @@ pub fn prune_to_targets(
         // the wrong steps were dropped — silently, since the pruned flow is
         // never revalidated.
         for step in &plan.steps {
+            // Generated names too: a pruned step takes its `# [Gen]` values with
+            // it exactly as it takes its captures, and a teardown left reading
+            // one would be dispatched against a value nothing in the run set.
             let caps = resolve_qualified(entries, helpers, &step.request)
-                .map(|e| {
-                    e.captures
-                        .iter()
-                        .map(|(c, _)| c.clone())
-                        .collect::<Vec<_>>()
-                })
+                .map(produced_names)
                 .unwrap_or_default();
             // What survives is not tracked here: `retain_cleanups` works it out
             // per scope, from the flow as it stands once every region has been
@@ -1200,6 +1254,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&p, &p.order), ["producer", "consumer"]);
+    }
+
+    #[test]
+    fn a_generated_value_orders_the_step_that_reads_it() {
+        // A `# [Gen]` value is an output of the step that generated it. Every
+        // other subsystem already said so — `validate` binds one "the same way
+        // a capture is", `run::record_generated` writes it into the capture
+        // chain — and the graph did not, so a step reading one got no edge, ran
+        // first, and was handed a state that could not contain it.
+        let mut create = entry("create", &[], &[]);
+        create.generators.push(("sid".into(), "uuid".into()));
+        let entries = [entry("fetch", &[], &["sid"]), create];
+        let p = plan(
+            "GRAPH\n    REQUEST fetch\n    REQUEST create\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&p, &p.order),
+            ["create", "fetch"],
+            "edges={:?}",
+            p.edges
+        );
+    }
+
+    #[test]
+    fn two_steps_generating_one_name_are_ambiguous_like_two_captures() {
+        // Same rule as two captures of a name: inside a region there is no
+        // written order for last-writer-wins to mean anything by, so a flat
+        // reference with two producers has no answer and picking one would be
+        // inventing an edge nobody wrote.
+        let mut a = entry("a", &[], &[]);
+        a.generators.push(("sid".into(), "uuid".into()));
+        let mut b = entry("b", &[], &[]);
+        b.generators.push(("sid".into(), "uuid".into()));
+        let entries = [a, b, entry("fetch", &[], &["sid"])];
+        let errs = plan(
+            "GRAPH\n    REQUEST a\n    REQUEST b\n    REQUEST fetch\nEND\n",
+            &entries,
+        )
+        .expect_err("two producers of `sid` is ambiguous");
+        assert!(errs.iter().any(|e| e.contains("sid")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_step_reading_the_value_it_generates_itself_gets_no_edge() {
+        // Its own `# [Gen]` row is resolved from the block itself, so being a
+        // producer of the name must not make the step wait for itself.
+        let mut solo = entry("solo", &[], &["sid"]);
+        solo.generators.push(("sid".into(), "uuid".into()));
+        let p = plan("GRAPH\n    REQUEST solo\nEND\n", &[solo]).unwrap();
+        assert!(p.edges.is_empty(), "{:?}", p.edges);
+    }
+
+    #[test]
+    fn an_override_that_replaces_the_url_takes_its_references_with_it() {
+        // `USING(url = …)` replaces the URL wholesale, so the `{{tok}}` the
+        // original held is text this step never sends. Counting it anyway drew
+        // an edge back from `b`, which closed a cycle with the real `{{id}}`
+        // edge and stopped a perfectly orderable region before anything was
+        // sent.
+        let entries = [entry("a", &["id"], &["tok"]), entry("b", &["tok"], &["id"])];
+        let p = plan(
+            "GRAPH\n    REQUEST a USING(url = \"https://static/1\")\n    REQUEST b\nEND\n",
+            &entries,
+        )
+        .expect("nothing `a` sends reads `tok`, so there is no cycle");
+        assert_eq!(names(&p, &p.order), ["a", "b"], "edges={:?}", p.edges);
+    }
+
+    #[test]
+    fn an_override_can_introduce_a_reference_the_entry_never_held() {
+        // The other direction: the effective entry has to be read *after* the
+        // overrides, not instead of them.
+        let entries = [entry("a", &[], &[]), entry("b", &["tok"], &[])];
+        let p = plan(
+            "GRAPH\n    REQUEST a USING(url = \"https://x/{{tok}}\")\n    REQUEST b\nEND\n",
+            &entries,
+        )
+        .unwrap();
+        assert_eq!(names(&p, &p.order), ["b", "a"], "edges={:?}", p.edges);
     }
 
     #[test]

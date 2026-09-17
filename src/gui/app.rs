@@ -34,12 +34,30 @@ pub enum EditorSection {
     Code,
 }
 
+/// Which of the Environments panel's two tabs is showing.
+///
+/// The panel answers two different questions and the second one used to be
+/// squeezed into a strip along the bottom of the first, which cost the list
+/// height it could not spare. A tab gives each question the whole panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EnvPanelTab {
+    /// The environments themselves: which exist, which is bound to this tab,
+    /// and an editor for their contents.
+    #[default]
+    Environments,
+    /// Everything a request on this tab will actually substitute — the bound
+    /// environment's variables *and* the values captured from responses, in
+    /// that precedence. The terminal UI answers the same question with `v`.
+    Variables,
+}
+
 /// Which section of the response viewer (centre-bottom) is shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ResponseSection {
     Body,
     Headers,
     Asserts,
+    Captures,
 }
 
 /// A modal dialog currently shown over the main UI.
@@ -236,6 +254,26 @@ pub struct GuiApp {
     /// `"head...tail"` overview (see [`crate::shared_utils::compact_long_strings`]).
     /// Display-only: the Copy button always yields the full body.
     pub response_compact: bool,
+    /// When true, the Captures section prints its values in the clear instead
+    /// of masking them.
+    ///
+    /// Masked by default: unlike an environment variable, which is marked
+    /// secret at its source, a capture carries no such marking and is very
+    /// often a bearer token — which is what `[Captures]` is largely *for*.
+    /// Display-only, so Copy still yields the real values; a masked value
+    /// nobody could retrieve would defeat the point of listing it.
+    ///
+    /// Not persisted, deliberately: "show me the tokens" should not be a
+    /// setting that survives a restart and greets the next screen-share.
+    pub response_reveal: bool,
+    /// Capture values in the Environments panel's Variables tab are masked
+    /// until this is set, for the reason given on
+    /// [`crate::vars_view::shown_value`]. Separate from `response_reveal`: the
+    /// two views can be shown at once and revealing one is not consent to
+    /// reveal the other.
+    pub vars_reveal: bool,
+    /// Which of the Environments panel's two tabs is showing.
+    pub env_panel_tab: EnvPanelTab,
     pub dialog: Option<Dialog>,
     /// A native file/folder dialog currently open on a worker thread, with the
     /// note of what to do once it answers. See [`super::filepick`] for why a
@@ -393,6 +431,9 @@ impl GuiApp {
             editor_section: EditorSection::All,
             response_section: ResponseSection::Body,
             response_compact: false,
+            response_reveal: false,
+            vars_reveal: false,
+            env_panel_tab: EnvPanelTab::default(),
             reveal_env: None,
             reveal_selected: false,
             env_query: String::new(),
@@ -432,6 +473,9 @@ impl GuiApp {
             editor_section: EditorSection::All,
             response_section: ResponseSection::Body,
             response_compact: false,
+            response_reveal: false,
+            vars_reveal: false,
+            env_panel_tab: EnvPanelTab::default(),
             reveal_env: None,
             reveal_selected: false,
             env_query: String::new(),
@@ -976,7 +1020,7 @@ impl GuiApp {
     /// screen every time it appeared.
     ///
     /// The one exception is a loaded environment that defines them but is
-    /// neither active nor linked: that is not advice, it is the answer, and the
+    /// not active on this tab: that is not advice, it is the answer, and the
     /// list of names cannot say it.
     fn undefined_vars_banner(&mut self, ui: &mut egui::Ui) {
         let ci = self.active_ci();
@@ -1511,7 +1555,9 @@ impl GuiApp {
                 // active environment is the one thing here that stands out.
                 let env = self
                     .session
-                    .active_env_id
+                    .collections
+                    .get(self.session.active_tab)
+                    .and_then(|c| c.env_id)
                     .and_then(|id| self.session.global_envs.iter().find(|e| e.id == id));
                 match env {
                     Some(env) => ui.label(

@@ -216,7 +216,7 @@ impl EnvVar {
 /// A loaded environment (one `.vars` file). Environments now live in a single
 /// global list ([`crate::tui::app::TuiApp::global_envs`]) rather than being
 /// owned by a single [`crate::collection::Collection`] — a collection instead
-/// holds an optional `linked_env_id` referencing one of these by [`id`](Self::id),
+/// holds an optional `env_id` referencing one of these by [`id`](Self::id),
 /// and any number of collections may link the same environment.
 #[derive(Debug, Clone)]
 pub struct Environment {
