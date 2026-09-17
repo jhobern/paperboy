@@ -28,6 +28,18 @@ use crate::report::writer::{OUTPUT_EXTENSIONS, writer_for_extension};
 use crate::report::{CsvWriter, Report, ReportResult, ReportWriter};
 use crate::shared_utils::sanitize_file_stem;
 
+/// A seed for a bare `--shuffle`, from the clock.
+///
+/// Not cryptographic and not meant to be: it only has to differ between runs so
+/// that repeated runs explore different legal orders, and it is printed, which
+/// is what makes a failure reproducible.
+fn random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
 /// Run a report headlessly. Returns an OS exit code: 0 when the report was
 /// produced and every row ran cleanly, 1 on a fatal setup/validation error
 /// *or* when the run collected per-row errors. The output is still written in
@@ -43,26 +55,15 @@ use crate::shared_utils::sanitize_file_stem;
 /// report. `--dry-run` expands the flow without sending any request, and `-o`
 /// chooses the output (`-` = stdout; a path whose extension selects the format;
 /// omitted = the `# output:` format written to a `# name:`-derived file next to
-/// the report, honouring the `{time}` token). `params` are the `--param
+/// the report, honouring the `{time}` token). `outputs` is repeatable: one run
+/// renders the same result once per requested format. `params` are the `--param
 /// NAME=VALUE` values for the report's `PARAM` declarations; anything not
 /// supplied falls back to the default written in the report.
-/// A seed for a bare `--shuffle`, from the clock.
-///
-/// Not cryptographic and not meant to be: it only has to differ between runs so
-/// that repeated runs explore different legal orders, and it is printed, which
-/// is what makes a failure reproducible.
-fn random_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-}
-
 pub fn run(
     collection_path: Option<String>,
     env_paths: Vec<String>,
     report_path: String,
-    output: Option<String>,
+    outputs: Vec<String>,
     dry_run: bool,
     targets: Vec<String>,
     shuffle: Option<Option<u64>>,
@@ -70,7 +71,7 @@ pub fn run(
 ) -> i32 {
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
     // "decorative" stream, which is stderr in that case and stdout otherwise.
-    let to_stdout = output.as_deref() == Some("-");
+    let to_stdout = outputs.iter().any(|o| o == "-");
 
     // --- report ----------------------------------------------------------
     let report = match Report::load_local(&report_path) {
@@ -120,6 +121,16 @@ pub fn run(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        return 1;
+    }
+
+    // --- outputs ---------------------------------------------------------
+    // Judged before anything is loaded or sent, for the same reason the
+    // parameters above are: a mistyped format is a setup error, and finding it
+    // only once the report has been rendered would mean paying for a whole run
+    // of live requests to be told where it couldn't be written.
+    if let Err(e) = check_outputs(&outputs, &flow.header) {
+        eprintln!("error: {e}");
         return 1;
     }
 
@@ -503,17 +514,33 @@ pub fn run(
     }
 
     // --- output ----------------------------------------------------------
-    match write_output(&result, &flow.header, output.as_deref(), &report) {
-        Ok(OutputTarget::Stdout) => {
-            // The CSV already went to stdout; nothing more to print there.
+    // One run, one result, rendered once per requested format — never re-run.
+    // Each file is announced as it lands, and a failure part-way through leaves
+    // the ones already written where they are: they are faithful renderings of
+    // a run that really happened, and removing them would destroy the only
+    // record of it to tidy up after a disk that was full.
+    let requested: Vec<Option<&str>> = if outputs.is_empty() {
+        vec![None]
+    } else {
+        outputs.iter().map(|o| Some(o.as_str())).collect()
+    };
+    let mut write_failed = false;
+    for target in requested {
+        match write_output(&result, &flow.header, target, &report) {
+            Ok(OutputTarget::Stdout) => {
+                // The CSV already went to stdout; nothing more to print there.
+            }
+            Ok(OutputTarget::File(path)) => {
+                decor.line(&format!("  Output     : {}", path.display()));
+            }
+            Err(e) => {
+                eprintln!("error: cannot write output: {e}");
+                write_failed = true;
+            }
         }
-        Ok(OutputTarget::File(path)) => {
-            decor.line(&format!("  Output     : {}", path.display()));
-        }
-        Err(e) => {
-            eprintln!("error: cannot write output: {e}");
-            return 1;
-        }
+    }
+    if write_failed {
+        return 1;
     }
 
     // The report was produced either way, but a caller scripting this needs to
@@ -567,11 +594,7 @@ fn write_output(
             Ok(OutputTarget::Stdout)
         }
         Some(path) => {
-            let ext = Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("csv")
-                .to_ascii_lowercase();
+            let ext = output_extension_of(path);
             let writer = writer_for_extension(&ext).ok_or_else(|| unsupported_ext(&ext))?;
             let bytes = writer.write(result, header)?;
             fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))?;
@@ -587,6 +610,50 @@ fn write_output(
             Ok(OutputTarget::File(path))
         }
     }
+}
+
+/// Everything about `-o` that can be judged before the run, judged before it.
+///
+/// With nothing chosen the header decides, so the format it names has to exist;
+/// with `-o` given, every path must carry a format PaperTrail can write.
+fn check_outputs(outputs: &[String], header: &Header) -> Result<(), String> {
+    if outputs.is_empty() {
+        output_extension_from_header(header)?;
+        return Ok(());
+    }
+    // Two formats written to one pipe would interleave into something that is
+    // neither of them, and there is no second stdout to send the other to.
+    if outputs.iter().filter(|o| o.as_str() == "-").count() > 1 {
+        return Err("-o - was given more than once, but there is only one stdout".to_string());
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for out in outputs {
+        if out == "-" {
+            continue;
+        }
+        // Writing the same path twice means the second write destroys the
+        // first, so the run would quietly produce one file where two were
+        // asked for. Far more likely a typo in one of them than an intent.
+        if seen.contains(&out.as_str()) {
+            return Err(format!("-o {out} was given more than once"));
+        }
+        seen.push(out);
+        let ext = output_extension_of(out);
+        if writer_for_extension(&ext).is_none() {
+            return Err(unsupported_ext(&ext));
+        }
+    }
+    Ok(())
+}
+
+/// The format an output path selects: its extension, lowercased, defaulting to
+/// CSV for a path that has none.
+fn output_extension_of(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("csv")
+        .to_ascii_lowercase()
 }
 
 /// The output extension implied by a `# output:` directive: its value lowercased
@@ -726,7 +793,7 @@ mod tests {
             Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some(out.to_string_lossy().into_owned()),
+            vec![out.to_string_lossy().into_owned()],
             true, // dry-run: no HTTP
             Vec::new(),
             None,
@@ -773,7 +840,7 @@ mod tests {
                 Some(coll.to_string_lossy().into_owned()),
                 Vec::new(),
                 report.to_string_lossy().into_owned(),
-                Some(out.to_string_lossy().into_owned()),
+                vec![out.to_string_lossy().into_owned()],
                 true, // dry-run: the loop still expands, no HTTP
                 Vec::new(),
                 None,
@@ -828,7 +895,7 @@ mod tests {
             Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some(out.to_string_lossy().into_owned()),
+            vec![out.to_string_lossy().into_owned()],
             true,
             Vec::new(),
             None,
@@ -836,6 +903,146 @@ mod tests {
         );
         assert_eq!(code, 1, "an undeclared parameter is a setup error");
         assert!(!out.exists(), "nothing should be written for a refused run");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of a repeatable `-o` for an application embedding PaperBoy:
+    /// one run of the requests yields a rendering to show a user *and* a
+    /// structure to parse, instead of running the whole report twice and
+    /// hoping the two runs agree.
+    #[test]
+    fn one_run_writes_every_requested_format() {
+        let dir = temp_dir("multiout");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\n\
+             REPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let html = dir.join("out.html");
+        let json = dir.join("out.json");
+        let csv = dir.join("out.csv");
+        let code = run(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec![
+                html.to_string_lossy().into_owned(),
+                json.to_string_lossy().into_owned(),
+                csv.to_string_lossy().into_owned(),
+            ],
+            true, // dry-run: no HTTP
+            Vec::new(),
+            None,
+            ParamValues::new(),
+        );
+        assert_eq!(code, 0, "a multi-output dry run should succeed");
+
+        // Each file exists and is actually in its own format, so the extension
+        // picked the writer rather than one format being written three times.
+        let html_text = fs::read_to_string(&html).unwrap();
+        assert!(html_text.contains("<table"), "not HTML:\n{html_text}");
+        let json_text = fs::read_to_string(&json).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&json_text).is_ok(),
+            "not JSON:\n{json_text}"
+        );
+        let csv_text = fs::read_to_string(&csv).unwrap();
+        assert!(csv_text.starts_with("Status"), "not CSV:\n{csv_text}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `-o` combinations that cannot mean what they say, refused before a
+    /// single request goes out — a typo in a format should not cost a whole
+    /// run of live traffic to discover.
+    #[test]
+    fn impossible_output_combinations_are_refused_before_the_run() {
+        let dir = temp_dir("badout");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\n\
+             REPORT REQUEST Ping\n",
+        )
+        .unwrap();
+
+        let go = |outs: Vec<String>| {
+            run(
+                Some(coll.to_string_lossy().into_owned()),
+                Vec::new(),
+                report.to_string_lossy().into_owned(),
+                outs,
+                true,
+                Vec::new(),
+                None,
+                ParamValues::new(),
+            )
+        };
+
+        // There is only one stdout, and two formats down it would interleave
+        // into neither of them.
+        assert_eq!(go(vec!["-".into(), "-".into()]), 1, "two stdouts");
+
+        // The same path twice means the second write destroys the first.
+        let dup = dir.join("out.json").to_string_lossy().into_owned();
+        assert_eq!(go(vec![dup.clone(), dup.clone()]), 1, "duplicate path");
+        assert!(
+            !dir.join("out.json").exists(),
+            "a refused run writes nothing"
+        );
+
+        // A format PaperTrail can't write, alongside one it can: the good one
+        // must not be written either, or a caller gets a partial answer from a
+        // command line that was rejected.
+        let good = dir.join("fine.csv");
+        assert_eq!(
+            go(vec![
+                good.to_string_lossy().into_owned(),
+                dir.join("out.docx").to_string_lossy().into_owned(),
+            ]),
+            1,
+            "unsupported extension"
+        );
+        assert!(!good.exists(), "nothing is written for a refused run");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `-o -` mixed with files is the shape an integrator actually uses: pipe
+    /// one format onward while keeping another on disk.
+    #[test]
+    fn stdout_and_a_file_can_be_asked_for_together() {
+        let dir = temp_dir("mixedout");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\n# columns: Ping.HttpStatus as Status\n\
+             REPORT REQUEST Ping\n",
+        )
+        .unwrap();
+        let json = dir.join("out.json");
+        let code = run(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            vec!["-".into(), json.to_string_lossy().into_owned()],
+            true,
+            Vec::new(),
+            None,
+            ParamValues::new(),
+        );
+        assert_eq!(code, 0);
+        assert!(json.exists(), "the file output still lands");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -865,7 +1072,7 @@ mod tests {
                 dir.join("staging.vars").to_string_lossy().into_owned(),
             ],
             report.to_string_lossy().into_owned(),
-            Some(out.to_string_lossy().into_owned()),
+            vec![out.to_string_lossy().into_owned()],
             true, // dry-run: no HTTP, but the ENVS loop still expands per env
             Vec::new(),
             None,
@@ -909,7 +1116,7 @@ mod tests {
                 b.join("prod.vars").to_string_lossy().into_owned(),
             ],
             report.to_string_lossy().into_owned(),
-            Some("-".to_string()),
+            vec!["-".to_string()],
             true,
             Vec::new(),
             None,
@@ -934,7 +1141,7 @@ mod tests {
             Some(dir.join("missing.hurl").to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some("-".to_string()),
+            vec!["-".to_string()],
             true,
             Vec::new(),
             None,
@@ -961,7 +1168,7 @@ mod tests {
             Some(coll.to_string_lossy().into_owned()),
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some(dir.join("out.docx").to_string_lossy().into_owned()),
+            vec![dir.join("out.docx").to_string_lossy().into_owned()],
             true,
             Vec::new(),
             None,
@@ -1007,7 +1214,7 @@ mod tests {
                 Some(coll.to_string_lossy().into_owned()),
                 Vec::new(),
                 report.to_string_lossy().into_owned(),
-                Some(out.to_string_lossy().into_owned()),
+                vec![out.to_string_lossy().into_owned()],
                 true, // dry-run: no HTTP
                 Vec::new(),
                 None,
@@ -1050,7 +1257,7 @@ mod tests {
             None,       // no -c → header's `# collection:` is used
             Vec::new(), // no -e → header's `# environment:` is used
             report.to_string_lossy().into_owned(),
-            Some(out.to_string_lossy().into_owned()),
+            vec![out.to_string_lossy().into_owned()],
             true, // dry-run: no HTTP
             Vec::new(),
             None,
@@ -1077,7 +1284,7 @@ mod tests {
             None,
             Vec::new(),
             report.to_string_lossy().into_owned(),
-            Some("-".to_string()),
+            vec!["-".to_string()],
             true,
             Vec::new(),
             None,

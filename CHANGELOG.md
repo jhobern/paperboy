@@ -8,9 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Releases before 0.1.2 predate this changelog and are not recorded here.
 
 
-## [0.6.0] - 2026-09-18
+## [Unreleased]
 
 ### Added
+
+- **`-o` is repeatable: one run, several output formats.** `paperboy -r
+  report.trail -o out.html -o out.json` runs the requests **once** and renders
+  the same result to every format asked for. It is what an application
+  embedding PaperBoy needs — a rendering to drop into its own UI and a
+  structure to parse alongside it — where running the report twice risked two
+  answers that disagreed, took twice the traffic, and left no way to say which
+  was the real one. `-` may be given at most once (two formats down one pipe
+  would interleave into neither of them), the same path twice is refused as the
+  typo it almost certainly is, and every requested format is checked *before*
+  any request goes out, so a misspelled extension costs nothing rather than a
+  full run. If one file can't be written the rest are left in place and the run
+  exits `1`: they are faithful renderings of a run that really happened.
 
 - **`--param NAME=VALUE` sets a report's declared `PARAM`s from the command
   line.** Repeatable, and documented in half a dozen places already — including
@@ -316,6 +329,21 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   nothing to warn about.
 
 ### Fixed
+
+- **`--postman-import -o ./API` works again.** `-o` carried a
+  "requires `--report`" rule, so every Postman download that named a
+  destination — including the one in `--help`'s own examples — was rejected
+  before it started, with a usage message demanding a report the command has
+  nothing to do with. `-o` now accepts either headless mode and is refused only
+  when neither is present. Passing it more than once to `--postman-import` is
+  an error rather than a silent "last one wins": a single download has a single
+  destination.
+
+- **The headless runner's documentation described the wrong function.** An
+  earlier change inserted a helper into the middle of `report_cli::run`'s doc
+  comment, so the entire description of the headless entry point — arguments,
+  exit codes, output rules — was attached to a private seed generator, and
+  `run` itself was left undocumented.
 
 - **The GUI's **Compact** and **Reveal** toggles look like buttons when they are
   off.** Both were drawn with a control that frames itself only while selected,

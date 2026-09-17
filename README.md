@@ -722,6 +722,7 @@ paperboy -r report.trail                                  # collection from the 
 paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout
 paperboy -c api.hurl -e prod.vars -e staging.vars -r report.trail
 paperboy -c api.hurl -r report.trail --dry-run            # expand it, send nothing
+paperboy -r report.trail -o out.html -o out.json          # one run, several formats
 paperboy -r report.trail --param CASES_DIR=./batch-07     # set a PARAM the report declares
 ```
 
@@ -732,6 +733,16 @@ staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")
 the first is also the base variable layer. `-o`'s extension picks the format
 (`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`), `-` writes CSV to stdout, and
 omitting it derives the filename from the report's own headers.
+
+`-o` is repeatable, and every file comes from **one** run of the requests — the
+report is rendered once per format from the same result, never run twice. That
+is what an application embedding PaperBoy needs: `-o out.html -o out.json` gives
+it a rendering to show a user and a structure to parse, with no risk of the two
+disagreeing because they came from separate runs. `-` may be given at most once
+(two formats down one pipe would interleave into neither), the same path twice
+is refused as a typo, and every format is checked *before* any request is sent,
+so a misspelled extension costs nothing. If one file fails to write, the others
+are left in place and the run exits `1`.
 
 `--param NAME=VALUE` supplies a value for a `PARAM` the report declares, and is
 repeatable. It is what lets one report serve many runs: a report that declares

@@ -110,6 +110,7 @@ static AFTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 \x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.trail   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
+\x20 paperboy -r report.trail -o out.html -o out.json   One run, several formats\n\
 \x20 paperboy -r report.trail --param CASES_DIR=./batch-07   Run a report, setting a PARAM it declares\n\
 \x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
 \x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\
@@ -188,13 +189,18 @@ struct Cli {
     #[arg(long, value_name = "SEED", num_args = 0..=1, requires = "report")]
     shuffle: Option<Option<u64>>,
 
-    /// With `-r`: where to write the report output. `-` writes CSV to stdout
-    /// (for piping); a path's extension selects the format (`.csv`, `.json`,
-    /// `.html` or `.xlsx`); omitted derives the file from the report's
-    /// `# output:`/`# name:` headers (next to the report file, honouring the
-    /// `{time}` token).
-    #[arg(short = 'o', long, value_name = "FILE", requires = "report")]
-    output: Option<String>,
+    /// Where to write the output. With `-r`, **repeatable**: give it once per
+    /// format and one run writes them all from the same result — `-o
+    /// report.html -o report.json` yields a rendering to show and a structure
+    /// to parse without running the requests twice. `-` writes CSV to stdout
+    /// (for piping) and may be given at most once; a path's extension selects
+    /// the format (`.csv`, `.json`, `.html`, `.xlsx` or `.pdf`); omitted
+    /// derives a single file from the report's `# output:`/`# name:` headers
+    /// (next to the report file, honouring the `{time}` token). With
+    /// `--postman-import` it is instead the download directory, and takes one
+    /// value.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    outputs: Vec<String>,
 
     /// With `-r`: set a `PARAM` declared by the report, as `NAME=VALUE`.
     /// Repeatable, and the value wins over the default written in the `.trail`
@@ -272,15 +278,36 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    // `-o` belongs to a headless mode: `-r` writes the report there and
+    // `--postman-import` downloads into it. clap has no attribute for "requires
+    // one of these two", and the `requires = "report"` this carried instead
+    // rejected the documented `--postman-import --postman-workspace ID -o
+    // ./API` outright. Exit 2, the code clap itself uses for "you invoked me
+    // wrongly", so a caller can still tell a bad command line from a bad API.
+    if !cli.outputs.is_empty() && cli.report.is_none() && !cli.postman_import {
+        eprintln!("error: -o/--output requires -r/--report or --postman-import");
+        std::process::exit(2);
+    }
+
     // Headless Postman import (`--postman-import`): fetch a workspace over the
     // Postman API and exit. Checked before `-c`/`-r` because it produces the
     // collections those modes run, rather than running anything itself.
     if cli.postman_import {
+        // One download, one destination. Repeating `-o` is meaningful for a
+        // report (one result, several formats) and meaningless here, so it is
+        // refused rather than silently resolved to whichever came last.
+        if cli.outputs.len() > 1 {
+            eprintln!(
+                "error: --postman-import downloads into one directory, but -o was given {} times",
+                cli.outputs.len()
+            );
+            std::process::exit(2);
+        }
         std::process::exit(postman_cli::run(postman_cli::Args {
             key: cli.postman_key,
             workspace: cli.postman_workspace,
             all: cli.postman_all,
-            out: cli.output,
+            out: cli.outputs.into_iter().next(),
             what: cli.postman_what,
             base_url: cli.postman_base_url,
             format: cli.postman_format,
@@ -297,7 +324,7 @@ fn main() {
             cli.collection,
             cli.env,
             report,
-            cli.output,
+            cli.outputs,
             cli.dry_run,
             cli.targets,
             cli.shuffle,
