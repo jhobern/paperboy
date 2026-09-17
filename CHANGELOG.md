@@ -12,6 +12,29 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Added
 
+- **`--param NAME=VALUE` sets a report's declared `PARAM`s from the command
+  line.** Repeatable, and documented in half a dozen places already — including
+  the error a required parameter raises ("set it before running (--param
+  NAME=…)") — but never actually implemented: the headless runner passed an
+  empty set, so a `PARAM` could only ever take the default written in the
+  `.trail`, and one with no default made a headless run impossible. It is now
+  the answer to "one report, run against a different folder each time": a
+  caller shelling out to PaperBoy passes `--param CASES_DIR=./batch-07` and the
+  `FOR … IN FOLDERS "{{CASES_DIR}}"` loop follows, with the file left untouched.
+
+  The value beats the declared default, is split on the *first* `=` only and
+  taken verbatim afterwards (a path may contain `=` and may end in a space), and
+  is held to the declaration's own rules — a `CHOICE` must be one of its
+  options, a `NUMBER` must parse. A name the report doesn't declare is a setup
+  error naming the ones it does, rather than a value that silently does nothing:
+  the usual way a scripted command line drifts from the script it calls is that
+  a parameter gets renamed, and the run would otherwise go on quietly using the
+  default the caller believed it had replaced. Malformed arguments exit `2`
+  (clap's "you invoked me wrongly"), an undeclared name exits `1`. The values in
+  force are echoed in the run's header block, so "which folder did last night's
+  run actually look at?" is answerable from the log rather than from the calling
+  shell's history.
+
 - **`AS` now names a step on a plain `REQUEST`, not just `REPORT REQUEST`.** A
   *step* is one execution of a request, and its name — not the request's name —
   is what identifies it. `REQUEST auth/session AS sess` is now legal, and `AS`

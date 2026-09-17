@@ -109,6 +109,7 @@ static AFTER_HELP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 \x20 paperboy -c collection.hurl -e prod.vars -e staging.vars -r report.trail   Run a baseline/comparison report\n\
 \x20 paperboy -c collection.hurl -r report.trail --dry-run   Preview a report without sending anything\n\
 \x20 paperboy -c collection.hurl -r report.trail -o out.csv   Write the report to a file (- = stdout)\n\
+\x20 paperboy -r report.trail --param CASES_DIR=./batch-07   Run a report, setting a PARAM it declares\n\
 \x20 paperboy --postman-import                          List the Postman workspaces your API key can see\n\
 \x20 paperboy --postman-import --postman-workspace ID -o ./API   Download a whole Postman workspace\n\
 \x20 paperboy --postman-import --postman-all -o ./API           Download every workspace the key can see\n\n\
@@ -193,6 +194,21 @@ struct Cli {
     /// `{time}` token).
     #[arg(short = 'o', long, value_name = "FILE", requires = "report")]
     output: Option<String>,
+
+    /// With `-r`: set a `PARAM` declared by the report, as `NAME=VALUE`.
+    /// Repeatable, and the value wins over the default written in the `.trail`
+    /// file (which is never rewritten). This is what lets one report serve many
+    /// runs — `--param CASES_DIR=./batch-07` points a `FOR … IN FOLDERS
+    /// "{{CASES_DIR}}"` loop somewhere new without editing the script. A name
+    /// the report doesn't declare is an error rather than a value that silently
+    /// does nothing.
+    #[arg(
+        long = "param",
+        value_name = "NAME=VALUE",
+        value_parser = report::params::parse_assignment,
+        requires = "report"
+    )]
+    params: Vec<(String, String)>,
 
     /// Launch the native graphical UI (eframe/egui) instead of the terminal UI.
     /// Ignored in the headless modes (`-c`/`-r`). Only available when built
@@ -284,6 +300,7 @@ fn main() {
             cli.dry_run,
             cli.targets,
             cli.shuffle,
+            cli.params.into_iter().collect(),
         ));
     }
 

@@ -24,6 +24,50 @@ use crate::i18n::{Strings, fill};
 /// relabelling a parameter never orphans a value.
 pub type ParamValues = HashMap<String, String>;
 
+/// Parse one `--param NAME=VALUE` argument.
+///
+/// Split at the *first* `=` only, and the value is taken verbatim — not
+/// trimmed, not unquoted. A parameter is most often a path, and a path is
+/// exactly the kind of value that may legitimately contain an `=` or end in a
+/// space; the shell has already done the one round of quote removal there is to
+/// do, so anything further here would be this code editing the user's value
+/// behind their back. `check` trims before judging, so a padded value is still
+/// judged on what it says.
+///
+/// An empty value (`--param NAME=`) is accepted and means "empty", which is not
+/// the same as leaving the parameter out (that takes the report's default).
+pub fn parse_assignment(arg: &str) -> Result<(String, String), String> {
+    let Some((name, value)) = arg.split_once('=') else {
+        return Err(format!(
+            "expected NAME=VALUE, got `{arg}` (no `=`; e.g. --param CASES_DIR=./cases)"
+        ));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("`{arg}` has no parameter name before the `=`"));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+/// The supplied names that no `PARAM` in the report declares.
+///
+/// Worth its own error rather than a shrug: a caller scripting PaperBoy writes
+/// the `--param` line once and then never looks at it again, so a parameter
+/// renamed in the `.trail` would otherwise go on being "supplied" to nothing,
+/// and the run would quietly use the default instead of the value the caller
+/// believes it passed.
+pub fn undeclared<'a>(decls: &[&ParamDecl], chosen: &'a ParamValues) -> Vec<&'a str> {
+    let mut names: Vec<&str> = chosen
+        .keys()
+        .filter(|name| !decls.iter().any(|d| &&d.name == name))
+        .map(String::as_str)
+        .collect();
+    // A HashMap's order is arbitrary and this text is read by a human (and by
+    // tests), so it is sorted rather than left to vary run to run.
+    names.sort_unstable();
+    names
+}
+
 /// The value a parameter takes for this run, or why it can't take one.
 ///
 /// A failure is reported rather than guessed at: substituting an empty string
@@ -149,6 +193,55 @@ mod tests {
             super::super::flow::FlowNode::Param(p) => p.clone(),
             other => panic!("expected Param, got {other:?}"),
         }
+    }
+
+    /// `--param` is how a caller scripting PaperBoy points one report at a
+    /// different folder each run, so the value has to survive the trip
+    /// untouched: split on the first `=` only, and no trimming of what follows.
+    #[test]
+    fn an_assignment_keeps_everything_after_the_first_equals() {
+        assert_eq!(
+            parse_assignment("CASES_DIR=./batch-07"),
+            Ok(("CASES_DIR".to_string(), "./batch-07".to_string()))
+        );
+        // A value may hold `=` (a query string, a base64 tail) — only the first
+        // one separates.
+        assert_eq!(
+            parse_assignment("URL=https://x.test/?a=1&b=2"),
+            Ok(("URL".to_string(), "https://x.test/?a=1&b=2".to_string()))
+        );
+        // The name is trimmed (shells make that easy to do by accident); the
+        // value is not, because a path is allowed to look like anything.
+        assert_eq!(
+            parse_assignment(" CASES = /tmp/a b "),
+            Ok(("CASES".to_string(), " /tmp/a b ".to_string()))
+        );
+        // Explicitly empty is a value, and different from not passing it.
+        assert_eq!(
+            parse_assignment("CASES="),
+            Ok(("CASES".to_string(), String::new()))
+        );
+
+        assert!(parse_assignment("CASES_DIR").is_err(), "no `=`");
+        assert!(parse_assignment("=/tmp/a").is_err(), "no name");
+    }
+
+    /// A name no `PARAM` declares is reported rather than ignored: a command
+    /// line that has drifted from the script would otherwise run the report
+    /// against the default it thought it had replaced.
+    #[test]
+    fn undeclared_names_are_listed_and_declared_ones_are_not() {
+        let a = decl("PARAM FOLDER CASES = \"./x\"");
+        let b = decl("PARAM TEXT TICKET");
+        let decls = [&a, &b];
+
+        let mut chosen = ParamValues::new();
+        chosen.insert("CASES".into(), "./y".into());
+        assert!(undeclared(&decls, &chosen).is_empty());
+
+        chosen.insert("CASE_DIR".into(), "./y".into());
+        chosen.insert("AAA".into(), "1".into());
+        assert_eq!(undeclared(&decls, &chosen), vec!["AAA", "CASE_DIR"]);
     }
 
     /// A parameter with no default is the report saying "I can't run without

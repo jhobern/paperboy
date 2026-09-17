@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use crate::environment::{looks_like_env, parse_vars};
 use crate::postman::{looks_like_postman, parse_collection};
 use crate::report::flow::Header;
+use crate::report::params::{ParamValues, undeclared};
 use crate::report::producers::resolve_path;
 use crate::report::report::{expand_output_tokens, name_has_output_token};
 use crate::report::run::{DryRunner, LiveRunner, RowEvent, RunContext, finalize, run_flow_raw};
@@ -42,7 +43,9 @@ use crate::shared_utils::sanitize_file_stem;
 /// report. `--dry-run` expands the flow without sending any request, and `-o`
 /// chooses the output (`-` = stdout; a path whose extension selects the format;
 /// omitted = the `# output:` format written to a `# name:`-derived file next to
-/// the report, honouring the `{time}` token).
+/// the report, honouring the `{time}` token). `params` are the `--param
+/// NAME=VALUE` values for the report's `PARAM` declarations; anything not
+/// supplied falls back to the default written in the report.
 /// A seed for a bare `--shuffle`, from the clock.
 ///
 /// Not cryptographic and not meant to be: it only has to differ between runs so
@@ -63,6 +66,7 @@ pub fn run(
     dry_run: bool,
     targets: Vec<String>,
     shuffle: Option<Option<u64>>,
+    params: ParamValues,
 ) -> i32 {
     // stdout stays clean for a piped CSV (`-o -`); everything human goes to the
     // "decorative" stream, which is stderr in that case and stdout otherwise.
@@ -87,6 +91,37 @@ pub fn run(
     // `# collection:`/`# environment:` header fallbacks below, and (later) the
     // `# root:` producer/baseline base directory.
     let report_dir = report.path.as_deref().and_then(Path::parent);
+
+    // --- parameters ------------------------------------------------------
+    // Checked here, before anything is loaded or sent: a `--param` naming a
+    // parameter this report doesn't declare is almost always a caller whose
+    // command line has drifted from the script, and letting it through would
+    // run the whole report against the default it thought it had replaced.
+    let undeclared_params = undeclared(&flow.params(), &params);
+    if !undeclared_params.is_empty() {
+        let declared = flow.params();
+        let known = if declared.is_empty() {
+            "it declares none".to_string()
+        } else {
+            format!(
+                "it declares: {}",
+                declared
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        eprintln!(
+            "error: report '{report_path}' has no parameter named {} ({known})",
+            undeclared_params
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return 1;
+    }
 
     // --- collection ------------------------------------------------------
     // `-c` re-points the report at any collection; when omitted, fall back to
@@ -341,6 +376,19 @@ pub fn run(
     if !targets.is_empty() {
         decor.line(&format!("  Targets    : {}", targets.join(", ")));
     }
+    // Echoed for the same reason the seed below is: a report is a script's
+    // output as much as a person's, and "which folder did last night's run
+    // actually look at?" has to be answerable from the run's own log rather
+    // than from the calling shell's history. Sorted, since the values arrive
+    // as a map.
+    if !params.is_empty() {
+        let mut supplied: Vec<String> = params
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        supplied.sort();
+        decor.line(&format!("  Parameters : {}", supplied.join(", ")));
+    }
     // Printed whether or not a seed was supplied, because a shuffled run that
     // fails is only useful if it can be repeated, and the seed is the whole of
     // what has to be carried from the failing run to the reproduction.
@@ -374,7 +422,7 @@ pub fn run(
             root,
             runner: &dry,
             strings: &cli_strings,
-            params: Default::default(),
+            params: params.clone(),
             sink: None,
             shuffle,
         };
@@ -395,7 +443,7 @@ pub fn run(
                 root: root.clone(),
                 runner: &dry,
                 strings: &cli_strings,
-                params: Default::default(),
+                params: params.clone(),
                 sink: None,
                 shuffle,
             };
@@ -423,7 +471,7 @@ pub fn run(
             root,
             runner: &live,
             strings: &cli_strings,
-            params: Default::default(),
+            params,
             sink: Some(&sink),
             shuffle,
         };
@@ -682,6 +730,7 @@ mod tests {
             true, // dry-run: no HTTP
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 0, "dry run should succeed");
 
@@ -690,6 +739,103 @@ mod tests {
         assert_eq!(lines.next(), Some("Status"), "header row");
         // One projected row exists (the dry cell value is a placeholder).
         assert!(lines.next().is_some(), "one projected row expected");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of `--param` for a caller shelling out to PaperBoy: one
+    /// report, pointed at a different folder per run, without editing the
+    /// `.trail` or writing a throwaway `.vars` file. The supplied value has to
+    /// beat the declared default and reach the producer path, which is what
+    /// decides how many rows there are.
+    #[test]
+    fn a_supplied_param_repoints_a_folders_loop() {
+        let dir = temp_dir("param");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+
+        // The batch this run is about, next to a decoy the default points at.
+        let batch = dir.join("batch-07");
+        fs::create_dir_all(batch.join("case-a")).unwrap();
+        fs::create_dir_all(batch.join("case-b")).unwrap();
+        fs::create_dir_all(dir.join("empty")).unwrap();
+
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nPARAM FOLDER CASES = \"./empty\"\n\
+             FOR CASE IN FOLDERS \"{{CASES}}\"\n    REPORT CASE\n    REPORT REQUEST Ping\nEND\n",
+        )
+        .unwrap();
+
+        let run_with = |params: ParamValues, out: &Path| {
+            run(
+                Some(coll.to_string_lossy().into_owned()),
+                Vec::new(),
+                report.to_string_lossy().into_owned(),
+                Some(out.to_string_lossy().into_owned()),
+                true, // dry-run: the loop still expands, no HTTP
+                Vec::new(),
+                None,
+                params,
+            )
+        };
+
+        // The default is honoured when nothing is supplied: an empty folder,
+        // so nothing to iterate.
+        let default_out = dir.join("default.csv");
+        assert_eq!(run_with(ParamValues::new(), &default_out), 0);
+        let csv = fs::read_to_string(&default_out).unwrap();
+        assert!(
+            !csv.contains("case-a"),
+            "the declared default should still point at ./empty:\n{csv}"
+        );
+
+        // …and is beaten by the value this run was given.
+        let chosen_out = dir.join("chosen.csv");
+        let mut params = ParamValues::new();
+        params.insert("CASES".into(), batch.to_string_lossy().into_owned());
+        assert_eq!(run_with(params, &chosen_out), 0);
+        let csv = fs::read_to_string(&chosen_out).unwrap();
+        assert!(
+            csv.contains("case-a") && csv.contains("case-b"),
+            "both cases from the supplied folder expected:\n{csv}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `--param` the report doesn't declare is a caller whose command line
+    /// has drifted from the script. Running anyway would produce a full report
+    /// built from the default it believed it had replaced, so it stops.
+    #[test]
+    fn a_param_the_report_does_not_declare_is_refused() {
+        let dir = temp_dir("badparam");
+        let coll = dir.join("api.hurl");
+        fs::write(&coll, "# Ping\nGET https://example.test/ping\nHTTP *\n").unwrap();
+        let report = dir.join("r.trail");
+        fs::write(
+            &report,
+            "# name: r\n# collection: api.hurl\nPARAM FOLDER CASES = \"./empty\"\n\
+             # columns: Ping.HttpStatus as Status\nREPORT REQUEST Ping\n",
+        )
+        .unwrap();
+        let out = dir.join("out.csv");
+
+        let mut params = ParamValues::new();
+        params.insert("CASE_DIR".into(), "./whatever".into());
+        let code = run(
+            Some(coll.to_string_lossy().into_owned()),
+            Vec::new(),
+            report.to_string_lossy().into_owned(),
+            Some(out.to_string_lossy().into_owned()),
+            true,
+            Vec::new(),
+            None,
+            params,
+        );
+        assert_eq!(code, 1, "an undeclared parameter is a setup error");
+        assert!(!out.exists(), "nothing should be written for a refused run");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -723,6 +869,7 @@ mod tests {
             true, // dry-run: no HTTP, but the ENVS loop still expands per env
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 0, "a multi-env dry run should succeed");
 
@@ -766,6 +913,7 @@ mod tests {
             true,
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 1, "a duplicate env stem is a fatal setup error");
 
@@ -790,6 +938,7 @@ mod tests {
             true,
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 1, "a missing collection is a fatal setup error");
 
@@ -816,6 +965,7 @@ mod tests {
             true,
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 1, "an unsupported extension should fail");
 
@@ -861,6 +1011,7 @@ mod tests {
                 true, // dry-run: no HTTP
                 Vec::new(),
                 None,
+                ParamValues::new(),
             );
             assert_eq!(code, 0, ".{ext} output should succeed");
             let bytes = fs::read(&out).unwrap();
@@ -903,6 +1054,7 @@ mod tests {
             true, // dry-run: no HTTP
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(code, 0, "header-resolved run should succeed");
 
@@ -929,6 +1081,7 @@ mod tests {
             true,
             Vec::new(),
             None,
+            ParamValues::new(),
         );
         assert_eq!(
             code, 1,

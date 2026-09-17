@@ -703,6 +703,7 @@ paperboy -r report.trail                                  # collection from the 
 paperboy -c api.hurl -r report.trail -o out.csv           # or given explicitly; - is stdout
 paperboy -c api.hurl -e prod.vars -e staging.vars -r report.trail
 paperboy -c api.hurl -r report.trail --dry-run            # expand it, send nothing
+paperboy -r report.trail --param CASES_DIR=./batch-07     # set a PARAM the report declares
 ```
 
 Without `-c`/`-e` the report's own `# collection:` / `# environment:` headers
@@ -710,8 +711,29 @@ apply, resolved relative to the report. `-e` is repeatable: each file is named
 by its stem and becomes selectable in an `ENVS` loop, so `-e prod.vars -e
 staging.vars` satisfies `FOR … IN ENVS BASELINE("prod"), COMPARISON("staging")`;
 the first is also the base variable layer. `-o`'s extension picks the format
-(`.csv`, `.json`, `.html`, `.xlsx`), `-` writes CSV to stdout, and omitting it
-derives the filename from the report's own headers.
+(`.csv`, `.json`, `.html`, `.xlsx`, `.pdf`), `-` writes CSV to stdout, and
+omitting it derives the filename from the report's own headers.
+
+`--param NAME=VALUE` supplies a value for a `PARAM` the report declares, and is
+repeatable. It is what lets one report serve many runs: a report that declares
+
+```
+PARAM FOLDER CASES_DIR = "./cases"
+FOR CASE IN FOLDERS "{{CASES_DIR}}"
+```
+
+is pointed somewhere new with `--param CASES_DIR=./batch-07` rather than by
+editing the file — which is never rewritten, so a report under version control
+keeps meaning the same thing to everyone. The value beats the declared default,
+is checked against the declaration (a `CHOICE` must be one of its options, a
+`NUMBER` must parse), and a name the report doesn't declare is an error rather
+than a value that silently does nothing. A `PARAM` with no default *requires*
+a `--param`, since there is nothing to fall back on.
+
+Exit codes are a contract for callers: `0` ran clean, `1` a setup error or a
+run with per-row errors, `3` some steps were skipped because something they
+depended on failed, and `2` (clap's) means the command line itself was wrong.
+Progress goes to stderr, so `-o -` leaves stdout clean for a pipe.
 
 #### Dependency graphs
 
