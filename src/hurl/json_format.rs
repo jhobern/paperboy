@@ -53,11 +53,9 @@ struct Tok<'a> {
     /// grouping they meant — a formatter that flattens it is losing something
     /// the same way a formatter that drops comments is.
     breaks: usize,
-    /// Roughly the column the token started at, used only to keep the inner
-    /// shape of a multi-line block comment. Counted in bytes, so a multi-byte
-    /// character earlier on the line skews it; the cost of being wrong is a
-    /// comment indented a space or two oddly, so exactness isn't worth a
-    /// char-by-char walk.
+    /// The column the token started at, in characters, used only to keep the
+    /// inner shape of a multi-line block comment: it is the baseline each of
+    /// that comment's continuation lines is measured against.
     col: usize,
 }
 
@@ -109,7 +107,7 @@ fn tokens(src: &str) -> Vec<Tok<'_>> {
                     kind,
                     text: &src[start..i],
                     breaks,
-                    col: start - line_start,
+                    col: src[line_start..start].chars().count(),
                 });
                 breaks = 0;
             }
@@ -124,7 +122,7 @@ fn tokens(src: &str) -> Vec<Tok<'_>> {
             kind,
             text,
             breaks,
-            col: a - line_start,
+            col: src[line_start..a].chars().count(),
         });
         breaks = 0;
         // A block comment or a template may carry newlines of its own, and the
@@ -191,7 +189,7 @@ fn lay_out(toks: &[Tok<'_>]) -> String {
                 out.push_str(&INDENT.repeat(depth));
             }
         }
-        write_token(&mut out, t, depth);
+        write_token(&mut out, t);
         if t.kind == Kind::Open {
             depth += 1;
         }
@@ -205,13 +203,24 @@ fn lay_out(toks: &[Tok<'_>]) -> String {
 /// whitespace matters, because moving only its first line leaves the rest
 /// hanging where the old indent used to be. Each continuation line keeps
 /// however much further it was indented than the opening `/*`, so the column
-/// of stars stays a column of stars at the new depth.
-fn write_token(out: &mut String, t: &Tok<'_>, depth: usize) {
+/// of stars stays a column of stars wherever that `/*` has been moved to.
+///
+/// Where it has moved to is read back off `out`, not assumed to be the indent
+/// for the current depth. A comment trailing a value (`"a": 1, /* … */`) is
+/// laid out with [`Gap::Space`], so its `/*` lands wherever the previous token
+/// ended — nowhere near the line's indent. Padding those continuation lines to
+/// the depth instead would move them by a different amount on every pass,
+/// damaging text that was already correctly formatted and only settling once
+/// the two baselines happened to coincide.
+fn write_token(out: &mut String, t: &Tok<'_>) {
     if t.kind != Kind::BlockComment || !t.text.contains('\n') {
         out.push_str(t.text);
         return;
     }
-    let pad = INDENT.repeat(depth);
+    // The column `/*` is about to land on, counted the same way as `t.col` so
+    // the two are comparable.
+    let line_start = out.rfind('\n').map_or(0, |nl| nl + 1);
+    let open_col = out[line_start..].chars().count();
     let mut lines = t.text.split('\n');
     if let Some(first) = lines.next() {
         out.push_str(first);
@@ -222,9 +231,9 @@ fn write_token(out: &mut String, t: &Tok<'_>, depth: usize) {
         if body.is_empty() {
             continue;
         }
+        // Leading whitespace is ASCII, so its byte length is its width.
         let extra = (line.len() - body.len()).saturating_sub(t.col);
-        out.push_str(&pad);
-        out.push_str(&" ".repeat(extra));
+        out.push_str(&" ".repeat(open_col + extra));
         out.push_str(body);
     }
 }
@@ -493,6 +502,7 @@ mod tests {
             "{\"n\":{{ COUNT }}}",
             "[1,2,3]",
             "{\n/* one\n * two\n */\n\"a\":1}",
+            "{\n\"a\":1, /* one\n       * two\n       */\n\"b\":2}",
         ] {
             let once = pretty(src);
             assert_eq!(
@@ -501,6 +511,30 @@ mod tests {
                 "second pass moved it: {once}"
             );
         }
+    }
+
+    /// A block comment that trails a value does not start its own line, so its
+    /// `/*` sits wherever the value ended — not at the line's indent. Its
+    /// continuation lines have to be measured against *that*, or an already
+    /// tidy body is damaged the first time the key is pressed.
+    #[test]
+    fn a_trailing_block_comment_keeps_its_column_of_stars() {
+        let out = pretty("{\n\"a\":1, /* one\n       * two\n       */\n\"b\":2}");
+        assert_eq!(
+            out,
+            "{\n  \"a\": 1, /* one\n          * two\n          */\n  \"b\": 2\n}"
+        );
+        // The stars line up under the `/*` they belong to.
+        let col = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap()
+                .find(needle)
+        };
+        assert_eq!(col("/*"), col("* two"));
+        assert_eq!(col("/*"), col("*/"));
+        // And a body already in that shape is left alone rather than shifted.
+        assert_eq!(prettify_json(&out), Prettified::Unchanged);
     }
 
     /// The cursor has to survive the reflow, or prettifying a long body means

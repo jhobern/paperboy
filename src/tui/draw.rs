@@ -4629,6 +4629,13 @@ pub(crate) fn draw_response(
 /// with a past-the-end sentinel closing each line — precisely so the existing
 /// expansion path (`resp_full_selected_parts`) can consume it unchanged.
 ///
+/// One entry per rendered *line*, which is not one entry per capture: a value
+/// may carry newlines of its own (a PEM, or a whole captured body) and then
+/// spans several lines. Since the expansion path looks the map up by line and
+/// keeps the line number, folding those into a single entry would translate
+/// every selection made below a multi-line value against the wrong capture —
+/// copying a neighbour's value instead of the one under the cursor.
+///
 /// Mask columns are clamped to the real value's length (`min(j, len)`) rather
 /// than mapped straight through. Without the clamp a value shorter than the
 /// mask would map its later bullets past its own end, and the map would stop
@@ -4639,68 +4646,76 @@ fn captures_view(
     reveal: bool,
     s: &Strings,
 ) -> (String, String, Vec<Vec<usize>>) {
-    let mut shown = String::new();
-    let mut full = String::new();
-    let mut maps: Vec<Vec<usize>> = Vec::new();
+    let mut rows: Vec<(String, String, Vec<usize>)> = Vec::new();
 
-    for (i, (key, value)) in captures.iter().enumerate() {
-        if i > 0 {
-            shown.push('\n');
-            full.push('\n');
-        }
-        let mut map: Vec<usize> = Vec::new();
-        let mut full_col = 0usize;
+    for (key, value) in captures {
+        let label = format!("{key}: ");
+        let label_w = label.chars().count();
+        let mut shown = label.clone();
+        let mut full = label;
+        // The label reads the same in both texts, so it maps to itself.
+        let mut map: Vec<usize> = (0..label_w).collect();
+        let mut full_col = label_w;
 
-        let plain = |text: &str,
-                     shown: &mut String,
-                     full: &mut String,
-                     map: &mut Vec<usize>,
-                     full_col: &mut usize| {
-            for c in text.chars() {
-                map.push(*full_col);
-                shown.push(c);
-                full.push(c);
-                *full_col += 1;
+        for (i, line) in value.split('\n').enumerate() {
+            if i > 0 {
+                map.push(full_col);
+                rows.push((
+                    std::mem::take(&mut shown),
+                    std::mem::take(&mut full),
+                    std::mem::take(&mut map),
+                ));
+                full_col = 0;
+                if !reveal {
+                    // Indent the continuation under the first run of bullets,
+                    // so it still reads as this capture's value rather than as
+                    // a nameless second entry. Only while masked: a revealed
+                    // value is copied straight off the panel, and padding it
+                    // would put spaces into the clipboard that were never in
+                    // the response.
+                    shown.push_str(&" ".repeat(label_w));
+                    map.resize(label_w, 0);
+                }
             }
-        };
-
-        plain(
-            &format!("{key}: "),
-            &mut shown,
-            &mut full,
-            &mut map,
-            &mut full_col,
-        );
-
-        let value_start = full_col;
-        let value_len = value.chars().count();
-        if reveal {
-            plain(value, &mut shown, &mut full, &mut map, &mut full_col);
-        } else {
-            for (j, c) in crate::environment::SECRET_MASK.chars().enumerate() {
-                map.push(value_start + j.min(value_len));
-                shown.push(c);
+            let start = full_col;
+            let len = line.chars().count();
+            if reveal {
+                shown.push_str(line);
+                full.push_str(line);
+                map.extend(start..start + len);
+            } else {
+                for (j, c) in crate::environment::SECRET_MASK.chars().enumerate() {
+                    map.push(start + j.min(len));
+                    shown.push(c);
+                }
+                full.push_str(line);
             }
-            full.push_str(value);
-            full_col = value_start + value_len;
+            full_col = start + len;
         }
 
         // Superseded against the *live* pool, not against anything on the
         // response: the response's own copy is by definition what it captured.
         if col.is_some_and(|c| crate::vars_view::is_superseded(c, key, value)) {
-            plain(
-                &format!("  ({})", s.resp_capture_superseded),
-                &mut shown,
-                &mut full,
-                &mut map,
-                &mut full_col,
-            );
+            for c in format!("  ({})", s.resp_capture_superseded).chars() {
+                map.push(full_col);
+                shown.push(c);
+                full.push(c);
+                full_col += 1;
+            }
         }
-
         map.push(full_col);
-        maps.push(map);
+        rows.push((shown, full, map));
     }
 
+    let join = |pick: fn(&(String, String, Vec<usize>)) -> &String| {
+        rows.iter()
+            .map(|r| pick(r).as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let shown = join(|r| &r.0);
+    let full = join(|r| &r.1);
+    let maps = rows.into_iter().map(|r| r.2).collect();
     (shown, full, maps)
 }
 

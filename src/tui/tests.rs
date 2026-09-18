@@ -5960,6 +5960,49 @@ fn p_works_from_the_main_panel_too() {
     assert_eq!(body_of(&app), Some("{\n  \"a\": 1\n}"));
 }
 
+/// The Request JSON preview is cached per selected entry, so rewriting the
+/// body underneath it leaves the pane drawing the old text while the status
+/// bar claims a reformat — worst for exactly the bodies this key exists for,
+/// where the preview carries the raw source because it will not parse.
+#[test]
+fn p_refreshes_the_request_json_preview_it_just_invalidated() {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    // A commented body: `build_request_json` cannot parse it, so it embeds the
+    // source verbatim and the reformat is visible in the preview.
+    let mut app = app_with_body("{\"a\":1, // note\n\"b\":2}");
+    app.default_request_view = RequestView::Json;
+    app.focus = Pane::List;
+    let ci = app.active_tab;
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    assert!(
+        app.collections[ci]
+            .request_json_buf
+            .contains("{\\\"a\\\":1,"),
+        "the preview starts out holding the unformatted source: {:?}",
+        app.collections[ci].request_json_buf
+    );
+
+    press(&mut app, KeyCode::Char('p'));
+    assert!(
+        app.collections[ci].request_json_for.is_none(),
+        "the cached preview must be marked stale by the rewrite"
+    );
+
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let buf = &app.collections[ci].request_json_buf;
+    assert!(
+        buf.contains("\\\"a\\\": 1,"),
+        "the redraw must show the reformatted body: {buf:?}"
+    );
+    assert!(
+        !buf.contains("{\\\"a\\\":1,"),
+        "and not still the old one: {buf:?}"
+    );
+}
+
 /// Silence would read as a broken key. Both "nothing to do" cases say what
 /// they did, and neither touches the body.
 #[test]
@@ -32791,6 +32834,114 @@ fn copying_the_captures_section_yields_the_real_values() {
     assert!(
         !copied.contains(crate::environment::SECRET_MASK),
         "the bullets are a view, not the text: {copied:?}"
+    );
+}
+
+/// The same bargain for a *partial* selection. `y` with nothing selected and a
+/// drag-select-and-copy must agree, and neither may depend on whether the user
+/// happened to leave the Body section's compact toggle on — same gesture, same
+/// screen, same text.
+#[test]
+fn dragging_across_a_masked_capture_copies_the_real_value() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_captures(&[("access_token", "ey.super.secret")]);
+    app.focus = Pane::Response;
+    assert!(!app.response_compact, "the Body toggle is off, as it ships");
+
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+    assert!(area.width > 20 && area.height > 0, "captures must render");
+
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+
+    // On screen the drag covered bullets...
+    let shown = app.resp_panel.selected_parts(None).join("");
+    assert!(
+        shown.contains(crate::environment::SECRET_MASK),
+        "the on-screen selection is masked: {shown:?}"
+    );
+    // ...but the clipboard gets the token.
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert!(
+        copied.contains("ey.super.secret"),
+        "a drag-copy must yield what a whole-panel copy yields: {copied:?}"
+    );
+    assert!(
+        !copied.contains(crate::environment::SECRET_MASK),
+        "the bullets are a view, not the text: {copied:?}"
+    );
+}
+
+/// A captured value can carry newlines of its own — a PEM, or a whole response
+/// body — and then takes several rows on screen. The column map is read per
+/// row, so a capture that folded its rows into one entry would send every
+/// selection below it to the wrong value: dragging `token` used to copy a
+/// fragment of the PEM above it.
+#[test]
+fn a_multi_line_capture_does_not_misdirect_the_rows_below_it() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let mut app = app_with_captures(&[
+        ("pem", "-----BEGIN-----\nmiddle\n-----END-----"),
+        ("token", "abc123"),
+    ]);
+    app.focus = Pane::Response;
+
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let area = app.resp_text_area;
+
+    // Masked, the value takes one run of bullets per line, indented under the
+    // first so it still reads as one capture.
+    let lines = response_lines(&mut app);
+    let mask = crate::environment::SECRET_MASK;
+    assert_eq!(lines[0], format!("pem: {mask}"));
+    assert_eq!(lines[1], format!("     {mask}"));
+    assert_eq!(lines[2], format!("     {mask}"));
+    assert_eq!(lines[3], format!("token: {mask}"));
+
+    // Dragging the `token` row copies the token, not a slice of the PEM.
+    let ev = |kind, col: u16| MouseEvent {
+        kind,
+        column: area.x + col,
+        row: area.y + 3,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 0));
+    app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), area.width - 1));
+    app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), area.width - 1));
+    let copied = app
+        .concatenated_selection_text()
+        .expect("a Response selection should copy something");
+    assert!(
+        copied.contains("abc123") && !copied.contains("middle"),
+        "the row under the cursor is the one that gets copied: {copied:?}"
+    );
+
+    // Revealed, the value is copied straight off the panel, so it must not
+    // have gained the indentation the masked view draws.
+    press(&mut app, KeyCode::Char('m'));
+    term.draw(|f| super::draw::draw(f, &mut app)).unwrap();
+    let copied = app
+        .whole_panel_text(Pane::Response)
+        .expect("the panel has text to copy");
+    assert!(
+        copied.contains("-----BEGIN-----\nmiddle\n-----END-----"),
+        "the PEM must survive verbatim: {copied:?}"
     );
 }
 

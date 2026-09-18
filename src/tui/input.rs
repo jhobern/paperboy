@@ -1358,6 +1358,20 @@ impl TuiApp {
         }
     }
 
+    /// Whether what the Response panel is *showing* differs from what a copy
+    /// of it should *produce* — the two cases where `draw` publishes
+    /// `resp_full_body` / `resp_compact_line_maps` alongside the panel's own
+    /// content.
+    ///
+    /// Both copy paths — whole-panel ([`Self::whole_panel_text`]) and
+    /// drag-selection ([`Self::resp_full_selected_parts`]) — have to agree on
+    /// this, or the same gesture on the same screen would yield different
+    /// text depending on whether an unrelated toggle happened to be on.
+    fn resp_text_is_abridged(&self) -> bool {
+        self.response_compact
+            || (self.response_section == ResponseSection::Captures && !self.response_reveal)
+    }
+
     /// The entire (unscrolled, unwrapped) text of whichever of Main
     /// (Request JSON) / Response `pane` is — `None` if that panel is
     /// neither, has no content cached yet, or is simply empty. Backs the
@@ -1373,11 +1387,7 @@ impl TuiApp {
         // A masked Captures section is the same bargain — bullets on screen,
         // real values on the clipboard — and caches the same two fields, so one
         // condition covers both.
-        let masked_captures =
-            self.response_section == ResponseSection::Captures && !self.response_reveal;
-        if pane == Pane::Response
-            && (self.response_compact || masked_captures)
-            && !self.resp_full_body.is_empty()
+        if pane == Pane::Response && self.resp_text_is_abridged() && !self.resp_full_body.is_empty()
         {
             return Some(self.resp_full_body.to_string());
         }
@@ -1469,9 +1479,10 @@ impl TuiApp {
         // In the Response pane's compact overview, a drag selects *shortened*
         // text — but a copy must still yield the untruncated values, so expand
         // the selection back through the compaction map (see
-        // `resp_full_selected_parts`). Outside compact mode there's nothing to
-        // expand and we take the panel's own extracted text directly.
-        if self.response_compact {
+        // `resp_full_selected_parts`). A masked Captures section is abridged
+        // the same way and expands through the same map. Outside both there's
+        // nothing to expand and we take the panel's own extracted text.
+        if self.resp_text_is_abridged() {
             parts.extend(self.resp_full_selected_parts());
         } else {
             parts.extend(self.resp_panel.selected_parts(None));
@@ -4349,6 +4360,14 @@ impl TuiApp {
             Prettified::Changed(text) => {
                 entry.body_src = Some(text);
                 entry.mark_edited();
+                if let Some(col) = self.collections.get_mut(ci) {
+                    col.invalidate_request_json();
+                }
+                // The Request JSON preview is cached per selected entry and is
+                // not rebuilt while the selection stays put, so without this
+                // the Main pane keeps drawing the pre-format body — visibly so
+                // for the bodies this feature exists for, where the preview
+                // embeds the raw source because it won't parse.
                 self.status = Some(Status::BodyPrettified);
                 self.save_state();
             }
