@@ -764,7 +764,7 @@ fn probe_builder_dialog(
 ) {
     let title = app.strings.gui_probe_title;
     let l = ProbeLabels::new(app);
-    let strings = crate::i18n::Strings::for_language(&app.session.language);
+    let strings = crate::i18n::Strings::mapped(&app.session.language, super::icons::drawable);
     let (dim, err, accent, text) = (
         app.theme.dim,
         app.theme.err,
@@ -2734,7 +2734,7 @@ fn theme_dialog(app: &mut GuiApp, ctx: &egui::Context, mut state: ThemeEditState
         Cancel,
         Apply,
     }
-    let strings = Strings::for_language(&app.session.language);
+    let strings = Strings::mapped(&app.session.language, super::icons::drawable);
     let title = app.strings.gui_theme_editor_title;
     let lbl_name = app.strings.gui_name;
     let lbl_apply = app.strings.gui_apply;

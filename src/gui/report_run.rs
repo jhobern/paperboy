@@ -246,7 +246,7 @@ pub fn spawn(inputs: ReportRunInputs) -> RunHandle {
             language,
             params,
         } = inputs;
-        let strings = crate::i18n::Strings::for_language(&language);
+        let strings = crate::i18n::Strings::mapped(&language, super::icons::drawable);
 
         // 1. Skeleton: expand with no HTTP to get the full canonical row set up
         //    front. Its rows map 1:1 (by `path`) to the live rows the sink will

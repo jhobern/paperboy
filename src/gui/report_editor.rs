@@ -759,7 +759,7 @@ impl ReportEditor {
             self.report.path.as_deref(),
         ) {
             Ok(inputs) => {
-                let strings = Strings::for_language(&app.session.language);
+                let strings = Strings::mapped(&app.session.language, super::icons::drawable);
                 let ctx = RunContext {
                     entries: &inputs.entries,
                     helpers: &inputs.helpers,
@@ -2992,7 +2992,7 @@ fn show_param_modal(ed: &mut ReportEditor, app: &mut GuiApp, ctx: &egui::Context
     let th = app.theme;
     // A copy of its own, so the app is free to be borrowed mutably for the file
     // picker at the end without the form's own words going out of scope.
-    let s = Strings::for_language(&app.session.language);
+    let s = Strings::mapped(&app.session.language, super::icons::drawable);
     let rows = ed.param_rows(&s);
     let envs: Vec<String> = app
         .session

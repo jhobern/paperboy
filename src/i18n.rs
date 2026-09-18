@@ -36,6 +36,20 @@ macro_rules! strings {
                 }
             }
 
+            /// Every row, with `fix` applied to each.
+            ///
+            /// The GUI uses this so that a character the terminal UI renders
+            /// happily but egui's fonts cannot draw is swapped for an icon
+            /// *once, centrally* (see `gui::icons::drawable`). Doing it here
+            /// rather than at the call sites is the whole point: there are
+            /// several hundred call sites and only one constructor, so this is
+            /// the only place that can promise it happened to every string.
+            #[cfg(feature = "gui")]
+            pub fn mapped(lang: &Language, fix: fn(&'static str) -> &'static str) -> Self {
+                let s = Self::for_language(lang);
+                Self { $($field: fix(s.$field),)* }
+            }
+
             /// Every row of the table, as (name, English, French, Danish), so a
             /// test can hold the whole table to a rule. There is no other way
             /// to look at every string: the table is a struct of fields, and a

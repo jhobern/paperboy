@@ -350,6 +350,17 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **Three GUI labels drew tofu boxes where an icon belonged.** "＋ Add assert"
+  and "＋ Add capture" used a full-width plus (U+FF0B), and the Postman key
+  help said "Settings → API keys" with an arrow (U+2192); egui's bundled fonts
+  carry none of the three. Rather than patch three rows, the GUI now maps
+  every string it shows through a substitution table that swaps a character no
+  bundled font can draw for the icon that means the same thing. The shared
+  string table is untouched, so the terminal UI keeps the plain characters —
+  a terminal renders them from the user's own font. A test sweeps the whole
+  table, in all three languages, and fails if any string reaches the GUI
+  carrying a character it cannot draw, so this class of bug cannot come back.
+
 - **A multi-line value in the GUI's report results grid showed a tofu box.**
   A cell that has to fit a response body onto one row marks each collapsed
   line break with a symbol, and that symbol was `⏎` (U+23CE) — which none of

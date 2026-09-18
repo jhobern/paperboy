@@ -1130,8 +1130,13 @@ mod tests {
     use crate::postman_import::{ImportPlan, WorkspacePlan};
     use crate::session::Session;
 
+    /// Built the way the GUI builds its own strings, so tests that compare an
+    /// expected string against painted text are comparing like with like. The
+    /// GUI swaps characters no bundled font can draw for Phosphor icons (see
+    /// [`crate::gui::icons::drawable`]), so `postman_key_help_paste`'s arrow —
+    /// and anything else that gets substituted — differs from the raw table.
     fn s() -> Strings {
-        Strings::for_language(&Language::English)
+        Strings::mapped(&Language::English, crate::gui::icons::drawable)
     }
 
     fn a_workspace(name: &str, id: &str) -> WorkspaceSummary {

@@ -423,7 +423,7 @@ impl GuiApp {
 
         let session = Session::restored();
         let session_view_is_hurl = session.default_request_view == RequestView::Hurl;
-        let strings = Strings::for_language(&session.language);
+        let strings = Strings::mapped(&session.language, super::icons::drawable);
         let theme = GuiTheme::from_spec(&session.active_theme_spec());
         let mut app = Self {
             session,
@@ -465,7 +465,7 @@ impl GuiApp {
     /// context and it restores the *real* user's session from disk.
     #[cfg(test)]
     pub(crate) fn for_test(session: Session) -> Self {
-        let strings = Strings::for_language(&session.language);
+        let strings = Strings::mapped(&session.language, super::icons::drawable);
         let theme = GuiTheme::from_spec(&session.active_theme_spec());
         Self {
             session,
@@ -1634,7 +1634,7 @@ impl GuiApp {
         let spec = self.session.active_theme_spec();
         self.theme = GuiTheme::from_spec(&spec);
         self.theme.apply(&ctx);
-        self.strings = Strings::for_language(&self.session.language);
+        self.strings = Strings::mapped(&self.session.language, super::icons::drawable);
 
         // Drain background work (secret resolution, captures, Run All) and keep
         // animating while anything is in flight.
