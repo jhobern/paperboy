@@ -350,6 +350,14 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
 
 ### Fixed
 
+- **A multi-line value in the GUI's report results grid showed a tofu box.**
+  A cell that has to fit a response body onto one row marks each collapsed
+  line break with a symbol, and that symbol was `⏎` (U+23CE) — which none of
+  the fonts egui bundles carries, so what the grid actually drew was an empty
+  rectangle. It now uses a glyph from the icon font the rest of the GUI draws
+  from. The terminal UI is unaffected and keeps `⏎`: a terminal's own font has
+  it.
+
 - **The GUI's status dots rendered as empty boxes.** The coloured dot beside
   each entry in the substitution legend asked for `●` (U+25CF). Of the fonts
   egui bundles only Hack carries that character, Hack is the *monospace*

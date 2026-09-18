@@ -92,3 +92,9 @@ pub const PREVIEW: &str = p::EYE;
 /// shares the row's right-hand gutter with the pass/fail run marks and a dot
 /// there reads as "queued" (see [`ROW_SCHEDULED`]).
 pub const EDITED: &str = p::PENCIL_SIMPLE;
+/// Stands in for a newline that was collapsed to fit a value onto one row of
+/// the report results grid. The obvious `⏎` (U+23CE) is a tofu box here — no
+/// font egui bundles carries it, and unlike the dots in [`super::widgets`]
+/// this one sits *inside* a run of text, so it can't be painted around. The
+/// terminal UI keeps `⏎`, which a terminal font does have.
+pub const CELL_NEWLINE: &str = p::ARROW_ELBOW_DOWN_LEFT;

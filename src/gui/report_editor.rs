@@ -5460,7 +5460,9 @@ fn pretty_json_cell(raw: &str) -> String {
 /// Collapse a cell's newlines to a single line (a response body can be huge).
 fn flatten_cell(value: &str) -> String {
     if value.contains(['\n', '\r']) {
-        value.replace("\r\n", "⏎").replace(['\n', '\r'], "⏎")
+        value
+            .replace("\r\n", super::icons::CELL_NEWLINE)
+            .replace(['\n', '\r'], super::icons::CELL_NEWLINE)
     } else {
         value.to_string()
     }
@@ -15199,5 +15201,64 @@ mod chip_spacing_tests {
             gap > 1.0,
             "the label and the box beside it must not touch (gap {gap})"
         );
+    }
+}
+
+#[cfg(test)]
+mod flatten_cell_tests {
+    use super::*;
+
+    /// Lay a string out the way a grid cell does and report whether the font
+    /// stack actually had a glyph for every character. egui substitutes a
+    /// "tofu" replacement glyph when it doesn't, and — crucially — does so
+    /// silently: the code looks right, the layout is the right width, and only
+    /// a human looking at the screen ever finds out.
+    fn every_character_has_a_glyph(text: &str) -> bool {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Light);
+        ctx.set_fonts(fonts);
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(400.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        ctx.fonts_mut(|f| {
+            let font = egui::FontId::new(14.0, egui::FontFamily::Proportional);
+            text.chars().all(|c| f.has_glyph(&font, c))
+        })
+    }
+
+    /// The marker that stands in for a collapsed newline used to be `⏎`
+    /// (U+23CE), which no font egui bundles carries — so every multi-line cell
+    /// in the results grid showed a tofu box where the marker should be.
+    #[test]
+    fn a_collapsed_newline_is_marked_with_something_the_font_can_draw() {
+        let flattened = flatten_cell("first\nsecond\r\nthird\rfourth");
+        assert!(
+            !flattened.contains(['\n', '\r']),
+            "the cell still has line breaks in it: {flattened:?}"
+        );
+        assert_eq!(
+            flattened.matches(crate::gui::icons::CELL_NEWLINE).count(),
+            3,
+            "each break is marked exactly once, and \\r\\n counts as one: {flattened:?}"
+        );
+        assert!(
+            every_character_has_a_glyph(&flattened),
+            "the grid cannot draw {flattened:?} — it will show tofu boxes"
+        );
+    }
+
+    /// A value with nothing to collapse must come through untouched: the
+    /// marker is a repair for a line break, not decoration.
+    #[test]
+    fn a_single_line_cell_is_left_exactly_as_it_was() {
+        assert_eq!(flatten_cell("200 OK"), "200 OK");
     }
 }
