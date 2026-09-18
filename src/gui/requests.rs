@@ -63,12 +63,24 @@ fn clickable_row(
     drawn.inner | hit
 }
 
-fn run_marker(status: RunStatus) -> (&'static str, bool) {
+/// Paint a request row's run marker into the current layout.
+///
+/// A [`RunStatus::Running`] row gets the turning icon rather than a still one:
+/// a request the app is waiting on is the one case where the marker is
+/// reporting *ongoing* work rather than an outcome, and a motionless spinner
+/// glyph reads as neither (see [`super::widgets::spinning_icon`]).
+fn paint_run_marker(ui: &mut egui::Ui, status: RunStatus, theme: &GuiTheme) {
     match status {
-        RunStatus::Passed => (super::icons::PASS, true),
-        RunStatus::Failed => (super::icons::FAIL, false),
-        RunStatus::Running => (super::icons::RUNNING, true),
-        RunStatus::NotRun => ("", true),
+        RunStatus::NotRun => {}
+        RunStatus::Running => {
+            super::widgets::spinning_icon(ui, theme.ok);
+        }
+        RunStatus::Passed => {
+            ui.colored_label(theme.ok, super::icons::PASS);
+        }
+        RunStatus::Failed => {
+            ui.colored_label(theme.err, super::icons::FAIL);
+        }
     }
 }
 
@@ -328,7 +340,7 @@ fn render_entry_row(
         } else {
             label
         };
-        let (marker, ok) = run_marker(entry.last_run);
+        let run_status = entry.last_run;
         let is_sel = i == selected;
 
         // Give the row its own id namespace, keyed by the request it draws.
@@ -355,10 +367,7 @@ fn render_entry_row(
                 // never pushes the row — and the panel — wider than its width.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(SCROLLBAR_GUTTER);
-                    if !marker.is_empty() {
-                        let mc = if ok { theme.ok } else { theme.err };
-                        ui.colored_label(mc, marker);
-                    }
+                    paint_run_marker(ui, run_status, theme);
                     edited_marker(ui, entry, theme, labels.edited);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         super::widgets::selectable_row(ui, is_sel, text)
@@ -1684,9 +1693,8 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                         // now outlives the file being loaded (see
                         // `collection::RunRecord`), so a request run before the
                         // tab moved on still shows how it fared.
-                        let marker = run_marker(
-                            app.session.collections[ci].workspace_run_status(collection, *idx),
-                        );
+                        let marker =
+                            app.session.collections[ci].workspace_run_status(collection, *idx);
                         // Unlike the method badge and the run marker, the edit
                         // pencil is shown for every collection's rows, not just
                         // the loaded one's — an edit parked while the user looks
@@ -1715,11 +1723,7 @@ fn workspace_ui(app: &mut GuiApp, ui: &mut egui::Ui, ci: usize) {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.add_space(SCROLLBAR_GUTTER);
-                                        let (mk, ok) = marker;
-                                        if !mk.is_empty() {
-                                            let mc = if ok { theme.ok } else { theme.err };
-                                            ui.colored_label(mc, mk);
-                                        }
+                                        paint_run_marker(ui, marker, &theme);
                                         if edited {
                                             ui.colored_label(theme.pending, super::icons::EDITED)
                                                 .on_hover_text(lbl_edited);

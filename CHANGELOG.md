@@ -316,6 +316,26 @@ Releases before 0.1.2 predate this changelog and are not recorded here.
   pinned by a test, instead of being implicit in which of four functions
   happened to have the arm.
 
+- **The GUI's "this request is running" marker now turns.** It has always been
+  a circle-notch — the ring-with-a-bite-out-of-it every spinner is drawn from —
+  but it stood still, which reads as a broken ring rather than as work in
+  progress. That mattered most in the PaperTrail report generator, where the
+  `done/total` counter beside it only moves when a request *finishes*: a run
+  waiting on one slow endpoint looked frozen at exactly the moment a user wants
+  reassurance that it isn't. Running rows in the report's results grid animate
+  too, which they did not before.
+
+  The ring is *painted* rather than spun as text. Rotating the real glyph looks
+  right in a screenshot but jostles in motion, because the text pipeline rounds
+  a glyph's position to a whole physical pixel before applying its angle — and
+  a glyph spun about its own middle has to walk its corner around a circle to
+  stay put, so it hops a pixel at a time instead of turning. A stroked arc is
+  rounded nowhere and turns at sub-pixel precision. Its geometry was measured
+  off the icon font so it sits among the still icons as if it were one of them,
+  and it reserves exactly the width a real icon would: every glyph in that font
+  is one em wide, which is what stops a request row from shifting sideways as
+  its marker goes scheduled → running → finished.
+
 ### Removed
 
 - **The `p` "link environment to collection" picker, and the linked/active

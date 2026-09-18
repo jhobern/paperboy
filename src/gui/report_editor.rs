@@ -2148,14 +2148,8 @@ pub fn ui(app: &mut GuiApp, ui: &mut egui::Ui) {
         // as well here, beside the Run button that started it.
         if ed.is_running() {
             ui.separator();
-            ui.colored_label(
-                th.pending,
-                format!(
-                    "{} {}",
-                    super::icons::RUNNING,
-                    app.strings.gui_report_running
-                ),
-            );
+            super::widgets::spinning_icon(ui, th.pending);
+            ui.colored_label(th.pending, app.strings.gui_report_running);
         }
         if let Some(prog) = &ed.progress {
             ui.colored_label(th.dim, format!("{}/{}", prog.done, prog.total));
@@ -5039,12 +5033,20 @@ fn results_grid(
                             }
                         }
                         if show_icons {
-                            let (glyph, colour) = match state {
-                                Some(RowState::Running) => (super::icons::RUNNING, th.pending),
-                                Some(RowState::Finished) => (super::icons::PASS, th.ok),
-                                _ => (super::icons::ROW_SCHEDULED, th.dim),
-                            };
-                            ui.colored_label(colour, glyph);
+                            match state {
+                                // Turning, so a row waiting on a slow endpoint
+                                // says "still going" rather than sitting there
+                                // looking like a result.
+                                Some(RowState::Running) => {
+                                    super::widgets::spinning_icon(ui, th.pending);
+                                }
+                                Some(RowState::Finished) => {
+                                    ui.colored_label(th.ok, super::icons::PASS);
+                                }
+                                _ => {
+                                    ui.colored_label(th.dim, super::icons::ROW_SCHEDULED);
+                                }
+                            }
                         }
                         let text_col = match state {
                             Some(RowState::Running) => th.pending,
